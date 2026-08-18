@@ -219,7 +219,7 @@ async fn test_parquet_response_is_not_http_compressed() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -235,7 +235,7 @@ async fn test_parquet_response_is_not_http_compressed() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run?_format=parquet")
+        .post("/$sql-run?_format=parquet")
         .add_header("x-tenant-id", "test-tenant")
         .add_header("accept-encoding", "gzip")
         .json(&body)

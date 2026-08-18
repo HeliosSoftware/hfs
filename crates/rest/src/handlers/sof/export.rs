@@ -1131,7 +1131,7 @@ fn parse_export_query(raw: Option<&str>) -> Result<ExportQueryParams, Response> 
                         "severity": "error",
                         "code": "not-supported",
                         "diagnostics": format!(
-                            "unsupported query parameter '{k}' for $viewdefinition-export"
+                            "unsupported query parameter '{k}' for $sql-export"
                         )
                     }]
                 })),

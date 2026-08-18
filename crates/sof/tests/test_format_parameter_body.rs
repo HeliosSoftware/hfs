@@ -18,7 +18,7 @@ async fn test_format_parameter_in_body_csv() {
                 "valueCode": "text/csv"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -62,10 +62,7 @@ async fn test_format_parameter_in_body_csv() {
         ]
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     assert_eq!(response.status_code(), StatusCode::OK);
     let content_type = response.header("content-type");
@@ -107,7 +104,7 @@ async fn test_format_parameter_in_body_overrides_accept_header() {
                 "valueCode": "text/csv"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -133,7 +130,7 @@ async fn test_format_parameter_in_body_overrides_accept_header() {
 
     // Send request with Accept header for JSON, but _format in body should override
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Accept", "application/json")
         .json(&request_body)
         .await;
@@ -162,7 +159,7 @@ async fn test_format_parameter_in_body_overrides_query_parameter() {
                 "valueCode": "text/csv"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -186,7 +183,7 @@ async fn test_format_parameter_in_body_overrides_query_parameter() {
 
     // Send request with query parameter for JSON, but _format in body should override
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_query_param("_format", "application/json")
         .json(&request_body)
         .await;
@@ -212,7 +209,7 @@ async fn test_format_parameter_valuestring_variant() {
                 "valueString": "application/ndjson"  // Using valueString instead of valueCode
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -244,10 +241,7 @@ async fn test_format_parameter_valuestring_variant() {
         ]
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     assert_eq!(response.status_code(), StatusCode::OK);
     let content_type = response.header("content-type");
@@ -278,7 +272,7 @@ async fn test_format_parameter_with_csv_header_control() {
                 "valueCode": "text/csv"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -302,7 +296,7 @@ async fn test_format_parameter_with_csv_header_control() {
 
     // Test with header=false query parameter
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_query_param("header", "false")
         .json(&request_body)
         .await;
@@ -335,7 +329,7 @@ async fn test_invalid_format_parameter_in_body() {
                 "valueCode": "text/plain"  // Invalid format
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -348,10 +342,7 @@ async fn test_invalid_format_parameter_in_body() {
         ]
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     // Spec: unsupported `_format` → 400 Bad Request + OperationOutcome.
     assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
@@ -379,7 +370,7 @@ async fn test_precedence_order_body_query_accept() {
                 "valueCode": "application/ndjson"  // Body parameter (highest priority)
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -400,7 +391,7 @@ async fn test_precedence_order_body_query_accept() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_query_param("_format", "text/csv") // Query parameter (medium priority)
         .add_header("Accept", "application/json") // Accept header (lowest priority)
         .json(&request_body)

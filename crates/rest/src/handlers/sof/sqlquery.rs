@@ -1,9 +1,8 @@
-//! `$sqlquery-run` operation handler (SQL-on-FHIR v2).
+//! Executing a `$sql-run` whose subject is a SQLQuery or SQLView Library.
 //!
-//! Implements three routes per the spec:
-//! - `POST /$sqlquery-run` (system)
-//! - `POST /Library/$sqlquery-run` (type)
-//! - `POST /Library/{id}/$sqlquery-run` (instance — `{id}` binds the Library)
+//! `$sql-run` is invoked at the system level and names its subject by
+//! parameter, so this module has no routes of its own: [`super::run`] resolves
+//! the subject and dispatches here when it turns out to be a Library.
 //!
 //! Execution model: the SQLQuery Library declares one or more `relatedArtifact`
 //! ViewDefinitions (`type=depends-on`, with a `label`). For each, this handler
@@ -17,9 +16,8 @@
 //!
 //! The spec declares the operation's `return` parameter as `Binary` (1..1):
 //! a raw binary stream in the format's native media type, *not* a serialized
-//! `Binary` resource envelope (spec PR #365, commit `86c178b`; same shape as
-//! `$viewdefinition-run`). When `_format=fhir` is requested the response is a
-//! `Parameters` resource instead — the documented exception to the `Binary`
+//! `Binary` resource envelope. When `_format=fhir` is requested the response is
+//! a `Parameters` resource instead — the documented exception to the `Binary`
 //! return. By default, flat formats (csv/json/ndjson/parquet) are returned as
 //! raw payload bytes with the format's `Content-Type`. Callers that want the
 //! serialized `Binary` envelope (base64 `data`) can request it by setting
@@ -71,7 +69,7 @@ use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
 
-/// Query-string parameters accepted by `$sqlquery-run`. The spec ships every
+/// Query-string parameters accepted by `$sql-run`. The spec ships every
 /// `in` parameter on the operation; we only honor the ones that make sense in
 /// a URL: `_format`, `header`, and `_limit`. Everything else (Library,
 /// parameters, source) is body-only.
@@ -161,7 +159,7 @@ where
     let runner = state
         .sof_runner()
         .ok_or_else(|| RestError::NotImplemented {
-            feature: "$sqlquery-run is not available: the configured storage backend does not \
+            feature: "$sql-run is not available: the configured storage backend does not \
                       provide a SOF runner"
                 .to_string(),
         })?
@@ -273,7 +271,7 @@ where
 /// Resolves the output format. Precedence (SoF v2 PR #353): body `_format` >
 /// URL `_format` > Accept header > `ndjson` default. `_format` is `0..1`.
 ///
-/// Accept mapping mirrors `$viewdefinition-run`: `application/json` → `json`,
+/// Accept mapping: `application/json` → `json`,
 /// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
 /// `application/octet-stream`/`application/parquet` → `parquet`,
 /// `application/fhir+json` → `fhir`. `application/fhir+xml` is **not**
@@ -515,7 +513,7 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
             ),
         },
         SqlQueryError::Sqlite(err) => {
-            warn!(error = %err, "sqlite error during $sqlquery-run");
+            warn!(error = %err, "sqlite error during $sql-run");
             RestError::UnprocessableEntity {
                 message: format!("SQLite error: {err}"),
             }

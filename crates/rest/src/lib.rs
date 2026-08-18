@@ -633,7 +633,7 @@ where
 
     // Wire SQL-on-FHIR runner and export controller. The SOF runtime path is
     // in-DB SQL only — backends without a SOF runner can't serve
-    // `$viewdefinition-run` and the handler returns 501 if SOF is enabled
+    // `$sql-run` and the handler returns 501 if SOF is enabled
     // without one.
     if config.sof_enabled {
         let Some(runner) = storage_arc.sof_runner() else {

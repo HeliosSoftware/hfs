@@ -11,12 +11,12 @@ pub type JobId = String;
 
 /// A single named ViewDefinition to be run as part of an export job.
 ///
-/// Per the SQL-on-FHIR v2 spec, `$viewdefinition-export` accepts `view` 1..*,
-/// each with an optional `name` plus either `viewResource` or `viewReference`.
-/// The kickoff handler resolves references and packages each view here.
+/// `$sql-export` accepts `subject` 1..*, each with an optional `name` plus one
+/// of `subjectCanonical`, `subjectReference` or `subjectResource`. The kick-off
+/// handler resolves the subject and packages each view here.
 #[derive(Debug, Clone)]
 pub struct NamedView {
-    /// `view.name` from the spec — drives `output.name` in the manifest.
+    /// `subject.name` from the spec — drives `output.name` in the manifest.
     pub name: String,
     /// The resolved ViewDefinition JSON.
     pub view: Value,
@@ -33,14 +33,14 @@ pub struct SqlTableSource {
     pub view: Value,
 }
 
-/// A single named SQL query to be run as part of a `$sqlquery-export` job.
+/// A single named SQL query to be run as part of a `$sql-export` job.
 ///
 /// The kickoff handler resolves the Library and its `depends-on`
 /// ViewDefinitions, validates the SQL, and binds `Library.parameter` values
 /// before submitting, so the background job only materializes and executes.
 #[derive(Debug, Clone)]
 pub struct NamedSqlQuery {
-    /// `query.name` from the spec — drives `output.name` in the manifest.
+    /// `subject.name` from the spec — drives `output.name` in the manifest.
     pub name: String,
     /// The validated (SELECT-only) SQL text from the Library.
     pub sql: String,
@@ -50,7 +50,7 @@ pub struct NamedSqlQuery {
     pub bindings: Vec<helios_sof::sqlquery::BoundParam>,
 }
 
-/// Execution caps for SQL query export work. Mirrors the `$sqlquery-run`
+/// Execution caps for SQL query export work. Mirrors the `$sql-run`
 /// server configuration so exports and synchronous runs enforce the same
 /// resource limits.
 #[derive(Debug, Clone, Copy, Default)]

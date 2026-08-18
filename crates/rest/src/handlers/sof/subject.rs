@@ -257,9 +257,12 @@ where
     if let Some(err) = last_internal {
         return Err(err);
     }
+    // `RestError::NotFound` renders as "Resource {type}/{id} not found", so the
+    // id carries the URL alone; naming the parameter goes in `resource_type`'s
+    // place would read as a path. Keep both legible.
     Err(RestError::NotFound {
-        resource_type: candidate_types.join(" or "),
-        id: format!("{param}={trimmed}"),
+        resource_type: format!("{param} subject ({})", candidate_types.join(" or ")),
+        id: trimmed.to_string(),
     })
 }
 
