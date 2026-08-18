@@ -27,6 +27,13 @@ inputs:
     description: Build cache to retain as a warm cache.
     required: false
     default: 20GB
+  container-max-age-min:
+    description: >
+      Age (minutes) past which a container labelled `hfs-ci=true` is treated as
+      an orphan and force-removed. Must comfortably exceed the longest CI job
+      runtime so a concurrent run is never reaped mid-test.
+    required: false
+    default: "180"
 
 runs:
   using: composite
@@ -73,6 +80,54 @@ runs:
         # A volume still in use by a concurrently starting container refuses
         # removal; that is the intended outcome, not an error worth failing on.
 
+    # Containers SECOND: after the volume sweep (which is what unwedges a
+    # quota-choked host) and before the image prune (which a surviving
+    # container would otherwise block by holding a reference to its image).
+    #
+    # This exists because `if: always()` cleanup is not enough. When the host
+    # hit its quota on 2026-07-30, containerd could not write meta.db, so the
+    # per-job `docker rm -f` failed too — and because those steps discarded
+    # stderr and ended in `|| true`, they reported success while leaking a
+    # running Playwright container. It then survived two weeks: its name is
+    # run-id-scoped so no later run could match it, it carried no
+    # testcontainers label so ci.yml's sweeps could not see it, and nothing
+    # here pruned containers at all. It also pinned the ~2GB Playwright image
+    # against `image prune`, so the leak actively degraded this very sweep.
+    #
+    # Scoped to the `hfs-ci=true` label rather than a blanket
+    # `docker container prune`: the host runs long-lived services alongside CI,
+    # and a stopped container a human intends to restart must never be
+    # collected by a routine sweep. Same defence-in-depth reasoning as the
+    # anonymous-volume filter above — the sweep should be structurally
+    # incapable of touching anything a person owns.
+    - name: Reap orphaned CI containers
+      shell: bash
+      run: |
+        # Not `$(docker ps ... || true)`: if the daemon cannot even list
+        # containers, an empty list would print "Reaped 0" and read as a clean
+        # sweep — the exact silent-success pattern that hid the original leak.
+        if ! ids=$(docker ps -aq --filter "label=hfs-ci=true"); then
+          echo "::warning::Could not list containers on the Docker host; orphan sweep skipped."
+          exit 0
+        fi
+
+        now=$(date +%s)
+        reaped=0
+        for id in $ids; do
+          started=$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null) || continue
+          age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
+          if [ "$age_min" -ge "${{ inputs.container-max-age-min }}" ]; then
+            name=$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null || echo "$id")
+            echo "Reaping orphan ${name#/} (age ${age_min}m)"
+            # -v for the same reason as the volume sweep: the container's
+            # anonymous volumes go with it, in one write, on a host where
+            # writes are the scarce resource.
+            docker rm -fv "$id" || true
+            reaped=$((reaped + 1))
+          fi
+        done
+        echo "Reaped ${reaped} orphaned CI container(s)."
+
     - name: Prune stale images, build cache and networks
       shell: bash
       run: |
@@ -81,7 +136,17 @@ runs:
         # them every run would re-pull gigabytes and get slower, trading one
         # problem for another.
         docker image prune -af --filter "until=${{ inputs.image-min-age }}" || true
-        docker builder prune -af --keep-storage "${{ inputs.builder-keep-storage }}" || true
+
+        # `--keep-storage` was renamed `--reserved-space`; the old spelling is
+        # deprecated and warns. The flag is parsed by the *client*, not the
+        # remote daemon, so the runner pool decides which name works and the
+        # pool is not uniform — probe rather than pin.
+        if docker builder prune --help 2>&1 | grep -q -- '--reserved-space'; then
+          docker builder prune -af --reserved-space "${{ inputs.builder-keep-storage }}" || true
+        else
+          docker builder prune -af --keep-storage "${{ inputs.builder-keep-storage }}" || true
+        fi
+
         docker network prune -f --filter "until=6h" || true
 
     - name: Docker disk usage after GC

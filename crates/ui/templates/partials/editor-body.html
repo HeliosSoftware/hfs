@@ -7,7 +7,7 @@
   it back and the server hands back a new one, so a key we never render is also
   a key we never destroy.
 -->
-<form id="editor-form" hx-post="/ui/editor/render" hx-target="#editor-body" hx-swap="innerHTML" data-error-count="{{ error_count }}">
+<form id="editor-form" hx-post="/ui/editor/render" hx-target="#editor-body" hx-swap="innerHTML" data-error-count="{{ error_count }}"{% if !focus_path.is_empty() %} data-focus="{{ focus_path }}"{% endif %}>
   <input type="hidden" name="doc" id="editor-doc" value="{{ document }}">
   <input type="hidden" name="op" id="editor-op" value="">
   <input type="hidden" name="path" id="editor-path" value="">
@@ -30,9 +30,11 @@
   <section class="card editor-json">
     <div class="card-head">
       <h3><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("editor-view-json") }}</h3>
-      <div class="card-head__tools">
+      <div class="card-head__tools card-head__tools--start">
         <button type="button" class="editor-json__act" data-json-fold="all" title="{{ i18n.t("editor-collapse-all") }}">{{ i18n.t("editor-collapse-all") }}</button>
         <button type="button" class="editor-json__act" data-json-fold="none" title="{{ i18n.t("editor-expand-all") }}">{{ i18n.t("editor-expand-all") }}</button>
+      </div>
+      <div class="card-head__tools">
         <button type="button" class="editor-json__act" id="editor-json-edit">{{ i18n.t("editor-edit-raw") }}</button>
       </div>
     </div>
@@ -133,6 +135,23 @@
           {% if row.is_primitive %}
           <input class="editor-row__input" type="text" value="{{ row.value }}"
                  data-set="{{ row.path }}"
+                 {% if row.type_label == "date" %}
+                 placeholder="2024-05-17" inputmode="numeric"
+                 pattern="\d{4}(-\d{2}(-\d{2})?)?"
+                 title="{{ i18n.t("editor-hint-date") }}"
+                 {% else if row.type_label == "dateTime" %}
+                 placeholder="2024-05-17T14:30:00+02:00"
+                 pattern="\d{4}(-\d{2}(-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+\-]\d{2}:\d{2}))?)?)?"
+                 title="{{ i18n.t("editor-hint-datetime") }}"
+                 {% else if row.type_label == "time" %}
+                 placeholder="14:30:00" inputmode="numeric"
+                 pattern="\d{2}:\d{2}:\d{2}(\.\d+)?"
+                 title="{{ i18n.t("editor-hint-time") }}"
+                 {% else if row.type_label == "instant" %}
+                 placeholder="2024-05-17T14:30:00.000Z"
+                 pattern="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+\-]\d{2}:\d{2})"
+                 title="{{ i18n.t("editor-hint-instant") }}"
+                 {% endif %}
                  {% if !row.binding_url.is_empty() %}data-vs-url="{{ row.binding_url }}"{% endif %}
                  {% if let Some(vs) = row.binding %}list="vs-{{ vs }}" placeholder="{{ vs }}"{% endif %}>
           {% endif %}
@@ -148,7 +167,7 @@
         {% endfor %}
 
         {% if !row.addable.is_empty() %}
-        <details class="editor-add">
+        <details class="editor-add"{% if row.path.is_empty() && auto_open_add %} open{% endif %}>
           <summary class="editor-add__toggle">+ {{ i18n.t("editor-add") }}</summary>
           <div class="editor-add__panel">
             <input type="search" class="editor-add__filter"
@@ -212,9 +231,14 @@
       {% endfor %}
     </div>
 
-    {% for message in orphan_errors %}
-    <p class="editor__orphan">{{ message }}</p>
-    {% endfor %}
+    {% if !orphan_errors.is_empty() %}
+    <div class="editor__orphans" role="alert">
+      <div class="editor__orphans-title">{{ i18n.t("editor-orphans-title") }}</div>
+      {% for message in orphan_errors %}
+      <p class="editor__orphan">{{ message }}</p>
+      {% endfor %}
+    </div>
+    {% endif %}
   </section>
 </div>
 

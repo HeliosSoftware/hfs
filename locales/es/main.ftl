@@ -589,6 +589,13 @@ bulk-import-result-finished = Procesamiento terminado a las
 bulk-import-result-outputs = Archivos de salida
 bulk-import-result-errors = Archivos de error
 bulk-import-abort-manifest = Abortar
+ui-cancel = Cancelar
+ui-close = Cerrar
+editor-orphans-title = Estos problemas aún no tienen campo — añada los elementos para corregirlos
+editor-hint-date = FHIR date: YYYY, YYYY-MM o YYYY-MM-DD
+editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD o un timestamp completo con zona horaria (2024-05-17T14:30:00+02:00)
+editor-hint-time = FHIR time: HH:MM:SS
+editor-hint-instant = FHIR instant: timestamp completo con zona horaria, p. ej. 2024-05-17T14:30:00.000Z
 
 ## Bulk Export workspace (#537)
 

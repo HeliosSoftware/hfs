@@ -141,6 +141,13 @@ pub struct EditorBody {
     /// on a backbone element, say). Surfaced rather than swallowed.
     pub orphan_errors: Vec<String>,
     pub parse_error: Option<String>,
+    /// Dotted path of the node the last mutation created, so the client can
+    /// put the caret straight into it after the swap (#547). Empty when the
+    /// mutation created nothing.
+    pub focus_path: String,
+    /// Whether the root add-picker opens by itself — a document with no
+    /// elements gives the user nothing else to act on (#547).
+    pub auto_open_add: bool,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +224,8 @@ pub async fn render_body(
                 error_count: 0,
                 orphan_errors: Vec::new(),
                 parse_error: Some(error.to_string()),
+                focus_path: String::new(),
+                auto_open_add: false,
             });
         }
     };
@@ -227,9 +236,16 @@ pub async fn render_body(
         .unwrap_or("Patient")
         .to_string();
 
-    apply(&*registry, &resource_type, &mut document, &form);
+    let created = apply(&*registry, &resource_type, &mut document, &form);
 
-    render(build_body(i18n, registry, resource_type, document, None))
+    render(build_body(
+        i18n,
+        registry,
+        resource_type,
+        document,
+        None,
+        created,
+    ))
 }
 
 /// Applies one mutation to the document.
@@ -238,12 +254,12 @@ fn apply(
     resource_type: &str,
     document: &mut Value,
     form: &EditorForm,
-) {
+) -> Option<editor::Path> {
     let path = editor::path_from_string(&form.path);
 
     match form.op.as_str() {
         "add" if !form.slice.is_empty() => {
-            editor::add_slice_element(
+            return editor::add_slice_element(
                 resolver,
                 resource_type,
                 document,
@@ -253,10 +269,10 @@ fn apply(
             );
         }
         "add" => {
-            editor::add_element(resolver, resource_type, document, &path, &form.name);
+            return editor::add_element(resolver, resource_type, document, &path, &form.name);
         }
         "choose" => {
-            editor::choose_type(
+            return editor::choose_type(
                 resolver,
                 resource_type,
                 document,
@@ -271,7 +287,7 @@ fn apply(
             } else {
                 form.url.trim()
             };
-            editor::add_extension(
+            return editor::add_extension(
                 resolver,
                 resource_type,
                 document,
@@ -289,6 +305,7 @@ fn apply(
         // No op: a plain re-render (the first load, or a mode switch).
         _ => {}
     }
+    None
 }
 
 /// Validates, flattens, and packages the editor body.
@@ -298,6 +315,7 @@ fn build_body(
     resource_type: String,
     document: Value,
     parse_error: Option<String>,
+    created: Option<editor::Path>,
 ) -> EditorBody {
     // The cheap pass, on every mutation. Pure, no I/O — this is what makes
     // continuous validation affordable at all.
@@ -346,15 +364,33 @@ fn build_body(
     // Anything that did not land on a row still has to be seen.
     let claimed: std::collections::HashSet<&str> =
         rows.iter().map(|row| row.path.as_str()).collect();
-    let orphan_errors = by_path
+    let mut orphan_errors: Vec<String> = by_path
         .iter()
         .filter(|(path, _)| !claimed.contains(path.as_str()) && !path.is_empty())
         .flat_map(|(path, messages)| {
-            messages
-                .iter()
-                .map(move |message| format!("{path}: {message}"))
+            messages.iter().map(move |message| {
+                // The validator's message usually opens with the element name
+                // ("priority is required"); prefixing the path then reads
+                // "priority: priority is required". Only prefix when the
+                // message doesn't already carry the leaf name.
+                let leaf = path.rsplit('.').next().unwrap_or(path);
+                if message.starts_with(leaf) {
+                    message.clone()
+                } else {
+                    format!("{path}: {message}")
+                }
+            })
         })
         .collect();
+    orphan_errors.sort();
+    orphan_errors.dedup();
+
+    // A document with nothing beyond resourceType leaves the user nothing to
+    // act on except adding elements — open the root picker for them (#547).
+    let auto_open_add = document
+        .as_object()
+        .map(|o| o.keys().all(|k| k == "resourceType"))
+        .unwrap_or(false);
 
     EditorBody {
         i18n,
@@ -365,6 +401,10 @@ fn build_body(
         orphan_errors,
         rows,
         parse_error,
+        focus_path: created
+            .map(|path| editor::path_to_string(&path))
+            .unwrap_or_default(),
+        auto_open_add,
     }
 }
 

@@ -291,6 +291,15 @@ jobs:
             exit 1
           fi
 
+      # Last step, and non-fatal by construction. `clean: false` above keeps the
+      # target dir warm across runs, which is what makes this job fit in 120
+      # minutes — but cargo never evicts the artifacts a bump or a toolchain
+      # update orphans, so that cache only ever grows. The macOS runner hit its
+      # disk ceiling this way. See .github/actions/cargo-target-gc.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
   cleanup-test-containers:
     name: Cleanup Test Containers
     runs-on: [self-hosted, Linux]
@@ -430,6 +439,12 @@ jobs:
         working-directory: crates/pysof
         run: uv run python -m pytest python-tests/ -v --cov=src --cov-report=xml:coverage.xml --cov-report=term-missing
 
+      # maturin compiles pysof into the same shared workspace target dir, so
+      # this job accumulates like the Rust ones. See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
   lint:
     name: Linting
     runs-on: [self-hosted]
@@ -510,6 +525,11 @@ jobs:
         working-directory: crates/pysof
         run: |
           uv run mypy src
+
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   security:
     name: Security Audit
@@ -618,6 +638,18 @@ jobs:
         # upstream, and rust_decimal still declares optional `rkyv ^0.7.46`
         # as of 1.42.1 (its 0.8 dependency is dev-only). Remove this once
         # rust_decimal moves its optional rkyv to 0.8.
+        #
+        # h2 0.3.27 (RUSTSEC-2026-0258, unbounded buffering of empty DATA
+        # frames -> memory-exhaustion DoS). Our own HTTP/2 stack (axum/hyper
+        # 1.x) is on the patched h2 0.4.16; the only copy left on the 0.3 line
+        # is the legacy hyper 0.14 one reached via aws-smithy-http-client
+        # 1.1.10, and that line is unsupported upstream -- the advisory's fix
+        # lands in >= 0.4.16 only, so no 0.3.x upgrade exists. Same reasoning
+        # as the rustls-webpki entries above: that copy is only linked under
+        # `--all-features`, and it is a *client* talking to AWS endpoints, so
+        # reaching the bug would require AWS itself to send the hostile frame
+        # stream. Remove this once the AWS SDK drops its hyper 0.14 fallback
+        # client.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0098
@@ -626,7 +658,13 @@ jobs:
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
           --ignore RUSTSEC-2026-0235
- 
+          --ignore RUSTSEC-2026-0258
+
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
   coverage:
     name: Code Coverage
     runs-on: [self-hosted, Unix] # llvm-tools-preview has problems on Windows, so restrict to Unix
@@ -728,6 +766,13 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           fail_ci_if_error: true
+
+      # The heaviest accumulator of the lot: `cargo llvm-cov` builds a whole
+      # separate instrumented profile, so every run this job's feature set
+      # changes leaves another full copy behind. See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   test-fhirpath:
     name: Test FHIRPath
@@ -1523,6 +1568,16 @@ jobs:
         with:
           name: pysof-${{ matrix.target }}
           path: crates/pysof/dist/*
+
+      # Runs after every upload above, so eviction can never race an artifact
+      # this job still has to publish. Unlike the jobs above this one checks out
+      # clean, so it does not accumulate across runs — but two of its four
+      # matrix legs (`Linux-ARM64` and `macOS`) land on the macOS runner and
+      # park a full release target dir there until the next tag. Bounding that
+      # is free: cargo-sweep does nothing when the dir is already under the cap.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   publish-pypi:
     name: Publish to PyPI

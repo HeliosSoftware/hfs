@@ -64,9 +64,97 @@
         return response.text();
       })
       .then(function (html) {
+        var state = captureUiState();
         body.innerHTML = html;
         applyView();
+        restoreUiState(state);
       });
+  }
+
+  /* ---- keeping the user's place across the swap (#547) ------------------ */
+
+  /* The whole body re-renders on every mutation; without this, each round
+   * trip destroyed the focused field, the caret, any open add-picker with
+   * its filter text, and the tree's scroll position. Captured at response
+   * time — where the user is *now*, not where they were at request time. */
+  function captureUiState() {
+    var state = { focus: null, pickers: [], scroll: 0 };
+    var tree = body.querySelector(".editor-tree");
+    if (tree) state.scroll = tree.scrollTop;
+    var active = document.activeElement;
+    if (active && body.contains(active) && active.dataset && active.dataset.set) {
+      state.focus = {
+        path: active.dataset.set,
+        start: active.selectionStart,
+        end: active.selectionEnd,
+      };
+    }
+    body.querySelectorAll("details.editor-add[open]").forEach(function (box) {
+      var row = box.closest("[data-path]");
+      var filter = box.querySelector(".editor-add__filter");
+      state.pickers.push({
+        path: row ? row.dataset.path : "",
+        filter: filter ? filter.value : "",
+        focusFilter: filter === document.activeElement,
+      });
+    });
+    return state;
+  }
+
+  function rowByPath(path) {
+    if (!path) return body;
+    var rows = body.querySelectorAll("[data-path]");
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.path === path) return rows[i];
+    }
+    return null;
+  }
+
+  function inputByPath(path) {
+    var inputs = body.querySelectorAll("[data-set]");
+    for (var i = 0; i < inputs.length; i++) {
+      if (inputs[i].dataset.set === path) return inputs[i];
+    }
+    return null;
+  }
+
+  function restoreUiState(state) {
+    state.pickers.forEach(function (saved) {
+      var row = rowByPath(saved.path);
+      if (!row) return;
+      var box = row.querySelector("details.editor-add");
+      if (!box) return;
+      box.setAttribute("open", "");
+      var filter = box.querySelector(".editor-add__filter");
+      if (filter && saved.filter) {
+        filter.value = saved.filter;
+        filter.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      if (saved.focusFilter && filter) filter.focus();
+    });
+
+    // The server names the node the mutation created; the caret goes there.
+    // Otherwise it returns to the field that was focused before the swap.
+    var formEl = body.querySelector("#editor-form");
+    var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
+    var target = createdPath ? inputByPath(createdPath) : null;
+    if (target) {
+      target.focus();
+      if (target.select) target.select();
+    } else if (state.focus) {
+      target = inputByPath(state.focus.path);
+      if (target) {
+        target.focus();
+        if (target.setSelectionRange && state.focus.start !== null) {
+          try {
+            target.setSelectionRange(state.focus.start, state.focus.end);
+          } catch (ignored) {}
+        }
+      }
+    }
+
+    var tree = body.querySelector(".editor-tree");
+    if (tree) tree.scrollTop = state.scroll;
   }
 
   /* The in-flight document. Normally the server's fragment (the hidden field),
@@ -309,6 +397,9 @@
     function (event) {
       var input = event.target.closest("[data-set]");
       if (!input) return;
+      // An unchanged value needs no round trip -- tabbing through fields
+      // must not re-render the panel (#547).
+      if (input.value === input.defaultValue) return;
       send("set", { path: input.dataset.set, value: input.value });
     },
     true
