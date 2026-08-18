@@ -11,6 +11,12 @@
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::BackendKind;
 
+// T2 cluster-harness helpers shared by the cluster suites. Included by
+// `#[path]` rather than via `mod common;` so this test binary compiles only
+// the harness it uses.
+#[path = "common/cluster_harness.rs"]
+mod cluster_harness;
+
 /// The backend-agnostic `ifMatch` scenarios (issue #311), shared verbatim with
 /// the SQLite suite that owns the file.
 ///
@@ -762,6 +768,10 @@ mod postgres_integration {
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
     static BULK_EXPORT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+    // Serializes the cluster-jobs T2 suite: `claim_next` is deliberately
+    // cross-tenant, so parallel tests sharing the container would claim (and
+    // finish) each other's queued jobs.
+    static CLUSTER_JOBS_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
@@ -5253,6 +5263,2149 @@ mod postgres_integration {
         use helios_persistence::core::SearchProvider;
         let backend = create_backend().await;
         assert!(backend.supports_contained_search());
+    }
+
+    // ========================================================================
+    // Cluster T2 Tests
+    // ========================================================================
+
+    /// T2 cross-instance suite for schema initialization: four independently
+    /// constructed backends (fresh pools, not a cloned `Arc`) cold-start
+    /// concurrently against one fresh, empty database.
+    ///
+    /// DoD rows — exclusivity: init is serialized by the advisory lock
+    /// (without it, a losing instance aborts on a pg_type duplicate-key error
+    /// from racing `CREATE TABLE IF NOT EXISTS`); visibility: create via
+    /// handle A → readable via handle B; isolation: wrong tenant sees nothing.
+    #[tokio::test]
+    async fn postgres_integration_cluster_concurrent_cold_start_schema_init() {
+        let pg = shared_pg().await;
+
+        // A database no other test touches — this must be a true cold start.
+        let dbname = format!("cold_start_{}", uuid::Uuid::new_v4().simple());
+        let admin_conn = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            pg.host, pg.port,
+        );
+        let (admin, connection) = tokio_postgres::connect(&admin_conn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to shared pg");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        admin
+            .execute(format!("CREATE DATABASE {}", dbname).as_str(), &[])
+            .await
+            .expect("create cold-start database");
+
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+
+        let mut backends = Vec::new();
+        for _ in 0..4 {
+            let config = PostgresConfig {
+                host: pg.host.clone(),
+                port: pg.port,
+                dbname: dbname.clone(),
+                user: "postgres".to_string(),
+                password: Some("postgres".to_string()),
+                max_connections: 2,
+                data_dir: Some(data_dir.clone()),
+                ..Default::default()
+            };
+            backends.push(
+                PostgresBackend::new(config)
+                    .await
+                    .expect("Failed to create PostgresBackend"),
+            );
+        }
+
+        // All four handles start init from a shared barrier to force the race.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(backends.len()));
+        let tasks: Vec<_> = backends
+            .into_iter()
+            .map(|backend| {
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    backend.init_schema().await.map(|_| backend)
+                })
+            })
+            .collect();
+        let mut handles = Vec::new();
+        for task in tasks {
+            handles.push(
+                task.await
+                    .expect("init task panicked")
+                    .expect("every instance must survive a concurrent cold start"),
+            );
+        }
+
+        // Init converged: exactly one schema_version row.
+        let cold_conn = format!(
+            "host={} port={} user=postgres password=postgres dbname={}",
+            pg.host, pg.port, dbname,
+        );
+        let (cold, connection) = tokio_postgres::connect(&cold_conn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to cold-start db");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let rows = cold
+            .query("SELECT version FROM schema_version", &[])
+            .await
+            .expect("query schema_version");
+        assert_eq!(
+            rows.len(),
+            1,
+            "racing inits must not duplicate schema_version rows"
+        );
+        assert!(rows[0].get::<_, i32>(0) >= 1);
+
+        // Visibility: create via handle A → readable via handle B (same tenant).
+        let tenant = create_tenant("cluster-cold-start");
+        let created = handles[0]
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let read_b = handles[1]
+            .read(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        assert!(read_b.is_some());
+
+        // Isolation: a different tenant on handle B sees nothing.
+        let other_tenant = create_tenant("cluster-cold-start-other");
+        let read_other = handles[1]
+            .read(&other_tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        assert!(read_other.is_none());
+    }
+
+    // ========================================================================
+    // T2 cluster calibration suite — bulk-export job store
+    // ========================================================================
+    //
+    // The bulk-export job store is already cluster-safe; these
+    // tests calibrate the `cluster_harness` helpers against it, so every row
+    // must pass green immediately. If a row is red, either the harness is
+    // unfaithful or the "already safe" boundary is drawn wrong — both are
+    // exactly what calibration exists to flush out (methodology §5).
+    // ========================================================================
+
+    use crate::cluster_harness as harness;
+    use helios_persistence::core::bulk_export::{ExportJobId, ExportProgress};
+    use helios_persistence::error::BulkExportError;
+
+    /// Maps `get_export_status` to the harness's `Option` shape: a job that
+    /// doesn't exist *for this tenant* is `None`; any other error is a bug.
+    async fn export_status_across(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+    ) -> Option<ExportProgress> {
+        match backend.get_export_status(tenant, job_id).await {
+            Ok(progress) => Some(progress),
+            Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => None,
+            Err(other) => panic!("unexpected error reading export status: {other:?}"),
+        }
+    }
+
+    /// Claims and finishes every eligible job so an exclusivity race starts
+    /// from an empty queue. Leftover `accepted` jobs from other suites
+    /// sharing the container would otherwise let both racers win on
+    /// different jobs.
+    async fn drain_export_queue(backend: &PostgresBackend) {
+        let reaper = WorkerId::new(format!("cluster-drain-{}", uuid::Uuid::new_v4()));
+        while let Some(lease) = backend
+            .claim_next(&reaper, StdDuration::from_secs(60))
+            .await
+            .unwrap()
+        {
+            backend
+                .finish_export_job(
+                    &lease.tenant,
+                    &lease.job_id,
+                    &lease.worker_id,
+                    lease.fencing_token,
+                )
+                .await
+                .expect("draining a leftover export job");
+        }
+    }
+
+    /// DoD rows: visibility + isolation (strategy §4).
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_visible_and_isolated_across_handles() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-vis");
+
+        let job_id = handles
+            .a
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Visibility: created via instance A, observable via instance B.
+        let progress = harness::assert_visible(
+            export_status_across(&handles.b, &tenant, &job_id).await,
+            "export job created via instance A",
+        );
+        assert_eq!(progress.status, ExportStatus::Accepted);
+
+        // Isolation: another tenant on instance B sees nothing.
+        let other_tenant = create_tenant("cluster-vis-other");
+        harness::assert_wrong_tenant_hidden(
+            export_status_across(&handles.b, &other_tenant, &job_id).await,
+            "export job",
+        );
+    }
+
+    /// DoD row: exclusivity — two instances race `claim_next` on one queued
+    /// job and exactly one wins (`FOR UPDATE SKIP LOCKED`).
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_claim_exclusive_across_handles() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-claim");
+
+        drain_export_queue(&handles.a).await;
+
+        let job_id = handles
+            .a
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker_a = WorkerId::new(format!("cluster-claim-a-{}", uuid::Uuid::new_v4()));
+        let worker_b = WorkerId::new(format!("cluster-claim-b-{}", uuid::Uuid::new_v4()));
+        let (a, b) = (handles.a, handles.b);
+        let (lease_a, lease_b) = harness::race2(
+            async move {
+                a.claim_next(&worker_a, StdDuration::from_secs(60))
+                    .await
+                    .unwrap()
+            },
+            async move {
+                b.claim_next(&worker_b, StdDuration::from_secs(60))
+                    .await
+                    .unwrap()
+            },
+        )
+        .await;
+
+        harness::assert_exactly_one(&lease_a, &lease_b, "the claim on one queued job");
+        let winner = lease_a.or(lease_b).unwrap();
+        assert_eq!(winner.job_id, job_id);
+        assert_eq!(
+            winner.tenant.tenant_id().as_str(),
+            tenant.tenant_id().as_str()
+        );
+    }
+
+    /// DoD row: fencing — after a release/reclaim moves the lease to another
+    /// instance, the stale holder's heartbeat and guarded writes are refused.
+    /// Deterministic: the reclaim uses `release`, not lease expiry, so there
+    /// are no sleeps (methodology §4, coverage-safe).
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_stale_handle_fenced_after_release() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-fence");
+
+        let job_id = handles
+            .a
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Instance A claims, then releases (graceful shutdown).
+        let worker_a = WorkerId::new(format!("cluster-fence-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&handles.a, &worker_a, &job_id, StdDuration::from_secs(60)).await;
+        ExportClaimStrategy::release(&handles.a, lease_a.clone())
+            .await
+            .unwrap();
+
+        // Instance B reclaims; the fencing token moves past A's.
+        let worker_b = WorkerId::new(format!("cluster-fence-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&handles.b, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+
+        // The stale handle is fenced out of heartbeat and guarded writes.
+        assert!(matches!(
+            handles.a.heartbeat(&lease_a).await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+        assert!(matches!(
+            handles
+                .a
+                .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        // The current holder is unaffected.
+        handles
+            .b
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// DoD row: durability — dropping the creating handle (simulated
+    /// redeploy) must not lose the job; a fresh handle still sees it.
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_survives_handle_drop() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let tenant = create_tenant("cluster-durable");
+
+        let first = create_backend().await;
+        let job_id = first
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        drop(first);
+
+        let replacement = create_backend().await;
+        let progress = harness::assert_visible(
+            export_status_across(&replacement, &tenant, &job_id).await,
+            "export job after its creating handle was dropped",
+        );
+        assert_eq!(progress.status, ExportStatus::Accepted);
+    }
+
+    // ========================================================================
+    // T2 cluster suite — F5 resource version-id race
+    // ========================================================================
+    //
+    // `update`/`delete` are version-guarded (CAS) and bump the version inside
+    // one transaction with the history insert, so two instances racing
+    // unconditional writes can never both assign the same version_id or lose
+    // a history row. `create_or_update` retries transient CAS losses, keeping
+    // unconditional PUT last-writer-wins at the API surface.
+    // ========================================================================
+
+    /// Asserts a resource's history holds every version exactly once,
+    /// contiguous from 1 — no duplicate version_ids, no lost history rows.
+    async fn assert_history_versions(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_len: u64,
+    ) {
+        let history = backend
+            .history_instance(
+                tenant,
+                resource_type,
+                id,
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap();
+        let mut versions: Vec<u64> = history
+            .items
+            .iter()
+            .map(|e| e.resource.version_id().parse().unwrap())
+            .collect();
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            (1..=expected_len).collect::<Vec<_>>(),
+            "history must hold every version exactly once"
+        );
+    }
+
+    /// DoD rows (F5): exclusivity + isolation — two instances race
+    /// unconditional `update`s from the same version-1 snapshot. The CAS lets
+    /// exactly one through; the loser gets `VersionConflict` instead of
+    /// silently losing an update or 500ing on a duplicate history row, and a
+    /// fresh read-then-retry converges on version 3.
+    #[tokio::test]
+    async fn postgres_integration_cluster_resource_update_race_no_lost_version() {
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-f5-upd");
+
+        let created = handles
+            .a
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "V1"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+
+        let (a, b) = (handles.a, handles.b);
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let (snapshot_a, snapshot_b) = (created.clone(), created);
+        let (res_a, res_b) = harness::race2(
+            async move {
+                a.update(
+                    &tenant_a,
+                    &snapshot_a,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                )
+                .await
+            },
+            async move {
+                b.update(
+                    &tenant_b,
+                    &snapshot_b,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+                )
+                .await
+            },
+        )
+        .await;
+
+        let (ok_a, err_a) = match res_a {
+            Ok(r) => (Some(r), None),
+            Err(e) => (None, Some(e)),
+        };
+        let (ok_b, err_b) = match res_b {
+            Ok(r) => (Some(r), None),
+            Err(e) => (None, Some(e)),
+        };
+        harness::assert_exactly_one(&ok_a, &ok_b, "the version-guarded update");
+        let winner = ok_a.or(ok_b).unwrap();
+        assert_eq!(winner.version_id(), "2");
+        let loser = err_a.or(err_b).unwrap();
+        assert!(
+            matches!(
+                loser,
+                StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+            ),
+            "loser must see VersionConflict, got {loser:?}"
+        );
+
+        // A fresh read-then-retry from a third instance converges.
+        let verifier = create_backend().await;
+        let current = verifier
+            .read(&tenant, "Patient", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version_id(), "2");
+        let retried = verifier
+            .update(
+                &tenant,
+                &current,
+                json!({"resourceType": "Patient", "name": [{"family": "Retry"}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.version_id(), "3");
+
+        assert_history_versions(&verifier, &tenant, "Patient", &id, 3).await;
+
+        // Isolation: the resource does not exist for another tenant.
+        harness::assert_wrong_tenant_hidden(
+            verifier
+                .read(&create_tenant("cluster-f5-other"), "Patient", &id)
+                .await
+                .unwrap(),
+            "patient",
+        );
+    }
+
+    /// DoD row (F5): unconditional PUT stays last-writer-wins — two instances
+    /// race `create_or_update` on one existing resource; the bounded CAS
+    /// retry absorbs the losing race so both callers succeed, with distinct
+    /// version_ids and a complete history.
+    #[tokio::test]
+    async fn postgres_integration_cluster_resource_create_or_update_race_both_succeed() {
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-f5-put");
+
+        let created = handles
+            .a
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "V1"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+
+        let (a, b) = (handles.a, handles.b);
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let (id_a, id_b) = (id.clone(), id.clone());
+        let (res_a, res_b) = harness::race2(
+            async move {
+                a.create_or_update(
+                    &tenant_a,
+                    "Patient",
+                    &id_a,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+            async move {
+                b.create_or_update(
+                    &tenant_b,
+                    "Patient",
+                    &id_b,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+        )
+        .await;
+
+        let (stored_a, created_a) = res_a.expect("create_or_update must absorb CAS races");
+        let (stored_b, created_b) = res_b.expect("create_or_update must absorb CAS races");
+        assert!(
+            !created_a && !created_b,
+            "both racers must take the update arm"
+        );
+        assert_ne!(
+            stored_a.version_id(),
+            stored_b.version_id(),
+            "racing writers must never assign the same version"
+        );
+
+        let verifier = create_backend().await;
+        let current = verifier
+            .read(&tenant, "Patient", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version_id(), "3");
+        assert_history_versions(&verifier, &tenant, "Patient", &id, 3).await;
+    }
+
+    /// DoD row (F5): an unconditional `update` racing an unconditional
+    /// `delete` can interleave either way, but the CAS keeps the invariants:
+    /// the delete always lands, no duplicate version_id, no lost history row,
+    /// and the resource ends deleted.
+    #[tokio::test]
+    async fn postgres_integration_cluster_resource_update_delete_race_keeps_history_coherent() {
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-f5-del");
+
+        let created = handles
+            .a
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "V1"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+
+        let (a, b) = (handles.a, handles.b);
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let id_b = id.clone();
+        let (res_update, res_delete) = harness::race2(
+            async move {
+                a.update(
+                    &tenant_a,
+                    &created,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                )
+                .await
+            },
+            async move { b.delete(&tenant_b, "Patient", &id_b).await },
+        )
+        .await;
+
+        // The delete retries CAS losses internally, so it always lands.
+        res_delete.expect("racing delete must succeed");
+
+        // The update either beat the delete (then the delete re-read and
+        // bumped again) or found the row gone.
+        let expected_versions = match res_update {
+            Ok(stored) => {
+                assert_eq!(stored.version_id(), "2");
+                3
+            }
+            Err(err) => {
+                assert!(
+                    matches!(err, StorageError::Resource(ResourceError::NotFound { .. })),
+                    "update racing a delete must see NotFound, got {err:?}"
+                );
+                2
+            }
+        };
+
+        let verifier = create_backend().await;
+        match verifier.read(&tenant, "Patient", &id).await {
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+            other => panic!("resource must end deleted, got {other:?}"),
+        }
+        assert_history_versions(&verifier, &tenant, "Patient", &id, expected_versions).await;
+    }
+
+    // ========================================================================
+    // T2 cluster suite — unified cluster job store (A1 substrate)
+    // ========================================================================
+    //
+    // The `cluster_jobs` table + `ClusterJobStore` back the SoF `$export`
+    // (#169) and reindex (A2) surfaces. Every test takes
+    // `CLUSTER_JOBS_TEST_LOCK`: `claim_next` is deliberately cross-tenant,
+    // so parallel tests sharing the container would claim each other's jobs.
+    //
+    // Nested module: `ClusterJobStore` and `ExportClaimStrategy` both give
+    // `PostgresBackend` a `claim_next`/`heartbeat`/`release`, so the two
+    // traits must never be in scope together or every call is ambiguous.
+    // ========================================================================
+
+    mod cluster_jobs_suite {
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+
+        use serde_json::json;
+
+        use helios_persistence::core::{
+            ClusterJobState, ClusterJobStore, ClusterLeaseError, JobKind, ResourceStorage, WorkerId,
+        };
+
+        use super::{CLUSTER_JOBS_TEST_LOCK, create_backend, create_tenant};
+        use crate::cluster_harness as harness;
+
+        /// The server-facing seam: the store comes off the backend the same
+        /// way `sof_runner()` does.
+        pub(super) fn store_of(backend: &impl ResourceStorage) -> Arc<dyn ClusterJobStore> {
+            backend
+                .cluster_job_store()
+                .expect("postgres backs a cluster job store")
+        }
+
+        /// Claims and finishes every eligible job of `kind` so an exclusivity
+        /// or fencing test starts from an empty queue (same rationale as
+        /// `drain_export_queue`).
+        pub(super) async fn drain_cluster_jobs(store: &dyn ClusterJobStore, kind: JobKind) {
+            let reaper = WorkerId::new(format!("cluster-jobs-drain-{}", uuid::Uuid::new_v4()));
+            while let Some((lease, _payload)) = store
+                .claim_next(kind, &reaper, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+            {
+                store
+                    .complete(&lease, json!({"drained": true}))
+                    .await
+                    .expect("draining a leftover cluster job");
+            }
+        }
+
+        /// DoD rows: visibility + isolation — a job enqueued via instance A is
+        /// observable (status and list) via instance B, and invisible to
+        /// another tenant.
+        #[tokio::test]
+        async fn postgres_integration_cluster_jobs_visible_and_isolated_across_handles() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let tenant = create_tenant("cluster-jobs-vis");
+
+            let job_id = a
+                .enqueue(&tenant, JobKind::SofExport, json!({"probe": "vis"}))
+                .await
+                .unwrap();
+
+            let rec = harness::assert_visible(
+                b.get_status(&tenant, &job_id).await.unwrap(),
+                "cluster job enqueued via instance A",
+            );
+            assert_eq!(rec.state, ClusterJobState::Queued);
+            assert_eq!(rec.payload, json!({"probe": "vis"}));
+            assert!(!rec.cancel_requested);
+
+            let listed = b.list_jobs(&tenant, JobKind::SofExport).await.unwrap();
+            assert_eq!(listed.len(), 1, "list_jobs must see the job via instance B");
+
+            harness::assert_wrong_tenant_hidden(
+                b.get_status(&create_tenant("cluster-jobs-vis-other"), &job_id)
+                    .await
+                    .unwrap(),
+                "cluster job",
+            );
+            assert!(
+                b.list_jobs(&create_tenant("cluster-jobs-vis-other"), JobKind::SofExport)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "tenant isolation violated: cluster job listed under the wrong tenant"
+            );
+        }
+
+        /// DoD row: exclusivity — two instances race `claim_next` on one
+        /// queued job and exactly one wins (`FOR UPDATE SKIP LOCKED`).
+        #[tokio::test]
+        async fn postgres_integration_cluster_jobs_claim_exclusive_across_handles() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let tenant = create_tenant("cluster-jobs-claim");
+
+            drain_cluster_jobs(a.as_ref(), JobKind::SofExport).await;
+
+            let job_id = a
+                .enqueue(&tenant, JobKind::SofExport, json!({"probe": "claim"}))
+                .await
+                .unwrap();
+
+            let worker_a = WorkerId::new(format!("cluster-jobs-a-{}", uuid::Uuid::new_v4()));
+            let worker_b = WorkerId::new(format!("cluster-jobs-b-{}", uuid::Uuid::new_v4()));
+            let (racer_a, racer_b) = (Arc::clone(&a), Arc::clone(&b));
+            let (claim_a, claim_b) = harness::race2(
+                async move {
+                    racer_a
+                        .claim_next(JobKind::SofExport, &worker_a, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+                async move {
+                    racer_b
+                        .claim_next(JobKind::SofExport, &worker_b, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+            )
+            .await;
+
+            harness::assert_exactly_one(&claim_a, &claim_b, "the claim on one queued cluster job");
+            let (lease, payload) = claim_a.or(claim_b).unwrap();
+            assert_eq!(lease.job_id, job_id);
+            assert_eq!(payload, json!({"probe": "claim"}));
+            assert_eq!(
+                lease.tenant.tenant_id().as_str(),
+                tenant.tenant_id().as_str()
+            );
+        }
+
+        /// DoD row: fencing — after a release/reclaim moves the lease to
+        /// another instance, every stale-holder write is refused with
+        /// `LeaseLost` while the current holder is unaffected. Deterministic:
+        /// release, not expiry.
+        #[tokio::test]
+        async fn postgres_integration_cluster_jobs_stale_handle_fenced_after_release() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let tenant = create_tenant("cluster-jobs-fence");
+
+            drain_cluster_jobs(a.as_ref(), JobKind::SofExport).await;
+
+            let job_id = a
+                .enqueue(&tenant, JobKind::SofExport, json!({"probe": "fence"}))
+                .await
+                .unwrap();
+
+            let worker_a = WorkerId::new(format!("cluster-fence-a-{}", uuid::Uuid::new_v4()));
+            let (lease_a, _) = a
+                .claim_next(JobKind::SofExport, &worker_a, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("instance A claims the queued job");
+            assert_eq!(lease_a.job_id, job_id);
+            a.release(lease_a.clone()).await.unwrap();
+
+            let worker_b = WorkerId::new(format!("cluster-fence-b-{}", uuid::Uuid::new_v4()));
+            let (lease_b, _) = b
+                .claim_next(JobKind::SofExport, &worker_b, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("instance B reclaims after release");
+            assert_eq!(lease_b.job_id, job_id);
+            assert!(lease_b.fencing_token > lease_a.fencing_token);
+
+            assert!(matches!(
+                a.heartbeat(&lease_a).await,
+                Err(ClusterLeaseError::LeaseLost { .. })
+            ));
+            assert!(matches!(
+                a.update_progress(&lease_a, json!({"pct": 1})).await,
+                Err(ClusterLeaseError::LeaseLost { .. })
+            ));
+            assert!(matches!(
+                a.complete(&lease_a, json!({})).await,
+                Err(ClusterLeaseError::LeaseLost { .. })
+            ));
+
+            b.heartbeat(&lease_b).await.unwrap();
+            b.complete(&lease_b, json!({"ok": true})).await.unwrap();
+
+            let rec = a.get_status(&tenant, &job_id).await.unwrap().unwrap();
+            assert_eq!(rec.state, ClusterJobState::Completed);
+            assert_eq!(rec.result, Some(json!({"ok": true})));
+        }
+
+        /// DoD row: durability — dropping the enqueueing handle (simulated
+        /// redeploy) must not lose the job; a fresh handle sees and can claim
+        /// it.
+        #[tokio::test]
+        async fn postgres_integration_cluster_jobs_survive_handle_drop() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let tenant = create_tenant("cluster-jobs-durable");
+
+            let first_backend = create_backend().await;
+            let first = store_of(&first_backend);
+            drain_cluster_jobs(first.as_ref(), JobKind::Reindex).await;
+            let job_id = first
+                .enqueue(&tenant, JobKind::Reindex, json!({"probe": "durable"}))
+                .await
+                .unwrap();
+            drop(first);
+            drop(first_backend);
+
+            let replacement_backend = create_backend().await;
+            let replacement = store_of(&replacement_backend);
+            let rec = harness::assert_visible(
+                replacement.get_status(&tenant, &job_id).await.unwrap(),
+                "cluster job after its enqueueing handle was dropped",
+            );
+            assert_eq!(rec.state, ClusterJobState::Queued);
+
+            let (lease, payload) = replacement
+                .claim_next(
+                    JobKind::Reindex,
+                    &WorkerId::new(format!("cluster-durable-{}", uuid::Uuid::new_v4())),
+                    StdDuration::from_secs(60),
+                )
+                .await
+                .unwrap()
+                .expect("a fresh handle claims the surviving job");
+            assert_eq!(lease.job_id, job_id);
+            assert_eq!(payload, json!({"probe": "durable"}));
+        }
+
+        /// Cross-instance cancel: the worker holds the lease on instance A,
+        /// the cancel arrives via instance B — pollers see `cancelled`
+        /// immediately, A's worker observes `cancel_requested`, and its
+        /// terminal writes are refused (a cancelled job cannot be
+        /// resurrected).
+        #[tokio::test]
+        async fn postgres_integration_cluster_jobs_cancel_via_other_handle_reaches_worker() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let tenant = create_tenant("cluster-jobs-cancel");
+
+            drain_cluster_jobs(a.as_ref(), JobKind::SofExport).await;
+
+            let job_id = a
+                .enqueue(&tenant, JobKind::SofExport, json!({"probe": "cancel"}))
+                .await
+                .unwrap();
+            let (lease, _) = a
+                .claim_next(
+                    JobKind::SofExport,
+                    &WorkerId::new(format!("cluster-cancel-{}", uuid::Uuid::new_v4())),
+                    StdDuration::from_secs(60),
+                )
+                .await
+                .unwrap()
+                .expect("instance A claims the queued job");
+            assert!(!a.cancel_requested(&lease).await.unwrap());
+
+            // Cancel arrives on the other instance; wrong tenant is a no-op.
+            assert!(
+                !b.cancel(&create_tenant("cluster-jobs-cancel-other"), &job_id)
+                    .await
+                    .unwrap()
+            );
+            assert!(b.cancel(&tenant, &job_id).await.unwrap());
+
+            let rec = b.get_status(&tenant, &job_id).await.unwrap().unwrap();
+            assert_eq!(rec.state, ClusterJobState::Cancelled);
+
+            assert!(a.cancel_requested(&lease).await.unwrap());
+            assert!(matches!(
+                a.complete(&lease, json!({})).await,
+                Err(ClusterLeaseError::LeaseLost { .. })
+            ));
+        }
+    }
+
+    mod reindex_cluster_suite {
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+
+        use serde_json::json;
+
+        use helios_fhir::FhirVersion;
+        use helios_persistence::backends::postgres::PostgresBackend;
+        use helios_persistence::core::ResourceStorage;
+        use helios_persistence::core::cluster_job_store::{JobKind, WorkerId};
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+        use helios_persistence::tenant::TenantContext;
+
+        use super::cluster_jobs_suite::{drain_cluster_jobs, store_of};
+        use super::{CLUSTER_JOBS_TEST_LOCK, create_backend, create_tenant};
+        use crate::cluster_harness as harness;
+
+        /// One simulated instance: a fresh backend handle and a reindex
+        /// driver wired the way `hfs` wires it in cluster mode (the job
+        /// store off the same backend's `cluster_job_store()` seam).
+        async fn instance() -> (Arc<PostgresBackend>, ReindexOperation) {
+            let backend = Arc::new(create_backend().await);
+            let store = store_of(backend.as_ref());
+            let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone())
+                .with_cluster_store(store);
+            (backend, op)
+        }
+
+        async fn seed_patients(backend: &PostgresBackend, tenant: &TenantContext, n: usize) {
+            for i in 0..n {
+                backend
+                    .create(
+                        tenant,
+                        "Patient",
+                        json!({"resourceType": "Patient", "name": [{"family": format!("Reindex{i}")}]}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .expect("seed patient");
+            }
+        }
+
+        /// DoD rows (A2): visibility + isolation — a reindex started via
+        /// instance A is pollable (status and list) via instance B and
+        /// invisible to another tenant.
+        #[tokio::test]
+        async fn postgres_integration_cluster_reindex_visible_and_isolated_across_handles() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let (_backend_a, op_a) = instance().await;
+            let (_backend_b, op_b) = instance().await;
+            let tenant = create_tenant("cluster-reindex-vis");
+
+            let job_id = op_a
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(vec!["Patient"]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let progress = harness::assert_visible(
+                op_b.get_progress(&tenant, &job_id).await,
+                "reindex job started via instance A",
+            );
+            assert_eq!(progress.status, ReindexStatus::Queued);
+
+            assert_eq!(op_b.list_jobs(&tenant).await.len(), 1);
+
+            harness::assert_wrong_tenant_hidden(
+                op_b.get_progress(&create_tenant("cluster-reindex-vis-other"), &job_id)
+                    .await,
+                "reindex job",
+            );
+            assert!(
+                op_b.list_jobs(&create_tenant("cluster-reindex-vis-other"))
+                    .await
+                    .is_empty(),
+                "tenant isolation violated: reindex job listed under the wrong tenant"
+            );
+        }
+
+        /// Cross-instance execution: started via A, claimed and run to
+        /// completion by B's worker (one deterministic cycle), completion
+        /// visible from A with real progress counters.
+        #[tokio::test]
+        async fn postgres_integration_cluster_reindex_runs_on_other_instance() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let (backend_a, op_a) = instance().await;
+            let (_backend_b, op_b) = instance().await;
+            let tenant = create_tenant("cluster-reindex-run");
+
+            drain_cluster_jobs(store_of(backend_a.as_ref()).as_ref(), JobKind::Reindex).await;
+            seed_patients(&backend_a, &tenant, 2).await;
+
+            let job_id = op_a
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(vec!["Patient"]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let ran = op_b
+                .run_next_cluster_job(
+                    &WorkerId::new(format!("reindex-t2-{}", uuid::Uuid::new_v4())),
+                    StdDuration::from_secs(60),
+                )
+                .await
+                .expect("worker cycle");
+            assert!(ran, "B's worker must claim the queued reindex job");
+
+            let progress = op_a
+                .get_progress(&tenant, &job_id)
+                .await
+                .expect("job visible via A after completion");
+            assert_eq!(
+                progress.status,
+                ReindexStatus::Completed,
+                "got {progress:?}"
+            );
+            assert_eq!(progress.processed_resources, 2);
+            assert!(progress.entries_created > 0);
+        }
+
+        /// Cross-instance cancel: started via A, cancelled via B before any
+        /// worker runs — pollers see `Cancelled` everywhere and the job is
+        /// no longer claimable.
+        #[tokio::test]
+        async fn postgres_integration_cluster_reindex_cancel_via_other_instance() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let (backend_a, op_a) = instance().await;
+            let (_backend_b, op_b) = instance().await;
+            let tenant = create_tenant("cluster-reindex-cancel");
+
+            drain_cluster_jobs(store_of(backend_a.as_ref()).as_ref(), JobKind::Reindex).await;
+
+            let job_id = op_a
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(vec!["Patient"]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Wrong tenant cannot cancel (indistinguishable from missing).
+            assert!(
+                op_b.cancel(&create_tenant("cluster-reindex-cancel-other"), &job_id)
+                    .await
+                    .is_err()
+            );
+            op_b.cancel(&tenant, &job_id).await.unwrap();
+
+            let progress = op_a
+                .get_progress(&tenant, &job_id)
+                .await
+                .expect("cancelled job still pollable");
+            assert_eq!(progress.status, ReindexStatus::Cancelled);
+
+            let ran = op_a
+                .run_next_cluster_job(
+                    &WorkerId::new(format!("reindex-t2-{}", uuid::Uuid::new_v4())),
+                    StdDuration::from_secs(60),
+                )
+                .await
+                .expect("worker cycle");
+            assert!(!ran, "a cancelled reindex job must not be claimable");
+        }
+
+        /// DoD row (A2): durability — the job survives its starting handle.
+        #[tokio::test]
+        async fn postgres_integration_cluster_reindex_survives_handle_drop() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let tenant = create_tenant("cluster-reindex-durable");
+
+            let (backend_a, op_a) = instance().await;
+            drain_cluster_jobs(store_of(backend_a.as_ref()).as_ref(), JobKind::Reindex).await;
+            let job_id = op_a
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(vec!["Patient"]),
+                    None,
+                )
+                .await
+                .unwrap();
+            drop(op_a);
+            drop(backend_a);
+
+            let (_backend, op) = instance().await;
+            let progress = harness::assert_visible(
+                op.get_progress(&tenant, &job_id).await,
+                "reindex job after its starting handle was dropped",
+            );
+            assert_eq!(progress.status, ReindexStatus::Queued);
+        }
+    }
+
+    // ========================================================================
+    // T2 cluster suite — coordinated refresh store (C2 substrate)
+    // ========================================================================
+    //
+    // The `cluster_refresh_cache` table + `ClusterRefreshCache` back the
+    // cross-instance single-flight JWKS refresh. The store is deliberately
+    // server-global — documents are public upstream material (IdP JWKS keys)
+    // shared by every tenant — so the mandatory wrong-tenant DoD row is N/A
+    // here (methodology §6); there is no tenant dimension to isolate.
+    //
+    // No `CLUSTER_JOBS_TEST_LOCK` needed: unlike the cross-tenant
+    // `claim_next` queue, refresh keys are per-test UUIDs, so parallel tests
+    // cannot interfere.
+    // ========================================================================
+
+    mod cluster_refresh_cache_suite {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration as StdDuration;
+
+        use helios_persistence::core::ResourceStorage;
+        use helios_persistence::core::cluster_refresh_cache::{
+            ClusterRefreshCache, FetchFn, FetchedDocument, RefreshCacheError,
+        };
+
+        use super::create_backend;
+        use crate::cluster_harness as harness;
+
+        const HOUR: StdDuration = StdDuration::from_secs(3600);
+
+        /// The server-facing seam: the store comes off the backend the same
+        /// way `cluster_job_store()` does.
+        fn store_of(backend: &impl ResourceStorage) -> Arc<dyn ClusterRefreshCache> {
+            backend
+                .cluster_refresh_cache()
+                .expect("postgres backs a cluster refresh cache")
+        }
+
+        fn test_key(label: &str) -> String {
+            format!("https://idp.example/{label}/{}/jwks", uuid::Uuid::new_v4())
+        }
+
+        /// A fetch closure returning `body` and counting invocations across
+        /// instances via a shared counter.
+        fn counting_fetch(body: &str, hits: &Arc<AtomicUsize>) -> FetchFn {
+            let body = body.to_string();
+            let hits = Arc::clone(hits);
+            Box::new(move || {
+                Box::pin(async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Ok(FetchedDocument {
+                        body,
+                        max_age_secs: Some(600),
+                    })
+                })
+            })
+        }
+
+        /// DoD row: exclusivity (single flight) — two instances racing a
+        /// refresh of the same key run exactly one upstream fetch between
+        /// them, and both end up holding the same document.
+        #[tokio::test]
+        async fn postgres_integration_cluster_refresh_single_flight_across_handles() {
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let key = test_key("single-flight");
+            let hits = Arc::new(AtomicUsize::new(0));
+
+            let (key_a, key_b) = (key.clone(), key.clone());
+            let (fetch_a, fetch_b) = (
+                counting_fetch("doc-from-a", &hits),
+                counting_fetch("doc-from-b", &hits),
+            );
+            let (res_a, res_b) = harness::race2(
+                async move { a.refresh_with(&key_a, None, HOUR, fetch_a).await },
+                async move { b.refresh_with(&key_b, None, HOUR, fetch_b).await },
+            )
+            .await;
+
+            let doc_a = res_a.expect("instance A refresh succeeds");
+            let doc_b = res_b.expect("instance B refresh succeeds");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "exactly one upstream fetch across both instances"
+            );
+            assert_eq!(
+                doc_a.body, doc_b.body,
+                "both instances hold the winner's document"
+            );
+            assert_eq!(doc_a.fetched_at, doc_b.fetched_at);
+        }
+
+        /// DoD rows: visibility + durability — a document stored via
+        /// instance A is reused (no fetch) by a freshly constructed instance
+        /// that shares nothing but the database.
+        #[tokio::test]
+        async fn postgres_integration_cluster_refresh_durable_across_handles() {
+            let handles = harness::two_handles(create_backend).await;
+            let key = test_key("durability");
+            let hits = Arc::new(AtomicUsize::new(0));
+
+            let stored = store_of(&handles.a)
+                .refresh_with(&key, None, HOUR, counting_fetch("doc-v1", &hits))
+                .await
+                .unwrap();
+            drop(handles);
+
+            let fresh = create_backend().await;
+            let reused = store_of(&fresh)
+                .refresh_with(&key, None, HOUR, counting_fetch("doc-v2", &hits))
+                .await
+                .unwrap();
+            assert_eq!(reused.body, "doc-v1");
+            assert_eq!(reused.fetched_at, stored.fetched_at);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "the fresh instance reused, not fetched"
+            );
+        }
+
+        /// Watermark row: an instance that already holds the stored document
+        /// (watermark == fetched_at) forces a genuine refetch; an instance
+        /// still on the older watermark then reuses the newer document.
+        #[tokio::test]
+        async fn postgres_integration_cluster_refresh_watermark_forces_refetch() {
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let key = test_key("watermark");
+            let hits = Arc::new(AtomicUsize::new(0));
+
+            let first = a
+                .refresh_with(&key, None, HOUR, counting_fetch("doc-v1", &hits))
+                .await
+                .unwrap();
+
+            // B holds v1 too (same watermark) and asks for something newer.
+            let second = b
+                .refresh_with(
+                    &key,
+                    Some(first.fetched_at),
+                    HOUR,
+                    counting_fetch("doc-v2", &hits),
+                )
+                .await
+                .unwrap();
+            assert_eq!(second.body, "doc-v2");
+            assert!(second.fetched_at > first.fetched_at);
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+            // A, still on the v1 watermark, sees v2 as newer and reuses it.
+            let third = a
+                .refresh_with(
+                    &key,
+                    Some(first.fetched_at),
+                    HOUR,
+                    counting_fetch("doc-v3", &hits),
+                )
+                .await
+                .unwrap();
+            assert_eq!(third.body, "doc-v2");
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "reuse must not fetch");
+        }
+
+        /// Abort row: a fetch failure on instance A surfaces as `Fetch`,
+        /// stores nothing, and releases the advisory lock — instance B's
+        /// immediately following refresh fetches successfully.
+        #[tokio::test]
+        async fn postgres_integration_cluster_refresh_fetch_error_releases_lock() {
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let key = test_key("abort");
+            let hits = Arc::new(AtomicUsize::new(0));
+
+            let failing: FetchFn =
+                Box::new(|| Box::pin(async { Err("idp unreachable".to_string()) }));
+            let err = a.refresh_with(&key, None, HOUR, failing).await.unwrap_err();
+            assert!(
+                matches!(err, RefreshCacheError::Fetch(ref m) if m == "idp unreachable"),
+                "fetch failure surfaces as RefreshCacheError::Fetch"
+            );
+
+            // The key is not poisoned and the lock is free: B fetches.
+            let doc = b
+                .refresh_with(&key, None, HOUR, counting_fetch("doc-after-error", &hits))
+                .await
+                .unwrap();
+            assert_eq!(doc.body, "doc-after-error");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    // ========================================================================
+    // T2 cluster suite — subscriptions substrate (Phase 3, strategy §8;
+    // B2 tokens / B4 counters / B5 outbox / B1 fan-out / B3 hydration).
+    //
+    // Every test drives two freshly constructed handles that share only the
+    // database (methodology §6). State/token/hydration tests need no lock —
+    // per-test unique tenants keep their rows disjoint; the outbox suite
+    // takes SUBSCRIPTION_OUTBOX_TEST_LOCK because `claim_next` is
+    // deliberately cross-tenant.
+    // ========================================================================
+    mod subscription_cluster_suite {
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+
+        use serde_json::json;
+        use tokio::sync::Mutex;
+        use tokio::time::timeout;
+
+        use helios_fhir::FhirVersion;
+        use helios_persistence::backends::postgres::PostgresBackend;
+        use helios_persistence::core::ResourceStorage;
+        use helios_persistence::core::event_fanout::{FanoutEnvelope, FanoutKind, LifecycleOp};
+        use helios_persistence::core::subscription_delivery::{
+            DeliveryLeaseError, DeliveryState, NewDelivery, SubscriptionDeliveryOutbox, WorkerId,
+        };
+        use helios_persistence::core::subscription_state::SubscriptionStateStore;
+        use helios_persistence::core::ws_binding_tokens::WsBindingTokenStore;
+
+        use super::{create_backend, create_tenant};
+        use crate::cluster_harness as harness;
+
+        static SUBSCRIPTION_OUTBOX_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+        /// How long an event-driven await may take before the test fails —
+        /// generous for a loaded CI Docker host, never slept in full.
+        const RECV_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+        fn state_of(backend: &PostgresBackend) -> Arc<dyn SubscriptionStateStore> {
+            backend
+                .subscription_state_store()
+                .expect("postgres backs a subscription state store")
+        }
+
+        fn tokens_of(backend: &PostgresBackend) -> Arc<dyn WsBindingTokenStore> {
+            backend
+                .ws_binding_token_store()
+                .expect("postgres backs a ws binding token store")
+        }
+
+        fn outbox_of(backend: &PostgresBackend) -> Arc<dyn SubscriptionDeliveryOutbox> {
+            backend
+                .subscription_delivery_outbox()
+                .expect("postgres backs a delivery outbox")
+        }
+
+        fn delivery(sub: &str) -> NewDelivery {
+            NewDelivery {
+                subscription_id: sub.to_string(),
+                event_number: Some(1),
+                notification_type: "event-notification".to_string(),
+                bundle: json!({"resourceType": "Bundle", "type": "subscription-notification"}),
+            }
+        }
+
+        /// DoD row (B4): exclusivity/atomicity — two instances racing the
+        /// event-number increment observe distinct consecutive values, so
+        /// `eventNumber` stays monotonic and gap-free cluster-wide.
+        #[tokio::test]
+        async fn postgres_integration_cluster_subscription_state_increment_race_gap_free() {
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("sub-state-race");
+            let (a, b) = (state_of(&handles.a), state_of(&handles.b));
+
+            let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+            let (got_a, got_b) = harness::race2(
+                async move { a.next_event_number(&tenant_a, "sub-1").await.unwrap() },
+                async move { b.next_event_number(&tenant_b, "sub-1").await.unwrap() },
+            )
+            .await;
+
+            let mut numbers = [got_a, got_b];
+            numbers.sort_unstable();
+            assert_eq!(
+                numbers,
+                [1, 2],
+                "racing increments must observe distinct consecutive values"
+            );
+        }
+
+        /// DoD rows (B4): visibility + isolation — failures scattered across
+        /// instances accumulate in one row; a status flip via A is observed
+        /// via B; another tenant sees nothing.
+        #[tokio::test]
+        async fn postgres_integration_cluster_subscription_state_shared_and_isolated() {
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("sub-state-vis");
+            let (a, b) = (state_of(&handles.a), state_of(&handles.b));
+
+            // Failures scattered across instances still accumulate (the
+            // "dead endpoint never reaches the off threshold" disease).
+            assert_eq!(a.record_failure(&tenant, "sub-1").await.unwrap(), 1);
+            assert_eq!(b.record_failure(&tenant, "sub-1").await.unwrap(), 2);
+            assert_eq!(a.record_failure(&tenant, "sub-1").await.unwrap(), 3);
+
+            a.set_status(&tenant, "sub-1", "error").await.unwrap();
+            let seen_via_b = harness::assert_visible(
+                b.get(&tenant, "sub-1").await.unwrap(),
+                "state row written via instance A",
+            );
+            assert_eq!(seen_via_b.consecutive_failures, 3);
+            assert_eq!(seen_via_b.status.as_deref(), Some("error"));
+
+            // A success via B resets the shared counter for both.
+            b.reset_failures(&tenant, "sub-1").await.unwrap();
+            assert_eq!(
+                a.get(&tenant, "sub-1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .consecutive_failures,
+                0
+            );
+
+            let other_tenant = create_tenant("sub-state-other");
+            harness::assert_wrong_tenant_hidden(
+                b.get(&other_tenant, "sub-1").await.unwrap(),
+                "subscription state row",
+            );
+        }
+
+        /// DoD row (B4): durability — counters survive the writing handle.
+        #[tokio::test]
+        async fn postgres_integration_cluster_subscription_state_survives_handle_drop() {
+            let tenant = create_tenant("sub-state-durable");
+            {
+                let writer = create_backend().await;
+                let state = state_of(&writer);
+                assert_eq!(state.next_event_number(&tenant, "sub-1").await.unwrap(), 1);
+                assert_eq!(state.next_event_number(&tenant, "sub-1").await.unwrap(), 2);
+            } // writer dropped
+
+            let fresh = create_backend().await;
+            let state = state_of(&fresh);
+            assert_eq!(
+                state.next_event_number(&tenant, "sub-1").await.unwrap(),
+                3,
+                "a fresh instance continues the sequence, no reset"
+            );
+        }
+
+        /// DoD rows (B1 substrate): a websocket notification bundle stored
+        /// via instance A is loadable via instance B by its fan-out key, and
+        /// invisible to another tenant.
+        #[tokio::test]
+        async fn postgres_integration_cluster_notification_events_roundtrip_across_handles() {
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("sub-events");
+            let (a, b) = (state_of(&handles.a), state_of(&handles.b));
+
+            let bundle = json!({
+                "resourceType": "Bundle",
+                "type": "subscription-notification",
+                "entry": [{"request": {"url": "Encounter/enc-1"}}]
+            });
+            a.put_notification_event(&tenant, "sub-1", 42, &bundle)
+                .await
+                .unwrap();
+
+            let loaded = harness::assert_visible(
+                b.get_notification_event(&tenant, "sub-1", 42)
+                    .await
+                    .unwrap(),
+                "notification bundle stored via instance A",
+            );
+            assert_eq!(loaded, bundle);
+
+            let other_tenant = create_tenant("sub-events-other");
+            harness::assert_wrong_tenant_hidden(
+                b.get_notification_event(&other_tenant, "sub-1", 42)
+                    .await
+                    .unwrap(),
+                "notification bundle",
+            );
+
+            // Subscription delete via B removes the stored bundles too.
+            b.delete(&tenant, "sub-1").await.unwrap();
+            assert!(
+                a.get_notification_event(&tenant, "sub-1", 42)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        /// DoD row (B2): exclusivity — mint on A, redeem exactly once on B;
+        /// the second redeem (any instance) fails. A zero-TTL token is
+        /// expired on arrival (DB clock — no sleeps).
+        #[tokio::test]
+        async fn postgres_integration_cluster_ws_token_mint_on_a_redeem_once_on_b() {
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("ws-token");
+            let (a, b) = (tokens_of(&handles.a), tokens_of(&handles.b));
+
+            let (token, expires_at) = a
+                .mint(&tenant, "sub-1", StdDuration::from_secs(30))
+                .await
+                .unwrap();
+            assert!(expires_at > chrono::Utc::now());
+
+            let redeemed = b.redeem(&token).await.unwrap();
+            assert_eq!(
+                redeemed,
+                Some((tenant.tenant_id().as_str().to_string(), "sub-1".to_string())),
+                "a token minted via A must redeem via B"
+            );
+            assert!(
+                a.redeem(&token).await.unwrap().is_none(),
+                "second redeem must fail on every instance"
+            );
+
+            // Expired-on-arrival: zero TTL, judged on the database clock.
+            let (expired, _) = a.mint(&tenant, "sub-1", StdDuration::ZERO).await.unwrap();
+            assert!(
+                b.redeem(&expired).await.unwrap().is_none(),
+                "an expired token must not redeem"
+            );
+        }
+
+        /// DoD row (B5): exclusivity — two instances race `claim_next` on
+        /// one queued delivery and exactly one wins.
+        #[tokio::test]
+        async fn postgres_integration_cluster_outbox_claim_exclusive_across_handles() {
+            let _guard = SUBSCRIPTION_OUTBOX_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("outbox-claim");
+
+            outbox_of(&handles.a)
+                .enqueue(&tenant, delivery("sub-1"))
+                .await
+                .unwrap();
+
+            let worker_a = WorkerId::new(format!("outbox-a-{}", uuid::Uuid::new_v4()));
+            let worker_b = WorkerId::new(format!("outbox-b-{}", uuid::Uuid::new_v4()));
+            let (a, b) = (outbox_of(&handles.a), outbox_of(&handles.b));
+            let (claim_a, claim_b) = harness::race2(
+                async move {
+                    a.claim_next(&worker_a, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+                async move {
+                    b.claim_next(&worker_b, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+            )
+            .await;
+
+            harness::assert_exactly_one(&claim_a, &claim_b, "the claim on one queued delivery");
+            let winner = claim_a.or(claim_b).unwrap();
+            assert_eq!(winner.subscription_id, "sub-1");
+            assert_eq!(winner.attempts, 1, "the claim is the first attempt");
+            assert_eq!(
+                winner.lease.tenant.tenant_id().as_str(),
+                tenant.tenant_id().as_str(),
+                "the lease carries the enqueueing tenant"
+            );
+
+            // Leave nothing claimable for the next test.
+            outbox_of(&handles.b).complete(&winner.lease).await.unwrap();
+        }
+
+        /// DoD rows (B5): durability + fencing — a delivery claimed by a
+        /// worker whose lease expires (and whose handle is dropped) is
+        /// reclaimed by a fresh instance under a bumped fencing token; the
+        /// zombie's terminal write is refused. Deterministic: the "expiry"
+        /// is a zero-length lease, no sleeps.
+        #[tokio::test]
+        async fn postgres_integration_cluster_outbox_reclaimed_after_worker_death() {
+            let _guard = SUBSCRIPTION_OUTBOX_TEST_LOCK.lock().await;
+            let tenant = create_tenant("outbox-durable");
+
+            let stale = {
+                let dying = create_backend().await;
+                let outbox = outbox_of(&dying);
+                outbox.enqueue(&tenant, delivery("sub-1")).await.unwrap();
+                let worker = WorkerId::new(format!("outbox-dying-{}", uuid::Uuid::new_v4()));
+                outbox
+                    .claim_next(&worker, StdDuration::ZERO)
+                    .await
+                    .unwrap()
+                    .expect("the enqueued delivery is claimable")
+            }; // the claiming handle is dropped mid-delivery
+
+            let fresh = create_backend().await;
+            let outbox = outbox_of(&fresh);
+            let worker = WorkerId::new(format!("outbox-fresh-{}", uuid::Uuid::new_v4()));
+            let reclaimed = outbox
+                .claim_next(&worker, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("the expired-lease delivery must be reclaimable");
+            assert_eq!(reclaimed.lease.id, stale.lease.id);
+            assert_eq!(reclaimed.attempts, 2, "the reclaim is a new attempt");
+            assert!(reclaimed.lease.fencing_token > stale.lease.fencing_token);
+
+            // The dead worker's lease is fenced out of every terminal write.
+            assert!(matches!(
+                outbox.complete(&stale.lease).await,
+                Err(DeliveryLeaseError::LeaseLost { .. })
+            ));
+            assert!(matches!(
+                outbox.fail(&stale.lease, "zombie").await,
+                Err(DeliveryLeaseError::LeaseLost { .. })
+            ));
+
+            outbox.complete(&reclaimed.lease).await.unwrap();
+            let record = outbox
+                .get(&tenant, reclaimed.lease.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, DeliveryState::Delivered);
+        }
+
+        /// DoD rows (B5): retry scheduling + isolation — a retryable failure
+        /// re-queues with a future due time (not claimable until then, on
+        /// the DB's schedule column), and another tenant cannot read the
+        /// row.
+        #[tokio::test]
+        async fn postgres_integration_cluster_outbox_retry_schedule_and_isolation() {
+            let _guard = SUBSCRIPTION_OUTBOX_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("outbox-retry");
+            let (a, b) = (outbox_of(&handles.a), outbox_of(&handles.b));
+
+            let id = a.enqueue(&tenant, delivery("sub-1")).await.unwrap();
+            let worker = WorkerId::new(format!("outbox-retry-{}", uuid::Uuid::new_v4()));
+            let claimed = a
+                .claim_next(&worker, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(3600);
+            a.release_for_retry(&claimed.lease, next_attempt, "503 from endpoint")
+                .await
+                .unwrap();
+
+            // Visible via B with the recorded error and schedule...
+            let record = harness::assert_visible(
+                b.get(&tenant, id).await.unwrap(),
+                "outbox row released via instance A",
+            );
+            assert_eq!(record.state, DeliveryState::Queued);
+            assert_eq!(record.attempts, 1);
+            assert_eq!(record.last_error.as_deref(), Some("503 from endpoint"));
+
+            // ...but not claimable before its due time.
+            let early_worker = WorkerId::new(format!("outbox-early-{}", uuid::Uuid::new_v4()));
+            assert!(
+                b.claim_next(&early_worker, StdDuration::from_secs(60))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a future next_attempt_at must not be claimable"
+            );
+
+            let other_tenant = create_tenant("outbox-retry-other");
+            harness::assert_wrong_tenant_hidden(
+                b.get(&other_tenant, id).await.unwrap(),
+                "outbox row",
+            );
+            // The row stays queued an hour out — invisible to every other
+            // outbox test in this binary's lifetime, no drain needed.
+        }
+
+        /// DoD row (B1): an envelope published via instance A's fan-out
+        /// reaches instance B's subscriber over LISTEN/NOTIFY — two fully
+        /// independent fan-outs sharing only the database. Event-driven
+        /// await under a timeout, no sleeps.
+        #[tokio::test]
+        async fn postgres_integration_cluster_fanout_publish_reaches_other_handle() {
+            let handles = harness::two_handles(create_backend).await;
+            let fanout_a = handles
+                .a
+                .subscription_fanout()
+                .expect("postgres backs a fan-out");
+            let fanout_b = handles
+                .b
+                .subscription_fanout()
+                .expect("postgres backs a fan-out");
+
+            let mut envelopes_b = fanout_b.subscribe();
+            let mut wakes_b = fanout_b.subscribe_outbox_wake();
+            // B must be LISTENing before A publishes, or the NOTIFY is
+            // (correctly, by contract) lost.
+            timeout(RECV_TIMEOUT, fanout_b.ready())
+                .await
+                .expect("instance B's LISTEN session must establish");
+
+            let envelope = FanoutEnvelope::new(FanoutKind::Lifecycle {
+                tenant: "tenant-fanout".into(),
+                rtype: "Subscription".into(),
+                rid: "sub-1".into(),
+                op: LifecycleOp::Upsert,
+            });
+            fanout_a.publish(&envelope).await.unwrap();
+            let received = timeout(RECV_TIMEOUT, envelopes_b.recv())
+                .await
+                .expect("envelope must arrive on instance B")
+                .unwrap();
+            assert_eq!(received, envelope);
+
+            fanout_a.publish_outbox_wake().await.unwrap();
+            timeout(RECV_TIMEOUT, wakes_b.recv())
+                .await
+                .expect("wake hint must arrive on instance B")
+                .unwrap();
+        }
+
+        /// DoD rows (B3): hydration enumerates current subscription/topic
+        /// resources across ALL tenants — including tenants never touched by
+        /// the tenant registry — pre-filters `Basic` to backport topics, and
+        /// tenant-checks the single-resource read.
+        #[tokio::test]
+        async fn postgres_integration_cluster_hydration_lists_across_tenants() {
+            let handles = harness::two_handles(create_backend).await;
+            let tenant_a = create_tenant("hydrate-a");
+            let tenant_b = create_tenant("hydrate-b");
+
+            handles
+                .a
+                .create(
+                    &tenant_a,
+                    "SubscriptionTopic",
+                    json!({
+                        "resourceType": "SubscriptionTopic",
+                        "id": "topic-1",
+                        "url": "http://example.org/topics/encounter",
+                        "status": "active"
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            handles
+                .a
+                .create(
+                    &tenant_b,
+                    "Subscription",
+                    json!({
+                        "resourceType": "Subscription",
+                        "id": "sub-1",
+                        "status": "requested"
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            // A backport topic Basic (must be listed)...
+            handles
+                .a
+                .create(
+                    &tenant_a,
+                    "Basic",
+                    json!({
+                        "resourceType": "Basic",
+                        "id": "basic-topic",
+                        "code": {"coding": [{
+                            "system": "http://hl7.org/fhir/fhir-types",
+                            "code": "SubscriptionTopic"
+                        }]}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            // ...and an unrelated Basic (must be pre-filtered out in SQL).
+            handles
+                .a
+                .create(
+                    &tenant_a,
+                    "Basic",
+                    json!({
+                        "resourceType": "Basic",
+                        "id": "basic-unrelated",
+                        "code": {"coding": [{
+                            "system": "http://example.org/other",
+                            "code": "SomethingElse"
+                        }]}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            // Enumerate via the OTHER instance (shared-DB visibility).
+            let source = handles
+                .b
+                .subscription_hydration_source()
+                .expect("postgres backs a hydration source");
+            let listed = source
+                .list_current(&["Subscription", "SubscriptionTopic", "Basic"])
+                .await
+                .unwrap();
+
+            let ours: Vec<_> = listed
+                .iter()
+                .filter(|r| {
+                    r.tenant_id == tenant_a.tenant_id().as_str()
+                        || r.tenant_id == tenant_b.tenant_id().as_str()
+                })
+                .collect();
+            assert_eq!(
+                ours.len(),
+                3,
+                "topic + subscription + backport Basic; unrelated Basic filtered in SQL"
+            );
+            assert!(
+                ours.iter().any(|r| r.resource_type == "Subscription"
+                    && r.tenant_id == tenant_b.tenant_id().as_str()),
+                "hydration must cross tenants (registry-independent)"
+            );
+            assert!(
+                !ours.iter().any(|r| r.resource_id == "basic-unrelated"),
+                "a non-topic Basic must not be hauled into memory"
+            );
+            for resource in &ours {
+                assert!(
+                    !resource.fhir_version.is_empty(),
+                    "hydrated rows carry their FHIR version for parser selection"
+                );
+            }
+
+            // Tenant-checked single read (the lifecycle re-read path).
+            let read = harness::assert_visible(
+                source
+                    .get_current(&tenant_a, "SubscriptionTopic", "topic-1")
+                    .await
+                    .unwrap(),
+                "topic resource read back for its owner",
+            );
+            assert_eq!(read.content["url"], "http://example.org/topics/encounter");
+            harness::assert_wrong_tenant_hidden(
+                source
+                    .get_current(&tenant_b, "SubscriptionTopic", "topic-1")
+                    .await
+                    .unwrap(),
+                "another tenant's topic resource",
+            );
+        }
+    }
+
+    // ========================================================================
+    // Phase 4 (E1): durable composite secondary-backend sync outbox T2 suite.
+    //
+    // Same two-fresh-handles-over-one-shared-store contract as the other
+    // cluster suites. `claim_next` is cross-tenant, so the exclusivity/
+    // fencing/retry tests take COMPOSITE_SYNC_OUTBOX_TEST_LOCK.
+    // ========================================================================
+    mod composite_sync_cluster_suite {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+
+        use helios_fhir::FhirVersion;
+        use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+        use helios_persistence::composite::{CompositeConfig, CompositeStorage, SyncMode};
+        use helios_persistence::core::composite_sync_outbox::{
+            CompositeSyncOutbox, NewSyncOutboxEntry, SyncLeaseError, SyncOperation,
+            SyncOutboxState, WorkerId,
+        };
+        use helios_persistence::core::{BackendKind, ResourceStorage};
+        use serde_json::json;
+        use tokio::sync::Mutex;
+
+        use super::{create_backend, create_tenant, shared_pg};
+        use crate::cluster_harness as harness;
+
+        static COMPOSITE_SYNC_OUTBOX_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+        fn outbox_of(backend: &PostgresBackend) -> Arc<dyn CompositeSyncOutbox> {
+            backend
+                .composite_sync_outbox()
+                .expect("postgres backs a composite sync outbox")
+        }
+
+        fn entry(backend_id: &str, resource_id: &str) -> NewSyncOutboxEntry {
+            NewSyncOutboxEntry {
+                backend_id: backend_id.to_string(),
+                operation: SyncOperation::Create,
+                resource_type: "Patient".to_string(),
+                resource_id: resource_id.to_string(),
+                content: Some(json!({"resourceType": "Patient", "id": resource_id})),
+                version: None,
+                tenant_id: "t1".to_string(),
+                fhir_version: Some("R4".to_string()),
+            }
+        }
+
+        /// DoD row: exclusivity — two instances race `claim_next` on one
+        /// queued entry and exactly one wins.
+        #[tokio::test]
+        async fn postgres_integration_cluster_composite_sync_claim_exclusive_across_handles() {
+            let _guard = COMPOSITE_SYNC_OUTBOX_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("composite-sync-claim");
+
+            outbox_of(&handles.a)
+                .enqueue(&tenant, entry("es", "p1"))
+                .await
+                .unwrap();
+
+            let worker_a = WorkerId::new(format!("csync-a-{}", uuid::Uuid::new_v4()));
+            let worker_b = WorkerId::new(format!("csync-b-{}", uuid::Uuid::new_v4()));
+            let (a, b) = (outbox_of(&handles.a), outbox_of(&handles.b));
+            let (claim_a, claim_b) = harness::race2(
+                async move {
+                    a.claim_next(&worker_a, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+                async move {
+                    b.claim_next(&worker_b, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+            )
+            .await;
+
+            harness::assert_exactly_one(&claim_a, &claim_b, "the claim on one queued entry");
+            let winner = claim_a.or(claim_b).unwrap();
+            assert_eq!(winner.backend_id, "es");
+            assert_eq!(winner.resource_id, "p1");
+            assert_eq!(winner.attempts, 1, "the claim is the first attempt");
+            assert_eq!(
+                winner.lease.tenant.tenant_id().as_str(),
+                tenant.tenant_id().as_str(),
+                "the lease carries the enqueueing tenant"
+            );
+
+            // Leave nothing claimable for the next test.
+            outbox_of(&handles.b).complete(&winner.lease).await.unwrap();
+        }
+
+        /// DoD rows: durability + fencing — an entry claimed by a worker
+        /// whose lease expires (and whose handle is dropped) is reclaimed by
+        /// a fresh instance under a bumped fencing token; the zombie's
+        /// terminal write is refused. Deterministic: the "expiry" is a
+        /// zero-length lease, no sleeps.
+        #[tokio::test]
+        async fn postgres_integration_cluster_composite_sync_reclaimed_after_worker_death() {
+            let _guard = COMPOSITE_SYNC_OUTBOX_TEST_LOCK.lock().await;
+            let tenant = create_tenant("composite-sync-durable");
+
+            let stale = {
+                let dying = create_backend().await;
+                let outbox = outbox_of(&dying);
+                outbox.enqueue(&tenant, entry("es", "p1")).await.unwrap();
+                let worker = WorkerId::new(format!("csync-dying-{}", uuid::Uuid::new_v4()));
+                outbox
+                    .claim_next(&worker, StdDuration::ZERO)
+                    .await
+                    .unwrap()
+                    .expect("the enqueued entry is claimable")
+            }; // the claiming handle is dropped mid-apply
+
+            let fresh = create_backend().await;
+            let outbox = outbox_of(&fresh);
+            let worker = WorkerId::new(format!("csync-fresh-{}", uuid::Uuid::new_v4()));
+            let reclaimed = outbox
+                .claim_next(&worker, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("the expired-lease entry must be reclaimable");
+            assert_eq!(reclaimed.lease.id, stale.lease.id);
+            assert_eq!(reclaimed.attempts, 2, "the reclaim is a new attempt");
+            assert!(reclaimed.lease.fencing_token > stale.lease.fencing_token);
+
+            // The dead worker's lease is fenced out of every terminal write.
+            assert!(matches!(
+                outbox.complete(&stale.lease).await,
+                Err(SyncLeaseError::LeaseLost { .. })
+            ));
+            assert!(matches!(
+                outbox.fail(&stale.lease, "zombie").await,
+                Err(SyncLeaseError::LeaseLost { .. })
+            ));
+
+            outbox.complete(&reclaimed.lease).await.unwrap();
+            let record = outbox
+                .get(&tenant, reclaimed.lease.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, SyncOutboxState::Applied);
+        }
+
+        /// DoD rows: retry scheduling + isolation — a retryable failure
+        /// re-queues with a future due time (on the DB's schedule column,
+        /// not claimable until then), and another tenant cannot read the
+        /// row.
+        #[tokio::test]
+        async fn postgres_integration_cluster_composite_sync_retry_schedule_and_isolation() {
+            let _guard = COMPOSITE_SYNC_OUTBOX_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("composite-sync-retry");
+            let (a, b) = (outbox_of(&handles.a), outbox_of(&handles.b));
+
+            let id = a.enqueue(&tenant, entry("es", "p1")).await.unwrap();
+            let worker = WorkerId::new(format!("csync-retry-{}", uuid::Uuid::new_v4()));
+            let claimed = a
+                .claim_next(&worker, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(3600);
+            a.release_for_retry(&claimed.lease, next_attempt, "connection refused")
+                .await
+                .unwrap();
+
+            let record = harness::assert_visible(
+                b.get(&tenant, id).await.unwrap(),
+                "outbox row released via instance A",
+            );
+            assert_eq!(record.state, SyncOutboxState::Queued);
+            assert_eq!(record.attempts, 1);
+            assert_eq!(record.last_error.as_deref(), Some("connection refused"));
+
+            let early_worker = WorkerId::new(format!("csync-early-{}", uuid::Uuid::new_v4()));
+            assert!(
+                b.claim_next(&early_worker, StdDuration::from_secs(60))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a future next_attempt_at must not be claimable"
+            );
+
+            let other_tenant = create_tenant("composite-sync-retry-other");
+            harness::assert_wrong_tenant_hidden(
+                b.get(&other_tenant, id).await.unwrap(),
+                "outbox row",
+            );
+            // The row stays queued an hour out — invisible to every other
+            // outbox test in this binary's lifetime, no drain needed.
+        }
+
+        /// End-to-end wiring: two independently constructed `CompositeStorage`
+        /// handles (Postgres primary + a genuinely separate "secondary"
+        /// database standing in for Elasticsearch, so applying a create
+        /// doesn't collide with the primary's own row) prove
+        /// `sync_asynchronous` actually durably enqueues — a write via A
+        /// survives without A ever running a worker — and a fresh handle's
+        /// `run_next_composite_sync` (B) claims and applies it to its own
+        /// secondary connection.
+        #[tokio::test]
+        async fn postgres_integration_cluster_composite_storage_durably_syncs_across_handles() {
+            // CompositeStorage::new() wires the outbox unconditionally
+            // (E1), so even without start_sync_workers() this test's
+            // enqueue lands in the same cross-tenant-claimable table the
+            // other tests in this suite race on.
+            let _guard = COMPOSITE_SYNC_OUTBOX_TEST_LOCK.lock().await;
+            let pg = shared_pg().await;
+            let dbname = format!("composite_sync_secondary_{}", uuid::Uuid::new_v4().simple());
+            let admin_conn = format!(
+                "host={} port={} user=postgres password=postgres dbname=postgres",
+                pg.host, pg.port,
+            );
+            let (admin, connection) = tokio_postgres::connect(&admin_conn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to shared pg");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            admin
+                .execute(format!("CREATE DATABASE {}", dbname).as_str(), &[])
+                .await
+                .expect("create secondary database");
+
+            let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("data"))
+                .unwrap_or_else(|| PathBuf::from("data"));
+
+            async fn secondary_backend(
+                pg_host: &str,
+                pg_port: u16,
+                dbname: &str,
+                data_dir: &std::path::Path,
+            ) -> Arc<dyn ResourceStorage + Send + Sync> {
+                let config = PostgresConfig {
+                    host: pg_host.to_string(),
+                    port: pg_port,
+                    dbname: dbname.to_string(),
+                    user: "postgres".to_string(),
+                    password: Some("postgres".to_string()),
+                    max_connections: 2,
+                    data_dir: Some(data_dir.to_path_buf()),
+                    ..Default::default()
+                };
+                let backend = PostgresBackend::new(config)
+                    .await
+                    .expect("secondary backend should connect");
+                backend
+                    .init_schema()
+                    .await
+                    .expect("secondary schema should initialize");
+                Arc::new(backend) as Arc<dyn ResourceStorage + Send + Sync>
+            }
+
+            let build_composite = || async {
+                let mut backends = std::collections::HashMap::new();
+                backends.insert(
+                    "primary".to_string(),
+                    Arc::new(create_backend().await) as Arc<dyn ResourceStorage + Send + Sync>,
+                );
+                backends.insert(
+                    "es".to_string(),
+                    secondary_backend(&pg.host, pg.port, &dbname, &data_dir).await,
+                );
+                let config = CompositeConfig::builder()
+                    .primary("primary", BackendKind::Postgres)
+                    .search_backend("es", BackendKind::Elasticsearch)
+                    .sync_mode(SyncMode::Asynchronous)
+                    .build()
+                    .unwrap();
+                CompositeStorage::new(config, backends).unwrap()
+            };
+
+            // Handle A: enqueue only, no worker started — proves durability
+            // does not depend on the writer's own instance running a worker.
+            let composite_a = build_composite().await;
+            let tenant = create_tenant("composite-storage-e2e");
+            composite_a
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "sync-e2e-1"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            // Handle B: a fresh instance drains the row A enqueued.
+            let composite_b = build_composite().await;
+            let worker_id = WorkerId::new(format!("csync-e2e-{}", uuid::Uuid::new_v4()));
+            let mut drained = false;
+            for _ in 0..20 {
+                if composite_b
+                    .run_next_composite_sync(&worker_id, StdDuration::from_secs(30))
+                    .await
+                {
+                    drained = true;
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+            assert!(drained, "B's worker cycle must claim the row A enqueued");
+
+            // The secondary now genuinely has the resource — applied by B,
+            // not A.
+            let secondary_check = secondary_backend(&pg.host, pg.port, &dbname, &data_dir).await;
+            let read = secondary_check
+                .read(&tenant, "Patient", "sync-e2e-1")
+                .await
+                .unwrap();
+            assert!(
+                read.is_some(),
+                "the secondary must have the resource after B's worker applied it"
+            );
+        }
     }
 
     // ========================================================================

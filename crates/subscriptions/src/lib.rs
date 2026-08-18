@@ -35,7 +35,7 @@ pub use channels::messaging::MessagingChannel;
 pub use channels::ws_manager::WebSocketManager;
 pub use channels::ws_token::WsBindingTokenManager;
 pub use config::{MessagingSettings, SubscriptionConfig};
-pub use engine::SubscriptionEngine;
+pub use engine::{ClusterHandles, SubscriptionEngine};
 pub use error::SubscriptionError;
 pub use event::{ResourceEvent, ResourceEventType};
 pub use rehydrate::{RehydrationConfig, RehydrationReport};

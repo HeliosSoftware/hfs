@@ -8,5 +8,9 @@ src = "src"
 site-url = "/hfs/"
 git-repository-url = "https://github.com/HeliosSoftware/hfs"
 edit-url-template = "https://github.com/HeliosSoftware/hfs/edit/main/book/src/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
 [preprocessor.links]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

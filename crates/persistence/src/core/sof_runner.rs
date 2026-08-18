@@ -31,7 +31,7 @@ use crate::tenant::TenantContext;
 /// Per the SQL-on-FHIR v2 spec, `patient` and `group` are `0..*` — supplying
 /// multiple values must include resources matching ANY of them (union of the
 /// corresponding compartments).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ViewFilters {
     /// Restrict to resources belonging to these patients (FHIR references,
     /// e.g. `Patient/123`). Multiple values are unioned: a resource that

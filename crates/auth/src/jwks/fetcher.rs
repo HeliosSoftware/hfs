@@ -15,6 +15,16 @@ pub struct JwksResponse {
     pub max_age: Option<Duration>,
 }
 
+/// A JWKS document as fetched, before parsing — the raw body is what a
+/// cluster coordination store shares between instances (each instance parses
+/// locally).
+pub struct RawJwks {
+    /// The raw JWKS JSON document body.
+    pub body: String,
+    /// Cache duration parsed from HTTP `Cache-Control: max-age=N`.
+    pub max_age: Option<Duration>,
+}
+
 /// A single JWK from a JWKS endpoint.
 #[derive(Debug, Deserialize)]
 struct Jwk {
@@ -56,6 +66,17 @@ impl JwksFetcher {
 
     /// Fetch and parse a JWKS document from the given URL.
     pub async fn fetch(&self, url: &str) -> Result<JwksResponse, AuthError> {
+        let raw = self.fetch_raw(url).await?;
+        let keys = Self::parse_document(&raw.body)?;
+        Ok(JwksResponse {
+            keys,
+            max_age: raw.max_age,
+        })
+    }
+
+    /// Fetch a JWKS document from the given URL without parsing it,
+    /// preserving the raw body (for the cluster coordination store).
+    pub async fn fetch_raw(&self, url: &str) -> Result<RawJwks, AuthError> {
         debug!(url, "Fetching JWKS");
 
         let response = self
@@ -79,9 +100,17 @@ impl JwksFetcher {
             .and_then(|v| v.to_str().ok())
             .and_then(parse_max_age);
 
-        let doc: JwksDocument = response
-            .json()
+        let body = response
+            .text()
             .await
+            .map_err(|e| AuthError::JwksFetchError(format!("Failed to read JWKS body: {}", e)))?;
+
+        Ok(RawJwks { body, max_age })
+    }
+
+    /// Parse a raw JWKS JSON document into decoding keys indexed by `kid`.
+    pub fn parse_document(body: &str) -> Result<HashMap<String, DecodingKey>, AuthError> {
+        let doc: JwksDocument = serde_json::from_str(body)
             .map_err(|e| AuthError::JwksFetchError(format!("Failed to parse JWKS JSON: {}", e)))?;
 
         let mut keys = HashMap::new();
@@ -112,8 +141,8 @@ impl JwksFetcher {
             }
         }
 
-        debug!(key_count = keys.len(), "JWKS fetch complete");
-        Ok(JwksResponse { keys, max_age })
+        debug!(key_count = keys.len(), "JWKS document parsed");
+        Ok(keys)
     }
 }
 

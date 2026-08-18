@@ -903,7 +903,7 @@ where
         client_tracking_id: inputs.client_tracking_id.clone(),
     };
 
-    let job_id = controller.submit(task);
+    let job_id = controller.submit(task).await;
     // Spec: `Content-Location` must be the absolute URL of the status endpoint.
     let location = format!(
         "{base}/export/{job_id}/status",
@@ -974,7 +974,7 @@ where
         }
     };
 
-    match controller.get_status(tenant.tenant_id(), &job_id) {
+    match controller.get_status(tenant.tenant_id(), &job_id).await {
         None | Some(JobStatus::Cancelled { .. }) => Ok((
             StatusCode::NOT_FOUND,
             axum::Json(json!({
@@ -1157,7 +1157,7 @@ where
         }
     };
 
-    match controller.get_status(tenant.tenant_id(), &job_id) {
+    match controller.get_status(tenant.tenant_id(), &job_id).await {
         // Unknown, cancelled, or still running → no result available. The
         // result URL is only handed out (via the status poll's 303) once the
         // job has finished, so reaching here otherwise means there is nothing
@@ -1202,7 +1202,10 @@ where
             // missing/empty `location`, so surface it as a 500 instead.
             let mut outputs: Vec<(String, String)> = Vec::with_capacity(files.len());
             for f in &files {
-                match controller.download_url(tenant.tenant_id(), &job_id, &f.filename) {
+                match controller
+                    .download_url(tenant.tenant_id(), &job_id, &f.filename)
+                    .await
+                {
                     Some(url) => outputs.push((f.view_name.clone(), url)),
                     None => {
                         return Ok((
@@ -1272,7 +1275,7 @@ where
         }
     };
 
-    if controller.cancel(tenant.tenant_id(), &job_id) {
+    if controller.cancel(tenant.tenant_id(), &job_id).await {
         // Spec: cancellation responds 202 Accepted, not 204 No Content.
         Ok((
             StatusCode::ACCEPTED,
@@ -1316,7 +1319,10 @@ where
         }
     };
 
-    match controller.read_shard(tenant.tenant_id(), &job_id, &filename) {
+    match controller
+        .read_shard(tenant.tenant_id(), &job_id, &filename)
+        .await
+    {
         None => Ok((
             StatusCode::NOT_FOUND,
             axum::Json(json!({

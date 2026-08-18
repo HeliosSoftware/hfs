@@ -172,12 +172,13 @@ impl SubscriptionManager {
         let channel = extract_channel_config(resource, fhir_version)?;
         let filter_strings = extract_filter_criteria(resource, fhir_version);
 
-        // Validate topic exists.
-        let topic = self.topic_registry.get_topic(&topic_url).ok_or_else(|| {
-            SubscriptionError::TopicNotFound {
+        // Validate topic exists (within this tenant).
+        let topic = self
+            .topic_registry
+            .get_topic(tenant_id, &topic_url)
+            .ok_or_else(|| SubscriptionError::TopicNotFound {
                 url: topic_url.clone(),
-            }
-        })?;
+            })?;
 
         // Validate channel type is supported.
         if !self
@@ -385,6 +386,38 @@ impl SubscriptionManager {
         let key = (tenant_id.to_string(), subscription_id.to_string());
         if let Some(mut entry) = self.subscriptions.get_mut(&key) {
             entry.consecutive_failures = 0;
+        }
+    }
+
+    /// Overlays cluster-shared runtime state onto the local projection: the
+    /// shared counters win over whatever this instance accumulated, and a
+    /// stored status is applied directly — transition validation happened on
+    /// the instance that recorded it, so replaying it here must not be
+    /// re-gated (e.g. a hydrating instance adopting `off`).
+    pub fn apply_state_overlay(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        event_number: u64,
+        consecutive_failures: u32,
+        status: Option<SubscriptionStatusCode>,
+    ) {
+        let key = (tenant_id.to_string(), subscription_id.to_string());
+        if let Some(mut entry) = self.subscriptions.get_mut(&key) {
+            entry.events_since_start = event_number;
+            entry.consecutive_failures = consecutive_failures;
+            if let Some(status) = status {
+                entry.status = status;
+            }
+        }
+    }
+
+    /// Mirrors a cluster-store event number into the local projection so
+    /// local reads stay coherent between overlays.
+    pub fn sync_event_count(&self, tenant_id: &str, subscription_id: &str, event_number: u64) {
+        let key = (tenant_id.to_string(), subscription_id.to_string());
+        if let Some(mut entry) = self.subscriptions.get_mut(&key) {
+            entry.events_since_start = event_number;
         }
     }
 
@@ -749,22 +782,29 @@ pub(crate) mod tests {
 
     fn create_test_registry() -> Arc<InMemoryTopicRegistry> {
         let registry = Arc::new(InMemoryTopicRegistry::new());
-        registry.add_topic(TopicDefinition {
-            canonical_url: "http://example.org/topic/encounter-start".to_string(),
-            title: Some("Encounter Start".to_string()),
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Encounter".to_string(),
-                interactions: vec![ResourceEventType::Create],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![FilterDefinition {
-                resource_type: Some("Encounter".to_string()),
-                filter_parameter: "patient".to_string(),
-                comparators: vec!["eq".to_string()],
-                modifiers: vec![],
-            }],
-            notification_shape: vec![],
-        });
+        // Topics are tenant-scoped: seed the topic for every tenant these
+        // tests register subscriptions under.
+        for tenant in ["t1", "t2", "tenant-1", "tenant-a", "tenant-b"] {
+            registry.add_topic(
+                tenant,
+                TopicDefinition {
+                    canonical_url: "http://example.org/topic/encounter-start".to_string(),
+                    title: Some("Encounter Start".to_string()),
+                    resource_triggers: vec![ResourceTrigger {
+                        resource_type: "Encounter".to_string(),
+                        interactions: vec![ResourceEventType::Create],
+                        fhirpath_criteria: None,
+                    }],
+                    can_filter_by: vec![FilterDefinition {
+                        resource_type: Some("Encounter".to_string()),
+                        filter_parameter: "patient".to_string(),
+                        comparators: vec!["eq".to_string()],
+                        modifiers: vec![],
+                    }],
+                    notification_shape: vec![],
+                },
+            );
+        }
         registry
     }
 

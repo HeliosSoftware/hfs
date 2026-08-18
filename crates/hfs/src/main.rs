@@ -18,6 +18,8 @@
 //! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`,
 //! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
+mod cluster;
+
 use std::sync::Arc;
 
 use helios_audit::{
@@ -568,6 +570,7 @@ async fn start_mongodb(
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
+    pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     let backend_config = build_mongodb_config(&config, false);
     info!(
@@ -579,6 +582,7 @@ async fn start_mongodb(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    finish_auth_boot(pending_jwks, backend.as_ref()).await?;
     seed_conformance_resources(&*backend, &config).await;
     spawn_mongodb_search_param_refresh(backend.clone(), &config);
     let serve_audit_state = audit_state.clone();
@@ -610,6 +614,7 @@ async fn start_mongodb(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, backend.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
@@ -634,6 +639,7 @@ async fn start_mongodb(
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
     _audit_state: Option<Arc<AuditMiddlewareState>>,
+    _pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The mongodb backend requires the 'mongodb' feature. \
@@ -726,17 +732,27 @@ async fn serve(
 /// When audit is enabled, the auth middleware uses an `AuditBridge` to record
 /// authentication events. Otherwise, a no-op sink is used.
 ///
-/// Returns the auth config and optional middleware state. If auth is disabled,
-/// returns `(config, None)`.
+/// Returns the auth config, optional middleware state, and — under the
+/// `database` JWKS-coordination mode (C2) — the JWKS cache with its initial
+/// fetch *deferred*: the shared refresh store lives on the primary backend,
+/// which does not exist yet, so the start function completes the boot via
+/// [`finish_auth_boot`]. The `local` and `redis` modes need no backend and
+/// finish here (third element `None`). If auth is disabled, returns
+/// `(config, None, None)`.
 async fn init_auth_with_audit(
     audit_sink: Arc<dyn AuditSink>,
     tenant_url_routing: bool,
-) -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareState>>)> {
+    jwks_mode: cluster::JwksCoordinationMode,
+) -> anyhow::Result<(
+    AuthConfig,
+    Option<Arc<AuthMiddlewareState>>,
+    Option<Arc<JwksCache>>,
+)> {
     let auth_config = AuthConfig::from_env();
 
     if !auth_config.enabled {
         info!("Authentication is DISABLED");
-        return Ok((auth_config, None));
+        return Ok((auth_config, None, None));
     }
 
     // Every invariant of an enabled auth config now lives on the type, so an
@@ -769,7 +785,30 @@ async fn init_auth_with_audit(
         jwks_url,
         auth_config.jwks_min_refresh_interval,
     ));
-    jwks_cache.initial_fetch().await?;
+    let pending_jwks = match jwks_mode {
+        cluster::JwksCoordinationMode::Local => {
+            jwks_cache.initial_fetch().await?;
+            None
+        }
+        #[cfg(feature = "redis")]
+        cluster::JwksCoordinationMode::Redis => {
+            let redis_url = auth_config
+                .redis_url
+                .as_deref()
+                .expect("resolve_jwks_coordination requires HFS_AUTH_REDIS_URL for redis");
+            let coordinator = helios_auth::RedisJwksCoordination::new(redis_url)
+                .map_err(|e| anyhow::anyhow!("Failed to set up Redis JWKS coordination: {e}"))?;
+            jwks_cache.set_coordination(Arc::new(coordinator));
+            info!("JWKS refresh coordination: redis");
+            jwks_cache.initial_fetch().await?;
+            None
+        }
+        #[cfg(not(feature = "redis"))]
+        cluster::JwksCoordinationMode::Redis => {
+            unreachable!("resolve_jwks_coordination refuses redis without the 'redis' feature")
+        }
+        cluster::JwksCoordinationMode::Database => Some(Arc::clone(&jwks_cache)),
+    };
 
     // Create auth provider
     let provider = JwksBearerAuthProvider::new(jwks_cache, &auth_config);
@@ -792,7 +831,44 @@ async fn init_auth_with_audit(
         tenant_url_routing,
     });
 
-    Ok((auth_config, Some(auth_state)))
+    Ok((auth_config, Some(auth_state), pending_jwks))
+}
+
+/// Completes auth boot for the `database` JWKS-coordination mode (C2):
+/// attaches the primary backend's shared refresh cache to the JWKS cache and
+/// performs the initial fetch that [`init_auth_with_audit`] deferred.
+///
+/// Mirrors [`reindex_cluster_store`]'s posture: a `database` mode over a
+/// backend with no cluster refresh cache (SQLite, MongoDB, S3 primaries)
+/// stays per-instance with a loud warning rather than refusing to boot —
+/// per-instance JWKS refresh is functionally correct (design §5: C2 is
+/// warn-level, never a refusal). No-op when there is nothing pending
+/// (auth disabled, or the `local`/`redis` modes, which finished earlier).
+async fn finish_auth_boot<S: ResourceStorage>(
+    pending_jwks: Option<Arc<JwksCache>>,
+    storage: &S,
+) -> anyhow::Result<()> {
+    let Some(jwks_cache) = pending_jwks else {
+        return Ok(());
+    };
+    match storage.cluster_refresh_cache() {
+        Some(store) => {
+            jwks_cache.set_coordination(Arc::new(helios_rest::StoreJwksCoordination::new(store)));
+            info!(
+                backend = storage.backend_name(),
+                "JWKS refresh coordination: database"
+            );
+        }
+        None => {
+            tracing::warn!(
+                backend = storage.backend_name(),
+                "JWKS coordination resolves to database but this backend has no cluster \
+                 refresh cache; JWKS refresh stays per-instance"
+            );
+        }
+    }
+    jwks_cache.initial_fetch().await?;
+    Ok(())
 }
 
 /// Initializes the audit subsystem from environment configuration.
@@ -894,6 +970,96 @@ async fn main() -> anyhow::Result<()> {
         .storage_backend_mode()
         .map_err(|e| anyhow::anyhow!("Invalid storage backend configuration: {}", e))?;
 
+    // Cluster-mode fail-fast: refuse configurations that cannot run as one
+    // of N instances before any subsystem starts. The audit config is
+    // re-parsed by its init function below; parsing here too is cheap and
+    // keeps this check pure. (Auth no
+    // longer participates: #205 made token validation stateless, so it holds
+    // no cross-instance state to validate.)
+    {
+        let audit_config = AuditConfig::from_env();
+        let view = cluster::ClusterConfigView {
+            cluster: config.cluster,
+            primary_backend: backend_mode.primary_backend_kind(),
+            job_store_backend: &config.job_store_backend,
+            bulk_export_enabled: config.bulk_export.enabled,
+            bulk_export_output_backend: &config.bulk_export.output_backend,
+            bulk_submit_enabled: config.bulk_submit.enabled,
+            bulk_submit_output_backend: &config.bulk_submit.output_backend,
+            audit_backend: audit_config.backend,
+            sof_enabled: config.sof_enabled,
+            export_controller: &config.export_controller,
+            export_sink: &config.export_sink,
+            // Feature-gated: a binary without the subscriptions feature
+            // cannot run the engine, so its configuration cannot hurt a
+            // cluster.
+            subscriptions_enabled: cfg!(feature = "subscriptions")
+                && config.subscriptions_enabled(),
+            subscriptions_fanout: &config.subscriptions_fanout,
+        };
+        if let Err(errors) = cluster::validate_cluster_config(&view) {
+            for error in &errors {
+                eprintln!("Configuration error: {}", error);
+            }
+            std::process::exit(1);
+        }
+    }
+
+    // C2 — JWKS refresh coordination mode. Warn-only under HFS_CLUSTER
+    // (per-instance refresh is functionally correct), but invalid values
+    // fail fast like the refusal table above. Resolved only when auth is
+    // enabled — a disabled subsystem's configuration cannot hurt a cluster.
+    let jwks_mode = {
+        let auth_env = AuthConfig::from_env();
+        if auth_env.enabled {
+            match cluster::resolve_jwks_coordination(
+                &auth_env.jwks_coordination,
+                config.cluster,
+                auth_env.redis_url.as_deref(),
+            ) {
+                Ok((mode, warning)) => {
+                    if let Some(warning) = warning {
+                        tracing::warn!("{warning}");
+                    }
+                    mode
+                }
+                Err(error) => {
+                    eprintln!("Configuration error: {}", error);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            cluster::JwksCoordinationMode::Local
+        }
+    };
+
+    // E1 — composite secondary-backend sync durability. Warn-only: the
+    // durable outbox wires itself automatically (in `CompositeStorage::new`)
+    // whenever the primary backend supports it, so there is no env var to
+    // validate here, only an operator warning when it can't apply.
+    #[cfg(feature = "elasticsearch")]
+    {
+        let composite_secondary_present = matches!(
+            backend_mode,
+            StorageBackendMode::SqliteElasticsearch
+                | StorageBackendMode::PostgresElasticsearch
+                | StorageBackendMode::MongoDBElasticsearch
+                | StorageBackendMode::S3Elasticsearch
+        );
+        let sync_mode_synchronous = matches!(
+            composite_sync_mode_from_env(),
+            helios_persistence::composite::SyncMode::Synchronous
+        );
+        if let Some(warning) = cluster::resolve_composite_sync_durability(
+            config.cluster,
+            backend_mode.primary_backend_kind(),
+            composite_secondary_present,
+            sync_mode_synchronous,
+        ) {
+            tracing::warn!("{warning}");
+        }
+    }
+
     // Propagate HFS_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
     // FHIRPath evaluation (CDS Hooks, _filter, etc.) delegates terminology
     // operations (memberOf, subsumes) to the configured HTS instance.
@@ -913,9 +1079,10 @@ async fn main() -> anyhow::Result<()> {
     let (audit_sink, audit_state) = init_audit(&config, backend_mode).await?;
 
     // Initialize authentication (with audit bridge if audit is enabled)
-    let (auth_config, auth_state) = init_auth_with_audit(
+    let (auth_config, auth_state, pending_jwks) = init_auth_with_audit(
         audit_sink,
         config.multitenancy.routing_mode.supports_url_path(),
+        jwks_mode,
     )
     .await?;
 
@@ -949,28 +1116,38 @@ async fn main() -> anyhow::Result<()> {
 
     match backend_mode {
         StorageBackendMode::Sqlite => {
-            start_sqlite(config, auth_config, auth_state, audit_state).await?;
+            start_sqlite(config, auth_config, auth_state, audit_state, pending_jwks).await?;
         }
         StorageBackendMode::SqliteElasticsearch => {
-            start_sqlite_elasticsearch(config, auth_config, auth_state, audit_state).await?;
+            start_sqlite_elasticsearch(config, auth_config, auth_state, audit_state, pending_jwks)
+                .await?;
         }
         StorageBackendMode::Postgres => {
-            start_postgres(config, auth_config, auth_state, audit_state).await?;
+            start_postgres(config, auth_config, auth_state, audit_state, pending_jwks).await?;
         }
         StorageBackendMode::PostgresElasticsearch => {
-            start_postgres_elasticsearch(config, auth_config, auth_state, audit_state).await?;
+            start_postgres_elasticsearch(
+                config,
+                auth_config,
+                auth_state,
+                audit_state,
+                pending_jwks,
+            )
+            .await?;
         }
         StorageBackendMode::MongoDB => {
-            start_mongodb(config, auth_config, auth_state, audit_state).await?;
+            start_mongodb(config, auth_config, auth_state, audit_state, pending_jwks).await?;
         }
         StorageBackendMode::MongoDBElasticsearch => {
-            start_mongodb_elasticsearch(config, auth_config, auth_state, audit_state).await?;
+            start_mongodb_elasticsearch(config, auth_config, auth_state, audit_state, pending_jwks)
+                .await?;
         }
         StorageBackendMode::S3 => {
-            start_s3(config, auth_config, auth_state, audit_state).await?;
+            start_s3(config, auth_config, auth_state, audit_state, pending_jwks).await?;
         }
         StorageBackendMode::S3Elasticsearch => {
-            start_s3_elasticsearch(config, auth_config, auth_state, audit_state).await?;
+            start_s3_elasticsearch(config, auth_config, auth_state, audit_state, pending_jwks)
+                .await?;
         }
     }
 
@@ -1146,9 +1323,11 @@ async fn start_sqlite(
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
+    pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
+    finish_auth_boot(pending_jwks, backend.as_ref()).await?;
     seed_conformance_resources(&*backend, &config).await;
     spawn_sqlite_search_param_refresh(backend.clone(), &config);
     // Second handle to the same backend for the web UI's tenant-maintenance
@@ -1166,6 +1345,7 @@ async fn start_sqlite(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, backend.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend,
@@ -1334,9 +1514,43 @@ where
     }))
 }
 
-/// Attaches the audit sink to a reindex driver and hands back a shared handle.
-/// Used by both the standalone and composite ops bundles; the S3-only build has
-/// no reindex target and so never calls it.
+/// The shared cluster job store for reindex, when the configuration selects
+/// the database job store and the backend can provide one.
+///
+/// A `database` job-store mode over a backend with no cluster store (SQLite,
+/// MongoDB, S3 primaries) falls back to the in-memory driver with a loud
+/// warning rather than refusing to boot — reindex is always-on, and those
+/// primaries are documented single-instance for Phase 1 features.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
+fn reindex_cluster_store<S: helios_persistence::core::ResourceStorage>(
+    config: &helios_rest::ServerConfig,
+    storage: &S,
+) -> Option<Arc<dyn helios_persistence::core::ClusterJobStore>> {
+    match config.job_store_backend_mode() {
+        Ok(helios_rest::JobStoreBackend::Database) => {
+            let store = storage.cluster_job_store();
+            if store.is_none() {
+                tracing::warn!(
+                    backend = storage.backend_name(),
+                    "HFS_JOB_STORE_BACKEND=database but this backend has no cluster job \
+                     store; reindex jobs stay per-instance"
+                );
+            }
+            store
+        }
+        _ => None,
+    }
+}
+
+/// Attaches the audit sink (and, in cluster mode, the shared job store) to a
+/// reindex driver, spawns the per-instance reindex workers when cluster-backed,
+/// and hands back a shared handle. Used by both the standalone and composite
+/// ops bundles; the S3-only build has no reindex target and so never calls it.
 #[cfg(any(
     feature = "sqlite",
     feature = "postgres",
@@ -1346,6 +1560,7 @@ where
 fn wire_reindex(
     op: ReindexOperation,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
+    cluster_store: Option<Arc<dyn helios_persistence::core::ClusterJobStore>>,
 ) -> Arc<ReindexOperation> {
     let op = match audit_state {
         Some(state) => op.with_audit(
@@ -1354,7 +1569,15 @@ fn wire_reindex(
         ),
         None => op,
     };
-    Arc::new(op)
+    let op = match cluster_store {
+        Some(store) => op.with_cluster_store(store),
+        None => op,
+    };
+    let op = Arc::new(op);
+    if op.is_cluster_backed() {
+        helios_persistence::search::spawn_reindex_cluster_workers(Arc::clone(&op), 1);
+    }
+    op
 }
 
 /// Ops bundle for a backend that indexes itself — the standalone deployments
@@ -1364,6 +1587,7 @@ fn standalone_ops<B>(
     backend: Arc<B>,
     registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
+    cluster_store: Option<Arc<dyn helios_persistence::core::ClusterJobStore>>,
 ) -> OperationsBundle
 where
     B: PurgableStorage + helios_persistence::search::ReindexableStorage + 'static,
@@ -1373,6 +1597,7 @@ where
         reindex: Some(wire_reindex(
             ReindexOperation::new(backend, registries),
             audit_state,
+            cluster_store,
         )),
     }
 }
@@ -1397,12 +1622,14 @@ fn composite_ops(
     targets: Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
     registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
+    cluster_store: Option<Arc<dyn helios_persistence::core::ClusterJobStore>>,
 ) -> OperationsBundle {
     OperationsBundle {
         purge: Some(composite as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
             ReindexOperation::with_parts(source, targets, registries),
             audit_state,
+            cluster_store,
         )),
     }
 }
@@ -1694,6 +1921,7 @@ async fn start_sqlite(
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
     _audit_state: Option<Arc<AuditMiddlewareState>>,
+    _pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The sqlite backend requires the 'sqlite' feature. \
@@ -1708,6 +1936,7 @@ async fn start_sqlite_elasticsearch(
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
+    pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1722,6 +1951,7 @@ async fn start_sqlite_elasticsearch(
     let mut sqlite = create_sqlite_backend(&config)?;
     sqlite.set_search_offloaded(true);
     let sqlite = Arc::new(sqlite);
+    finish_auth_boot(pending_jwks, sqlite.as_ref()).await?;
     info!("SQLite search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -1841,6 +2071,7 @@ async fn start_sqlite_elasticsearch(
         vec![sqlite.clone(), es.clone()],
         sqlite.tenant_registries().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, sqlite.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
@@ -1872,6 +2103,7 @@ async fn start_sqlite_elasticsearch(
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
     _audit_state: Option<Arc<AuditMiddlewareState>>,
+    _pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The sqlite-elasticsearch backend requires the 'elasticsearch' feature. \
@@ -1886,11 +2118,13 @@ async fn start_postgres(
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
+    pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     let backend = create_postgres_backend(&config).await?;
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    finish_auth_boot(pending_jwks, backend.as_ref()).await?;
     seed_conformance_resources(&*backend, &config).await;
     spawn_postgres_search_param_refresh(backend.clone(), &config);
 
@@ -1905,6 +2139,7 @@ async fn start_postgres(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, backend.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
@@ -1929,6 +2164,7 @@ async fn start_postgres(
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
     _audit_state: Option<Arc<AuditMiddlewareState>>,
+    _pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The postgres backend requires the 'postgres' feature. \
@@ -1943,6 +2179,7 @@ async fn start_postgres_elasticsearch(
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
+    pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1962,6 +2199,7 @@ async fn start_postgres_elasticsearch(
     let mut backend = backend;
     backend.set_search_offloaded(true);
     let pg = Arc::new(backend);
+    finish_auth_boot(pending_jwks, pg.as_ref()).await?;
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -2076,6 +2314,7 @@ async fn start_postgres_elasticsearch(
         vec![pg.clone(), es.clone()],
         pg.tenant_registries().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, pg.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
@@ -2107,6 +2346,7 @@ async fn start_postgres_elasticsearch(
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
     _audit_state: Option<Arc<AuditMiddlewareState>>,
+    _pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The postgres-elasticsearch backend requires both 'postgres' and 'elasticsearch' features. \
@@ -2121,6 +2361,7 @@ async fn start_mongodb_elasticsearch(
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
+    pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2144,6 +2385,7 @@ async fn start_mongodb_elasticsearch(
 
     // Offload search to Elasticsearch
     let mongo = Arc::new(backend);
+    finish_auth_boot(pending_jwks, mongo.as_ref()).await?;
     info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -2273,6 +2515,7 @@ async fn start_mongodb_elasticsearch(
         vec![mongo.clone(), es.clone()],
         mongo.tenant_registries().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, mongo.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
@@ -2304,6 +2547,7 @@ async fn start_mongodb_elasticsearch(
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
     _audit_state: Option<Arc<AuditMiddlewareState>>,
+    _pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The mongodb-elasticsearch backend requires both 'mongodb' and 'elasticsearch' features. \
@@ -2318,6 +2562,7 @@ async fn start_s3(
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
+    pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
 
@@ -2365,6 +2610,7 @@ async fn start_s3(
     })?;
 
     let backend = Arc::new(backend);
+    finish_auth_boot(pending_jwks, backend.as_ref()).await?;
     let serve_audit_state = audit_state.clone();
 
     // Second handle to the same backend (S3Backend clones share the client)
@@ -2439,6 +2685,7 @@ async fn start_s3(
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
     _audit_state: Option<Arc<AuditMiddlewareState>>,
+    _pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The s3 backend requires the 's3' feature. \
@@ -2485,6 +2732,7 @@ async fn start_s3_elasticsearch(
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
+    pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2539,6 +2787,7 @@ async fn start_s3_elasticsearch(
             e
         )
     })?);
+    finish_auth_boot(pending_jwks, s3.as_ref()).await?;
 
     // --- Elasticsearch backend (search) ---
     let es_nodes: Vec<String> = config
@@ -2652,6 +2901,7 @@ async fn start_s3_elasticsearch(
         vec![es.clone()],
         es.tenant_registries().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, s3.as_ref()),
     );
 
     // S3 primary; embedded SQLite sidecar for bulk-export job state. A single
@@ -2711,6 +2961,7 @@ async fn start_s3_elasticsearch(
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
     _audit_state: Option<Arc<AuditMiddlewareState>>,
+    _pending_jwks: Option<Arc<JwksCache>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The s3-elasticsearch backend requires both 's3' and 'elasticsearch' features. \

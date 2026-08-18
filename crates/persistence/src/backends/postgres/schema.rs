@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 16;
+pub const SCHEMA_VERSION: i32 = 20;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -314,6 +314,10 @@ async fn migrate_schema(
             13 => migrate_v13_to_v14(client).await?,
             14 => migrate_v14_to_v15(client).await?,
             15 => migrate_v15_to_v16(client).await?,
+            16 => migrate_v16_to_v17(client).await?,
+            17 => migrate_v17_to_v18(client).await?,
+            18 => migrate_v18_to_v19(client).await?,
+            19 => migrate_v19_to_v20(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1084,6 +1088,295 @@ async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v13->v14 failed: {}", e)))?;
+    Ok(())
+}
+
+/// v16 -> v17: Add the unified `cluster_jobs` table (design doc §4).
+///
+/// One shared queue for every async job surface that was process-local
+/// (SoF `$export` #169, search reindex A2), discriminated by `kind`. Claiming
+/// uses the same lease + fencing-token discipline as `bulk_export_jobs`
+/// (worker_id / lease_expiry / heartbeat_at / fencing_token columns and the
+/// `FOR UPDATE SKIP LOCKED` claim in `cluster_jobs.rs`); bulk export/submit
+/// deliberately stay on their own tables (resolved decision F3).
+async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS cluster_jobs (
+                id               TEXT PRIMARY KEY,
+                tenant_id        TEXT NOT NULL,
+                kind             TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'queued',
+                payload          JSONB NOT NULL,
+                progress         JSONB,
+                result           JSONB,
+                error_message    TEXT,
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                worker_id        TEXT,
+                lease_expiry     TIMESTAMPTZ,
+                heartbeat_at     TIMESTAMPTZ,
+                fencing_token    BIGINT NOT NULL DEFAULT 0,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                started_at       TIMESTAMPTZ,
+                finished_at      TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_cluster_jobs_claim
+                 ON cluster_jobs(kind, status, lease_expiry)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_claim: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_cluster_jobs_tenant
+                 ON cluster_jobs(tenant_id, kind, created_at DESC)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_tenant: {}", e)))?;
+
+    Ok(())
+}
+
+/// v17 -> v18: Add the `cluster_refresh_cache` table (design doc §5 C2).
+///
+/// Shared store for cluster-coordinated single-flight document refreshes
+/// (`cluster_refresh_cache.rs`; today: IdP JWKS documents keyed by URL).
+/// Deliberately **no `tenant_id` column**: the cached documents are public
+/// upstream material shared by every tenant, so the wrong-tenant DoD row
+/// does not apply (methodology §6).
+async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS cluster_refresh_cache (
+                cache_key    TEXT PRIMARY KEY,
+                body         TEXT NOT NULL,
+                max_age_secs BIGINT,
+                fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v17->v18 failed: {}", e)))?;
+
+    Ok(())
+}
+
+/// v18 -> v19: Subscriptions cluster delivery (design doc §Class B, #170).
+///
+/// Four tables:
+/// - `subscription_state` — shared per-subscription counters/status (B4);
+///   rows are created lazily by the first upsert-increment so a Subscription
+///   update can never reset them.
+/// - `subscription_notification_events` — built websocket-channel bundles,
+///   loaded by the instances holding the sockets when a fan-out envelope
+///   arrives (B1; NOTIFY payloads cap at ~8KB so bundles never ride it).
+/// - `subscription_delivery_outbox` — durable push-channel deliveries under
+///   the cluster-jobs lease + fencing discipline plus a retry schedule (B5).
+/// - `subscription_ws_tokens` — single-use WebSocket binding tokens,
+///   redeemed with `DELETE … RETURNING` (B2).
+async fn migrate_v18_to_v19(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_state (
+                tenant_id            TEXT NOT NULL,
+                subscription_id      TEXT NOT NULL,
+                event_number         BIGINT NOT NULL DEFAULT 0,
+                consecutive_failures INT NOT NULL DEFAULT 0,
+                status               TEXT,
+                created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, subscription_id)
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v18->v19 (subscription_state) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_notification_events (
+                tenant_id       TEXT NOT NULL,
+                subscription_id TEXT NOT NULL,
+                event_number    BIGINT NOT NULL,
+                bundle          JSONB NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, subscription_id, event_number)
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v18->v19 (subscription_notification_events) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_sub_notification_events_reap
+                 ON subscription_notification_events(created_at)",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Failed to create idx_sub_notification_events_reap: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_delivery_outbox (
+                id                BIGSERIAL PRIMARY KEY,
+                tenant_id         TEXT NOT NULL,
+                subscription_id   TEXT NOT NULL,
+                event_number      BIGINT,
+                notification_type TEXT NOT NULL,
+                bundle            JSONB NOT NULL,
+                attempts          INT NOT NULL DEFAULT 0,
+                next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status            TEXT NOT NULL DEFAULT 'queued',
+                last_error        TEXT,
+                worker_id         TEXT,
+                lease_expiry      TIMESTAMPTZ,
+                fencing_token     BIGINT NOT NULL DEFAULT 0,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                finished_at       TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v18->v19 (subscription_delivery_outbox) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_sub_outbox_claim
+                 ON subscription_delivery_outbox(status, next_attempt_at, lease_expiry)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_sub_outbox_claim: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_sub_outbox_tenant
+                 ON subscription_delivery_outbox(tenant_id, subscription_id)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_sub_outbox_tenant: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_ws_tokens (
+                token           TEXT PRIMARY KEY,
+                tenant_id       TEXT NOT NULL,
+                subscription_id TEXT NOT NULL,
+                expires_at      TIMESTAMPTZ NOT NULL
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v18->v19 (subscription_ws_tokens) failed: {}",
+                e
+            ))
+        })?;
+
+    Ok(())
+}
+
+/// v19 -> v20: durable composite secondary-backend sync outbox (design doc
+/// §Class E, E1).
+///
+/// One table, `composite_sync_outbox`, denormalized to one row per
+/// `(event, backend_id)` pair under the cluster-jobs lease + fencing
+/// discipline plus a retry schedule — the same shape as
+/// `subscription_delivery_outbox` (v19), adapted for a resource-sync
+/// payload instead of a push-notification payload.
+async fn migrate_v19_to_v20(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS composite_sync_outbox (
+                id              BIGSERIAL PRIMARY KEY,
+                tenant_id       TEXT NOT NULL,
+                backend_id      TEXT NOT NULL,
+                operation       TEXT NOT NULL,
+                resource_type   TEXT NOT NULL,
+                resource_id     TEXT NOT NULL,
+                content         JSONB,
+                version         TEXT,
+                fhir_version    TEXT,
+                attempts        INT NOT NULL DEFAULT 0,
+                next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status          TEXT NOT NULL DEFAULT 'queued',
+                last_error      TEXT,
+                worker_id       TEXT,
+                lease_expiry    TIMESTAMPTZ,
+                fencing_token   BIGINT NOT NULL DEFAULT 0,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                finished_at     TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v19->v20 (composite_sync_outbox) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_composite_sync_outbox_claim
+                 ON composite_sync_outbox(status, next_attempt_at, lease_expiry)",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Failed to create idx_composite_sync_outbox_claim: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_composite_sync_outbox_tenant
+                 ON composite_sync_outbox(tenant_id, backend_id)",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Failed to create idx_composite_sync_outbox_tenant: {}",
+                e
+            ))
+        })?;
+
     Ok(())
 }
 

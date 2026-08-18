@@ -89,7 +89,7 @@ pub use registry::{
 };
 pub use reindex::{
     ReindexOperation, ReindexProgress, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
-    ReindexableStorage, ResourcePage,
+    ReindexableStorage, ResourcePage, spawn_reindex_cluster_workers,
 };
 pub use seeder::{
     SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,

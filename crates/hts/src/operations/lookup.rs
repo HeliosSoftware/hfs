@@ -141,6 +141,9 @@ async fn process_lookup<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // Cross-instance freshness (C3) — before any handler-cache read below.
+    state.check_terminology_epoch().await;
+
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips supplement resolution, the backend `lookup` call, the
     // `code_system_language` lookup, and FHIR Parameters assembly when the

@@ -1468,6 +1468,9 @@ async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
+    // Cross-instance freshness (C3) — before any handler-cache read below.
+    state.check_terminology_epoch().await;
+
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips ALL pre-call helpers when the same canonical params have produced
     // a response earlier in this AppState's lifetime.  Cleared on every

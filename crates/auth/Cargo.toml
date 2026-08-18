@@ -10,6 +10,8 @@ description = "Authentication and authorization for the Helios FHIR Server"
 
 [features]
 default = []
+# Redis-backed JWKS refresh coordination (cluster design §5 C2).
+redis = ["dep:redis"]
 
 [dependencies]
 # JWT validation
@@ -17,6 +19,9 @@ jsonwebtoken = "9"
 
 # HTTP client for JWKS endpoint
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Redis (optional, for cluster JWKS refresh coordination)
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
 
 # SMART scope permissions
 bitflags = "2"
@@ -41,3 +46,6 @@ thiserror = "2"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
+# For the RUN_REDIS_CLUSTER_TESTS=1-gated Redis coordination T2 twin
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["redis"] }

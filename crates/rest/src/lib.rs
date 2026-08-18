@@ -157,6 +157,7 @@ pub mod extractors;
 pub mod fhir_types;
 pub mod handlers;
 pub mod jwe;
+pub mod jwks_coordination;
 pub mod middleware;
 pub(crate) mod rate_limit;
 pub mod responses;
@@ -167,8 +168,12 @@ pub mod terminology;
 pub mod validation;
 
 // Re-export commonly used types
-pub use config::{MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode};
+pub use config::{
+    ExportControllerMode, JobStoreBackend, MultitenancyConfig, ServerConfig, StorageBackendMode,
+    SubscriptionsFanoutMode, TenantRoutingMode,
+};
 pub use error::{RestError, RestResult};
+pub use jwks_coordination::StoreJwksCoordination;
 pub use middleware::auth::AuthMiddlewareState;
 pub use state::AppState;
 pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
@@ -657,21 +662,68 @@ where
 
         // Wire the export job controller.
         use crate::export::{
-            CleanupConfig, ExportJobController, FilesystemSink, InMemoryController,
+            CleanupConfig, DatabaseExportJobController, ExportJobController, ExportSink,
+            FilesystemSink, InMemoryController, spawn_sof_export_workers,
         };
-        let controller: Arc<dyn ExportJobController> = {
-            let max_concurrency = Some(config.export_max_concurrency);
-            let shard_rows = Some(config.export_shard_rows);
-            // Reaper that reclaims finished jobs' output after the TTL. The
-            // interval is clamped to >= 1s because `tokio::time::interval`
-            // panics on a zero period.
-            let cleanup = Some(CleanupConfig {
-                output_ttl: std::time::Duration::from_secs(config.export_output_ttl_secs),
-                interval: std::time::Duration::from_secs(
-                    config.export_cleanup_interval_secs.max(1),
-                ),
-            });
 
+        // Selected by HFS_EXPORT_CONTROLLER (unset follows the job-store
+        // mode: `database` under HFS_CLUSTER=true). `validate()` already
+        // rejected unparsable values at startup.
+        let controller_mode = config
+            .export_controller_mode()
+            .expect("export controller mode validated at startup");
+
+        /// Builds the selected controller over a concrete sink type; the
+        /// `database` mode also spawns this instance's claim/lease worker
+        /// pool and output reaper.
+        fn build_controller<Sink: ExportSink>(
+            mode: config::ExportControllerMode,
+            runner: Arc<dyn helios_persistence::core::SofRunner>,
+            sink: Sink,
+            store: Option<Arc<dyn helios_persistence::core::ClusterJobStore>>,
+            config: &ServerConfig,
+        ) -> Arc<dyn ExportJobController> {
+            let output_ttl = std::time::Duration::from_secs(config.export_output_ttl_secs);
+            // Interval clamped to >= 1s: `tokio::time::interval` panics on a
+            // zero period.
+            let cleanup_interval =
+                std::time::Duration::from_secs(config.export_cleanup_interval_secs.max(1));
+            match mode {
+                config::ExportControllerMode::Memory => Arc::new(InMemoryController::with_options(
+                    runner,
+                    sink,
+                    Some(config.export_max_concurrency),
+                    Some(config.export_shard_rows),
+                    Some(CleanupConfig {
+                        output_ttl,
+                        interval: cleanup_interval,
+                    }),
+                )),
+                config::ExportControllerMode::Database => {
+                    let store = store.unwrap_or_else(|| {
+                        // Hard config error, same posture as the missing
+                        // SofRunner panic above.
+                        panic!(
+                            "HFS_EXPORT_CONTROLLER=database requires a storage backend that \
+                             provides a cluster job store (postgres)"
+                        )
+                    });
+                    spawn_sof_export_workers(
+                        Arc::clone(&store),
+                        runner,
+                        sink.clone(),
+                        config.export_max_concurrency,
+                        config.export_shard_rows,
+                        output_ttl,
+                        cleanup_interval,
+                    );
+                    Arc::new(DatabaseExportJobController::new(store, sink))
+                }
+            }
+        }
+
+        let job_store = storage_arc.cluster_job_store();
+        let controller: Arc<dyn ExportJobController> = {
             #[cfg(feature = "s3")]
             if config.export_sink.to_lowercase() == "s3" {
                 use crate::export::S3Sink;
@@ -692,13 +744,13 @@ where
                         ttl,
                     ))
                 }) {
-                    Ok(sink) => Arc::new(InMemoryController::with_options(
+                    Ok(sink) => build_controller(
+                        controller_mode,
                         runner_for_export,
                         sink,
-                        max_concurrency,
-                        shard_rows,
-                        cleanup,
-                    )),
+                        job_store,
+                        &config,
+                    ),
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -706,38 +758,26 @@ where
                             "S3 export sink init failed — falling back to FilesystemSink"
                         );
                         let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                        Arc::new(InMemoryController::with_options(
+                        build_controller(
+                            controller_mode,
                             runner_for_export,
                             sink,
-                            max_concurrency,
-                            shard_rows,
-                            cleanup,
-                        ))
+                            job_store,
+                            &config,
+                        )
                     }
                 }
             } else {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                Arc::new(InMemoryController::with_options(
-                    runner_for_export,
-                    sink,
-                    max_concurrency,
-                    shard_rows,
-                    cleanup,
-                ))
+                build_controller(controller_mode, runner_for_export, sink, job_store, &config)
             }
 
             #[cfg(not(feature = "s3"))]
             {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                Arc::new(InMemoryController::with_options(
-                    runner_for_export,
-                    sink,
-                    max_concurrency,
-                    shard_rows,
-                    cleanup,
-                ))
+                build_controller(controller_mode, runner_for_export, sink, job_store, &config)
             }
         };
         state = state.with_export_controller(controller);
@@ -764,9 +804,7 @@ where
     // Inject subscription engine if enabled
     #[cfg(feature = "subscriptions")]
     let state = {
-        let subscriptions_enabled = std::env::var("HFS_SUBSCRIPTIONS_ENABLED")
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
-            .unwrap_or(false);
+        let subscriptions_enabled = config.subscriptions_enabled();
         if subscriptions_enabled {
             let smtp = build_smtp_settings_from_env();
             let messaging = build_messaging_settings_from_env(&config.base_url);
@@ -813,11 +851,64 @@ where
             };
             // Outbound auth provider was built above (static bearer when
             // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
-            let engine = helios_subscriptions::SubscriptionEngine::with_outbound_auth(
+            let mut engine = helios_subscriptions::SubscriptionEngine::with_outbound_auth(
                 sub_config,
                 config.base_url.clone(),
                 outbound_auth_provider,
             );
+
+            // Cluster delivery (design §Class B): under the pg-notify fan-out
+            // mode, wire the shared persistence seams. A backend without them
+            // warns and stays per-instance (the reindex posture); the hfs
+            // validator refuses the genuinely unsafe combinations at boot.
+            let fanout_mode = config
+                .subscriptions_fanout_mode()
+                .unwrap_or(SubscriptionsFanoutMode::Memory);
+            let mut cluster_backed = false;
+            if fanout_mode == SubscriptionsFanoutMode::PgNotify {
+                let seams = (
+                    storage_arc.subscription_state_store(),
+                    storage_arc.ws_binding_token_store(),
+                    storage_arc.subscription_hydration_source(),
+                    storage_arc.subscription_fanout(),
+                    storage_arc.subscription_delivery_outbox(),
+                );
+                match seams {
+                    (
+                        Some(state_store),
+                        Some(tokens),
+                        Some(hydration),
+                        Some(fanout),
+                        Some(outbox),
+                    ) => {
+                        let instance_id = format!("hfs-{}", uuid::Uuid::new_v4());
+                        engine =
+                            engine.with_cluster_handles(helios_subscriptions::ClusterHandles {
+                                state: state_store,
+                                tokens,
+                                hydration,
+                                fanout,
+                                outbox,
+                                instance_id: instance_id.clone(),
+                            });
+                        cluster_backed = true;
+                        info!(
+                            instance_id,
+                            "Subscriptions cluster delivery ENABLED (pg-notify fan-out)"
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            backend = storage_arc.backend_name(),
+                            "HFS_SUBSCRIPTIONS_FANOUT resolves to pg-notify but this backend \
+                             has no cluster subscription seams; subscriptions stay per-instance \
+                             (a Subscription created on one instance will not fire for writes \
+                             served by another)"
+                        );
+                    }
+                }
+            }
+
             // Server-driven status transitions are written back into the stored
             // `Subscription` (issue #357), so the engine's own decisions survive
             // a restart and `GET /Subscription/{id}` stops contradicting
@@ -843,7 +934,33 @@ where
                 );
             }
             let engine = Arc::new(engine);
-            spawn_subscription_rehydration(Arc::clone(&engine), Arc::clone(&storage_arc), &config);
+            if cluster_backed {
+                // Consume the fan-out (subscribes before hydration so no
+                // envelope is missed; processing is idempotent), start the
+                // outbox workers, and rebuild the projections from storage.
+                // Events served before hydration completes evaluate against
+                // a partial registry — bounded, and strictly better than the
+                // permanently-empty registry a restart meant before Phase 3.
+                engine.start_fanout_listener();
+                engine.spawn_outbox_workers(1);
+                let hydrating = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    hydrating.hydrate().await;
+                });
+            } else {
+                // Single-instance rehydration (issue #305). Deliberately NOT
+                // run when cluster seams are active: `hydrate()` above already
+                // rebuilds the registry from storage, and `rehydrate()` fires
+                // activation handshakes for `requested` subscriptions — which
+                // N cluster instances would each redo at boot. In cluster mode
+                // activation stays a write-time concern on the instance that
+                // served the write.
+                spawn_subscription_rehydration(
+                    Arc::clone(&engine),
+                    Arc::clone(&storage_arc),
+                    &config,
+                );
+            }
             state.with_subscription_engine(engine)
         } else {
             state

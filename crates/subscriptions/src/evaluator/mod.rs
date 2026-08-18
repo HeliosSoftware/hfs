@@ -43,9 +43,11 @@ impl EventEvaluator {
     /// 3. For each subscription, evaluate filter criteria against the resource.
     /// 4. Return subscriptions that pass all filters.
     pub fn evaluate(&self, event: &ResourceEvent) -> Vec<EvaluationMatch> {
-        let topic_matches = self
-            .topic_registry
-            .matching_topics(&event.resource_type, event.event_type);
+        let topic_matches = self.topic_registry.matching_topics(
+            event.tenant_id.as_ref(),
+            &event.resource_type,
+            event.event_type,
+        );
 
         let mut results = Vec::new();
 
@@ -93,22 +95,28 @@ mod tests {
 
     fn setup() -> (Arc<InMemoryTopicRegistry>, Arc<SubscriptionManager>) {
         let registry = Arc::new(InMemoryTopicRegistry::new());
-        registry.add_topic(TopicDefinition {
-            canonical_url: "http://example.org/topic/encounter-start".to_string(),
-            title: Some("Encounter Start".to_string()),
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Encounter".to_string(),
-                interactions: vec![ResourceEventType::Create],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![FilterDefinition {
-                resource_type: Some("Encounter".to_string()),
-                filter_parameter: "patient".to_string(),
-                comparators: vec!["eq".to_string()],
-                modifiers: vec![],
-            }],
-            notification_shape: vec![],
-        });
+        // Topics are tenant-scoped: seed for every tenant these tests use.
+        for tenant in ["t1", "tenant-a", "tenant-b"] {
+            registry.add_topic(
+                tenant,
+                TopicDefinition {
+                    canonical_url: "http://example.org/topic/encounter-start".to_string(),
+                    title: Some("Encounter Start".to_string()),
+                    resource_triggers: vec![ResourceTrigger {
+                        resource_type: "Encounter".to_string(),
+                        interactions: vec![ResourceEventType::Create],
+                        fhirpath_criteria: None,
+                    }],
+                    can_filter_by: vec![FilterDefinition {
+                        resource_type: Some("Encounter".to_string()),
+                        filter_parameter: "patient".to_string(),
+                        comparators: vec!["eq".to_string()],
+                        modifiers: vec![],
+                    }],
+                    notification_shape: vec![],
+                },
+            );
+        }
 
         let manager = Arc::new(SubscriptionManager::new(
             Arc::clone(&registry),
@@ -246,17 +254,20 @@ mod tests {
         let (registry, manager) = setup();
 
         // Add a topic that triggers on delete.
-        registry.add_topic(TopicDefinition {
-            canonical_url: "http://example.org/topic/encounter-delete".to_string(),
-            title: None,
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Encounter".to_string(),
-                interactions: vec![ResourceEventType::Delete],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![],
-            notification_shape: vec![],
-        });
+        registry.add_topic(
+            "t1",
+            TopicDefinition {
+                canonical_url: "http://example.org/topic/encounter-delete".to_string(),
+                title: None,
+                resource_triggers: vec![ResourceTrigger {
+                    resource_type: "Encounter".to_string(),
+                    interactions: vec![ResourceEventType::Delete],
+                    fhirpath_criteria: None,
+                }],
+                can_filter_by: vec![],
+                notification_shape: vec![],
+            },
+        );
 
         register_active_subscription(&manager, "t1", "sub-1", vec![]);
 

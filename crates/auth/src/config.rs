@@ -25,6 +25,13 @@ pub struct AuthConfig {
     pub allowed_algorithms: Vec<String>,
     /// Minimum interval (seconds) between JWKS refreshes.
     pub jwks_min_refresh_interval: u64,
+    /// Cluster JWKS refresh coordination selector (`HFS_AUTH_JWKS_COORDINATION`):
+    /// `local`, `database`, or `redis`. Empty when unset — resolution (cluster
+    /// defaulting, validation) happens in the server binary.
+    pub jwks_coordination: String,
+    /// Redis connection URL (`HFS_AUTH_REDIS_URL`), required when
+    /// `jwks_coordination` is `redis`.
+    pub redis_url: Option<String>,
 
     // SMART discovery endpoint fields
     /// Token endpoint URL for `/.well-known/smart-configuration`.
@@ -70,6 +77,10 @@ impl AuthConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
+            jwks_coordination: env::var("HFS_AUTH_JWKS_COORDINATION")
+                .map(|v| v.trim().to_ascii_lowercase())
+                .unwrap_or_default(),
+            redis_url: env::var("HFS_AUTH_REDIS_URL").ok(),
             smart_token_endpoint: env::var("HFS_SMART_TOKEN_ENDPOINT").ok(),
             smart_authorize_endpoint: env::var("HFS_SMART_AUTHORIZE_ENDPOINT").ok(),
             smart_jwks_url: env::var("HFS_SMART_JWKS_URL").ok(),
@@ -156,6 +167,8 @@ impl Default for AuthConfig {
                 "ES384".to_string(),
             ],
             jwks_min_refresh_interval: 10,
+            jwks_coordination: String::new(),
+            redis_url: None,
             smart_token_endpoint: None,
             smart_authorize_endpoint: None,
             smart_jwks_url: None,
@@ -183,6 +196,8 @@ mod tests {
         "HFS_AUTH_TENANT_CLAIM",
         "HFS_AUTH_ALGORITHMS",
         "HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL",
+        "HFS_AUTH_JWKS_COORDINATION",
+        "HFS_AUTH_REDIS_URL",
         "HFS_SMART_TOKEN_ENDPOINT",
         "HFS_SMART_AUTHORIZE_ENDPOINT",
         "HFS_SMART_JWKS_URL",

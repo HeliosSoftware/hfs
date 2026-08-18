@@ -1,7 +1,7 @@
 name: HFS Cluster Smoke
 
-# T3 tier of docs/cluster-testing-strategy.md (§3, §7): two hfs processes on
-# separate ports sharing one Postgres, behind an nginx round-robin front.
+# T3 tier (true multi-process end-to-end): two hfs processes on separate
+# ports sharing one Postgres, behind an nginx round-robin front.
 #
 # This is the workflow_dispatch skeleton for the cluster-capable-state work
 # (discussion #223). It lands on main ahead of the feature phases because a
@@ -9,9 +9,10 @@ name: HFS Cluster Smoke
 # it with ref=<feature-branch> to run the branch's version of this file and of
 # the smoke script. The skeleton asserts only behavior that is already
 # cluster-safe (shared-Postgres CRUD visibility A→B, round-robin through the
-# front) — it calibrates the two-instance harness. Phase 1 adds the SoF
-# $export A→B round-trip; Phase 3 adds the WebSocket fan-out A→B case; the
-# nightly kill-9 recovery cases (A1/E1) get a schedule trigger when they land.
+# front) — it calibrates the two-instance harness. Phase 1 added the SoF
+# $export A→B round-trip (check 4) and the nightly kill-9 recovery check (A1,
+# schedule-gated: kill -9 the lease holder mid-export, the survivor reclaims
+# and completes); Phase 3 adds the WebSocket fan-out A→B case.
 #
 # Cloned from bulk-export-smoke.yml: same self-hosted runners, remote Docker
 # host (containers are reached at $DOCKER_HOST_IP, the hfs binaries run on the
@@ -19,6 +20,17 @@ name: HFS Cluster Smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      nightly:
+        description: "Also run the slow kill-9 recovery check (A1)"
+        type: boolean
+        default: false
+  schedule:
+    # Nightly recovery tier (strategy §8/§10). NOTE: scheduled runs execute
+    # the default branch's copy of this workflow; until the feature branch
+    # merges, exercise the branch's version via workflow_dispatch with
+    # nightly=true and ref=<branch>.
+    - cron: "17 6 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -51,13 +63,26 @@ jobs:
       - name: Build HFS binary
         run: |
           cargo build -p helios-hfs --no-default-features \
-            --features R4,postgres
+            --features R4,postgres,subscriptions,elasticsearch
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v7
         with:
           name: hfs-cluster-smoke-binary
           path: target/debug/hfs
+          retention-days: 1
+
+      - name: Build HTS binary
+        # Phase 4 (C3): needs the postgres feature; kept alongside the
+        # sqlite+R4 defaults so a single build covers both HTS test suites.
+        run: |
+          cargo build -p helios-hts --bin hts --features postgres
+
+      - name: Upload HTS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hts-cluster-smoke-binary
+          path: target/debug/hts
           retention-days: 1
 
   cluster-smoke:
@@ -69,6 +94,12 @@ jobs:
       FHIR_VERSION: R4
       HFS_PORT_A: "18200"
       HFS_PORT_B: "18201"
+      # Dedicated postgres-elasticsearch pair for the nightly E1 kill-9
+      # check only — distinct ports so it can run alongside (or right after)
+      # the main postgres-only pair without any bind-address race.
+      HFS_E1_PORT_A: "18210"
+      HFS_E1_PORT_B: "18211"
+      NIGHTLY: ${{ (github.event_name == 'schedule' || inputs.nightly == true) && 'true' || 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -79,10 +110,18 @@ jobs:
           name: hfs-cluster-smoke-binary
           path: target/debug
 
+      - name: Download HTS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hts-cluster-smoke-binary
+          path: target/debug
+
       - name: Make executables available
         run: |
           chmod +x target/debug/hfs
+          chmod +x target/debug/hts
           chmod +x crates/hfs/tests/cluster/run_external_cluster_smoke.sh
+          chmod +x crates/hfs/tests/cluster/run_external_hts_cluster_smoke.sh
 
       - name: Determine runner and Docker host IP
         run: |
@@ -142,11 +181,20 @@ jobs:
               ''      close;
             }
             upstream hfs_cluster {
-              server $RUNNER_IP:$HFS_PORT_A;
-              server $RUNNER_IP:$HFS_PORT_B;
+              # max_fails=0: never blacklist an upstream. The default
+              # (max_fails=1 fail_timeout=10s) turns one refused connect into
+              # a 10s "no live upstreams" window — a probe that races instance
+              # startup would poison every request that follows it.
+              server $RUNNER_IP:$HFS_PORT_A max_fails=0;
+              server $RUNNER_IP:$HFS_PORT_B max_fails=0;
             }
             server {
               listen 80;
+              # Answered by nginx itself — readiness probes must not go
+              # through the upstreams, which may not be started yet.
+              location = /nginx-health {
+                return 200 "ok\n";
+              }
               location / {
                 proxy_pass http://hfs_cluster;
                 proxy_http_version 1.1;
@@ -166,12 +214,12 @@ jobs:
           docker start "$NGINX_CONTAINER"
           echo "NGINX_CONTAINER=$NGINX_CONTAINER" >> "$GITHUB_ENV"
 
-          # hfs is not up yet, so accept any HTTP answer (502 included) as
-          # proof that nginx itself is serving.
+          # Probe the nginx-local endpoint: hfs is not up yet, and a proxied
+          # request would count as an upstream failure.
           for i in {1..30}; do
             NGINX_PORT=$(docker port "$NGINX_CONTAINER" 80 2>/dev/null | head -1 | sed 's/.*://')
             if [ -n "$NGINX_PORT" ] \
-                && curl -s -o /dev/null "http://$DOCKER_HOST_IP:$NGINX_PORT/health"; then
+                && curl -sf -o /dev/null "http://$DOCKER_HOST_IP:$NGINX_PORT/nginx-health"; then
               echo "NGINX_PORT=$NGINX_PORT" >> "$GITHUB_ENV"
               echo "FRONT_URL=http://$DOCKER_HOST_IP:$NGINX_PORT" >> "$GITHUB_ENV"
               echo "nginx front is ready on port $NGINX_PORT"
@@ -191,6 +239,14 @@ jobs:
 
           # One logical cluster: both instances share the database and the
           # public base URL (the nginx front), differing only in port.
+          #
+          # SoF export (Phase 1, #169) runs on the shared cluster job store;
+          # both instances run from this runner host, so a shared export
+          # directory stands in for the shared object store. HFS_CLUSTER=true
+          # is deliberately NOT set here: its fail-fast validator (rightly)
+          # refuses HFS_EXPORT_SINK=fs, and S3 is out of scope for the smoke.
+          SHARED_EXPORT_DIR="$PWD/cluster-shared-exports"
+          mkdir -p "$SHARED_EXPORT_DIR"
           COMMON_ENV=(
             HFS_BASE_URL="$FRONT_URL"
             HFS_DEFAULT_FHIR_VERSION="$FHIR_VERSION"
@@ -202,7 +258,16 @@ jobs:
             HFS_PG_DBNAME=helios
             HFS_PG_USER=helios
             HFS_PG_PASSWORD=helios
+            HFS_JOB_STORE_BACKEND=database
+            HFS_EXPORT_CONTROLLER=database
+            HFS_EXPORT_DIR="$SHARED_EXPORT_DIR"
+            HFS_SUBSCRIPTIONS_ENABLED=true
+            HFS_SUBSCRIPTIONS_FANOUT=pg-notify
           )
+
+          # Persisted so the nightly kill-9 check can restart an instance
+          # with identical configuration (values are space-free).
+          printf '%s\n' "${COMMON_ENV[@]}" > "$RESULTS_DIR/cluster-env.list"
 
           HFS_LOG_A="$RESULTS_DIR/hfs-a.log"
           HFS_LOG_B="$RESULTS_DIR/hfs-b.log"
@@ -240,6 +305,90 @@ jobs:
           wait_ready A "$HFS_PID_A" "$HFS_PORT_A" "$HFS_LOG_A"
           wait_ready B "$HFS_PID_B" "$HFS_PORT_B" "$HFS_LOG_B"
 
+      - name: Start HTS instances A and B (Phase 4, C3)
+        run: |
+          # HTS is its own binary with its own Postgres pool, sharing the
+          # same database as the two hfs instances (HTS's tables are
+          # distinctly named — no collision). epoch mode is set explicitly:
+          # this check exists to prove that mode works, not HTS's local
+          # default.
+          HTS_LOG_A="$RESULTS_DIR/hts-a.log"
+          HTS_LOG_B="$RESULTS_DIR/hts-b.log"
+          echo "HTS_LOG_A=$HTS_LOG_A" >> "$GITHUB_ENV"
+          echo "HTS_LOG_B=$HTS_LOG_B" >> "$GITHUB_ENV"
+          echo "HTS_PORT_A=18400" >> "$GITHUB_ENV"
+          echo "HTS_PORT_B=18401" >> "$GITHUB_ENV"
+
+          env \
+            HTS_SERVER_PORT=18400 \
+            HTS_SERVER_HOST=0.0.0.0 \
+            HTS_DATABASE_URL="$PG_URL" \
+            HTS_STORAGE_BACKEND=postgres \
+            HTS_TERMINOLOGY_CACHE_INVALIDATION=epoch \
+            ./target/debug/hts run > "$HTS_LOG_A" 2>&1 &
+          echo "HTS_PID_A=$!" >> "$GITHUB_ENV"
+
+          env \
+            HTS_SERVER_PORT=18401 \
+            HTS_SERVER_HOST=0.0.0.0 \
+            HTS_DATABASE_URL="$PG_URL" \
+            HTS_STORAGE_BACKEND=postgres \
+            HTS_TERMINOLOGY_CACHE_INVALIDATION=epoch \
+            ./target/debug/hts run > "$HTS_LOG_B" 2>&1 &
+          echo "HTS_PID_B=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for both HTS instances to be ready
+        run: |
+          wait_ready() {
+            local name="$1" pid="$2" port="$3" log="$4"
+            for i in {1..45}; do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                echo "HTS instance $name exited"
+                cat "$log"
+                return 1
+              fi
+              if curl -sf "http://localhost:$port/health" >/dev/null 2>&1; then
+                echo "HTS instance $name is ready on port $port"
+                return 0
+              fi
+              echo "Attempt $i/45: HTS instance $name not ready yet..."
+              sleep 2
+            done
+            tail -100 "$log"
+            return 1
+          }
+          wait_ready A "$HTS_PID_A" "$HTS_PORT_A" "$HTS_LOG_A"
+          wait_ready B "$HTS_PID_B" "$HTS_PORT_B" "$HTS_LOG_B"
+
+      # Check 5 (Phase 3 WS fan-out) needs a websocket client; same pinned
+      # build the subscriptions smoke uses.
+      - name: Install websocat
+        run: |
+          if command -v websocat >/dev/null 2>&1; then
+            echo "WEBSOCAT_BIN=$(command -v websocat)" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64)
+              ASSET="websocat.x86_64-unknown-linux-musl"
+              ;;
+            aarch64|arm64)
+              ASSET="websocat.aarch64-unknown-linux-musl"
+              ;;
+            *)
+              echo "::error::Unsupported architecture for websocat install: $ARCH"
+              exit 1
+              ;;
+          esac
+
+          WEBSOCAT_PATH="/tmp/websocat"
+          curl -fsSL "https://github.com/vi/websocat/releases/download/v1.13.0/${ASSET}" -o "$WEBSOCAT_PATH"
+          chmod +x "$WEBSOCAT_PATH"
+          echo "WEBSOCAT_BIN=$WEBSOCAT_PATH" >> $GITHUB_ENV
+          "$WEBSOCAT_PATH" --version
+
       - name: Run cluster smoke checks
         run: |
           BASE_URL_A="http://localhost:$HFS_PORT_A" \
@@ -248,12 +397,142 @@ jobs:
           FHIR_VERSION="$FHIR_VERSION" \
           RESULTS_DIR="$RESULTS_DIR" \
           SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}" \
+          WEBSOCAT_BIN="$WEBSOCAT_BIN" \
           ./crates/hfs/tests/cluster/run_external_cluster_smoke.sh
+
+      - name: Run HTS cluster smoke check (Phase 4, C3)
+        run: |
+          HTS_BASE_URL_A="http://localhost:$HTS_PORT_A" \
+          HTS_BASE_URL_B="http://localhost:$HTS_PORT_B" \
+          RESULTS_DIR="$RESULTS_DIR" \
+          SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}" \
+          ./crates/hfs/tests/cluster/run_external_hts_cluster_smoke.sh
+
+      - name: Nightly kill-9 recovery check (A1)
+        if: env.NIGHTLY == 'true'
+        run: |
+          BASE_URL_A="http://localhost:$HFS_PORT_A" \
+          BASE_URL_B="http://localhost:$HFS_PORT_B" \
+          FHIR_VERSION="$FHIR_VERSION" \
+          RESULTS_DIR="$RESULTS_DIR" \
+          HFS_BINARY="./target/debug/hfs" \
+          CLUSTER_ENV_FILE="$RESULTS_DIR/cluster-env.list" \
+          ./crates/hfs/tests/cluster/run_nightly_kill9_check.sh
+
+      # --- Nightly E1 kill-9 recovery check (Phase 4) -------------------------
+      # Needs a dedicated postgres-elasticsearch pair: the main A/B instances
+      # above are plain postgres (no composite secondary, so no
+      # composite_sync_outbox activity to crash-test). Sharing $PG_URL/
+      # $PG_CONTAINER, new Elasticsearch container, new ports.
+
+      - name: Start Elasticsearch (nightly E1 kill-9 check)
+        if: env.NIGHTLY == 'true'
+        run: |
+          ES_CONTAINER="es-cluster-smoke-e1-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$ES_CONTAINER" -p 0:9200 \
+            -e "discovery.type=single-node" \
+            -e "xpack.security.enabled=false" \
+            -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+            elasticsearch:8.15.0
+          echo "ES_CONTAINER=$ES_CONTAINER" >> "$GITHUB_ENV"
+
+          for i in {1..30}; do
+            ES_PORT=$(docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$ES_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" >/dev/null 2>&1; then
+              echo "ES_PORT=$ES_PORT" >> "$GITHUB_ENV"
+              echo "Elasticsearch is ready on port $ES_PORT"
+              exit 0
+            fi
+            echo "Attempt $i/30: Elasticsearch not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$ES_CONTAINER"
+          exit 1
+
+      - name: Start postgres-elasticsearch instances A and B (nightly E1 kill-9 check)
+        if: env.NIGHTLY == 'true'
+        run: |
+          E1_TENANT="cluster-e1-${{ github.run_id }}-${{ github.run_attempt }}"
+          E1_ENV=(
+            HFS_BASE_URL="http://localhost:$HFS_E1_PORT_A"
+            HFS_DEFAULT_FHIR_VERSION=R4
+            HFS_DEFAULT_TENANT="$E1_TENANT"
+            HFS_STORAGE_BACKEND=postgres-elasticsearch
+            HFS_DATABASE_URL="$PG_URL"
+            HFS_PG_HOST="$DOCKER_HOST_IP"
+            HFS_PG_PORT="$PG_PORT"
+            HFS_PG_DBNAME=helios
+            HFS_PG_USER=helios
+            HFS_PG_PASSWORD=helios
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT"
+          )
+          printf '%s\n' "${E1_ENV[@]}" > "$RESULTS_DIR/cluster-e1-env.list"
+
+          HFS_LOG_E1_A="$RESULTS_DIR/hfs-e1-a.log"
+          HFS_LOG_E1_B="$RESULTS_DIR/hfs-e1-b.log"
+          echo "HFS_LOG_E1_A=$HFS_LOG_E1_A" >> "$GITHUB_ENV"
+          echo "HFS_LOG_E1_B=$HFS_LOG_E1_B" >> "$GITHUB_ENV"
+
+          env "${E1_ENV[@]}" \
+            ./target/debug/hfs --log-level info --port "$HFS_E1_PORT_A" --host 0.0.0.0 > "$HFS_LOG_E1_A" 2>&1 &
+          echo "HFS_E1_PID_A=$!" >> "$GITHUB_ENV"
+
+          env "${E1_ENV[@]}" \
+            ./target/debug/hfs --log-level info --port "$HFS_E1_PORT_B" --host 0.0.0.0 > "$HFS_LOG_E1_B" 2>&1 &
+          echo "HFS_E1_PID_B=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for postgres-elasticsearch instances to be ready (nightly E1 kill-9 check)
+        if: env.NIGHTLY == 'true'
+        run: |
+          wait_ready() {
+            local name="$1" pid="$2" port="$3" log="$4"
+            for i in {1..45}; do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                echo "HFS E1 instance $name exited"
+                cat "$log"
+                return 1
+              fi
+              if curl -sf "http://localhost:$port/health" >/dev/null 2>&1; then
+                echo "HFS E1 instance $name is ready on port $port"
+                return 0
+              fi
+              echo "Attempt $i/45: HFS E1 instance $name not ready yet..."
+              sleep 2
+            done
+            tail -100 "$log"
+            return 1
+          }
+          wait_ready A "$HFS_E1_PID_A" "$HFS_E1_PORT_A" "$HFS_LOG_E1_A"
+          wait_ready B "$HFS_E1_PID_B" "$HFS_E1_PORT_B" "$HFS_LOG_E1_B"
+
+      - name: Nightly kill-9 recovery check (E1)
+        if: env.NIGHTLY == 'true'
+        run: |
+          BASE_URL_A="http://localhost:$HFS_E1_PORT_A" \
+          BASE_URL_B="http://localhost:$HFS_E1_PORT_B" \
+          RESULTS_DIR="$RESULTS_DIR" \
+          HFS_PID_A="$HFS_E1_PID_A" \
+          HFS_PID_B="$HFS_E1_PID_B" \
+          HFS_PORT_B="$HFS_E1_PORT_B" \
+          HFS_BINARY="./target/debug/hfs" \
+          CLUSTER_ENV_FILE="$RESULTS_DIR/cluster-e1-env.list" \
+          ./crates/hfs/tests/cluster/run_nightly_e1_kill9_check.sh
 
       - name: Stop HFS instances gracefully
         if: always()
         run: |
-          for pid in "${HFS_PID_A:-}" "${HFS_PID_B:-}"; do
+          NIGHTLY_B_PID=""
+          if [ -f "$RESULTS_DIR/nightly-b.pid" ]; then
+            NIGHTLY_B_PID="$(cat "$RESULTS_DIR/nightly-b.pid")"
+          fi
+          NIGHTLY_E1_B_PID=""
+          if [ -f "$RESULTS_DIR/nightly-e1-b.pid" ]; then
+            NIGHTLY_E1_B_PID="$(cat "$RESULTS_DIR/nightly-e1-b.pid")"
+          fi
+          for pid in "${HFS_PID_A:-}" "${HFS_PID_B:-}" "${HTS_PID_A:-}" "${HTS_PID_B:-}" \
+                     "${HFS_E1_PID_A:-}" "${HFS_E1_PID_B:-}" "$NIGHTLY_B_PID" "$NIGHTLY_E1_B_PID"; do
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
               kill -INT "$pid" 2>/dev/null || true
               for _ in {1..50}; do
@@ -276,6 +555,9 @@ jobs:
           fi
           if [ -n "${NGINX_CONTAINER:-}" ]; then
             docker logs "$NGINX_CONTAINER" > "$RESULTS_DIR/backend-logs/nginx.log" 2>&1 || true
+          fi
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker logs "$ES_CONTAINER" > "$RESULTS_DIR/backend-logs/elasticsearch.log" 2>&1 || true
           fi
 
       - name: Append smoke report to summary
@@ -305,4 +587,7 @@ jobs:
           fi
           if [ -n "${NGINX_CONTAINER:-}" ]; then
             docker rm -fv "$NGINX_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
           fi

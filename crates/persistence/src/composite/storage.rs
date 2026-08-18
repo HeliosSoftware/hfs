@@ -293,9 +293,18 @@ impl CompositeStorage {
         let router = QueryRouter::new(config.clone());
         let merger = ResultMerger::new();
 
-        // Create sync manager if we have secondaries
+        // Create sync manager if we have secondaries. Capability-based, not
+        // `HFS_CLUSTER`-gated: wire the durable outbox (E1) unconditionally
+        // whenever the primary backend can back one (a Postgres primary) —
+        // see the module doc on `crate::core::composite_sync_outbox` for why
+        // this is unconditional rather than mirroring the other cluster
+        // seams' higher-layer activation gating.
         let sync_manager = if !secondaries.is_empty() {
-            Some(SyncManager::new(config.sync_config.clone()))
+            let mut manager = SyncManager::new(config.sync_config.clone());
+            if let Some(outbox) = primary.composite_sync_outbox() {
+                manager = manager.with_composite_sync_outbox(outbox);
+            }
+            Some(manager)
         } else {
             None
         };
@@ -358,6 +367,8 @@ impl CompositeStorage {
                 SyncMode::Asynchronous | SyncMode::Hybrid { .. }
             ) {
                 manager.start_async_worker(self.secondaries.clone());
+                // No-op unless a durable outbox was wired in `new()` (E1).
+                manager.spawn_composite_sync_workers(self.secondaries.clone(), 1);
             }
         }
         self
@@ -466,6 +477,23 @@ impl CompositeStorage {
             sync_manager.sync(&event, &self.secondaries).await?;
         }
         Ok(())
+    }
+
+    /// One deterministic composite-sync outbox worker cycle (E1) — the test
+    /// seam for driving the durable outbox without spawning a poller.
+    /// Returns `false` when no outbox is wired (no secondaries, or a
+    /// non-Postgres primary) or nothing is currently claimable.
+    pub async fn run_next_composite_sync(
+        &self,
+        worker_id: &crate::core::composite_sync_outbox::WorkerId,
+        lease_duration: std::time::Duration,
+    ) -> bool {
+        let Some(ref sync_manager) = self.sync_manager else {
+            return false;
+        };
+        sync_manager
+            .run_next_composite_sync(worker_id, lease_duration, &self.secondaries)
+            .await
     }
 
     /// Routes and executes a search query.
@@ -770,6 +798,57 @@ impl ResourceStorage for CompositeStorage {
         // primary is SOF-capable (e.g. sqlite-elasticsearch) thus expose a
         // runner; others inherit `None`.
         self.primary.sof_runner()
+    }
+
+    // The cluster seams all live on the primary store (the shared database
+    // every instance writes to), so a composite forwards each one. Without
+    // these a postgres-elasticsearch composite would silently report "no
+    // cluster stores" and stay per-instance.
+
+    fn cluster_job_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_job_store::ClusterJobStore>> {
+        self.primary.cluster_job_store()
+    }
+
+    fn cluster_refresh_cache(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_refresh_cache::ClusterRefreshCache>> {
+        self.primary.cluster_refresh_cache()
+    }
+
+    fn subscription_state_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionStateStore>> {
+        self.primary.subscription_state_store()
+    }
+
+    fn subscription_hydration_source(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionHydrationSource>> {
+        self.primary.subscription_hydration_source()
+    }
+
+    fn subscription_delivery_outbox(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_delivery::SubscriptionDeliveryOutbox>> {
+        self.primary.subscription_delivery_outbox()
+    }
+
+    fn composite_sync_outbox(
+        &self,
+    ) -> Option<Arc<dyn crate::core::composite_sync_outbox::CompositeSyncOutbox>> {
+        self.primary.composite_sync_outbox()
+    }
+
+    fn ws_binding_token_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::ws_binding_tokens::WsBindingTokenStore>> {
+        self.primary.ws_binding_token_store()
+    }
+
+    fn subscription_fanout(&self) -> Option<Arc<dyn crate::core::event_fanout::EventFanout>> {
+        self.primary.subscription_fanout()
     }
 
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type))]
@@ -2877,6 +2956,196 @@ mod tests {
             .search_backend("es", BackendKind::Elasticsearch)
             .build()
             .unwrap()
+    }
+
+    /// Minimal mock primary that exposes every cluster seam (the shape of a
+    /// shared-database primary like Postgres), for the delegation tests.
+    struct MockClusterPrimary;
+
+    #[async_trait]
+    impl ResourceStorage for MockClusterPrimary {
+        fn backend_name(&self) -> &'static str {
+            "cluster-mock"
+        }
+
+        async fn create(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            let id = uuid::Uuid::new_v4().to_string();
+            Ok(StoredResource::new(
+                resource_type,
+                &id,
+                tenant.tenant_id().clone(),
+                resource,
+                fhir_version,
+            ))
+        }
+
+        async fn create_or_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            Ok((
+                StoredResource::new(
+                    resource_type,
+                    id,
+                    tenant.tenant_id().clone(),
+                    resource,
+                    fhir_version,
+                ),
+                true,
+            ))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            tenant: &TenantContext,
+            current: &StoredResource,
+            resource: Value,
+        ) -> StorageResult<StoredResource> {
+            Ok(StoredResource::new(
+                current.resource_type(),
+                current.id(),
+                tenant.tenant_id().clone(),
+                resource,
+                current.fhir_version(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        fn cluster_job_store(
+            &self,
+        ) -> Option<Arc<dyn crate::core::cluster_job_store::ClusterJobStore>> {
+            Some(Arc::new(
+                crate::core::cluster_job_store::testing::InMemoryClusterJobStore::new(),
+            ))
+        }
+
+        fn cluster_refresh_cache(
+            &self,
+        ) -> Option<Arc<dyn crate::core::cluster_refresh_cache::ClusterRefreshCache>> {
+            Some(Arc::new(
+                crate::core::cluster_refresh_cache::testing::InMemoryClusterRefreshCache::new(),
+            ))
+        }
+
+        fn subscription_state_store(
+            &self,
+        ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionStateStore>> {
+            Some(Arc::new(
+                crate::core::subscription_state::testing::InMemorySubscriptionStateStore::new(),
+            ))
+        }
+
+        fn subscription_hydration_source(
+            &self,
+        ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionHydrationSource>> {
+            Some(Arc::new(
+                crate::core::subscription_state::testing::InMemoryHydrationSource::new(),
+            ))
+        }
+
+        fn subscription_delivery_outbox(
+            &self,
+        ) -> Option<Arc<dyn crate::core::subscription_delivery::SubscriptionDeliveryOutbox>>
+        {
+            Some(Arc::new(
+                crate::core::subscription_delivery::testing::InMemoryDeliveryOutbox::new(),
+            ))
+        }
+
+        fn ws_binding_token_store(
+            &self,
+        ) -> Option<Arc<dyn crate::core::ws_binding_tokens::WsBindingTokenStore>> {
+            Some(Arc::new(
+                crate::core::ws_binding_tokens::testing::InMemoryWsTokenStore::new(),
+            ))
+        }
+
+        fn subscription_fanout(&self) -> Option<Arc<dyn crate::core::event_fanout::EventFanout>> {
+            Some(Arc::new(
+                crate::core::event_fanout::testing::InMemoryEventFanout::default(),
+            ))
+        }
+
+        fn composite_sync_outbox(
+            &self,
+        ) -> Option<Arc<dyn crate::core::composite_sync_outbox::CompositeSyncOutbox>> {
+            Some(Arc::new(
+                crate::core::composite_sync_outbox::testing::InMemorySyncOutbox::new(),
+            ))
+        }
+    }
+
+    /// Every cluster seam forwards to the primary: a composite over a
+    /// seam-capable primary exposes them all; one over a seam-less primary
+    /// inherits `None` for them all.
+    #[test]
+    fn cluster_seams_delegate_to_the_primary() {
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Postgres)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert(
+            "primary".to_string(),
+            Arc::new(MockClusterPrimary) as DynStorage,
+        );
+        backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
+        let composite = CompositeStorage::new(config, backends).unwrap();
+
+        assert!(composite.cluster_job_store().is_some());
+        assert!(composite.cluster_refresh_cache().is_some());
+        assert!(composite.subscription_state_store().is_some());
+        assert!(composite.subscription_hydration_source().is_some());
+        assert!(composite.subscription_delivery_outbox().is_some());
+        assert!(composite.ws_binding_token_store().is_some());
+        assert!(composite.subscription_fanout().is_some());
+        assert!(composite.composite_sync_outbox().is_some());
+
+        let plain = make_composite_no_secondary();
+        assert!(plain.cluster_job_store().is_none());
+        assert!(plain.cluster_refresh_cache().is_none());
+        assert!(plain.subscription_state_store().is_none());
+        assert!(plain.subscription_hydration_source().is_none());
+        assert!(plain.subscription_delivery_outbox().is_none());
+        assert!(plain.ws_binding_token_store().is_none());
+        assert!(plain.subscription_fanout().is_none());
+        assert!(plain.composite_sync_outbox().is_none());
     }
 
     // ── PurgableStorage fan-out ────────────────────────────────────

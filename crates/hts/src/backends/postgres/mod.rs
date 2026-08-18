@@ -3,11 +3,14 @@
 //! Gated by the `postgres` feature flag. Uses `deadpool-postgres` for async
 //! connection pooling and `tokio-postgres` for query execution.
 
+pub mod epoch;
 pub mod schema;
 
 mod code_system;
 mod concept_map;
 mod value_set;
+
+pub use epoch::EpochGuard;
 
 use async_trait::async_trait;
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
@@ -114,6 +117,10 @@ pub struct PostgresTerminologyBackend {
     /// `$translate` response memo — CM01/CM02 hot paths repeat the same
     /// (system, code, target) tuples across pool entries.
     pub(super) translate_response_cache: TranslateResponseCache,
+    /// Cross-instance cache-freshness check (C3). Disabled
+    /// (`HTS_TERMINOLOGY_CACHE_INVALIDATION=local`, the default) unless
+    /// replaced via [`Self::with_epoch_guard`].
+    pub(super) epoch: Arc<EpochGuard>,
 }
 
 impl PostgresTerminologyBackend {
@@ -155,6 +162,8 @@ impl PostgresTerminologyBackend {
 
         info!(database_url, "PostgreSQL terminology backend initialized");
 
+        let epoch = Arc::new(EpochGuard::disabled(pool.clone()));
+
         Ok(Self {
             pool,
             inline_compose_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -162,7 +171,24 @@ impl PostgresTerminologyBackend {
             cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
             subsumes_response_cache: Arc::new(RwLock::new(HashMap::new())),
             translate_response_cache: Arc::new(RwLock::new(HashMap::new())),
+            epoch,
         })
+    }
+
+    /// Replaces the (disabled-by-default) epoch guard, enabling cross-instance
+    /// cache invalidation (C3) when `HTS_TERMINOLOGY_CACHE_INVALIDATION=epoch`.
+    /// The returned `Arc<EpochGuard>` should also be threaded onto every
+    /// `AppState` built over this backend (`AppState::with_epoch_guard`) —
+    /// the two share one guard because they own disjoint cache sets that each
+    /// independently decide whether to clear on a detected epoch transition.
+    pub fn with_epoch_guard(mut self, enabled: bool, memo_window: std::time::Duration) -> Self {
+        self.epoch = Arc::new(EpochGuard::new(self.pool.clone(), enabled, memo_window));
+        self
+    }
+
+    /// The shared epoch guard, for threading onto `AppState`.
+    pub fn epoch_guard(&self) -> Arc<EpochGuard> {
+        Arc::clone(&self.epoch)
     }
 
     /// Borrow the underlying `deadpool-postgres` connection pool.
@@ -213,6 +239,10 @@ impl TerminologyCaches for PostgresTerminologyBackend {
         let Self {
             // Not a cache: the connection pool itself.
             pool: _,
+            // Not a cache either: the C3 epoch guard is the cross-instance
+            // invalidation *mechanism* (its bump is async and lives on the
+            // mutation paths, not here).
+            epoch: _,
             inline_compose_cache,
             lookup_response_cache,
             cs_resolved_meta_cache,
@@ -494,6 +524,14 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         // newly-imported codes.
         self.invalidate_caches();
 
+        // Best-effort, not transactional with the write above (see
+        // EpochGuard::bump doc) — informs other instances (and this
+        // instance's own AppState-layer handler caches, cleared separately
+        // via check_appstate) that terminology data changed.
+        if let Err(e) = self.epoch.bump().await {
+            tracing::warn!(error = %e, "failed to bump terminology epoch after import");
+        }
+
         Ok(stats)
     }
 
@@ -579,6 +617,10 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         // Invalidate per-instance response caches — they may reference the
         // now-deleted resource.
         self.invalidate_caches();
+
+        if let Err(e) = self.epoch.bump().await {
+            tracing::warn!(error = %e, "failed to bump terminology epoch after delete");
+        }
 
         Ok(())
     }

@@ -1,0 +1,83 @@
+name: HFS Redis Cluster Tests
+
+# Runs the Redis twin of the T2 cluster suites: the Redis seam gets the
+# identical assertions as the CI-default DB backend, without adding Redis to
+# every CI run or making it a merge blocker.
+# Today that is the C2 JWKS-coordination twin
+# (crates/auth/tests/jwks_cluster_redis.rs), gated in-code behind
+# RUN_REDIS_CLUSTER_TESTS=1.
+#
+# Triggers: any PR touching crates/auth (where the Redis coordinator lives),
+# a nightly schedule, and manual dispatch. NOTE: scheduled runs execute the
+# default branch's copy of this workflow; until the feature branch merges,
+# exercise the branch's version via workflow_dispatch with ref=<branch>.
+
+on:
+  pull_request:
+    paths:
+      - "crates/auth/**"
+      - ".github/workflows/redis-cluster-tests.yml"
+  schedule:
+    - cron: "43 6 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+
+jobs:
+  redis-cluster-tests:
+    name: Redis Cluster Tests
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Verify DOCKER_HOST is set
+        if: env.DOCKER_HOST == ''
+        run: |
+          echo "::error::DOCKER_HOST secret is not set. Testcontainers require DOCKER_HOST to connect to Docker."
+          exit 1
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD (Linux)
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Run the Redis cluster twin suites
+        env:
+          RUN_REDIS_CLUSTER_TESTS: "1"
+        run: |
+          cargo test -p helios-auth --features redis --test jwks_cluster_redis -- --nocapture
+
+  cleanup-test-containers:
+    name: Cleanup Test Containers
+    runs-on: [self-hosted, Linux]
+    needs: [redis-cluster-tests]
+    if: always()
+    steps:
+      - name: Reap this run's testcontainers
+        run: |
+          # Same rationale as ci.yml: the shared container is parked in a
+          # static OnceCell and never dropped; the github.run_id label is the
+          # only cleanup path.
+          #
+          # `-v` for the same reason as ci.yml: the redis image declares
+          # VOLUME /data, so every testcontainer here leaves an anonymous
+          # volume behind that plain `docker rm -f` never reclaims. This
+          # workflow arrived with #269, after the repo-wide `-v` sweep, so it
+          # has to opt in explicitly.
+          docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" \
+            | xargs -r docker rm -fv || true

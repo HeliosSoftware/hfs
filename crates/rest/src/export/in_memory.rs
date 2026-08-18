@@ -141,8 +141,9 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
     }
 }
 
+#[async_trait::async_trait]
 impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink> {
-    fn submit(&self, task: ExportTask) -> JobId {
+    async fn submit(&self, task: ExportTask) -> JobId {
         let job_id = Uuid::new_v4().to_string();
         let submitted_at = Utc::now();
 
@@ -169,31 +170,18 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             // Acquire concurrency permit (blocks if too many jobs running)
             let _permit = semaphore.acquire().await;
 
+            let progress = InMemoryProgress {
+                jobs: Arc::clone(&jobs),
+                jid: jid.clone(),
+                submitted_at,
+            };
             let outcome = match &task.work {
                 ExportWork::Views(views) => {
-                    run_views_job(
-                        &jobs,
-                        &jid,
-                        submitted_at,
-                        &runner,
-                        &sink,
-                        shard_rows,
-                        &task,
-                        views,
-                    )
-                    .await
+                    run_views_job(&jid, &runner, &sink, shard_rows, &task, views, &progress).await
                 }
                 ExportWork::SqlQueries { queries, limits } => {
                     run_sqlquery_job(
-                        &jobs,
-                        &jid,
-                        submitted_at,
-                        &runner,
-                        &sink,
-                        shard_rows,
-                        &task,
-                        queries,
-                        *limits,
+                        &jid, &runner, &sink, shard_rows, &task, queries, *limits, &progress,
                     )
                     .await
                 }
@@ -252,14 +240,14 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         job_id
     }
 
-    fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
+    async fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
         if !self.tenant_matches(tenant_id, job_id) {
             return None;
         }
         self.jobs.get(job_id).map(|v| v.clone())
     }
 
-    fn cancel(&self, tenant_id: &str, job_id: &str) -> bool {
+    async fn cancel(&self, tenant_id: &str, job_id: &str) -> bool {
         if !self.tenant_matches(tenant_id, job_id) {
             return false;
         }
@@ -297,7 +285,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         true
     }
 
-    fn read_shard(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<Vec<u8>> {
+    async fn read_shard(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<Vec<u8>> {
         if !self.tenant_matches(tenant_id, job_id) {
             return None;
         }
@@ -312,7 +300,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         self.sink.read_shard(job_id, filename)
     }
 
-    fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String> {
+    async fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String> {
         if !self.tenant_matches(tenant_id, job_id) {
             return None;
         }
@@ -384,6 +372,37 @@ fn ext_for(format: &str) -> &'static str {
 /// A job cancelled mid-run keeps its `Cancelled` state: the spec requires
 /// status polls after a DELETE to return 404, so a background task that
 /// finishes anyway must not resurrect the job to Completed/Failed.
+/// Per-unit progress hook shared by the export execution functions
+/// ([`run_views_job`] / [`run_sqlquery_job`]) so both controllers reuse them:
+/// the in-memory controller writes a `Running {{ percent }}` status, the
+/// database controller persists a progress snapshot to the shared job store
+/// and observes cross-instance cancellation.
+///
+/// Returning `false` asks the job to stop early (cancellation / lost lease);
+/// the execution functions surface that as an error the caller maps to a
+/// terminal state (which a cancelled job then refuses — see
+/// `set_status_if_running` and the store's fenced writes).
+#[async_trait::async_trait]
+pub(crate) trait JobProgress: Send + Sync {
+    /// Reports `done` of `total` work units finished.
+    async fn advance(&self, done: u32, total: u32) -> bool;
+}
+
+/// [`JobProgress`] for the in-memory controller: percent into the DashMap.
+struct InMemoryProgress {
+    jobs: Arc<DashMap<String, JobStatus>>,
+    jid: String,
+    submitted_at: DateTime<Utc>,
+}
+
+#[async_trait::async_trait]
+impl JobProgress for InMemoryProgress {
+    async fn advance(&self, done: u32, total: u32) -> bool {
+        record_progress(&self.jobs, &self.jid, self.submitted_at, done, total);
+        true
+    }
+}
+
 fn set_status_if_running(jobs: &DashMap<String, JobStatus>, jid: &str, status: JobStatus) {
     if let Some(mut entry) = jobs.get_mut(jid) {
         if matches!(&*entry, JobStatus::Running { .. }) {
@@ -417,15 +436,14 @@ fn record_progress(
 /// `$viewdefinition-export` work: run each named ViewDefinition through the
 /// `SofRunner` and shard its rows into output files.
 #[allow(clippy::too_many_arguments)]
-async fn run_views_job<Sink: ExportSink>(
-    jobs: &DashMap<String, JobStatus>,
+pub(crate) async fn run_views_job<Sink: ExportSink>(
     jid: &str,
-    submitted_at: DateTime<Utc>,
     runner: &Arc<dyn SofRunner>,
     sink: &Sink,
     shard_rows: usize,
     task: &ExportTask,
     views: &[NamedView],
+    progress: &dyn JobProgress,
 ) -> Result<(Vec<CompletedFile>, usize), String> {
     let view_count = views.len().max(1) as u32;
     let format = task.format.to_lowercase();
@@ -486,7 +504,9 @@ async fn run_views_job<Sink: ExportSink>(
             });
         }
 
-        record_progress(jobs, jid, submitted_at, (view_idx as u32) + 1, view_count);
+        if !progress.advance((view_idx as u32) + 1, view_count).await {
+            return Err("export cancelled".to_string());
+        }
     }
 
     Ok((completed_files, total_rows))
@@ -496,16 +516,15 @@ async fn run_views_job<Sink: ExportSink>(
 /// `SofRunner`, execute the pre-validated SQL, and shard the result rows into
 /// output files.
 #[allow(clippy::too_many_arguments)]
-async fn run_sqlquery_job<Sink: ExportSink>(
-    jobs: &DashMap<String, JobStatus>,
+pub(crate) async fn run_sqlquery_job<Sink: ExportSink>(
     jid: &str,
-    submitted_at: DateTime<Utc>,
     runner: &Arc<dyn SofRunner>,
     sink: &Sink,
     shard_rows: usize,
     task: &ExportTask,
     queries: &[NamedSqlQuery],
     limits: SqlExportLimits,
+    progress: &dyn JobProgress,
 ) -> Result<(Vec<CompletedFile>, usize), String> {
     let query_count = queries.len().max(1) as u32;
     let format = task.format.to_lowercase();
@@ -539,7 +558,9 @@ async fn run_sqlquery_job<Sink: ExportSink>(
             });
         }
 
-        record_progress(jobs, jid, submitted_at, (query_idx as u32) + 1, query_count);
+        if !progress.advance((query_idx as u32) + 1, query_count).await {
+            return Err("export cancelled".to_string());
+        }
     }
 
     Ok((completed_files, total_rows))
@@ -824,27 +845,29 @@ mod tests {
             InMemoryController::new(runner, InMemorySink::new("http://localhost"), None);
 
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
-        let job_id = controller.submit(ExportTask {
-            work: ExportWork::Views(vec![NamedView {
-                name: "patients".to_string(),
-                view: serde_json::json!({
-                    "resourceType": "ViewDefinition",
-                    "resource": "Patient",
-                    "status": "active",
-                    "select": [{"column": [{"name": "id", "path": "id"}]}]
-                }),
-            }]),
-            tenant,
-            filters: ViewFilters::default(),
-            format: "ndjson".to_string(),
-            header: true,
-            client_tracking_id: None,
-        });
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork::Views(vec![NamedView {
+                    name: "patients".to_string(),
+                    view: serde_json::json!({
+                        "resourceType": "ViewDefinition",
+                        "resource": "Patient",
+                        "status": "active",
+                        "select": [{"column": [{"name": "id", "path": "id"}]}]
+                    }),
+                }]),
+                tenant,
+                filters: ViewFilters::default(),
+                format: "ndjson".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .await;
 
         // The runner is blocked, so the job is still Running — cancel it.
-        assert!(controller.cancel("t1", &job_id));
+        assert!(controller.cancel("t1", &job_id).await);
         assert!(matches!(
-            controller.get_status("t1", &job_id),
+            controller.get_status("t1", &job_id).await,
             Some(JobStatus::Cancelled { .. })
         ));
 
@@ -853,7 +876,7 @@ mod tests {
         release.notify_one();
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            match controller.get_status("t1", &job_id) {
+            match controller.get_status("t1", &job_id).await {
                 Some(JobStatus::Cancelled { .. }) => {}
                 other => panic!("cancelled job must stay Cancelled, got {other:?}"),
             }
@@ -875,22 +898,24 @@ mod tests {
         let controller = InMemoryController::new(runner, sink.clone(), None);
 
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
-        let job_id = controller.submit(ExportTask {
-            work: ExportWork::Views(vec![NamedView {
-                name: "patients".to_string(),
-                view: serde_json::json!({
-                    "resourceType": "ViewDefinition",
-                    "resource": "Patient",
-                    "status": "active",
-                    "select": [{"column": [{"name": "id", "path": "id"}]}]
-                }),
-            }]),
-            tenant,
-            filters: ViewFilters::default(),
-            format: "ndjson".to_string(),
-            header: true,
-            client_tracking_id: None,
-        });
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork::Views(vec![NamedView {
+                    name: "patients".to_string(),
+                    view: serde_json::json!({
+                        "resourceType": "ViewDefinition",
+                        "resource": "Patient",
+                        "status": "active",
+                        "select": [{"column": [{"name": "id", "path": "id"}]}]
+                    }),
+                }]),
+                tenant,
+                filters: ViewFilters::default(),
+                format: "ndjson".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .await;
 
         // Simulate a shard the running job had already streamed out.
         sink.write_shard(&job_id, 0, b"{\"id\":\"a\"}\n".to_vec(), "ndjson")
@@ -898,12 +923,13 @@ mod tests {
         assert!(
             controller
                 .read_shard("t1", &job_id, "shard-0.ndjson")
+                .await
                 .is_some(),
             "shard should be downloadable while the job is running"
         );
 
         // Cancel: partial output is dropped and the download route 404s.
-        assert!(controller.cancel("t1", &job_id));
+        assert!(controller.cancel("t1", &job_id).await);
         assert!(
             sink.read_shard(&job_id, "shard-0.ndjson").is_none(),
             "cancel must delete partial shards from the sink"
@@ -911,6 +937,7 @@ mod tests {
         assert!(
             controller
                 .read_shard("t1", &job_id, "shard-0.ndjson")
+                .await
                 .is_none(),
             "download route must 404 for a cancelled job"
         );
@@ -1059,9 +1086,11 @@ mod tests {
         // rather than reused from write time.
         let first = controller
             .download_url("t1", &job_id, "shard-0.ndjson")
+            .await
             .expect("owner should resolve a URL");
         let second = controller
             .download_url("t1", &job_id, "shard-0.ndjson")
+            .await
             .expect("owner should resolve a URL");
         assert_ne!(first, second, "each poll must re-resolve the download URL");
 
@@ -1069,6 +1098,7 @@ mod tests {
         assert!(
             controller
                 .download_url("other", &job_id, "shard-0.ndjson")
+                .await
                 .is_none(),
             "cross-tenant resolution must be denied"
         );

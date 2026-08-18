@@ -41,7 +41,11 @@ pub mod scope;
 pub use config::AuthConfig;
 pub use discovery::SmartConfiguration;
 pub use error::{AuthError, FhirOperation};
-pub use jwks::JwksCache;
+#[cfg(feature = "redis")]
+pub use jwks::RedisJwksCoordination;
+pub use jwks::{
+    CoordinatedJwks, FetchedJwks, JwksCache, JwksCoordination, JwksCoordinationError, JwksFetchFn,
+};
 pub use outbound::{
     NoOpOutboundAuthProvider, OutboundAuthProvider, StaticBearerOutboundAuthProvider,
     provider_from_token,

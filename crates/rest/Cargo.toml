@@ -150,6 +150,9 @@ base64 = "0.22"
 # Regex for pattern matching in tests
 regex = "1"
 
+# Mock IdP for the JWKS cluster-coordination T2 suite
+wiremock = "0.6"
+
 # Postgres conformance test (gated via #[ignore] + PG_CONFORMANCE env var).
 # Brings up a PostgreSQL container locally — same versions used by
 # `helios-persistence`'s integration tests for binary-version parity.

@@ -130,7 +130,21 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     use helios_persistence::backends::postgres::PostgresBackend;
     use std::sync::Arc;
 
-    let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
+    let epoch_enabled = match config.terminology_cache_invalidation.as_str() {
+        "epoch" => true,
+        "local" => false,
+        other => {
+            tracing::warn!(
+                value = other,
+                "Unrecognized HTS_TERMINOLOGY_CACHE_INVALIDATION value; defaulting to 'local'"
+            );
+            false
+        }
+    };
+    let backend = PostgresTerminologyBackend::new(&config.database_url)
+        .await?
+        .with_epoch_guard(epoch_enabled, std::time::Duration::from_secs(1));
+    let epoch_guard = backend.epoch_guard();
 
     bootstrap_sync_postgres(&backend, &config).await?;
 
@@ -156,6 +170,7 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     let state = helios_hts::state::AppState::new(backend.clone())
         .with_resource_store_pg(resource_store)
         .with_terminology_importer(Arc::new(backend))
+        .with_epoch_guard(epoch_guard)
         .with_max_expansion_size(config.max_expansion_size);
 
     let app = helios_hts::server::create_app(&config, state);
@@ -196,6 +211,17 @@ async fn bootstrap_sync_sqlite(
     bootstrap_sync(&tracker, backend, &dir, config).await
 }
 
+/// Runs the Postgres bootstrap sync under a session-scoped advisory lock
+/// ([`helios_hts::backends::postgres::schema::with_bootstrap_lock`]) so that
+/// N instances cold-starting concurrently against one empty (or
+/// partially-populated) database don't each redundantly run the same heavy
+/// SNOMED/LOINC/RxNorm/ICD-10-CM import.
+///
+/// The lock covers the whole `bootstrap_sync` call (every file in the
+/// directory, not per-file) — the per-file ledger check inside
+/// `bootstrap_sync` still runs normally, so an instance that queues behind
+/// the lock and then acquires it naturally skips any files the winner
+/// already imported.
 #[cfg(feature = "postgres")]
 async fn bootstrap_sync_postgres(
     backend: &PostgresTerminologyBackend,
@@ -204,8 +230,12 @@ async fn bootstrap_sync_postgres(
     let Some(dir) = resolve_bootstrap_dir(&config.bootstrap_dir) else {
         return Ok(());
     };
+
     let tracker = BootstrapTracker::Postgres(backend);
-    bootstrap_sync(&tracker, backend, &dir, config).await
+    helios_hts::backends::postgres::schema::with_bootstrap_lock(backend.pool(), || {
+        bootstrap_sync(&tracker, backend, &dir, config)
+    })
+    .await
 }
 
 /// Backend-agnostic bootstrap sync: import the directory, gating each file on

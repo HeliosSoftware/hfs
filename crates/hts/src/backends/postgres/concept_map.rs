@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::HtsError;
-use crate::traits::ConceptMapOperations;
+use crate::traits::{ConceptMapOperations, TerminologyCaches};
 use crate::types::{
     ClosureRequest, ClosureResponse, ResourceSearchQuery, TranslateRequest, TranslateResponse,
     TranslationMatch,
@@ -42,6 +42,9 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
         _ctx: &TenantContext,
         req: TranslateRequest,
     ) -> Result<TranslateResponse, HtsError> {
+        // Cross-instance freshness (C3) — before any cache read.
+        self.epoch.check_backend(|| self.invalidate_caches()).await;
+
         // CM01/CM02 hot-path memo — bench pool entries repeat the same
         // translation tuples across 50 VUs.
         let cache_key = translate_cache_key(&req);

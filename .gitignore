@@ -19,6 +19,13 @@ off
 # Test artifacts
 /test-artifacts
 
+# Local-only planning docs for the in-progress cluster-capable-state effort
+# (discussion #223) — working documents, not shipped to main.
+/docs/cluster-capable-state-design.md
+/docs/cluster-capable-state-roadmap.md
+/docs/cluster-testing-methodology.md
+/docs/cluster-testing-strategy.md
+
 # Python bytecode (e.g. audit test helpers under crates/hfs/tests/audit)
 __pycache__/
 *.pyc

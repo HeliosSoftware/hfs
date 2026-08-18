@@ -58,9 +58,9 @@ async fn handle_ws_connection(
         None => return,
     };
 
-    // Validate and consume the binding token (single-use).
-    let (tenant_id, subscription_id) = match engine.ws_token_manager().validate_and_consume(&token)
-    {
+    // Validate and consume the binding token (single-use; redeemable on any
+    // instance when clustered).
+    let (tenant_id, subscription_id) = match engine.redeem_ws_token(&token).await {
         Some(binding) => binding,
         None => {
             warn!("Invalid or expired WebSocket binding token");
@@ -71,8 +71,8 @@ async fn handle_ws_connection(
 
     // Verify subscription still exists.
     let sub = match engine
-        .manager()
-        .get_subscription(&tenant_id, &subscription_id)
+        .subscription_snapshot(&tenant_id, &subscription_id)
+        .await
     {
         Some(sub) => sub,
         None => {
