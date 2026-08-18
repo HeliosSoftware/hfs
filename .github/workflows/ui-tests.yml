@@ -73,7 +73,17 @@ jobs:
           docker rm -fv "$RUN_CONTAINER" 2>/dev/null || true
           # 2g shm: Chromium and the tmpfs-backed SQLite DB share /dev/shm, and
           # per-tenant conformance seeding overflows docker's 64m default.
-          docker run -d --name "$RUN_CONTAINER" --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+          # Labels are what make this container reapable by something other
+          # than the step below. `hfs-ci=true` is the marker the docker-host-gc
+          # orphan sweep looks for; `github.run_id` matches the filter ci.yml
+          # already uses. Without them a container that outlives its job is
+          # invisible to every sweep on the host, because the name is
+          # run-id-scoped and so can never be matched by a later run.
+          docker run -d --name "$RUN_CONTAINER" \
+            --label hfs-ci=true \
+            --label github.run_id=${{ github.run_id }} \
+            --label github.workflow=ui-tests \
+            --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
           docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui
           docker cp target/debug/hfs "$RUN_CONTAINER":/work/target/debug/hfs
           docker cp data "$RUN_CONTAINER":/work/data
@@ -97,4 +107,33 @@ jobs:
 
       - name: Remove Playwright container
         if: always()
-        run: docker rm -fv "$RUN_CONTAINER" 2>/dev/null || true
+        run: |
+          # Deliberately not `2>/dev/null || true`. On 2026-07-30 the host was
+          # over its disk quota, containerd could not write meta.db, and this
+          # removal failed with "disk quota exceeded" — but the error went to
+          # /dev/null and `|| true` made the step green, so a running
+          # Playwright container leaked unnoticed for two weeks. Cleanup that
+          # cannot clean up has to say so.
+          #
+          # Still non-fatal: a leak should not turn a passing suite red. The
+          # annotation is the signal, and docker-host-gc is the backstop.
+          reap() {
+            local name="${1:-}"
+            [ -n "$name" ] || return 0
+            if ! docker inspect "$name" >/dev/null 2>&1; then
+              echo "$name already gone"
+              return 0
+            fi
+            # Verify by inspect rather than trusting the exit code: `docker rm
+            # -f` exits 0 for a container that does not exist, and a wedged
+            # daemon can report success without the container actually going
+            # away. "Did it disappear?" is the only claim worth making.
+            if err=$(docker rm -fv "$name" 2>&1) && ! docker inspect "$name" >/dev/null 2>&1; then
+              echo "Removed $name"
+            else
+              if [ -n "$err" ]; then echo "$err"; fi
+              echo "::warning::Could not remove $name; it is leaking on the Docker host."
+            fi
+          }
+
+          reap "$RUN_CONTAINER"
