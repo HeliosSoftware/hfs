@@ -135,9 +135,17 @@ jobs:
       - name: Start Elasticsearch
         if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
         run: |
+          # Every container this workflow starts carries hfs-ci=true and the
+          # run id. Container names here are run-id-scoped, so a leak can never
+          # be matched by name from a later run; the labels are the only thing
+          # that lets the docker-host-gc orphan sweep collect one. See the
+          # 2026-07-30 leak documented in that action.
           ES_CONTAINER="es-ui-matrix-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
           docker run -d --name "$ES_CONTAINER" -p 0:9200 \
+            --label hfs-ci=true \
+            --label github.run_id=${{ github.run_id }} \
+            --label github.workflow=ui-tests-matrix \
             -e "discovery.type=single-node" \
             -e "xpack.security.enabled=false" \
             -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
@@ -169,6 +177,9 @@ jobs:
           PG_CONTAINER="pg-ui-matrix-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
+            --label hfs-ci=true \
+            --label github.run_id=${{ github.run_id }} \
+            --label github.workflow=ui-tests-matrix \
             -e POSTGRES_USER=helios \
             -e POSTGRES_PASSWORD=helios \
             -e POSTGRES_DB=helios \
@@ -199,7 +210,11 @@ jobs:
         run: |
           MONGO_CONTAINER="mongo-ui-matrix-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 \
+            --label hfs-ci=true \
+            --label github.run_id=${{ github.run_id }} \
+            --label github.workflow=ui-tests-matrix \
+            mongo:7.0 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
 
@@ -385,7 +400,11 @@ jobs:
           echo "Driving browser against $BASE"
           docker rm -fv "$PW_CONTAINER" 2>/dev/null || true
           # 2g shm: Chromium needs more than docker's 64m default.
-          docker run -d --name "$PW_CONTAINER" --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+          docker run -d --name "$PW_CONTAINER" \
+            --label hfs-ci=true \
+            --label github.run_id=${{ github.run_id }} \
+            --label github.workflow=ui-tests-matrix \
+            --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
           docker cp crates/ui/e2e "$PW_CONTAINER":/work/e2e
           docker exec -e CI=1 -e HFS_E2E_BASE_URL="$BASE" -w /work/e2e "$PW_CONTAINER" \
             bash -c "npm ci && npx playwright test"
@@ -407,8 +426,33 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          # Non-silent by design. On 2026-07-30 this host was over its disk
+          # quota, containerd could not write meta.db, and `docker rm -f`
+          # failed with "disk quota exceeded" — but the error went to
+          # /dev/null and `|| true` reported success, so a running Playwright
+          # container leaked while this step showed green. Warn instead of
+          # hiding it; still non-fatal, so a leak cannot mask the real result.
+          reap() {
+            local name="${1:-}"
+            [ -n "$name" ] || return 0
+            if ! docker inspect "$name" >/dev/null 2>&1; then
+              echo "$name already gone"
+              return 0
+            fi
+            # Verify by inspect rather than trusting the exit code: `docker rm
+            # -f` exits 0 for a container that does not exist, and a wedged
+            # daemon can report success without the container actually going
+            # away. "Did it disappear?" is the only claim worth making.
+            if err=$(docker rm -fv "$name" 2>&1) && ! docker inspect "$name" >/dev/null 2>&1; then
+              echo "Removed $name"
+            else
+              if [ -n "$err" ]; then echo "$err"; fi
+              echo "::warning::Could not remove $name; it is leaking on the Docker host."
+            fi
+          }
+
           echo "Removing Playwright container..."
-          docker rm -fv "$PW_CONTAINER" 2>/dev/null || true
+          reap "$PW_CONTAINER"
 
           echo "Stopping HFS..."
           if [ -f /tmp/hfs-ui-matrix-${{ matrix.backend }}.pid ]; then
@@ -426,6 +470,9 @@ jobs:
           fi
 
           echo "Stopping backend containers..."
-          docker rm -fv "${ES_CONTAINER:-none}" 2>/dev/null || true
-          docker rm -fv "${PG_CONTAINER:-none}" 2>/dev/null || true
-          docker rm -fv "${MONGO_CONTAINER:-none}" 2>/dev/null || true
+          # `:-` empty, not `:-none`: the old default asked the daemon to
+          # remove a container literally named "none" on every leg that did
+          # not start one, which reap() would then report as a spurious miss.
+          reap "${ES_CONTAINER:-}"
+          reap "${PG_CONTAINER:-}"
+          reap "${MONGO_CONTAINER:-}"
