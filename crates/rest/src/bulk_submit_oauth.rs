@@ -183,26 +183,12 @@ pub(crate) fn derive_public_jwk(pem: &str, alg: &str) -> Option<Value> {
                 "alg": "ES384",
             }))
         }
-        "RS384" => {
-            use rsa::pkcs8::DecodePrivateKey;
-            use rsa::traits::PublicKeyParts;
-
-            let private_key = rsa::RsaPrivateKey::from_pkcs8_pem(pem).ok()?;
-            let pub_key = private_key.to_public_key();
-            let n = URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
-            let e = URL_SAFE_NO_PAD.encode(pub_key.e().to_bytes_be());
-            // RFC 7638 §3.3: required RSA members in lexicographic order.
-            let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
-            let kid = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
-            Some(serde_json::json!({
-                "kty": "RSA",
-                "n": n,
-                "e": e,
-                "kid": kid,
-                "use": "sig",
-                "alg": "RS384",
-            }))
-        }
+        // RS384 derivation is deliberately not offered: the only pure-Rust
+        // RSA implementation carries RUSTSEC-2023-0071 (Marvin Attack timing
+        // sidechannel) with no fixed release — the same reason jwe.rs rejects
+        // RSA-OAEP. An RS384 deployment registers its public key with the
+        // recipient out-of-band; the JWKS endpoint serves an empty set, as
+        // its handler documents.
         _ => None,
     }
 }

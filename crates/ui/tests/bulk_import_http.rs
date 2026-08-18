@@ -899,25 +899,27 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert!(detail.contains("got 200 OK"));
 }
 
+/// The UI route became a permanent redirect to the server-level JWKS when
+/// `/.well-known/bulk-submit-jwks.json` landed; existing registrations keep
+/// working through it.
 #[tokio::test]
-async fn the_keys_endpoint_serves_the_configured_jwks() {
+async fn the_keys_endpoint_redirects_to_the_well_known_jwks() {
     let settings = settings_store();
-
-    unsafe { std::env::remove_var("HFS_BULK_SUBMIT_PUBLIC_JWK") };
-    let (status, _) = get(&settings, "/ui/bulk-import/keys").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-
-    unsafe {
-        std::env::set_var(
-            "HFS_BULK_SUBMIT_PUBLIC_JWK",
-            r#"{"kty":"EC","crv":"P-384","x":"abc","y":"def","alg":"ES384","kid":"hfs-1"}"#,
+    let res = app(&settings)
+        .oneshot(
+            Request::get("/ui/bulk-import/keys")
+                .body(Body::empty())
+                .unwrap(),
         )
-    };
-    let (status, body) = get(&settings, "/ui/bulk-import/keys").await;
-    assert_eq!(status, StatusCode::OK);
-    let jwks: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(jwks["keys"][0]["kid"], "hfs-1");
-    unsafe { std::env::remove_var("HFS_BULK_SUBMIT_PUBLIC_JWK") };
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        res.headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/.well-known/bulk-submit-jwks.json")
+    );
 }
 
 #[tokio::test]

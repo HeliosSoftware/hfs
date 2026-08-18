@@ -582,17 +582,12 @@ fn signing_kid(pem: &str, alg: &str) -> Option<String> {
     use sha2::{Digest, Sha256};
 
     match alg {
-        "RS384" => {
-            use rsa::pkcs8::DecodePrivateKey;
-            use rsa::traits::PublicKeyParts;
-
-            let private_key = rsa::RsaPrivateKey::from_pkcs8_pem(pem).ok()?;
-            let pub_key = private_key.to_public_key();
-            let n = URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
-            let e = URL_SAFE_NO_PAD.encode(pub_key.e().to_bytes_be());
-            let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
-            Some(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
-        }
+        // RS384 thumbprints are deliberately not derived: the only pure-Rust
+        // RSA implementation carries RUSTSEC-2023-0071 (Marvin Attack) with
+        // no fixed release — the same reason jwe.rs rejects RSA-OAEP. An
+        // RS384 assertion goes out without a kid; the key is registered with
+        // the recipient out-of-band.
+        "RS384" => None,
         _ => {
             use p384::elliptic_curve::sec1::ToEncodedPoint;
             use p384::pkcs8::DecodePrivateKey;
