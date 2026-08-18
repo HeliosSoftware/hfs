@@ -232,6 +232,10 @@ where
             "/.well-known/smart-configuration",
             get(handlers::smart_discovery::smart_configuration_handler::<S>),
         )
+        .route(
+            "/.well-known/bulk-submit-jwks.json",
+            get(handlers::bulk_submit_jwks_handler::<S>),
+        )
         .route("/_history", get(handlers::history_system_handler::<S>))
         // Per-user UI settings. The leading `_` keeps these authenticated yet
         // exempt from FHIR scope checks, and out of the FHIR resource namespace.
@@ -524,7 +528,7 @@ where
 /// of functionality.
 pub fn create_minimal_routes<S>(state: AppState<S>) -> Router
 where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+    S: ResourceStorage + SearchProvider + BundleProvider + Send + Sync + 'static,
 {
     Router::new()
         .route("/health", get(handlers::health_handler::<S>))

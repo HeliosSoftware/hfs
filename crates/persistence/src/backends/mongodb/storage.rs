@@ -2521,6 +2521,18 @@ impl SystemHistoryProvider for MongoBackend {
 
 #[async_trait]
 impl BundleProvider for MongoBackend {
+    /// MongoDB bundles run inside a server-side session transaction
+    /// (`begin_required_bundle_transaction_session` … `commit_transaction`),
+    /// so the server unwinds on abort or on a dropped session — including the
+    /// cancellation case that defeats an in-process compensation log.
+    ///
+    /// Requires a replica set; `begin_required_bundle_transaction_session`
+    /// fails the bundle when transactions are unavailable rather than silently
+    /// degrading to non-atomic writes.
+    fn supports_atomic_transactions(&self) -> bool {
+        true
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,

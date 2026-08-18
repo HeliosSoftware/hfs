@@ -67,6 +67,12 @@
             <input class="field__input" type="url" name="token_url" autocomplete="off">
             <span class="field__hint">{{ i18n.t("bulk-import-field-token-url-hint") }}</span>
           </label>
+          <p class="field__hint">
+            {{ i18n.t("bulk-import-jwks-hint") }}
+            <a href="/.well-known/bulk-submit-jwks.json" target="_blank" rel="noopener">
+              /.well-known/bulk-submit-jwks.json
+            </a>
+          </p>
           <button type="submit" class="button"
                   formaction="/ui/bulk-import/test-auth"
                   hx-post="/ui/bulk-import/test-auth"

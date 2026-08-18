@@ -65,6 +65,11 @@ jsonwebtoken = "9"
 # Hand-parsing the export form: repeated checkbox fields need more than
 # serde_urlencoded offers (#537).
 form_urlencoded = "1"
+# RFC 7638 thumbprint derivation for the bulk-submit signing key kid (#529).
+p384 = { version = "0.13", features = ["pem", "pkcs8"] }
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = "0.10"
+base64 = "0.22"
 
 # Compile-time, type-checked, auto-escaping templates (Jinja2-like).
 # Markup lives in templates/, never in Rust source.

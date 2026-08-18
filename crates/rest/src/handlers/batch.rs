@@ -1465,6 +1465,27 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
             "not-supported",
             format!("Isolation level '{}' is not supported", level),
         ),
+        // 501 + `not-supported`, matching the two sibling capability gaps
+        // above. This is a property of the configured storage backend, not of
+        // the request: the same bundle succeeds against a PostgreSQL or MongoDB
+        // deployment. The message names `batch` because that is the actionable
+        // alternative — it carries no atomicity requirement and every backend
+        // supports it (#489).
+        //
+        // Raised before any entry is written, so a client that retries finds
+        // the server in exactly the state it left it.
+        TransactionError::AtomicityUnsupported { backend_name } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "not-supported",
+            format!(
+                "The configured storage backend ('{}') cannot guarantee the all-or-nothing \
+                 semantics a transaction Bundle requires, so no entries were applied. Submit \
+                 the entries as a batch Bundle if partial success is acceptable, or use a \
+                 backend with transaction support. This server's CapabilityStatement lists \
+                 the interactions it supports.",
+                backend_name
+            ),
+        ),
     }
 }
 
@@ -2235,5 +2256,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A backend that cannot honour transaction atomicity must produce a client
+    /// -actionable refusal, not a 500.
+    ///
+    /// 501 + `not-supported` matches the two sibling capability gaps
+    /// (`NestedNotSupported`, `UnsupportedIsolationLevel`) already mapped that
+    /// way, and the message has to name `batch` — that is the alternative the
+    /// caller can actually act on, and the fallback the Inferno loader uses for
+    /// S3 (#489).
+    #[test]
+    fn atomicity_unsupported_maps_to_501_not_supported() {
+        let (status, code, message) =
+            transaction_error_response_parts(&TransactionError::AtomicityUnsupported {
+                backend_name: "s3".to_string(),
+            });
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(code, "not-supported");
+        assert!(message.contains("s3"), "should name the backend: {message}");
+        assert!(
+            message.contains("batch"),
+            "should point at the workable alternative: {message}"
+        );
+        assert!(
+            message.contains("no entries were applied"),
+            "must state that nothing was written, so a retry is known-safe: {message}"
+        );
     }
 }
