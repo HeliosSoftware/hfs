@@ -159,7 +159,8 @@
               {% if option.kind == "choice" %}
               <div class="editor-add__choice" data-add-name="{{ option.name }}">
                 <span class="editor-add__name">{{ option.name }}[x]{% if option.required %} <em>*</em>{% endif %}</span>
-                <select data-choose="{{ row.path }}" data-declarer="{{ option.name }}">
+                <select data-choose="{{ row.path }}" data-declarer="{{ option.name }}"
+                        aria-label="{{ option.name }}[x] — {{ i18n.t("editor-pick-type") }}">
                   <option value="">{{ i18n.t("editor-pick-type") }}</option>
                   {% for arm in option.arms %}
                   <option value="{{ arm }}">{{ arm }}</option>
