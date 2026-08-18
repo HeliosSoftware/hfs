@@ -1,0 +1,45 @@
+{#-
+  Shared OperationOutcome renderer for the HTS UI (design doc §7 error contract
+  and §11.1). Every HTS proxy handler renders this partial when the upstream
+  returns an OperationOutcome, keeping error surfaces consistent across
+  Lookup / Validate / Expand / Subsumes / Translate / Closure / Batch / Import.
+
+  Inputs (context-provided):
+    outcome — a struct with:
+      severity   : "fatal" | "error" | "warning" | "information"
+      code       : the FHIR issue code (e.g. "not-found", "invalid", "too-costly")
+      diagnostics: freeform message string (may be empty)
+      location   : optional array of FHIRPath location strings
+      request_id : optional correlation id (X-Request-Id)
+
+  Presentation rules (design doc §11.1):
+    • The severity drives the ARIA role (`alert` for fatal/error, `status`
+      otherwise) so screen readers announce the outcome without stealing focus
+      from the form.
+    • `code` is rendered as a Fluent key `hts-outcome-code-<code>` when
+      present in the catalog; falls back to the raw code so unknown codes
+      still surface.
+    • `location[]` renders as a small monospace list, useful for form-field
+      wiring in Wave 2 slices (Ops workbench).
+-#}
+<aside class="hts-outcome hts-outcome--{{ outcome.severity }}"
+       role="{% if outcome.severity == "fatal" || outcome.severity == "error" %}alert{% else %}status{% endif %}"
+       aria-live="polite">
+  <p class="hts-outcome__code">
+    <span class="visually-hidden">{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", outcome.severity.to_string()) }}</span>
+    {{ chrome.i18n.t(format!("hts-outcome-code-{}", outcome.code).as_str()) }}
+  </p>
+  {% if !outcome.diagnostics.is_empty() %}
+  <p class="hts-outcome__diagnostics">{{ outcome.diagnostics }}</p>
+  {% endif %}
+  {% if !outcome.location.is_empty() %}
+  <ul class="hts-outcome__location">
+    {% for loc in outcome.location %}
+    <li><code>{{ loc }}</code></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% if let Some(rid) = outcome.request_id %}
+  <p class="hts-outcome__meta"><small>{{ chrome.i18n.t_arg("hts-outcome-request-id", "id", rid.to_string()) }}</small></p>
+  {% endif %}
+</aside>

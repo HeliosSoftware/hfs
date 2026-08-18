@@ -112,6 +112,16 @@ pub struct HtsConfig {
     /// Changing this re-triggers bootstrap imports of affected files.
     #[arg(long, env = "HTS_IMPORT_LANGUAGES", default_value = "")]
     pub import_languages: String,
+
+    /// Mount the optional HTS administrative UI (crates/hts-ui) at `/ui`.
+    ///
+    /// Off by default: the terminology API surface is the primary product
+    /// contract, and operators who deploy behind an API gateway may not want
+    /// an HTML surface listening at all. `HTS_UI_ENABLED=1` opts in.
+    ///
+    /// Design doc: `edson/docs/hts-ui-design.md` §7 / §12 acceptance.
+    #[arg(long, env = "HTS_UI_ENABLED", default_value = "false")]
+    pub ui_enabled: bool,
 }
 
 impl HtsConfig {
@@ -136,6 +146,7 @@ impl Default for HtsConfig {
             bootstrap_dir: String::new(),
             bootstrap_batch_size: 5000,
             import_languages: String::new(),
+            ui_enabled: false,
         }
     }
 }

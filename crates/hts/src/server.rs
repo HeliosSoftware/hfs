@@ -81,7 +81,65 @@ where
 {
     let cors = build_cors(config);
 
-    Router::new()
+    // Optional HTS administrative UI (crates/hts-ui) mounted at `/ui` so
+    // routes resolve as `/ui/hts`, `/ui/hts/assets/*`, etc. — matching the
+    // design doc `edson/docs/hts-ui-design.md` §5.1. Off by default; opt in
+    // with `HTS_UI_ENABLED=1`.
+    //
+    // Upstream URL policy (design doc §7 degraded state contract):
+    //   1. `HTS_UI_UPSTREAM_URL` when set — lets a developer point the UI at
+    //      a remote HTS without a rebuild;
+    //   2. otherwise loopback to *this* binary's `127.0.0.1:{port}`. Not
+    //      `config.host` because that may be `0.0.0.0` for external binds;
+    //      the loopback client always uses the loopback interface.
+    //
+    // Bundled data footprint powers the dashboard's "Bundled data: X MB"
+    // tile. `None` when no `HTS_BOOTSTRAP_DIR` was configured — the tile
+    // then shows an em-dash rather than a misleading zero.
+    let hts_ui = if config.ui_enabled {
+        let upstream_url = std::env::var("HTS_UI_UPSTREAM_URL")
+            .unwrap_or_else(|_| format!("http://127.0.0.1:{}", config.port));
+        let upstream = helios_hts_ui::UpstreamClient::new(upstream_url).unwrap_or_else(|err| {
+            // reqwest's builder fails only under very degenerate conditions
+            // (e.g. no TLS backend, which cannot happen here — we use
+            // default_features = false with no TLS feature). Log loudly if
+            // it ever does and fall back to a client aimed at a closed loopback
+            // port so the dashboard degrades cleanly instead of the whole
+            // binary crashing.
+            tracing::error!(
+                ?err,
+                "hts-ui: upstream client build failed; UI will render only the degraded banner"
+            );
+            helios_hts_ui::UpstreamClient::new("http://127.0.0.1:1")
+                .expect("closed loopback URL should always parse")
+        });
+        let bundled_data_bytes = if config.bootstrap_dir.is_empty() {
+            None
+        } else {
+            match dir_size_bytes(std::path::Path::new(&config.bootstrap_dir)) {
+                Ok(bytes) => Some(bytes),
+                Err(err) => {
+                    tracing::warn!(
+                        dir = %config.bootstrap_dir,
+                        error = %err,
+                        "hts-ui: could not compute bootstrap dir size; the tile will read `—`"
+                    );
+                    None
+                }
+            }
+        };
+        let ui_state = std::sync::Arc::new(helios_hts_ui::HtsUiState {
+            fhir_version: FHIR_VERSION_LABEL,
+            version: env!("CARGO_PKG_VERSION"),
+            upstream,
+            bundled_data_bytes,
+        });
+        Some(helios_hts_ui::router(ui_state))
+    } else {
+        None
+    };
+
+    let router = Router::new()
         // ── Batch / transaction ───────────────────────────────────────────────
         .route("/", post(batch_handler::<B>))
         // ── Utility ──────────────────────────────────────────────────────────
@@ -176,7 +234,18 @@ where
                 .put(update_concept_map::<B>)
                 .delete(delete_concept_map::<B>),
         )
-        .with_state(state)
+        .with_state(state);
+
+    // Merge the optional UI router before wrapping the whole app in the
+    // observability / cors / timeout / trace layers so the UI benefits from
+    // the same shared middleware stack (metrics + trace spans).
+    let router = if let Some(ui) = hts_ui {
+        router.nest("/ui", ui)
+    } else {
+        router
+    };
+
+    router
         // Raise the body-size limit from axum's 2 MiB default to the
         // configured ceiling. The decompression layer below replaces the
         // request body before extractors read it, so this limit applies to
@@ -200,6 +269,51 @@ where
         ))
         .layer(TraceLayer::new_for_http())
 }
+
+/// Recursively size a directory in bytes. Small utility used at HTS-UI
+/// mount time to compute the "Bundled data: X MiB" dashboard tile.
+///
+/// Returns `Err` on the first I/O failure so operator-facing errors don't
+/// mix "partial walk succeeded" with "walk failed" — callers log and fall
+/// back to `None` for the tile.
+fn dir_size_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
+    let mut total: u64 = 0;
+    let mut stack: Vec<std::path::PathBuf> = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                stack.push(entry?.path());
+            }
+        } else if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        }
+        // Symlinks and other non-file entries: skip silently — the bootstrap
+        // directory contract is "regular files under a directory tree".
+    }
+    Ok(total)
+}
+
+/// Compile-time FHIR version label rendered in the HTS UI topbar.
+///
+/// The `hts` binary is built for exactly one FHIR version (features are
+/// mutually exclusive in this crate's build matrix). R4 is the workspace
+/// default; the CI matrix and Docker images set exactly one of the four.
+#[cfg(feature = "R4")]
+const FHIR_VERSION_LABEL: &str = "R4";
+#[cfg(all(feature = "R4B", not(feature = "R4")))]
+const FHIR_VERSION_LABEL: &str = "R4B";
+#[cfg(all(feature = "R5", not(feature = "R4"), not(feature = "R4B")))]
+const FHIR_VERSION_LABEL: &str = "R5";
+#[cfg(all(
+    feature = "R6",
+    not(feature = "R4"),
+    not(feature = "R4B"),
+    not(feature = "R5")
+))]
+const FHIR_VERSION_LABEL: &str = "R6";
+#[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6")))]
+const FHIR_VERSION_LABEL: &str = "R4";
 
 fn build_cors(config: &HtsConfig) -> CorsLayer {
     if !config.enable_cors {

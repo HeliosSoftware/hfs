@@ -1,0 +1,59 @@
+{#-
+  ConceptMap $closure input (design doc §7.6 F6). Fields: required
+  `name` (client-provided closure table name) and repeatable
+  system+code Coding rows. Empty rows are silently dropped by the
+  server-side parser. First submit with only `name` returns an empty
+  ConceptMap → hts-cm-closure-result.html renders the neutral
+  "empty graph" state (§7.6 F6).
+-#}
+<form id="hts-workbench-input"
+      class="hts-op-workbench__input"
+      method="post"
+      action="/ui/hts/operations/closure"
+      hx-post="/ui/hts/operations/closure"
+      hx-target="#hts-workbench-result"
+      hx-swap="outerHTML"
+      aria-labelledby="hts-workbench-input-heading">
+  <h2 id="hts-workbench-input-heading" class="hts-op-workbench__input-heading">
+    {{ chrome.i18n.t("hts-cm-closure-heading") }}
+  </h2>
+
+  <div class="hts-op-workbench__field">
+    <label for="cl-name">{{ chrome.i18n.t("hts-cm-closure-name") }}</label>
+    <input id="cl-name" name="name" type="text" required autocomplete="off" spellcheck="false">
+    <p class="hts-op-workbench__hint">{{ chrome.i18n.t("hts-cm-closure-name-hint") }}</p>
+  </div>
+
+  <fieldset class="hts-op-workbench__field">
+    <legend>{{ chrome.i18n.t("hts-cm-closure-concepts-legend") }}</legend>
+    <p class="hts-op-workbench__hint">{{ chrome.i18n.t("hts-cm-closure-concepts-hint") }}</p>
+    <div class="hts-op-workbench__row">
+      <label>{{ chrome.i18n.t("hts-cm-closure-concept-system") }}
+        <input type="url" name="concept.system" autocomplete="off" spellcheck="false">
+      </label>
+      <label>{{ chrome.i18n.t("hts-cm-closure-concept-code") }}
+        <input type="text" name="concept.code" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+    <div class="hts-op-workbench__row">
+      <label>{{ chrome.i18n.t("hts-cm-closure-concept-system") }}
+        <input type="url" name="concept.system" autocomplete="off" spellcheck="false">
+      </label>
+      <label>{{ chrome.i18n.t("hts-cm-closure-concept-code") }}
+        <input type="text" name="concept.code" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+    <div class="hts-op-workbench__row">
+      <label>{{ chrome.i18n.t("hts-cm-closure-concept-system") }}
+        <input type="url" name="concept.system" autocomplete="off" spellcheck="false">
+      </label>
+      <label>{{ chrome.i18n.t("hts-cm-closure-concept-code") }}
+        <input type="text" name="concept.code" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+  </fieldset>
+
+  <div class="hts-op-workbench__actions">
+    <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
+  </div>
+</form>

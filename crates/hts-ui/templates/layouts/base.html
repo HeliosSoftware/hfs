@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="{{ chrome.i18n.lang() }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ chrome.i18n.t("hts-app-title") }}{% endblock %}</title>
+  <link rel="stylesheet" href="/ui/hts/assets/app.css">
+  <!-- No `defer`: the theme attribute must land on <html> before first paint,
+       or the stored theme flashes its default first. -->
+  <script src="/ui/hts/assets/theme.js"></script>
+  <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
+  <script src="/ui/hts/assets/htmx.min.js" defer></script>
+</head>
+<body class="{% block body_class %}{% endblock %}">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand__text">
+        <span class="brand__name">{{ chrome.i18n.t("hts-app-title") }}</span>
+        <span class="brand__version">hts v{{ chrome.version }}</span>
+      </div>
+    </div>
+
+    <hr class="divider">
+
+    <nav class="nav">
+      <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-work") }}</div>
+      <a class="nav-item" href="/ui/hts"{% if chrome.active_page == "dashboard" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-dashboard") }}">
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-dashboard") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/hts/code-systems"{% if chrome.active_page == "code-systems" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-code-systems") }}">
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-code-systems") }}</span>
+      </a>
+      <a class="nav-item nav-item--soon" href="/ui/hts/value-sets"{% if chrome.active_page == "value-sets" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-value-sets") }}">
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-value-sets") }}</span>
+      </a>
+      <a class="nav-item nav-item--soon" href="/ui/hts/concept-maps"{% if chrome.active_page == "concept-maps" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-concept-maps") }}">
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-concept-maps") }}</span>
+      </a>
+
+      <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-tools") }}</div>
+      <a class="nav-item nav-item--soon" href="/ui/hts/operations"{% if chrome.active_page == "operations" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-operations") }}">
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-operations") }}</span>
+      </a>
+      <a class="nav-item nav-item--soon" href="/ui/hts/import"{% if chrome.active_page == "import" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-import") }}">
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-import") }}</span>
+      </a>
+
+      <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-server") }}</div>
+      <a class="nav-item nav-item--soon" href="/ui/hts/diagnostics"{% if chrome.active_page == "diagnostics" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-diagnostics") }}">
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-diagnostics") }}</span>
+      </a>
+    </nav>
+
+    <div class="sidebar__foot">
+      <span class="fhir-badge" title="{{ chrome.i18n.t("hts-fhir-version-heading") }}">
+        {{ chrome.i18n.t_arg("hts-fhir-version", "version", chrome.fhir_version.to_string()) }}
+      </span>
+    </div>
+  </aside>
+
+  <div class="pane">
+    <header class="topbar">
+      <div class="topbar__tools">
+        <!--
+          Dialect chip (design doc §7.1 topbar): the session-wide BCP-47
+          displayLanguage / Accept-Language surface. A <details><summary>
+          disclosure so keyboard users can open it without JS; each option
+          POSTs back and the server sets the `hts_dialect` cookie so the
+          choice is persisted across pages. Per-op fields on §7.6 override
+          this session value.
+        -->
+        <details class="dialect-chip">
+          <summary class="dialect-chip__summary" aria-label="{{ chrome.i18n.t("hts-dialect-label") }}">
+            <span class="dialect-chip__prefix">{{ chrome.i18n.t("hts-dialect-prefix") }}</span>
+            <code class="dialect-chip__value">{{ chrome.i18n.lang() }}</code>
+          </summary>
+          <div class="dialect-chip__panel">
+            <p class="dialect-chip__heading">{{ chrome.i18n.t("hts-dialect-heading") }}</p>
+            <p class="dialect-chip__hint">{{ chrome.i18n.t("hts-dialect-hint") }}</p>
+          </div>
+        </details>
+        <!-- Language switcher: real links, so it works without JavaScript. -->
+        <nav class="lang-switcher" aria-label="{{ chrome.i18n.t("language-label") }}">
+          <a href="?lang=en"{% if chrome.i18n.lang() == "en" %} aria-current="true"{% endif %}>{{ chrome.i18n.t("language-en") }}</a>
+          <a href="?lang=es"{% if chrome.i18n.lang() == "es" %} aria-current="true"{% endif %}>{{ chrome.i18n.t("language-es") }}</a>
+          <a href="?lang=de"{% if chrome.i18n.lang() == "de" %} aria-current="true"{% endif %}>{{ chrome.i18n.t("language-de") }}</a>
+        </nav>
+        <div class="theme-toggle" role="group" aria-label="{{ chrome.i18n.t("theme-label") }}">
+          <button type="button" data-set-theme="light" aria-label="{{ chrome.i18n.t("theme-light") }}">
+            <span aria-hidden="true">&#9728;</span>
+          </button>
+          <button type="button" data-set-theme="dark" aria-label="{{ chrome.i18n.t("theme-dark") }}">
+            <span aria-hidden="true">&#9789;</span>
+          </button>
+        </div>
+      </div>
+    </header>
+    <main class="content{% block content_class %}{% endblock %}">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,152 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}
+{%- if let Some(summary) = self.summary() -%}
+  {{ chrome.i18n.t_arg("hts-vs-detail-title", "name", summary.heading().to_string()) }}
+{%- else -%}
+  {{ chrome.i18n.t("hts-vs-detail-title-fallback") }}
+{%- endif %} · {{ chrome.i18n.t("hts-app-title") }}
+{% endblock %}
+
+{% block content %}
+<section class="hts-vs-detail" aria-labelledby="hts-vs-detail-heading">
+  {#-
+    Inline degraded banner (mirrors cs-detail.html for the same reasons).
+  -#}
+  {% if let Some(reason) = self.degraded_reason() %}
+  <aside class="hts-degraded" role="alert" aria-live="assertive">
+    <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
+    <p class="hts-degraded__reason">
+      {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    </p>
+    <p class="hts-degraded__body">{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  </aside>
+  {% endif %}
+
+  {% if let Some(outcome) = self.outcome() %}
+    {% include "partials/hts-outcome.html" %}
+  {% endif %}
+
+  {% if let Some(summary) = self.summary() %}
+    <header class="page-header hts-vs-detail__header">
+      <p class="page-header__eyebrow">{{ chrome.i18n.t("hts-vs-detail-eyebrow") }}</p>
+      <h1 id="hts-vs-detail-heading" class="page-header__title">
+        {{ summary.heading() }}
+        {% if !summary.version.is_empty() %}
+          <span class="hts-vs-detail__version"> · v{{ summary.version }}</span>
+        {% endif %}
+        {% if !summary.status.is_empty() %}
+          <span class="pill pill--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
+            {{ chrome.i18n.t(format!("hts-vs-status-{}", summary.status).as_str()) }}
+          </span>
+        {% endif %}
+      </h1>
+      {% if !summary.description.is_empty() %}
+        <p class="page-header__subtitle">{{ summary.description }}</p>
+      {% endif %}
+    </header>
+
+    <div class="hts-vs-detail__facts">
+      <section class="hts-vs-detail__section" aria-labelledby="hts-vs-detail-identity">
+        <h2 id="hts-vs-detail-identity" class="hts-vs-detail__section-title">
+          {{ chrome.i18n.t("hts-vs-detail-section-identity") }}
+        </h2>
+        <dl class="hts-vs-detail__dl">
+          <dt>{{ chrome.i18n.t("hts-vs-browser-column-url") }}</dt>
+          <dd>{% if summary.url.is_empty() %}&mdash;{% else %}<code>{{ summary.url }}</code>{% endif %}</dd>
+
+          <dt>{{ chrome.i18n.t("hts-vs-detail-publisher") }}</dt>
+          <dd>{% if summary.publisher.is_empty() %}&mdash;{% else %}{{ summary.publisher }}{% endif %}</dd>
+
+          <dt>{{ chrome.i18n.t("hts-vs-detail-jurisdiction") }}</dt>
+          <dd>
+            {% if summary.jurisdiction.is_empty() %}
+              &mdash;
+            {% else %}
+              <ul class="hts-vs-detail__list">
+                {% for j in summary.jurisdiction %}<li>{{ j }}</li>{% endfor %}
+              </ul>
+            {% endif %}
+          </dd>
+
+          {% match summary.immutable %}
+            {% when Some(im) %}
+          <dt>{{ chrome.i18n.t("hts-vs-detail-immutable") }}</dt>
+          <dd>
+            {% if im %}{{ chrome.i18n.t("hts-vs-detail-immutable-yes") }}
+            {%- else %}{{ chrome.i18n.t("hts-vs-detail-immutable-no") }}
+            {%- endif %}
+          </dd>
+            {% when None %}
+          {% endmatch %}
+        </dl>
+      </section>
+
+      <section class="hts-vs-detail__section" aria-labelledby="hts-vs-detail-governance">
+        <h2 id="hts-vs-detail-governance" class="hts-vs-detail__section-title">
+          {{ chrome.i18n.t("hts-vs-detail-section-governance") }}
+        </h2>
+        <dl class="hts-vs-detail__dl">
+          <dt>{{ chrome.i18n.t("hts-vs-detail-purpose") }}</dt>
+          <dd>{% if summary.purpose.is_empty() %}&mdash;{% else %}{{ summary.purpose }}{% endif %}</dd>
+
+          <dt>{{ chrome.i18n.t("hts-vs-detail-copyright") }}</dt>
+          <dd>{% if summary.copyright.is_empty() %}&mdash;{% else %}{{ summary.copyright }}{% endif %}</dd>
+        </dl>
+      </section>
+    </div>
+
+    {#-
+      Tabs strip. §7.4.1 F9 removes the Validate tab — Metadata + Expand
+      only. Both are real <a>s so the nojs fallback works; htmx
+      hijacks the click to swap the workbench region without a full
+      page reload.
+    -#}
+    <div class="hts-vs-detail__tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-vs-detail-tabs-label") }}">
+      <a role="tab"
+         class="hts-vs-detail__tab{% if tab == VsTab::Metadata %} is-active{% endif %}"
+         aria-selected="{% if tab == VsTab::Metadata %}true{% else %}false{% endif %}"
+         aria-controls="hts-vs-workbench"
+         href="/ui/hts/value-sets/{{ id }}"
+         hx-get="/ui/hts/value-sets/{{ id }}"
+         hx-target="#hts-vs-workbench"
+         hx-select="#hts-vs-workbench"
+         hx-swap="outerHTML">
+        {{ chrome.i18n.t("hts-vs-detail-tab-metadata") }}
+      </a>
+      <a role="tab"
+         class="hts-vs-detail__tab{% if tab == VsTab::Expand %} is-active{% endif %}"
+         aria-selected="{% if tab == VsTab::Expand %}true{% else %}false{% endif %}"
+         aria-controls="hts-vs-workbench"
+         href="/ui/hts/value-sets/{{ id }}/expand"
+         hx-get="/ui/hts/value-sets/{{ id }}/expand"
+         hx-target="#hts-workbench-input"
+         hx-swap="outerHTML">
+        {{ chrome.i18n.t("hts-vs-detail-tab-expand") }}
+      </a>
+    </div>
+
+    <div id="hts-vs-workbench" class="hts-vs-detail__workbench" role="tabpanel" aria-labelledby="hts-vs-detail-heading">
+      {% match tab %}
+        {% when VsTab::Metadata %}
+          <p class="hts-vs-detail__workbench-hint">{{ chrome.i18n.t("hts-vs-detail-workbench-hint") }}</p>
+        {% when VsTab::Expand %}
+          {% let summary = Some(summary.clone()) %}
+          {% let threshold = self.threshold() %}
+          {% let tree_mode = self.tree_mode() %}
+          {% include "partials/hts-vs-expand-input.html" %}
+      {% endmatch %}
+
+      {% if let Some(view) = workbench %}
+        {% include "partials/hts-vs-expand-result.html" %}
+      {% else %}
+        {% if tab != VsTab::Metadata %}
+          <div id="hts-workbench-result" class="hts-vs-detail__result" aria-live="polite">
+            <p class="hts-vs-detail__result-empty">{{ chrome.i18n.t("hts-vs-detail-result-empty") }}</p>
+          </div>
+        {% endif %}
+      {% endif %}
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

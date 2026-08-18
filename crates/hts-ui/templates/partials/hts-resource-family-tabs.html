@@ -1,0 +1,27 @@
+{#-
+  Resource-family tab strip (design doc §7.6 F5). Renders only for
+  ops that accept both CS and VS. Each tab is a real <a> so the
+  nojs fallback works; hx-get swaps the input partial in place.
+-#}
+<div class="hts-op-tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-operations-resource-tabs-label") }}">
+  <a role="tab"
+     class="hts-op-tabs__tab{% if flags.is_resource_cs %} is-active{% endif %}"
+     aria-selected="{% if flags.is_resource_cs %}true{% else %}false{% endif %}"
+     aria-controls="hts-workbench-input"
+     href="/ui/hts/operations?op={{ flags.op_slug }}&resource=CodeSystem"
+     hx-get="/ui/hts/operations/input?op={{ flags.op_slug }}&resource=CodeSystem"
+     hx-target="#hts-workbench-input"
+     hx-swap="outerHTML">
+    {{ chrome.i18n.t("hts-operations-resource-code-system") }}
+  </a>
+  <a role="tab"
+     class="hts-op-tabs__tab{% if flags.is_resource_vs %} is-active{% endif %}"
+     aria-selected="{% if flags.is_resource_vs %}true{% else %}false{% endif %}"
+     aria-controls="hts-workbench-input"
+     href="/ui/hts/operations?op={{ flags.op_slug }}&resource=ValueSet"
+     hx-get="/ui/hts/operations/input?op={{ flags.op_slug }}&resource=ValueSet"
+     hx-target="#hts-workbench-input"
+     hx-swap="outerHTML">
+    {{ chrome.i18n.t("hts-operations-resource-value-set") }}
+  </a>
+</div>

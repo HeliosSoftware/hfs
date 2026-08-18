@@ -1,0 +1,113 @@
+{#-
+  ValueSet $validate-code input (design doc §7.6 F4 — new op in Slice E,
+  no prior Slice-D form). Three-way ValueSet source selector (canonical
+  URL / instance id / inline JSON) plus the widened per-parameter matrix.
+-#}
+<form id="hts-workbench-input"
+      class="hts-op-workbench__input"
+      method="post"
+      action="/ui/hts/operations/validate-code"
+      hx-post="/ui/hts/operations/validate-code"
+      hx-target="#hts-workbench-result"
+      hx-swap="outerHTML"
+      aria-labelledby="hts-workbench-input-heading">
+  <h2 id="hts-workbench-input-heading" class="hts-op-workbench__input-heading">
+    {{ chrome.i18n.t("hts-vs-validate-heading") }}
+  </h2>
+
+  <input type="hidden" name="resource" value="ValueSet">
+
+  <fieldset class="hts-op-workbench__scope">
+    <legend>{{ chrome.i18n.t("hts-vs-validate-source-legend") }}</legend>
+    <label>
+      <input type="radio" name="sourceMode" value="canonical" checked>
+      {{ chrome.i18n.t("hts-vs-validate-source-canonical") }}
+    </label>
+    <input name="sourceCanonical" type="url" autocomplete="off" spellcheck="false"
+           placeholder="https://example.org/ValueSet/foo">
+
+    <label>
+      <input type="radio" name="sourceMode" value="instance">
+      {{ chrome.i18n.t("hts-vs-validate-source-instance") }}
+    </label>
+    <input name="sourceInstance" type="text" autocomplete="off" spellcheck="false"
+           placeholder="{{ chrome.i18n.t("hts-operations-scope-instance-placeholder") }}">
+
+    <label>
+      <input type="radio" name="sourceMode" value="inline">
+      {{ chrome.i18n.t("hts-vs-validate-source-inline") }}
+    </label>
+    <textarea name="sourceInline" rows="4" spellcheck="false"
+              placeholder='{"resourceType":"ValueSet",...}'></textarea>
+  </fieldset>
+
+  <fieldset class="hts-op-workbench__field">
+    <legend>{{ chrome.i18n.t("hts-vs-validate-mode-legend") }}</legend>
+    <label><input type="radio" name="mode" value="code" checked> {{ chrome.i18n.t("hts-vs-validate-mode-code") }}</label>
+    <label><input type="radio" name="mode" value="coding"> {{ chrome.i18n.t("hts-vs-validate-mode-coding") }}</label>
+    <label><input type="radio" name="mode" value="CodeableConcept"> {{ chrome.i18n.t("hts-vs-validate-mode-CodeableConcept") }}</label>
+  </fieldset>
+
+  <div class="hts-op-workbench__field">
+    <label for="vs-val-code">{{ chrome.i18n.t("hts-vs-validate-code") }}</label>
+    <input id="vs-val-code" name="code" type="text" autocomplete="off" spellcheck="false">
+  </div>
+  <div class="hts-op-workbench__field">
+    <label for="vs-val-system">{{ chrome.i18n.t("hts-vs-validate-system") }}</label>
+    <input id="vs-val-system" name="system" type="url" autocomplete="off" spellcheck="false">
+  </div>
+  <div class="hts-op-workbench__field">
+    <label for="vs-val-system-version">{{ chrome.i18n.t("hts-vs-validate-systemVersion") }}</label>
+    <input id="vs-val-system-version" name="systemVersion" type="text" autocomplete="off" spellcheck="false">
+  </div>
+  <div class="hts-op-workbench__field">
+    <label for="vs-val-display">{{ chrome.i18n.t("hts-vs-validate-display") }}</label>
+    <input id="vs-val-display" name="display" type="text" autocomplete="off" spellcheck="false">
+  </div>
+
+  <fieldset class="hts-op-workbench__field">
+    <legend>{{ chrome.i18n.t("hts-vs-validate-coding-legend") }}</legend>
+    <label for="vs-val-coding-system">{{ chrome.i18n.t("hts-vs-validate-coding-system") }}</label>
+    <input id="vs-val-coding-system" name="coding.system" type="text" autocomplete="off" spellcheck="false">
+    <label for="vs-val-coding-code">{{ chrome.i18n.t("hts-vs-validate-coding-code") }}</label>
+    <input id="vs-val-coding-code" name="coding.code" type="text" autocomplete="off" spellcheck="false">
+    <label for="vs-val-coding-display">{{ chrome.i18n.t("hts-vs-validate-coding-display") }}</label>
+    <input id="vs-val-coding-display" name="coding.display" type="text" autocomplete="off" spellcheck="false">
+  </fieldset>
+
+  <div class="hts-op-workbench__field">
+    <label for="vs-val-displang">{{ chrome.i18n.t("hts-vs-validate-displayLanguage") }}</label>
+    <input id="vs-val-displang" name="displayLanguage" type="text" autocomplete="off" spellcheck="false">
+  </div>
+  <div class="hts-op-workbench__field">
+    <label for="vs-val-vsversion">{{ chrome.i18n.t("hts-vs-validate-valueSetVersion") }}</label>
+    <input id="vs-val-vsversion" name="valueSetVersion" type="text" autocomplete="off" spellcheck="false">
+  </div>
+
+  <details class="hts-op-workbench__advanced">
+    <summary>{{ chrome.i18n.t("hts-vs-validate-advanced") }}</summary>
+    <div class="hts-op-workbench__field">
+      <label for="vs-val-date">{{ chrome.i18n.t("hts-vs-validate-date") }}</label>
+      <input id="vs-val-date" name="date" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <label><input type="checkbox" name="activeOnly" value="true"> {{ chrome.i18n.t("hts-vs-validate-activeOnly") }}</label>
+    <label><input type="checkbox" name="abstract" value="true"> {{ chrome.i18n.t("hts-vs-validate-abstract") }}</label>
+    <label><input type="checkbox" name="lenient-display-validation" value="true"> {{ chrome.i18n.t("hts-vs-validate-lenient-display-validation") }}</label>
+    <div class="hts-op-workbench__field">
+      <label for="vs-val-use-supplement">{{ chrome.i18n.t("hts-vs-validate-useSupplement") }}</label>
+      <input id="vs-val-use-supplement" name="useSupplement" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="hts-op-workbench__field">
+      <label for="vs-val-txres">{{ chrome.i18n.t("hts-vs-validate-tx-resource") }}</label>
+      <input id="vs-val-txres" name="tx-resource" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="hts-op-workbench__field">
+      <label for="vs-val-defvsv">{{ chrome.i18n.t("hts-vs-validate-default-valueset-version") }}</label>
+      <input id="vs-val-defvsv" name="default-valueset-version" type="text" autocomplete="off" spellcheck="false">
+    </div>
+  </details>
+
+  <div class="hts-op-workbench__actions">
+    <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
+  </div>
+</form>

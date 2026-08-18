@@ -1,0 +1,79 @@
+{#-
+  VS $expand input for the standalone workbench (design doc §7.6 F4).
+  Widening beyond Slice C: designation[] chip multi-select. The
+  Advanced <details> panel hosts the threshold input — see §7.6 F12
+  for the visibility rule (only this partial renders it).
+-#}
+<form id="hts-workbench-input"
+      class="hts-op-workbench__input"
+      method="post"
+      action="/ui/hts/operations/expand"
+      hx-post="/ui/hts/operations/expand"
+      hx-target="#hts-workbench-result"
+      hx-swap="outerHTML"
+      aria-labelledby="hts-workbench-input-heading">
+  <h2 id="hts-workbench-input-heading" class="hts-op-workbench__input-heading">
+    {{ chrome.i18n.t("hts-vs-expand-heading") }}
+  </h2>
+
+  <fieldset class="hts-op-workbench__scope">
+    <legend>{{ chrome.i18n.t("hts-operations-scope-legend") }}</legend>
+    <div class="hts-op-workbench__field">
+      <label for="exp-instance">{{ chrome.i18n.t("hts-operations-scope-instance") }}</label>
+      <input id="exp-instance" name="sourceInstance" type="text" required autocomplete="off" spellcheck="false"
+             placeholder="{{ chrome.i18n.t("hts-operations-scope-instance-placeholder") }}">
+    </div>
+  </fieldset>
+
+  <fieldset class="hts-op-workbench__field">
+    <legend>{{ chrome.i18n.t("hts-vs-expand-mode-legend") }}</legend>
+    <label><input type="radio" name="mode" value="flat" checked> {{ chrome.i18n.t("hts-vs-expand-mode-flat") }}</label>
+    <label><input type="radio" name="mode" value="tree"> {{ chrome.i18n.t("hts-vs-expand-mode-tree") }}</label>
+  </fieldset>
+
+  <div class="hts-op-workbench__field">
+    <label for="exp-filter">{{ chrome.i18n.t("hts-vs-expand-filter") }}</label>
+    <input id="exp-filter" name="filter" type="text" autocomplete="off" spellcheck="false">
+  </div>
+  <div class="hts-op-workbench__field">
+    <label for="exp-count">{{ chrome.i18n.t("hts-vs-expand-count") }}</label>
+    <input id="exp-count" name="count" type="number" min="1" max="1000" value="50">
+  </div>
+  <div class="hts-op-workbench__field">
+    <label for="exp-offset">{{ chrome.i18n.t("hts-vs-expand-offset") }}</label>
+    <input id="exp-offset" name="offset" type="number" min="0" value="0">
+  </div>
+  <div class="hts-op-workbench__field">
+    <label for="exp-display-language">{{ chrome.i18n.t("hts-vs-expand-displayLanguage") }}</label>
+    <input id="exp-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false">
+  </div>
+
+  <label><input type="checkbox" name="activeOnly" value="true"> {{ chrome.i18n.t("hts-vs-expand-activeOnly") }}</label>
+  <label><input type="checkbox" name="includeDesignations" value="true"> {{ chrome.i18n.t("hts-vs-expand-includeDesignations") }}</label>
+
+  <fieldset class="hts-op-workbench__field">
+    <legend>{{ chrome.i18n.t("hts-vs-expand-designation") }}</legend>
+    <p class="hts-op-workbench__hint">{{ chrome.i18n.t("hts-vs-expand-designation-hint") }}</p>
+    <input type="text" name="designation" autocomplete="off" spellcheck="false"
+           placeholder="es|900000000000013009">
+  </fieldset>
+
+  <details class="hts-op-workbench__advanced">
+    <summary>{{ chrome.i18n.t("hts-vs-expand-advanced") }}</summary>
+    <div class="hts-op-workbench__field">
+      <label for="exp-threshold">{{ chrome.i18n.t("hts-vs-expand-threshold") }}</label>
+      <input id="exp-threshold" name="threshold" type="number" min="1" placeholder="{{ ceiling }}">
+      <p class="hts-op-workbench__hint">
+        {{ chrome.i18n.t_arg("hts-vs-expand-threshold-hint", "ceiling", ceiling.to_string()) }}
+      </p>
+    </div>
+    <div class="hts-op-workbench__field">
+      <label for="exp-date">{{ chrome.i18n.t("hts-vs-expand-date") }}</label>
+      <input id="exp-date" name="date" type="text" autocomplete="off" spellcheck="false">
+    </div>
+  </details>
+
+  <div class="hts-op-workbench__actions">
+    <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
+  </div>
+</form>

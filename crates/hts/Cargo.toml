@@ -28,10 +28,10 @@ path = "src/main.rs"
 default = ["sqlite", "R4"]
 sqlite = ["dep:rusqlite", "dep:r2d2", "dep:r2d2_sqlite"]
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "helios-persistence/postgres"]
-R4 = ["helios-fhir/R4", "helios-persistence/R4"]
-R4B = ["helios-fhir/R4B", "helios-persistence/R4B"]
-R5 = ["helios-fhir/R5", "helios-persistence/R5"]
-R6 = ["helios-fhir/R6", "helios-persistence/R6"]
+R4 = ["helios-fhir/R4", "helios-persistence/R4", "helios-hts-ui/R4"]
+R4B = ["helios-fhir/R4B", "helios-persistence/R4B", "helios-hts-ui/R4B"]
+R5 = ["helios-fhir/R5", "helios-persistence/R5", "helios-hts-ui/R5"]
+R6 = ["helios-fhir/R6", "helios-persistence/R6", "helios-hts-ui/R6"]
 
 # OpenTelemetry OTLP trace export (heavy deps; opt-in for production images)
 otel = ["helios-observability/otel"]
@@ -40,6 +40,11 @@ otel = ["helios-observability/otel"]
 helios-fhir = { workspace = true }
 helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["sqlite"] }
 helios-observability = { path = "../observability", version = "0.2.1" }
+# Optional administrative UI. Compiled in unconditionally so that the mount
+# gate in server.rs is a single runtime `if HTS_UI_ENABLED`, not a cfg-ladder.
+# The UI ships no HTML at boot when disabled and adds negligible binary size
+# relative to the terminology payload.
+helios-hts-ui = { path = "../hts-ui", version = "0.2.1", default-features = false }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "query"] }

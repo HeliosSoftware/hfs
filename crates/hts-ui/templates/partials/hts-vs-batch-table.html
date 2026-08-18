@@ -1,0 +1,60 @@
+{#-
+  Batch skeleton table (design doc §7.6 F1=D). Rendered as the seed
+  response body. Each row is a skeleton <tr aria-busy="true"> that
+  polls its own dispatch endpoint; the progress region separately
+  polls the counter endpoint. NO OOB attributes — every swap is
+  explicit.
+-#}
+<div id="hts-workbench-result" class="hts-op-workbench__result">
+  <h3 class="hts-op-workbench__result-heading">
+    {{ chrome.i18n.t("hts-vs-batch-result-heading") }}
+  </h3>
+  <p class="hts-op-workbench__hint">
+    {{ chrome.i18n.t_arg("hts-vs-batch-target-hint", "target", target.clone()) }}
+  </p>
+  <table class="hts-op-workbench__table" aria-labelledby="hts-workbench-input-heading">
+    <thead>
+      <tr>
+        <th scope="col">{{ chrome.i18n.t("hts-vs-batch-column-code") }}</th>
+        <th scope="col">{{ chrome.i18n.t("hts-vs-batch-column-system") }}</th>
+        <th scope="col">{{ chrome.i18n.t("hts-vs-batch-column-display") }}</th>
+        <th scope="col">{{ chrome.i18n.t("hts-vs-batch-column-result") }}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+        <tr id="hts-batch-row-{{ row.index }}"
+            aria-busy="true"
+            hx-get="/ui/hts/operations/batch-validate/row/{{ row.index }}?batch_id={{ batch_id }}"
+            hx-trigger="load"
+            hx-swap="outerHTML">
+          <td><code>{{ row.code }}</code></td>
+          <td><code>{{ row.system }}</code></td>
+          <td>{{ row.display }}</td>
+          <td>
+            {% if row.index == 0 %}
+              <span autofocus tabindex="-1" class="hts-op-workbench__row-focus"
+                    aria-label="{{ chrome.i18n.t("hts-vs-batch-row-placeholder") }}">
+                {{ chrome.i18n.t("hts-vs-batch-row-placeholder") }}
+              </span>
+            {% else %}
+              <span aria-hidden="true">{{ chrome.i18n.t("hts-vs-batch-row-placeholder") }}</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {#- Progress region — polls the counter endpoint on load and every
+      second until n == m, then stops. The final response omits the
+      trigger attribute so polling naturally halts. -#}
+  <div id="hts-batch-progress"
+       role="status"
+       aria-live="polite"
+       hx-get="/ui/hts/operations/batch-validate/progress?batch_id={{ batch_id }}"
+       hx-trigger="load, every 1s"
+       hx-swap="outerHTML">
+    <p>{{ chrome.i18n.t_arg2("hts-vs-batch-progress", "n", "0".to_string(), "m", rows.len().to_string()) }}</p>
+  </div>
+</div>

@@ -1,0 +1,133 @@
+{#-
+  ConceptMap `$translate` result panel (design doc §7.5 wireframe).
+
+  Per-op partial (mirrors Slice C's `hts-vs-expand-result.html`, per
+  §7.4.1 F3). The abstract concept renderer stays aspirational until a
+  second operation demands it.
+
+  Inputs (context-provided):
+    id   : the current CM instance id
+    view : TranslateResultView { request_url, raw_body, result, outcome,
+                                 degraded_reason, direction }
+
+  Renders (in order):
+    - Degraded banner (Connect / Timeout / ClientBuild)
+    - Inline validation OperationOutcome (pre-flight, forward missing
+      code/system or reverse missing targetCode — §7.5 states matrix)
+    - HTS error OperationOutcome (4xx / 5xx via `hts-outcome.html`)
+    - `result=false` neutral no-matches label (§7.5 F11 realized: 200
+      + `result=false` is NOT an error)
+    - Match grid with columns code / system / display /
+      equivalence|relationship / origin — column heading reads whichever
+      field name HTS actually returned in the response
+    - Raw request + response echo (§7.5 wireframe)
+-#}
+<div id="hts-workbench-result" class="hts-cm-detail__result" aria-live="polite">
+  {% if let Some(reason) = view.degraded_reason %}
+  <aside class="hts-degraded" role="alert" aria-live="assertive">
+    <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
+    <p class="hts-degraded__reason">
+      {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    </p>
+    <p class="hts-degraded__body">{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  </aside>
+  {% endif %}
+
+  {% if let Some(outcome) = view.outcome.as_ref() %}
+    {% let outcome = outcome.clone() %}
+    {% include "partials/hts-outcome.html" %}
+  {% endif %}
+
+  {% if let Some(result) = view.result.as_ref() %}
+    <article class="hts-cm-workbench__result hts-cm-workbench__result--translate">
+      <header class="hts-cm-workbench__result-head">
+        {% if result.result %}
+          <p class="hts-cm-workbench__result-heading">
+            {{ chrome.i18n.t_arg("hts-cm-translate-matches-count", "count", result.matches.len().to_string()) }}
+          </p>
+        {% else %}
+          {#-
+            §7.5 F11: HTTP 200 with `result=false` is the neutral empty
+            state, NOT the error partial. The neutral label reads
+            "no matches for this source"; if HTS attached a message
+            parameter we surface it as a smaller line below.
+          -#}
+          <p class="hts-cm-workbench__no-matches">{{ chrome.i18n.t("hts-cm-translate-no-matches") }}</p>
+          {% if !result.message.is_empty() %}
+          <p class="hts-cm-workbench__no-matches-detail"><small>{{ result.message }}</small></p>
+          {% endif %}
+        {% endif %}
+      </header>
+
+      {% if result.result && !result.matches.is_empty() %}
+      {#-
+        Column heading for the mapping-kind column derives from the field
+        name HTS returned, not from a compile-time cfg. `result.mapping_kind`
+        is `Equivalence` when the response used the R4/R4B `equivalence`
+        field, `Relationship` for R5/R6. The Fluent catalog picks a label
+        off the `$kind` selector so a Rust build compiled for R5 pointed
+        at an R4 HTS still renders "Equivalence" if that's what came back.
+      -#}
+      {% let kind = result.mapping_kind %}
+      <table class="data-table hts-cm-workbench__matches">
+        <thead>
+          <tr>
+            <th scope="col">{{ chrome.i18n.t("hts-cm-translate-column-code") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-cm-translate-column-system") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-cm-translate-column-display") }}</th>
+            <th scope="col"
+                aria-label="{{ chrome.i18n.t_arg("hts-cm-translate-column-mapping", "kind", kind.as_str().to_string()) }}">
+              {{ chrome.i18n.t_arg("hts-cm-translate-column-mapping", "kind", kind.as_str().to_string()) }}
+            </th>
+            <th scope="col">{{ chrome.i18n.t("hts-cm-translate-column-origin") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for m in result.matches %}
+          <tr>
+            <td>{% if m.code.is_empty() %}&mdash;{% else %}<code>{{ m.code }}</code>{% endif %}</td>
+            <td>{% if m.system.is_empty() %}&mdash;{% else %}<code>{{ m.system }}</code>{% endif %}</td>
+            <td>
+              {% match m.display %}
+                {% when Some(d) %}{{ d }}
+                {% when None %}&mdash;
+              {% endmatch %}
+            </td>
+            <td>
+              {% match m.mapping_value %}
+                {% when Some(v) %}<code class="hts-cm-workbench__mapping-value">{{ v }}</code>
+                {% when None %}&mdash;
+              {% endmatch %}
+            </td>
+            <td>
+              {% match m.origin %}
+                {% when Some(o) %}<code class="hts-cm-workbench__origin">{{ o }}</code>
+                {% when None %}&mdash;
+              {% endmatch %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+    </article>
+  {% endif %}
+
+  {#- Raw request + response echo (§7.5 wireframe). Kept last so the
+      readable summary stays visually primary. Copy affordance is a
+      plain textarea select-all target for intranet deployments. -#}
+  {% if !view.raw_body.is_empty() || !view.request_url.is_empty() %}
+  <details class="hts-cm-workbench__raw">
+    <summary>{{ chrome.i18n.t("hts-workbench-raw-response") }}</summary>
+    {% if !view.request_url.is_empty() %}
+    <p class="hts-cm-workbench__raw-url">
+      <span class="hts-cm-workbench__raw-url-label">{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
+      <code>{{ view.request_url }}</code>
+    </p>
+    {% endif %}
+    {% if !view.raw_body.is_empty() %}
+    <pre class="hts-cm-workbench__raw-body" tabindex="0"><code>{{ view.raw_body }}</code></pre>
+    {% endif %}
+  </details>
+  {% endif %}
+</div>

@@ -1,0 +1,137 @@
+{#-
+  ConceptMap `$translate` input form (design doc §7.5 wireframe).
+
+  Layout follows §7.5:
+    - Direction toggle (radio): forward / reverse
+    - Source group (visible in forward): system, code, display (optional)
+    - Reverse group (visible in reverse): targetCode
+    - Target group (always): targetSystem, source (source VS URL),
+      target (target VS URL)
+    - Optional date input inline at the bottom
+    - Translate submit button
+
+  §7.5 explicitly forbids:
+    - `version` (of the ConceptMap)  — HTS ignores it
+    - `dependency`                    — HTS does not implement it
+    - `targetsystem` (lowercase)      — HTS does not accept the alias
+
+  On direction change, `hx-get` re-renders this partial with the
+  appropriate field group visible. The radio itself carries the
+  `direction` name for the POST body, and the GET re-render preserves
+  the visibility so the nojs fallback (plain form submit) still works.
+
+  Inputs (context-provided):
+    id        : the current CM instance id
+    summary   : Option<ConceptMapSummary> — Some when the canonical read
+                succeeded, used to render the map's canonical url header
+    direction : TranslateDirection — current toggle state
+-#}
+<form id="hts-workbench-input"
+      class="hts-cm-workbench__input"
+      method="post"
+      action="/ui/hts/concept-maps/{{ id }}/translate"
+      hx-post="/ui/hts/concept-maps/{{ id }}/translate"
+      hx-target="#hts-workbench-result"
+      hx-swap="outerHTML"
+      aria-labelledby="hts-workbench-input-heading">
+  <h3 id="hts-workbench-input-heading" class="hts-cm-workbench__input-heading">
+    {{ chrome.i18n.t("hts-cm-translate-heading") }}
+  </h3>
+
+  {% if let Some(s) = summary %}
+    {% if !s.url.is_empty() %}
+    <p class="hts-cm-workbench__pinned-map">
+      <span class="hts-cm-workbench__pinned-map-label">{{ chrome.i18n.t("hts-cm-translate-scoped-map") }}</span>
+      <code>{{ s.url }}</code>
+    </p>
+    {% endif %}
+  {% endif %}
+
+  {#-
+    Direction toggle. `hx-trigger="change"` on the radios re-fetches the
+    input partial with the appropriate visibility. The URL carries
+    `direction=…` and the server re-renders this same partial with the
+    matching field group. Same-URL GET means the nojs fallback stays
+    coherent (a hard nav to /translate?direction=reverse still lands the
+    right form).
+  -#}
+  <fieldset class="hts-cm-workbench__field hts-cm-workbench__field--direction">
+    <legend>{{ chrome.i18n.t("hts-cm-translate-direction-legend") }}</legend>
+    <label class="hts-cm-workbench__radio">
+      <input type="radio" name="direction" value="forward"
+             {% if direction == TranslateDirection::Forward %} checked{% endif %}
+             hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=forward"
+             hx-target="#hts-workbench-input"
+             hx-swap="outerHTML"
+             hx-trigger="change">
+      <span>{{ chrome.i18n.t("hts-cm-translate-direction-forward") }}</span>
+    </label>
+    <label class="hts-cm-workbench__radio">
+      <input type="radio" name="direction" value="reverse"
+             {% if direction == TranslateDirection::Reverse %} checked{% endif %}
+             hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=reverse"
+             hx-target="#hts-workbench-input"
+             hx-swap="outerHTML"
+             hx-trigger="change">
+      <span>{{ chrome.i18n.t("hts-cm-translate-direction-reverse") }}</span>
+    </label>
+  </fieldset>
+
+  {% if direction == TranslateDirection::Forward %}
+  <fieldset class="hts-cm-workbench__field hts-cm-workbench__field--source">
+    <legend>{{ chrome.i18n.t("hts-cm-translate-source-legend") }}</legend>
+    <div class="hts-cm-workbench__field-row">
+      <label for="translate-system">{{ chrome.i18n.t("hts-cm-translate-source-system") }}</label>
+      <input id="translate-system" name="system" type="text" autocomplete="off" spellcheck="false"
+             placeholder="{{ chrome.i18n.t("hts-cm-translate-source-system-placeholder") }}">
+    </div>
+    <div class="hts-cm-workbench__field-row">
+      <label for="translate-code">{{ chrome.i18n.t("hts-cm-translate-source-code") }}</label>
+      <input id="translate-code" name="code" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="hts-cm-workbench__field-row">
+      <label for="translate-display">{{ chrome.i18n.t("hts-cm-translate-source-display") }}</label>
+      <input id="translate-display" name="display" type="text" autocomplete="off" spellcheck="false"
+             placeholder="{{ chrome.i18n.t("hts-cm-translate-source-display-placeholder") }}">
+    </div>
+  </fieldset>
+  {% else %}
+  <fieldset class="hts-cm-workbench__field hts-cm-workbench__field--reverse">
+    <legend>{{ chrome.i18n.t("hts-cm-translate-reverse-legend") }}</legend>
+    <div class="hts-cm-workbench__field-row">
+      <label for="translate-target-code">{{ chrome.i18n.t("hts-cm-translate-target-code") }}</label>
+      <input id="translate-target-code" name="targetCode" type="text" autocomplete="off" spellcheck="false">
+      <small class="hts-cm-workbench__hint">{{ chrome.i18n.t("hts-cm-translate-target-code-hint") }}</small>
+    </div>
+  </fieldset>
+  {% endif %}
+
+  <fieldset class="hts-cm-workbench__field hts-cm-workbench__field--target">
+    <legend>{{ chrome.i18n.t("hts-cm-translate-target-legend") }}</legend>
+    <div class="hts-cm-workbench__field-row">
+      <label for="translate-target-system">{{ chrome.i18n.t("hts-cm-translate-target-system") }}</label>
+      <input id="translate-target-system" name="targetSystem" type="text" autocomplete="off" spellcheck="false"
+             placeholder="{{ chrome.i18n.t("hts-cm-translate-target-system-placeholder") }}">
+    </div>
+    <div class="hts-cm-workbench__field-row">
+      <label for="translate-source-url">{{ chrome.i18n.t("hts-cm-translate-source-url") }}</label>
+      <input id="translate-source-url" name="source" type="text" autocomplete="off" spellcheck="false"
+             placeholder="{{ chrome.i18n.t("hts-cm-translate-source-url-placeholder") }}">
+    </div>
+    <div class="hts-cm-workbench__field-row">
+      <label for="translate-target-url">{{ chrome.i18n.t("hts-cm-translate-target-url") }}</label>
+      <input id="translate-target-url" name="target" type="text" autocomplete="off" spellcheck="false"
+             placeholder="{{ chrome.i18n.t("hts-cm-translate-target-url-placeholder") }}">
+    </div>
+  </fieldset>
+
+  <div class="hts-cm-workbench__field">
+    <label for="translate-date">{{ chrome.i18n.t("hts-cm-translate-date") }}</label>
+    <input id="translate-date" name="date" type="text" autocomplete="off" spellcheck="false"
+           placeholder="{{ chrome.i18n.t("hts-cm-translate-date-placeholder") }}">
+  </div>
+
+  <div class="hts-cm-workbench__actions">
+    <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-cm-translate-submit") }}</button>
+  </div>
+</form>

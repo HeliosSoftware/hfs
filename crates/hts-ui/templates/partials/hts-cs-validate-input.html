@@ -1,0 +1,65 @@
+{#-
+  CodeSystem `$validate-code` input form (design doc §7.3, ui-design-map §3).
+
+  Two modes: bare `code` and structured `Coding`. `CodeableConcept` is
+  deferred to Slice E's standalone workbench (design doc §7.6) — the
+  detail-page surface stays terse. The mode selector is a real
+  <fieldset><label> pair so the nojs path still submits a mode.
+-#}
+<form id="hts-workbench-input"
+      class="hts-cs-workbench__input"
+      method="post"
+      action="/ui/hts/code-systems/{{ id }}/validate"
+      hx-post="/ui/hts/code-systems/{{ id }}/validate"
+      hx-target="#hts-workbench-result"
+      hx-swap="outerHTML"
+      aria-labelledby="hts-workbench-input-heading">
+  <h3 id="hts-workbench-input-heading" class="hts-cs-workbench__input-heading">
+    {{ chrome.i18n.t("hts-cs-validate-heading") }}
+  </h3>
+
+  <fieldset class="hts-cs-workbench__field hts-cs-workbench__field--mode">
+    <legend>{{ chrome.i18n.t("hts-cs-validate-mode-legend") }}</legend>
+    <label class="hts-cs-workbench__radio">
+      <input type="radio" name="mode" value="code" checked>
+      <span>{{ chrome.i18n.t("hts-cs-validate-mode-code") }}</span>
+    </label>
+    <label class="hts-cs-workbench__radio">
+      <input type="radio" name="mode" value="coding">
+      <span>{{ chrome.i18n.t("hts-cs-validate-mode-coding") }}</span>
+    </label>
+  </fieldset>
+
+  <div class="hts-cs-workbench__field">
+    <label for="validate-code">{{ chrome.i18n.t("hts-cs-validate-code") }}</label>
+    <input id="validate-code" name="code" type="text" autocomplete="off" spellcheck="false">
+  </div>
+
+  <div class="hts-cs-workbench__field">
+    <label for="validate-display">{{ chrome.i18n.t("hts-cs-validate-display") }}</label>
+    <input id="validate-display" name="display" type="text" autocomplete="off" spellcheck="false">
+  </div>
+
+  <fieldset class="hts-cs-workbench__field hts-cs-workbench__field--coding">
+    <legend>{{ chrome.i18n.t("hts-cs-validate-coding-legend") }}</legend>
+    <label for="validate-coding-system">{{ chrome.i18n.t("hts-cs-validate-coding-system") }}</label>
+    <input id="validate-coding-system" name="coding.system" type="text" autocomplete="off" spellcheck="false"
+           value="{% if let Some(s) = summary %}{{ s.url }}{% endif %}">
+
+    <label for="validate-coding-code">{{ chrome.i18n.t("hts-cs-validate-coding-code") }}</label>
+    <input id="validate-coding-code" name="coding.code" type="text" autocomplete="off" spellcheck="false">
+
+    <label for="validate-coding-display">{{ chrome.i18n.t("hts-cs-validate-coding-display") }}</label>
+    <input id="validate-coding-display" name="coding.display" type="text" autocomplete="off" spellcheck="false">
+  </fieldset>
+
+  <div class="hts-cs-workbench__field">
+    <label for="validate-display-language">{{ chrome.i18n.t("hts-cs-lookup-display-language") }}</label>
+    <input id="validate-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false"
+           placeholder="{{ chrome.i18n.t("hts-cs-lookup-display-language-placeholder") }}">
+  </div>
+
+  <div class="hts-cs-workbench__actions">
+    <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
+  </div>
+</form>

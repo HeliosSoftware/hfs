@@ -1,0 +1,32 @@
+{#-
+  Degraded-state banner for the HTS UI (design doc §7 header).
+
+  Trigger contract:
+    • Preferred: the in-process `Arc<AppState>` readiness probe reports the
+      terminology backend is not ready (e.g. bootstrap still hydrating).
+    • Fallback: `HTS_UI_UPSTREAM_URL` is set and its `/health` returns a 5xx
+      or is unreachable.
+
+    The HFS-side variable `HFS_TERMINOLOGY_SERVER` has NO meaning in the hts
+    binary — this partial must not reference it.
+
+  Inputs:
+    reason     : short reason key rendered via `hts-degraded-reason-<reason>`
+                 (e.g. `bootstrapping`, `upstream-down`, `unknown`)
+    since      : optional ISO-8601 timestamp of first failure, for operator
+                 triage
+    request_id : optional correlation id
+-#}
+<aside class="hts-degraded" role="alert" aria-live="assertive">
+  <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
+  <p class="hts-degraded__reason">
+    {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+  </p>
+  {% if let Some(t) = since %}
+  <p class="hts-degraded__since"><small>{{ chrome.i18n.t_arg("hts-degraded-since", "timestamp", t.to_string()) }}</small></p>
+  {% endif %}
+  <p class="hts-degraded__body">{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  {% if let Some(rid) = request_id %}
+  <p class="hts-degraded__meta"><small>{{ chrome.i18n.t_arg("hts-outcome-request-id", "id", rid.to_string()) }}</small></p>
+  {% endif %}
+</aside>

@@ -1,11 +1,11 @@
-# Helios FHIR Server — UI message catalog
-# Locale: English (en) — SOURCE LOCALE. Every key defined here is the
+# Helios FHIR Server â€” UI message catalog
+# Locale: English (en) â€” SOURCE LOCALE. Every key defined here is the
 # canonical set; other locales are expected to provide the same keys.
 #
 # Syntax: Project Fluent (https://projectfluent.org/). Terms (prefixed with
 # `-`) are reusable snippets; messages (bare identifiers) are what the UI
 # looks up. Placeables `{ $var }` are interpolated by the caller. Do NOT put
-# markup or logic here — translations are data, the template renders them.
+# markup or logic here â€” translations are data, the template renders them.
 
 ## Brand / shared terms
 
@@ -45,7 +45,7 @@ health-status-ok = All systems operational
 health-status-degraded = Some systems are degraded
 health-uptime = Uptime: { $duration }
 
-# Pluralized count — every locale must supply the plural categories its
+# Pluralized count â€” every locale must supply the plural categories its
 # grammar requires (CLDR rules; Fluent selects the branch automatically).
 resource-count = { $count ->
     [one] { $count } resource
@@ -66,7 +66,7 @@ action-save = Save
 action-cancel = Cancel
 action-retry = Retry
 
-## Errors (mirrors OperationOutcome text; see docs/multi-language.md §5)
+## Errors (mirrors OperationOutcome text; see docs/multi-language.md Â§5)
 
 error-not-found = The requested resource was not found.
 error-unauthorized = You are not authorized to perform this action.
@@ -105,7 +105,7 @@ tenants-stat-total-sub = { $count ->
 }
 tenants-stat-resources = Resources stored
 tenants-stat-resources-sub = across all tenants
-tenants-search-placeholder = Search by name or tenant id…
+tenants-search-placeholder = Search by name or tenant idâ€¦
 tenants-add = Add tenant
 tenants-add-title = Add a tenant
 tenants-field-id = Tenant id
@@ -148,7 +148,7 @@ chart-window = Chart time window
 
 ## Footer
 
-footer-copyright = © { $year } { -org-name }
+footer-copyright = Â© { $year } { -org-name }
 
 ## History & Versions (#236)
 
@@ -170,7 +170,7 @@ history-to = To
 history-show-metadata = Show metadata changes
 history-empty = Load a resource, then pick two versions to compare.
 history-load-error = Could not load that resource's history.
-history-not-found = No history for that resource — check the type and id.
+history-not-found = No history for that resource â€” check the type and id.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } metadata change hidden
@@ -179,7 +179,7 @@ history-metadata-hidden = { $count ->
 history-textual = Show full text diff
 history-only-metadata = Only metadata changed between these versions.
 history-identical = These two versions are identical.
-history-deleted = { $version } is a deletion — there is nothing to diff against.
+history-deleted = { $version } is a deletion â€” there is nothing to diff against.
 history-parse-error = Those versions could not be read as JSON.
 ## Saved queries (#234)
 
@@ -208,7 +208,7 @@ queries-unavailable = Saved queries are unavailable: this server's storage backe
 sp-heading = Search parameters
 sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant.
 sp-version-label = FHIR version
-sp-spec-missing = The full spec bundle (search-parameters-*.json) was not found in the data directory — only the minimal embedded fallback parameters are shown.
+sp-spec-missing = The full spec bundle (search-parameters-*.json) was not found in the data directory â€” only the minimal embedded fallback parameters are shown.
 sp-rail-label = Resource filter
 sp-rail-search = Filter types
 sp-rail-recent = Recently used
@@ -236,7 +236,7 @@ sp-page-next = Next
 sp-detail-label = Parameter detail
 sp-detail-empty = No parameter selected
 sp-detail-empty-hint = Select a row to inspect its definition, expression, and how it resolves against the registry.
-sp-detail-readonly = Spec parameter (compiled in from the data file) — read-only.
+sp-detail-readonly = Spec parameter (compiled in from the data file) â€” read-only.
 sp-field-url = Canonical URL
 sp-field-name = Name
 sp-field-status = Status
@@ -246,7 +246,7 @@ sp-field-description = Description
 sp-field-target = Target types
 sp-field-components = Components
 sp-status-hint = The loader promotes the spec's draft status to active on load.
-sp-note-conflict = Duplicate (base, code) within the same source as { $url } — the registry rejects this collision (DuplicateCode).
+sp-note-conflict = Duplicate (base, code) within the same source as { $url } â€” the registry rejects this collision (DuplicateCode).
 sp-note-overrides = Overrides { $url } on (base, code): a Stored definition outranks the spec parameter, so this one resolves searches. The registry logs a WARN naming both URLs.
 sp-note-shadowed = Shadowed by { $url } on (base, code): a higher-precedence source resolves searches for this slot.
 sp-note-empty-expression = Empty expression: the extractor indexes zero rows, so every search on this parameter silently returns empty.
@@ -268,7 +268,7 @@ cmp-heading = Compartments
 cmp-lede = The compartment definitions this server routes /{"{"}compartment{"}"}/{"{"}id{"}"}/{"{"}type{"}"} requests with, and a tester that answers: is this type in this compartment, via which parameters, and what search does the server run?
 cmp-rail-label = Compartment definitions
 cmp-rail-heading = Compartments
-cmp-degraded = Compartment definitions could not be loaded from this server right now — the self-call to /CompartmentDefinition failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
+cmp-degraded = Compartment definitions could not be loaded from this server right now â€” the self-call to /CompartmentDefinition failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
 cmp-rail-note = Definitions are stored resources, seeded from the FHIR spec at startup. Edits and deletions here are tenant-scoped.
 cmp-tabs-label = Compartment sections
 cmp-tab-definition = Definition
@@ -296,23 +296,23 @@ cmp-excluded = excluded
 cmp-tester-id = Id
 cmp-tester-target = Target type (or *)
 cmp-tester-run = Test
-cmp-result-member = ✓ member — via { $params }
+cmp-result-member = âœ“ member â€” via { $params }
 cmp-result-flat = // equivalent flat search
 cmp-result-member-note = The server resolves the compartment route to this search over the type's reference parameters.
-cmp-result-self = ✓ member — the compartment resource itself ({"{"}def{"}"})
+cmp-result-self = âœ“ member â€” the compartment resource itself ({"{"}def{"}"})
 cmp-result-self-note = The compartment instance is trivially in its own compartment; the route reads the resource directly.
-cmp-result-notmember = ✕ { $type } is not a member of this compartment
+cmp-result-notmember = âœ• { $type } is not a member of this compartment
 cmp-result-notmember-note = The server returns 404 with an OperationOutcome for types that are not compartment members.
 cmp-result-fanout = Fans out to { $count } member types
-cmp-result-fanout-note = Excluded types are skipped, not failed — the fan-out drops non-member types rather than erroring.
+cmp-result-fanout-note = Excluded types are skipped, not failed â€” the fan-out drops non-member types rather than erroring.
 queries-builder-heading = Search builder
 queries-url-label = FHIR search URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edit the GET URL directly or through the rows below — they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
+queries-builder-hint = Edit the GET URL directly or through the rows below â€” they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
 queries-recent = Recent
 queries-recent-heading = Recent searches
-queries-recent-empty = No recent searches yet — Run one to record it here.
-queries-invalid-url = Enter a search like GET /Patient?name=smith — the resource type comes from the path.
+queries-recent-empty = No recent searches yet â€” Run one to record it here.
+queries-invalid-url = Enter a search like GET /Patient?name=smith â€” the resource type comes from the path.
 
 queries-conditions = Conditions
 queries-add-condition = Add condition
@@ -326,7 +326,7 @@ plain-find = Find {"{type}"} records
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-and = and
 plain-or = or
-plain-arrow = ’s
+plain-arrow = â€™s
 plain-has = that have a related {"{type}"} whose {"{param}"} {"{verb}"} {"{value}"}
 plain-include = Also returning the {"{param}"} of each {"{type}"}{"{target}"}
 plain-revinclude = Plus every {"{type}"} whose {"{param}"} points here
@@ -380,7 +380,7 @@ queries-has-pill = has a related
 queries-has-type-placeholder = resource type
 queries-has-via = linked via
 queries-has-where = where its
-queries-add-has = ⧉ Filter a resource that links here
+queries-add-has = â§‰ Filter a resource that links here
 queries-param-placeholder = parameter
 queries-value-placeholder = value
 queries-results = Results
@@ -395,7 +395,7 @@ queries-next = Next
 queries-rail-heading = Resource types
 queries-rail-filter = Filter types
 
-## Search — natural language & visual builder (#255)
+## Search â€” natural language & visual builder (#255)
 
 search-heading = Search
 search-lede = Describe what you're looking for, or build the query by hand. Either way you get a FHIR search query you can read, correct, and run.
@@ -407,9 +407,9 @@ search-mode-nl = Natural language
 search-mode-builder = Visual builder
 
 search-nl-label = Describe the search
-search-nl-placeholder = Describe what you're looking for — e.g. patients named Smith born after 1980
+search-nl-placeholder = Describe what you're looking for â€” e.g. patients named Smith born after 1980
 search-nl-hint = Your text and this server's search parameters go to the language model. Patient data never does. The query it writes is shown below for you to check and run.
-search-nl-working = Translating…
+search-nl-working = Translatingâ€¦
 search-nl-caveats = Worth knowing:
 search-nl-unsupported = That isn't a search this server can run. Try describing the records you want to find.
 
@@ -418,15 +418,15 @@ search-nl-example-2 = Observations from the last 30 days, most recent first
 search-nl-example-3 = Encounters at Boston General still in progress
 
 search-setup-heading = Natural-language search is available
-search-setup-body = Turn plain-language descriptions into FHIR search queries. It needs an API key for a language model — the server reads it from the environment, and it never reaches this page. Until one is set, use the visual builder below.
+search-setup-body = Turn plain-language descriptions into FHIR search queries. It needs an API key for a language model â€” the server reads it from the environment, and it never reaches this page. Until one is set, use the visual builder below.
 search-setup-key-placeholder = your API key
-search-setup-disable = To remove the feature entirely — endpoint, page, and this notice — set HFS_NL_SEARCH_ENABLED=false.
+search-setup-disable = To remove the feature entirely â€” endpoint, page, and this notice â€” set HFS_NL_SEARCH_ENABLED=false.
 search-setup-docs = Read the how-to
 
 ## Resource editor (#264)
 
 editor-heading = Resource editor
-editor-lede = Edit a resource against its schema: add any element the schema allows, at any depth — including extensions, on any node that accepts one.
+editor-lede = Edit a resource against its schema: add any element the schema allows, at any depth â€” including extensions, on any node that accepts one.
 editor-title = Edit resource
 editor-view-label = How to edit
 editor-view-form = Guided form
@@ -442,7 +442,7 @@ editor-source-hint = Edit the source directly. Switching back to the guided form
 
 editor-add = Add element
 editor-must-support-badge = MS
-editor-binding-hint = Bound to a value set — codes come from it; strength shown
+editor-binding-hint = Bound to a value set â€” codes come from it; strength shown
 editor-legend-live = Checked as you type: structure, cardinality, required bindings
 editor-legend-save = Checked on save: constraints and terminology
 editor-deferred-badge = on save
@@ -450,7 +450,7 @@ editor-deferred-hint = Codes are verified against the value set when you save (a
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
 editor-add-filter = Filter elements
 editor-add-another = add another
-editor-pick-type = Pick a type…
+editor-pick-type = Pick a typeâ€¦
 editor-extension-url = Extension URL
 editor-add-extension = Add extension
 
@@ -480,7 +480,7 @@ resources-heading = Resources
 resources-lede = Browse, search, create, and edit FHIR resources. Search in natural language or build the query by hand, then open any result to edit it.
 resources-create = Create new
 resources-save-blocked = Fix the validation issues before saving.
-resources-save-invalid = The JSON is not valid — fix it before saving.
+resources-save-invalid = The JSON is not valid â€” fix it before saving.
 resources-edit-title = Edit resource
 resources-tab-edit = Edit
 resources-tab-history = History
@@ -500,11 +500,11 @@ batch-not-a-bundle = That JSON is not a FHIR Bundle
 batch-bad-type = Only Bundles of type batch or transaction can be executed here
 batch-request = Request
 batch-entries = entries
-batch-semantics-batch = Batch: entries run independently — a failed entry does not stop or undo the others.
-batch-semantics-transaction = Transaction: all or nothing — if any entry fails, the server rolls the whole bundle back.
+batch-semantics-batch = Batch: entries run independently â€” a failed entry does not stop or undo the others.
+batch-semantics-transaction = Transaction: all or nothing â€” if any entry fails, the server rolls the whole bundle back.
 batch-tab-actions = Actions
 batch-tab-json = Bundle JSON
-batch-no-body = (no body — this entry only addresses a resource)
+batch-no-body = (no body â€” this entry only addresses a resource)
 batch-cancel = Cancel
 batch-upload-another = Upload another
 batch-execute = Execute
@@ -586,9 +586,568 @@ bulk-import-field-submitter-hint = Must match an identifier registered with the 
 bulk-import-field-submission-id = Submission ID
 bulk-import-field-submission-id-hint = Unique per submitter. Leave empty to generate a UUID.
 bulk-import-processing = Processing
-bulk-import-processing-waiting = Waiting for the recipient's first status report…
+bulk-import-processing-waiting = Waiting for the recipient's first status reportâ€¦
 bulk-import-result = Result
 bulk-import-result-finished = Processing finished at
 bulk-import-result-outputs = Output files
 bulk-import-result-errors = Error files
 bulk-import-abort-manifest = Abort
+
+## HTS administrative UI (crates/hts-ui) â€” Phase 1 scaffold stubs
+##
+## The full catalog for the HTS UI is filled in during Phase 1.4 / Phase 2
+## slices per `edson/docs/hts-ui-design.md` Â§7 (Fluent convention:
+## hts-<page>-<role>-<control>). These stubs cover the base layout, sidebar
+## nav, and the dashboard scaffold placeholder rendered by the Phase 1 blocker
+## slice. They must be kept in parity with es/de/main.ftl.
+
+-hts-app-name = Helios Terminology Server
+hts-app-title = { -hts-app-name }
+
+hts-nav-section-work = Terminology
+hts-nav-section-tools = Tools
+hts-nav-section-server = Server
+hts-nav-dashboard = Dashboard
+hts-nav-code-systems = Code Systems
+hts-nav-value-sets = Value Sets
+hts-nav-concept-maps = Concept Maps
+hts-nav-operations = Operations
+hts-nav-import = Import
+hts-nav-diagnostics = Diagnostics
+
+hts-fhir-version-heading = FHIR version
+hts-fhir-version = FHIR { $version }
+
+hts-dashboard-title = Dashboard
+hts-dashboard-subtitle = Terminology server health, catalog inventory, and quick actions.
+
+## Dashboard rows (row headings are visually hidden â€” they're for screen readers).
+
+hts-dashboard-row-status = Server status
+hts-dashboard-row-inventory = Loaded inventory
+hts-dashboard-row-metrics = Traffic metrics
+hts-dashboard-quick-links = Quick links
+
+## Dashboard tiles.
+
+hts-dashboard-tile-status = Status
+hts-dashboard-tile-backend = Backend
+hts-dashboard-tile-uptime = Uptime
+hts-dashboard-tile-fhir-version = FHIR version
+hts-dashboard-tile-loaded-systems = Loaded systems
+hts-dashboard-tile-loaded-systems-hint = From TerminologyCapabilities.codeSystem[]
+hts-dashboard-tile-bundled-data = Bundled data
+hts-dashboard-tile-bundled-data-value = { $mib } MiB
+hts-dashboard-tile-bundled-data-hint = From HTS_BOOTSTRAP_DIR footprint
+hts-dashboard-tile-requests = Requests
+hts-dashboard-tile-avg-latency = Avg latency
+hts-dashboard-tile-metrics-hint = From /metrics â€” Wave 2
+
+## /health `status` values, keyed for translation.
+
+hts-dashboard-status-ok = OK
+
+## Degraded banner (design doc Â§7 header contract).
+
+hts-degraded-title = Terminology backend not fully available
+hts-degraded-body = Some tiles are hidden until HTS becomes reachable again. Interactive controls are disabled on affected pages.
+hts-degraded-reason-client-build = Failed to build the upstream HTTP client.
+hts-degraded-reason-upstream-down = Could not reach the terminology server.
+hts-degraded-reason-upstream-timeout = The terminology server did not respond in time.
+hts-degraded-reason-upstream-error = The terminology server returned an error status.
+hts-degraded-reason-upstream-shape = The terminology server returned an unexpected response shape.
+hts-degraded-reason-bootstrapping = The terminology server is still loading its bootstrap data.
+hts-degraded-reason-unknown = The terminology server is temporarily unavailable.
+
+## Dialect chip (topbar, session-wide displayLanguage / Accept-Language per Â§7.1).
+
+hts-dialect-label = Dialect
+hts-dialect-prefix = dialect:
+hts-dialect-heading = Session dialect
+hts-dialect-hint = Controls displayLanguage on expansions and Accept-Language on reads. Per-op fields on Operations override this.
+
+## OperationOutcome partial (shared, design doc Â§7 / Â§11).
+
+hts-outcome-severity = Severity: { $severity }
+hts-outcome-request-id = Request id: { $id }
+hts-outcome-code-not-found = The requested resource was not found.
+hts-outcome-code-invalid = The request was rejected as invalid.
+hts-outcome-code-too-costly = The requested operation was rejected as too expensive.
+hts-outcome-code-unknown = The server returned an issue the UI does not recognise.
+hts-degraded-since = Since { $timestamp }
+
+## HTS Slice B â€” CodeSystem browser + detail with embedded workbench
+## (design doc Â§7.2 + Â§7.3). Every key here has a peer in es/de/main.ftl.
+
+## CodeSystem status pills (used by browser rows and detail header).
+
+hts-cs-status-draft = draft
+hts-cs-status-active = active
+hts-cs-status-retired = retired
+hts-cs-status-unknown = unknown
+
+## CS browser page.
+
+hts-cs-browser-title = CodeSystems
+hts-cs-browser-subtitle = Browse the terminology server's catalog of CodeSystems and open any row to inspect its metadata and workbench.
+hts-cs-browser-filter-legend = Filter CodeSystems
+hts-cs-browser-filter-url = Canonical URL
+hts-cs-browser-filter-version = Version
+hts-cs-browser-filter-name = Name
+hts-cs-browser-filter-title = Title
+hts-cs-browser-filter-status = Status
+hts-cs-browser-filter-search = Search
+hts-cs-browser-filter-reset = Reset
+hts-cs-browser-empty = No CodeSystems match these filters.
+hts-cs-browser-load-more = Load more
+hts-cs-browser-showing-count = Showing { $count ->
+    [one] { $count } CodeSystem
+   *[other] { $count } CodeSystems
+}
+hts-cs-browser-table-caption = CodeSystems matching the active filters.
+hts-cs-browser-column-url = URL
+hts-cs-browser-column-version = Version
+hts-cs-browser-column-title = Title
+hts-cs-browser-column-status = Status
+hts-cs-browser-error-title = CodeSystems could not be listed
+
+## CS detail page.
+
+hts-cs-detail-title = { $name } Â· CodeSystem
+hts-cs-detail-title-fallback = CodeSystem
+hts-cs-detail-eyebrow = CodeSystem
+hts-cs-detail-section-identity = Identity
+hts-cs-detail-section-content = Content
+hts-cs-detail-content-mode = Content mode
+hts-cs-detail-count = Concept count
+hts-cs-detail-publisher = Publisher
+hts-cs-detail-jurisdiction = Jurisdiction
+hts-cs-detail-supersedes = Supersedes
+hts-cs-detail-superseded-by = Superseded by
+hts-cs-detail-tabs-label = CodeSystem workbench sections
+hts-cs-detail-tab-metadata = Metadata
+hts-cs-detail-tab-lookup = Lookup
+hts-cs-detail-tab-validate = Validate
+hts-cs-detail-tab-subsumes = Subsumes
+hts-cs-detail-workbench-hint = Pick an operation to run against this CodeSystem.
+hts-cs-detail-result-empty = Run the operation to see its result here.
+
+## CS $lookup form + result labels.
+
+hts-cs-lookup-heading = Look up a concept
+hts-cs-lookup-code = Code
+hts-cs-lookup-version = Version
+hts-cs-lookup-display-language = Display language
+hts-cs-lookup-display-language-placeholder = e.g. en-GB
+hts-cs-lookup-properties-legend = Properties
+hts-cs-lookup-designations = Designations
+hts-cs-lookup-properties = Properties
+hts-cs-lookup-no-match = HTS returned no matching concept.
+
+## CS $validate-code form + result labels.
+
+hts-cs-validate-heading = Validate a code
+hts-cs-validate-mode-legend = Input mode
+hts-cs-validate-mode-code = Bare code
+hts-cs-validate-mode-coding = Coding
+hts-cs-validate-code = Code
+hts-cs-validate-display = Display
+hts-cs-validate-coding-legend = Coding
+hts-cs-validate-coding-system = system
+hts-cs-validate-coding-code = code
+hts-cs-validate-coding-display = display
+hts-cs-validate-badge-true = valid
+hts-cs-validate-badge-false = invalid
+hts-cs-validate-message = Message
+
+## CS $subsumes form + result labels.
+
+hts-cs-subsumes-heading = Test subsumption
+hts-cs-subsumes-scoped-system = System (fixed)
+hts-cs-subsumes-code-a = Code A
+hts-cs-subsumes-code-b = Code B
+hts-cs-subsumes-outcome-equivalent = Codes are equivalent.
+hts-cs-subsumes-outcome-subsumes = Code A subsumes code B.
+hts-cs-subsumes-outcome-subsumed-by = Code A is subsumed by code B.
+hts-cs-subsumes-outcome-not-subsumed = Neither code subsumes the other.
+
+## Shared workbench chrome (reused by Slice C/D/E workbenches).
+
+hts-workbench-run = Run
+hts-workbench-raw-response = Raw request and response
+hts-workbench-copy-url = Request URL
+hts-workbench-format-json = JSON
+hts-workbench-format-xml = XML
+
+## Additional degraded reason for CS-read 404s (design doc Â§7.3 states matrix).
+
+hts-degraded-reason-upstream-not-found = The terminology server did not find that resource.
+
+## HTS Slice C â€” ValueSet browser + detail with embedded $expand workbench
+## (design doc Â§7.4 + Â§7.4.1). Every key here has a peer in es/de/main.ftl.
+
+## ValueSet status pills.
+
+hts-vs-status-draft = draft
+hts-vs-status-active = active
+hts-vs-status-retired = retired
+hts-vs-status-unknown = unknown
+
+## VS browser page.
+
+hts-vs-browser-title = ValueSets
+hts-vs-browser-subtitle = Browse the terminology server's catalog of ValueSets and open any row to inspect its metadata or run an expansion.
+hts-vs-browser-filter-legend = Filter ValueSets
+hts-vs-browser-filter-url = Canonical URL
+hts-vs-browser-filter-version = Version
+hts-vs-browser-filter-name = Name
+hts-vs-browser-filter-title = Title
+hts-vs-browser-filter-status = Status
+hts-vs-browser-filter-search = Search
+hts-vs-browser-filter-reset = Reset
+hts-vs-browser-empty = No ValueSets match these filters.
+hts-vs-browser-load-more = Load more
+hts-vs-browser-showing-count = Showing { $count ->
+    [one] { $count } ValueSet
+   *[other] { $count } ValueSets
+}
+hts-vs-browser-table-caption = ValueSets matching the active filters.
+hts-vs-browser-column-url = URL
+hts-vs-browser-column-version = Version
+hts-vs-browser-column-title = Title
+hts-vs-browser-column-status = Status
+
+## VS detail page.
+
+hts-vs-detail-title = { $name } Â· ValueSet
+hts-vs-detail-title-fallback = ValueSet
+hts-vs-detail-eyebrow = ValueSet
+hts-vs-detail-section-identity = Identity
+hts-vs-detail-section-governance = Governance
+hts-vs-detail-publisher = Publisher
+hts-vs-detail-jurisdiction = Jurisdiction
+hts-vs-detail-immutable = Immutable
+hts-vs-detail-immutable-yes = yes
+hts-vs-detail-immutable-no = no
+hts-vs-detail-purpose = Purpose
+hts-vs-detail-copyright = Copyright
+hts-vs-detail-tabs-label = ValueSet workbench sections
+hts-vs-detail-tab-metadata = Metadata
+hts-vs-detail-tab-expand = Expand
+hts-vs-detail-workbench-hint = Pick an operation to run against this ValueSet.
+hts-vs-detail-result-empty = Run the operation to see its result here.
+
+## VS $expand form + result labels.
+
+hts-vs-expand-heading = Expand this ValueSet
+hts-vs-expand-scoped-valueset = ValueSet (fixed)
+hts-vs-expand-filter = Filter
+hts-vs-expand-filter-placeholder = code or display text
+hts-vs-expand-count = count
+hts-vs-expand-offset = offset
+hts-vs-expand-display-language = Display language
+hts-vs-expand-display-language-placeholder = e.g. en-GB
+hts-vs-expand-flags-legend = Flags
+hts-vs-expand-active-only = Active concepts only
+hts-vs-expand-include-designations = Include designations
+hts-vs-expand-mode-legend = Result mode
+hts-vs-expand-mode-flat = Flat
+hts-vs-expand-mode-tree = Tree
+hts-vs-expand-use-supplement-legend = Use supplements
+hts-vs-expand-use-supplement-placeholder = canonical URL
+hts-vs-expand-advanced-summary = Advanced
+hts-vs-expand-date = Date
+hts-vs-expand-date-placeholder = ISO 8601 (e.g. 2025-06-01)
+hts-vs-expand-property-legend = Properties
+hts-vs-expand-property-placeholder = property code
+hts-vs-expand-tx-resource-legend = tx-resource
+hts-vs-expand-tx-resource-placeholder = canonical URL or reference
+hts-vs-expand-system-version-legend = system-version
+hts-vs-expand-system-version-placeholder = system|version
+hts-vs-expand-check-system-version-legend = check-system-version
+hts-vs-expand-force-system-version-legend = force-system-version
+hts-vs-expand-default-valueset-version = default-valueset-version
+hts-vs-expand-threshold = Too-costly threshold
+hts-vs-expand-ceiling-tooltip = UI ceiling: { $ceiling } (values above are dropped)
+hts-vs-expand-ceiling-note = ceiling: { $ceiling }
+hts-vs-expand-ceiling-warning-title = Threshold above the UI ceiling
+hts-vs-expand-ceiling-warning-body = You requested threshold { $requested }, which is above the UI ceiling â€” the header was not attached.
+hts-vs-expand-ceiling-value = ceiling: { $ceiling }
+hts-vs-expand-too-costly-title = Expansion rejected as too costly
+hts-vs-expand-too-costly-body = HTS refused the expansion above the current threshold. Raise it below and re-run, or narrow the filter.
+hts-vs-expand-raise-threshold = Raise threshold to
+hts-vs-expand-raise-submit = Retry
+hts-vs-expand-tree-label = showing full tree { $count ->
+    [one] { $count } leaf
+   *[other] { $count } leaves
+}
+hts-vs-expand-total-label = total { $total }
+hts-vs-expand-total-unknown = total (unknown)
+hts-vs-expand-offset-label = offset { $offset }
+hts-vs-expand-filter-no-match = No members match the filter "{ $filter }".
+hts-vs-expand-no-members = This expansion contains no members.
+hts-vs-expand-column-code = Code
+hts-vs-expand-column-display = Display
+hts-vs-expand-column-system = System
+hts-vs-expand-load-more = Load more
+hts-vs-expand-echoed-parameters = Echoed parameters
+
+## HTS Slice D â€” ConceptMap browser + detail with embedded $translate
+## workbench (design doc Â§7.5). Every key here has a peer in
+## es/de/main.ftl.
+
+## ConceptMap status pills.
+
+hts-cm-status-draft = draft
+hts-cm-status-active = active
+hts-cm-status-retired = retired
+hts-cm-status-unknown = unknown
+
+## CM browser page.
+
+hts-cm-browser-title = ConceptMaps
+hts-cm-browser-subtitle = Browse the terminology server's catalog of ConceptMaps and open any row to inspect its metadata or run a translation.
+hts-cm-browser-filter-legend = Filter ConceptMaps
+hts-cm-browser-filter-url = Canonical URL
+hts-cm-browser-filter-name = Name
+hts-cm-browser-filter-title = Title
+hts-cm-browser-filter-source = Source system
+hts-cm-browser-filter-target = Target system
+hts-cm-browser-filter-status = Status
+hts-cm-browser-filter-search = Search
+hts-cm-browser-filter-reset = Reset
+hts-cm-browser-empty = No ConceptMaps match these filters.
+hts-cm-browser-load-more = Load more
+hts-cm-browser-showing-count = Showing { $count ->
+    [one] { $count } ConceptMap
+   *[other] { $count } ConceptMaps
+}
+hts-cm-browser-table-caption = ConceptMaps matching the active filters.
+hts-cm-browser-column-url = URL
+hts-cm-browser-column-version = Version
+hts-cm-browser-column-title = Title
+hts-cm-browser-column-status = Status
+
+## CM detail page.
+
+hts-cm-detail-title = { $name } Â· ConceptMap
+hts-cm-detail-title-fallback = ConceptMap
+hts-cm-detail-eyebrow = ConceptMap
+hts-cm-detail-section-identity = Identity
+hts-cm-detail-section-mapping = Mapping
+hts-cm-detail-publisher = Publisher
+hts-cm-detail-jurisdiction = Jurisdiction
+hts-cm-detail-purpose = Purpose
+hts-cm-detail-source-uri = Source
+hts-cm-detail-target-uri = Target
+hts-cm-detail-group-count = Groups
+hts-cm-detail-tabs-label = ConceptMap workbench sections
+hts-cm-detail-tab-metadata = Metadata
+hts-cm-detail-tab-translate = Translate
+hts-cm-detail-workbench-hint = Pick an operation to run against this ConceptMap.
+hts-cm-detail-result-empty = Run the operation to see its result here.
+
+## CM $translate form + result labels.
+
+hts-cm-translate-heading = Translate a code
+hts-cm-translate-scoped-map = ConceptMap (fixed)
+hts-cm-translate-direction-legend = Direction
+hts-cm-translate-direction-forward = Forward
+hts-cm-translate-direction-reverse = Reverse
+hts-cm-translate-source-legend = Source coding
+hts-cm-translate-source-system = System
+hts-cm-translate-source-system-placeholder = canonical URL
+hts-cm-translate-source-code = Code
+hts-cm-translate-source-display = Display
+hts-cm-translate-source-display-placeholder = optional
+hts-cm-translate-reverse-legend = Reverse source
+hts-cm-translate-target-code = Target code
+hts-cm-translate-target-code-hint = Required in reverse mode.
+hts-cm-translate-target-legend = Target constraints
+hts-cm-translate-target-system = Target system
+hts-cm-translate-target-system-placeholder = canonical URL
+hts-cm-translate-source-url = Source ValueSet
+hts-cm-translate-source-url-placeholder = canonical URL (optional)
+hts-cm-translate-target-url = Target ValueSet
+hts-cm-translate-target-url-placeholder = canonical URL (optional)
+hts-cm-translate-date = Date
+hts-cm-translate-date-placeholder = ISO 8601 (e.g. 2025-06-01)
+hts-cm-translate-submit = Translate
+hts-cm-translate-matches-heading = Matches
+hts-cm-translate-matches-count = { $count ->
+    [one] { $count } match
+   *[other] { $count } matches
+}
+hts-cm-translate-no-matches = No matches for this source.
+hts-cm-translate-column-code = Code
+hts-cm-translate-column-system = System
+hts-cm-translate-column-display = Display
+hts-cm-translate-column-mapping = { $kind ->
+    [equivalence] Equivalence
+    [relationship] Relationship
+   *[other] Mapping
+}
+hts-cm-translate-column-origin = Origin
+hts-cm-translate-column-mapping-equivalence = Equivalence
+hts-cm-translate-column-mapping-relationship = Relationship
+hts-cm-translate-validate-forward-missing = Forward translation requires both `code` and `system`.
+hts-cm-translate-validate-reverse-missing-target-code = Reverse translation requires `targetCode`.
+
+## HTS Slice E -- standalone Operations workbench (design doc s7.6).
+## Every user-visible string on `/ui/hts/operations` resolves to a key
+## in this section. Keys have peers in es/de/main.ftl (parity gated by
+## the fluent-key inventory test).
+
+## Shell.
+hts-operations-title = Operations workbench
+hts-operations-eyebrow = Terminology
+hts-operations-subtitle = Run terminology operations against the connected server. Every operation is proxied via POST regardless of the input form's verb.
+hts-operations-selector-label = Operation
+hts-operations-resource-tabs-label = Resource family
+hts-operations-resource-code-system = CodeSystem
+hts-operations-resource-value-set = ValueSet
+hts-operations-result-empty = Run the operation to see its result here.
+hts-operations-scope-legend = Scope
+hts-operations-scope-system = CodeSystem canonical URL
+hts-operations-scope-instance = Instance id
+hts-operations-scope-instance-placeholder = instance id
+hts-operations-scope-canonical = Canonical URL
+hts-operations-not-implemented = This operation ships in Slice E2.
+hts-operations-closure-stateless-warning = Closure state lives on the server keyed by the `name` you provide. The UI never persists it across requests.
+hts-operations-closure-empty-graph = No closure edges yet -- submit at least one Coding to add nodes to the graph.
+
+## Op selector labels -- one per OperationKind slug.
+hts-operations-op-lookup = $lookup
+hts-operations-op-validate-code = $validate-code
+hts-operations-op-subsumes = $subsumes
+hts-operations-op-expand = $expand
+hts-operations-op-translate = $translate
+hts-operations-op-closure = $closure
+hts-operations-op-batch-validate = batch-validate
+
+## CS $lookup widening (Slice E adds useSupplement to the Slice B set).
+hts-cs-lookup-useSupplement = Supplement
+hts-cs-lookup-useSupplement-hint = Optional canonical URL of a CodeSystem supplement to layer on top of the base.
+hts-cs-lookup-result-heading = Lookup result
+hts-cs-lookup-fact-name = Name
+hts-cs-lookup-fact-version = Version
+hts-cs-lookup-fact-display = Display
+hts-cs-lookup-fact-definition = Definition
+
+## CS $validate-code widening.
+hts-cs-validate-version = CodeSystem version
+hts-cs-validate-systemVersion = System version override
+hts-cs-validate-mode-CodeableConcept = CodeableConcept
+hts-cs-validate-displayLanguage = Display language
+hts-cs-validate-advanced = Advanced parameters
+hts-cs-validate-date = Date
+hts-cs-validate-activeOnly = Active codes only
+hts-cs-validate-abstract = Allow abstract codes
+hts-cs-validate-lenient-display-validation = Lenient display validation
+hts-cs-validate-useSupplement = Supplement URL
+hts-cs-validate-system-version = System version pin
+hts-cs-validate-check-system-version = Check system version
+hts-cs-validate-force-system-version = Force system version
+hts-cs-validate-result-heading = Validate result
+hts-cs-validate-result-badge-true = Valid
+hts-cs-validate-result-badge-false = Not valid
+hts-cs-validate-fact-code = Code
+hts-cs-validate-fact-display = Display
+hts-cs-validate-fact-message = Message
+
+## CS $subsumes standalone (heading + outcomes already live in Slice B).
+hts-cs-subsumes-version = Version
+hts-cs-subsumes-codeA = Code A
+hts-cs-subsumes-codeB = Code B
+hts-cs-subsumes-result-heading = Subsumption result
+
+## VS $expand widening (adds designation chip).
+hts-vs-expand-displayLanguage = Display language
+hts-vs-expand-activeOnly = Active only
+hts-vs-expand-includeDesignations = Include designations
+hts-vs-expand-designation = Designation
+hts-vs-expand-designation-hint = Chip filter -- pass a `use|value` pair per line (repeatable).
+hts-vs-expand-advanced = Advanced parameters
+hts-vs-expand-threshold-hint = HTS refuses expansions above threshold. UI ceiling: { $ceiling }.
+hts-vs-expand-result-heading = Expansion
+hts-vs-expand-total = total { $n }
+hts-vs-expand-count-shown = showing { $n }
+
+## VS $validate-code (new op in Slice E).
+hts-vs-validate-heading = Validate a code against a ValueSet
+hts-vs-validate-source-legend = ValueSet source
+hts-vs-validate-source-canonical = Canonical URL
+hts-vs-validate-source-instance = Instance id
+hts-vs-validate-source-inline = Inline JSON
+hts-vs-validate-mode-legend = Input shape
+hts-vs-validate-mode-code = Code
+hts-vs-validate-mode-coding = Coding
+hts-vs-validate-mode-CodeableConcept = CodeableConcept
+hts-vs-validate-code = Code
+hts-vs-validate-system = System
+hts-vs-validate-systemVersion = System version
+hts-vs-validate-display = Display
+hts-vs-validate-coding-legend = Coding
+hts-vs-validate-coding-system = System
+hts-vs-validate-coding-code = Code
+hts-vs-validate-coding-display = Display
+hts-vs-validate-displayLanguage = Display language
+hts-vs-validate-valueSetVersion = ValueSet version
+hts-vs-validate-advanced = Advanced parameters
+hts-vs-validate-date = Date
+hts-vs-validate-activeOnly = Active only
+hts-vs-validate-abstract = Allow abstract codes
+hts-vs-validate-lenient-display-validation = Lenient display validation
+hts-vs-validate-useSupplement = Supplement URL
+hts-vs-validate-tx-resource = Extra tx-resource
+hts-vs-validate-default-valueset-version = Default ValueSet version
+hts-vs-validate-no-membership = Code is not a member of the ValueSet.
+hts-vs-validate-result-heading = Validate result
+hts-vs-validate-result-badge-true = Valid
+hts-vs-validate-result-badge-false = Not valid
+hts-vs-validate-fact-code = Code
+hts-vs-validate-fact-system = System
+hts-vs-validate-fact-display = Display
+hts-vs-validate-fact-message = Message
+
+## CM $translate standalone (base keys already live in Slice D).
+hts-cm-translate-code = Code
+hts-cm-translate-system = System
+hts-cm-translate-display = Display
+hts-cm-translate-targetCode = Target code
+hts-cm-translate-targetSystem = Target system
+hts-cm-translate-result-heading = Translate result
+hts-cm-translate-result-badge-true = Matched
+hts-cm-translate-result-badge-false = No match
+
+## $closure workbench (new op in Slice E).
+hts-cm-closure-heading = Closure graph
+hts-cm-closure-name = Closure name
+hts-cm-closure-name-hint = Client-provided name that identifies the closure table on the server across requests.
+hts-cm-closure-concepts-legend = Concepts
+hts-cm-closure-concepts-hint = Add up to three seed codings; each row is a system + code pair.
+hts-cm-closure-concept-system = System
+hts-cm-closure-concept-code = Code
+hts-cm-closure-result-heading = Closure edges
+hts-cm-closure-edge-source = Source
+hts-cm-closure-edge-equivalence = Equivalence
+hts-cm-closure-edge-target = Target
+
+## batch-validate workbench (new UI-fabricated op in Slice E).
+hts-vs-batch-heading = Batch validate codes against a ValueSet
+hts-vs-batch-target-value-set-label = Target ValueSet
+hts-vs-batch-rows-legend = Rows
+hts-vs-batch-rows-hint = Enter one code per row; empty rows are dropped.
+hts-vs-batch-row-code = Code
+hts-vs-batch-row-system = System
+hts-vs-batch-row-display = Display
+hts-vs-batch-row-timeout = Timed out
+hts-vs-batch-row-placeholder = --
+hts-vs-batch-result-heading = Batch result
+hts-vs-batch-target-hint = Target ValueSet: { $target }
+hts-vs-batch-column-code = Code
+hts-vs-batch-column-system = System
+hts-vs-batch-column-display = Display
+hts-vs-batch-column-result = Result
+hts-vs-batch-progress = { $n } of { $m } completed
+hts-vs-batch-progress-final = { $m } completed

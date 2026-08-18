@@ -1,0 +1,101 @@
+{#-
+  CS $validate-code input for the standalone workbench (design doc §7.6 F4).
+  Widening beyond Slice B: CodeableConcept mode (nested coding rows +
+  text), version pins, date, activeOnly, abstract, lenient-display-
+  validation, useSupplement, tx-resource, system-version pins. The
+  widened fields ship as inputs even though the current Slice B
+  `cs_validate_code` client only forwards the narrow set — the ignored
+  fields are documented in §7.6.1 as a Phase 3 follow-up.
+-#}
+<form id="hts-workbench-input"
+      class="hts-op-workbench__input"
+      method="post"
+      action="/ui/hts/operations/validate-code"
+      hx-post="/ui/hts/operations/validate-code"
+      hx-target="#hts-workbench-result"
+      hx-swap="outerHTML"
+      aria-labelledby="hts-workbench-input-heading">
+  <h2 id="hts-workbench-input-heading" class="hts-op-workbench__input-heading">
+    {{ chrome.i18n.t("hts-cs-validate-heading") }}
+  </h2>
+
+  <input type="hidden" name="resource" value="CodeSystem">
+
+  <fieldset class="hts-op-workbench__scope">
+    <legend>{{ chrome.i18n.t("hts-operations-scope-legend") }}</legend>
+    <div class="hts-op-workbench__field">
+      <label for="cs-val-system">{{ chrome.i18n.t("hts-operations-scope-system") }}</label>
+      <input id="cs-val-system" name="system" type="url" required autocomplete="off" spellcheck="false">
+    </div>
+    <div class="hts-op-workbench__field">
+      <label for="cs-val-version">{{ chrome.i18n.t("hts-cs-validate-version") }}</label>
+      <input id="cs-val-version" name="version" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="hts-op-workbench__field">
+      <label for="cs-val-system-version">{{ chrome.i18n.t("hts-cs-validate-systemVersion") }}</label>
+      <input id="cs-val-system-version" name="systemVersion" type="text" autocomplete="off" spellcheck="false">
+    </div>
+  </fieldset>
+
+  <fieldset class="hts-op-workbench__field">
+    <legend>{{ chrome.i18n.t("hts-cs-validate-mode-legend") }}</legend>
+    <label><input type="radio" name="mode" value="code" checked> {{ chrome.i18n.t("hts-cs-validate-mode-code") }}</label>
+    <label><input type="radio" name="mode" value="coding"> {{ chrome.i18n.t("hts-cs-validate-mode-coding") }}</label>
+    <label><input type="radio" name="mode" value="CodeableConcept"> {{ chrome.i18n.t("hts-cs-validate-mode-CodeableConcept") }}</label>
+  </fieldset>
+
+  <div class="hts-op-workbench__field">
+    <label for="cs-val-code">{{ chrome.i18n.t("hts-cs-validate-code") }}</label>
+    <input id="cs-val-code" name="code" type="text" autocomplete="off" spellcheck="false">
+  </div>
+  <div class="hts-op-workbench__field">
+    <label for="cs-val-display">{{ chrome.i18n.t("hts-cs-validate-display") }}</label>
+    <input id="cs-val-display" name="display" type="text" autocomplete="off" spellcheck="false">
+  </div>
+
+  <fieldset class="hts-op-workbench__field">
+    <legend>{{ chrome.i18n.t("hts-cs-validate-coding-legend") }}</legend>
+    <label for="cs-val-coding-system">{{ chrome.i18n.t("hts-cs-validate-coding-system") }}</label>
+    <input id="cs-val-coding-system" name="coding.system" type="text" autocomplete="off" spellcheck="false">
+    <label for="cs-val-coding-code">{{ chrome.i18n.t("hts-cs-validate-coding-code") }}</label>
+    <input id="cs-val-coding-code" name="coding.code" type="text" autocomplete="off" spellcheck="false">
+    <label for="cs-val-coding-display">{{ chrome.i18n.t("hts-cs-validate-coding-display") }}</label>
+    <input id="cs-val-coding-display" name="coding.display" type="text" autocomplete="off" spellcheck="false">
+  </fieldset>
+
+  <div class="hts-op-workbench__field">
+    <label for="cs-val-display-language">{{ chrome.i18n.t("hts-cs-validate-displayLanguage") }}</label>
+    <input id="cs-val-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false">
+  </div>
+
+  <details class="hts-op-workbench__advanced">
+    <summary>{{ chrome.i18n.t("hts-cs-validate-advanced") }}</summary>
+    <div class="hts-op-workbench__field">
+      <label for="cs-val-date">{{ chrome.i18n.t("hts-cs-validate-date") }}</label>
+      <input id="cs-val-date" name="date" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <label><input type="checkbox" name="activeOnly" value="true"> {{ chrome.i18n.t("hts-cs-validate-activeOnly") }}</label>
+    <label><input type="checkbox" name="abstract" value="true"> {{ chrome.i18n.t("hts-cs-validate-abstract") }}</label>
+    <label><input type="checkbox" name="lenient-display-validation" value="true"> {{ chrome.i18n.t("hts-cs-validate-lenient-display-validation") }}</label>
+    <div class="hts-op-workbench__field">
+      <label for="cs-val-use-supplement">{{ chrome.i18n.t("hts-cs-validate-useSupplement") }}</label>
+      <input id="cs-val-use-supplement" name="useSupplement" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="hts-op-workbench__field">
+      <label for="cs-val-system-version-pin">{{ chrome.i18n.t("hts-cs-validate-system-version") }}</label>
+      <input id="cs-val-system-version-pin" name="system-version" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="hts-op-workbench__field">
+      <label for="cs-val-check-system-version">{{ chrome.i18n.t("hts-cs-validate-check-system-version") }}</label>
+      <input id="cs-val-check-system-version" name="check-system-version" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="hts-op-workbench__field">
+      <label for="cs-val-force-system-version">{{ chrome.i18n.t("hts-cs-validate-force-system-version") }}</label>
+      <input id="cs-val-force-system-version" name="force-system-version" type="text" autocomplete="off" spellcheck="false">
+    </div>
+  </details>
+
+  <div class="hts-op-workbench__actions">
+    <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
+  </div>
+</form>

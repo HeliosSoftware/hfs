@@ -1,0 +1,943 @@
+//! ValueSet browser + detail + expand HTTP tests (Slice C).
+//!
+//! Two upstream fixtures cover the whole ring:
+//!
+//! 1. **Closed loopback** (`127.0.0.1:1`) — used by every test that only
+//!    needs to observe a UI shell / degraded / OperationOutcome partial
+//!    (the reads collapse to `UpstreamError::Connect`). This matches the
+//!    Slice B `tests/code_systems.rs` shape and keeps most of the ring
+//!    dependency-free.
+//! 2. **In-process axum mock** — spun up per test on an ephemeral loopback
+//!    port for the flows that assert HTTP-level behavior of the outgoing
+//!    request: the tree/flat parameter mapping (§7.4.1 F7), the
+//!    too-costly banner (§7.4 wireframe), and the pager (§7.4.1 F6). The
+//!    mock captures headers + body per call and returns a canned
+//!    response, so the ring pins the wire contract without depending on
+//!    a real HTS.
+//!
+//! Closed-loopback tests keep the tight `100 ms / 250 ms` timeout envelope
+//! from design doc §7.4.1 invariant #3 (matches `tests/code_systems.rs`);
+//! mock-based tests use a more generous `2 s / 5 s` envelope so the
+//! `tokio::spawn`ed `axum::serve` on a Windows current-thread `#[tokio::
+//! test]` runtime has enough headroom to poll its accept before the client
+//! side times out. `start_mock` pings a `/__mock_ready` probe to guarantee
+//! the server is actually accepting before the base URL is returned.
+
+use axum::{
+    Router,
+    body::Body,
+    extract::{Path, Request, State},
+    http::{HeaderMap, Method, StatusCode, header},
+    response::IntoResponse,
+    routing::{get, post},
+};
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
+use tower::ServiceExt;
+
+// ── Shared fixtures ─────────────────────────────────────────────────────
+
+/// Build a router pointed at `base_url` with the given upstream timeouts.
+///
+/// Split into two helpers below so mock-based tests (which need an actual
+/// round-trip to succeed) can use generous timeouts while closed-loopback
+/// tests keep tight ones — the latter *want* `Connect` to fire fast so the
+/// whole matrix finishes in seconds.
+fn app_with_timeouts(
+    base_url: &str,
+    request_timeout: Duration,
+    connect_timeout: Duration,
+) -> Router {
+    let state = Arc::new(helios_hts_ui::HtsUiState {
+        fhir_version: "R4",
+        version: "9.9.9-test",
+        upstream: helios_hts_ui::UpstreamClient::new_with_timeouts(
+            base_url,
+            request_timeout,
+            connect_timeout,
+        )
+        .expect("test upstream base URL parses"),
+        bundled_data_bytes: None,
+    });
+    Router::new().nest("/ui", helios_hts_ui::router(state))
+}
+
+/// Router pointed at a real upstream (in-process mock). Generous timeouts
+/// so a `tokio::spawn`ed `axum::serve` has time to accept its first
+/// connection on Windows — the current-thread runtime that `#[tokio::test]`
+/// defaults to gives no guarantees about when the server task first polls,
+/// and 100 ms connect + 250 ms request is not enough headroom in practice.
+fn app_pointing_at(base_url: &str) -> Router {
+    app_with_timeouts(
+        base_url,
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+    )
+}
+
+/// Router pointed at a closed loopback port — the "Connect" fixture for
+/// tests that only need to assert degraded / OperationOutcome shape.
+/// Timeouts stay tight because the OS returns `ECONNREFUSED` immediately.
+fn app() -> Router {
+    app_with_timeouts(
+        "http://127.0.0.1:1",
+        Duration::from_millis(250),
+        Duration::from_millis(100),
+    )
+}
+
+async fn body_text(response: axum::response::Response) -> String {
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+// ── In-process mock upstream ─────────────────────────────────────────────
+
+/// One captured request, in the order the mock saw it.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // `method` and `body` are inspected only when tests fail; kept for triage.
+struct CapturedRequest {
+    method: String,
+    path: String,
+    headers: HeaderMap,
+    body: String,
+}
+
+/// Canned mock response. Keeps `Value` for JSON bodies + a status so
+/// tests can dial in success + 422 too-costly + 404 unknown from the
+/// same fixture.
+#[derive(Clone)]
+struct CannedResponse {
+    status: StatusCode,
+    body: Value,
+}
+
+impl CannedResponse {
+    fn ok_expansion_flat() -> Self {
+        Self {
+            status: StatusCode::OK,
+            body: json!({
+                "resourceType": "ValueSet",
+                "url": "http://example.org/vs/limbs",
+                "expansion": {
+                    "identifier": "test-expansion",
+                    "total": 3,
+                    "offset": 0,
+                    "contains": [
+                        {"code": "A", "system": "http://example.org/cs", "display": "Alpha"},
+                        {"code": "B", "system": "http://example.org/cs", "display": "Bravo"},
+                        {"code": "C", "system": "http://example.org/cs", "display": "Charlie"}
+                    ]
+                }
+            }),
+        }
+    }
+
+    fn ok_expansion_tree() -> Self {
+        Self {
+            status: StatusCode::OK,
+            body: json!({
+                "resourceType": "ValueSet",
+                "expansion": {
+                    "contains": [{
+                        "code": "root", "system": "http://example.org/cs", "display": "Root",
+                        "contains": [
+                            {"code": "leaf1", "system": "http://example.org/cs", "display": "Leaf 1"},
+                            {"code": "leaf2", "system": "http://example.org/cs", "display": "Leaf 2"}
+                        ]
+                    }]
+                }
+            }),
+        }
+    }
+
+    fn too_costly() -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            body: json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "too-costly",
+                    "diagnostics": "expansion exceeds threshold"
+                }]
+            }),
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "not-found",
+                    "diagnostics": "unknown ValueSet"
+                }]
+            }),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MockState {
+    captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    canned: Arc<Mutex<CannedResponse>>,
+}
+
+impl MockState {
+    async fn snapshot(&self) -> Vec<CapturedRequest> {
+        self.captured.lock().await.clone()
+    }
+
+    async fn set_canned(&self, response: CannedResponse) {
+        *self.canned.lock().await = response;
+    }
+}
+
+async fn mock_handler(
+    State(state): State<MockState>,
+    method: Method,
+    req: Request<Body>,
+) -> axum::response::Response {
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&bytes).into_owned();
+    state.captured.lock().await.push(CapturedRequest {
+        method: method.to_string(),
+        path: parts.uri.to_string(),
+        headers: parts.headers.clone(),
+        body: body_str,
+    });
+    let canned = state.canned.lock().await.clone();
+    (canned.status, axum::Json(canned.body)).into_response()
+}
+
+/// Spin up an in-process mock HTS upstream on an ephemeral loopback
+/// port. Returns the base URL (no trailing slash) and the shared
+/// `MockState` so tests can peek at captured requests + swap the canned
+/// response between calls.
+///
+/// The spawned server is bound to the current tokio runtime and cleans
+/// up when the test's runtime shuts down (no explicit teardown needed).
+///
+/// A `__mock_ready` probe route is included so this helper can block
+/// until `axum::serve` is actually accepting connections — on Windows
+/// current-thread `#[tokio::test]` runtimes the spawned server task can
+/// otherwise trail the first client request by several milliseconds.
+async fn start_mock() -> (String, MockState) {
+    let state = MockState {
+        captured: Arc::new(Mutex::new(Vec::new())),
+        canned: Arc::new(Mutex::new(CannedResponse::ok_expansion_flat())),
+    };
+    let router: Router = Router::new()
+        .route(
+            "/__mock_ready",
+            get(|| async { (StatusCode::OK, "ok") }),
+        )
+        .route(
+            "/ValueSet",
+            get(mock_handler_get_search),
+        )
+        .route(
+            "/ValueSet/{id}",
+            get(mock_handler_get_id),
+        )
+        .route(
+            "/ValueSet/{id}/$expand",
+            post(mock_handler),
+        )
+        // Fallback catches routing misses so an unexpected URL becomes a
+        // captured request (with method GET-through-{method} inferred by
+        // axum) rather than a silent 404 the test can't attribute.
+        .fallback(mock_fallback)
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream listener");
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let base = format!("http://{addr}");
+    // Poll the ready probe until axum::serve is actually accepting. Two
+    // seconds of headroom is plenty on Windows; the loop returns on the
+    // first 200. If the probe never answers the tests will still fail
+    // downstream — this helper just prevents a phantom timeout in the
+    // very first client request.
+    let probe = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .expect("build ready-probe client");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let ready_url = format!("{base}/__mock_ready");
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        match probe.get(&ready_url).send().await {
+            Ok(r) if r.status().is_success() => break,
+            _ => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    (base, state)
+}
+
+/// Fallback handler for the mock — captures method + path so tests can
+/// surface which URLs were sent but did not match a registered route.
+async fn mock_fallback(
+    State(state): State<MockState>,
+    method: Method,
+    req: Request<Body>,
+) -> axum::response::Response {
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    state.captured.lock().await.push(CapturedRequest {
+        method: method.to_string(),
+        path: format!("<fallback>{}", parts.uri),
+        headers: parts.headers.clone(),
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+    });
+    (StatusCode::NOT_FOUND, "").into_response()
+}
+
+async fn mock_handler_get_search(
+    State(state): State<MockState>,
+    req: Request<Body>,
+) -> axum::response::Response {
+    let (parts, _body) = req.into_parts();
+    state.captured.lock().await.push(CapturedRequest {
+        method: "GET".to_owned(),
+        path: parts.uri.to_string(),
+        headers: parts.headers.clone(),
+        body: String::new(),
+    });
+    // Empty Bundle — the tests that exercise this route only care about
+    // the browser shell, not the row rendering.
+    (
+        StatusCode::OK,
+        axum::Json(json!({"resourceType": "Bundle", "entry": []})),
+    )
+        .into_response()
+}
+
+async fn mock_handler_get_id(
+    State(state): State<MockState>,
+    Path(id): Path<String>,
+    req: Request<Body>,
+) -> axum::response::Response {
+    let (parts, _body) = req.into_parts();
+    state.captured.lock().await.push(CapturedRequest {
+        method: "GET".to_owned(),
+        path: parts.uri.to_string(),
+        headers: parts.headers.clone(),
+        body: String::new(),
+    });
+    let canned = state.canned.lock().await.clone();
+    // For 404 tests, the canned response's status can override the read;
+    // otherwise we return a minimal ValueSet keyed on the id.
+    if canned.status == StatusCode::NOT_FOUND {
+        return (canned.status, axum::Json(canned.body)).into_response();
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "resourceType": "ValueSet",
+            "id": id,
+            "url": "http://example.org/vs/limbs",
+            "version": "1.0.0",
+            "name": "Limbs",
+            "title": "Limbs of the Body",
+            "status": "active"
+        })),
+    )
+        .into_response()
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn browser_renders_full_page_with_translated_heading() {
+    let response = app()
+        .oneshot(
+            axum::http::Request::get("/ui/hts/value-sets")
+                .header(header::ACCEPT_LANGUAGE, "en")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(
+        html.contains("<!doctype html>"),
+        "hard nav must render a full HTML page",
+    );
+    assert!(
+        html.contains(">ValueSets<"),
+        "browser heading must be Fluent-resolved (en value: ValueSets)",
+    );
+    assert!(
+        html.contains("hts-vs-browser__filters"),
+        "filter form must render",
+    );
+    for key in [
+        "hts-vs-browser-title",
+        "hts-vs-browser-filter-search",
+        "hts-vs-browser-column-url",
+        "hts-vs-browser-load-more",
+        "hts-vs-expand-heading",
+    ] {
+        assert!(
+            !html.contains(key),
+            "raw catalog key `{key}` leaked (missing Fluent value?)",
+        );
+    }
+    assert!(
+        html.contains("Terminology backend not fully available"),
+        "closed-loopback upstream must render the degraded banner (en)",
+    );
+}
+
+#[tokio::test]
+async fn browser_rows_fragment_targets_and_varies_on_htmx_request() {
+    let response = app()
+        .oneshot(
+            axum::http::Request::get("/ui/hts/value-sets/rows")
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let vary: Vec<String> = response
+        .headers()
+        .get_all(header::VARY)
+        .iter()
+        .map(|v| v.to_str().unwrap_or_default().to_ascii_lowercase())
+        .collect();
+    assert!(
+        vary.iter().any(|v| v.contains("hx-request")),
+        "rows fragment must add HX-Request to Vary; got: {vary:?}",
+    );
+    let html = body_text(response).await;
+    assert!(
+        html.contains("hts-vs-rows"),
+        "rows fragment must render its stable outer id (found: {})",
+        &html[..html.len().min(300)],
+    );
+}
+
+#[tokio::test]
+async fn browser_over_max_count_renders_invalid_input_outcome() {
+    // Mirror of the CS `_count > MAX` clamp (§7.4.1 invariant #1).
+    // A pre-flight OperationOutcome is preferred over an HTTP 400 so the
+    // filter form and its other values stay legible.
+    let response = app()
+        .oneshot(
+            axum::http::Request::get("/ui/hts/value-sets?_count=200")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("hts-outcome hts-outcome--error"),
+        "over-max _count must render the outcome partial in error severity",
+    );
+}
+
+#[tokio::test]
+async fn detail_renders_shell_and_degraded_on_upstream_failure() {
+    // Closed-loopback upstream: `read_value_set` fails with `Connect`.
+    // The handler must degrade to the banner + shell rather than a 5xx.
+    let response = app()
+        .oneshot(
+            axum::http::Request::get("/ui/hts/value-sets/example-vs")
+                .header(header::ACCEPT_LANGUAGE, "en")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("<!doctype html>"),
+        "detail hard nav must render a full HTML page",
+    );
+    assert!(
+        html.contains("Terminology backend not fully available"),
+        "detail must render the degraded banner when upstream is unreachable",
+    );
+    assert!(
+        html.contains("hts-vs-detail"),
+        "detail scaffold section id must be present regardless of load result",
+    );
+}
+
+#[tokio::test]
+async fn detail_unknown_id_renders_outcome_inside_shell() {
+    // §7.4.1 invariant #5: HTS returns 404 for both truly-missing and
+    // soft-deleted resources; the UI cannot tell them apart at the HTTP
+    // layer. The detail handler renders an OperationOutcome inside the
+    // shell rather than a hard page 404. This test uses the mock so we
+    // can dial the upstream response to 404 (closed-loopback would
+    // surface Connect + degraded, not the outcome path).
+    let (base, state) = start_mock().await;
+    state.set_canned(CannedResponse::not_found()).await;
+    let response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::get("/ui/hts/value-sets/no-such-vs")
+                .header(header::ACCEPT_LANGUAGE, "en")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "detail page must never surface a page 404; the outcome partial \
+         is the operator-visible signal",
+    );
+    let html = body_text(response).await;
+    assert!(
+        html.contains("hts-outcome hts-outcome--error"),
+        "unknown VS id must render the outcome partial in error severity",
+    );
+}
+
+#[tokio::test]
+async fn expand_tab_htmx_returns_input_partial_only() {
+    let response = app()
+        .oneshot(
+            axum::http::Request::get("/ui/hts/value-sets/example-vs/expand")
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("hts-vs-workbench__input"),
+        "htmx tab load must return only the workbench input partial",
+    );
+    assert!(
+        !html.contains("<!doctype html>"),
+        "htmx tab load must not include the full page shell",
+    );
+}
+
+#[tokio::test]
+async fn expand_input_shows_advanced_details_and_threshold_field() {
+    // The Expand tab renders the always-visible controls + Advanced
+    // <details> panel with the threshold input (§7.4 / §7.4.1 F1/F4).
+    let response = app()
+        .oneshot(
+            axum::http::Request::get("/ui/hts/value-sets/example-vs/expand")
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("name=\"filter\""), "filter input must be present");
+    assert!(html.contains("name=\"count\""), "count input must be present");
+    assert!(
+        html.contains("name=\"threshold\""),
+        "Advanced panel must expose a `threshold` numeric input",
+    );
+    assert!(
+        html.contains("hts-vs-workbench__advanced"),
+        "Advanced <details> must render with its stable class",
+    );
+    assert!(
+        html.contains("value=\"tree\"") && html.contains("value=\"flat\""),
+        "tree/flat toggle must render both radio options",
+    );
+}
+
+#[tokio::test]
+async fn expand_tree_mode_sends_hierarchical_true_and_no_exclude_nested() {
+    // §7.4.1 F7: tree ⇒ `hierarchical=true`, flat ⇒ `excludeNested=true`.
+    // Never both — this test asserts the wire body directly.
+    let (base, state) = start_mock().await;
+    state.set_canned(CannedResponse::ok_expansion_tree()).await;
+
+    let response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/value-sets/example-vs/expand")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from("mode=tree&count=25&offset=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = state.snapshot().await;
+    let expand = captured
+        .iter()
+        .find(|c| c.path.contains("/$expand"))
+        .expect("mock must have observed the expand POST");
+    let body: Value =
+        serde_json::from_str(&expand.body).expect("expand body must be JSON Parameters");
+    let names: Vec<&str> = body
+        .get("parameter")
+        .and_then(|v| v.as_array())
+        .expect("parameter array")
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"hierarchical"),
+        "tree mode must emit `hierarchical` (names seen: {names:?})",
+    );
+    assert!(
+        !names.contains(&"excludeNested"),
+        "tree mode must NOT emit `excludeNested` (names seen: {names:?})",
+    );
+}
+
+#[tokio::test]
+async fn expand_flat_mode_sends_exclude_nested_true_and_no_hierarchical() {
+    // Companion to the tree-mode test: same wire assertion, other direction.
+    let (base, state) = start_mock().await;
+    state.set_canned(CannedResponse::ok_expansion_flat()).await;
+
+    let _response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/value-sets/example-vs/expand")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from("mode=flat&count=25&offset=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let captured = state.snapshot().await;
+    let expand = captured
+        .iter()
+        .find(|c| c.path.contains("/$expand"))
+        .expect("mock must have observed the expand POST");
+    let body: Value = serde_json::from_str(&expand.body).unwrap();
+    let names: Vec<&str> = body
+        .get("parameter")
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"excludeNested"),
+        "flat mode must emit `excludeNested` (names seen: {names:?})",
+    );
+    assert!(
+        !names.contains(&"hierarchical"),
+        "flat mode must NOT emit `hierarchical` (names seen: {names:?})",
+    );
+}
+
+#[tokio::test]
+async fn expand_flat_renders_load_more_when_total_exceeds_page() {
+    // §7.4.1 F6 pager rule: `remaining = expansion.total - expansion.offset
+    //  - contains.len()`. Fixture returns 3 rows out of 3 total but with
+    // count=2, so the terminal-page fallback also fires; using the
+    // total-based path we set count=2 & total=5.
+    let (base, state) = start_mock().await;
+    state
+        .set_canned(CannedResponse {
+            status: StatusCode::OK,
+            body: json!({
+                "resourceType": "ValueSet",
+                "expansion": {
+                    "total": 5,
+                    "offset": 0,
+                    "contains": [
+                        {"code": "A", "display": "A"},
+                        {"code": "B", "display": "B"}
+                    ]
+                }
+            }),
+        })
+        .await;
+
+    let response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/value-sets/example-vs/expand")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from("mode=flat&count=2&offset=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains("hts-vs-expand-load-more") || html.contains(">Load more<"),
+        "flat mode with expansion.total > offset+len must render [Load more]",
+    );
+    assert!(
+        !html.contains("hts-vs-workbench__tree"),
+        "flat mode result must not render the tree container",
+    );
+}
+
+#[tokio::test]
+async fn expand_tree_hides_pager_and_labels_total_leaves() {
+    // §7.4.1 F10: tree mode hides the pager and renders `showing full
+    // tree {N}` — HTS ignores count / offset in tree mode.
+    let (base, state) = start_mock().await;
+    state.set_canned(CannedResponse::ok_expansion_tree()).await;
+
+    let response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/value-sets/example-vs/expand")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from("mode=tree&count=10&offset=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains("role=\"tree\""),
+        "tree mode result must render the tree ARIA container",
+    );
+    assert!(
+        html.contains("showing full tree"),
+        "tree mode must render the `showing full tree {{N}}` label",
+    );
+    // The Load more button belongs strictly to flat mode.
+    assert!(
+        !html.contains(">Load more<"),
+        "tree mode must NOT render [Load more]",
+    );
+}
+
+#[tokio::test]
+async fn expand_422_renders_too_costly_banner_with_raise_form() {
+    // §7.4 wireframe: 422 too-costly renders a status banner containing
+    // a compact "Raise threshold" form. The raise form's hidden field is
+    // the same `threshold` key the Advanced panel writes to, so the
+    // value survives a re-submit (§7.4.1 F1/F4).
+    let (base, state) = start_mock().await;
+    state.set_canned(CannedResponse::too_costly()).await;
+
+    let response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/value-sets/example-vs/expand")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from("mode=flat&count=25&offset=0&threshold=1000"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("hts-vs-workbench__too-costly"),
+        "422 must render the too-costly banner",
+    );
+    assert!(
+        html.contains("hts-vs-workbench__too-costly-form"),
+        "banner must render the Raise-threshold form",
+    );
+    assert!(
+        html.contains("value=\"1000\""),
+        "the submitted threshold (1000) must echo back into the Raise form input",
+    );
+}
+
+#[tokio::test]
+async fn expand_threshold_below_ceiling_attaches_x_too_costly_header() {
+    // §7.4 / §7.4.1 F1/F4: values at or below HTS_UI_MAX_EXPANSION_SIZE
+    // _HINT are attached as `X-TOO-COSTLY-THRESHOLD`; values above are
+    // dropped. This test hits the below-ceiling path.
+    let (base, state) = start_mock().await;
+    state.set_canned(CannedResponse::ok_expansion_flat()).await;
+
+    let _response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/value-sets/example-vs/expand")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from("mode=flat&count=25&offset=0&threshold=42"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let captured = state.snapshot().await;
+    let expand = captured
+        .iter()
+        .find(|c| c.path.contains("/$expand"))
+        .expect("mock must have observed the expand POST");
+    let hdr = expand
+        .headers
+        .get("x-too-costly-threshold")
+        .expect("threshold header must be attached for values below the ceiling");
+    assert_eq!(hdr.to_str().unwrap(), "42");
+}
+
+#[tokio::test]
+async fn expand_threshold_above_ceiling_drops_header_and_warns() {
+    // §7.4 / §7.4.1 F1/F4 ceiling rule: the operator can enter values
+    // above `HTS_UI_MAX_EXPANSION_SIZE_HINT`, but the UI drops them
+    // from the outgoing request and renders a warning so the operator
+    // sees why HTS did not honour the value.
+    let (base, state) = start_mock().await;
+    state.set_canned(CannedResponse::ok_expansion_flat()).await;
+
+    let over =
+        helios_hts_ui::HTS_UI_MAX_EXPANSION_SIZE_HINT + 1;
+    let form_body = format!(
+        "mode=flat&count=25&offset=0&threshold={over}"
+    );
+
+    let response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/value-sets/example-vs/expand")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(form_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let captured = state.snapshot().await;
+    let expand = captured
+        .iter()
+        .find(|c| c.path.contains("/$expand"))
+        .expect("mock must have observed the expand POST");
+    assert!(
+        expand.headers.get("x-too-costly-threshold").is_none(),
+        "threshold above the ceiling must NOT be attached as a header",
+    );
+
+    let html = body_text(response).await;
+    assert!(
+        html.contains("hts-vs-workbench__ceiling-warning"),
+        "requests above the ceiling must render the ceiling-warning banner",
+    );
+}
+
+#[tokio::test]
+async fn expand_no_members_renders_neutral_state() {
+    // §7.4.1 F11 companion: empty `contains` without a filter renders
+    // the `no-members` neutral state, not an error.
+    let (base, state) = start_mock().await;
+    state
+        .set_canned(CannedResponse {
+            status: StatusCode::OK,
+            body: json!({
+                "resourceType": "ValueSet",
+                "expansion": { "total": 0, "offset": 0, "contains": [] }
+            }),
+        })
+        .await;
+
+    let response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/value-sets/example-vs/expand")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from("mode=flat&count=25&offset=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains("hts-vs-workbench__no-members"),
+        "empty expansion without filter must render the no-members neutral state",
+    );
+    assert!(
+        !html.contains("hts-outcome--error"),
+        "no-members must NOT surface as an error outcome",
+    );
+}
+
+#[tokio::test]
+async fn expand_filter_no_match_renders_neutral_state_with_filter() {
+    // §7.4 states matrix: empty `contains` WITH a filter renders the
+    // filter-no-match neutral state (still not an error) and echoes the
+    // filter string in the label.
+    let (base, state) = start_mock().await;
+    state
+        .set_canned(CannedResponse {
+            status: StatusCode::OK,
+            body: json!({
+                "resourceType": "ValueSet",
+                "expansion": { "total": 0, "offset": 0, "contains": [] }
+            }),
+        })
+        .await;
+
+    let response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/value-sets/example-vs/expand")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(
+                    "mode=flat&count=25&offset=0&filter=xyzzy",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains("hts-vs-workbench__filter-no-match"),
+        "empty expansion with filter must render the filter-no-match neutral state",
+    );
+    assert!(
+        html.contains("xyzzy"),
+        "filter-no-match label must echo the submitted filter",
+    );
+}
+
+// Compile-time sanity check that the exported constant exists — a link
+// error here means Slice C removed the shared threshold ceiling.
+#[allow(dead_code)]
+const _: u64 = helios_hts_ui::HTS_UI_MAX_EXPANSION_SIZE_HINT;

@@ -1,0 +1,185 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}
+{%- if let Some(summary) = self.summary() -%}
+  {{ chrome.i18n.t_arg("hts-cs-detail-title", "name", summary.heading().to_string()) }}
+{%- else -%}
+  {{ chrome.i18n.t("hts-cs-detail-title-fallback") }}
+{%- endif %} · {{ chrome.i18n.t("hts-app-title") }}
+{% endblock %}
+
+{% block content %}
+<section class="hts-cs-detail" aria-labelledby="hts-cs-detail-heading">
+  {#-
+    Inline degraded banner (see hts-cs-rows.html for the rationale).
+  -#}
+  {% if let Some(reason) = self.degraded_reason() %}
+  <aside class="hts-degraded" role="alert" aria-live="assertive">
+    <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
+    <p class="hts-degraded__reason">
+      {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    </p>
+    <p class="hts-degraded__body">{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  </aside>
+  {% endif %}
+
+  {% if let Some(outcome) = self.outcome() %}
+    {% include "partials/hts-outcome.html" %}
+  {% endif %}
+
+  {% if let Some(summary) = self.summary() %}
+    <header class="page-header hts-cs-detail__header">
+      <p class="page-header__eyebrow">{{ chrome.i18n.t("hts-cs-detail-eyebrow") }}</p>
+      <h1 id="hts-cs-detail-heading" class="page-header__title">
+        {{ summary.heading() }}
+        {% if !summary.version.is_empty() %}
+          <span class="hts-cs-detail__version"> · v{{ summary.version }}</span>
+        {% endif %}
+        {% if !summary.status.is_empty() %}
+          <span class="pill pill--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
+            {{ chrome.i18n.t(format!("hts-cs-status-{}", summary.status).as_str()) }}
+          </span>
+        {% endif %}
+      </h1>
+      {% if !summary.description.is_empty() %}
+        <p class="page-header__subtitle">{{ summary.description }}</p>
+      {% endif %}
+    </header>
+
+    <div class="hts-cs-detail__facts">
+      <section class="hts-cs-detail__section" aria-labelledby="hts-cs-detail-identity">
+        <h2 id="hts-cs-detail-identity" class="hts-cs-detail__section-title">
+          {{ chrome.i18n.t("hts-cs-detail-section-identity") }}
+        </h2>
+        <dl class="hts-cs-detail__dl">
+          <dt>{{ chrome.i18n.t("hts-cs-browser-column-url") }}</dt>
+          <dd>{% if summary.url.is_empty() %}&mdash;{% else %}<code>{{ summary.url }}</code>{% endif %}</dd>
+
+          <dt>{{ chrome.i18n.t("hts-cs-detail-publisher") }}</dt>
+          <dd>{% if summary.publisher.is_empty() %}&mdash;{% else %}{{ summary.publisher }}{% endif %}</dd>
+
+          <dt>{{ chrome.i18n.t("hts-cs-detail-jurisdiction") }}</dt>
+          <dd>
+            {% if summary.jurisdiction.is_empty() %}
+              &mdash;
+            {% else %}
+              <ul class="hts-cs-detail__list">
+                {% for j in summary.jurisdiction %}<li>{{ j }}</li>{% endfor %}
+              </ul>
+            {% endif %}
+          </dd>
+
+          {% if !summary.supersedes.is_empty() %}
+          <dt>{{ chrome.i18n.t("hts-cs-detail-supersedes") }}</dt>
+          <dd>
+            <ul class="hts-cs-detail__list">
+              {% for s in summary.supersedes %}<li><code>{{ s }}</code></li>{% endfor %}
+            </ul>
+          </dd>
+          {% endif %}
+
+          {% if let Some(sb) = summary.superseded_by %}
+          <dt>{{ chrome.i18n.t("hts-cs-detail-superseded-by") }}</dt>
+          <dd><code>{{ sb }}</code></dd>
+          {% endif %}
+        </dl>
+      </section>
+
+      <section class="hts-cs-detail__section" aria-labelledby="hts-cs-detail-content">
+        <h2 id="hts-cs-detail-content" class="hts-cs-detail__section-title">
+          {{ chrome.i18n.t("hts-cs-detail-section-content") }}
+        </h2>
+        <dl class="hts-cs-detail__dl">
+          <dt>{{ chrome.i18n.t("hts-cs-detail-content-mode") }}</dt>
+          <dd>{% if summary.content.is_empty() %}&mdash;{% else %}<code>{{ summary.content }}</code>{% endif %}</dd>
+
+          <dt>{{ chrome.i18n.t("hts-cs-detail-count") }}</dt>
+          <dd>
+            {%- match summary.count -%}
+              {%- when Some(n) -%}{{ n }}
+              {%- when None -%}&mdash;
+            {%- endmatch -%}
+          </dd>
+        </dl>
+      </section>
+    </div>
+
+    {#-
+      Tabs strip. Every tab is a real <a> so the nojs fallback works;
+      htmx attributes hijack the click to swap the workbench region
+      without a full page reload. The Metadata tab links back to the
+      canonical detail URL. `role="tab"` + `aria-selected` + `aria-controls`
+      wire the WAI-ARIA tabs pattern per design doc §7.3 a11y clause.
+    -#}
+    <div class="hts-cs-detail__tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-cs-detail-tabs-label") }}">
+      <a role="tab"
+         class="hts-cs-detail__tab{% if tab == CsTab::Metadata %} is-active{% endif %}"
+         aria-selected="{% if tab == CsTab::Metadata %}true{% else %}false{% endif %}"
+         aria-controls="hts-cs-workbench"
+         href="/ui/hts/code-systems/{{ id }}"
+         hx-get="/ui/hts/code-systems/{{ id }}"
+         hx-target="#hts-cs-workbench"
+         hx-select="#hts-cs-workbench"
+         hx-swap="outerHTML">
+        {{ chrome.i18n.t("hts-cs-detail-tab-metadata") }}
+      </a>
+      <a role="tab"
+         class="hts-cs-detail__tab{% if tab == CsTab::Lookup %} is-active{% endif %}"
+         aria-selected="{% if tab == CsTab::Lookup %}true{% else %}false{% endif %}"
+         aria-controls="hts-cs-workbench"
+         href="/ui/hts/code-systems/{{ id }}/lookup"
+         hx-get="/ui/hts/code-systems/{{ id }}/lookup"
+         hx-target="#hts-workbench-input"
+         hx-swap="outerHTML">
+        {{ chrome.i18n.t("hts-cs-detail-tab-lookup") }}
+      </a>
+      <a role="tab"
+         class="hts-cs-detail__tab{% if tab == CsTab::Validate %} is-active{% endif %}"
+         aria-selected="{% if tab == CsTab::Validate %}true{% else %}false{% endif %}"
+         aria-controls="hts-cs-workbench"
+         href="/ui/hts/code-systems/{{ id }}/validate"
+         hx-get="/ui/hts/code-systems/{{ id }}/validate"
+         hx-target="#hts-workbench-input"
+         hx-swap="outerHTML">
+        {{ chrome.i18n.t("hts-cs-detail-tab-validate") }}
+      </a>
+      <a role="tab"
+         class="hts-cs-detail__tab{% if tab == CsTab::Subsumes %} is-active{% endif %}"
+         aria-selected="{% if tab == CsTab::Subsumes %}true{% else %}false{% endif %}"
+         aria-controls="hts-cs-workbench"
+         href="/ui/hts/code-systems/{{ id }}/subsumes"
+         hx-get="/ui/hts/code-systems/{{ id }}/subsumes"
+         hx-target="#hts-workbench-input"
+         hx-swap="outerHTML">
+        {{ chrome.i18n.t("hts-cs-detail-tab-subsumes") }}
+      </a>
+    </div>
+
+    <div id="hts-cs-workbench" class="hts-cs-detail__workbench" role="tabpanel" aria-labelledby="hts-cs-detail-heading">
+      {% match tab %}
+        {% when CsTab::Metadata %}
+          <p class="hts-cs-detail__workbench-hint">{{ chrome.i18n.t("hts-cs-detail-workbench-hint") }}</p>
+        {% when CsTab::Lookup %}
+          {% let summary = Some(summary.clone()) %}
+          {% include "partials/hts-cs-lookup-input.html" %}
+        {% when CsTab::Validate %}
+          {% let summary = Some(summary.clone()) %}
+          {% include "partials/hts-cs-validate-input.html" %}
+        {% when CsTab::Subsumes %}
+          {% let summary = Some(summary.clone()) %}
+          {% include "partials/hts-cs-subsumes-input.html" %}
+      {% endmatch %}
+
+      {% if let Some(view) = workbench %}
+        {% include "partials/hts-cs-workbench-result.html" %}
+      {% else %}
+        {% if tab != CsTab::Metadata %}
+          <div id="hts-workbench-result" class="hts-cs-detail__result" aria-live="polite">
+            <p class="hts-cs-detail__result-empty">{{ chrome.i18n.t("hts-cs-detail-result-empty") }}</p>
+          </div>
+        {% endif %}
+      {% endif %}
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,25 @@
+{#-
+  7-op selector strip (design doc §7.6). Every entry is a real <a>
+  so the nojs fallback works; the active entry gets aria-current="page".
+  Op-selector links do a full page swap (target=body) so the whole
+  shell (banners, tab strip, progress region) re-renders per §7.6 F5/F6.
+-#}
+<nav class="hts-op-selector" aria-label="{{ chrome.i18n.t("hts-operations-selector-label") }}">
+  <ul class="hts-op-selector__list" role="tablist">
+    {% for entry in flags.op_selector_entries %}
+      <li class="hts-op-selector__item" role="none">
+        <a role="tab"
+           class="hts-op-selector__link{% if entry.active %} is-active{% endif %}"
+           aria-selected="{% if entry.active %}true{% else %}false{% endif %}"
+           {% if entry.active %}aria-current="page"{% endif %}
+           href="/ui/hts/operations?op={{ entry.slug }}&resource={{ entry.resource }}"
+           hx-get="/ui/hts/operations?op={{ entry.slug }}&resource={{ entry.resource }}"
+           hx-target="body"
+           hx-swap="outerHTML"
+           hx-push-url="true">
+          {{ chrome.i18n.t(entry.label_key.as_str()) }}
+        </a>
+      </li>
+    {% endfor %}
+  </ul>
+</nav>

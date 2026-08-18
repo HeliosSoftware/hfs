@@ -1,0 +1,28 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ chrome.i18n.t("hts-dashboard-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
+
+{% block content %}
+<section class="hts-dashboard" aria-labelledby="hts-dashboard-heading">
+  <header class="page-header">
+    <h1 id="hts-dashboard-heading">{{ chrome.i18n.t("hts-dashboard-title") }}</h1>
+    <p class="page-header__subtitle">{{ chrome.i18n.t("hts-dashboard-subtitle") }}</p>
+  </header>
+
+  {#-
+    The cards live in a dedicated <div id="hts-dashboard-cards"> the refresh
+    fragment swaps every 15 seconds (design doc §7.1). The shell is fetched
+    once on hard navigation so first paint is meaningful even when JS is off.
+    `hx-get` + `hx-trigger="every 15s"` degrade to a static, still-useful
+    page when JavaScript is disabled — the operator just reloads to refresh.
+    A dedicated live-region wrapper keeps AT announcements to the swap, not
+    the surrounding chrome.
+  -#}
+  <div hx-get="/ui/hts/dashboard/cards"
+       hx-trigger="every 15s"
+       hx-swap="outerHTML"
+       hx-target="#hts-dashboard-cards">
+    {% include "partials/hts-dashboard-cards.html" %}
+  </div>
+</section>
+{% endblock %}

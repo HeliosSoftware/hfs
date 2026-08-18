@@ -1,0 +1,18 @@
+{#-
+  Op-specific result dispatcher (design doc §7.6). Included as the
+  entire body of the swap into #hts-workbench-result. Each per-op
+  result partial re-emits the wrapping id so the next submit can
+  swap outer-HTML on the shared target.
+
+  Uses the boolean flag fields on OpResultTemplate rather than
+  matching on the enum path — the flags are precomputed by
+  OpResultTemplate::new so Askama does not have to resolve enum
+  discriminants through a crate:: path.
+-#}
+{% if is_closure %}
+  {% include "partials/hts-cm-closure-result.html" %}
+{% else if is_validate_code && view.vs_validate.is_some() %}
+  {% include "partials/hts-vs-validate-result.html" %}
+{% else %}
+  {% include "partials/hts-op-generic-result.html" %}
+{% endif %}

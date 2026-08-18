@@ -1,0 +1,98 @@
+{#-
+  ValueSet browser rows partial (design doc §7.4 mirror of §7.2).
+
+  Rendered inline by `pages/vs-browser.html` on the first hard nav, and
+  swapped in by every subsequent filter change or Load-more click. The
+  same partial covers every state: empty page, HTS-side OperationOutcome,
+  connection-level degrade. The pre-flight `_count > MAX` branch renders
+  the invalid-input OperationOutcome above an empty table so the operator
+  can still see the filter form's other values echoed back.
+-#}
+<div id="hts-vs-rows" class="hts-vs-browser__rows">
+  {#-
+    Inline degraded banner — same shape as `hts-cs-rows.html` so caches
+    stay consistent across CS + VS browsers.
+  -#}
+  {% if let Some(reason) = view.degraded_reason() %}
+  <aside class="hts-degraded" role="alert" aria-live="assertive">
+    <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
+    <p class="hts-degraded__reason">
+      {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    </p>
+    <p class="hts-degraded__body">{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  </aside>
+  {% endif %}
+
+  {% if let Some(outcome) = view.outcome() %}
+    {% include "partials/hts-outcome.html" %}
+  {% endif %}
+
+  <table class="data-table hts-vs-browser__table" aria-describedby="hts-vs-browser-heading">
+    <caption class="visually-hidden">{{ chrome.i18n.t("hts-vs-browser-table-caption") }}</caption>
+    <thead>
+      <tr>
+        <th scope="col">{{ chrome.i18n.t("hts-vs-browser-column-url") }}</th>
+        <th scope="col">{{ chrome.i18n.t("hts-vs-browser-column-version") }}</th>
+        <th scope="col">{{ chrome.i18n.t("hts-vs-browser-column-title") }}</th>
+        <th scope="col">{{ chrome.i18n.t("hts-vs-browser-column-status") }}</th>
+      </tr>
+    </thead>
+    <tbody aria-live="polite">
+      {% if let Some(page) = view.page() %}
+        {% if page.rows.is_empty() %}
+          {% if !view.count_over_max %}
+          <tr class="hts-vs-browser__empty">
+            <td colspan="4">{{ chrome.i18n.t("hts-vs-browser-empty") }}</td>
+          </tr>
+          {% endif %}
+        {% else %}
+          {% for row in page.rows %}
+          <tr>
+            <td>{% if row.url.is_empty() %}&mdash;{% else %}<code class="hts-vs-browser__url">{{ row.url }}</code>{% endif %}</td>
+            <td>{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
+            <td>
+              <a class="hts-vs-browser__row-link" href="/ui/hts/value-sets/{{ row.id }}">
+                {% if !row.title.is_empty() %}{{ row.title }}
+                {%- else if !row.name.is_empty() %}{{ row.name }}
+                {%- else %}{{ row.id }}
+                {%- endif %}
+              </a>
+            </td>
+            <td>
+              {% if row.status.is_empty() %}
+                &mdash;
+              {% else %}
+                <span class="pill pill--{{ row.status }}">{{ chrome.i18n.t(format!("hts-vs-status-{}", row.status).as_str()) }}</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        {% endif %}
+      {% endif %}
+    </tbody>
+  </table>
+
+  {% if let Some(page) = view.page() %}
+    {% if !page.rows.is_empty() %}
+    <div class="hts-vs-browser__pager">
+      <span class="hts-vs-browser__count">
+        {{ chrome.i18n.t_arg("hts-vs-browser-showing-count", "count", page.showing_count().to_string()) }}
+      </span>
+      {% if let Some(next) = page.next_offset() %}
+        {#-
+          `hx-swap="beforeend"` appends the next tbody's rows without
+          replacing the current ones; the surrounding rows partial is
+          re-fetched with the new offset preserving all active filters.
+        -#}
+        <button type="button" class="btn btn--secondary"
+                hx-get="/ui/hts/value-sets/rows?{%- if let Some(u) = view.filters.url -%}url={{ u }}&{%- endif -%}{%- if let Some(v) = view.filters.version -%}version={{ v }}&{%- endif -%}{%- if let Some(n) = view.filters.name -%}name={{ n }}&{%- endif -%}{%- if let Some(t) = view.filters.title -%}title={{ t }}&{%- endif -%}{%- if let Some(s) = view.filters.status -%}status={{ s }}&{%- endif -%}_count={{ view.filters.effective_count() }}&_offset={{ next }}"
+                hx-target="#hts-vs-rows tbody"
+                hx-swap="beforeend"
+                hx-select="#hts-vs-rows tbody > tr">
+          {{ chrome.i18n.t("hts-vs-browser-load-more") }}
+        </button>
+      {% endif %}
+    </div>
+    {% endif %}
+  {% endif %}
+</div>

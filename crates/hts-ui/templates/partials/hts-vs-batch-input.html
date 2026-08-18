@@ -1,0 +1,74 @@
+{#-
+  Batch $validate-code input (design doc §7.6 F1=D). UI-fabricated
+  aggregation: seeds a batch on the server, then the seed response
+  swaps in the skeleton table and progress region for client-side
+  polling. Slice E1 ships the input surface; the seed handler is a
+  stub (§7.6.1 F1=D E1/E2 split) so submissions render a not-implemented
+  outcome.
+
+  The seed form and the row form share the same URL (§7.6 F1=D). The
+  nojs fallback is the same POST — the server fans out inline, waits
+  for every row, and returns a fully-rendered table.
+-#}
+<form id="hts-workbench-input"
+      class="hts-op-workbench__input"
+      method="post"
+      action="/ui/hts/operations/batch-validate"
+      hx-post="/ui/hts/operations/batch-validate"
+      hx-target="#hts-workbench-result"
+      hx-swap="outerHTML"
+      aria-labelledby="hts-workbench-input-heading">
+  <h2 id="hts-workbench-input-heading" class="hts-op-workbench__input-heading">
+    {{ chrome.i18n.t("hts-vs-batch-heading") }}
+  </h2>
+
+  <input type="hidden" name="resource" value="{{ resource.slug() }}">
+
+  <div class="hts-op-workbench__field">
+    <label for="batch-target">{{ chrome.i18n.t("hts-vs-batch-target-value-set-label") }}</label>
+    <input id="batch-target" name="target" type="url" required autocomplete="off" spellcheck="false"
+           placeholder="https://example.org/ValueSet/foo">
+  </div>
+
+  <fieldset class="hts-op-workbench__field">
+    <legend>{{ chrome.i18n.t("hts-vs-batch-rows-legend") }}</legend>
+    <p class="hts-op-workbench__hint">{{ chrome.i18n.t("hts-vs-batch-rows-hint") }}</p>
+    <div class="hts-op-workbench__row">
+      <label>{{ chrome.i18n.t("hts-vs-batch-row-code") }}
+        <input type="text" name="row.code" autocomplete="off" spellcheck="false">
+      </label>
+      <label>{{ chrome.i18n.t("hts-vs-batch-row-system") }}
+        <input type="url" name="row.system" autocomplete="off" spellcheck="false">
+      </label>
+      <label>{{ chrome.i18n.t("hts-vs-batch-row-display") }}
+        <input type="text" name="row.display" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+    <div class="hts-op-workbench__row">
+      <label>{{ chrome.i18n.t("hts-vs-batch-row-code") }}
+        <input type="text" name="row.code" autocomplete="off" spellcheck="false">
+      </label>
+      <label>{{ chrome.i18n.t("hts-vs-batch-row-system") }}
+        <input type="url" name="row.system" autocomplete="off" spellcheck="false">
+      </label>
+      <label>{{ chrome.i18n.t("hts-vs-batch-row-display") }}
+        <input type="text" name="row.display" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+    <div class="hts-op-workbench__row">
+      <label>{{ chrome.i18n.t("hts-vs-batch-row-code") }}
+        <input type="text" name="row.code" autocomplete="off" spellcheck="false">
+      </label>
+      <label>{{ chrome.i18n.t("hts-vs-batch-row-system") }}
+        <input type="url" name="row.system" autocomplete="off" spellcheck="false">
+      </label>
+      <label>{{ chrome.i18n.t("hts-vs-batch-row-display") }}
+        <input type="text" name="row.display" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+  </fieldset>
+
+  <div class="hts-op-workbench__actions">
+    <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
+  </div>
+</form>

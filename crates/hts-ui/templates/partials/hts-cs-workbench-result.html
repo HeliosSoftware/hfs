@@ -1,0 +1,136 @@
+{#-
+  Shared workbench result panel for CodeSystem $lookup / $validate-code /
+  $subsumes (design doc §6.1 unified workbench, §7.3 wireframe).
+
+  Branches on `view.lookup` / `view.validate` / `view.subsumes` as `Option<_>`
+  (mirrors the Slice A dashboard's Result-matching style). Any upstream
+  failure surfaces here — connection-level via the `degraded` banner,
+  OperationOutcome via the shared partial — so the caller does not need to
+  render either separately.
+
+  Fluent keys: op-specific under `hts-cs-lookup-*` / `hts-cs-validate-*` /
+  `hts-cs-subsumes-*`; shared under `hts-workbench-*` (reused by Slice C/D/E).
+-#}
+<div id="hts-workbench-result" class="hts-cs-detail__result" aria-live="polite">
+  {% if let Some(reason) = view.degraded_reason %}
+  <aside class="hts-degraded" role="alert" aria-live="assertive">
+    <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
+    <p class="hts-degraded__reason">
+      {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    </p>
+    <p class="hts-degraded__body">{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  </aside>
+  {% endif %}
+
+  {% if let Some(outcome) = view.outcome.as_ref() %}
+    {% let outcome = outcome.clone() %}
+    {% include "partials/hts-outcome.html" %}
+  {% endif %}
+
+  {% if let Some(result) = view.lookup.as_ref() %}
+    <article class="hts-cs-workbench__result hts-cs-workbench__result--lookup">
+      <header class="hts-cs-workbench__result-head">
+        <h4 class="hts-cs-workbench__result-heading">
+          {% if !result.display.is_empty() %}{{ result.display }}
+          {%- else if !result.name.is_empty() %}{{ result.name }}
+          {%- else %}{{ chrome.i18n.t("hts-cs-lookup-no-match") }}
+          {%- endif %}
+        </h4>
+        {% if !result.version.is_empty() %}
+        <p class="hts-cs-workbench__result-sub">v{{ result.version }}</p>
+        {% endif %}
+      </header>
+      {% if !result.definition.is_empty() %}
+      <p class="hts-cs-workbench__definition">{{ result.definition }}</p>
+      {% endif %}
+
+      {% if !result.designations.is_empty() %}
+      <section class="hts-cs-workbench__panel">
+        <h5 class="hts-cs-workbench__panel-heading">{{ chrome.i18n.t("hts-cs-lookup-designations") }}</h5>
+        <ul class="hts-cs-workbench__designations">
+          {% for d in result.designations %}
+          <li>
+            <span class="hts-cs-workbench__designation-value">{{ d.value }}</span>
+            {% if !d.language.is_empty() %}<code class="hts-cs-workbench__designation-lang">{{ d.language }}</code>{% endif %}
+            {% if !d.use_code.is_empty() %}<code class="hts-cs-workbench__designation-use">{{ d.use_code }}</code>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+      </section>
+      {% endif %}
+
+      {% if !result.properties.is_empty() %}
+      <section class="hts-cs-workbench__panel">
+        <h5 class="hts-cs-workbench__panel-heading">{{ chrome.i18n.t("hts-cs-lookup-properties") }}</h5>
+        <dl class="hts-cs-workbench__properties">
+          {% for p in result.properties %}
+          <dt><code>{{ p.code }}</code></dt>
+          <dd>{{ p.value }}</dd>
+          {% endfor %}
+        </dl>
+      </section>
+      {% endif %}
+    </article>
+  {% endif %}
+
+  {% if let Some(result) = view.validate.as_ref() %}
+    <article class="hts-cs-workbench__result hts-cs-workbench__result--validate">
+      <header class="hts-cs-workbench__result-head">
+        {% if result.result %}
+          <span class="pill pill--active hts-cs-workbench__badge hts-cs-workbench__badge--true"
+                aria-label="{{ chrome.i18n.t("hts-cs-validate-badge-true") }}">
+            {{ chrome.i18n.t("hts-cs-validate-badge-true") }}
+          </span>
+        {% else %}
+          <span class="pill pill--retired hts-cs-workbench__badge hts-cs-workbench__badge--false"
+                aria-label="{{ chrome.i18n.t("hts-cs-validate-badge-false") }}">
+            {{ chrome.i18n.t("hts-cs-validate-badge-false") }}
+          </span>
+        {% endif %}
+        {% if !result.display.is_empty() %}
+        <h4 class="hts-cs-workbench__result-heading">{{ result.display }}</h4>
+        {% endif %}
+      </header>
+
+      <dl class="hts-cs-workbench__properties">
+        {% if !result.code.is_empty() %}<dt>{{ chrome.i18n.t("hts-cs-validate-code") }}</dt><dd><code>{{ result.code }}</code></dd>{% endif %}
+        {% if !result.system.is_empty() %}<dt>{{ chrome.i18n.t("hts-cs-validate-coding-system") }}</dt><dd><code>{{ result.system }}</code></dd>{% endif %}
+        {% if !result.version.is_empty() %}<dt>{{ chrome.i18n.t("hts-cs-lookup-version") }}</dt><dd>{{ result.version }}</dd>{% endif %}
+        {% if !result.message.is_empty() %}<dt>{{ chrome.i18n.t("hts-cs-validate-message") }}</dt><dd>{{ result.message }}</dd>{% endif %}
+      </dl>
+
+      {% if let Some(issues) = result.issues.as_ref() %}
+        {% let outcome = issues.clone() %}
+        {% include "partials/hts-outcome.html" %}
+      {% endif %}
+    </article>
+  {% endif %}
+
+  {% if let Some(result) = view.subsumes.as_ref() %}
+    <article class="hts-cs-workbench__result hts-cs-workbench__result--subsumes">
+      <p class="hts-cs-workbench__outcome hts-cs-workbench__outcome--{{ result.outcome }}"
+         aria-label="{{ chrome.i18n.t(format!("hts-cs-subsumes-outcome-{}", result.outcome).as_str()) }}">
+        {{ chrome.i18n.t(format!("hts-cs-subsumes-outcome-{}", result.outcome).as_str()) }}
+      </p>
+    </article>
+  {% endif %}
+
+  {#- Raw request + response echo (§7.3 wireframe). Kept last so the
+      readable summary above stays visually primary. Copy affordance is a
+      plain textarea select-all target to sidestep the browser
+      Clipboard API's HTTPS-only quirk in intranet HTS deployments. -#}
+  {% if !view.raw_body.is_empty() || !view.request_url.is_empty() %}
+  <details class="hts-cs-workbench__raw">
+    <summary>{{ chrome.i18n.t("hts-workbench-raw-response") }}</summary>
+    {% if !view.request_url.is_empty() %}
+    <p class="hts-cs-workbench__raw-url">
+      <span class="hts-cs-workbench__raw-url-label">{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
+      <code>{{ view.request_url }}</code>
+    </p>
+    {% endif %}
+    {% if !view.raw_body.is_empty() %}
+    <pre class="hts-cs-workbench__raw-body" tabindex="0"><code>{{ view.raw_body }}</code></pre>
+    {% endif %}
+  </details>
+  {% endif %}
+</div>
