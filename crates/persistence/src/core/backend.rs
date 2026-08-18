@@ -21,10 +21,16 @@ pub enum BackendKind {
     /// PostgreSQL database.
     Postgres,
     /// Apache Cassandra (wide-column store).
+    ///
+    /// Reserved: no backend is implemented for this kind. It is accepted by
+    /// composite configuration and the advisor but cannot be instantiated.
     Cassandra,
     /// MongoDB (document store).
     MongoDB,
     /// Neo4j (graph database).
+    ///
+    /// Reserved: no backend is implemented for this kind. It is accepted by
+    /// composite configuration and the advisor but cannot be instantiated.
     Neo4j,
     /// Elasticsearch (search engine).
     Elasticsearch,
