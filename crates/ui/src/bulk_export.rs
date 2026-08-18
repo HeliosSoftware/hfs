@@ -262,6 +262,9 @@ pub async fn page(
     let i18n = I18n::new(locale);
     let status = current_status(state.version, rv.0, &rt);
     let user_key = settings_user_key(principal.as_deref());
+    // Like the other three callers, the version here is a cache key only —
+    // the list reflects the server's seeded version regardless of the sidebar
+    // selector (see resource_type_names' caveat).
     let resource_types = state
         .compartments
         .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())

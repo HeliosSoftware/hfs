@@ -128,6 +128,13 @@ impl CompartmentCatalog {
     /// Every resource type of the version, from the first CompartmentDefinition
     /// (each enumerates the full set — 145 in R4). Used by the queries page's
     /// resource picker rail.
+    ///
+    /// Caveat: `version` is a **cache key only**. The production
+    /// [`HttpConformanceSource`](crate::conformance) discards its version
+    /// argument, so the list always reflects whatever version the server
+    /// seeded (`HFS_FHIR_VERSION`) — the sidebar's version selector does not
+    /// change it. Correct on a single-version deployment, which is the common
+    /// case; making the version real end-to-end is tracked separately.
     pub async fn resource_type_names(&self, tenant: &str, version: FhirVersion) -> Vec<String> {
         self.definitions(tenant, version)
             .await
