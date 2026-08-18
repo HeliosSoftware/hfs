@@ -15,13 +15,13 @@
 </head>
 <body class="{% block body_class %}{% endblock %}">
   <aside class="sidebar" id="sidebar">
-    <div class="brand">
+    <a class="brand" href="/ui" aria-label="{{ i18n.t("app-title") }} hfs v{{ status.version }} — {{ i18n.t("nav-home") }}">
       <img class="brand__logo" src="/ui/assets/logo.png" alt="">
       <div class="brand__text">
         <span class="brand__name">{{ i18n.t("app-title") }}</span>
         <span class="brand__version">hfs v{{ status.version }}</span>
       </div>
-    </div>
+    </a>
 
     <!--
       Tenant selector (#344). A <details> disclosure — works without
