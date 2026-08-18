@@ -858,3 +858,76 @@ async fn batch_page_serves_the_workspace_shell() {
     assert!(html.contains("data-msg-semantics-transaction"));
     assert!(html.contains(r#"src="/ui/assets/batch.js""#));
 }
+
+/* #546: creating a resource with required elements must not dump duplicated,
+ * unanchored error lines. */
+
+#[tokio::test]
+async fn editor_orphan_issues_are_deduped_and_titled() {
+    // A brand-new Claim: several required elements, none present, no rows.
+    let html = edit("doc=%7B%22resourceType%22%3A%22Claim%22%7D&op=").await;
+
+    // Styled panel with a heading, not bare lines.
+    assert!(html.contains("editor__orphans-title"), "titled panel");
+    // The old "priority: priority is required" duplication is gone.
+    assert!(
+        !html.contains("priority: priority"),
+        "no duplicated element name"
+    );
+    assert!(html.contains("priority"), "the issue itself still shows");
+}
+
+/* #549: temporal primitives get format assistance. */
+
+#[tokio::test]
+async fn editor_temporal_primitives_carry_format_assistance() {
+    // A Patient with a birthDate (type `date`) present renders its row.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%222024-01-01%22%7D&op=",
+    )
+    .await;
+    assert!(
+        html.contains(r#"placeholder="2024-05-17""#),
+        "date placeholder"
+    );
+    assert!(
+        html.contains(r#"pattern="\d{4}(-\d{2}(-\d{2})?)?""#),
+        "date pattern"
+    );
+    // Non-temporal primitives stay bare.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22name%22%3A%5B%7B%22family%22%3A%22X%22%7D%5D%7D&op=",
+    )
+    .await;
+    assert!(!html.contains(r#"placeholder="14:30:00""#));
+}
+
+/* #547: the server marks the created node so the client can focus it, and
+ * an empty document opens the root add-picker by itself. */
+
+#[tokio::test]
+async fn editor_marks_the_created_node_for_focus() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=add&path=&name=birthDate").await;
+    assert!(
+        html.contains(r#"data-focus="birthDate""#),
+        "created path marked: {}",
+        &html[..400]
+    );
+}
+
+#[tokio::test]
+async fn editor_opens_the_root_picker_on_an_empty_document() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+    assert!(
+        html.contains(r#"<details class="editor-add" open>"#),
+        "root picker auto-opens"
+    );
+
+    // With content present it stays closed.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%222024-01-01%22%7D&op=",
+    )
+    .await;
+    assert!(!html.contains(r#"<details class="editor-add" open>"#));
+}

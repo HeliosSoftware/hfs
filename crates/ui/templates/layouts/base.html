@@ -12,6 +12,7 @@
   <script src="/ui/assets/theme.js"></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
+  <script src="/ui/assets/addbox.js" defer></script>
 </head>
 <body class="{% block body_class %}{% endblock %}">
   <aside class="sidebar" id="sidebar">
@@ -30,6 +31,7 @@
       lazily fetched from the registry by htmx when the menu first opens; with
       JavaScript disabled the panel offers the tenant-maintenance page instead.
     -->
+    {% if status.show_tenant_picker() %}
     <details class="menu">
       <summary class="selector">
         <span class="avatar">{{ status.tenant_initials() }}</span>
@@ -49,6 +51,7 @@
         </div>
       </div>
     </details>
+    {% endif %}
 
     <hr class="divider">
 

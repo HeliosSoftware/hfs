@@ -4185,3 +4185,78 @@ body.has-nav-panel {
   color: var(--muted);
   font-size: 9.5px;
 }
+
+/* The JSON-pane header (#548): fold controls hug the heading on the left,
+   Edit raw stays alone at the end. */
+.card-head__tools--start {
+  margin-right: auto;
+}
+
+/* Addbox close affordances (#545). */
+.addbox__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.addbox__x {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.addbox__x:hover,
+.addbox__x:focus-visible {
+  color: var(--text-strong);
+  background: var(--accent-soft);
+}
+
+.addbox__actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* The Recent/Saved dropdown scrolls instead of growing unbounded (#542):
+   the recents are capped at ten, but every saved query renders in the same
+   panel, and a long collection was pushing it off-screen. */
+.query-recent #recent-searches {
+  max-height: min(420px, 60vh);
+  overflow-y: auto;
+}
+
+/* Issues that have no field yet (#546): a bounded, styled panel instead of a
+   wall of bare red lines under the tree. */
+.editor__orphans {
+  margin-top: 14px;
+  padding: 12px 16px;
+  border-left: 3px solid #C0362C;
+  border-radius: 0 10px 10px 0;
+  background: rgb(192 54 44 / 8%);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.editor__orphans-title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.editor__orphans .editor__orphan {
+  margin: 2px 0;
+  font-size: 13px;
+}
+
+/* Temporal-primitive assistance (#549): the pattern attribute drives live
+   native validity — a malformed date shows before any server round trip. */
+.editor-row__input:invalid {
+  border-color: #C0362C;
+  box-shadow: 0 0 0 3px rgb(192 54 44 / 12%);
+}

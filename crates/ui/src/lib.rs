@@ -188,6 +188,9 @@ where
 pub(crate) struct RequestTenant {
     pub(crate) id: String,
     pub(crate) display: Option<String>,
+    /// Whether this install has any tenant beyond the server default — the
+    /// sidebar tenant picker only renders when it does (#544).
+    pub(crate) multi: bool,
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestTenant
@@ -207,6 +210,7 @@ where
             .unwrap_or(RequestTenant {
                 id: "default".to_string(),
                 display: None,
+                multi: false,
             }))
     }
 }
@@ -224,6 +228,7 @@ async fn resolve_prefs(
     let mut tenant = RequestTenant {
         id: state.default_tenant.clone(),
         display: None,
+        multi: false,
     };
     let document = match &state.settings {
         Some(store) => {
@@ -251,9 +256,23 @@ async fn resolve_prefs(
             tenant = RequestTenant {
                 id: record.id,
                 display: record.display_name,
+                multi: false,
             };
         }
     }
+    // The picker is pointless on a single-tenant install: show it only when
+    // the effective tenant already differs from the default, or the registry
+    // knows a second tenant. One indexed registry read per page load, the
+    // same cost class as the settings read above.
+    tenant.multi = tenant.id != state.default_tenant
+        || match &state.tenants {
+            Some(registry) => registry
+                .list_tenants()
+                .await
+                .map(|records| records.iter().any(|r| r.id != state.default_tenant))
+                .unwrap_or(false),
+            None => false,
+        };
     request.extensions_mut().insert(RequestVersion(version));
     request.extensions_mut().insert(tenant);
     next.run(request).await
@@ -272,6 +291,8 @@ pub(crate) struct Status {
     /// (#344).
     tenant_id: String,
     tenant_display: Option<String>,
+    /// Whether the sidebar renders the tenant picker (#544).
+    show_tenant_picker: bool,
 }
 
 impl Status {
@@ -288,6 +309,11 @@ impl Status {
             .into_iter()
             .map(|v| v.as_str())
             .collect()
+    }
+
+    /// Whether the sidebar renders the tenant picker (#544).
+    pub(crate) fn show_tenant_picker(&self) -> bool {
+        self.show_tenant_picker
     }
 
     /// The effective tenant id, for the `hfs-tenant` meta tag browser calls
@@ -1620,6 +1646,7 @@ pub(crate) fn current_status(
         fhir_version,
         tenant_id: tenant.id.clone(),
         tenant_display: tenant.display.clone(),
+        show_tenant_picker: tenant.multi,
     }
 }
 
@@ -1660,6 +1687,7 @@ mod tests {
                 fhir_version: helios_fhir::FhirVersion::R4,
                 tenant_id: "default".to_string(),
                 tenant_display: None,
+                show_tenant_picker: true,
             },
             metrics,
             chart,
@@ -1713,6 +1741,7 @@ mod tests {
                 fhir_version: helios_fhir::FhirVersion::R4,
                 tenant_id: "default".to_string(),
                 tenant_display: None,
+                show_tenant_picker: true,
             },
             i18n: i18n("en"),
         }
@@ -1768,6 +1797,7 @@ mod tests {
                 fhir_version: helios_fhir::FhirVersion::R4,
                 tenant_id: "default".to_string(),
                 tenant_display: None,
+                show_tenant_picker: true,
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -1807,6 +1837,7 @@ mod tests {
                 fhir_version: helios_fhir::FhirVersion::R4,
                 tenant_id: "default".to_string(),
                 tenant_display: None,
+                show_tenant_picker: true,
             },
             i18n: i18n("es"),
             active_page: "queries",

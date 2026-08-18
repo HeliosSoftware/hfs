@@ -86,7 +86,78 @@
     });
     return fetch("/ui/editor/render", { method: "POST", body: form })
       .then(function (r) { return r.text(); })
-      .then(function (html) { editorBody.innerHTML = html; });
+      .then(function (html) {
+        var state = captureEditorState();
+        editorBody.innerHTML = html;
+        restoreEditorState(state);
+      });
+  }
+
+  /* Keeps the user's place across the modal editor's full re-render (#547):
+   * the focused field and caret, any open add-picker with its filter text,
+   * and the tree scroll. The server marks the node a mutation created via
+   * data-focus on #editor-form; the caret goes there first. */
+  function captureEditorState() {
+    var state = { focus: null, pickers: [], scroll: 0 };
+    var tree = editorBody.querySelector(".editor-tree");
+    if (tree) state.scroll = tree.scrollTop;
+    var active = document.activeElement;
+    if (active && editorBody.contains(active) && active.dataset && active.dataset.set) {
+      state.focus = { path: active.dataset.set, start: active.selectionStart, end: active.selectionEnd };
+    }
+    editorBody.querySelectorAll("details.editor-add[open]").forEach(function (box) {
+      var row = box.closest("[data-path]");
+      var filter = box.querySelector(".editor-add__filter");
+      state.pickers.push({
+        path: row ? row.dataset.path : "",
+        filter: filter ? filter.value : "",
+        focusFilter: filter === document.activeElement,
+      });
+    });
+    return state;
+  }
+
+  function editorNodeBy(attr, path) {
+    var nodes = editorBody.querySelectorAll("[" + attr + "]");
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].getAttribute(attr) === path) return nodes[i];
+    }
+    return null;
+  }
+
+  function restoreEditorState(state) {
+    state.pickers.forEach(function (saved) {
+      var row = saved.path ? editorNodeBy("data-path", saved.path) : editorBody;
+      if (!row) return;
+      var box = row.querySelector("details.editor-add");
+      if (!box) return;
+      box.setAttribute("open", "");
+      var filter = box.querySelector(".editor-add__filter");
+      if (filter && saved.filter) {
+        filter.value = saved.filter;
+        filter.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      if (saved.focusFilter && filter) filter.focus();
+    });
+
+    var formEl = editorBody.querySelector("#editor-form");
+    var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
+    var target = createdPath ? editorNodeBy("data-set", createdPath) : null;
+    if (target) {
+      target.focus();
+      if (target.select) target.select();
+    } else if (state.focus) {
+      target = editorNodeBy("data-set", state.focus.path);
+      if (target) {
+        target.focus();
+        if (target.setSelectionRange && state.focus.start !== null) {
+          try { target.setSelectionRange(state.focus.start, state.focus.end); } catch (ignored) {}
+        }
+      }
+    }
+
+    var tree = editorBody.querySelector(".editor-tree");
+    if (tree) tree.scrollTop = state.scroll;
   }
 
   /* Delegated editor interactions within the modal body. */
@@ -176,6 +247,8 @@
   editorBody.addEventListener("blur", function (event) {
     var input = event.target.closest("[data-set]");
     if (!input) return;
+    // An unchanged value needs no round trip (#547).
+    if (input.value === input.defaultValue) return;
     editorSend("set", { path: input.dataset.set, value: input.value });
   }, true);
 

@@ -456,3 +456,44 @@ async fn delete_still_accepts_underscore_prefixed_tenants() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 }
+
+/// #544: the sidebar tenant picker only renders once a tenant beyond the
+/// server default exists.
+#[tokio::test]
+async fn the_tenant_picker_hides_until_a_second_tenant_exists() {
+    let store = store();
+
+    // Fresh install: default tenant only — no picker in the chrome.
+    let (_, html) = get(&store, "/ui/tenants").await;
+    assert!(
+        !html.contains(r#"class="selector""#),
+        "picker hidden on a single-tenant install"
+    );
+
+    // Provision a second tenant through the page's own form.
+    let res = app(&store)
+        .oneshot(
+            Request::post("/ui/tenants")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("id=acme&display_name=Acme"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    let (_, html) = get(&store, "/ui/tenants").await;
+    assert!(
+        html.contains(r#"class="selector""#),
+        "picker appears once a second tenant exists"
+    );
+}
+
+/// #545: the Add-tenant panel carries explicit ways out.
+#[tokio::test]
+async fn the_add_tenant_panel_offers_cancel_and_close() {
+    let store = store();
+    let (_, html) = get(&store, "/ui/tenants").await;
+    assert!(html.contains("data-addbox-close"), "close controls present");
+    assert!(html.contains("Cancel"));
+}
