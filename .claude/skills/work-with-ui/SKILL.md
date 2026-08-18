@@ -109,6 +109,22 @@ Enforced by review, and three of them by `e2e/tests/no-cdn.spec.ts`:
 To update htmx, replace `assets/htmx.min.js` with the new pinned release and note
 the version bump in the commit message.
 
+### CSS: one vocabulary, four layers
+
+`assets/app.css` is layered — `@layer tokens, base, components, pages`. Shared
+primitives live in `components`; put in `pages` only what no other screen wants.
+**Never invent a second class for an existing primitive** (`.button` next to
+`.btn` is how the Import page drifted, #543) and never restyle a shared control
+page-locally. The canonical spellings: `.btn`/`.btn--primary`, `.card` +
+`.card-head`, `.page-head__title` (the only `<h1>` class), `.table-wrap` >
+`.data-table`, `.field__*`, `.addbox`, `.menu`, `.notice`, `.tag`, `.chip`,
+`.toolbar`, `.tabs`/`.tab`, `.filter-rail`, `.icon-button`. Full table:
+`crates/ui/README.md` § Component vocabulary. `e2e/tests/design-system.spec.ts`
+fails undefined classes, off-canon `<h1>`s, diverging primary buttons, and
+duplicate selectors; every full page must be in `e2e/pages/routes.ts`, the one
+route list all cross-page guards share. New pages start from
+`templates/pages/_scaffold.html`.
+
 ## Configuration
 
 The UI reads no configuration of its own; `hfs` passes it in at `mount()`.
