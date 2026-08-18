@@ -1816,6 +1816,9 @@ mod tests {
         assert!(html.contains(r#"data-intent="run""#));
         assert!(html.contains(r#"data-intent="save""#));
         assert!(html.contains(r#"id="recent-searches""#));
+        // The Recent panel closes from an explicit X as well as outside
+        // click / Esc (addbox.js covers details.menu too).
+        assert!(html.contains("data-addbox-close"));
         // Resource picker rail: the version's full type list, with count
         // slots the script hydrates via _summary=count.
         assert!(html.contains(r#"data-rail-type="Patient""#));
