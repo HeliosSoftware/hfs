@@ -532,6 +532,7 @@ bulk-import-field-client-id = Client-ID
 bulk-import-field-client-id-hint = Registrieren Sie diesen Datenanbieter beim Empfänger und erhalten Sie eine Client-ID.
 bulk-import-field-token-url = Token-URL
 bulk-import-field-token-url-hint = Token-Endpunkt-URL des Autorisierungsservers.
+bulk-import-jwks-hint = Registrieren Sie den öffentlichen Schlüssel dieses Servers beim Empfänger über die JWKS-URL:
 bulk-import-test-auth = Authentifizierung testen
 bulk-import-test-auth-ok = Authentifizierung erfolgreich.
 bulk-import-create-submit = Submission anlegen

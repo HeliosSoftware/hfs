@@ -26,6 +26,8 @@ pub struct JwtClientCredentialsTokenProvider {
     client_id: String,
     signing_alg: Algorithm,
     encoding_key: EncodingKey,
+    /// RFC 7638 thumbprint of the public key, used as `kid` in assertion headers.
+    kid: Option<String>,
     /// Cache of `(token_endpoint, scope) -> (token, expiry)`.
     cache: Mutex<HashMap<(String, String), (String, Instant)>>,
 }
@@ -45,11 +47,14 @@ impl JwtClientCredentialsTokenProvider {
             ),
             _ => return None,
         };
+        let kid = derive_public_jwk(private_key_pem, signing_alg)
+            .and_then(|jwk| jwk.get("kid").and_then(|v| v.as_str()).map(String::from));
         Some(Arc::new(Self {
             client: reqwest::Client::new(),
             client_id: client_id.to_string(),
             signing_alg: alg,
             encoding_key: key,
+            kid,
             cache: Mutex::new(HashMap::new()),
         }))
     }
@@ -79,6 +84,7 @@ impl JwtClientCredentialsTokenProvider {
         });
         let mut header = Header::new(self.signing_alg);
         header.typ = Some("JWT".to_string());
+        header.kid = self.kid.clone();
         jsonwebtoken::encode(&header, &claims, &self.encoding_key).ok()
     }
 
@@ -141,6 +147,63 @@ impl FileTokenProvider for JwtClientCredentialsTokenProvider {
             .await
             .insert(cache_key, (token.clone(), exp));
         Some(token)
+    }
+}
+
+/// Derives the public JWK (with RFC 7638 thumbprint as `kid`) from a PEM private key.
+///
+/// Supports ES384 (P-384) and RS384. Returns `None` for any other algorithm or
+/// for a key that cannot be parsed.
+pub(crate) fn derive_public_jwk(pem: &str, alg: &str) -> Option<Value> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use sha2::{Digest, Sha256};
+
+    match alg {
+        "ES384" => {
+            use p384::elliptic_curve::sec1::ToEncodedPoint;
+            use p384::pkcs8::DecodePrivateKey;
+
+            let secret = p384::SecretKey::from_pkcs8_pem(pem)
+                .or_else(|_| p384::SecretKey::from_sec1_pem(pem))
+                .ok()?;
+            let point = secret.public_key().to_encoded_point(false);
+            let x = URL_SAFE_NO_PAD.encode(point.x()?);
+            let y = URL_SAFE_NO_PAD.encode(point.y()?);
+            // RFC 7638 §3.3: required EC members in lexicographic order.
+            let canonical = format!(r#"{{"crv":"P-384","kty":"EC","x":"{x}","y":"{y}"}}"#);
+            let kid = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
+            Some(serde_json::json!({
+                "kty": "EC",
+                "crv": "P-384",
+                "x": x,
+                "y": y,
+                "kid": kid,
+                "use": "sig",
+                "alg": "ES384",
+            }))
+        }
+        "RS384" => {
+            use rsa::pkcs8::DecodePrivateKey;
+            use rsa::traits::PublicKeyParts;
+
+            let private_key = rsa::RsaPrivateKey::from_pkcs8_pem(pem).ok()?;
+            let pub_key = private_key.to_public_key();
+            let n = URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
+            let e = URL_SAFE_NO_PAD.encode(pub_key.e().to_bytes_be());
+            // RFC 7638 §3.3: required RSA members in lexicographic order.
+            let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
+            let kid = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
+            Some(serde_json::json!({
+                "kty": "RSA",
+                "n": n,
+                "e": e,
+                "kid": kid,
+                "use": "sig",
+                "alg": "RS384",
+            }))
+        }
+        _ => None,
     }
 }
 

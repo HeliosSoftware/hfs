@@ -57,6 +57,7 @@ const EXEMPT_PATHS: &[&str] = &[
     "/_liveness",
     "/_readiness",
     "/.well-known/smart-configuration",
+    "/.well-known/bulk-submit-jwks.json",
     "/$versions",
 ];
 
