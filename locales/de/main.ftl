@@ -1134,3 +1134,67 @@ hts-vs-batch-column-display = Anzeige
 hts-vs-batch-column-result = Ergebnis
 hts-vs-batch-progress = { $n } von { $m } abgeschlossen
 hts-vs-batch-progress-final = { $m } abgeschlossen
+
+## Slice F — Import (§7.7). Erste Uebersetzung; im i18n-Review pruefen
+## (# TODO(F): review de).
+
+hts-import-title = Terminologie importieren
+hts-import-heading = Terminologie importieren
+hts-import-help = Sende ein FHIR-Bundle als JSON. HTS akzeptiert CodeSystem, ValueSet und ConceptMap in einem POST.
+hts-import-source-legend = Quelle
+hts-import-source-paste = JSON einfuegen
+hts-import-source-file = Datei hochladen
+hts-import-bundle-textarea-label = FHIR-Bundle (JSON)
+hts-import-bundle-file-label = Bundle-Datei (JSON)
+hts-import-submit = Importieren
+hts-import-status-empty = Es wurde noch kein Import gesendet.
+hts-import-status-success = Import abgeschlossen
+hts-import-status-partial = Import teilweise erfolgreich
+hts-import-status-rejected = Import abgelehnt
+hts-import-status-too-large = Bundle zu gross
+hts-import-counts-heading = Anzahl pro Ressource
+hts-import-counts-created = Erstellt / aktualisiert
+hts-import-counts-updated = Aktualisiert
+hts-import-counts-errors = Fehler
+hts-import-resource-code-system = CodeSystem
+hts-import-resource-value-set = ValueSet
+hts-import-resource-concept-map = ConceptMap
+hts-import-resource-concept = Eingefuegte Konzepte
+hts-import-duration = { $seconds } s
+hts-import-issues-heading = { $n ->
+    [one] { $n } Hinweis
+   *[other] { $n } Hinweise
+}
+hts-import-too-large-hint = Die Anfrage hat das Serverlimit ueberschritten. Teile das Bundle in kleinere Batches auf und versuche es erneut.
+hts-import-empty-bundle-error = Bitte ein JSON-Bundle einfuegen, bevor du absendest.
+hts-import-invalid-json-error = Der uebermittelte Inhalt ist kein gueltiges JSON.
+
+## Slice G — Diagnose (§7.9). Erste Uebersetzung; im i18n-Review pruefen
+## (# TODO(G): review de).
+
+hts-diagnostics-title = Diagnose
+hts-diagnostics-heading = Diagnose
+hts-diagnostics-nav-label = Diagnose
+hts-diagnostics-fhir-version-chip = FHIR { $version }
+hts-diagnostics-tab-capability = Capability
+hts-diagnostics-tab-terminology-capabilities = TerminologyCapabilities
+hts-diagnostics-tab-health = /health
+hts-diagnostics-tab-metrics = /metrics
+hts-diagnostics-capability-heading = CapabilityStatement
+hts-diagnostics-terminology-capabilities-heading = TerminologyCapabilities
+hts-diagnostics-health-heading = Gesundheit
+hts-diagnostics-metrics-heading = Prometheus-Metriken
+hts-diagnostics-property-url = URL
+hts-diagnostics-property-version = Version
+hts-diagnostics-property-name = Name
+hts-diagnostics-property-title = Titel
+hts-diagnostics-property-status = Status
+hts-diagnostics-property-date = Datum
+hts-diagnostics-capability-rest-heading = REST-Ressourcen
+hts-diagnostics-terminology-code-systems-heading = Code Systems
+hts-diagnostics-terminology-code-systems-empty = Keine Systeme geladen
+hts-diagnostics-health-status-label = Status
+hts-diagnostics-health-unknown = Unbekannt
+hts-diagnostics-metrics-figcaption = Prometheus-Metriken im Textformat
+hts-diagnostics-metrics-empty = Der Metrics-Endpunkt lieferte keinen Inhalt
+hts-diagnostics-error = Diese Diagnose-Oberflaeche ist voruebergehend nicht verfuegbar.

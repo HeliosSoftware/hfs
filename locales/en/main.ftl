@@ -1151,3 +1151,74 @@ hts-vs-batch-column-display = Display
 hts-vs-batch-column-result = Result
 hts-vs-batch-progress = { $n } of { $m } completed
 hts-vs-batch-progress-final = { $m } completed
+
+## Slice F — standalone Import page (design doc §7.7).
+##
+## Shell + upload form + status region for POST /import. All strings
+## live under `hts-import-*`; `hts-nav-import` above is the sidebar
+## label reused from the Phase 1 stub set.
+
+hts-import-title = Import terminology
+hts-import-heading = Import terminology
+hts-import-help = Submit a FHIR JSON Bundle. HTS accepts CodeSystem, ValueSet, and ConceptMap resources in one POST.
+hts-import-source-legend = Source
+hts-import-source-paste = Paste JSON
+hts-import-source-file = Upload file
+hts-import-bundle-textarea-label = FHIR Bundle (JSON)
+hts-import-bundle-file-label = Bundle file (JSON)
+hts-import-submit = Import
+hts-import-status-empty = No import has been submitted yet.
+hts-import-status-success = Import complete
+hts-import-status-partial = Import partially succeeded
+hts-import-status-rejected = Import rejected
+hts-import-status-too-large = Bundle too large
+hts-import-counts-heading = Counts by resource
+hts-import-counts-created = Created / updated
+hts-import-counts-updated = Updated
+hts-import-counts-errors = Errors
+hts-import-resource-code-system = CodeSystem
+hts-import-resource-value-set = ValueSet
+hts-import-resource-concept-map = ConceptMap
+hts-import-resource-concept = Concepts inserted
+hts-import-duration = { $seconds } s
+hts-import-issues-heading = { $n ->
+    [one] { $n } issue
+   *[other] { $n } issues
+}
+hts-import-too-large-hint = The request exceeded the server's payload limit. Split the Bundle into smaller batches and retry.
+hts-import-empty-bundle-error = Paste a JSON Bundle before submitting.
+hts-import-invalid-json-error = The submitted body is not valid JSON.
+
+## Slice G — standalone Diagnostics page (design doc §7.9).
+##
+## Deep-link friendly, tab-swap view over CapabilityStatement,
+## TerminologyCapabilities, /health, and /metrics. Per-tab
+## OperationOutcome renders inside the shared `#diag-panel` so a
+## failing surface never blanks the tab strip.
+
+hts-diagnostics-title = Diagnostics
+hts-diagnostics-heading = Diagnostics
+hts-diagnostics-nav-label = Diagnostics
+hts-diagnostics-fhir-version-chip = FHIR { $version }
+hts-diagnostics-tab-capability = Capability
+hts-diagnostics-tab-terminology-capabilities = TerminologyCapabilities
+hts-diagnostics-tab-health = /health
+hts-diagnostics-tab-metrics = /metrics
+hts-diagnostics-capability-heading = CapabilityStatement
+hts-diagnostics-terminology-capabilities-heading = TerminologyCapabilities
+hts-diagnostics-health-heading = Health
+hts-diagnostics-metrics-heading = Prometheus metrics
+hts-diagnostics-property-url = URL
+hts-diagnostics-property-version = Version
+hts-diagnostics-property-name = Name
+hts-diagnostics-property-title = Title
+hts-diagnostics-property-status = Status
+hts-diagnostics-property-date = Date
+hts-diagnostics-capability-rest-heading = REST resources
+hts-diagnostics-terminology-code-systems-heading = Code Systems
+hts-diagnostics-terminology-code-systems-empty = No systems loaded
+hts-diagnostics-health-status-label = Status
+hts-diagnostics-health-unknown = Unknown
+hts-diagnostics-metrics-figcaption = Prometheus text-format metrics
+hts-diagnostics-metrics-empty = Metrics endpoint returned no body
+hts-diagnostics-error = This diagnostic surface is temporarily unavailable.

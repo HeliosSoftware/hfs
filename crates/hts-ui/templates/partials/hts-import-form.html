@@ -1,0 +1,62 @@
+{#-
+  Import upload form (design doc §7.7).
+
+  Rules of the road:
+    - Real <form action= method=POST> so the page works without JS.
+    - `hx-post` targets `#hts-import-status` for htmx clients; the
+      hard-nav response re-renders the whole page with the status
+      partial embedded inline (design doc §7.10 row 7.7 nojs).
+    - Source selector is a radio group; paste is the required v1 path,
+      file is disabled and carries a `# TODO(F)` note in the module
+      docs for a Phase-3 follow-up.
+    - Submit is disabled when the shared degraded banner is showing
+      (design doc §7 preamble degraded state).
+-#}
+<form class="hts-import__form"
+      action="/ui/hts/import"
+      method="post"
+      hx-post="/ui/hts/import"
+      hx-target="#hts-import-status"
+      hx-swap="innerHTML"
+      enctype="application/x-www-form-urlencoded">
+  <fieldset class="hts-import__source">
+    <legend>{{ chrome.i18n.t("hts-import-source-legend") }}</legend>
+    <label class="hts-import__source-option">
+      <input type="radio" name="source" value="paste" checked>
+      <span>{{ chrome.i18n.t("hts-import-source-paste") }}</span>
+    </label>
+    <label class="hts-import__source-option hts-import__source-option--disabled">
+      <input type="radio" name="source" value="file" disabled>
+      <span>{{ chrome.i18n.t("hts-import-source-file") }}</span>
+    </label>
+  </fieldset>
+
+  <label class="hts-import__bundle-label" for="hts-import-bundle">
+    {{ chrome.i18n.t("hts-import-bundle-textarea-label") }}
+  </label>
+  <textarea id="hts-import-bundle"
+            class="hts-import__bundle"
+            name="bundle"
+            rows="16"
+            aria-label="{{ chrome.i18n.t("hts-import-bundle-textarea-label") }}"
+            spellcheck="false"
+            autocorrect="off"
+            autocapitalize="off"></textarea>
+
+  <label class="hts-import__file-label" for="hts-import-file">
+    {{ chrome.i18n.t("hts-import-bundle-file-label") }}
+  </label>
+  <input id="hts-import-file"
+         class="hts-import__file"
+         name="bundle_file"
+         type="file"
+         accept="application/json,application/fhir+json,.json"
+         disabled>
+
+  <button id="hts-import-submit"
+          class="hts-import__submit"
+          type="submit"
+          {% if degraded_reason.is_some() %}disabled{% endif %}>
+    {{ chrome.i18n.t("hts-import-submit") }}
+  </button>
+</form>

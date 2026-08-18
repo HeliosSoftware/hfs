@@ -38,7 +38,9 @@
 mod code_systems;
 mod concept_maps;
 mod dashboard;
+mod diagnostics;
 mod i18n;
+mod import;
 mod operations;
 mod upstream;
 mod value_sets;
@@ -59,13 +61,19 @@ pub use upstream::{
     ClosureConcept, ClosureEdge, ClosureParams, ClosureResult, CmBrowserFilters, CmBrowserPage,
     CmBrowserRow, CodeSystemSummary, ConceptMapSummary, CsBrowserFilters, CsBrowserPage,
     CsBrowserRow, ExpandParams, ExpansionConcept, ExpansionDesignation, ExpansionResult,
-    LookupDesignation, LookupParams, LookupProperty, LookupResult, MappingKind, OutcomeView,
-    SubsumesParams, SubsumesResult, TranslateDirection, TranslateMatch, TranslateParams,
-    TranslateResult, UpstreamCapabilitiesCodeSystem, UpstreamClient, UpstreamError,
-    UpstreamHealth, UpstreamTerminologyCapabilities, ValidateCodeParams, ValidateCodeResult,
-    ValidateInputMode, ValueSetSummary, VsBrowserFilters, VsBrowserPage, VsBrowserRow,
-    VsValidateMode, VsValidateParams, VsValidateResult, VsValidateSource,
-    HTS_UI_BATCH_FANOUT_CONCURRENCY, HTS_UI_MAX_EXPANSION_SIZE_HINT,
+    ImportCounts, ImportResult, ImportStatus, LookupDesignation, LookupParams, LookupProperty,
+    LookupResult, MappingKind, OutcomeView, SubsumesParams, SubsumesResult, TranslateDirection,
+    TranslateMatch, TranslateParams, TranslateResult, UpstreamCapabilitiesCodeSystem,
+    UpstreamClient, UpstreamError, UpstreamHealth, UpstreamTerminologyCapabilities,
+    ValidateCodeParams, ValidateCodeResult, ValidateInputMode, ValueSetSummary, VsBrowserFilters,
+    VsBrowserPage, VsBrowserRow, VsValidateMode, VsValidateParams, VsValidateResult,
+    VsValidateSource, HTS_UI_BATCH_FANOUT_CONCURRENCY, HTS_UI_MAX_EXPANSION_SIZE_HINT,
+};
+// Slice G additions (diagnostics, §7.9). Appended below Slice F's block to
+// avoid touching the alphabetized list.
+pub use upstream::{
+    CapabilityRestResource, CapabilityView, TerminologyCapabilitiesView,
+    TerminologyCodeSystemEntry,
 };
 
 /// Static UI assets (htmx, CSS, JS) embedded into the binary at compile time.
@@ -114,6 +122,8 @@ pub fn router(state: Arc<HtsUiState>) -> Router {
         .merge(value_sets::routes())
         .merge(concept_maps::routes())
         .merge(operations::routes())
+        .merge(import::routes())
+        .merge(diagnostics::routes())
         .nest_service("/hts/assets", ServeEmbed::<Assets>::new())
         .with_state(state)
         .layer(axum::middleware::from_fn(i18n::negotiate_locale))

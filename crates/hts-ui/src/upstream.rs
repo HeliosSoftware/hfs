@@ -3181,6 +3181,280 @@ impl UpstreamClient {
     }
 }
 
+// ── Slice F: Import Bundle ─────────────────────────────────────────────
+//
+// Types + method backing the standalone Import page (§7.7). HTS's
+// `POST /import` returns:
+//   • 200 OK — clean import; body is a JSON object with per-resource
+//     counts (`code_systems`, `value_sets`, `concept_maps`, `concepts`)
+//     and no `errors[]`.
+//   • 207 Multi-Status — partial success; same shape as 200 plus a
+//     non-empty `errors[]` array of freeform diagnostic strings (one
+//     per non-fatal issue).
+//   • 400 Bad Request — malformed Bundle / non-JSON body; HTS returns
+//     an `OperationOutcome` via its shared error mapping.
+//   • 413 Payload Too Large — transport-level; no body guarantee.
+//   • 5xx — storage failure; also an OperationOutcome per HTS.
+//
+// `ImportCounts` is optional because a 413 (or a decode failure on the
+// success body) carries none. The status handler renders "—" when the
+// counts are absent rather than fabricating zeros.
+
+/// Status variant returned by [`UpstreamClient::import_bundle`], driving
+/// the four visual states in `partials/hts-import-status.html`
+/// (design doc §7.7 states matrix).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportStatus {
+    /// HTTP 200 — clean import, no non-fatal errors.
+    Success,
+    /// HTTP 207 — import ran but produced non-fatal errors.
+    PartialSuccess,
+    /// HTTP 400 — malformed Bundle, HTS refused it before touching storage.
+    Rejected,
+    /// HTTP 413 — request body exceeded a transport limit. Surface a
+    /// split-the-Bundle hint via `hts-import-too-large-hint`.
+    TooLarge,
+}
+
+impl ImportStatus {
+    /// Fluent key suffix rendered by the status partial:
+    /// `hts-import-status-{success | partial | rejected | too-large}`.
+    pub fn key_suffix(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::PartialSuccess => "partial",
+            Self::Rejected => "rejected",
+            Self::TooLarge => "too-large",
+        }
+    }
+}
+
+/// Per-resource-type counts returned by HTS on 200 / 207. Absent on
+/// 400 / 413 where HTS has nothing to report. Kept as `u32` because
+/// the HTS `ImportResponse` struct uses `u32` for each field.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportCounts {
+    pub code_systems: u32,
+    pub value_sets: u32,
+    pub concept_maps: u32,
+    /// Total number of concept rows inserted across the CS resources
+    /// in the Bundle. Rendered as a compact stat below the counts
+    /// table in the status partial.
+    pub concepts: u32,
+}
+
+/// Parsed result of a `POST /import` round-trip. The UI Import handler
+/// discriminates on `status` to pick the right variant of the status
+/// partial (§7.7 states matrix).
+#[derive(Clone, Debug)]
+pub struct ImportResult {
+    pub status: ImportStatus,
+    /// Populated for 200 / 207 when HTS returned its `ImportResponse`
+    /// JSON. `None` for 400 / 413 (no counts) or when the body could
+    /// not be decoded (still surfaced as `Rejected` rather than a
+    /// panic).
+    pub counts: Option<ImportCounts>,
+    /// Non-fatal issues reported by HTS. On 207 these are the
+    /// `errors[]` strings from the success body; on 400 / 5xx they
+    /// come from the OperationOutcome (severity/code discarded — each
+    /// entry is a single line of diagnostic prose the UI can render
+    /// inside `<details><summary>`).
+    pub issues: Vec<String>,
+    /// Structured OperationOutcome, when the response body was one.
+    /// Only populated for `Rejected` (400) responses so the shared
+    /// `hts-outcome.html` partial can render the first issue with
+    /// full severity / code / location context. `None` on 200 / 207
+    /// (where the body is HTS's custom shape) and on 413 (no body).
+    pub outcome: Option<OutcomeView>,
+    /// URL the request was sent to, for the "Request URL" line in
+    /// the status partial (matches the workbench pattern from §7.3).
+    pub request_url: String,
+    /// Pretty-printed raw response body. Empty on 413.
+    pub raw_body: String,
+}
+
+impl UpstreamClient {
+    /// `POST /import` (design doc §7.7). Body is the raw JSON Bundle
+    /// text with `Content-Type: application/fhir+json`. Returns a
+    /// structured [`ImportResult`] regardless of upstream status —
+    /// only transport-level failures collapse into
+    /// [`UpstreamError::Connect`] / [`UpstreamError::Timeout`].
+    ///
+    /// Rationale for absorbing 4xx into `Ok(ImportResult)`: the Import
+    /// page's status region has bespoke rendering per status (200 /
+    /// 207 / 400 / 413) that would be lossy to squeeze through the
+    /// generic `UpstreamError::Outcome` / `HttpStatus` arms. 5xx
+    /// still flows through `UpstreamError` so the shared degraded
+    /// banner picks it up.
+    pub async fn import_bundle(
+        &self,
+        bundle_json: &str,
+    ) -> Result<ImportResult, UpstreamError> {
+        let url = format!("{}/import", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header("Accept", "application/fhir+json")
+            .header("Content-Type", "application/fhir+json")
+            .body(bundle_json.to_owned())
+            .send()
+            .await
+            .map_err(|e| UpstreamError::from_reqwest("import", &url, e))?;
+        let status = response.status();
+        let raw = response
+            .text()
+            .await
+            .map_err(|e| UpstreamError::Decode {
+                op: "import",
+                url: url.clone(),
+                message: e.to_string(),
+            })?;
+        let status_u16 = status.as_u16();
+
+        // 413 typically has no body — synthesize the result without
+        // touching serde_json.
+        if status_u16 == 413 {
+            return Ok(ImportResult {
+                status: ImportStatus::TooLarge,
+                counts: None,
+                issues: Vec::new(),
+                outcome: None,
+                request_url: url,
+                raw_body: raw,
+            });
+        }
+
+        // 5xx (and anything else outside the handled 200/207/400/413
+        // matrix) surfaces through the standard error path so the
+        // degraded banner catches it.
+        if status_u16 >= 500 {
+            let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
+            return Err(status_to_error("import", &url, status_u16, &parsed));
+        }
+
+        // 400 — body is an OperationOutcome per HTS's error mapping.
+        // Parse loosely so a body that isn't quite an OO still surfaces
+        // a rejection state (never a 5xx-shaped panic).
+        if status_u16 == 400 {
+            let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
+            let outcome = if parsed
+                .get("resourceType")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "OperationOutcome")
+                .unwrap_or(false)
+            {
+                Some(OutcomeView::from_body(&parsed))
+            } else {
+                None
+            };
+            let issues = collect_outcome_diagnostics(&parsed);
+            let pretty = serde_json::to_string_pretty(&parsed).unwrap_or(raw);
+            return Ok(ImportResult {
+                status: ImportStatus::Rejected,
+                counts: None,
+                issues,
+                outcome,
+                request_url: url,
+                raw_body: pretty,
+            });
+        }
+
+        // 200 / 207 — HTS's custom ImportResponse shape.
+        let parsed: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(err) => {
+                // Body was not JSON. Surface as `Rejected` with a
+                // synthetic outcome so the operator sees something
+                // more useful than a crash.
+                return Ok(ImportResult {
+                    status: ImportStatus::Rejected,
+                    counts: None,
+                    issues: vec![err.to_string()],
+                    outcome: Some(OutcomeView::invalid_input(err.to_string())),
+                    request_url: url,
+                    raw_body: raw,
+                });
+            }
+        };
+        let counts = parse_import_counts(&parsed);
+        let issues = parsed
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let import_status = if status_u16 == 207 || !issues.is_empty() {
+            ImportStatus::PartialSuccess
+        } else {
+            ImportStatus::Success
+        };
+        let pretty = serde_json::to_string_pretty(&parsed).unwrap_or(raw);
+        Ok(ImportResult {
+            status: import_status,
+            counts,
+            issues,
+            outcome: None,
+            request_url: url,
+            raw_body: pretty,
+        })
+    }
+}
+
+/// Parse an HTS `ImportResponse` body into counts. Returns `None` when
+/// none of the count fields are present (a body that has an `errors`
+/// array but no counts is still legal — the caller records the issues
+/// and renders "—" for the columns).
+fn parse_import_counts(body: &Value) -> Option<ImportCounts> {
+    let obj = body.as_object()?;
+    let has_any = ["code_systems", "value_sets", "concept_maps", "concepts"]
+        .iter()
+        .any(|k| obj.contains_key(*k));
+    if !has_any {
+        return None;
+    }
+    let read = |k: &str| -> u32 {
+        obj.get(k)
+            .and_then(|v| v.as_u64())
+            .map(|n| n.min(u32::MAX as u64) as u32)
+            .unwrap_or(0)
+    };
+    Some(ImportCounts {
+        code_systems: read("code_systems"),
+        value_sets: read("value_sets"),
+        concept_maps: read("concept_maps"),
+        concepts: read("concepts"),
+    })
+}
+
+/// Best-effort projection of `OperationOutcome.issue[].diagnostics`
+/// into a flat list of strings. Used for the 400-rejection issue list
+/// under the shared outcome banner. Missing / empty diagnostics fall
+/// back to the issue code so the operator sees something.
+fn collect_outcome_diagnostics(body: &Value) -> Vec<String> {
+    body.get("issue")
+        .and_then(|v| v.as_array())
+        .map(|issues| {
+            issues
+                .iter()
+                .map(|i| {
+                    let d = i.get("diagnostics").and_then(|v| v.as_str()).unwrap_or("");
+                    if !d.is_empty() {
+                        d.to_owned()
+                    } else {
+                        i.get("code")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_owned()
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Walk a ConceptMap resource's `group[].element[].target[]` matrix
 /// into a flat edge list. Accepts both R4/R4B (`equivalence`) and
 /// R5/R6 (`relationship`) flavors — whichever field HTS returned is
@@ -3239,6 +3513,262 @@ fn parse_closure_edges(resource: &Value) -> Vec<ClosureEdge> {
         }
     }
     out
+}
+
+// ── Slice G: Diagnostics fetches ────────────────────────────────────────
+//
+// Three read-only surfaces the Diagnostics page (design doc §7.9) sits on:
+//
+//   • `GET /metadata`                     — FHIR CapabilityStatement.
+//   • `GET /metadata?mode=terminology`    — FHIR TerminologyCapabilities.
+//   • `GET /metrics`                      — Prometheus text-format body.
+//
+// The existing [`UpstreamClient::terminology_capabilities`] method (used
+// by the dashboard) parses only the fields Slice A's cards render
+// (`codeSystem[].uri` + `fhirVersion`); Slice G's tabs need the richer
+// identity block (`url`, `version`, `name`, `title`, `status`, `date`)
+// plus per-`codeSystem[].version[]` details. Rather than mutate the
+// dashboard's projection, Slice G ships a parallel
+// [`terminology_capabilities_view`] method that returns
+// [`TerminologyCapabilitiesView`] — a strict superset of the fields the
+// TerminologyCap tab shows.
+//
+// `metrics_text` returns the raw body verbatim: the metrics tab wraps it
+// in `<pre>` inside a `<figure>` and does no numeric parsing.
+
+/// Projection of a FHIR `CapabilityStatement` for the Diagnostics
+/// **Capability** tab (design doc §7.9). Only the identity block plus a
+/// REST-resource summary is parsed — the tab is a documentation surface,
+/// not a machine consumer, so unknown fields are silently dropped.
+#[derive(Clone, Debug, Default)]
+pub struct CapabilityView {
+    pub url: String,
+    pub version: String,
+    pub name: String,
+    pub title: String,
+    pub status: String,
+    pub date: String,
+    /// Flattened `rest[].resource[]` summary — resource type + the list of
+    /// advertised interaction verbs (`read`, `search-type`, ...). Empty
+    /// when the upstream response does not carry a `rest[]` section.
+    pub resources: Vec<CapabilityRestResource>,
+}
+
+/// One row in [`CapabilityView::resources`].
+#[derive(Clone, Debug, Default)]
+pub struct CapabilityRestResource {
+    pub resource_type: String,
+    pub interactions: Vec<String>,
+}
+
+/// Projection of the `TerminologyCapabilities` fields the Diagnostics
+/// **TerminologyCap** tab renders (design doc §7.9). Complementary to
+/// [`UpstreamTerminologyCapabilities`] — that one exposes the fields
+/// Slice A's dashboard cards read (loaded-system count + FHIR version);
+/// this one exposes the identity block and the per-system version list
+/// the operator surface needs.
+#[derive(Clone, Debug, Default)]
+pub struct TerminologyCapabilitiesView {
+    pub url: String,
+    pub version: String,
+    pub name: String,
+    pub title: String,
+    pub status: String,
+    pub code_systems: Vec<TerminologyCodeSystemEntry>,
+}
+
+/// One row in [`TerminologyCapabilitiesView::code_systems`]. HTS today
+/// emits `codeSystem[].uri` but no `codeSystem[].version[]`; the parser
+/// accepts either the FHIR-spec array shape (`version[].code`) or a
+/// convenience flat string, so a richer server does not break the tab.
+#[derive(Clone, Debug, Default)]
+pub struct TerminologyCodeSystemEntry {
+    pub uri: String,
+    pub version: String,
+}
+
+impl UpstreamClient {
+    /// `GET /metadata` — the FHIR `CapabilityStatement`. Feeds the
+    /// Diagnostics **Capability** tab.
+    pub async fn capability_statement(&self) -> Result<CapabilityView, UpstreamError> {
+        let url = format!("{}/metadata", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .header("Accept", "application/fhir+json")
+            .send()
+            .await
+            .map_err(|e| UpstreamError::from_reqwest("metadata", &url, e))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(UpstreamError::HttpStatus {
+                op: "metadata",
+                url,
+                status: status.as_u16(),
+            });
+        }
+        let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
+            op: "metadata",
+            url: url.clone(),
+            message: e.to_string(),
+        })?;
+        Ok(parse_capability_statement(&body))
+    }
+
+    /// `GET /metadata?mode=terminology` — the FHIR
+    /// `TerminologyCapabilities`, projected into the richer
+    /// [`TerminologyCapabilitiesView`]. Feeds the Diagnostics
+    /// **TerminologyCap** tab; the dashboard keeps using
+    /// [`Self::terminology_capabilities`] for the loaded-systems count.
+    pub async fn terminology_capabilities_view(
+        &self,
+    ) -> Result<TerminologyCapabilitiesView, UpstreamError> {
+        let url = format!("{}/metadata?mode=terminology", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .header("Accept", "application/fhir+json")
+            .send()
+            .await
+            .map_err(|e| UpstreamError::from_reqwest("metadata", &url, e))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(UpstreamError::HttpStatus {
+                op: "metadata",
+                url,
+                status: status.as_u16(),
+            });
+        }
+        let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
+            op: "metadata",
+            url: url.clone(),
+            message: e.to_string(),
+        })?;
+        Ok(parse_terminology_capabilities_view(&body))
+    }
+
+    /// `GET /metrics` — the raw Prometheus text-format body. Returned
+    /// verbatim so the Diagnostics **/metrics** tab can render it inside
+    /// a `<pre>` without a numeric-parser dependency.
+    pub async fn metrics_text(&self) -> Result<String, UpstreamError> {
+        let url = format!("{}/metrics", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| UpstreamError::from_reqwest("metrics", &url, e))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(UpstreamError::HttpStatus {
+                op: "metrics",
+                url,
+                status: status.as_u16(),
+            });
+        }
+        response.text().await.map_err(|e| UpstreamError::Decode {
+            op: "metrics",
+            url,
+            message: e.to_string(),
+        })
+    }
+}
+
+fn parse_capability_statement(body: &Value) -> CapabilityView {
+    let get_str = |key: &str| -> String {
+        body.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let resources = body
+        .get("rest")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .flat_map(|rest| {
+                    rest.get("resource")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .map(|resource| CapabilityRestResource {
+                    resource_type: resource
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    interactions: resource
+                        .get("interaction")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|i| {
+                                    i.get("code")
+                                        .and_then(|c| c.as_str())
+                                        .map(|s| s.to_owned())
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    CapabilityView {
+        url: get_str("url"),
+        version: get_str("version"),
+        name: get_str("name"),
+        title: get_str("title"),
+        status: get_str("status"),
+        date: get_str("date"),
+        resources,
+    }
+}
+
+fn parse_terminology_capabilities_view(body: &Value) -> TerminologyCapabilitiesView {
+    let get_str = |key: &str| -> String {
+        body.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let code_systems = body
+        .get("codeSystem")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|entry| {
+                    let uri = entry
+                        .get("uri")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    // FHIR spec shape: `version` is an array of
+                    // BackboneElement with a `code` scalar. Fall back to
+                    // a flat string if a server flattens it.
+                    let version = entry
+                        .get("version")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|first| first.get("code"))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| entry.get("version").and_then(|v| v.as_str()))
+                        .unwrap_or_default()
+                        .to_owned();
+                    TerminologyCodeSystemEntry { uri, version }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    TerminologyCapabilitiesView {
+        url: get_str("url"),
+        version: get_str("version"),
+        name: get_str("name"),
+        title: get_str("title"),
+        status: get_str("status"),
+        code_systems,
+    }
 }
 
 #[cfg(test)]

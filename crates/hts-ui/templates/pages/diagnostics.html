@@ -1,0 +1,64 @@
+{#-
+  Standalone Diagnostics page (design doc §7.9).
+
+  Renders a header, a 4-tab strip, and a shared `#diag-panel` region
+  containing the pre-rendered active tab. Each tab is a real `<a
+  href="/ui/hts/diagnostics?tab=X">` so the nojs contract works: the
+  server re-renders the full page with the target tab pre-selected.
+  When JS is available, the `hx-get="/ui/hts/diagnostics/panel?tab=X"`
+  attributes swap only the panel body via htmx, and `hx-push-url="true"`
+  keeps every tab deep-linkable.
+
+  Inherited guards (§7 preamble): degraded / nojs / error. The shared
+  `hts-degraded.html` banner renders above the tab strip when the
+  upstream `/health` probe fails on the initial GET.
+-#}
+{% extends "layouts/base.html" %}
+
+{% block title %}
+{{ chrome.i18n.t("hts-diagnostics-title") }} · {{ chrome.i18n.t("hts-app-title") }}
+{% endblock %}
+
+{% block content %}
+<section class="hts-diagnostics" aria-labelledby="hts-diagnostics-heading">
+  <header class="page-header">
+    <div class="page-header__row">
+      <h1 id="hts-diagnostics-heading" class="page-header__title">{{ chrome.i18n.t("hts-diagnostics-heading") }}</h1>
+      <span class="hts-diagnostics__fhir-chip" aria-label="{{ chrome.i18n.t("hts-fhir-version-heading") }}">
+        {{ chrome.i18n.t_arg("hts-diagnostics-fhir-version-chip", "version", chrome.fhir_version.to_string()) }}
+      </span>
+    </div>
+  </header>
+
+  {% if let Some(reason) = degraded_reason %}
+    {% let request_id = None::<String> %}
+    {% let since = None::<String> %}
+    {% include "partials/hts-degraded.html" %}
+  {% endif %}
+
+  <div class="hts-diagnostics__tablist" role="tablist" aria-label="{{ chrome.i18n.t("hts-diagnostics-heading") }}">
+    {% for tab in tabs %}
+      <a class="hts-diagnostics__tab{% if tab.active %} hts-diagnostics__tab--active{% endif %}"
+         role="tab"
+         id="hts-diagnostics-tab-{{ tab.slug }}"
+         aria-selected="{% if tab.active %}true{% else %}false{% endif %}"
+         aria-controls="diag-panel"
+         href="/ui/hts/diagnostics?tab={{ tab.slug }}"
+         hx-get="/ui/hts/diagnostics/panel?tab={{ tab.slug }}"
+         hx-target="#diag-panel"
+         hx-swap="innerHTML"
+         hx-push-url="true">
+        {{ chrome.i18n.t(tab.label_key) }}
+      </a>
+    {% endfor %}
+  </div>
+
+  <section id="diag-panel"
+           class="hts-diagnostics__panel"
+           role="tabpanel"
+           aria-live="polite"
+           aria-atomic="false">
+    {% include "partials/hts-diagnostics-panel.html" %}
+  </section>
+</section>
+{% endblock %}

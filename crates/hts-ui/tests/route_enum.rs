@@ -183,6 +183,39 @@ const ROUTES: &[Route] = &[
         path: "/ui/hts/operations/input?op=batch-validate&resource=ValueSet",
         expect: "hts-workbench-input",
     },
+    // Slice F: standalone Import page. The shell renders a real
+    // `<form>` (nojs contract) with a paste-mode textarea; the H1
+    // string is the stable marker across states (loaded / degraded).
+    // No `/ui/hts/import/*` subroutes: F ships one route pair (GET +
+    // POST) on the same path, so this single entry covers the shell
+    // walk; the POST arm is exercised by `tests/import.rs`.
+    Route {
+        path: "/ui/hts/import",
+        // Fluent en value for `hts-import-heading` is "Import terminology".
+        expect: ">Import terminology<",
+    },
+    // Slice G: standalone Diagnostics page. Two entries — the shell
+    // and the panel fragment. The shell renders the 4-tab strip
+    // (Capability, TerminologyCap, /health, /metrics); the panel
+    // route is the htmx `hx-get` target for the tab swap. The panel
+    // marker is a class the shared panel partial always emits (the
+    // capability tab is the default when `?tab=` is absent).
+    // Per-tab HTTP failure paths are covered in `tests/diagnostics.rs`.
+    Route {
+        path: "/ui/hts/diagnostics",
+        // Fluent en value for `hts-diagnostics-heading` is "Diagnostics".
+        // The `>Diagnostics<` marker is on both the H1 and the sidebar
+        // nav item, so it survives any state (loaded / degraded).
+        expect: ">Diagnostics<",
+    },
+    Route {
+        path: "/ui/hts/diagnostics/panel",
+        // Outer wrapper class emitted unconditionally by the shared
+        // panel partial. Stable across all four tabs *and* the
+        // per-tab OperationOutcome arm (§7.9 per-tab isolation),
+        // so the marker survives a closed-loopback upstream too.
+        expect: "hts-diagnostics-panel-body",
+    },
 ];
 
 /// Locales the fixture matrix walks. Matches the switcher order in

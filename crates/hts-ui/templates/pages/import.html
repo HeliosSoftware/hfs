@@ -1,0 +1,44 @@
+{#-
+  Standalone Import page (design doc §7.7).
+
+  Two regions:
+    - Upload form (`partials/hts-import-form.html`) — Bundle paste + file
+      radio, with a real <form> that works without JavaScript.
+    - Status region — empty on initial GET, filled by the POST response
+      via htmx (`hx-target="#hts-import-status"`) or inline on hard-nav
+      re-render (design doc §7.10 row 7.7 nojs contract).
+
+  Inherited guards (§7 preamble): degraded / nojs / error. When the
+  upstream `/health` probe fails on GET, the shared `hts-degraded.html`
+  banner renders above the form and the submit button is disabled.
+-#}
+{% extends "layouts/base.html" %}
+
+{% block title %}
+{{ chrome.i18n.t("hts-import-title") }} · {{ chrome.i18n.t("hts-app-title") }}
+{% endblock %}
+
+{% block content %}
+<section class="hts-import" aria-labelledby="hts-import-heading">
+  <header class="page-header">
+    <h1 id="hts-import-heading" class="page-header__title">{{ chrome.i18n.t("hts-import-heading") }}</h1>
+    <p class="page-header__subtitle">{{ chrome.i18n.t("hts-import-help") }}</p>
+  </header>
+
+  {% if let Some(reason) = degraded_reason %}
+    {% let request_id = None::<String> %}
+    {% let since = None::<String> %}
+    {% include "partials/hts-degraded.html" %}
+  {% endif %}
+
+  {% include "partials/hts-import-form.html" %}
+
+  <div id="hts-import-status" class="hts-import__status" aria-live="polite" aria-atomic="true">
+    {% if let Some(view) = status %}
+      {% include "partials/hts-import-status.html" %}
+    {% else %}
+      <p class="visually-hidden">{{ chrome.i18n.t("hts-import-status-empty") }}</p>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

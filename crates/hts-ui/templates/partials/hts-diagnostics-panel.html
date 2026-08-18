@@ -1,0 +1,133 @@
+{#-
+  Shared tabpanel body for the Diagnostics page (design doc §7.9).
+
+  Dispatches on the four `is_*` flags precomputed in `PanelView` — same
+  idiom as Slice E1's `OpsFlags` and Slice F's `StatusView`, so the
+  template never needs to import a Rust enum.
+
+  On upstream failure the shared `hts-outcome.html` partial renders
+  *inside* this panel — per-tab isolation contract from §7.9: the tab
+  strip in the parent shell stays intact so the operator can pivot to a
+  different diagnostic surface.
+
+  The outermost `<div class="hts-diagnostics-panel-body">` wrapper
+  always renders (across all four tabs *and* the outcome arm), so the
+  merged route-enum matrix walker in `tests/route_enum.rs` can key its
+  fragment-response oracle on the class name and never care about
+  which tab was resolved.
+-#}
+<div class="hts-diagnostics-panel-body">
+{% if let Some(outcome) = panel.outcome %}
+  {% include "partials/hts-outcome.html" %}
+{% else if panel.is_capability %}
+  <article class="hts-diagnostics-tab hts-diagnostics-tab--capability" aria-labelledby="hts-diagnostics-capability-heading">
+    <h2 id="hts-diagnostics-capability-heading" class="hts-diagnostics-tab__heading">{{ chrome.i18n.t("hts-diagnostics-capability-heading") }}</h2>
+    {% if let Some(cap) = panel.capability %}
+      <dl class="hts-diagnostics-facts">
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-url") }}</dt>
+        <dd>{% if !cap.url.is_empty() %}<code>{{ cap.url }}</code>{% else %}&mdash;{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-version") }}</dt>
+        <dd>{% if !cap.version.is_empty() %}{{ cap.version }}{% else %}&mdash;{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-name") }}</dt>
+        <dd>{% if !cap.name.is_empty() %}{{ cap.name }}{% else %}&mdash;{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-title") }}</dt>
+        <dd>{% if !cap.title.is_empty() %}{{ cap.title }}{% else %}&mdash;{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-status") }}</dt>
+        <dd>{% if !cap.status.is_empty() %}{{ cap.status }}{% else %}&mdash;{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-date") }}</dt>
+        <dd>{% if !cap.date.is_empty() %}{{ cap.date }}{% else %}&mdash;{% endif %}</dd>
+      </dl>
+      {% if !cap.resources.is_empty() %}
+        <h3 class="hts-diagnostics-tab__subheading">{{ chrome.i18n.t("hts-diagnostics-capability-rest-heading") }}</h3>
+        <table class="hts-diagnostics-resources">
+          <thead>
+            <tr>
+              <th scope="col">{{ chrome.i18n.t("hts-diagnostics-property-name") }}</th>
+              <th scope="col">{{ chrome.i18n.t("hts-diagnostics-capability-rest-heading") }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in cap.resources %}
+              <tr>
+                <th scope="row">{{ r.resource_type }}</th>
+                <td>
+                  {% if !r.interactions.is_empty() %}
+                    {% for verb in r.interactions %}<code>{{ verb }}</code>{% if !loop.last %} {% endif %}{% endfor %}
+                  {% else %}&mdash;{% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% endif %}
+    {% endif %}
+  </article>
+{% else if panel.is_terminology_capabilities %}
+  <article class="hts-diagnostics-tab hts-diagnostics-tab--terminology" aria-labelledby="hts-diagnostics-terminology-capabilities-heading">
+    <h2 id="hts-diagnostics-terminology-capabilities-heading" class="hts-diagnostics-tab__heading">{{ chrome.i18n.t("hts-diagnostics-terminology-capabilities-heading") }}</h2>
+    {% if let Some(tc) = panel.terminology %}
+      <dl class="hts-diagnostics-facts">
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-url") }}</dt>
+        <dd>{% if !tc.url.is_empty() %}<code>{{ tc.url }}</code>{% else %}&mdash;{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-version") }}</dt>
+        <dd>{% if !tc.version.is_empty() %}{{ tc.version }}{% else %}&mdash;{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-name") }}</dt>
+        <dd>{% if !tc.name.is_empty() %}{{ tc.name }}{% else %}&mdash;{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-title") }}</dt>
+        <dd>{% if !tc.title.is_empty() %}{{ tc.title }}{% else %}&mdash;{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-status") }}</dt>
+        <dd>{% if !tc.status.is_empty() %}{{ tc.status }}{% else %}&mdash;{% endif %}</dd>
+      </dl>
+      <h3 class="hts-diagnostics-tab__subheading">{{ chrome.i18n.t("hts-diagnostics-terminology-code-systems-heading") }}</h3>
+      {% if !tc.code_systems.is_empty() %}
+        <ul class="hts-diagnostics-code-systems">
+          {% for cs in tc.code_systems %}
+            <li>
+              <code>{{ cs.uri }}</code>
+              {% if !cs.version.is_empty() %}<span class="hts-diagnostics-code-systems__version">(v{{ cs.version }})</span>{% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="hts-diagnostics-tab__empty">{{ chrome.i18n.t("hts-diagnostics-terminology-code-systems-empty") }}</p>
+      {% endif %}
+    {% endif %}
+  </article>
+{% else if panel.is_health %}
+  <article class="hts-diagnostics-tab hts-diagnostics-tab--health" aria-labelledby="hts-diagnostics-health-heading">
+    <h2 id="hts-diagnostics-health-heading" class="hts-diagnostics-tab__heading">{{ chrome.i18n.t("hts-diagnostics-health-heading") }}</h2>
+    {% if let Some(h) = panel.health %}
+      <dl class="hts-diagnostics-facts">
+        <dt>{{ chrome.i18n.t("hts-diagnostics-health-status-label") }}</dt>
+        <dd>{% if !h.status.is_empty() %}{{ h.status }}{% else %}{{ chrome.i18n.t("hts-diagnostics-health-unknown") }}{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-name") }}</dt>
+        <dd>{% if !h.service.is_empty() %}{{ h.service }}{% else %}&mdash;{% endif %}</dd>
+        <dt>{{ chrome.i18n.t("hts-diagnostics-property-version") }}</dt>
+        <dd>{% if !h.version.is_empty() %}{{ h.version }}{% else %}&mdash;{% endif %}</dd>
+        <dt>backend</dt>
+        <dd>{% if !h.backend.is_empty() %}<code>{{ h.backend }}</code>{% else %}&mdash;{% endif %}</dd>
+        <dt>uptime</dt>
+        <dd>{{ h.uptime_pretty() }}</dd>
+      </dl>
+    {% endif %}
+  </article>
+{% else if panel.is_metrics %}
+  <article class="hts-diagnostics-tab hts-diagnostics-tab--metrics" aria-labelledby="hts-diagnostics-metrics-heading">
+    <h2 id="hts-diagnostics-metrics-heading" class="hts-diagnostics-tab__heading">{{ chrome.i18n.t("hts-diagnostics-metrics-heading") }}</h2>
+    {% if let Some(text) = panel.metrics %}
+      {% if !text.is_empty() %}
+        <figure class="hts-diagnostics-metrics"
+                role="region"
+                aria-labelledby="hts-diagnostics-metrics-figcaption">
+          <figcaption id="hts-diagnostics-metrics-figcaption" class="hts-diagnostics-metrics__caption">
+            {{ chrome.i18n.t("hts-diagnostics-metrics-figcaption") }}
+          </figcaption>
+          <pre class="hts-diagnostics-metrics__body"><code>{{ text }}</code></pre>
+        </figure>
+      {% else %}
+        <p class="hts-diagnostics-tab__empty">{{ chrome.i18n.t("hts-diagnostics-metrics-empty") }}</p>
+      {% endif %}
+    {% endif %}
+  </article>
+{% endif %}
+</div>
