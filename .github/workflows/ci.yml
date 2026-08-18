@@ -618,6 +618,18 @@ jobs:
         # upstream, and rust_decimal still declares optional `rkyv ^0.7.46`
         # as of 1.42.1 (its 0.8 dependency is dev-only). Remove this once
         # rust_decimal moves its optional rkyv to 0.8.
+        #
+        # h2 0.3.27 (RUSTSEC-2026-0258, unbounded buffering of empty DATA
+        # frames -> memory-exhaustion DoS). Our own HTTP/2 stack (axum/hyper
+        # 1.x) is on the patched h2 0.4.16; the only copy left on the 0.3 line
+        # is the legacy hyper 0.14 one reached via aws-smithy-http-client
+        # 1.1.10, and that line is unsupported upstream -- the advisory's fix
+        # lands in >= 0.4.16 only, so no 0.3.x upgrade exists. Same reasoning
+        # as the rustls-webpki entries above: that copy is only linked under
+        # `--all-features`, and it is a *client* talking to AWS endpoints, so
+        # reaching the bug would require AWS itself to send the hostile frame
+        # stream. Remove this once the AWS SDK drops its hyper 0.14 fallback
+        # client.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0098
@@ -626,6 +638,7 @@ jobs:
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
           --ignore RUSTSEC-2026-0235
+          --ignore RUSTSEC-2026-0258
  
   coverage:
     name: Code Coverage
