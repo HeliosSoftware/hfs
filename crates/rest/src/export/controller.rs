@@ -53,7 +53,7 @@ pub struct NamedSqlQuery {
 /// Execution caps for SQL query export work. Mirrors the `$sqlquery-run`
 /// server configuration so exports and synchronous runs enforce the same
 /// resource limits.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SqlExportLimits {
     /// Maximum rows materialized per depends-on ViewDefinition.
     pub max_source_rows_per_vd: usize,
@@ -63,27 +63,44 @@ pub struct SqlExportLimits {
     pub timeout_secs: u64,
 }
 
-/// The work an export job performs — one variant per kick-off operation.
-#[derive(Debug, Clone)]
-pub enum ExportWork {
-    /// `$viewdefinition-export`: run each named ViewDefinition. Spec is
-    /// `1..*`; running produces one or more output entries per view in the
-    /// manifest.
-    Views(Vec<NamedView>),
-    /// `$sqlquery-export`: materialize each query's table sources and run
-    /// its SQL. One or more output entries per query in the manifest.
-    SqlQueries {
-        /// The set of (named) queries to run. Spec is `1..*`.
-        queries: Vec<NamedSqlQuery>,
-        /// Execution caps shared by every query in the job.
-        limits: SqlExportLimits,
-    },
+/// The work an export job performs.
+///
+/// `$sql-export` takes a repeating `subject` parameter carrying "any mixture of
+/// ViewDefinitions, SQLQuery Libraries and SQLView Libraries", so one job holds
+/// both kinds rather than one kind per job. That mixture is the point of the
+/// operation: every subject is computed against a single snapshot of the data,
+/// so a view output and a query output can be joined on a shared key without a
+/// skew window — which two separate jobs, seeing the data at two different
+/// moments, cannot offer.
+#[derive(Debug, Clone, Default)]
+pub struct ExportWork {
+    /// ViewDefinition subjects. Each produces one output entry in the manifest.
+    pub views: Vec<NamedView>,
+    /// SQLQuery / SQLView Library subjects. Each produces one output entry.
+    pub queries: Vec<NamedSqlQuery>,
+    /// Execution caps shared by every query in the job. Ignored when
+    /// [`queries`](Self::queries) is empty.
+    pub limits: SqlExportLimits,
+}
+
+impl ExportWork {
+    /// Total number of subjects, which is also the number of `output` entries
+    /// the manifest will carry.
+    pub fn subject_count(&self) -> usize {
+        self.views.len() + self.queries.len()
+    }
+
+    /// Whether the job names no subjects at all. `subject` is `1..*`, so a
+    /// request that produces this is rejected with `400 Bad Request`.
+    pub fn is_empty(&self) -> bool {
+        self.subject_count() == 0
+    }
 }
 
 /// Input task for a new export job.
 #[derive(Debug, Clone)]
 pub struct ExportTask {
-    /// The work to perform (views or SQL queries).
+    /// The subjects to compute, in any mixture of views and queries.
     pub work: ExportWork,
     /// Tenant that owns this export.
     pub tenant: TenantContext,

@@ -24,8 +24,8 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::controller::{
-    CompletedFile, ExportError, ExportJobController, ExportTask, ExportWork, JobId, JobStatus,
-    NamedSqlQuery, NamedView, SqlExportLimits,
+    CompletedFile, ExportError, ExportJobController, ExportTask, JobId, JobStatus, NamedSqlQuery,
+    NamedView, SqlExportLimits,
 };
 use super::planner;
 use super::sink::ExportSink;
@@ -169,35 +169,47 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             // Acquire concurrency permit (blocks if too many jobs running)
             let _permit = semaphore.acquire().await;
 
-            let outcome = match &task.work {
-                ExportWork::Views(views) => {
-                    run_views_job(
-                        &jobs,
-                        &jid,
-                        submitted_at,
-                        &runner,
-                        &sink,
-                        shard_rows,
-                        &task,
-                        views,
-                    )
-                    .await
-                }
-                ExportWork::SqlQueries { queries, limits } => {
-                    run_sqlquery_job(
-                        &jobs,
-                        &jid,
-                        submitted_at,
-                        &runner,
-                        &sink,
-                        shard_rows,
-                        &task,
-                        queries,
-                        *limits,
-                    )
-                    .await
-                }
-            };
+            // One job, one snapshot, any mixture of subjects. Views run first,
+            // then queries, and their outputs are concatenated into a single
+            // manifest. Progress counts every subject so the X-Progress
+            // percentage tracks real work across both halves.
+            let total_subjects = task.work.subject_count().max(1) as u32;
+            let outcome = async {
+                let (mut files, mut rows) = run_views_job(
+                    &jobs,
+                    &jid,
+                    submitted_at,
+                    &runner,
+                    &sink,
+                    shard_rows,
+                    &task,
+                    &task.work.views,
+                    0,
+                    total_subjects,
+                )
+                .await?;
+
+                let (query_files, query_rows) = run_sqlquery_job(
+                    &jobs,
+                    &jid,
+                    submitted_at,
+                    &runner,
+                    &sink,
+                    shard_rows,
+                    &task,
+                    &task.work.queries,
+                    task.work.limits,
+                    task.work.views.len() as u32,
+                    total_subjects,
+                    files.len(),
+                )
+                .await?;
+
+                files.extend(query_files);
+                rows += query_rows;
+                Ok::<_, String>((files, rows))
+            }
+            .await;
 
             match outcome {
                 Ok((completed_files, total_rows)) => {
@@ -417,6 +429,7 @@ fn record_progress(
 /// `$viewdefinition-export` work: run each named ViewDefinition through the
 /// `SofRunner` and shard its rows into output files.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn run_views_job<Sink: ExportSink>(
     jobs: &DashMap<String, JobStatus>,
     jid: &str,
@@ -426,18 +439,20 @@ async fn run_views_job<Sink: ExportSink>(
     shard_rows: usize,
     task: &ExportTask,
     views: &[NamedView],
+    // `progress_offset`: subjects already finished before this half started.
+    // `total_subjects`: subjects in the whole job, views and queries together.
+    progress_offset: u32,
+    total_subjects: u32,
 ) -> Result<(Vec<CompletedFile>, usize), String> {
-    let view_count = views.len().max(1) as u32;
     let format = task.format.to_lowercase();
     let ext = ext_for(&format);
 
     let mut completed_files: Vec<CompletedFile> = Vec::new();
     let mut total_rows: usize = 0;
 
-    // Spec: `view` is 1..* — run each ViewDefinition and produce its own set
-    // of output shards. `output.name` in the manifest carries the per-view
-    // name. Progress advances by `1/view_count` per view finished so the
-    // X-Progress percentage tracks real work.
+    // Each ViewDefinition subject produces its own set of output shards, and
+    // `output.name` in the manifest carries its name. Progress advances by one
+    // subject per view finished.
     for (view_idx, named) in views.iter().enumerate() {
         let stream = runner
             .run_view(&task.tenant, named.view.clone(), task.filters.clone())
@@ -486,15 +501,21 @@ async fn run_views_job<Sink: ExportSink>(
             });
         }
 
-        record_progress(jobs, jid, submitted_at, (view_idx as u32) + 1, view_count);
+        record_progress(
+            jobs,
+            jid,
+            submitted_at,
+            progress_offset + (view_idx as u32) + 1,
+            total_subjects,
+        );
     }
 
     Ok((completed_files, total_rows))
 }
 
-/// `$sqlquery-export` work: materialize each query's table sources via the
-/// `SofRunner`, execute the pre-validated SQL, and shard the result rows into
-/// output files.
+/// The SQLQuery / SQLView half of an export job: materialize each subject's
+/// table sources via the `SofRunner`, execute the pre-validated SQL, and shard
+/// the result rows into output files.
 #[allow(clippy::too_many_arguments)]
 async fn run_sqlquery_job<Sink: ExportSink>(
     jobs: &DashMap<String, JobStatus>,
@@ -506,8 +527,14 @@ async fn run_sqlquery_job<Sink: ExportSink>(
     task: &ExportTask,
     queries: &[NamedSqlQuery],
     limits: SqlExportLimits,
+    // `progress_offset`: subjects already finished before this half started.
+    // `total_subjects`: subjects in the whole job, views and queries together.
+    // `shard_offset`: shards already written by the views half, so shard
+    // filenames stay unique across the whole job.
+    progress_offset: u32,
+    total_subjects: u32,
+    shard_offset: usize,
 ) -> Result<(Vec<CompletedFile>, usize), String> {
-    let query_count = queries.len().max(1) as u32;
     let format = task.format.to_lowercase();
     let ext = ext_for(&format);
 
@@ -526,7 +553,7 @@ async fn run_sqlquery_job<Sink: ExportSink>(
             let data = format_query_rows(&result, range, &format, task.header)
                 .map_err(|e| format!("query '{}': {e}", query.name))?;
 
-            let shard_key = completed_files.len();
+            let shard_key = shard_offset + completed_files.len();
             let filename = sink
                 .write_shard(jid, shard_key, data, ext)
                 .map_err(|e| format!("query '{}': {e}", query.name))?;
@@ -539,7 +566,13 @@ async fn run_sqlquery_job<Sink: ExportSink>(
             });
         }
 
-        record_progress(jobs, jid, submitted_at, (query_idx as u32) + 1, query_count);
+        record_progress(
+            jobs,
+            jid,
+            submitted_at,
+            progress_offset + (query_idx as u32) + 1,
+            total_subjects,
+        );
     }
 
     Ok((completed_files, total_rows))
