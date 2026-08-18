@@ -252,3 +252,400 @@ test.describe("HTS Operations workbench a11y + nav (§7.6, §7.10)", () => {
     await expect(heading).toHaveText(originalHeading ?? "");
   });
 });
+
+// ─── Slice E2 additions — real invocations behind the E1 shell ──────────
+//
+// The describe blocks above cover Slice E1: the workbench shell shape,
+// the seven-op selector, closure banner + threshold panel gating,
+// resource-family tabs, and the widened per-op input surfaces. Slice
+// E2 wired the real handlers for `$closure`, VS `$validate-code`, and
+// the batch-validate fan-out, so the specs below assert the submit →
+// result behavior end-to-end against the shared hts binary.
+//
+// Fixture context (`boot.mjs`):
+//   - Spins up the `hts` binary against an empty SQLite (no bootstrap
+//     dir, no ValueSets seeded). Every upstream call the UI makes
+//     proxies back into the same-process HTS terminology server, so
+//     unknown ValueSets / closure tables surface as `OperationOutcome`
+//     or degraded partials. These specs assert on the *shape* of the
+//     response (outcome partial rendered inline, workbench-result
+//     region populated, htmx polling attributes correct) rather than
+//     on a specific happy-path body.
+//   - Uses single-worker sequential mode (`fullyParallel: false`,
+//     `workers: 1`); Slice E2's batch job store is process-global so
+//     interleaving would otherwise cause id collisions.
+//   - `page.request.post(...)` is used for pre-flight shape checks
+//     because it bypasses browser HTML5 validation on `required`
+//     fields; interactive DOM-state checks still go through
+//     `page.goto` + `fill` + `click` so we can key off role/label
+//     selectors instead of raw HTML strings.
+
+test.describe("HTS Operations $closure invocation (§7.6 E2)", () => {
+  test("submitting closure with an empty `name` renders the OperationOutcome partial inline", async ({
+    page,
+  }) => {
+    // §7.6 F6 pre-flight: `name` (closure table identifier) is
+    // required; an empty submit must NOT reach HTS and must render
+    // the shared outcome partial into #hts-workbench-result. Mirrors
+    // the invalid-input arm exercised by `tests/operations_e2.rs`.
+    const response = await page.request.post(
+      "/ui/hts/operations/closure",
+      {
+        headers: {
+          "HX-Request": "true",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data: "name=",
+      },
+    );
+    expect(response.status()).toBe(200);
+    const html = await response.text();
+    // The shared error partial re-emits the wrapping workbench id.
+    expect(html).toContain("hts-workbench-result");
+    // hts-outcome.html renders `<aside class="hts-outcome…" role=
+    // "alert">` for severity=error, which the invalid-input pre-flight
+    // always is.
+    expect(
+      html,
+      "empty-name pre-flight must render the shared hts-outcome error partial",
+    ).toMatch(/hts-outcome__code|role="alert"/);
+    // Positive: the E1 not-implemented stub is gone — closure is real
+    // in E2. Any residual "not implemented" copy would flag a regression.
+    expect(html).not.toMatch(/not[-_ ]implemented/i);
+  });
+
+  test("submitting closure with `name` + one coding row renders result content in the workbench", async ({
+    page,
+  }) => {
+    // §7.6 F7 happy path: `name` + at least one (system, code) row
+    // reaches HTS as POST /ConceptMap/$closure (the E2 verb rule test
+    // in `tests/operations_e2.rs` proves the upstream verb). Against
+    // the empty SQLite fixture the response is either an
+    // OperationOutcome, the degraded banner, or the neutral
+    // "empty graph" copy from hts-cm-closure-result.html. Any of
+    // those shapes is the wired-up dispatch; the invariant is that
+    // #hts-workbench-result is populated with a known result surface.
+    const body =
+      "name=e2e-closure&concept.system=" +
+      encodeURIComponent("http://example.org/cs") +
+      "&concept.code=abc";
+    const response = await page.request.post(
+      "/ui/hts/operations/closure",
+      {
+        headers: {
+          "HX-Request": "true",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data: body,
+      },
+    );
+    expect(response.status()).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("hts-workbench-result");
+    expect(
+      html,
+      "closure submit must render one of: edge list, empty-graph, outcome, degraded",
+    ).toMatch(
+      /Closure edges|No closure edges yet|hts-outcome__code|hts-degraded__title/,
+    );
+    expect(html).not.toMatch(/not[-_ ]implemented/i);
+  });
+
+  test("closure banner (F7) stays visible after a result render", async ({
+    page,
+  }) => {
+    // §7.6 F7 invariant: the stateless-warning banner (`role="status"`
+    // with the `hts-op-banner` class) is part of the page shell, not
+    // the swap target. A closure submit must swap only
+    // #hts-workbench-result and leave the banner in place.
+    await page.goto("/ui/hts/operations?op=closure&resource=");
+    const banner = page.locator(".hts-op-banner[role='status']");
+    await expect(banner).toBeVisible();
+    await expect(
+      page.getByText(/Closure state lives on the server/i),
+    ).toBeVisible();
+
+    await page.getByLabel(/Closure name/i).fill("e2e-banner-stays");
+    const responsePromise = page.waitForResponse(
+      (r) =>
+        r.url().includes("/ui/hts/operations/closure") &&
+        r.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: /Run/i, exact: false }).click();
+    await responsePromise;
+
+    // Give htmx a beat to apply the outerHTML swap into
+    // #hts-workbench-result before asserting the banner is still there.
+    await expect
+      .poll(
+        async () => {
+          const text = await page
+            .locator("#hts-workbench-result")
+            .innerText()
+            .catch(() => "");
+          return text.trim().length > 0 ? "populated" : "empty";
+        },
+        { timeout: 8_000 },
+      )
+      .toBe("populated");
+    await expect(
+      banner,
+      "closure banner must persist across a result swap",
+    ).toBeVisible();
+  });
+});
+
+test.describe("HTS Operations VS $validate-code widened form (§7.6 F3 E2)", () => {
+  test("free-scope input renders three source radios plus all three input surfaces", async ({
+    page,
+  }) => {
+    // §7.6 F3: the ValueSet-source selector is a `<fieldset>` with
+    // three radios (`sourceMode` ∈ canonical | instance | inline).
+    // Slice E2's current template renders all three paired input
+    // surfaces at the same time — selecting a radio only sets
+    // `sourceMode` on submit. A JS-driven show/hide of the surfaces
+    // is out of scope for E2 (flagged in the Phase 3a output doc).
+    await page.goto("/ui/hts/operations?op=validate-code&resource=ValueSet");
+    const sourceRadios = page.locator(
+      "input[type='radio'][name='sourceMode']",
+    );
+    expect(await sourceRadios.count()).toBeGreaterThanOrEqual(3);
+    // All three paired input surfaces are rendered.
+    await expect(page.locator("input[name='sourceCanonical']")).toBeVisible();
+    await expect(page.locator("input[name='sourceInstance']")).toBeVisible();
+    await expect(page.locator("textarea[name='sourceInline']")).toBeVisible();
+  });
+
+  test("each source radio can be selected and clears the other two", async ({
+    page,
+  }) => {
+    // §7.6 F3: source selection is single-choice (native radio group).
+    // Slice E2 defaults to `canonical`. Switching to `instance` /
+    // `inline` clears the previous check without extra JS.
+    await page.goto("/ui/hts/operations?op=validate-code&resource=ValueSet");
+    const canonical = page.locator(
+      "input[type='radio'][name='sourceMode'][value='canonical']",
+    );
+    const instance = page.locator(
+      "input[type='radio'][name='sourceMode'][value='instance']",
+    );
+    const inline = page.locator(
+      "input[type='radio'][name='sourceMode'][value='inline']",
+    );
+    await expect(canonical).toBeChecked();
+    await instance.check();
+    await expect(instance).toBeChecked();
+    await expect(canonical).not.toBeChecked();
+    await inline.check();
+    await expect(inline).toBeChecked();
+    await expect(instance).not.toBeChecked();
+  });
+
+  test("submitting canonical + code renders a result surface inline", async ({
+    page,
+  }) => {
+    // §7.6 F4 happy path: `sourceMode=canonical` + `code`+`system`
+    // fans out to POST /ValueSet/$validate-code (verb-rule test lives
+    // in `tests/operations_e2.rs`). Against the empty SQLite fixture
+    // the response surfaces as one of: `result=false` neutral badge,
+    // an OperationOutcome, or the degraded banner — all valid E2
+    // outputs. The invariant is that #hts-workbench-result is
+    // populated with a known result-surface class, NOT the E1
+    // not-implemented placeholder.
+    await page.goto("/ui/hts/operations?op=validate-code&resource=ValueSet");
+    await page
+      .locator("input[name='sourceCanonical']")
+      .fill("http://example.org/ValueSet/e2e");
+    await page.locator("input[name='code']").fill("abc");
+    await page.locator("input[name='system']").fill("http://example.org/cs");
+
+    const responsePromise = page.waitForResponse(
+      (r) =>
+        r.url().includes("/ui/hts/operations/validate-code") &&
+        r.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: /Run/i, exact: false }).click();
+    await responsePromise;
+
+    const surface = page
+      .locator("#hts-workbench-result")
+      .locator(".hts-op-workbench__badge, .hts-outcome, .hts-degraded")
+      .first();
+    await expect(surface).toBeVisible({ timeout: 8_000 });
+  });
+
+  test("submitting inline mode with an empty body triggers the pre-flight OperationOutcome", async ({
+    page,
+  }) => {
+    // §7.6 F3 pre-flight: `sourceMode=inline` with an empty
+    // `sourceInline` textarea is rejected server-side without
+    // burning an HTS round-trip, and the shared outcome partial
+    // renders in #hts-workbench-result.
+    //
+    // NOTE (design-vs-implementation): the parent brief asked for a
+    // spec on "invalid JSON" triggering pre-flight. Slice E2's
+    // actual pre-flight only rejects an empty inline body — non-
+    // empty invalid JSON is passed through to `serde_json::from_str`
+    // inside `UpstreamClient::vs_validate_code`, which quietly maps
+    // failures to `Value::Null` and lets HTS return its own
+    // OperationOutcome. Documented as a design-vs-implementation
+    // gap in `edson/docs/hts-ui-phase3a-operations-output.md`.
+    const response = await page.request.post(
+      "/ui/hts/operations/validate-code",
+      {
+        headers: {
+          "HX-Request": "true",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data:
+          "resource=ValueSet&sourceMode=inline&sourceInline=&mode=code&code=abc",
+      },
+    );
+    expect(response.status()).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("hts-workbench-result");
+    expect(
+      html,
+      "empty inline body must render the shared hts-outcome partial",
+    ).toMatch(/hts-outcome__code|role="alert"/);
+  });
+});
+
+test.describe("HTS Operations $batch-validate fan-out (§7.6 F1=D E2)", () => {
+  test("seed submit returns the skeleton table with per-row + progress htmx polling attributes", async ({
+    page,
+  }) => {
+    // §7.6.1 F1 = D: the seed response is the skeleton table
+    // (hts-vs-batch-table.html). Each row carries its per-row
+    // `hx-get="/ui/hts/operations/batch-validate/row/{i}?batch_id=…"`
+    // with `hx-trigger="load"`, and the sibling progress region polls
+    // `…/batch-validate/progress?batch_id=…` on `hx-trigger="load,
+    // every 1s"` until the terminal arm fires.
+    //
+    // NOTE (design-vs-implementation): the parent brief described
+    // the progress path as `/ui/hts/operations/batch-progress/<id>`;
+    // the actual E2 route is a query-string variant of
+    // `/batch-validate/progress`. Flagged in the Phase 3a output doc.
+    await page.goto(
+      "/ui/hts/operations?op=batch-validate&resource=ValueSet",
+    );
+    await page
+      .locator("input[name='target']")
+      .fill("http://example.org/ValueSet/e2e-batch");
+    const codeInputs = page.locator("input[name='row.code']");
+    const systemInputs = page.locator("input[name='row.system']");
+    // Fill two of the three template rows; the third stays blank so
+    // the server-side `collect_batch_rows` filter drops it
+    // (§7.6 F1 bullet on empty-row elision).
+    await codeInputs.nth(0).fill("a");
+    await systemInputs.nth(0).fill("http://example.org/cs");
+    await codeInputs.nth(1).fill("b");
+    await systemInputs.nth(1).fill("http://example.org/cs");
+
+    const responsePromise = page.waitForResponse(
+      (r) =>
+        r.url().includes("/ui/hts/operations/batch-validate") &&
+        r.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: /Run/i, exact: false }).click();
+    await responsePromise;
+
+    // Skeleton row 0: row polling target + aria-busy.
+    const row0 = page.locator("#hts-batch-row-0");
+    await expect(row0).toBeAttached({ timeout: 8_000 });
+    await expect(row0).toHaveAttribute(
+      "hx-get",
+      /\/ui\/hts\/operations\/batch-validate\/row\/0\?batch_id=/,
+    );
+    await expect(row0).toHaveAttribute("aria-busy", "true");
+    await expect(row0).toHaveAttribute("hx-trigger", /load/i);
+
+    // Skeleton row 1: same shape, distinct row index.
+    const row1 = page.locator("#hts-batch-row-1");
+    await expect(row1).toBeAttached();
+    await expect(row1).toHaveAttribute(
+      "hx-get",
+      /\/ui\/hts\/operations\/batch-validate\/row\/1\?batch_id=/,
+    );
+
+    // Progress region: `hx-get` targets `…/batch-validate/progress?batch_id=…`
+    // and `hx-trigger` includes the recurring `every Ns` interval.
+    // The interval is intentionally NOT hardcoded — Phase 3b may
+    // tune it under `HTS_UI_*` knobs.
+    const progress = page.locator("#hts-batch-progress");
+    await expect(progress).toBeAttached();
+    await expect(progress).toHaveAttribute(
+      "hx-get",
+      /\/ui\/hts\/operations\/batch-validate\/progress\?batch_id=/,
+    );
+    await expect(progress).toHaveAttribute(
+      "hx-trigger",
+      /every\s+\d+\s*s/i,
+    );
+
+    // TODO(phase-3b): once local polling timings are confirmed, extend
+    // this spec to assert that (a) each `#hts-batch-row-N` sheds its
+    // `aria-busy` attribute after the per-row endpoint drains, and
+    // (b) `#hts-batch-progress` reaches the terminal arm through the
+    // browser-side htmx polling loop (not just the raw `page.request`
+    // poll covered by the sibling spec below).
+  });
+
+  test("progress endpoint reaches the terminal (no `hx-trigger`) arm after fan-out drains", async ({
+    page,
+  }) => {
+    // §7.6.1 F1 = D terminal-state contract: once every row completes,
+    // hts-vs-batch-progress.html omits the `hx-trigger` polling
+    // attribute so htmx stops polling. This is the lighter
+    // "aggregated result" assertion the parent brief suggested — a
+    // full result-replacement check driven through the browser's
+    // htmx loop is deferred to Phase 3b (see the TODO in the sibling
+    // spec above). Mirrors the Rust hook
+    // `batch_progress_terminal_state_stops_polling` in
+    // `tests/operations_e2.rs`.
+    const seed = await page.request.post(
+      "/ui/hts/operations/batch-validate",
+      {
+        headers: {
+          "HX-Request": "true",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data: [
+          "resource=ValueSet",
+          `target=${encodeURIComponent("http://example.org/vs")}`,
+          "row.code=a",
+          `row.system=${encodeURIComponent("http://example.org/cs")}`,
+        ].join("&"),
+      },
+    );
+    expect(seed.status()).toBe(200);
+    const seedHtml = await seed.text();
+    const match = seedHtml.match(
+      /batch-validate\/row\/0\?batch_id=([^"& \n]+)/,
+    );
+    expect(match, "seed response must embed a batch id").not.toBeNull();
+    const batchId = match![1];
+
+    // Poll the progress endpoint through the raw request API so we
+    // don't depend on the DOM-side htmx swap loop. `expect.poll`
+    // retries with a generous deadline; Phase 3b may need to raise
+    // this on Windows CPU-loaded hosts.
+    await expect
+      .poll(
+        async () => {
+          const poll = await page.request.get(
+            `/ui/hts/operations/batch-validate/progress?batch_id=${batchId}`,
+          );
+          const body = await poll.text();
+          return body.includes("hx-trigger") ? "polling" : "done";
+        },
+        {
+          timeout: 15_000,
+          intervals: [200, 400, 800, 1_200],
+          message:
+            "batch progress must reach the terminal state within 15s (Phase 3b: raise if Windows CPU load is high)",
+        },
+      )
+      .toBe("done");
+  });
+});
