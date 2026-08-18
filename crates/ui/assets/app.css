@@ -120,11 +120,8 @@ body {
 
 @layer components {
 /* The fixed sidebar sits outside the grid flow, so the flow columns need
-   explicit placement — otherwise the pane auto-fills the rail column. */
-.pane {
-  grid-column: 2;
-}
-
+   explicit placement — otherwise the pane auto-fills the rail column. The
+   .pane rule itself lives with the top-bar section. */
 body.has-nav-panel .nav-panel {
   grid-column: 2;
 }
@@ -504,6 +501,7 @@ button.menu__option {
 /* ---------- Top bar + content pane ---------- */
 
 .pane {
+  grid-column: 2;
   display: flex;
   flex-direction: column;
   background: var(--bg-content);
@@ -923,6 +921,9 @@ button.pill {
 
 .addbox__actions {
   margin-top: 4px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
 }
 
 /* Centered-popup variant of the addbox (the Bulk Import dialogs, #527): the
@@ -1005,16 +1006,6 @@ button.pill {
 
 }
 @layer components {
-.tag {
-  display: inline-block;
-  margin-left: 8px;
-  padding: 1px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 500;
-  vertical-align: middle;
-}
-
 .tag--muted {
   background: var(--accent-soft);
   color: var(--muted);
@@ -1103,25 +1094,30 @@ button.pill {
 .history__id { width: 200px; }
 .history__slash { color: var(--muted); }
 
-/* Tabs (Instance / Type feed / System feed). */
+/* Tabs — one definition for both tab designs (history's underline feed
+   switcher and the compartment viewer's pill links); the blocks used to be
+   defined twice and render their cascade-merge, which this preserves. */
 .tabs {
   display: flex;
   gap: 4px;
   margin-bottom: 16px;
   border-bottom: 1px solid var(--surface-border);
+  padding: 8px;
 }
 
 .tab {
-  padding: 8px 14px;
+  padding: 8px 16px;
   font: inherit;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--muted);
   background: transparent;
   border: 0;
   border-bottom: 2px solid transparent;
   margin-bottom: -1px;
   cursor: pointer;
+  border-radius: 9px;
+  text-decoration: none;
 }
 
 .tab:hover { color: var(--text); }
@@ -1958,6 +1954,8 @@ button.pill {
 
 .tag {
   display: inline-flex;
+  margin-left: 8px;
+  vertical-align: middle;
   align-items: center;
   height: 20px;
   padding: 0 8px;
@@ -2257,26 +2255,8 @@ button.pill {
 .lint__item--warn .lint__sev { color: var(--warn); }
 .lint__item--info .lint__sev { color: var(--accent); }
 
-/* Compartment viewer: tabs, members, tester */
-
-.tabs {
-  display: flex;
-  gap: 4px;
-  padding: 8px;
-}
-
-.tab {
-  padding: 8px 16px;
-  border-radius: 9px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--muted);
-  text-decoration: none;
-}
-
-.tab:hover {
-  color: var(--text);
-}
+/* Compartment viewer: tabs, members, tester. The .tabs / .tab primitives are
+   defined once, with the history feed switcher. */
 
 .tab[aria-current="true"] {
   background: var(--accent-soft);
@@ -4216,11 +4196,6 @@ body.has-nav-panel {
   background: var(--accent-soft);
 }
 
-.addbox__actions {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-}
 }
 
 @layer pages {
