@@ -1594,6 +1594,8 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         distinct_types: 142,
         window,
         series,
+        export_jobs: None,
+        import_jobs_active: None,
     }
 }
 
@@ -2003,6 +2005,8 @@ mod tests {
             distinct_types: 0,
             window: DashboardWindow::default(),
             series: Vec::new(),
+            export_jobs: None,
+            import_jobs_active: None,
         };
         let (metrics, chart, legend, windows) = build_dashboard(&empty, None);
         assert!(!chart.has_data);
