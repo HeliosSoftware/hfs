@@ -66,6 +66,7 @@ Work that is currently underway or planned for the near term.
 |------|------|--------|
 | **Standards** | FHIR Validation engine | 🟡 In progress |
 | **Developer Experience** | Administrative UI — web-based management console for server configuration and monitoring | 🟡 In progress |
+| **Terminology** | [Administrative UI for HTS](crates/hts/README.md) — web-based management console for the terminology server: CodeSystem / ValueSet / ConceptMap browsing, terminology import and bootstrap sync monitoring, and operation testing | 🟡 In progress |
 | **Deployment** | Cluster support — multi-instance deployment behind a load balancer, with cluster-safe state | 🟡 In progress |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
