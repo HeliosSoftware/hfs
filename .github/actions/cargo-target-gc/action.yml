@@ -62,9 +62,21 @@ runs:
       if: runner.os != 'Windows'
       shell: bash
       run: |
-        # Deliberately NOT `set -e`. This is janitorial work running under
-        # `if: always()`; failing to reclaim space must never turn a green build
-        # red. Every command below is non-fatal and reports loudly instead.
+        # `set +e` is load-bearing, and NOT redundant with omitting `set -e`.
+        # Actions invokes `shell: bash` as
+        #   /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+        # so errexit is already on at the process level before the first line
+        # runs; simply not turning it on does not turn it off. Without this the
+        # very first probe -- `cargo sweep --version` on a runner that has not
+        # got cargo-sweep yet -- exits the script with cargo's 101 and fails the
+        # job, which is exactly the opposite of what this step is for. That is
+        # not hypothetical: it happened on the first CI run of this action.
+        #
+        # This is janitorial work running under `if: always()`. Failing to
+        # reclaim space must never turn a green build red, so every command
+        # below is non-fatal and reports loudly instead, and the script ends in
+        # an explicit `exit 0`.
+        set +e
         set -uo pipefail
 
         MAXSIZE='${{ inputs.maxsize }}'
@@ -102,3 +114,7 @@ runs:
         after="$(du -sh target 2>/dev/null | cut -f1)"
         echo "target/: ${before:-?} before, ${after:-?} after (ceiling ${MAXSIZE})."
         df -h . 2>/dev/null | tail -2 || true
+
+        # Belt and braces: the step's exit status is the last command's, and no
+        # future edit to the reporting above should be able to fail the job.
+        exit 0
