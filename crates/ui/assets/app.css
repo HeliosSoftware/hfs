@@ -11,6 +11,13 @@
  * paint; with JS disabled the page stays light, which is the design default.
  */
 
+/* Cascade layers (#543): tokens < base < components < pages. A page-layer
+   rule outranks a component rule regardless of specificity, and shared
+   component definitions can never be accidentally beaten by an earlier
+   page block. Every rule below lives in exactly one layer. */
+@layer tokens, base, components, pages;
+
+@layer base {
 /* Vendored Figtree variable font (OFL) — no runtime CDN, per crate rules. */
 @font-face {
   font-family: "Figtree";
@@ -33,7 +40,9 @@
     U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
     U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
+}
 
+@layer tokens {
 :root {
   color-scheme: light;
   /* Page + panes */
@@ -92,7 +101,9 @@
   --grid-line: rgb(255 255 255 / 12%);
   --input-bg: #1a1a1a;
 }
+}
 
+@layer base {
 * {
   box-sizing: border-box;
 }
@@ -105,7 +116,9 @@ body {
   font-size: 15px;
   line-height: 1.2;
 }
+}
 
+@layer components {
 /* The fixed sidebar sits outside the grid flow, so the flow columns need
    explicit placement — otherwise the pane auto-fills the rail column. */
 .pane {
@@ -119,7 +132,9 @@ body.has-nav-panel .nav-panel {
 body.has-nav-panel .pane {
   grid-column: 3;
 }
+}
 
+@layer base {
 svg {
   display: block;
 }
@@ -129,7 +144,9 @@ svg {
 [hidden] {
   display: none !important;
 }
+}
 
+@layer components {
 /* ---------- Sidebar ---------- */
 
 .sidebar {
@@ -637,7 +654,9 @@ button.menu__option {
   font-size: 12px;
   color: var(--muted);
 }
+}
 
+@layer pages {
 /* ---------- Chart card ---------- */
 
 .chart-card {
@@ -654,7 +673,9 @@ button.menu__option {
   display: flex;
   gap: 8px;
 }
+}
 
+@layer components {
 .pill {
   display: flex;
   align-items: center;
@@ -683,7 +704,9 @@ button.pill {
   color: inherit;
   cursor: pointer;
 }
+}
 
+@layer pages {
 .chart {
   width: 100%;
   height: auto;
@@ -788,6 +811,8 @@ button.pill {
   font-variant-numeric: tabular-nums;
 }
 
+}
+@layer components {
 /* ---------- Tenant maintenance (/ui/tenants) ---------- */
 
 .stat-grid--2 {
@@ -959,7 +984,9 @@ button.pill {
   align-items: center;
   gap: 12px;
 }
+}
 
+@layer pages {
 .tenant-id {
   display: flex;
   flex-direction: column;
@@ -976,6 +1003,8 @@ button.pill {
   color: var(--muted);
 }
 
+}
+@layer components {
 .tag {
   display: inline-block;
   margin-left: 8px;
@@ -1020,7 +1049,9 @@ button.pill {
     grid-template-columns: repeat(2, 1fr);
   }
 }
+}
 
+@layer pages {
 /* ---------------------------------------------------------------------------
    History & Versions (#236, Figma "History & Versions").
 
@@ -1205,6 +1236,8 @@ button.pill {
   border-radius: 8px;
 }
 
+}
+@layer components {
 /* ---- Saved queries (#234) ---------------------------------------------- */
 
 .page-head {
@@ -1223,7 +1256,9 @@ button.pill {
   font-size: 13px;
   color: var(--muted);
 }
+}
 
+@layer pages {
 .query-form-card {
   padding: 20px;
   margin-bottom: 24px;
@@ -1269,7 +1304,9 @@ button.pill {
 .query-builder__name input:focus {
   border-color: var(--accent);
 }
+}
 
+@layer components {
 .btn {
   display: inline-flex;
   align-items: center;
@@ -1303,7 +1340,9 @@ button.pill {
   background: var(--accent-strong);
   filter: brightness(1.08);
 }
+}
 
+@layer pages {
 .query-group {
   padding: 16px 20px;
   margin-bottom: 16px;
@@ -1458,13 +1497,17 @@ button.pill {
   color: inherit;
 }
 
+}
+@layer components {
 .menu__panel--right {
   left: auto;
   right: 0;
   width: 380px;
   max-width: 90vw;
 }
+}
 
+@layer pages {
 .recent-item {
   display: flex;
   align-items: center;
@@ -1609,6 +1652,8 @@ button.pill {
   }
 }
 
+}
+@layer components {
 /* ---- Registry viewers: shared filter layout (#237/#238) ----------------- */
 
 /* These pages want the full pane width; .content keeps its dashboard cap. */
@@ -1957,7 +2002,9 @@ button.pill {
   background: var(--danger-soft);
   color: var(--danger);
 }
+}
 
+@layer pages {
 /* Detail panel (right rail on the SearchParameter viewer) */
 
 .detail {
@@ -3337,6 +3384,8 @@ button.filter-rail__item {
   }
 }
 
+}
+@layer components {
 /* ---------------------------------------------------------------------------
    Resources workspace (#282): the nav submenu, the Create-button page head, and
    the Edit Resource modal (shadowbox).
@@ -3354,7 +3403,9 @@ button.filter-rail__item {
   background: var(--accent-soft);
   color: var(--text-strong);
 }
+}
 
+@layer pages {
 /* ---- the Edit Resource modal (shadowbox) ---- */
 
 .modal {
@@ -3486,7 +3537,9 @@ button.filter-rail__item {
   .modal__box { max-height: 96vh; }
   .modal__head { flex-wrap: wrap; }
 }
+}
 
+@layer components {
 /* ---------------------------------------------------------------------------
    Resources: the resource-type panel as part of the menu (#282, Brett's
    "Resources" frame). A secondary column flush against the sidebar — same
@@ -3592,7 +3645,9 @@ body.has-nav-panel {
   body.has-nav-panel .pane { grid-column: 2; }
   .nav-panel { display: none; }
 }
+}
 
+@layer pages {
 /* Saved / Recent group headings inside the Recent dropdown (#282). */
 .recent-group {
   margin: 8px 4px 4px;
@@ -3834,6 +3889,8 @@ body.has-nav-panel {
   white-space: nowrap;
 }
 
+}
+@layer components {
 /* Conformance CRUD (#237, #238): New in the page head, Edit/Delete in the
    detail panels. */
 .page-head__actions {
@@ -3855,6 +3912,8 @@ body.has-nav-panel {
   background: var(--danger-soft);
 }
 
+}
+@layer pages {
 /* mustSupport emphasis + human labels (#364). */
 .editor-row--must-support > .editor-row__head .editor-row__label {
   font-weight: 600;
@@ -4130,6 +4189,8 @@ body.has-nav-panel {
   margin-right: auto;
 }
 
+}
+@layer components {
 /* Addbox close affordances (#545). */
 .addbox__head {
   display: flex;
@@ -4160,7 +4221,9 @@ body.has-nav-panel {
   gap: 8px;
   justify-content: flex-end;
 }
+}
 
+@layer pages {
 /* The Recent/Saved dropdown scrolls instead of growing unbounded (#542):
    the recents are capped at ten, but every saved query renders in the same
    panel, and a long collection was pushing it off-screen. */
@@ -4197,4 +4260,5 @@ body.has-nav-panel {
 .editor-row__input:invalid {
   border-color: #C0362C;
   box-shadow: 0 0 0 3px rgb(192 54 44 / 12%);
+}
 }
