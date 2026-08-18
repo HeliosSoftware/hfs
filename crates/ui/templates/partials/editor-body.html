@@ -7,7 +7,7 @@
   it back and the server hands back a new one, so a key we never render is also
   a key we never destroy.
 -->
-<form id="editor-form" hx-post="/ui/editor/render" hx-target="#editor-body" hx-swap="innerHTML" data-error-count="{{ error_count }}">
+<form id="editor-form" hx-post="/ui/editor/render" hx-target="#editor-body" hx-swap="innerHTML" data-error-count="{{ error_count }}"{% if !focus_path.is_empty() %} data-focus="{{ focus_path }}"{% endif %}>
   <input type="hidden" name="doc" id="editor-doc" value="{{ document }}">
   <input type="hidden" name="op" id="editor-op" value="">
   <input type="hidden" name="path" id="editor-path" value="">
@@ -167,7 +167,7 @@
         {% endfor %}
 
         {% if !row.addable.is_empty() %}
-        <details class="editor-add">
+        <details class="editor-add"{% if row.path.is_empty() && auto_open_add %} open{% endif %}>
           <summary class="editor-add__toggle">+ {{ i18n.t("editor-add") }}</summary>
           <div class="editor-add__panel">
             <input type="search" class="editor-add__filter"

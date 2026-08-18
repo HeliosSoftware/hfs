@@ -901,3 +901,33 @@ async fn editor_temporal_primitives_carry_format_assistance() {
     .await;
     assert!(!html.contains(r#"placeholder="14:30:00""#));
 }
+
+/* #547: the server marks the created node so the client can focus it, and
+ * an empty document opens the root add-picker by itself. */
+
+#[tokio::test]
+async fn editor_marks_the_created_node_for_focus() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=add&path=&name=birthDate").await;
+    assert!(
+        html.contains(r#"data-focus="birthDate""#),
+        "created path marked: {}",
+        &html[..400]
+    );
+}
+
+#[tokio::test]
+async fn editor_opens_the_root_picker_on_an_empty_document() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+    assert!(
+        html.contains(r#"<details class="editor-add" open>"#),
+        "root picker auto-opens"
+    );
+
+    // With content present it stays closed.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%222024-01-01%22%7D&op=",
+    )
+    .await;
+    assert!(!html.contains(r#"<details class="editor-add" open>"#));
+}
