@@ -64,7 +64,6 @@ uuid = { version = "1", features = ["v4"] }
 jsonwebtoken = "9"
 # RFC 7638 thumbprint derivation for the bulk-submit signing key kid (#529).
 p384 = { version = "0.13", features = ["pem", "pkcs8"] }
-rsa = { version = "0.9", features = ["pem"] }
 sha2 = "0.10"
 base64 = "0.22"
 
