@@ -120,7 +120,6 @@ hmac = "0.12"                                            # A*CBC-HS* authenticat
 sha2 = "0.10"                                            # Concat KDF, A*CBC-HS*
 p256 = { version = "0.13", features = ["ecdh", "jwk", "pem", "pkcs8"] }  # ECDH-ES (P-256)
 p384 = { version = "0.13", features = ["ecdh", "jwk", "pem", "pkcs8"] }  # ECDH-ES (P-384)
-rsa = { version = "0.9", features = ["pem"] }                # RS384 public JWK derivation (#529)
 flate2 = "1"                                             # JWE `zip: "DEF"` payloads
 
 [dev-dependencies]
