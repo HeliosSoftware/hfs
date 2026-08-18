@@ -291,6 +291,15 @@ jobs:
             exit 1
           fi
 
+      # Last step, and non-fatal by construction. `clean: false` above keeps the
+      # target dir warm across runs, which is what makes this job fit in 120
+      # minutes — but cargo never evicts the artifacts a bump or a toolchain
+      # update orphans, so that cache only ever grows. The macOS runner hit its
+      # disk ceiling this way. See .github/actions/cargo-target-gc.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
   cleanup-test-containers:
     name: Cleanup Test Containers
     runs-on: [self-hosted, Linux]
@@ -430,6 +439,12 @@ jobs:
         working-directory: crates/pysof
         run: uv run python -m pytest python-tests/ -v --cov=src --cov-report=xml:coverage.xml --cov-report=term-missing
 
+      # maturin compiles pysof into the same shared workspace target dir, so
+      # this job accumulates like the Rust ones. See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
   lint:
     name: Linting
     runs-on: [self-hosted]
@@ -510,6 +525,11 @@ jobs:
         working-directory: crates/pysof
         run: |
           uv run mypy src
+
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   security:
     name: Security Audit
@@ -626,7 +646,12 @@ jobs:
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
           --ignore RUSTSEC-2026-0235
- 
+
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
   coverage:
     name: Code Coverage
     runs-on: [self-hosted, Unix] # llvm-tools-preview has problems on Windows, so restrict to Unix
@@ -728,6 +753,13 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           fail_ci_if_error: true
+
+      # The heaviest accumulator of the lot: `cargo llvm-cov` builds a whole
+      # separate instrumented profile, so every run this job's feature set
+      # changes leaves another full copy behind. See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   test-fhirpath:
     name: Test FHIRPath
@@ -1523,6 +1555,16 @@ jobs:
         with:
           name: pysof-${{ matrix.target }}
           path: crates/pysof/dist/*
+
+      # Runs after every upload above, so eviction can never race an artifact
+      # this job still has to publish. Unlike the jobs above this one checks out
+      # clean, so it does not accumulate across runs — but two of its four
+      # matrix legs (`Linux-ARM64` and `macOS`) land on the macOS runner and
+      # park a full release target dir there until the next tag. Bounding that
+      # is free: cargo-sweep does nothing when the dir is already under the cap.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   publish-pypi:
     name: Publish to PyPI

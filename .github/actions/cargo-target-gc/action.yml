@@ -1,0 +1,104 @@
+name: Cargo target dir GC
+description: >
+  Cap the size of the workspace `target/` directory on a self-hosted runner by
+  evicting least-recently-used build artifacts. Runs at the end of every job
+  that compiles Rust on a persistent runner.
+
+# Why this exists
+# ---------------
+# Nothing in cargo ever deletes a stale artifact. Every dependency bump,
+# toolchain update and feature-flag combination adds a new set of `.rlib`s,
+# `.rmeta`s and incremental fragments alongside the old ones, and the old ones
+# stay forever. On a GitHub-hosted runner that does not matter — the machine is
+# thrown away. On our self-hosted runners it compounds indefinitely, because the
+# jobs that feed `target/` check out with `clean: false` on purpose (a warm
+# target dir is what keeps `test-rust` inside its 120-minute budget). Growth is
+# the price of that cache; a ceiling is the only thing that bounds it.
+#
+# Why per-run and not a nightly cron: same reasoning as `docker-host-gc`. The
+# runner fills during the working day, and a nightly sweep cannot help a job
+# that dies out of disk at 16:03 — by the time it fires the damage is twelve
+# hours old and several runs have already gone red.
+#
+# It is a soft cap, not a hard ceiling. cargo-sweep evicts the artifacts cargo
+# manages under `deps/`, `build/`, `.fingerprint/` and `incremental/` — which is
+# precisely the part that compounds — but it does not remove the linked outputs
+# at `target/<profile>/<bin>`. Those are hardlinked to their `deps/` copy
+# (verified: link count 2), so sweeping the dep entry frees nothing while the
+# top-level name survives. That residue is a small constant per profile and is
+# overwritten by the next build; it does not accumulate. Expect the swept
+# directory to settle slightly above `maxsize`, not exactly at it.
+#
+# Scope: this caps `target/` only. `~/.cargo/registry` also grows without bound
+# (every `.crate` tarball and unpacked source ever resolved), but far more
+# slowly — it is measured in single-digit GB, not hundreds. If it ever becomes
+# the problem it needs a different tool; cargo-sweep does not touch it.
+
+inputs:
+  maxsize:
+    description: >
+      Size ceiling for `target/`. cargo-sweep evicts oldest-first until the
+      directory is under this. ALWAYS pass an explicit unit: a bare number is
+      interpreted as MEGABYTES, so `100` means 100MB and would evict essentially
+      the entire warm cache on every run.
+    required: false
+    default: 100GB
+  cargo-sweep-version:
+    description: >
+      Pinned cargo-sweep version. >=0.7.0 is required for unit suffixes on
+      `--maxsize`; >=0.8.0 for Rust 1.85+ compatibility (our MSRV is 1.90).
+    required: false
+    default: 0.8.0
+
+runs:
+  using: composite
+  steps:
+    # `runs-on: [self-hosted]` is unpinned on several ci.yml jobs, so this
+    # action can land on the Windows runner, where the plain `shell: bash` alias
+    # is unreliable (see the Git Bash 8.3-path workaround in ci.yml). The
+    # Windows runner is not the one running out of space; skip rather than
+    # invent a second code path for it.
+    - name: Cap target dir size
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        # Deliberately NOT `set -e`. This is janitorial work running under
+        # `if: always()`; failing to reclaim space must never turn a green build
+        # red. Every command below is non-fatal and reports loudly instead.
+        set -uo pipefail
+
+        MAXSIZE='${{ inputs.maxsize }}'
+        WANT='${{ inputs.cargo-sweep-version }}'
+
+        if [ ! -d target ]; then
+          echo "No target/ directory in $(pwd) — nothing to sweep."
+          exit 0
+        fi
+
+        # Guard against the footgun the flag invites. cargo-sweep's own help
+        # says "Unit defaults to MB", so `--maxsize 100` means 100 megabytes,
+        # not 100 gigabytes. Refuse a unitless value rather than silently
+        # nuking the cache the `clean: false` checkouts exist to preserve.
+        if ! printf '%s' "$MAXSIZE" | grep -qiE '^[0-9]+(\.[0-9]+)?[[:space:]]*(k|m|g|t)i?b$'; then
+          echo "::error::maxsize='${MAXSIZE}' has no unit suffix. cargo-sweep reads a bare number as MEGABYTES, which would wipe the warm build cache on every run. Use e.g. 100GB."
+          exit 0
+        fi
+
+        HAVE="$(cargo sweep --version 2>/dev/null | awk '{print $NF}')"
+        if [ "$HAVE" != "$WANT" ]; then
+          echo "cargo-sweep: have '${HAVE:-none}', want '${WANT}' — installing."
+          cargo install cargo-sweep --locked --version "$WANT" || true
+        fi
+        if ! cargo sweep --version >/dev/null 2>&1; then
+          echo "::warning::cargo-sweep unavailable (install failed?); skipping target dir GC. This runner's target/ is unbounded until a later run succeeds."
+          exit 0
+        fi
+
+        # `du` on a multi-million-file target dir is not instant, but it is the
+        # only number that makes the trend legible in the job log. Both calls
+        # are non-fatal so a transient stat error cannot break the step.
+        before="$(du -sh target 2>/dev/null | cut -f1)"
+        cargo sweep --maxsize "$MAXSIZE" || true
+        after="$(du -sh target 2>/dev/null | cut -f1)"
+        echo "target/: ${before:-?} before, ${after:-?} after (ceiling ${MAXSIZE})."
+        df -h . 2>/dev/null | tail -2 || true
