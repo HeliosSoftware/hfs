@@ -8,11 +8,11 @@
 <header class="page-head">
   <div>
     <a class="backlink" href="/ui/bulk-import">‹ {{ i18n.t("bulk-import-all") }}</a>
-    <h1 class="page-title">{{ name }}</h1>
+    <h1 class="page-head__title">{{ name }}</h1>
   </div>
 
   <details class="addbox addbox--modal">
-    <summary class="button button--primary">
+    <summary class="btn btn--primary">
       {% include "icons/plus.svg" %}
       {{ i18n.t("bulk-import-add-manifest") }}
     </summary>
@@ -46,8 +46,8 @@
           <span class="field__hint">{{ i18n.t("bulk-import-field-headers-hint") }}</span>
         </label>
         <div class="addbox__actions">
-          <button type="button" class="button" data-addbox-close>{{ i18n.t("ui-cancel") }}</button>
-          <button type="submit" class="button button--primary">
+          <button type="button" class="btn" data-addbox-close>{{ i18n.t("ui-cancel") }}</button>
+          <button type="submit" class="btn btn--primary">
             {{ i18n.t("bulk-import-add-manifest-submit") }}
           </button>
         </div>
@@ -70,13 +70,13 @@
 
   <div class="detail__actions">
     <form method="post" action="/ui/bulk-import/{{ id }}/abort">
-      <button type="submit" class="button">{{ i18n.t("bulk-import-abort") }}</button>
+      <button type="submit" class="btn">{{ i18n.t("bulk-import-abort") }}</button>
     </form>
     <form method="post" action="/ui/bulk-import/{{ id }}/complete">
-      <button type="submit" class="button">{{ i18n.t("bulk-import-complete") }}</button>
+      <button type="submit" class="btn">{{ i18n.t("bulk-import-complete") }}</button>
     </form>
     <form method="post" action="/ui/bulk-import/{{ id }}/delete">
-      <button type="submit" class="button">{{ i18n.t("bulk-import-delete") }}</button>
+      <button type="submit" class="btn">{{ i18n.t("bulk-import-delete") }}</button>
     </form>
   </div>
 </section>
@@ -93,14 +93,15 @@
     </h2>
     {% if !manifests.is_empty() %}
     <form method="post" action="/ui/bulk-import/{{ id }}/submit-all">
-      <button type="submit" class="button button--primary">
+      <button type="submit" class="btn btn--primary">
         {{ i18n.t("bulk-import-submit-all") }}
       </button>
     </form>
     {% endif %}
   </div>
 
-  <table class="table">
+  <div class="table-wrap">
+  <table class="data-table">
     <tbody>
       {% for m in manifests %}
       <tr>
@@ -108,26 +109,27 @@
         <td>{{ m.last_submitted_at }}</td>
         <td>
           <form method="post" action="/ui/bulk-import/{{ id }}/manifests/{{ m.id }}/submit">
-            <button type="submit" class="button button--primary">
+            <button type="submit" class="btn btn--primary">
               {{ i18n.t("bulk-import-submit") }}
             </button>
           </form>
         </td>
         <td>
           <form method="post" action="/ui/bulk-import/{{ id }}/manifests/{{ m.id }}/abort">
-            <button type="submit" class="button">{{ i18n.t("bulk-import-abort-manifest") }}</button>
+            <button type="submit" class="btn">{{ i18n.t("bulk-import-abort-manifest") }}</button>
           </form>
           <form method="post" action="/ui/bulk-import/{{ id }}/manifests/{{ m.id }}/delete">
-            <button type="submit" class="button">{{ i18n.t("bulk-import-remove") }}</button>
+            <button type="submit" class="btn">{{ i18n.t("bulk-import-remove") }}</button>
           </form>
         </td>
       </tr>
       {% endfor %}
       {% if manifests.is_empty() %}
-      <tr><td colspan="4">{{ i18n.t("bulk-import-no-manifests") }}</td></tr>
+      <tr class="data-table__empty"><td colspan="4">{{ i18n.t("bulk-import-no-manifests") }}</td></tr>
       {% endif %}
     </tbody>
   </table>
+  </div>
 </section>
 
 <section class="card table-card">
