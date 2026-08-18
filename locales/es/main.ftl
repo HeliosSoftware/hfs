@@ -135,6 +135,9 @@ card-stored-resources = Recursos almacenados
 card-stored-resources-sub = en el tenant activo
 card-export-jobs = Trabajos de exportación
 card-export-jobs-sub = en ejecución ({ $queued } en cola)
+card-import-jobs = Trabajos de importación
+card-import-jobs-sub = activos
+card-jobs-unavailable = no disponible
 card-uptime = Disponibilidad
 card-uptime-sub = últimos 30 días
 

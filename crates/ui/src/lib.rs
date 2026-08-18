@@ -62,7 +62,7 @@ use axum_embed::ServeEmbed;
 use axum_htmx::{AutoVaryLayer, HxRequest};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
-    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow,
+    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts,
 };
 use helios_persistence::core::{ResourceStorage, SettingsStore};
 use i18n::{I18n, RequestLocale};
@@ -322,18 +322,20 @@ impl Status {
 /// Dashboard headline metrics rendered by `pages/index.html` (design: Figma
 /// "Dashboard V1.1").
 ///
-/// `resource_types`, `stored_resources`, `fhir_version`, and `chart_total` are
-/// derived from the live [`DashboardSnapshot`] (default tenant). `export_jobs`,
-/// `export_jobs_queued`, and `uptime_percent` describe other subsystems (bulk
-/// export job state; availability history) that are not part of the
-/// resource-count read path and remain placeholder values until those read paths
-/// land.
+/// `resource_types`, `stored_resources`, `fhir_version`, `export_jobs`,
+/// `import_jobs`, and `chart_total` are derived from the live
+/// [`DashboardSnapshot`] (default tenant). `uptime_percent` describes
+/// availability history, which is not part of that read path and remains a
+/// placeholder value until #540 wires it to a real source.
 struct DashboardMetrics {
     fhir_version: String,
     resource_types: String,
     stored_resources: String,
-    export_jobs: String,
-    export_jobs_queued: u32,
+    /// Bulk-export jobs for the tenant; `None` renders the unavailable state.
+    export_jobs: Option<ExportJobCounts>,
+    /// Active bulk-submit (import) jobs for the tenant; `None` renders the
+    /// unavailable state.
+    import_jobs: Option<u64>,
     uptime_percent: String,
     chart_total: String,
 }
@@ -1368,10 +1370,9 @@ fn build_dashboard(
         fhir_version: snapshot.fhir_version.clone(),
         resource_types: snapshot.distinct_types.to_string(),
         stored_resources: compact_count(snapshot.total_resources),
-        // Not part of the resource-count read path — placeholder until the bulk
-        // export job-state and availability read paths are wired.
-        export_jobs: "13".to_string(),
-        export_jobs_queued: 1,
+        export_jobs: snapshot.export_jobs,
+        import_jobs: snapshot.import_jobs_active,
+        // Uptime is still a placeholder until #540 wires it to a real source.
         uptime_percent: "99.98".to_string(),
         chart_total: selected_series
             .map(|s| grouped(s.total))
