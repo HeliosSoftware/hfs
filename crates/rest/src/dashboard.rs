@@ -610,7 +610,7 @@ mod tests {
         };
 
         let provider = StorageDashboardProvider::new(Arc::new(backend), &config);
-        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
+        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
 
         assert_eq!(snapshot.export_jobs, None);
         assert_eq!(snapshot.import_jobs_active, None);
@@ -633,7 +633,7 @@ mod tests {
         let submit_jobs = Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>;
         let provider = StorageDashboardProvider::new(Arc::clone(&backend), &config)
             .with_job_stores(Some(export_jobs), Some(submit_jobs));
-        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
+        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
 
         assert_eq!(
             snapshot.export_jobs,
@@ -695,7 +695,7 @@ mod tests {
         let submit_jobs = Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>;
         let provider = StorageDashboardProvider::new(Arc::clone(&backend), &config)
             .with_job_stores(Some(export_jobs), Some(submit_jobs));
-        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
+        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
 
         assert_eq!(
             snapshot.export_jobs,

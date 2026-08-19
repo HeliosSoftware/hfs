@@ -4492,7 +4492,7 @@ body.has-nav-panel {
 
 @layer pages {
 /* Bulk Export (#537): the resource-type checkbox grid. Its job-status chips
-   are .tag variants — one status-pill vocabulary, not a second .chip. */
+   are .tag variants — one status-pill vocabulary, not a second chip family. */
 .typegrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
