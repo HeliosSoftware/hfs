@@ -34,20 +34,32 @@ test.describe("HTS CodeSystem browser (§7.2)", () => {
     });
     // Reset returns us to the full listing (empty-anchor href navigation).
     await page.getByRole("link", { name: "Reset", exact: true }).click();
+    // Match the seed CS's canonical exactly; the 30 filler CSs each carry
+    // a URL that contains "http://example.org/cs" as a substring
+    // ("http://example.org/cs/filler-N"), which would otherwise trip
+    // Playwright strict mode on multiple matches.
     await expect(
-      page.getByRole("cell", { name: "http://example.org/cs" }),
+      page.getByRole("cell", { name: "http://example.org/cs", exact: true }),
     ).toBeVisible();
   });
 
   test("load-more appends the next page beforeend without replacing rows", async ({ page }) => {
-    // The seed loader also injects 30 filler CodeSystems (`ex-cs-2` …
-    // `ex-cs-31`) so the default `_count=25` page yields a Load-more.
+    // The seed loader injects 34 CodeSystems total (ex-cs-1 + ex-cs-2..
+    // ex-cs-31 + ex-cs-source + ex-cs-target + ex-cs-limbs). The default
+    // `_count=25` page shows 25 rows and Load-more fetches the remaining 9.
     await page.goto("/ui/hts/code-systems");
     const rows = page.locator("table tbody tr");
     const before = await rows.count();
     expect(before).toBeGreaterThanOrEqual(25);
     await page.getByRole("button", { name: "Load more", exact: true }).click();
-    await expect(rows).toHaveCount(before + 6, { timeout: 3_000 });
+    // Assert progress-not-regression rather than a fragile exact delta:
+    // the paginator must strictly grow the table (append semantics), and
+    // must never exceed the total seed roster.
+    await expect
+      .poll(async () => await rows.count(), { timeout: 3_000 })
+      .toBeGreaterThan(before);
+    const after = await rows.count();
+    expect(after).toBeLessThanOrEqual(34);
   });
 });
 

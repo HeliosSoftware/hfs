@@ -50,6 +50,10 @@ const child = spawn(bin, [], {
     HTS_DATABASE_URL: db,
     HTS_LOG_LEVEL: "warn",
     HTS_UI_ENABLED: "true",
+    // A tiny expansion ceiling so the value-sets spec's too-costly test
+    // (ex-vs-too-costly seeded in seed.mjs) reliably trips HTS's guard
+    // and returns 422 with a `too-costly` OperationOutcome.
+    HTS_MAX_EXPANSION_SIZE: "5",
   },
 });
 console.log(`[boot.mjs] child pid=${child.pid}`);

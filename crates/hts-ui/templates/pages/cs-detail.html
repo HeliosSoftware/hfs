@@ -159,6 +159,14 @@
       {% match tab %}
         {% when CsTab::Metadata %}
           <p class="hts-cs-detail__workbench-hint">{{ chrome.i18n.t("hts-cs-detail-workbench-hint") }}</p>
+          {#-
+            Empty swap target so the operation tabs (Lookup/Validate/Subsumes)
+            can hx-swap="outerHTML" into `#hts-workbench-input` from the
+            Metadata landing. Without this placeholder htmx's target lookup
+            fails silently and the workbench never renders on first click
+            (see Playwright group C tab-click failures).
+          -#}
+          <div id="hts-workbench-input" hidden></div>
         {% when CsTab::Lookup %}
           {% let summary = Some(summary.clone()) %}
           {% include "partials/hts-cs-lookup-input.html" %}

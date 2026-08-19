@@ -170,8 +170,13 @@ pub struct UpstreamHealth {
     pub version: String,
     #[serde(default)]
     pub backend: String,
+    /// HTS emits a fractional second count from
+    /// `helios_observability::uptime` (see `crates/hts/src/operations/health.rs`).
+    /// Serde would reject any float here if this were `u64`, so a
+    /// couple-seconds-old server (uptime 0.2 s) would fail decode and the
+    /// Import/Diagnostics surfaces would incorrectly render as degraded.
     #[serde(default)]
-    pub uptime_seconds: u64,
+    pub uptime_seconds: f64,
 }
 
 /// Parsed shape of the `TerminologyCapabilities` fields the dashboard reads.
@@ -289,7 +294,7 @@ impl UpstreamHealth {
     /// as a placeable in the Fluent catalog rather than composed as prose in
     /// the template, so translations control their own formatting.
     pub fn uptime_pretty(&self) -> String {
-        let mut secs = self.uptime_seconds;
+        let mut secs = self.uptime_seconds.floor().max(0.0) as u64;
         let days = secs / 86_400;
         secs %= 86_400;
         let hours = secs / 3_600;
@@ -3850,14 +3855,18 @@ mod tests {
 
     #[test]
     fn uptime_pretty_shapes_units_from_seconds() {
-        let cases = [
-            (0, "0m"),
-            (59, "0m"),
-            (60, "1m"),
-            (3_599, "59m"),
-            (3_660, "1h 1m"),
-            (86_400, "1d 0h 0m"),
-            (90_061, "1d 1h 1m"),
+        let cases: [(f64, &str); 8] = [
+            (0.0, "0m"),
+            // Real HTS emits fractional seconds while the process warms up;
+            // uptime_pretty must not round these up to "1m" so the
+            // dashboard tile stays honest during boot.
+            (0.218_212, "0m"),
+            (59.9, "0m"),
+            (60.0, "1m"),
+            (3_599.0, "59m"),
+            (3_660.0, "1h 1m"),
+            (86_400.0, "1d 0h 0m"),
+            (90_061.0, "1d 1h 1m"),
         ];
         for (secs, expected) in cases {
             let h = UpstreamHealth {
@@ -3866,6 +3875,20 @@ mod tests {
             };
             assert_eq!(h.uptime_pretty(), expected, "for {secs}s");
         }
+    }
+
+    #[test]
+    fn health_deserializes_fractional_uptime_seconds() {
+        // Real HTS `/health` body sampled seconds after boot. The previous
+        // `u64` shape rejected this with a JSON decode error, which set
+        // `degraded_reason` on the Import + Diagnostics pages and left the
+        // submit button `disabled` (`playwright-group-a2.log` evidence).
+        let body = r#"{"status":"ok","backend":"sqlite","uptime_seconds":0.218212}"#;
+        let h: UpstreamHealth = serde_json::from_str(body).expect("real HTS /health shape");
+        assert_eq!(h.status, "ok");
+        assert_eq!(h.backend, "sqlite");
+        assert!((h.uptime_seconds - 0.218_212).abs() < 1e-9);
+        assert_eq!(h.uptime_pretty(), "0m");
     }
 
     #[test]
@@ -3968,7 +3991,7 @@ impl Default for UpstreamHealth {
             service: String::new(),
             version: String::new(),
             backend: String::new(),
-            uptime_seconds: 0,
+            uptime_seconds: 0.0,
         }
     }
 }

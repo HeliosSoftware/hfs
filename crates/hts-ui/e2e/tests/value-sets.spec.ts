@@ -133,6 +133,14 @@ test.describe("HTS ValueSet detail + $expand workbench (Â§7.4)", () => {
     page,
   }) => {
     await page.goto("/ui/hts/value-sets/ex-vs-too-costly/expand");
+    // HTS only enforces `HTS_MAX_EXPANSION_SIZE` when the request omits
+    // `count` (see crates/hts/src/backends/sqlite/value_set.rs — the
+    // too-costly gate is guarded by `if req.count.is_none()`). The
+    // workbench Advanced panel defaults `count=50`, so unless we clear
+    // it the request would resolve to a bounded page and never trip the
+    // banner. Emptying the input mirrors the "expand everything" intent
+    // the too-costly banner is designed to gate.
+    await page.locator('input[name="count"]').fill("");
     await page.getByRole("button", { name: "Run", exact: true }).click();
     const result = page.locator("#hts-workbench-result");
     await expect(

@@ -141,6 +141,11 @@
       {% match tab %}
         {% when CmTab::Metadata %}
           <p class="hts-cm-detail__workbench-hint">{{ chrome.i18n.t("hts-cm-detail-workbench-hint") }}</p>
+          {#-
+            Empty swap target so the Translate tab can hx-swap="outerHTML"
+            into `#hts-workbench-input` from the Metadata landing.
+          -#}
+          <div id="hts-workbench-input" hidden></div>
         {% when CmTab::Translate %}
           {% let summary = Some(summary.clone()) %}
           {% let direction = self.effective_direction() %}

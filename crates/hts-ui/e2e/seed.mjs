@@ -150,6 +150,25 @@ function buildSeedBundle() {
     },
   });
 
+  // -- ex-vs-too-costly: reuses ex-cs-limbs (60 concepts). Combined with
+  //    HTS_MAX_EXPANSION_SIZE=5 in boot.mjs, its default `$expand` blows
+  //    past the ceiling and HTS answers 422 with a `too-costly`
+  //    OperationOutcome, so the workbench renders the banner + Raise form
+  //    the value-sets spec asserts on.
+  entries.push({
+    resource: {
+      resourceType: "ValueSet",
+      id: "ex-vs-too-costly",
+      url: "http://example.org/vs/too-costly",
+      version: "1.0.0",
+      name: "ExampleTooCostlyVS",
+      status: "active",
+      compose: {
+        include: [{ system: "http://example.org/cs/limbs" }],
+      },
+    },
+  });
+
   // -- Supporting VSs referenced by the ConceptMap source/target.
   entries.push({
     resource: {

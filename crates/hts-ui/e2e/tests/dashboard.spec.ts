@@ -37,7 +37,7 @@ test.describe("HTS dashboard (Phase 2 Slice A)", () => {
       "Import",
       "Diagnostics",
     ]) {
-      await expect(page.getByRole("navigation").getByText(label, { exact: false })).toBeVisible();
+      await expect(page.locator("#sidebar nav").getByText(label, { exact: false })).toBeVisible();
     }
   });
 
