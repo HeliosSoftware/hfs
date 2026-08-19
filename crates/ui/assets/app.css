@@ -3379,6 +3379,7 @@ button.filter-rail__item {
   width: 100%;
   height: 100%;
   margin: 0;
+  pointer-events: none;
   padding: 12px;
   box-sizing: border-box;
   overflow: hidden;
