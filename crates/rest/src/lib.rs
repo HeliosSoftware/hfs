@@ -589,11 +589,16 @@ where
     let storage_arc = storage;
 
     // Register the process-global dashboard data provider so the web UI can
-    // render real per-type resource counts (default tenant) without depending on
-    // the persistence layer. Storage-agnostic consumers read it via
-    // `helios_observability::dashboard::snapshot()`.
+    // render real per-type resource counts (default tenant), plus bulk-export
+    // and bulk-submit job counts when those subsystems are wired, without
+    // depending on the persistence layer. Storage-agnostic consumers read it
+    // via `helios_observability::dashboard::snapshot()`.
     helios_observability::dashboard::set_provider(Arc::new(
-        dashboard::StorageDashboardProvider::new(Arc::clone(&storage_arc), &config),
+        dashboard::StorageDashboardProvider::new(Arc::clone(&storage_arc), &config)
+            .with_job_stores(
+                bulk_export.as_ref().map(|b| Arc::clone(&b.jobs)),
+                bulk_submit.as_ref().map(|b| Arc::clone(&b.jobs)),
+            ),
     ));
 
     let (app_audit_sink, app_audit_source_observer) = audit_state

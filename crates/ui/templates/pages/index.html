@@ -3,7 +3,7 @@
 {% block content %}
 <h1 class="page-title">{{ i18n.t("nav-home") }}</h1>
 
-<section class="stat-grid">
+<section class="stat-grid stat-grid--5">
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("card-resource-types") }}</span>
     <span class="stat__value">{{ metrics.resource_types }}</span>
@@ -14,11 +14,26 @@
     <span class="stat__value">{{ metrics.stored_resources }}</span>
     <span class="stat__sub">{{ i18n.t("card-stored-resources-sub") }}</span>
   </article>
-  <article class="card stat">
+  <a class="card stat stat--link" href="/ui/bulk-export">
     <span class="stat__label">{{ i18n.t("card-export-jobs") }}</span>
-    <span class="stat__value">{{ metrics.export_jobs }}</span>
-    <span class="stat__sub">{{ i18n.t_arg("card-export-jobs-sub", "queued", metrics.export_jobs_queued) }}</span>
-  </article>
+    {% if let Some(jobs) = metrics.export_jobs %}
+    <span class="stat__value">{{ jobs.running }}</span>
+    <span class="stat__sub">{{ i18n.t_arg("card-export-jobs-sub", "queued", jobs.queued) }}</span>
+    {% else %}
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("card-jobs-unavailable") }}">&mdash;</span>
+    <span class="stat__sub">{{ i18n.t("card-jobs-unavailable") }}</span>
+    {% endif %}
+  </a>
+  <a class="card stat stat--link" href="/ui/bulk-import">
+    <span class="stat__label">{{ i18n.t("card-import-jobs") }}</span>
+    {% if let Some(active) = metrics.import_jobs %}
+    <span class="stat__value">{{ active }}</span>
+    <span class="stat__sub">{{ i18n.t("card-import-jobs-sub") }}</span>
+    {% else %}
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("card-jobs-unavailable") }}">&mdash;</span>
+    <span class="stat__sub">{{ i18n.t("card-jobs-unavailable") }}</span>
+    {% endif %}
+  </a>
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("card-uptime") }}</span>
     <span class="stat__value">{{ metrics.uptime_percent }}<span class="stat__unit">%</span></span>

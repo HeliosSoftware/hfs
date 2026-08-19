@@ -994,6 +994,17 @@ pub trait BulkExportStorage: Send + Sync {
     /// enforce the per-tenant concurrency cap at kickoff.
     async fn count_active_exports(&self, tenant: &TenantContext) -> StorageResult<u64>;
 
+    /// Counts the tenant's export jobs currently in `status`.
+    ///
+    /// Used by the dashboard to show the running (`in-progress`) / queued
+    /// (`accepted`) split. The per-tenant concurrency cap keeps using
+    /// [`count_active_exports`](Self::count_active_exports).
+    async fn count_exports_by_status(
+        &self,
+        tenant: &TenantContext,
+        status: ExportStatus,
+    ) -> StorageResult<u64>;
+
     /// Lists expired completed jobs across *all* tenants, for the cleanup task.
     ///
     /// This is intentionally cross-tenant — the cleanup task is a server-wide

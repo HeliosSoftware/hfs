@@ -63,6 +63,28 @@ async fn index_serves_the_full_landing_page() {
 }
 
 #[tokio::test]
+async fn dashboard_renders_job_cards_with_unavailable_state_when_no_provider() {
+    // No DashboardProvider is registered in this test router, so build_index_page
+    // falls back to sample_snapshot, whose export_jobs/import_jobs_active are
+    // both None — the dashboard must render the explicit "unavailable" state
+    // rather than any fabricated numbers.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Export jobs"));
+    assert!(html.contains("Import jobs"));
+    assert!(html.contains(r#"href="/ui/bulk-export""#));
+    assert!(html.contains(r#"href="/ui/bulk-import""#));
+    assert!(html.contains("unavailable"));
+    assert!(!html.contains(">13<"));
+    assert!(!html.contains("queued)"));
+}
+
+#[tokio::test]
 async fn page_wires_the_hover_rail_nav() {
     let response = app()
         .oneshot(Request::get("/ui").body(Body::empty()).unwrap())

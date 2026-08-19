@@ -135,6 +135,9 @@ card-stored-resources = Gespeicherte Ressourcen
 card-stored-resources-sub = im aktiven Tenant
 card-export-jobs = Export-Jobs
 card-export-jobs-sub = laufend ({ $queued } in der Warteschlange)
+card-import-jobs = Import-Jobs
+card-import-jobs-sub = aktiv
+card-jobs-unavailable = nicht verfügbar
 card-uptime = Verfügbarkeit
 card-uptime-sub = letzte 30 Tage
 

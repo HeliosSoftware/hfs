@@ -139,6 +139,9 @@ card-stored-resources = Stored resources
 card-stored-resources-sub = across active tenant
 card-export-jobs = Export jobs
 card-export-jobs-sub = running ({ $queued } queued)
+card-import-jobs = Import jobs
+card-import-jobs-sub = active
+card-jobs-unavailable = unavailable
 card-uptime = Uptime
 card-uptime-sub = last 30 days
 
