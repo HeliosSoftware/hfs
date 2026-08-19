@@ -295,7 +295,8 @@ jobs:
       # target dir warm across runs, which is what makes this job fit in 120
       # minutes — but cargo never evicts the artifacts a bump or a toolchain
       # update orphans, so that cache only ever grows. The macOS runner hit its
-      # disk ceiling this way. See .github/actions/cargo-target-gc.
+      # disk ceiling this way, then the Windows one did.
+      # See .github/actions/cargo-target-gc.
       - name: Cap target dir size
         if: always()
         uses: ./.github/actions/cargo-target-gc
@@ -1331,6 +1332,16 @@ jobs:
             Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue
             Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
           }
+
+      # This job is the reason the action had to learn Windows. agent4 is the
+      # only Windows agent, this job is pinned to it and checks out with
+      # `clean: false`, and the unpinned `runs-on: [self-hosted]` jobs land there
+      # too — so its target dir grew unbounded until the disk filled and the
+      # NEXT run died in "Set up job", before any step could run. Must come
+      # after the cleanup above so a sweep can never race the running server.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   # Release-only conformance gate: run the HTS and extended-CI suites as
   # reusable sub-workflows against the exact tagged commit, so a release is

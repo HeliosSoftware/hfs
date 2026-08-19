@@ -4887,6 +4887,13 @@ mod postgres_integration {
                 .unwrap();
         }
         assert_eq!(backend.count_active_exports(&tenant).await.unwrap(), 2);
+        assert_eq!(
+            backend
+                .count_exports_by_status(&tenant, ExportStatus::Accepted)
+                .await
+                .unwrap(),
+            2
+        );
 
         // Nothing is expired yet.
         let expired_now = backend

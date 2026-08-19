@@ -60,7 +60,7 @@ echo '{"resourceType": "Patient", "id": "123"}' | ./fhirpath-cli 'Patient.id'
 # Transform NDJSON file to CSV using SQL-on-FHIR
 ./sof-cli --view examples/patient-view.json --bundle examples/patients.ndjson
 
-# SQL-on-FHIR HTTP server (POST to http://localhost:8080/ViewDefinition/$viewdefinition-run)
+# SQL-on-FHIR HTTP server (POST to http://localhost:8080/$sql-run)
 ./sof-server
 
 # FHIRPath HTTP server (POST expressions to http://localhost:3000/fhirpath)
@@ -328,13 +328,13 @@ compressed when the client sends `Accept-Encoding`.
 
 **SQL-on-FHIR async export**
 
-The `$viewdefinition-export` / `$sqlquery-export` operations write tabular output
+The `$sql-export` operation writes tabular output
 asynchronously to an export sink. See the [rest crate README](crates/rest/README.md#sql-on-fhir-async-export)
 for the full `HFS_EXPORT_*` table.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$viewdefinition-run`/`-export`, `$sqlquery-*`); requires a `sqlite`/`postgres` backend |
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`); requires a `sqlite`/`postgres` backend |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` export sink |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output and bookkeeping; the cleanup reaper deletes shards and drops the job afterward |
@@ -413,10 +413,10 @@ Complete implementation of the [FHIRPath 3.0.0-ballot specification](https://hl7
 - Auto-detects FHIR version from input data
 
 ### 6. [`helios-sof`](crates/sof) - SQL-on-FHIR Implementation
-Transform FHIR resources into tabular data using [ViewDefinitions](https://sql-on-fhir.org/ig/latest/index.html).
+Transform FHIR resources into tabular data using [ViewDefinitions](http://hl7.org/fhir/uv/sql-on-fhir/index.html).
 - **Executables:**
   - `sof-cli` - Command-line tool for batch transformations
-  - `sof-server` - HTTP server with `ViewDefinition/$viewdefinition-run` operation
+  - `sof-server` - HTTP server with `$sql-run` operation
 - Supports multiple input formats: JSON, NDJSON, and FHIR Bundles from local/cloud storage
 - Supports multiple output formats: CSV, JSON, NDJSON, and Parquet
 
@@ -497,7 +497,7 @@ Storage backend abstraction supporting multiple database technologies optimized 
 - Multiple input formats: JSON, NDJSON (newline-delimited), and FHIR Bundles
 - Multiple output formats: CSV, JSON, NDJSON, Parquet
 - Streaming support for large datasets
-- HTTP API with `$viewdefinition-run` operation
+- HTTP API with `$sql-run` operation
 - Cloud storage support: S3, GCS, Azure Blob Storage
 
 ## FHIR REST API

@@ -1,11 +1,29 @@
-//! Shared SoF v2 `$viewdefinition-run` parameter extraction.
+//! Shared `$sql-run` parameter extraction.
 //!
 //! Both the REST handler in `helios-rest` and the standalone sof-server walk a
 //! FHIR `Parameters` body for the same set of operation parameters
-//! (`_format`, `_limit`, `_since`, `patient`, `group`, `viewResource`,
-//! `viewReference`, `resource`, `header`, plus the Parquet options). This
-//! module owns the field-name list and the accepted JSON shapes so a new
-//! parameter name only needs to be added in one place.
+//! (`_format`, `_limit`, `_since`, `patient`, `group`, `subjectCanonical`,
+//! `subjectReference`, `subjectResource`, `resource`, `header`, plus the
+//! Parquet options). This module owns the field-name list and the accepted
+//! JSON shapes so a new parameter name only needs to be added in one place.
+//!
+//! ## Subject naming
+//!
+//! SQL on FHIR 3.0.0-ballot consolidated `$viewdefinition-run` and
+//! `$sqlquery-run` into a single system-level `$sql-run`, which names what it
+//! acts on through a *subject* rather than through the request path. The three
+//! subject parameters are mutually exclusive and one is required:
+//!
+//! | Parameter           | Names the subject by                                |
+//! |---------------------|-----------------------------------------------------|
+//! | `subjectCanonical`  | Canonical URL, optionally with a `\|version` suffix  |
+//! | `subjectReference`  | Literal location — relative on this server, or absolute |
+//! | `subjectResource`   | Inline resource (POST only)                         |
+//!
+//! `subjectCanonical` and `subjectReference` are deliberately distinct: a
+//! canonical URL is an identity, a literal reference is a location, and the
+//! same string can be neither or both. The pre-ballot `viewResource` /
+//! `viewReference` pair conflated the two and is not accepted.
 //!
 //! The extractor is **permissive**: missing / wrong-typed `value[X]` fields
 //! produce `None`/empty rather than an error. Strict callers (sof-server) run
@@ -31,10 +49,15 @@ pub struct ExtractedRunParams {
     pub patient: Vec<String>,
     /// `group` — `valueReference.reference` or `valueString` (any number).
     pub group: Vec<String>,
-    /// `viewResource` — the inline `resource`.
-    pub view_resource: Option<Value>,
-    /// `viewReference` — `valueReference.reference` or `valueString`.
-    pub view_reference: Option<String>,
+    /// `subjectResource` — the inline `resource` (a ViewDefinition, SQLQuery
+    /// Library or SQLView Library).
+    pub subject_resource: Option<Value>,
+    /// `subjectReference` — literal location, `valueReference.reference` or
+    /// `valueString`.
+    pub subject_reference: Option<String>,
+    /// `subjectCanonical` — canonical URL, `valueCanonical`/`valueUri`/
+    /// `valueString`, optionally carrying a `|version` suffix.
+    pub subject_canonical: Option<String>,
     /// `resource` — every inline resource encountered (any number).
     pub inline_resources: Vec<Value>,
     /// `source` — `valueString` or `valueUri`.
@@ -65,10 +88,10 @@ pub fn split_csv_refs(value: Option<&str>) -> Vec<String> {
     }
 }
 
-/// Returns `true` when `body` carries a ViewDefinition the caller can run
-/// directly — either a bare `ViewDefinition` resource or a `Parameters` body
-/// with a `viewResource` or `viewReference` parameter.
-pub fn body_has_view_definition(body: &Value) -> bool {
+/// Returns `true` when `body` names a subject the caller can run — either a
+/// bare `ViewDefinition` resource or a `Parameters` body carrying one of the
+/// three subject parameters.
+pub fn body_has_subject(body: &Value) -> bool {
     match body.get("resourceType").and_then(|v| v.as_str()) {
         Some("ViewDefinition") => true,
         Some("Parameters") => body
@@ -78,7 +101,9 @@ pub fn body_has_view_definition(body: &Value) -> bool {
                 params.iter().any(|p| {
                     matches!(
                         parameter_name(p).as_deref(),
-                        Some("viewResource") | Some("viewReference")
+                        Some("subjectResource")
+                            | Some("subjectReference")
+                            | Some("subjectCanonical")
                     )
                 })
             })
@@ -92,7 +117,7 @@ pub fn body_has_view_definition(body: &Value) -> bool {
 ///
 /// Returns an empty struct when `body` isn't a `Parameters` resource — call
 /// sites that may receive a bare `ViewDefinition` should detect that case
-/// separately (e.g. via [`body_has_view_definition`]). Repeated entries for
+/// separately (e.g. via [`body_has_subject`]). Repeated entries for
 /// the same scalar field keep the first value; `patient` / `group` /
 /// `inline_resources` accumulate.
 pub fn extract_run_params_from_json(body: &Value) -> ExtractedRunParams {
@@ -147,16 +172,24 @@ pub fn extract_run_params_from_json(body: &Value) -> ExtractedRunParams {
                     out.group.push(s);
                 }
             }
-            "viewResource" => {
-                if out.view_resource.is_none() {
+            "subjectResource" => {
+                if out.subject_resource.is_none() {
                     if let Some(r) = p.get("resource") {
-                        out.view_resource = Some(r.clone());
+                        out.subject_resource = Some(r.clone());
                     }
                 }
             }
-            "viewReference" => {
-                if out.view_reference.is_none() {
-                    out.view_reference = read_reference_or_string(p);
+            "subjectReference" => {
+                if out.subject_reference.is_none() {
+                    out.subject_reference = read_reference_or_string(p);
+                }
+            }
+            "subjectCanonical" => {
+                if out.subject_canonical.is_none() {
+                    out.subject_canonical = read_str(
+                        p,
+                        &["valueCanonical", "valueUri", "valueUrl", "valueString"],
+                    );
                 }
             }
             "resource" => {
@@ -267,32 +300,48 @@ mod tests {
 
     #[test]
     fn bare_viewdefinition_detected() {
-        assert!(body_has_view_definition(
-            &json!({"resourceType": "ViewDefinition"})
-        ));
+        assert!(body_has_subject(&json!({"resourceType": "ViewDefinition"})));
     }
 
     #[test]
-    fn parameters_with_view_resource_detected() {
-        assert!(body_has_view_definition(&params(vec![json!({
-            "name": "viewResource",
+    fn parameters_with_subject_resource_detected() {
+        assert!(body_has_subject(&params(vec![json!({
+            "name": "subjectResource",
             "resource": {"resourceType": "ViewDefinition"}
         })])));
     }
 
     #[test]
-    fn parameters_with_view_reference_detected() {
-        assert!(body_has_view_definition(&params(vec![json!({
-            "name": "viewReference",
+    fn parameters_with_subject_reference_detected() {
+        assert!(body_has_subject(&params(vec![json!({
+            "name": "subjectReference",
             "valueReference": {"reference": "ViewDefinition/x"}
         })])));
     }
 
     #[test]
-    fn parameters_without_view_returns_false() {
-        assert!(!body_has_view_definition(&params(vec![json!({
+    fn parameters_with_subject_canonical_detected() {
+        assert!(body_has_subject(&params(vec![json!({
+            "name": "subjectCanonical",
+            "valueCanonical": "http://example.org/ViewDefinition/x"
+        })])));
+    }
+
+    #[test]
+    fn parameters_without_subject_returns_false() {
+        assert!(!body_has_subject(&params(vec![json!({
             "name": "patient",
             "valueString": "Patient/123"
+        })])));
+    }
+
+    #[test]
+    fn pre_ballot_view_parameter_names_are_not_subjects() {
+        // `viewResource` / `viewReference` existed only in the continuous
+        // build and were never published. They name nothing in 3.0.0.
+        assert!(!body_has_subject(&params(vec![json!({
+            "name": "viewResource",
+            "resource": {"resourceType": "ViewDefinition"}
         })])));
     }
 
@@ -380,26 +429,57 @@ mod tests {
     }
 
     #[test]
-    fn view_resource_extracted() {
+    fn subject_resource_extracted() {
         let p = extract_run_params_from_json(&params(vec![json!({
-            "name": "viewResource",
+            "name": "subjectResource",
             "resource": {"resourceType": "ViewDefinition"}
         })]));
-        assert!(p.view_resource.is_some());
+        assert!(p.subject_resource.is_some());
     }
 
     #[test]
-    fn view_reference_string_or_reference() {
+    fn subject_reference_string_or_reference() {
         let p = extract_run_params_from_json(&params(vec![json!({
-            "name": "viewReference",
+            "name": "subjectReference",
             "valueReference": {"reference": "ViewDefinition/x"}
         })]));
-        assert_eq!(p.view_reference.as_deref(), Some("ViewDefinition/x"));
+        assert_eq!(p.subject_reference.as_deref(), Some("ViewDefinition/x"));
         let p = extract_run_params_from_json(&params(vec![json!({
-            "name": "viewReference",
+            "name": "subjectReference",
             "valueString": "ViewDefinition/y"
         })]));
-        assert_eq!(p.view_reference.as_deref(), Some("ViewDefinition/y"));
+        assert_eq!(p.subject_reference.as_deref(), Some("ViewDefinition/y"));
+    }
+
+    #[test]
+    fn subject_canonical_accepts_canonical_uri_and_string() {
+        for key in ["valueCanonical", "valueUri", "valueUrl", "valueString"] {
+            let p = extract_run_params_from_json(&params(vec![json!({
+                "name": "subjectCanonical",
+                key: "http://example.org/ViewDefinition/x|1.0.0"
+            })]));
+            assert_eq!(
+                p.subject_canonical.as_deref(),
+                Some("http://example.org/ViewDefinition/x|1.0.0"),
+                "key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn subject_canonical_and_reference_are_independent() {
+        // A canonical URL is an identity; a literal reference is a location.
+        // Supplying both is rejected by the handler, but the extractor keeps
+        // them apart so it can tell that both were present.
+        let p = extract_run_params_from_json(&params(vec![
+            json!({"name": "subjectCanonical", "valueCanonical": "http://example.org/vd"}),
+            json!({"name": "subjectReference", "valueString": "ViewDefinition/x"}),
+        ]));
+        assert_eq!(
+            p.subject_canonical.as_deref(),
+            Some("http://example.org/vd")
+        );
+        assert_eq!(p.subject_reference.as_deref(), Some("ViewDefinition/x"));
     }
 
     #[test]

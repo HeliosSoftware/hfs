@@ -341,16 +341,16 @@ rather than PHI and providers commonly leave them unencrypted.
 
 ### SQL-on-FHIR Async Export
 
-Separate from Bulk Data Export, the SQL-on-FHIR `$viewdefinition-export` and
-`$sqlquery-export` operations run asynchronously and write their tabular output
+Separate from Bulk Data Export, the SQL-on-FHIR `$sql-export` and
+`$sql-export` operations run asynchronously and write their tabular output
 to a dedicated *export sink*, configured via `HFS_EXPORT_*`. The whole subsystem
-is gated by `HFS_SOF_ENABLED` (which also enables `$viewdefinition-run`); when
+is gated by `HFS_SOF_ENABLED` (which also enables `$sql-run`); when
 enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 `postgres`).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$viewdefinition-run`/`-export`, `$sqlquery-*`). |
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`). |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. |
 | `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |

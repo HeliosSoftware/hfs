@@ -1,7 +1,7 @@
 //! # SQL-on-FHIR Server Implementation
 //!
 //! This module provides a stateless HTTP server implementation for the [SQL-on-FHIR
-//! specification](https://sql-on-fhir.org/ig/latest),
+//! specification](http://hl7.org/fhir/uv/sql-on-fhir),
 //! enabling HTTP-based access to ViewDefinition transformation capabilities.  Use this module
 //! if you need a stateless, simple web service for SQL-on-FHIR implementations.  Should you
 //! need to perform SQL-on-FHIR transformations using server-stored ViewDefinitions and
@@ -26,9 +26,13 @@
 //! GET /metadata
 //!   Returns: CapabilityStatement
 //!
-//! POST /ViewDefinition/$viewdefinition-run
-//!   Body: Parameters resource containing ViewDefinition and data
-//!   Query Parameters (except viewReference, viewResource, patient, group, resource):
+//! GET /OperationDefinition/sof-sql-run
+//!   Returns: this server's $sql-run OperationDefinition, declaring the
+//!            subset of parameters it supports (base = the guide's definition)
+//!
+//! POST /$sql-run
+//!   Body: Parameters resource containing the subject and data
+//!   Query Parameters (except the subject trio, patient, group, resource):
 //!     _format: Output format - application/json, application/x-ndjson, text/csv, application/octet-stream (parquet)
 //!     header: CSV header control - true (default), false (only applies to CSV format)
 //!     source: Data source (type: string) - Not yet supported
@@ -41,8 +45,9 @@
 //!   Body Parameters (in FHIR Parameters resource):
 //!     _format: Output format (type: code or string)
 //!     header: CSV header control (type: boolean)
-//!     viewReference: Reference(s) to ViewDefinition(s) (type: Reference) - Not yet supported
-//!     viewResource: ViewDefinition(s) to use (type: ViewDefinition)
+//!     subjectCanonical: Canonical URL of the subject - not supported (stateless)
+//!     subjectReference: Literal location of the subject - not supported (stateless)
+//!     subjectResource: The ViewDefinition to execute, supplied inline
 //!     patient: Filter by patient (type: Reference)
 //!     group: Filter by group (type: Reference) - Not yet supported
 //!     source: Data source (type: string) - Not yet supported
@@ -329,44 +334,30 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
     let mut app = Router::new()
         // FHIR endpoints
         .route("/metadata", get(handlers::capability_statement))
-        // SQL-on-FHIR capabilities (audit item #11): the spec-defined
-        // `GET /$sql-on-fhir-capabilities` endpoint returning a Parameters
-        // resource that enumerates which SoF features this server supports.
-        // sof-server is stateless so most of the reference-resolution
-        // capabilities are false; the truthful capability block lets
-        // clients negotiate without trial-and-error.
+        // This server's own OperationDefinition for `$sql-run`. It supports a
+        // subset of the guide's parameters (no `subjectCanonical`,
+        // `subjectReference`, `context` or `source`), and
+        // operations-capability.html#partial-operation-support requires such a
+        // server to publish its own definition, with `base` naming the guide's,
+        // and to cite that from its CapabilityStatement.
         .route(
-            "/$sql-on-fhir-capabilities",
-            get(handlers::sof_capabilities),
+            "/OperationDefinition/sof-sql-run",
+            get(handlers::sql_run_operation_definition),
         )
-        // Per spec, GET is permitted for simple invocations (no
-        // viewResource/resource body). sof-server is stateless and rejects
-        // viewReference, so GET will normally surface a 400/501 — but the
-        // route exists so clients can negotiate the method correctly.
+        // `$sql-run` is invoked at the **system level only**
+        // (`system=true, type=false, instance=false`). The pre-ballot
+        // continuous build also offered type- and instance-level
+        // `$viewdefinition-run` endpoints; those were never published and are
+        // gone.
         //
-        // The SoF v2 OperationDefinition lists three valid endpoints:
-        //   - [base]/$viewdefinition-run                            (system-level)
-        //   - [base]/CanonicalResource/$viewdefinition-run          (type-level)
-        //   - [base]/CanonicalResource/[id]/$viewdefinition-run     (instance-level)
-        //
-        // sof-server is stateless, so instance-level (which infers the
-        // ViewDefinition from a stored {id}) is rejected with a clear 400
-        // by `instance_level_not_supported`. The system- and type-level
-        // endpoints both route to the same handler — they differ only in
-        // URL shape (the type-level path is `CanonicalResource =
-        // ViewDefinition`).
+        // GET is permitted whenever every supplied parameter is primitive,
+        // which is what keeps the operation usable from a browser or a command
+        // line. sof-server is stateless and resolves no subject by URL, so GET
+        // will normally surface a 400 — but the route exists so clients can
+        // negotiate the method correctly.
         .route(
-            "/$viewdefinition-run",
-            post(handlers::run_view_definition_handler).get(handlers::run_view_definition_handler),
-        )
-        .route(
-            "/ViewDefinition/$viewdefinition-run",
-            post(handlers::run_view_definition_handler).get(handlers::run_view_definition_handler),
-        )
-        .route(
-            "/ViewDefinition/{id}/$viewdefinition-run",
-            post(handlers::instance_level_not_supported)
-                .get(handlers::instance_level_not_supported),
+            "/$sql-run",
+            post(handlers::sql_run_handler).get(handlers::sql_run_handler),
         )
         // Health check endpoint
         .route("/health", get(handlers::health_check))
@@ -538,10 +529,7 @@ mod tests {
             .unwrap()
             .push(serde_json::json!({"name": "_format", "valueCode": "text/plain"}));
 
-        let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
-            .json(&body)
-            .await;
+        let response = server.post("/$sql-run").json(&body).await;
 
         assert_eq!(
             response.status_code(),
@@ -562,7 +550,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 {
-                    "name": "viewResource",
+                    "name": "subjectResource",
                     "resource": {
                         "resourceType": "ViewDefinition",
                         "status": "active",
@@ -612,7 +600,7 @@ mod tests {
         let body = serde_json::to_vec(&run_request_body()).unwrap();
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header("content-encoding", "gzip")
             .add_header("accept", "application/json")
             .content_type("application/json")
@@ -636,7 +624,7 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header("content-encoding", "deflate")
             .add_header("accept", "application/json")
             .content_type("application/json")
@@ -651,7 +639,7 @@ mod tests {
         let server = TestServer::new(create_app()).unwrap();
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header("accept", "application/json")
             .json(&run_request_body())
             .await;
@@ -664,7 +652,7 @@ mod tests {
         let server = TestServer::new(create_app()).unwrap();
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header("content-encoding", "gzip")
             .content_type("application/json")
             .bytes(b"this is not gzip".to_vec().into())
@@ -683,7 +671,7 @@ mod tests {
         let body = serde_json::to_vec(&run_request_body()).unwrap();
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header("content-encoding", "compress")
             .content_type("application/json")
             .bytes(body.into())
@@ -739,7 +727,7 @@ mod tests {
         );
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header("accept-encoding", "gzip")
             .json(&body)
             .await;
@@ -775,7 +763,7 @@ mod tests {
         );
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header("content-encoding", "gzip")
             .content_type("application/json")
             .bytes(compressed.into())
@@ -798,10 +786,7 @@ mod tests {
             serde_json::json!({"name": "_format", "valueCode": "fhir"}),
         );
 
-        let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
-            .json(&body)
-            .await;
+        let response = server.post("/$sql-run").json(&body).await;
 
         assert_eq!(
             response.status_code(),
@@ -831,7 +816,7 @@ mod tests {
     async fn test_accept_fhir_json_without_format_selects_fhir() {
         let server = TestServer::new(create_app()).unwrap();
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header("accept", "application/fhir+json")
             .json(&run_request_body())
             .await;
@@ -860,7 +845,7 @@ mod tests {
         );
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header("accept", "application/fhir+json")
             .json(&body)
             .await;
@@ -889,7 +874,7 @@ mod tests {
     async fn test_accept_fhir_xml_returns_406() {
         let server = TestServer::new(create_app()).unwrap();
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header("accept", "application/fhir+xml")
             .json(&run_request_body())
             .await;

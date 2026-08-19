@@ -4,7 +4,7 @@ This crate provides a complete implementation of the SQL-on-FHIR specification f
 
 ## Overview
 
-The `sof` crate implements the [HL7 FHIR SQL-on-FHIR Implementation Guide](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2), providing:
+The `sof` crate implements the [HL7 FHIR SQL-on-FHIR Implementation Guide](http://hl7.org/fhir/uv/sql-on-fhir), providing:
 
 - **ViewDefinition Processing** - Transform FHIR resources into tabular data using declarative configuration
 - **Multi-Version Support** - Works seamlessly with R4, R4B, R5, and R6 FHIR specifications
@@ -295,9 +295,9 @@ sof-cli -v view.json -s s3://bucket/patients.ndjson -f json
 sof-cli -v view.json -s file:///data.ndjson -b additional-data.json -f csv
 
 # Server API with NDJSON
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?source=s3://bucket/data.ndjson" \
+curl -X POST "http://localhost:8080/$sql-run?source=s3://bucket/data.ndjson" \
   -H "Content-Type: application/json" \
-  -d '{"resourceType": "Parameters", "parameter": [{"name": "viewResource", "resource": {...}}]}'
+  -d '{"resourceType": "Parameters", "parameter": [{"name": "subjectResource", "resource": {...}}]}'
 ```
 
 #### Output Formats
@@ -534,17 +534,17 @@ Returns the server's CapabilityStatement describing supported operations:
 curl http://localhost:8080/metadata
 ```
 
-##### POST /ViewDefinition/$viewdefinition-run
+##### POST /$sql-run
 Execute a ViewDefinition transformation:
 
 ```bash
 # JSON output (default)
-curl -X POST http://localhost:8080/ViewDefinition/$viewdefinition-run \
+curl -X POST http://localhost:8080/$sql-run \
   -H "Content-Type: application/json" \
   -d '{
     "resourceType": "Parameters",
     "parameter": [{
-      "name": "viewResource",
+      "name": "subjectResource",
       "resource": {
         "resourceType": "ViewDefinition",
         "status": "active",
@@ -570,17 +570,17 @@ curl -X POST http://localhost:8080/ViewDefinition/$viewdefinition-run \
   }'
 
 # CSV output (includes headers by default)
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=text/csv" \
+curl -X POST "http://localhost:8080/$sql-run?_format=text/csv" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
 # CSV output without headers
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=text/csv&header=false" \
+curl -X POST "http://localhost:8080/$sql-run?_format=text/csv&header=false" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
 # NDJSON output
-curl -X POST http://localhost:8080/ViewDefinition/$viewdefinition-run \
+curl -X POST http://localhost:8080/$sql-run \
   -H "Content-Type: application/json" \
   -H "Accept: application/ndjson" \
   -d '{...}'
@@ -588,32 +588,33 @@ curl -X POST http://localhost:8080/ViewDefinition/$viewdefinition-run \
 
 #### Parameters
 
-The `$viewdefinition-run` POST operation accepts parameters either as query parameters or in a FHIR Parameters resource.
+The `$sql-run` POST operation accepts parameters either as query parameters or in a FHIR Parameters resource.
 
 Parameter table:
 
 | Name | Type | Use | Scope | Min | Max | Documentation |
 |------|------|-----|-------|-----|-----|---------------|
-| _format | code | in | type, instance | 0 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/vnd.apache.parquet` (aliases: `application/parquet`, `application/octet-stream`), `application/fhir+json` (`fhir`). Defaults to `application/x-ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
-| header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
-| maxFileSize | integer | in | type, instance | 0 | 1 | Maximum Parquet file size in MB (10-10000). When exceeded, generates multiple files in a ZIP archive. |
-| rowGroupSize | integer | in | type, instance | 0 | 1 | Parquet row group size in MB (64-1024, default: 256) |
-| pageSize | integer | in | type, instance | 0 | 1 | Parquet page size in KB (64-8192, default: 1024) |
-| compression | code | in | type, instance | 0 | 1 | Parquet compression: none, snappy (default), gzip, lz4, brotli, zstd |
-| viewReference | Reference | in | type, instance | 0 | 1 | Reference to ViewDefinition to be used for data transformation. (not yet supported) |
-| viewResource | ViewDefinition | in | type | 0 | 1 | ViewDefinition to be used for data transformation. |
-| patient | Reference | in | type, instance | 0 | * | Filter resources by patient. |
-| group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
-| source | string | in | type, instance | 0 | 1 | URL or path to FHIR data source. Supports file://, http(s)://, s3://, gs://, and azure:// protocols. |
-| _limit | integer | in | type, instance | 0 | 1 | Limits the number of results. (1-10000) |
-| _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
-| resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
+| _format | code | in | system | 0 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/vnd.apache.parquet` (aliases: `application/parquet`, `application/octet-stream`), `application/fhir+json` (`fhir`). Defaults to `application/x-ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
+| header | boolean | in | system | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
+| maxFileSize | integer | in | system | 0 | 1 | Maximum Parquet file size in MB (10-10000). When exceeded, generates multiple files in a ZIP archive. |
+| rowGroupSize | integer | in | system | 0 | 1 | Parquet row group size in MB (64-1024, default: 256) |
+| pageSize | integer | in | system | 0 | 1 | Parquet page size in KB (64-8192, default: 1024) |
+| compression | code | in | system | 0 | 1 | Parquet compression: none, snappy (default), gzip, lz4, brotli, zstd |
+| subjectCanonical | canonical | in | system | 0 | 1 | Canonical URL of the subject. Not supported here: sof-server is stateless and has nothing to resolve it against. |
+| subjectReference | Reference | in | system | 0 | 1 | Literal location of the subject. Not supported here, for the same reason. |
+| subjectResource | CanonicalResource | in | system | 0 | 1 | The ViewDefinition to execute, supplied inline. |
+| patient | Reference | in | system | 0 | * | Filter resources by patient. |
+| group | Reference | in | system | 0 | * | Filter resources by group. (not yet supported) |
+| source | string | in | system | 0 | 1 | URL or path to FHIR data source. Supports file://, http(s)://, s3://, gs://, and azure:// protocols. |
+| _limit | integer | in | system | 0 | 1 | Limits the number of results. (1-10000) |
+| _since | instant | in | system | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
+| resource | Resource | in | system | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
 
 ##### Query Parameters
 
-All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `resource` can be provided as POST query parameters:
+All parameters except the subject trio, `patient`, `group`, and `resource` can be provided as POST query parameters:
 
-- **_format**: Output format (optional; defaults to `application/x-ndjson` per SoF v2)
+- **_format**: Output format (optional; defaults to `application/x-ndjson`)
   - `application/json` - JSON array output
   - `text/csv` - CSV output
   - `application/ndjson` - Newline-delimited JSON
@@ -636,8 +637,8 @@ For POST requests, parameters can be provided in a FHIR Parameters resource:
 
 - **_format**: As valueCode or valueString (overrides query params and Accept header)
 - **header**: As valueBoolean (overrides query params)
-- **viewReference**: As valueReference (not yet supported)
-- **viewResource**: As resource (inline ViewDefinition)
+- **subjectCanonical** / **subjectReference**: not supported (no resource store)
+- **subjectResource**: As resource (inline ViewDefinition)
 - **patient**: As valueReference
 - **group**: As valueReference (not yet supported)
 - **source**: As valueString (URL to external FHIR data)
@@ -681,17 +682,17 @@ The server automatically sets appropriate response headers based on the output f
 
 ```bash
 # Limit results - first 50 records as CSV
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_limit=50&_format=text/csv" \
+curl -X POST "http://localhost:8080/$sql-run?_limit=50&_format=text/csv" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
 # CSV without headers, limited to 20 results
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=text/csv&header=false&_limit=20" \
+curl -X POST "http://localhost:8080/$sql-run?_format=text/csv&header=false&_limit=20" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
 # Using header parameter in request body (overrides query params)
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=text/csv" \
+curl -X POST "http://localhost:8080/$sql-run?_format=text/csv" \
   -H "Content-Type: application/json" \
   -d '{
     "resourceType": "Parameters",
@@ -699,46 +700,46 @@ curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=t
       "name": "header",
       "valueBoolean": false
     }, {
-      "name": "viewResource",
+      "name": "subjectResource",
       "resource": {...}
     }]
   }'
 
 # Filter by modification time (requires resources with lastUpdated metadata)
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_since=2024-01-01T00:00:00Z" \
+curl -X POST "http://localhost:8080/$sql-run?_since=2024-01-01T00:00:00Z" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
 # Load data from S3 bucket
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?source=s3://my-bucket/bundle.json" \
+curl -X POST "http://localhost:8080/$sql-run?source=s3://my-bucket/bundle.json" \
   -H "Content-Type: application/json" \
   -d '{
     "resourceType": "Parameters",
     "parameter": [{
-      "name": "viewResource",
+      "name": "subjectResource",
       "resource": {...}
     }]
   }'
 
 # Load data from Azure with filtering
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?source=azure://container/data.json&_limit=100" \
+curl -X POST "http://localhost:8080/$sql-run?source=azure://container/data.json&_limit=100" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
 # Generate Parquet with custom compression and row group size
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=application/parquet&compression=zstd&rowGroupSize=512" \
+curl -X POST "http://localhost:8080/$sql-run?_format=application/parquet&compression=zstd&rowGroupSize=512" \
   -H "Content-Type: application/json" \
   -d '{...}' \
   --output result.parquet
 
 # Generate large Parquet with file splitting (returns ZIP if multiple files)
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=application/parquet&maxFileSize=100" \
+curl -X POST "http://localhost:8080/$sql-run?_format=application/parquet&maxFileSize=100" \
   -H "Content-Type: application/json" \
   -d '{...}' \
   --output result.zip
 
 # Using Parquet parameters in request body
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run" \
+curl -X POST "http://localhost:8080/$sql-run" \
   -H "Content-Type: application/json" \
   -d '{
     "resourceType": "Parameters",
@@ -752,7 +753,7 @@ curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run" \
       "name": "compression",
       "valueCode": "brotli"
     }, {
-      "name": "viewResource",
+      "name": "subjectResource",
       "resource": {...}
     }]
   }' \
@@ -965,19 +966,19 @@ sof-cli --view view.json --bundle large-data.json --format parquet \
 #          output_003.parquet (remaining data)
 
 # Server API - single Parquet file
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=application/parquet" \
+curl -X POST "http://localhost:8080/$sql-run?_format=application/parquet" \
   -H "Content-Type: application/json" \
   -d '{"resourceType": "Parameters", ...}' \
   --output result.parquet
 
 # Server API - with file splitting (returns ZIP archive if multiple files)
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=application/parquet&maxFileSize=100" \
+curl -X POST "http://localhost:8080/$sql-run?_format=application/parquet&maxFileSize=100" \
   -H "Content-Type: application/json" \
   -d '{"resourceType": "Parameters", ...}' \
   --output result.zip
 
 # Server API - optimized settings for large datasets
-curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=application/parquet&compression=zstd&rowGroupSize=512&maxFileSize=500" \
+curl -X POST "http://localhost:8080/$sql-run?_format=application/parquet&compression=zstd&rowGroupSize=512&maxFileSize=500" \
   -H "Content-Type: application/json" \
   -d '{"resourceType": "Parameters", ...}' \
   --output result.zip

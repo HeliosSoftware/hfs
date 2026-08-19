@@ -17,6 +17,8 @@ export const ROUTES = [
   "/ui/tenants",
   "/ui/editor?type=Patient",
   "/ui/bulk-import",
+  "/ui/bulk-export",
+  "/ui/bulk-export/active",
 ];
 
 // The bulk-import detail page only exists with a submission behind it. Seed

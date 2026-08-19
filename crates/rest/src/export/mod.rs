@@ -1,5 +1,4 @@
-//! Export job infrastructure for `$viewdefinition-export` and
-//! `$sqlquery-export`.
+//! Export job infrastructure for `$sql-export`.
 //!
 //! This module defines:
 //! - [`ExportJobController`] — trait for managing async export jobs

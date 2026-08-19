@@ -138,6 +138,18 @@ pub struct TypeCount {
     pub total: u64,
 }
 
+/// Bulk-export jobs for one tenant, split by lifecycle stage.
+///
+/// Carried by [`DashboardSnapshot::export_jobs`]; both figures come from the
+/// same storage read so they are always consistent with each other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportJobCounts {
+    /// Jobs a worker has claimed and is executing (`in-progress`).
+    pub running: u64,
+    /// Jobs accepted and waiting for a worker slot (`accepted`).
+    pub queued: u64,
+}
+
 /// A snapshot of the figures the dashboard renders. Plain data — no storage or
 /// FHIR types — so this crate stays dependency-light.
 #[derive(Clone, Debug, Default)]
@@ -155,6 +167,15 @@ pub struct DashboardSnapshot {
     /// Every type with at least one stored resource, largest first — the
     /// picker's option list, so a tenant charts what it actually has (#555).
     pub available: Vec<TypeCount>,
+    /// Bulk-export jobs for the tenant.
+    ///
+    /// `None` when the running storage backend has no bulk-export job store,
+    /// the subsystem is disabled, or the count could not be read — the UI
+    /// renders an explicit "unavailable" state instead of a fabricated zero.
+    pub export_jobs: Option<ExportJobCounts>,
+    /// Non-terminal bulk-submit (import) jobs for the tenant. `None` under the
+    /// same conditions as [`Self::export_jobs`].
+    pub import_jobs_active: Option<u64>,
 }
 
 /// Supplies [`DashboardSnapshot`]s on demand. Implemented in `helios-rest` over
@@ -517,6 +538,8 @@ mod tests {
                     }],
                 }],
                 available: Vec::new(),
+                export_jobs: None,
+                import_jobs_active: None,
             }
         }
     }

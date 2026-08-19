@@ -165,13 +165,13 @@ No command-line flags. All configuration is via environment variables.
 
 ### Endpoint
 
-`POST /ViewDefinition/$viewdefinition-run`
+`POST /$sql-run`
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `_format` | string | `csv`, `json`, `ndjson`, `parquet` |
 | `header` | boolean | Include CSV header (`true` / `false`) |
-| `viewResource` | object | ViewDefinition resource |
+| `subjectResource` | object | ViewDefinition resource |
 | `resource` | array | FHIR resources to transform |
 | `patient` | string | Filter by patient reference |
 | `_limit` | integer | Limit results (1–10000) |
