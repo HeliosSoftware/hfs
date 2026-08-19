@@ -412,6 +412,8 @@ struct ChartView {
     table: Vec<ChartTableRow>,
     /// Comma-joined plotted type names, for the SVG's accessible name.
     types_label: String,
+    /// Compact picker-pill label: the first type plus a `+N` overflow count.
+    pick_label: String,
 }
 
 /// One entry in the chart legend: a plotted series, with a link that removes
@@ -1436,7 +1438,13 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
                     .cloned()
                     .collect()
             } else {
-                let mut set = charted.clone();
+                // Selecting past the cap swaps the oldest series out — three
+                // stay legible (mirrors the provider's MAX_CHARTED_TYPES).
+                let mut set: Vec<String> = charted
+                    .iter()
+                    .skip(charted.len().saturating_sub(CHART_MAX_SERIES - 1))
+                    .cloned()
+                    .collect();
                 set.push(t.resource_type.clone());
                 set
             };
@@ -1517,6 +1525,9 @@ const CHART_HEIGHT: i64 = 300;
 const CHART_HEIGHT_EXPANDED: i64 = 520;
 /// Palette slots defined as `--series-N` custom properties in app.css.
 const SERIES_COLORS: usize = 6;
+/// Most series plotted at once — mirrors the provider's `MAX_CHARTED_TYPES`,
+/// so a picker link never asks for more than the server will chart.
+const CHART_MAX_SERIES: usize = 3;
 
 /// Computes the SVG geometry for one resource type's cumulative series. `window`
 /// decides only the x-axis label format — a calendar date over daily buckets, a
@@ -1535,6 +1546,12 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -
         .map(|s| s.resource_type.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    // The pill stays one name wide however many series are plotted.
+    let pick_label = match plotted.len() {
+        0 => String::new(),
+        1 => plotted[0].resource_type.clone(),
+        n => format!("{} +{}", plotted[0].resource_type, n - 1),
+    };
 
     if plotted.is_empty() {
         return ChartView {
@@ -1547,6 +1564,7 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -
             tip_json: "{}".to_string(),
             table: Vec::new(),
             types_label,
+            pick_label: String::new(),
         };
     }
 
@@ -1656,6 +1674,7 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -
         tip_json,
         table,
         types_label,
+        pick_label,
     }
 }
 

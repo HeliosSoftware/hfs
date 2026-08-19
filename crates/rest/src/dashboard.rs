@@ -33,9 +33,25 @@ use crate::config::ServerConfig;
 /// How many series the dashboard charts when the user has not picked any:
 /// the tenant's largest types, enough to compare without turning to spaghetti.
 const DEFAULT_CHARTED_TYPES: usize = 3;
-/// Hard cap on a user selection — bounds the per-type delta queries and
-/// matches the number of series colors the stylesheet defines.
-const MAX_CHARTED_TYPES: usize = 6;
+/// Definitional/infrastructure types the *default* selection skips — a server
+/// that seeds its own SearchParameters would otherwise chart those instead of
+/// the tenant's clinical data. They stay in `available`, so the picker still
+/// offers them; this only shapes the out-of-the-box view.
+const INFRASTRUCTURE_TYPES: &[&str] = &[
+    "CapabilityStatement",
+    "CodeSystem",
+    "CompartmentDefinition",
+    "ConceptMap",
+    "ImplementationGuide",
+    "OperationDefinition",
+    "SearchParameter",
+    "StructureDefinition",
+    "Subscription",
+    "ValueSet",
+];
+/// Hard cap on a user selection — three series stay legible (the mockup's
+/// choice), and it bounds the per-type delta queries.
+const MAX_CHARTED_TYPES: usize = 3;
 
 /// A span to chart, and the bucket width that samples it.
 ///
@@ -241,11 +257,21 @@ where
         // types, else the largest few. Capped so the query fan-out (one delta
         // aggregate per type) and the palette stay bounded.
         let selection: Vec<&str> = if types.is_empty() {
-            available
+            let mut defaults: Vec<&str> = available
                 .iter()
+                .filter(|t| !INFRASTRUCTURE_TYPES.contains(&t.resource_type.as_str()))
                 .take(DEFAULT_CHARTED_TYPES)
                 .map(|t| t.resource_type.as_str())
-                .collect()
+                .collect();
+            // A store holding nothing but definitional resources still charts.
+            if defaults.is_empty() {
+                defaults = available
+                    .iter()
+                    .take(DEFAULT_CHARTED_TYPES)
+                    .map(|t| t.resource_type.as_str())
+                    .collect();
+            }
+            defaults
         } else {
             types
                 .iter()

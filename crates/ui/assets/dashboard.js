@@ -86,3 +86,19 @@
     guide.hidden = true;
   });
 })();
+
+/* Type-picker filter: typeahead over the option rows, same pattern as the
+   resource rail's filter. Without JavaScript the list simply scrolls. */
+(function () {
+  "use strict";
+  document.addEventListener("input", function (event) {
+    var filter = event.target.closest ? event.target.closest("[data-pick-filter]") : null;
+    if (!filter) return;
+    var panel = filter.closest(".menu__panel");
+    if (!panel) return;
+    var needle = filter.value.trim().toLowerCase();
+    panel.querySelectorAll("[data-pick-name]").forEach(function (option) {
+      option.hidden = !!needle && option.dataset.pickName.toLowerCase().indexOf(needle) === -1;
+    });
+  });
+})();

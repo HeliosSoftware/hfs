@@ -60,21 +60,28 @@
       <details class="menu chart-pick">
         <summary class="pill">
           <span class="icon">{% include "icons/layers-platforms.svg" %}</span>
-          {{ chart.types_label }}
+          {{ chart.pick_label }}
           <span class="icon">{% include "icons/chevron-down.svg" %}</span>
         </summary>
         <div class="menu__panel menu__panel--right">
           <div class="menu__heading">{{ i18n.t("chart-pick-heading") }}</div>
-          {% if picker.is_empty() %}
-          <p class="chart-pick__none">{{ i18n.t("chart-empty") }}</p>
-          {% endif %}
-          {% for option in picker %}
-          <a class="menu__option chart-pick__option{% if option.selected %} chart-pick__option--on{% endif %}" href="{{ option.href }}">
-            <span class="chart-pick__box" aria-hidden="true">{% if option.selected %}✓{% endif %}</span>
-            <span class="chart-pick__name">{{ option.resource_type }}</span>
-            <span class="chart-pick__count">{{ option.total }}</span>
-          </a>
-          {% endfor %}
+          <div class="menu__search">
+            <input type="search" placeholder="{{ i18n.t("chart-pick-filter") }}"
+                   aria-label="{{ i18n.t("chart-pick-filter") }}" data-pick-filter>
+          </div>
+          <div class="chart-pick__list">
+            {% if picker.is_empty() %}
+            <p class="chart-pick__none">{{ i18n.t("chart-empty") }}</p>
+            {% endif %}
+            {% for option in picker %}
+            <a class="menu__option chart-pick__option{% if option.selected %} chart-pick__option--on{% endif %}"
+               href="{{ option.href }}" data-pick-name="{{ option.resource_type }}">
+              <span class="chart-pick__box" aria-hidden="true">{% if option.selected %}✓{% endif %}</span>
+              <span class="chart-pick__name">{{ option.resource_type }}</span>
+              <span class="chart-pick__count">{{ option.total }}</span>
+            </a>
+            {% endfor %}
+          </div>
         </div>
       </details>
       <a class="pill pill--square" href="{{ expand_href }}"

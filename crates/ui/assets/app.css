@@ -855,7 +855,12 @@ a.pill {
 
 .chart-pick .menu__panel {
   min-width: 260px;
-  max-height: min(420px, 60vh);
+}
+
+/* The option list scrolls on its own so the heading and the filter stay put
+   however many types the tenant stores. */
+.chart-pick__list {
+  max-height: min(340px, 50vh);
   overflow-y: auto;
 }
 
