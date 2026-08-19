@@ -20,7 +20,7 @@
   <p class="page-head__lede">{{ i18n.t("editor-lede") }}</p>
 </section>
 
-<div class="editor" id="editor"
+<div id="editor"
      data-type="{{ resource_type }}"
      data-id="{{ resource_id }}"
      data-msg-load-error="{{ i18n.t("editor-load-error") }}"
@@ -50,7 +50,7 @@
     version rail is hydrated from the ordinary _history API.
   -->
   <div class="editor__layout">
-    <div class="editor__body" id="editor-body"></div>
+    <div id="editor-body"></div>
 
     <aside class="card editor-versions" id="editor-versions" aria-label="{{ i18n.t("editor-versions") }}">
       <div class="card-head"><h3><span class="icon">{% include "icons/history.svg" %}</span> {{ i18n.t("editor-versions") }}</h3></div>

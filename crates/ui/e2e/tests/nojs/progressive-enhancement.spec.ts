@@ -26,7 +26,7 @@ test("the sidebar brand is an accessible native Home link", async ({ page }) => 
   await expect(brand).toHaveAccessibleName(name);
   await brand.press("Enter");
   await expect(page).toHaveURL(/\/ui$/);
-  await expect(page.locator("h1.page-title")).toHaveText("Home");
+  await expect(page.locator("h1.page-head__title")).toHaveText("Home");
 });
 
 test("the language switcher works as plain links (en → es → de)", async ({ page, chrome }) => {
@@ -59,7 +59,7 @@ for (const { href, url } of NAV) {
     await expect(link).toBeVisible();
     await link.click();
     await expect(page).toHaveURL(url);
-    await expect(page.locator("h1.page-head__title, h1.page-title")).toBeVisible();
+    await expect(page.locator("h1.page-head__title, h1.page-head__title")).toBeVisible();
   });
 }
 

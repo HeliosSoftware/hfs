@@ -1,7 +1,9 @@
 {% extends "layouts/base.html" %}
 
 {% block content %}
-<h1 class="page-title">{{ i18n.t("nav-home") }}</h1>
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("nav-home") }}</h1>
+</section>
 
 <section class="stat-grid stat-grid--5">
   <article class="card stat">
@@ -106,7 +108,7 @@
         href="{{ item.href }}"
         {% if item.active %}aria-current="true"{% endif %}
       >
-        <span class="chart-legend__type">{{ item.resource_type }}</span>
+        <span>{{ item.resource_type }}</span>
         <span class="chart-legend__total">{{ item.total }}</span>
       </a>
     </li>

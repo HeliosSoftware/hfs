@@ -7,7 +7,7 @@
     <tr>
       <th class="col-tenant">{{ i18n.t("tenants-col-tenant") }}</th>
       <th class="col-num">{{ i18n.t("tenants-col-resources") }}</th>
-      <th class="col-created">{{ i18n.t("tenants-col-created") }}</th>
+      <th>{{ i18n.t("tenants-col-created") }}</th>
       <th class="col-actions">{{ i18n.t("tenants-col-actions") }}</th>
     </tr>
   </thead>
@@ -30,7 +30,7 @@
         </span>
       </td>
       <td class="col-num">{{ row.resources_human() }}</td>
-      <td class="col-created">{{ row.created_date() }}</td>
+      <td>{{ row.created_date() }}</td>
       <td class="col-actions">
         <button
           type="button"

@@ -24,7 +24,7 @@
   <div class="nav-panel__list" id="type-rail-list">
     {% for t in resource_types %}
     <button type="button" class="nav-panel__item{% if t.as_str() == selected_type.as_str() %} nav-panel__item--on{% endif %}" data-rail-type="{{ t }}">
-      <span class="nav-panel__name">{{ t }}</span>
+      <span>{{ t }}</span>
       <span class="count" data-count-for="{{ t }}"></span>
     </button>
     {% endfor %}
@@ -135,11 +135,11 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
     </header>
     <div class="modal__status" id="resource-modal-status" role="status"></div>
     <div class="modal__body">
-      <div class="modal__pane" data-modal-pane="edit">
+      <div data-modal-pane="edit">
         <div id="resource-editor-body"></div>
       </div>
-      <div class="modal__pane" data-modal-pane="history" hidden>
-        <div class="history" id="resource-history"
+      <div data-modal-pane="history" hidden>
+        <div id="resource-history"
              data-msg-load-error="{{ i18n.t("history-load-error") }}"
              data-msg-current="{{ i18n.t("history-current") }}"
              data-msg-not-found="{{ i18n.t("history-not-found") }}">
@@ -151,14 +151,14 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
               </div>
               <div class="history__versions" id="resource-history-versions"></div>
             </aside>
-            <div class="history__main">
+            <div>
               <div class="history__controls" id="resource-history-controls" hidden>
                 <label class="history__select"><span>{{ i18n.t("history-from") }}</span><select id="resource-history-from"></select></label>
                 <span class="history__arrow">→</span>
                 <label class="history__select"><span>{{ i18n.t("history-to") }}</span><select id="resource-history-to"></select></label>
                 <label class="history__meta-toggle"><input type="checkbox" id="resource-history-metadata"> {{ i18n.t("history-show-metadata") }}</label>
               </div>
-              <div class="history__diff" id="resource-history-diff">
+              <div id="resource-history-diff">
                 <p class="history__empty">{{ i18n.t("history-empty") }}</p>
               </div>
             </div>

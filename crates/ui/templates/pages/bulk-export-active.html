@@ -7,13 +7,13 @@
 {% block content %}
 <header class="page-head page-head--row">
   <div>
-    <a class="backlink" href="/ui/bulk-export">‹ {{ i18n.t("bulk-export-title") }}</a>
-    <h1 class="page-title">
+    <a href="/ui/bulk-export">‹ {{ i18n.t("bulk-export-title") }}</a>
+    <h1 class="page-head__title">
       {{ i18n.t("bulk-export-active-title") }}
       <span class="toolbar__count">{{ total }} · {{ running }} {{ i18n.t("bulk-export-running") }}</span>
     </h1>
   </div>
-  <a class="button button--primary" href="/ui/bulk-export">{{ i18n.t("bulk-export-new") }}</a>
+  <a class="btn btn--primary" href="/ui/bulk-export">{{ i18n.t("bulk-export-new") }}</a>
 </header>
 
 {% if cards.is_empty() %}

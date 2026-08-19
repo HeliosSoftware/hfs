@@ -6,8 +6,8 @@
 
 {% block content %}
 <header class="page-head page-head--row">
-  <h1 class="page-title">{{ i18n.t("bulk-export-title") }}</h1>
-  <a class="button" href="/ui/bulk-export/active">
+  <h1 class="page-head__title">{{ i18n.t("bulk-export-title") }}</h1>
+  <a class="btn" href="/ui/bulk-export/active">
     {{ i18n.t("bulk-export-active-link") }}
     <span class="toolbar__count">{{ active_count }}</span>
   </a>
@@ -94,7 +94,7 @@
   </section>
 
   <div class="detail__actions">
-    <button type="submit" class="button button--primary">
+    <button type="submit" class="btn btn--primary">
       {{ i18n.t("bulk-export-start") }}
     </button>
   </div>

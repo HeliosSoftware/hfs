@@ -155,6 +155,45 @@ All of that lives in Rust behind `/ui/editor/render`, where it is tested.
   them, not the reverse.
 - **Don't couple templates to a single FHIR version** — go through the
   version-agnostic abstractions already in the workspace.
+- **No new component class for a primitive that already exists, and no
+  page-local CSS for a shared control.** The vocabulary below is the whole
+  list; `.button` next to `.btn` is how the Import page drifted off the design
+  (#543). `design-system.spec.ts` fails a page that uses an undefined class,
+  restyles a shared primitive, or defines a selector twice.
+
+---
+
+## Component vocabulary
+
+`assets/app.css` is one stylesheet in four cascade layers —
+`@layer tokens, base, components, pages` — so a page rule outranks a component
+rule by layer, never by accident of specificity or source order. `tokens` holds
+the custom properties, `base` element defaults, `components` the shared
+vocabulary, `pages` what is genuinely unique to one screen.
+
+These are the shared primitives. Before styling anything, reach for one; add to
+`pages` only what no other screen will ever want.
+
+| Class | What it is |
+|---|---|
+| `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current` | The button. Secondary by default; primary is the one blue action on a page. |
+| `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
+| `.page-head`, `.page-head__title`, `.page-head__lede`, `.page-head--row` | Page heading block; the only `<h1>` treatment; `--row` puts an action on the right. |
+| `.table-wrap` > `.data-table`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper; empty-state row; footer with pagination. |
+| `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
+| `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
+| `.menu`, `.menu__panel`, `.menu__heading`, `.menu__option` | The `<details>` dropdown (tenant/version selectors, Recent). |
+| `.notice`, `.notice--warn` | Inline banner. |
+| `.pill` | Large control chip (chart tools). |
+| `.tag`, `.tag--*` | Small status pill in tables and lists. |
+| `.chip` | Facet/filter chip row member. |
+| `.toolbar`, `.toolbar__title`, `.toolbar__search`, `.toolbar__count` | In-card section header with optional search. |
+| `.tabs`, `.tab`, `.tab--on` | Tab strip. |
+| `.filter-rail`, `.nav-panel` | Left rails: the filter list inside a page; the type panel flush against the sidebar. |
+| `.icon-button`, `.icon-button--danger` | Bare icon action (table rows). |
+
+Starting a new page: copy `templates/pages/_scaffold.html` (or crib
+`tenants.html`, the smallest real page). Both compose only this vocabulary.
 
 ---
 

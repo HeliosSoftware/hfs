@@ -50,14 +50,14 @@
            data-fold-id="{{ line.fold_id }}" data-parents="{{ line.parents }}">
         <span class="json-line__num">{{ line.num }}</span>
         <span class="json-line__fold">{% if line.foldable %}<span class="json-line__arrow" data-fold="{{ line.fold_id }}">▾</span>{% endif %}</span>
-        <span class="json-line__code" style="padding-left: {{ line.depth }}em">{% for t in line.tokens %}<span class="jt jt--{{ t.kind }}">{{ t.text }}</span>{% endfor %}<span class="json-line__summary">{{ line.summary }}</span></span>
+        <span class="json-line__code" style="padding-left: {{ line.depth }}em">{% for t in line.tokens %}<span class="jt--{{ t.kind }}">{{ t.text }}</span>{% endfor %}<span class="json-line__summary">{{ line.summary }}</span></span>
       </div>
       {% endfor %}
     </div>
 
     <!-- Raw editing, one toggle away. On apply it re-parses and the form
          re-renders from it. -->
-    <div class="editor-json__raw" id="editor-json-raw" hidden>
+    <div id="editor-json-raw" hidden>
       <textarea class="editor__source" id="editor-source" spellcheck="false">{{ pretty }}</textarea>
       <p class="editor__source-hint">{{ i18n.t("editor-source-hint") }}</p>
     </div>
@@ -205,7 +205,7 @@
             {% if row.accepts_extension %}
             <div class="editor-add__ext">
               {% if !row.ext_options.is_empty() %}
-              <div class="editor-add__extlist">
+              <div>
                 {% for ext in row.ext_options %}
                 <button type="button" class="editor-add__item" data-add-name="{{ ext.name }}"
                         data-extension="{{ row.path }}" data-url="{{ ext.url }}"

@@ -1,21 +1,11 @@
 import { test, expect } from "../pages/fixtures";
+import { ROUTES, seedBulkImportDetail } from "../pages/routes";
 
 // crates/ui/README.md states "rules of the road" that were enforced only by
-// review. These make three of them executable, across every full page.
-const ROUTES = [
-  "/ui",
-  "/ui/resources",
-  "/ui/batch",
-  "/ui/compartments",
-  "/ui/search-parameters",
-  "/ui/queries",
-  "/ui/history",
-  "/ui/search",
-  "/ui/tenants",
-  "/ui/editor?type=Patient",
-];
+// review. These make three of them executable, across every full page. The
+// route list is shared with the other cross-page guards (#543).
 
-test("no page makes an external-origin request (no CDN)", async ({ page, baseURL }) => {
+test("no page makes an external-origin request (no CDN)", async ({ page, baseURL, request }) => {
   const origin = new URL(baseURL!).origin;
   const foreign: string[] = [];
   page.on("request", (r) => {
@@ -23,23 +13,23 @@ test("no page makes an external-origin request (no CDN)", async ({ page, baseURL
     if (u.startsWith("data:") || u.startsWith("blob:")) return;
     if (!u.startsWith(origin)) foreign.push(`${r.method()} ${u}`);
   });
-  for (const route of ROUTES) {
+  for (const route of [...ROUTES, await seedBulkImportDetail(request)]) {
     await page.goto(route, { waitUntil: "networkidle" });
   }
   expect(foreign, `off-origin requests:\n${foreign.join("\n")}`).toEqual([]);
 });
 
-test("no route emits an uncaught page error", async ({ page }) => {
+test("no route emits an uncaught page error", async ({ page, request }) => {
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(String(e)));
-  for (const route of ROUTES) {
+  for (const route of [...ROUTES, await seedBulkImportDetail(request)]) {
     await page.goto(route, { waitUntil: "networkidle" });
   }
   expect(errors, errors.join("\n")).toEqual([]);
 });
 
-test("rendered HTML carries no inline executable <script>", async ({ page }) => {
-  for (const route of ROUTES) {
+test("rendered HTML carries no inline executable <script>", async ({ page, request }) => {
+  for (const route of [...ROUTES, await seedBulkImportDetail(request)]) {
     await page.goto(route, { waitUntil: "domcontentloaded" });
     const inline = await page.$$eval("script", (nodes) =>
       nodes

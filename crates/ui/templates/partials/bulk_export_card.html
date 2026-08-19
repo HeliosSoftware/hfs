@@ -8,7 +8,7 @@
 {% endif %}
   <div class="toolbar">
     <h2 class="toolbar__title">{{ card.name }}</h2>
-    <span class="chip chip--{{ card.status }}">{{ card.status_label }}</span>
+    <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
   </div>
 
   {% if card.status == "in-progress" %}
@@ -17,7 +17,7 @@
     <div>{% if !card.progress.is_empty() %}{{ card.progress }}{% else %}{{ i18n.t("bulk-export-progress-waiting") }}{% endif %}</div>
   </div>
   <form method="post" action="/ui/bulk-export/active/{{ card.id }}/cancel">
-    <button type="submit" class="button">{{ i18n.t("bulk-export-cancel") }}</button>
+    <button type="submit" class="btn">{{ i18n.t("bulk-export-cancel") }}</button>
   </form>
   {% endif %}
 
@@ -41,7 +41,7 @@
     <div>{{ card.error }}</div>
   </div>
   <form method="post" action="/ui/bulk-export/active/{{ card.id }}/retry">
-    <button type="submit" class="button">{{ i18n.t("bulk-export-retry") }}</button>
+    <button type="submit" class="btn">{{ i18n.t("bulk-export-retry") }}</button>
   </form>
   {% endif %}
 </div>
