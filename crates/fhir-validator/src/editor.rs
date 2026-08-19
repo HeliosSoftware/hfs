@@ -1117,11 +1117,23 @@ mod tests {
         let mut patient = donald();
         add_element(resolver, "Patient", &mut patient, &[], "active").unwrap();
 
-        set_value(resolver, "Patient", &mut patient, &path_from_string("active"), "true");
+        set_value(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("active"),
+            "true",
+        );
         assert_eq!(patient["active"], json!(true));
 
         // Clearing a field removes it rather than storing "".
-        set_value(resolver, "Patient", &mut patient, &path_from_string("active"), "");
+        set_value(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("active"),
+            "",
+        );
         assert!(patient.get("active").is_none());
     }
 
@@ -1134,7 +1146,13 @@ mod tests {
         // A year-precision date is legal FHIR and must stay a string, even
         // though it parses as an integer.
         add_element(resolver, "Patient", &mut patient, &[], "birthDate").unwrap();
-        set_value(resolver, "Patient", &mut patient, &path_from_string("birthDate"), "1974");
+        set_value(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("birthDate"),
+            "1974",
+        );
         assert_eq!(patient["birthDate"], json!("1974"));
 
         // Same for string-typed elements whose content merely looks numeric.

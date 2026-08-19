@@ -112,7 +112,10 @@ async fn the_page_goes_from_unavailable_to_the_live_dashboard() {
     set_provider(Arc::new(Fixed));
     let (status, html) = get("/ui/subscriptions").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains(r#"href="/ui/subscriptions""#), "nav entry live");
+    assert!(
+        html.contains(r#"href="/ui/subscriptions""#),
+        "nav entry live"
+    );
 
     // Cards: 1 failing, 1 idle, 1 active, 4,500 notifications.
     assert!(html.contains("4,500"), "events card sums the counters");
