@@ -385,6 +385,8 @@
           subject.textContent = current.type + "/" + current.id;
           say(messages.msgSaved, "ok");
           renderEditor(res.body);
+          // The results table behind the modal is now stale — let it catch up.
+          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
         })
         .catch(function () { say(messages.msgLoadError, "error"); });
     });
@@ -395,8 +397,12 @@
     if (!window.confirm(messages.msgConfirmDelete)) return;
     fetch("/" + current.type + "/" + current.id, { method: "DELETE", headers: fhirHeaders() })
       .then(function (r) {
-        if (r.ok || r.status === 204) { closeModal(); location.reload(); }
-        else say(String(r.status), "error");
+        if (r.ok || r.status === 204) {
+          closeModal();
+          // No full reload: the table and counts refresh in place, keeping
+          // the rail selection and scroll where the user left them.
+          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
+        } else say(String(r.status), "error");
       })
       .catch(function () { say(messages.msgLoadError, "error"); });
   });
