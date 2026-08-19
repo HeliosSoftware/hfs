@@ -12,6 +12,12 @@ export class DashboardPage {
   get statCards(): Locator {
     return this.page.locator(".card.stat");
   }
+  get exportJobsCard(): Locator {
+    return this.page.locator("a.card.stat", { hasText: "Export jobs" });
+  }
+  get importJobsCard(): Locator {
+    return this.page.locator("a.card.stat", { hasText: "Import jobs" });
+  }
   get chart(): Locator {
     return this.page.locator("svg.chart");
   }

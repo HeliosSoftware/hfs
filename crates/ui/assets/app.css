@@ -660,6 +660,25 @@ button.menu__option {
   font-size: 12px;
   color: var(--muted);
 }
+
+.stat--link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+
+.stat--link:hover {
+  border-color: var(--accent);
+}
+
+.stat--link:focus-visible {
+  outline: 2px solid var(--outline);
+  outline-offset: 2px;
+}
+
+.stat__value--unavailable {
+  color: var(--muted);
+}
 }
 
 @layer pages {
@@ -993,6 +1012,16 @@ a.pill {
 .stat-grid--2 {
   grid-template-columns: repeat(2, 1fr);
   max-width: 620px;
+}
+
+.stat-grid--5 {
+  grid-template-columns: repeat(5, 1fr);
+}
+
+@media (max-width: 1100px) {
+  .stat-grid--5 {
+    grid-template-columns: repeat(3, 1fr);
+  }
 }
 
 .table-card {
@@ -4372,6 +4401,13 @@ body.has-nav-panel {
   gap: 10px;
 }
 
+.menu__heading--row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .addbox__x {
   border: 0;
   background: none;
@@ -4429,4 +4465,35 @@ body.has-nav-panel {
   border-color: #C0362C;
   box-shadow: 0 0 0 3px rgb(192 54 44 / 12%);
 }
+
+/* Bulk Export (#537): the resource-type checkbox grid and job-status chips.
+   The status chip is `.status-chip`, not `.chip` — `.chip` is the filter
+   affordance the search and registry pages use. */
+.typegrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 6px 18px;
+  padding: 6px 0;
+}
+
+.typegrid__item {
+  font-size: 14px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.status-chip {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 2px 12px;
+  white-space: nowrap;
+}
+
+.status-chip--in-progress { color: #B45309; background: rgb(180 83 9 / 12%); }
+.status-chip--complete { color: var(--accent, #0E7C6B); background: rgb(14 124 107 / 12%); }
+.status-chip--failed { color: #C0362C; background: rgb(192 54 44 / 12%); }
+.status-chip--cancelled { color: var(--muted, #667); background: rgb(120 130 130 / 14%); }
 }

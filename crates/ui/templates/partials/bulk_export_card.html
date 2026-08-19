@@ -1,0 +1,47 @@
+{% if card.status == "in-progress" %}
+<div id="job-{{ card.id }}" class="card detail"
+     hx-get="/ui/bulk-export/active/{{ card.id }}/card"
+     hx-trigger="every 5s"
+     hx-swap="outerHTML">
+{% else %}
+<div id="job-{{ card.id }}" class="card detail">
+{% endif %}
+  <div class="toolbar">
+    <h2 class="toolbar__title">{{ card.name }}</h2>
+    <span class="status-chip status-chip--{{ card.status }}">{{ card.status_label }}</span>
+  </div>
+
+  {% if card.status == "in-progress" %}
+  <div class="detail__field">
+    <span>{{ i18n.t("bulk-export-progress") }}</span>
+    <div>{% if !card.progress.is_empty() %}{{ card.progress }}{% else %}{{ i18n.t("bulk-export-progress-waiting") }}{% endif %}</div>
+  </div>
+  <form method="post" action="/ui/bulk-export/active/{{ card.id }}/cancel">
+    <button type="submit" class="btn">{{ i18n.t("bulk-export-cancel") }}</button>
+  </form>
+  {% endif %}
+
+  {% if card.status == "complete" %}
+  <div class="detail__field">
+    <span>{{ i18n.t("bulk-export-files") }}</span>
+    <div>{{ card.file_count }}{% if !card.elapsed.is_empty() %} · {{ i18n.t("bulk-export-finished-in") }} {{ card.elapsed }}{% endif %}</div>
+  </div>
+  {% if !card.files.is_empty() %}
+  <ul>
+    {% for f in card.files %}
+    <li><a href="{{ f.1 }}" download>{{ f.0 }}</a></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% endif %}
+
+  {% if card.status == "failed" %}
+  <div class="detail__field">
+    <span>{{ i18n.t("bulk-export-error") }}</span>
+    <div>{{ card.error }}</div>
+  </div>
+  <form method="post" action="/ui/bulk-export/active/{{ card.id }}/retry">
+    <button type="submit" class="btn">{{ i18n.t("bulk-export-retry") }}</button>
+  </form>
+  {% endif %}
+</div>
