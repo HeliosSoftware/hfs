@@ -4143,11 +4143,12 @@ body.has-nav-panel {
   font-weight: 500;
 }
 
-/* Live-vs-save legend (#366). */
+/* Live-vs-save legend (#366): stacked, inset from the card edge. */
 .editor-legend {
   display: flex;
-  gap: 14px;
-  margin: 4px 0 8px;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 14px 10px;
   color: var(--muted);
   font-size: 11px;
 }
