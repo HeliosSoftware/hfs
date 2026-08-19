@@ -138,8 +138,8 @@ card-export-jobs-sub = en ejecución ({ $queued } en cola)
 card-import-jobs = Trabajos de importación
 card-import-jobs-sub = activos
 card-jobs-unavailable = no disponible
-card-uptime = Disponibilidad
-card-uptime-sub = últimos 30 días
+card-uptime = Tiempo activo
+card-uptime-sub = desde el arranque del proceso
 
 chart-title = Recursos FHIR en el tiempo
 chart-expand = Ampliar el gráfico

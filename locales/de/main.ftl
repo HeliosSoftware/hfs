@@ -138,8 +138,8 @@ card-export-jobs-sub = laufend ({ $queued } in der Warteschlange)
 card-import-jobs = Import-Jobs
 card-import-jobs-sub = aktiv
 card-jobs-unavailable = nicht verfügbar
-card-uptime = Verfügbarkeit
-card-uptime-sub = letzte 30 Tage
+card-uptime = Betriebszeit
+card-uptime-sub = seit Prozessstart
 
 chart-title = FHIR-Ressourcen im Zeitverlauf
 chart-expand = Diagramm vergrößern

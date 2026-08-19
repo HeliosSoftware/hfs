@@ -360,9 +360,9 @@ impl Status {
 ///
 /// `resource_types`, `stored_resources`, `fhir_version`, `export_jobs`,
 /// `import_jobs`, and `chart_total` are derived from the live
-/// [`DashboardSnapshot`] (default tenant). `uptime_percent` describes
-/// availability history, which is not part of that read path and remains a
-/// placeholder value until #540 wires it to a real source.
+/// [`DashboardSnapshot`] (default tenant). `uptime` is the process uptime from
+/// `helios_observability::uptime` (#540); in a cluster it describes only the
+/// node that served this request.
 struct DashboardMetrics {
     fhir_version: String,
     resource_types: String,
@@ -372,8 +372,30 @@ struct DashboardMetrics {
     /// Active bulk-submit (import) jobs for the tenant; `None` renders the
     /// unavailable state.
     import_jobs: Option<u64>,
-    uptime_percent: String,
+    /// Formatted process uptime; `None` renders the unavailable state (the
+    /// uptime tracker was never initialized).
+    uptime: Option<String>,
     chart_total: String,
+}
+
+/// Process uptime as a short human duration ("3d 4h", "5h 12m", "42m", "18s"),
+/// or `None` when the tracker was never initialized and no honest figure
+/// exists.
+fn format_uptime(seconds: f64) -> Option<String> {
+    if seconds <= 0.0 {
+        return None;
+    }
+    let s = seconds as u64;
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60);
+    Some(if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
+    })
 }
 
 /// A single axis gridline or tick, in the chart's `0 0 1060 300` viewBox. `pos`
@@ -1513,8 +1535,7 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
         stored_resources: compact_count(snapshot.total_resources),
         export_jobs: snapshot.export_jobs,
         import_jobs: snapshot.import_jobs_active,
-        // Uptime is still a placeholder until #540 wires it to a real source.
-        uptime_percent: "99.98".to_string(),
+        uptime: format_uptime(helios_observability::uptime::uptime_seconds()),
         chart_total: {
             let sum: u64 = snapshot.series.iter().map(|s| s.total).sum();
             grouped(sum)
@@ -1916,6 +1937,22 @@ mod tests {
             i18n,
             active_page: "home",
         }
+    }
+
+    #[test]
+    fn format_uptime_picks_the_two_leading_units() {
+        assert_eq!(format_uptime(0.0), None);
+        assert_eq!(format_uptime(-5.0), None);
+        assert_eq!(format_uptime(18.4), Some("18s".to_string()));
+        assert_eq!(format_uptime(42.0 * 60.0 + 30.0), Some("42m".to_string()));
+        assert_eq!(
+            format_uptime(5.0 * 3_600.0 + 12.0 * 60.0),
+            Some("5h 12m".to_string())
+        );
+        assert_eq!(
+            format_uptime(3.0 * 86_400.0 + 4.0 * 3_600.0 + 59.0 * 60.0),
+            Some("3d 4h".to_string())
+        );
     }
 
     /// A point at a fixed instant, for geometry tests that don't care when.
