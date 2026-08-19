@@ -168,7 +168,12 @@ where
     // that rely on it.
     //
     // Keyed off `request.url` through the same `parse_request_url` the side
-    // effect itself keys off, so the scan and the write cannot disagree.
+    // effect itself keys off, so the scan and the write cannot disagree. Since
+    // #503 that parse strips the query, so `StructureDefinition?url=…` matches
+    // here where it did not before. Such an entry is refused as conditional
+    // before it writes, which makes the clamp conservative rather than
+    // load-bearing — but the scan and the write still agree, which is the
+    // invariant this is keyed for.
     //
     // NOTE: extend this scan in lockstep with any new cross-entry
     // `state.validation()` mutation added to `process_batch_entry`.
@@ -387,6 +392,45 @@ where
     for (index, entry) in json_entries.iter().enumerate() {
         match parse_bundle_entry(entry) {
             Ok((bundle_entry, full_url)) => {
+                // Entry URLs reach the backends unparsed, and every backend's
+                // `parse_url` splits on `/` alone and takes the last two
+                // segments — sqlite, postgres and mongodb carry byte-equivalent
+                // copies. A query string therefore lands in storage as part of
+                // the resource type or the id: `PUT Patient?identifier=http://…`
+                // commits a row typed `Patient?identifier=http:`, and
+                // `PUT Patient/123?_format=json` commits one whose id is
+                // `123?_format=json`. `PUT Patient?name=peter` yields a single
+                // segment and fails the whole bundle with a message about the
+                // URL format instead. Decline here, before anything executes, so
+                // the bundle is declined intact (#503).
+                //
+                // GET is exempt — but not because this path resolves searches.
+                // It does not: a GET entry still reaches the backend's
+                // `parse_url`, and a query-bearing one still fails there. The
+                // exemption keeps this guard off the arm #478 is rewriting, so
+                // that work lands on an untouched dispatch path instead of
+                // merging against a refusal it is about to replace.
+                //
+                // `ifNoneExist` is left alone too — MongoDB resolves it inside
+                // the session, so refusing it here would remove a working,
+                // atomic feature. Resolving URL criteria within a transaction's
+                // atomic scope is #511.
+                if !matches!(bundle_entry.method, BundleMethod::Get)
+                    && bundle_entry.url.contains('?')
+                {
+                    return Err(RestError::NotSupported {
+                        feature: format!(
+                            "Transaction entry {} ({} {}) carries a query string. This \
+                             server cannot resolve one inside a transaction's atomic \
+                             scope, so no entries were applied. Submit it in a batch \
+                             Bundle, or address the instance directly.",
+                            index,
+                            bundle_method_to_http_method(&bundle_entry.method),
+                            bundle_entry.url
+                        ),
+                    });
+                }
+
                 // Enforce per-entry scope authorization for transactions.
                 // Transactions are atomic so any denied entry rejects the whole bundle.
                 if let Some(principal) = principal {
@@ -650,6 +694,30 @@ where
         }
     }
 
+    // A query on a type-level URL is FHIR conditional criteria, and this path
+    // cannot resolve one — that needs a search, which is #511. Refuse it
+    // explicitly rather than dispatch something else: before #503 the criteria
+    // rode along in `resource_type`, so a conditional PUT reached
+    // `create_or_update` with an empty id and wrote a row no search can address.
+    //
+    // GET is exempt. A query there is a search rather than a condition, and
+    // executing it is #478's deliverable; leaving the arm untouched keeps this
+    // fix off that diff.
+    if method != "GET"
+        && let Some(criteria) = conditional_criteria(url, &id)
+    {
+        return create_error_result(
+            400,
+            &format!(
+                "Conditional interactions are not supported in Bundle entries \
+                 (entry {index}: {method} {url}). Criteria were not applied and \
+                 nothing was written. Address the instance directly, or perform \
+                 the conditional interaction against the resource endpoint. \
+                 Criteria: {criteria}"
+            ),
+        );
+    }
+
     match method {
         "GET" => {
             // Read operation
@@ -714,6 +782,19 @@ where
                 }
             };
 
+            // `PUT Patient` names no instance to update. Left to fall through it
+            // reaches `create_or_update` with an empty id, and that writes a row
+            // rather than rejecting: the backend inserts `"id": ""` into the
+            // resource before delegating to `create`, whose id fallback fires on
+            // an absent id, not an empty one. Every later such entry then reads
+            // that row back and overwrites it (#503).
+            if id.is_empty() {
+                return create_error_result(
+                    400,
+                    "PUT entry request.url must address an instance ('[type]/[id]')",
+                );
+            }
+
             // Ahead of validation, because every backend evaluates `ifMatch`
             // first: a stale precondition carrying an invalid body is a 412,
             // not a 422.
@@ -767,6 +848,16 @@ where
             }
         }
         "DELETE" => {
+            // Mirror of the PUT guard above. FHIR defines no unconditional
+            // type-level delete, and an empty id would otherwise target the
+            // empty-id row a pre-#503 conditional PUT could have written.
+            if id.is_empty() {
+                return create_error_result(
+                    400,
+                    "DELETE entry request.url must address an instance ('[type]/[id]')",
+                );
+            }
+
             // Honour `ifMatch` on DELETE: a client asking to delete only the
             // version it reviewed must not destroy a concurrent amendment.
             if let Some(failure) =
@@ -996,18 +1087,54 @@ fn extract_outcome_description(outcome: Option<&Value>) -> Option<String> {
 }
 
 /// Parses a request URL to extract resource type and optional ID.
+///
+/// The query string is split off **before** the path is parsed. FHIR conditional
+/// criteria routinely contain `/` — the spec's own transaction example carries
+/// `Patient?identifier=http:/example.org/fhir/ids|456456` — so splitting the raw
+/// URL on `/` first folds the criteria into the resource type, and the caller
+/// then addresses storage with a type like `Patient?identifier=http:` (#503).
+///
+/// Empty segments are dropped rather than yielded, so a leading `/` and the
+/// `[type]/?[criteria]` form that `http.html` prints for conditional delete both
+/// reduce to the type alone instead of producing an empty id.
+///
+/// The query itself is deliberately not returned. Callers refuse conditional
+/// entries via [`conditional_criteria`]; resolving them is #511.
 fn parse_request_url(url: &str) -> Result<(String, String), String> {
-    let parts: Vec<&str> = url.trim_start_matches('/').split('/').collect();
+    let path = url.split_once('?').map_or(url, |(path, _)| path);
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
 
-    match parts.len() {
-        0 => Err("Empty URL".to_string()),
-        1 => Ok((parts[0].to_string(), String::new())),
-        2 => Ok((parts[0].to_string(), parts[1].to_string())),
-        _ => {
-            // Handle URLs like Patient/123/_history/1
-            Ok((parts[0].to_string(), parts[1].to_string()))
-        }
+    // Unlike the previous `Vec`-and-`match` shape, this arm is reachable: an
+    // absent or empty `request.url` used to parse as the resource type `""`,
+    // which the POST arm then created a row under.
+    let resource_type = segments
+        .next()
+        .ok_or_else(|| "Entry request.url is empty".to_string())?;
+
+    // `Patient/123/_history/1` addresses `Patient/123`; anything past the id
+    // qualifies that address rather than extending it.
+    Ok((
+        resource_type.to_string(),
+        segments.next().unwrap_or_default().to_string(),
+    ))
+}
+
+/// Returns the conditional criteria an entry URL carries, if any.
+///
+/// A query on a **type-level** URL (`Patient?identifier=x`) is FHIR conditional
+/// criteria. A query on an **instance** URL (`Patient/123?_format=json`) is a
+/// control parameter — the entry addresses a known resource either way — so it
+/// is not reported here.
+///
+/// A bare `Patient?` carries no criteria and is not conditional; treating it as
+/// one would match every resource of the type.
+fn conditional_criteria<'a>(url: &'a str, id: &str) -> Option<&'a str> {
+    if !id.is_empty() {
+        return None;
     }
+    url.split_once('?')
+        .map(|(_, query)| query)
+        .filter(|query| !query.is_empty())
 }
 
 /// Creates an error BundleEntryResult.
@@ -2193,6 +2320,17 @@ mod tests {
         })];
         assert_eq!(batch_concurrency(&state, &url_only), 1);
 
+        // Since #503 the parse strips the query, so a conditional conformance
+        // URL is caught here where it silently was not before. Such an entry is
+        // refused before it writes, which makes this clamp conservative — but
+        // the scan and the write must not disagree, which is what it is keyed
+        // for.
+        let conditional = [serde_json::json!({
+            "request": { "method": "PUT", "url": "StructureDefinition?url=http://example.org/sd" },
+            "resource": { "resourceType": "StructureDefinition" }
+        })];
+        assert_eq!(batch_concurrency(&state, &conditional), 1);
+
         // A bundle with no conformance writes resolves normally. Compared
         // against the empty bundle rather than a literal, so this test stays
         // about the carve-out; the cap itself is pinned by
@@ -2205,6 +2343,163 @@ mod tests {
             batch_concurrency(&state, &[])
         );
         assert!(batch_concurrency(&state, &data_only) > 1);
+    }
+
+    /// The query is split off before the path, so conditional criteria never
+    /// ride along in the resource type (#503).
+    #[test]
+    fn parse_request_url_splits_the_query_off_before_the_path() {
+        // The shape from the issue: the `//` inside the criteria produced an
+        // empty path segment, and the criteria became the resource type.
+        assert_eq!(
+            parse_request_url("Patient?identifier=http://example.org|12345").unwrap(),
+            ("Patient".to_string(), String::new())
+        );
+        // The spec's own transaction example carries `/` inside its criteria.
+        assert_eq!(
+            parse_request_url("Patient?identifier=http:/example.org/fhir/ids|456456").unwrap(),
+            ("Patient".to_string(), String::new())
+        );
+        // `[type]/?[criteria]` is the form `http.html` prints for conditional
+        // delete; the empty segment must not become an id.
+        assert_eq!(
+            parse_request_url("Patient/?identifier=x").unwrap(),
+            ("Patient".to_string(), String::new())
+        );
+        // A query on an instance URL qualifies the request; it is not the id.
+        assert_eq!(
+            parse_request_url("Patient/p1?_format=json").unwrap(),
+            ("Patient".to_string(), "p1".to_string())
+        );
+    }
+
+    /// Shapes that already resolved keep resolving identically.
+    #[test]
+    fn parse_request_url_still_addresses_types_instances_and_history() {
+        for (url, expected_type, expected_id) in [
+            ("Patient", "Patient", ""),
+            ("Patient/p1", "Patient", "p1"),
+            ("/Patient/p1", "Patient", "p1"),
+            ("Patient/p1/_history/2", "Patient", "p1"),
+        ] {
+            assert_eq!(
+                parse_request_url(url).unwrap(),
+                (expected_type.to_string(), expected_id.to_string()),
+                "url: {url}"
+            );
+        }
+    }
+
+    /// The empty-URL arm used to be unreachable — `str::split` always yields at
+    /// least one element, so an absent `request.url` parsed as the resource type
+    /// `""` and the POST arm created a row under it.
+    #[test]
+    fn parse_request_url_rejects_a_url_with_no_resource_type() {
+        for url in ["", "/", "?identifier=x"] {
+            assert!(parse_request_url(url).is_err(), "url: {url}");
+        }
+    }
+
+    #[test]
+    fn conditional_criteria_only_fires_on_a_type_level_url() {
+        assert_eq!(
+            conditional_criteria("Patient?identifier=x", ""),
+            Some("identifier=x")
+        );
+        // An instance URL already addresses its target.
+        assert_eq!(conditional_criteria("Patient/p1?_format=json", "p1"), None);
+        // Nothing to condition on. A bare `Patient?` in particular must not be
+        // read as criteria — that would match every Patient.
+        assert_eq!(conditional_criteria("Patient", ""), None);
+        assert_eq!(conditional_criteria("Patient?", ""), None);
+    }
+
+    /// A conditional write is refused per-entry and never reaches storage.
+    ///
+    /// `DelayStorage::create_or_update` and `::delete` are `unimplemented!()`,
+    /// so this panics rather than merely failing if a refusal is ever moved
+    /// after dispatch.
+    #[tokio::test]
+    async fn conditional_write_entries_are_refused_before_they_reach_storage() {
+        let state = state_with(DelayStorage::new(8, 0));
+
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                {
+                    "request": { "method": "PUT", "url": "Patient?identifier=http://example.org|1" },
+                    "resource": { "resourceType": "Patient" }
+                },
+                { "request": { "method": "DELETE", "url": "Patient?identifier=x" } },
+                {
+                    "request": { "method": "POST", "url": "Patient?identifier=x" },
+                    "resource": { "resourceType": "Patient" }
+                },
+            ]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        let entries = response["entry"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry["response"]["status"], "400 Bad Request",
+                "entry {index}: {entry}"
+            );
+        }
+        assert_eq!(state.storage().peak(), 0, "no entry may reach storage");
+    }
+
+    /// A type-level URL with no criteria names no instance. Left to fall
+    /// through, `PUT Patient` reached `create_or_update` with an empty id, and
+    /// the backend wrote a row rather than rejecting (#503).
+    #[tokio::test]
+    async fn type_level_writes_without_an_id_are_refused() {
+        let state = state_with(DelayStorage::new(8, 0));
+
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                {
+                    "request": { "method": "PUT", "url": "Patient" },
+                    "resource": { "resourceType": "Patient" }
+                },
+                { "request": { "method": "DELETE", "url": "Patient" } },
+            ]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        let entries = response["entry"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry["response"]["status"], "400 Bad Request",
+                "entry {index}: {entry}"
+            );
+        }
+        assert_eq!(state.storage().peak(), 0, "no entry may reach storage");
+    }
+
+    /// An instance-addressed entry carrying a control parameter still resolves:
+    /// the query is dropped, not treated as criteria.
+    #[tokio::test]
+    async fn an_instance_url_with_a_query_still_addresses_its_instance() {
+        let state = state_with(DelayStorage::new(8, 0));
+
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                { "request": { "method": "GET", "url": "Patient/p1?_format=json" } },
+            ]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        let entry = &response["entry"][0];
+        assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
+        assert_eq!(entry["resource"]["id"], "p1");
     }
 
     /// Scope enforcement stays per-entry when entries run concurrently: denied

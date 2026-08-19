@@ -908,3 +908,240 @@ mod conditional_references {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 }
+
+// =============================================================================
+// Conditional Entry Tests (#503)
+// =============================================================================
+
+/// Conditional interactions expressed in an entry URL (`[type]?[criteria]`) are
+/// refused rather than resolved, and — the point of #503 — nothing is written.
+///
+/// Before the fix the criteria rode along inside the parsed resource type, so a
+/// conditional `PUT`/`DELETE` addressed storage with a type like
+/// `Patient?identifier=http:` and an empty id. Resolving these is #511.
+mod conditional_entries {
+    use super::*;
+
+    /// Posts a bundle and returns the raw response without asserting on status,
+    /// so declined transactions can be inspected.
+    async fn post_bundle(server: &TestServer, bundle: Value) -> axum_test::TestResponse {
+        server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&bundle)
+            .await
+    }
+
+    async fn patient_count(backend: &SqliteBackend) -> u64 {
+        backend
+            .count(&test_tenant(), Some("Patient"))
+            .await
+            .expect("count failed")
+    }
+
+    #[tokio::test]
+    async fn conditional_put_is_refused_and_writes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": {
+                        "method": "PUT",
+                        "url": "Patient?identifier=http://example.org|12345"
+                    },
+                    "resource": { "resourceType": "Patient", "name": [{"family": "Conditional"}] }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "a refused conditional PUT must not create a resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_is_refused_and_deletes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": { "method": "DELETE", "url": "Patient?name=Nguyen" }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "a refused conditional DELETE must not remove a resource"
+        );
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "p1")
+                .await
+                .expect("read failed")
+                .is_some(),
+            "the seeded patient must survive"
+        );
+    }
+
+    /// The corruption #503 closes: `create_or_update` with an empty id inserts
+    /// `"id": ""` into the resource and delegates to `create`, whose id fallback
+    /// fires on an absent id rather than an empty one — so the row is written,
+    /// and every later type-level PUT reads it back and overwrites it.
+    #[tokio::test]
+    async fn a_type_level_put_never_writes_an_empty_id_row() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": { "method": "PUT", "url": "Patient" },
+                    "resource": { "resourceType": "Patient", "name": [{"family": "NoId"}] }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(patient_count(&backend).await, before);
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "")
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "no resource may be stored under the empty id"
+        );
+    }
+
+    /// An instance URL carrying a control parameter still addresses its
+    /// instance — the query is dropped, not read as criteria.
+    #[tokio::test]
+    async fn an_instance_url_with_a_query_still_resolves() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": { "method": "GET", "url": "Patient/p1?_format=json" }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "200 OK");
+        assert_eq!(body["entry"][0]["resource"]["id"], "p1");
+    }
+
+    /// A transaction carrying a query-bearing non-GET entry is declined whole,
+    /// before anything executes — so the sibling create in the same bundle must
+    /// not have landed. Backends parse entry URLs query-blind, so letting it
+    /// through commits the criteria as part of the resource type or the id.
+    #[tokio::test]
+    async fn a_transaction_with_a_conditional_url_is_declined_intact() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [
+                    {
+                        "request": { "method": "POST", "url": "Patient" },
+                        "resource": { "resourceType": "Patient", "name": [{"family": "Sibling"}] }
+                    },
+                    {
+                        "request": {
+                            "method": "PUT",
+                            "url": "Patient?identifier=http://example.org|12345"
+                        },
+                        "resource": { "resourceType": "Patient" }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["code"], "not-supported");
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "the bundle must be declined before any entry is applied"
+        );
+    }
+
+    /// GET entries are left to #478: a transaction search URL is not declined
+    /// by the query guard, so that work lands on an untouched arm.
+    #[tokio::test]
+    async fn a_transaction_get_with_a_query_is_not_declined_by_the_query_guard() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [{
+                    "request": { "method": "GET", "url": "Patient?name=Nguyen" }
+                }]
+            }),
+        )
+        .await;
+
+        let body: Value = response.json();
+        // `details.text`, not `diagnostics`: the guard raises
+        // `RestError::NotSupported`, and `create_operation_outcome` writes only
+        // `details.text` — `RestError` never renders a `diagnostics` field. As
+        // written against `diagnostics` the third conjunct was unsatisfiable,
+        // so `declined_by_the_guard` was permanently false and the negated
+        // assert below held even if a GET entry *were* declined by the guard,
+        // which is the one thing this test exists to catch.
+        let declined_by_the_guard = body["resourceType"] == "OperationOutcome"
+            && body["issue"][0]["code"] == "not-supported"
+            && body["issue"][0]["details"]["text"]
+                .as_str()
+                .is_some_and(|d| d.contains("carries a query string"));
+        assert!(
+            !declined_by_the_guard,
+            "GET entries must stay on #478's path, not this guard: {body}"
+        );
+    }
+}
