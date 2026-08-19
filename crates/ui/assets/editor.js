@@ -358,9 +358,15 @@
         event.target.classList.add("editor-json__act--on");
       } else {
         // Leaving raw: the text becomes the document, and the form re-renders.
+        // Close the pane before the round trip — the state capture during the
+        // swap keeps raw mode alive, and this is the one re-render that must
+        // read as "the user left raw mode".
         var source = document.getElementById("editor-source");
         var field = document.getElementById("editor-doc");
         if (source && field) field.value = source.value;
+        raw.hidden = true;
+        viewEl.hidden = false;
+        event.target.classList.remove("editor-json__act--on");
         send("");
       }
       return;

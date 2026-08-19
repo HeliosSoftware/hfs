@@ -187,9 +187,14 @@
       if (!raw || !viewEl) return;
       if (raw.hidden) { raw.hidden = false; viewEl.hidden = true; event.target.classList.add("editor-json__act--on"); }
       else {
+        // Same as the standalone page: close the pane before the round trip
+        // so the raw-mode persistence reads this re-render as leaving raw.
         var src = editorBody.querySelector("#editor-source");
         var fld = editorBody.querySelector("#editor-doc");
         if (src && fld) fld.value = src.value;
+        raw.hidden = true;
+        viewEl.hidden = false;
+        event.target.classList.remove("editor-json__act--on");
         editorSend("");
       }
       return;
