@@ -143,7 +143,7 @@ card-import-jobs = Import jobs
 card-import-jobs-sub = active
 card-jobs-unavailable = unavailable
 card-uptime = Uptime
-card-uptime-sub = last 30 days
+card-uptime-sub = since process start
 
 chart-title = FHIR resources over time
 chart-expand = Expand chart

@@ -648,12 +648,6 @@ button.menu__option {
   color: var(--text);
 }
 
-.stat__unit {
-  font-size: 17px;
-  letter-spacing: -0.3px;
-  vertical-align: 12px;
-}
-
 .stat__sub {
   display: block;
   margin-top: 6px;
