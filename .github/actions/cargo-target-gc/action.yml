@@ -32,7 +32,25 @@ description: >
 # Scope: this caps `target/` only. `~/.cargo/registry` also grows without bound
 # (every `.crate` tarball and unpacked source ever resolved), but far more
 # slowly — it is measured in single-digit GB, not hundreds. If it ever becomes
-# the problem it needs a different tool; cargo-sweep does not touch it.
+# the problem it needs a different tool; cargo-sweep does not touch it. The
+# `free-floor-gb` warning exists so that "something *else* on this box is
+# filling up" surfaces in a job log rather than as a mystery.
+#
+# Why two near-identical steps below
+# ----------------------------------
+# This originally skipped Windows on the grounds that "the Windows runner is not
+# the one running out of space". That stopped being true immediately: agent4 is
+# the sole Windows agent, `test-fhirpath` is pinned to it and checks out with
+# `clean: false`, and the unpinned `runs-on: [self-hosted]` jobs land there too
+# — so it accumulated a full all-features workspace target dir with nothing ever
+# evicting it, and filled the disk. Skipping it was the bug.
+#
+# The plain `shell: bash` alias resolves to WSL bash on that agent, which has no
+# distro installed and aborts before running a line, so the Windows step points
+# at Git Bash through its space-free 8.3 short path — the same workaround
+# ci.yml already uses for its bash-only steps. Both steps run the identical
+# `sweep.sh` with the identical arguments; the script lives in a file rather
+# than inline precisely so the two paths cannot drift.
 
 inputs:
   maxsize:
@@ -41,8 +59,27 @@ inputs:
       directory is under this. ALWAYS pass an explicit unit: a bare number is
       interpreted as MEGABYTES, so `100` means 100MB and would evict essentially
       the entire warm cache on every run.
+
+      100GB suits every agent we have: the smallest disk in the fleet is the
+      1.5TB C: on the Windows agent, so the ceiling leaves an order of magnitude
+      of headroom while still bounding the thing that compounds. Check this
+      assumption before adding a runner with a smaller disk — a ceiling above
+      the volume size is a no-op, not a cap.
     required: false
     default: 100GB
+  free-floor-gb:
+    description: >
+      Emit a `::warning::` when the checkout's filesystem has less than this
+      many GB free *after* sweeping. Not a failure — it is the early signal that
+      something this action does not manage is filling the runner. `0` disables.
+
+      100 rather than something tighter because a single job here can consume
+      tens of GB in one go: an all-features workspace build, or `cargo llvm-cov`
+      laying down a whole second instrumented profile. A floor that only trips
+      at 20GB free would routinely fire for the first time on the run that
+      already failed.
+    required: false
+    default: "100"
   cargo-sweep-version:
     description: >
       Pinned cargo-sweep version. >=0.7.0 is required for unit suffixes on
@@ -53,68 +90,23 @@ inputs:
 runs:
   using: composite
   steps:
-    # `runs-on: [self-hosted]` is unpinned on several ci.yml jobs, so this
-    # action can land on the Windows runner, where the plain `shell: bash` alias
-    # is unreliable (see the Git Bash 8.3-path workaround in ci.yml). The
-    # Windows runner is not the one running out of space; skip rather than
-    # invent a second code path for it.
-    - name: Cap target dir size
+    - name: Cap target dir size (Unix)
       if: runner.os != 'Windows'
       shell: bash
-      run: |
-        # `set +e` is load-bearing, and NOT redundant with omitting `set -e`.
-        # Actions invokes `shell: bash` as
-        #   /usr/bin/bash --noprofile --norc -e -o pipefail {0}
-        # so errexit is already on at the process level before the first line
-        # runs; simply not turning it on does not turn it off. Without this the
-        # very first probe -- `cargo sweep --version` on a runner that has not
-        # got cargo-sweep yet -- exits the script with cargo's 101 and fails the
-        # job, which is exactly the opposite of what this step is for. That is
-        # not hypothetical: it happened on the first CI run of this action.
-        #
-        # This is janitorial work running under `if: always()`. Failing to
-        # reclaim space must never turn a green build red, so every command
-        # below is non-fatal and reports loudly instead, and the script ends in
-        # an explicit `exit 0`.
-        set +e
-        set -uo pipefail
+      env:
+        MAXSIZE: ${{ inputs.maxsize }}
+        WANT: ${{ inputs.cargo-sweep-version }}
+        FREE_FLOOR_GB: ${{ inputs.free-floor-gb }}
+      # `${GITHUB_ACTION_PATH//\\//}` — the runner hands this out in native form,
+      # so on Windows it arrives with backslashes, which bash reads as escapes.
+      # Normalising in both steps keeps the two `run:` bodies byte-identical.
+      run: bash "${GITHUB_ACTION_PATH//\\//}/sweep.sh"
 
-        MAXSIZE='${{ inputs.maxsize }}'
-        WANT='${{ inputs.cargo-sweep-version }}'
-
-        if [ ! -d target ]; then
-          echo "No target/ directory in $(pwd) — nothing to sweep."
-          exit 0
-        fi
-
-        # Guard against the footgun the flag invites. cargo-sweep's own help
-        # says "Unit defaults to MB", so `--maxsize 100` means 100 megabytes,
-        # not 100 gigabytes. Refuse a unitless value rather than silently
-        # nuking the cache the `clean: false` checkouts exist to preserve.
-        if ! printf '%s' "$MAXSIZE" | grep -qiE '^[0-9]+(\.[0-9]+)?[[:space:]]*(k|m|g|t)i?b$'; then
-          echo "::error::maxsize='${MAXSIZE}' has no unit suffix. cargo-sweep reads a bare number as MEGABYTES, which would wipe the warm build cache on every run. Use e.g. 100GB."
-          exit 0
-        fi
-
-        HAVE="$(cargo sweep --version 2>/dev/null | awk '{print $NF}')"
-        if [ "$HAVE" != "$WANT" ]; then
-          echo "cargo-sweep: have '${HAVE:-none}', want '${WANT}' — installing."
-          cargo install cargo-sweep --locked --version "$WANT" || true
-        fi
-        if ! cargo sweep --version >/dev/null 2>&1; then
-          echo "::warning::cargo-sweep unavailable (install failed?); skipping target dir GC. This runner's target/ is unbounded until a later run succeeds."
-          exit 0
-        fi
-
-        # `du` on a multi-million-file target dir is not instant, but it is the
-        # only number that makes the trend legible in the job log. Both calls
-        # are non-fatal so a transient stat error cannot break the step.
-        before="$(du -sh target 2>/dev/null | cut -f1)"
-        cargo sweep --maxsize "$MAXSIZE" || true
-        after="$(du -sh target 2>/dev/null | cut -f1)"
-        echo "target/: ${before:-?} before, ${after:-?} after (ceiling ${MAXSIZE})."
-        df -h . 2>/dev/null | tail -2 || true
-
-        # Belt and braces: the step's exit status is the last command's, and no
-        # future edit to the reporting above should be able to fail the job.
-        exit 0
+    - name: Cap target dir size (Windows)
+      if: runner.os == 'Windows'
+      shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+      env:
+        MAXSIZE: ${{ inputs.maxsize }}
+        WANT: ${{ inputs.cargo-sweep-version }}
+        FREE_FLOOR_GB: ${{ inputs.free-floor-gb }}
+      run: bash "${GITHUB_ACTION_PATH//\\//}/sweep.sh"

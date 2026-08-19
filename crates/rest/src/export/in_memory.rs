@@ -3,13 +3,14 @@
 //! Each job runs inside a `tokio::spawn` task, bounded by a `Semaphore`.
 //! Results are stored in a `DashMap<JobId, JobStatus>`.
 //!
-//! Two kinds of work are executed (see [`ExportWork`]):
-//! - **Views** (`$viewdefinition-export`) — each named ViewDefinition is run
-//!   through the `SofRunner` and its rows are sharded into output files.
-//! - **SQL queries** (`$sqlquery-export`) — each named query's table sources
-//!   are materialized into an in-memory SQLite engine via the `SofRunner`,
-//!   the (pre-validated) SQL is executed, and the result rows are sharded
-//!   into output files.
+//! A job carries a mixture of subjects (see [`ExportWork`]), computed against
+//! one snapshot of the data and written into one manifest:
+//! - **Views** — each named ViewDefinition is run through the `SofRunner` and
+//!   its rows are sharded into output files.
+//! - **SQL queries** — each named SQLQuery/SQLView Library's table sources are
+//!   materialized into an in-memory SQLite engine via the `SofRunner`, the
+//!   (pre-validated) SQL is executed, and the result rows are sharded into
+//!   output files.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,8 +25,8 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::controller::{
-    CompletedFile, ExportError, ExportJobController, ExportTask, ExportWork, JobId, JobStatus,
-    NamedSqlQuery, NamedView, SqlExportLimits,
+    CompletedFile, ExportError, ExportJobController, ExportTask, JobId, JobStatus, NamedSqlQuery,
+    NamedView, SqlExportLimits,
 };
 use super::planner;
 use super::sink::ExportSink;
@@ -169,35 +170,47 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             // Acquire concurrency permit (blocks if too many jobs running)
             let _permit = semaphore.acquire().await;
 
-            let outcome = match &task.work {
-                ExportWork::Views(views) => {
-                    run_views_job(
-                        &jobs,
-                        &jid,
-                        submitted_at,
-                        &runner,
-                        &sink,
-                        shard_rows,
-                        &task,
-                        views,
-                    )
-                    .await
-                }
-                ExportWork::SqlQueries { queries, limits } => {
-                    run_sqlquery_job(
-                        &jobs,
-                        &jid,
-                        submitted_at,
-                        &runner,
-                        &sink,
-                        shard_rows,
-                        &task,
-                        queries,
-                        *limits,
-                    )
-                    .await
-                }
-            };
+            // One job, one snapshot, any mixture of subjects. Views run first,
+            // then queries, and their outputs are concatenated into a single
+            // manifest. Progress counts every subject so the X-Progress
+            // percentage tracks real work across both halves.
+            let total_subjects = task.work.subject_count().max(1) as u32;
+            let outcome = async {
+                let (mut files, mut rows) = run_views_job(
+                    &jobs,
+                    &jid,
+                    submitted_at,
+                    &runner,
+                    &sink,
+                    shard_rows,
+                    &task,
+                    &task.work.views,
+                    0,
+                    total_subjects,
+                )
+                .await?;
+
+                let (query_files, query_rows) = run_sqlquery_job(
+                    &jobs,
+                    &jid,
+                    submitted_at,
+                    &runner,
+                    &sink,
+                    shard_rows,
+                    &task,
+                    &task.work.queries,
+                    task.work.limits,
+                    task.work.views.len() as u32,
+                    total_subjects,
+                    files.len(),
+                )
+                .await?;
+
+                files.extend(query_files);
+                rows += query_rows;
+                Ok::<_, String>((files, rows))
+            }
+            .await;
 
             match outcome {
                 Ok((completed_files, total_rows)) => {
@@ -414,7 +427,7 @@ fn record_progress(
     );
 }
 
-/// `$viewdefinition-export` work: run each named ViewDefinition through the
+/// The ViewDefinition half of an export job: run each named view through the
 /// `SofRunner` and shard its rows into output files.
 #[allow(clippy::too_many_arguments)]
 async fn run_views_job<Sink: ExportSink>(
@@ -426,18 +439,20 @@ async fn run_views_job<Sink: ExportSink>(
     shard_rows: usize,
     task: &ExportTask,
     views: &[NamedView],
+    // `progress_offset`: subjects already finished before this half started.
+    // `total_subjects`: subjects in the whole job, views and queries together.
+    progress_offset: u32,
+    total_subjects: u32,
 ) -> Result<(Vec<CompletedFile>, usize), String> {
-    let view_count = views.len().max(1) as u32;
     let format = task.format.to_lowercase();
     let ext = ext_for(&format);
 
     let mut completed_files: Vec<CompletedFile> = Vec::new();
     let mut total_rows: usize = 0;
 
-    // Spec: `view` is 1..* — run each ViewDefinition and produce its own set
-    // of output shards. `output.name` in the manifest carries the per-view
-    // name. Progress advances by `1/view_count` per view finished so the
-    // X-Progress percentage tracks real work.
+    // Each ViewDefinition subject produces its own set of output shards, and
+    // `output.name` in the manifest carries its name. Progress advances by one
+    // subject per view finished.
     for (view_idx, named) in views.iter().enumerate() {
         let stream = runner
             .run_view(&task.tenant, named.view.clone(), task.filters.clone())
@@ -486,15 +501,21 @@ async fn run_views_job<Sink: ExportSink>(
             });
         }
 
-        record_progress(jobs, jid, submitted_at, (view_idx as u32) + 1, view_count);
+        record_progress(
+            jobs,
+            jid,
+            submitted_at,
+            progress_offset + (view_idx as u32) + 1,
+            total_subjects,
+        );
     }
 
     Ok((completed_files, total_rows))
 }
 
-/// `$sqlquery-export` work: materialize each query's table sources via the
-/// `SofRunner`, execute the pre-validated SQL, and shard the result rows into
-/// output files.
+/// The SQLQuery / SQLView half of an export job: materialize each subject's
+/// table sources via the `SofRunner`, execute the pre-validated SQL, and shard
+/// the result rows into output files.
 #[allow(clippy::too_many_arguments)]
 async fn run_sqlquery_job<Sink: ExportSink>(
     jobs: &DashMap<String, JobStatus>,
@@ -506,8 +527,14 @@ async fn run_sqlquery_job<Sink: ExportSink>(
     task: &ExportTask,
     queries: &[NamedSqlQuery],
     limits: SqlExportLimits,
+    // `progress_offset`: subjects already finished before this half started.
+    // `total_subjects`: subjects in the whole job, views and queries together.
+    // `shard_offset`: shards already written by the views half, so shard
+    // filenames stay unique across the whole job.
+    progress_offset: u32,
+    total_subjects: u32,
+    shard_offset: usize,
 ) -> Result<(Vec<CompletedFile>, usize), String> {
-    let query_count = queries.len().max(1) as u32;
     let format = task.format.to_lowercase();
     let ext = ext_for(&format);
 
@@ -526,7 +553,7 @@ async fn run_sqlquery_job<Sink: ExportSink>(
             let data = format_query_rows(&result, range, &format, task.header)
                 .map_err(|e| format!("query '{}': {e}", query.name))?;
 
-            let shard_key = completed_files.len();
+            let shard_key = shard_offset + completed_files.len();
             let filename = sink
                 .write_shard(jid, shard_key, data, ext)
                 .map_err(|e| format!("query '{}': {e}", query.name))?;
@@ -539,14 +566,20 @@ async fn run_sqlquery_job<Sink: ExportSink>(
             });
         }
 
-        record_progress(jobs, jid, submitted_at, (query_idx as u32) + 1, query_count);
+        record_progress(
+            jobs,
+            jid,
+            submitted_at,
+            progress_offset + (query_idx as u32) + 1,
+            total_subjects,
+        );
     }
 
     Ok((completed_files, total_rows))
 }
 
 /// Materializes a query's table sources and executes its SQL, enforcing the
-/// same row caps and timeout as the synchronous `$sqlquery-run` operation.
+/// same row caps and timeout as the synchronous `$sql-run` operation.
 /// The export operations emit flat formats only (csv/ndjson/parquet/json), so
 /// the result's JSON cell values feed `format_output` directly.
 async fn execute_sql_query(
@@ -587,7 +620,7 @@ async fn execute_sql_query(
     }
 
     // Run the user SQL on a blocking thread with a watchdog timeout, exactly
-    // like the synchronous `$sqlquery-run` path.
+    // like the synchronous `$sql-run` path.
     let interrupt = engine.interrupt_handle();
     let timeout_secs = limits.timeout_secs;
     let watchdog = tokio::spawn(async move {
@@ -638,7 +671,7 @@ fn format_rows(
 }
 
 /// Serializes a shard of SQL query result rows through
-/// `helios_sof::format_output` (matching the `$sqlquery-run` bytes). The
+/// `helios_sof::format_output` (matching the `$sql-run` bytes). The
 /// export operations support flat formats only; `fhir` is a run-operation
 /// format and is rejected at kick-off.
 fn format_query_rows(
@@ -661,7 +694,7 @@ fn format_query_rows(
         _ => helios_sof::ContentType::NdJson,
     };
     // Build a ProcessedResult directly so columns keep their SQL order
-    // (mirrors the `$sqlquery-run` handler).
+    // (mirrors the `$sql-run` handler).
     let processed = helios_sof::ProcessedResult {
         columns: result.columns.clone(),
         rows: rows
@@ -781,6 +814,7 @@ fn csv_cell(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::export::controller::ExportWork;
     use crate::export::sink::InMemorySink;
     use async_trait::async_trait;
     use helios_persistence::core::sof_runner::{RowStream, SofError, ViewFilters};
@@ -825,15 +859,18 @@ mod tests {
 
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
         let job_id = controller.submit(ExportTask {
-            work: ExportWork::Views(vec![NamedView {
-                name: "patients".to_string(),
-                view: serde_json::json!({
-                    "resourceType": "ViewDefinition",
-                    "resource": "Patient",
-                    "status": "active",
-                    "select": [{"column": [{"name": "id", "path": "id"}]}]
-                }),
-            }]),
+            work: ExportWork {
+                views: vec![NamedView {
+                    name: "patients".to_string(),
+                    view: serde_json::json!({
+                        "resourceType": "ViewDefinition",
+                        "resource": "Patient",
+                        "status": "active",
+                        "select": [{"column": [{"name": "id", "path": "id"}]}]
+                    }),
+                }],
+                ..Default::default()
+            },
             tenant,
             filters: ViewFilters::default(),
             format: "ndjson".to_string(),
@@ -876,15 +913,18 @@ mod tests {
 
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
         let job_id = controller.submit(ExportTask {
-            work: ExportWork::Views(vec![NamedView {
-                name: "patients".to_string(),
-                view: serde_json::json!({
-                    "resourceType": "ViewDefinition",
-                    "resource": "Patient",
-                    "status": "active",
-                    "select": [{"column": [{"name": "id", "path": "id"}]}]
-                }),
-            }]),
+            work: ExportWork {
+                views: vec![NamedView {
+                    name: "patients".to_string(),
+                    view: serde_json::json!({
+                        "resourceType": "ViewDefinition",
+                        "resource": "Patient",
+                        "status": "active",
+                        "select": [{"column": [{"name": "id", "path": "id"}]}]
+                    }),
+                }],
+                ..Default::default()
+            },
             tenant,
             filters: ViewFilters::default(),
             format: "ndjson".to_string(),

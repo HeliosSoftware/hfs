@@ -1,6 +1,6 @@
 //! Shared helpers for resolving FHIR references inside SQL-on-FHIR handlers.
 //!
-//! `$viewdefinition-run` and `$sqlquery-run` both accept references in two
+//! `$sql-run` accepts references in two
 //! shapes: a relative `Type/{id}` and an absolute canonical URL (optionally
 //! with a `|version` suffix). This module centralises the resolution so both
 //! handlers stay in sync.

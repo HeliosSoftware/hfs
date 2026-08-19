@@ -6,8 +6,24 @@ import { test, expect } from "../pages/fixtures";
 
 test("the dashboard renders its stat cards and chart", async ({ dashboard }) => {
   await dashboard.goto();
-  await expect(dashboard.statCards).toHaveCount(4);
+  await expect(dashboard.statCards).toHaveCount(5);
   await expect(dashboard.chart).toBeVisible();
+});
+
+test("export and import job cards show real counts and link to their pages", async ({ dashboard }) => {
+  await dashboard.goto();
+
+  const exportCard = dashboard.exportJobsCard;
+  await expect(exportCard).toBeVisible();
+  await expect(exportCard).toHaveAttribute("href", "/ui/bulk-export");
+  await expect(exportCard.locator(".stat__value")).toHaveText(/^\d+$/);
+  await expect(exportCard.locator(".stat__sub")).toHaveText(/running \(\d+ queued\)/);
+
+  const importCard = dashboard.importJobsCard;
+  await expect(importCard).toBeVisible();
+  await expect(importCard).toHaveAttribute("href", "/ui/bulk-import");
+  await expect(importCard.locator(".stat__value")).toHaveText(/^\d+$/);
+  await expect(importCard.locator(".stat__sub")).toHaveText("active");
 });
 
 test("the time-window selector re-renders over the chosen window", async ({ page, dashboard }) => {

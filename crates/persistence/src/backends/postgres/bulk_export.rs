@@ -461,6 +461,25 @@ impl BulkExportStorage for PostgresBackend {
         Ok(count as u64)
     }
 
+    async fn count_exports_by_status(
+        &self,
+        tenant: &TenantContext,
+        status: ExportStatus,
+    ) -> StorageResult<u64> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let status = status.to_string();
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_export_jobs WHERE tenant_id = $1 AND status = $2",
+                &[&tenant_id, &status],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count exports by status: {e}")))?;
+        let count: i64 = row.get(0);
+        Ok(count as u64)
+    }
+
     async fn list_expired_exports(
         &self,
         now: DateTime<Utc>,

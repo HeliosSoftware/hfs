@@ -1,7 +1,16 @@
-# SQL-on-FHIR v2 conformance fixtures
+# SQL-on-FHIR conformance fixtures
 
-The JSON files in `tests/` are the official SQL-on-FHIR v2 declarative test
+The JSON files in `tests/` are the official SQL-on-FHIR declarative test
 fixtures, kept here as a **verbatim** copy of upstream so they can run in CI.
+
+Version 2.0.0 shipped this suite inside the published package. 3.0.0-ballot
+does not: the specification moved to HL7 under CC0, while the reference
+implementation and its test suite stayed with the FHIR Foundation under MIT,
+and one package could not carry both licenses. The suite is now versioned with
+the reference implementation, which is where the sync command below points.
+
+(The directory is still named `sql-on-fhir-v2` for path stability; the fixtures
+themselves track the current reference implementation.)
 
 - **Upstream source:** <https://github.com/FHIR/sql-on-fhir.js/tree/main/tests>
   (raw: `https://raw.githubusercontent.com/FHIR/sql-on-fhir.js/main/tests/<file>.json`)

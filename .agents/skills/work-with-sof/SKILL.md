@@ -24,13 +24,13 @@ Use this when working in `helios-sof`, `sof-cli`, `sof-server`, or ViewDefinitio
 
 - `GET /metadata`: return CapabilityStatement.
 - `GET /health`: health check.
-- `POST /ViewDefinition/$viewdefinition-run`: execute ViewDefinition transformation.
+- `POST /$sql-run`: execute ViewDefinition transformation.
 
-`$viewdefinition-run` accepts these parameters in the request body or query:
+`$sql-run` accepts these parameters in the request body or query:
 
 - `_format`: csv, ndjson, json, or parquet.
 - `header`: CSV header control, true or false.
-- `viewResource`: ViewDefinition resource.
+- `subjectResource`: ViewDefinition resource.
 - `resource`: FHIR resources to transform.
 - `patient`: filter by patient reference.
 - `_limit`: limit results, 1 to 10000.
@@ -45,9 +45,9 @@ Parameter precedence is request body, then query params, then Accept header.
 cargo run --bin sof-cli -- --view view.json --bundle data.json --format parquet
 
 # Server
-curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+curl -X POST http://localhost:8080/\$sql-run \
   -H "Content-Type: application/json" \
-  -d '{"_format": "parquet", "viewResource": {...}, "resource": [...]}'
+  -d '{"_format": "parquet", "subjectResource": {...}, "resource": [...]}'
 ```
 
 Parquet type mapping follows Pathling conventions:

@@ -72,11 +72,11 @@ SOF_SERVER_PORT=9090 sof-server
 Send a transform request:
 
 ```bash
-curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+curl -X POST http://localhost:8080/\$sql-run \
   -H "Content-Type: application/json" \
   -d '{
     "_format": "csv",
-    "viewResource": { ... },
+    "subjectResource": { ... },
     "resource": [ ... ]
   }'
 ```

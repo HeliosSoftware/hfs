@@ -654,6 +654,27 @@ button.menu__option {
 }
 }
 
+@layer components {
+.stat--link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+
+.stat--link:hover {
+  border-color: var(--accent);
+}
+
+.stat--link:focus-visible {
+  outline: 2px solid var(--outline);
+  outline-offset: 2px;
+}
+
+.stat__value--unavailable {
+  color: var(--muted);
+}
+}
+
 @layer pages {
 /* ---------- Chart card ---------- */
 
@@ -816,6 +837,16 @@ button.pill {
 .stat-grid--2 {
   grid-template-columns: repeat(2, 1fr);
   max-width: 620px;
+}
+
+.stat-grid--5 {
+  grid-template-columns: repeat(5, 1fr);
+}
+
+@media (max-width: 1100px) {
+  .stat-grid--5 {
+    grid-template-columns: repeat(3, 1fr);
+  }
 }
 
 .table-card {
@@ -2034,6 +2065,27 @@ button.pill {
 .tag--error {
   background: var(--danger-soft);
   color: var(--danger);
+}
+
+/* Bulk Export job states (#537) — the same status-pill vocabulary. */
+.tag--in-progress {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tag--complete {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.tag--failed {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.tag--cancelled {
+  background: var(--accent-soft);
+  color: var(--muted);
 }
 
 .subs-sort summary.btn {
@@ -4221,6 +4273,13 @@ body.has-nav-panel {
   gap: 10px;
 }
 
+.menu__heading--row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .addbox__x {
   border: 0;
   background: none;
@@ -4277,5 +4336,23 @@ body.has-nav-panel {
 .editor-row__input:invalid {
   border-color: #C0362C;
   box-shadow: 0 0 0 3px rgb(192 54 44 / 12%);
+}
+}
+
+@layer pages {
+/* Bulk Export (#537): the resource-type checkbox grid. Its job-status chips
+   are .tag variants — one status-pill vocabulary, not a second .chip. */
+.typegrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 6px 18px;
+  padding: 6px 0;
+}
+
+.typegrid__item {
+  font-size: 14px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 }
