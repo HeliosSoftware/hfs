@@ -649,6 +649,8 @@ pub fn mount(
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url,
         outbound_auth,
+        fhir_version,
+        data_dir.clone(),
     ));
     mount_with_conformance_source(
         fhir_app,
@@ -1048,10 +1050,7 @@ async fn search(
     rv: RequestVersion,
     rt: RequestTenant,
 ) -> Response {
-    let resource_types = state
-        .compartments
-        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(SearchPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1070,10 +1069,7 @@ async fn queries(
     rv: RequestVersion,
     rt: RequestTenant,
 ) -> Response {
-    let resource_types = state
-        .compartments
-        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(QueriesPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1095,10 +1091,7 @@ async fn resources(
     rt: RequestTenant,
     Query(query): Query<ResourcesQuery>,
 ) -> Response {
-    let resource_types = state
-        .compartments
-        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(ResourcesPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1128,16 +1121,14 @@ struct ParamsCatalogQuery {
 
 /// Parameter datalist for the search builder: the active parameters that
 /// apply to the given resource type (including `Resource` /
-/// `DomainResource`-level ones), from the default-version snapshot.
+/// `DomainResource`-level ones), from the selected version's snapshot.
 async fn query_params_catalog(
     State(state): State<WebState>,
     rt: RequestTenant,
+    rv: RequestVersion,
     Query(raw): Query<ParamsCatalogQuery>,
 ) -> Response {
-    let snapshot = state
-        .sp_catalog
-        .snapshot(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let snapshot = state.sp_catalog.snapshot(&rt.id, rv.0).await;
     let resource_type = raw.resource_type.unwrap_or_default();
     let mut params: Vec<ParamOption> = snapshot
         .params
