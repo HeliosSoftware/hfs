@@ -608,6 +608,36 @@ editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD o un timestamp c
 editor-hint-time = FHIR time: HH:MM:SS
 editor-hint-instant = FHIR instant: timestamp completo con zona horaria, p. ej. 2024-05-17T14:30:00.000Z
 
+## Página de suscripciones (#580)
+
+subs-title = Suscripciones
+subs-lede = Vista de solo lectura del motor de suscripciones: cada suscripción registrada, su canal, estado en vivo y contadores de entrega.
+subs-unavailable = El motor de suscripciones no está habilitado en este servidor.
+subs-empty = No hay suscripciones registradas para este tenant.
+subs-card-failing = Fallando
+subs-card-failing-sub = requiere atención
+subs-card-idle = Inactivas
+subs-card-idle-sub = sin clientes
+subs-card-active = Activas
+subs-card-active-sub = entregando
+subs-card-events = Notificaciones
+subs-card-events-sub = desde el registro
+subs-table-heading = Suscripciones
+subs-sort = Ordenar
+subs-sort-status = Estado
+subs-sort-sent = Más enviadas
+subs-sort-fails = Racha de fallos
+subs-col-subscription = Suscripción
+subs-col-channel = Canal
+subs-col-status = Estado
+subs-col-sent = Enviadas
+subs-col-fails = Racha de fallos
+subs-state-active = activa
+subs-state-error = error
+subs-state-idle = 0 clientes
+subs-state-requested = solicitada
+subs-state-off = apagada
+
 ## Bulk Export workspace (#537)
 
 bulk-export-title = Exportación masiva

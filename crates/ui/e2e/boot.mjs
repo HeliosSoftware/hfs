@@ -110,6 +110,9 @@ const child = spawn(bin, [], {
     // Natural-language search advertises itself as configured so the search
     // area renders its working pane. The key is never used by the tests.
     HFS_NL_SEARCH_API_KEY: "e2e-placeholder-not-a-real-key",
+    // The subscriptions engine advertises itself so the operator page (#580)
+    // renders its live (empty) dashboard instead of the unavailable state.
+    HFS_SUBSCRIPTIONS_ENABLED: "true",
     ...authEnv,
   },
 });

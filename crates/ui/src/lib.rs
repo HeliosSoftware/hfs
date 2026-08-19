@@ -45,6 +45,7 @@ mod history;
 mod i18n;
 mod json_view;
 mod search_params;
+mod subscriptions;
 mod tenants;
 
 #[doc(hidden)]
@@ -294,6 +295,9 @@ pub(crate) struct Status {
     tenant_display: Option<String>,
     /// Whether the sidebar renders the tenant picker (#544).
     show_tenant_picker: bool,
+    /// Whether the subscriptions engine is advertised — the sidebar entry and
+    /// the operator page only appear when it is (#580).
+    subscriptions_enabled: bool,
 }
 
 impl Status {
@@ -315,6 +319,11 @@ impl Status {
     /// Whether the sidebar renders the tenant picker (#544).
     pub(crate) fn show_tenant_picker(&self) -> bool {
         self.show_tenant_picker
+    }
+
+    /// Whether the subscriptions engine is advertised (#580).
+    pub(crate) fn subscriptions_enabled(&self) -> bool {
+        self.subscriptions_enabled
     }
 
     /// The effective tenant id, for the `hfs-tenant` meta tag browser calls
@@ -703,6 +712,7 @@ pub fn mount_with_conformance_source(
         .route("/ui/compartments", get(compartments_page))
         // Batch/Transaction workspace (#476): upload → preflight → response.
         .route("/ui/batch", get(batch_page))
+        .route("/ui/subscriptions", get(subscriptions::page))
         // Schema-driven resource editor (#264). One POST endpoint applies every
         // structural mutation and re-renders: the document rides with it.
         .route("/ui/editor", get(editor::page))
@@ -1736,7 +1746,7 @@ fn compact_count(n: u64) -> String {
 }
 
 /// Thousands-separated integer for prominent totals: `1204 -> "1,204"`.
-fn grouped(n: u64) -> String {
+pub(crate) fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let bytes = digits.as_bytes();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -1767,7 +1777,7 @@ fn axis_time_label(bucket_start: DateTime<Utc>, window: DashboardWindow) -> Stri
 /// Both values we read this way (a FHIR resource type, a window slug) are
 /// alphanumeric, so no percent-decoding is needed; each is validated — against
 /// the snapshot's series, or `DashboardWindow::from_slug` — before use.
-fn query_value(query: Option<&str>, key: &str) -> Option<String> {
+pub(crate) fn query_value(query: Option<&str>, key: &str) -> Option<String> {
     let query = query?;
     query.split('&').find_map(|pair| {
         let (k, value) = pair.split_once('=')?;
@@ -1862,6 +1872,7 @@ pub(crate) fn current_status(
         tenant_id: tenant.id.clone(),
         tenant_display: tenant.display.clone(),
         show_tenant_picker: tenant.multi,
+        subscriptions_enabled: helios_observability::subscriptions::enabled(),
     }
 }
 
@@ -1902,6 +1913,7 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -1959,6 +1971,7 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             i18n: i18n("en"),
         }
@@ -2015,6 +2028,7 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -2058,6 +2072,7 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             i18n: i18n("es"),
             active_page: "queries",

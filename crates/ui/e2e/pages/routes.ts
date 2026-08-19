@@ -19,6 +19,7 @@ export const ROUTES = [
   "/ui/bulk-import",
   "/ui/bulk-export",
   "/ui/bulk-export/active",
+  "/ui/subscriptions",
 ];
 
 // The bulk-import detail page only exists with a submission behind it. Seed

@@ -611,6 +611,36 @@ editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD, or a full times
 editor-hint-time = FHIR time: HH:MM:SS
 editor-hint-instant = FHIR instant: full timestamp with timezone, e.g. 2024-05-17T14:30:00.000Z
 
+## Subscriptions operator page (#580)
+
+subs-title = Subscriptions
+subs-lede = Read-only view of the subscriptions engine: every registered subscription, its channel, live status, and delivery counters.
+subs-unavailable = The subscriptions engine is not enabled on this server.
+subs-empty = No subscriptions are registered for this tenant.
+subs-card-failing = Failing
+subs-card-failing-sub = needs attention
+subs-card-idle = Idle
+subs-card-idle-sub = no clients
+subs-card-active = Active
+subs-card-active-sub = delivering
+subs-card-events = Notifications
+subs-card-events-sub = since registration
+subs-table-heading = Subscriptions
+subs-sort = Sort
+subs-sort-status = Status
+subs-sort-sent = Most sent
+subs-sort-fails = Fail streak
+subs-col-subscription = Subscription
+subs-col-channel = Channel
+subs-col-status = Status
+subs-col-sent = Sent
+subs-col-fails = Fail streak
+subs-state-active = active
+subs-state-error = error
+subs-state-idle = 0 clients
+subs-state-requested = requested
+subs-state-off = off
+
 ## Bulk Export workspace (#537)
 
 bulk-export-title = Bulk Export
