@@ -98,7 +98,9 @@
    * and the tree scroll. The server marks the node a mutation created via
    * data-focus on #editor-form; the caret goes there first. */
   function captureEditorState() {
-    var state = { focus: null, pickers: [], scroll: 0 };
+    var state = { focus: null, pickers: [], scroll: 0, rawOpen: false };
+    var rawPane = editorBody.querySelector("#editor-json-raw");
+    state.rawOpen = !!(rawPane && !rawPane.hidden);
     var tree = editorBody.querySelector(".editor-tree");
     if (tree) state.scroll = tree.scrollTop;
     var active = document.activeElement;
@@ -126,6 +128,19 @@
   }
 
   function restoreEditorState(state) {
+    // Raw mode survives the swap: the fresh textarea already carries the
+    // updated document, so a guided edit refreshes the JSON in place instead
+    // of kicking the user back to the fold view.
+    if (state.rawOpen) {
+      var rawPane = editorBody.querySelector("#editor-json-raw");
+      var viewEl = editorBody.querySelector("#json-view");
+      var toggle = editorBody.querySelector("#editor-json-edit");
+      if (rawPane && viewEl) {
+        rawPane.hidden = false;
+        viewEl.hidden = true;
+        if (toggle) toggle.classList.add("editor-json__act--on");
+      }
+    }
     state.pickers.forEach(function (saved) {
       var row = saved.path ? editorNodeBy("data-path", saved.path) : editorBody;
       if (!row) return;
@@ -172,9 +187,14 @@
       if (!raw || !viewEl) return;
       if (raw.hidden) { raw.hidden = false; viewEl.hidden = true; event.target.classList.add("editor-json__act--on"); }
       else {
+        // Same as the standalone page: close the pane before the round trip
+        // so the raw-mode persistence reads this re-render as leaving raw.
         var src = editorBody.querySelector("#editor-source");
         var fld = editorBody.querySelector("#editor-doc");
         if (src && fld) fld.value = src.value;
+        raw.hidden = true;
+        viewEl.hidden = false;
+        event.target.classList.remove("editor-json__act--on");
         editorSend("");
       }
       return;
@@ -370,6 +390,8 @@
           subject.textContent = current.type + "/" + current.id;
           say(messages.msgSaved, "ok");
           renderEditor(res.body);
+          // The results table behind the modal is now stale — let it catch up.
+          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
         })
         .catch(function () { say(messages.msgLoadError, "error"); });
     });
@@ -380,8 +402,12 @@
     if (!window.confirm(messages.msgConfirmDelete)) return;
     fetch("/" + current.type + "/" + current.id, { method: "DELETE", headers: fhirHeaders() })
       .then(function (r) {
-        if (r.ok || r.status === 204) { closeModal(); location.reload(); }
-        else say(String(r.status), "error");
+        if (r.ok || r.status === 204) {
+          closeModal();
+          // No full reload: the table and counts refresh in place, keeping
+          // the rail selection and scroll where the user left them.
+          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
+        } else say(String(r.status), "error");
       })
       .catch(function () { say(messages.msgLoadError, "error"); });
   });
