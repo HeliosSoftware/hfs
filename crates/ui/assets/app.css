@@ -3358,6 +3358,49 @@ button.filter-rail__item {
   resize: vertical;
 }
 
+/* Raw-mode highlight (editor-sync.js): a mirror <pre> sits behind the
+   textarea with identical metrics; its text is invisible and only the <mark>
+   around the hovered node's range shows through the textarea, whose own
+   background goes transparent while the mirror is present. */
+.editor-json__raw {
+  position: relative;
+}
+
+.editor-json__raw--mirrored .editor__source {
+  position: relative;
+  z-index: 1;
+  background: transparent;
+}
+
+.editor__source-mirror {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 12px;
+  box-sizing: border-box;
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  color: transparent;
+  background: var(--input-bg);
+  border: 1px solid transparent;
+  border-radius: 10px;
+}
+
+.editor__source-mirror mark {
+  color: transparent;
+  background: var(--accent-soft);
+  border-radius: 3px;
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
 .editor__source-hint {
   margin: 8px 2px 0;
   font-size: 12px;

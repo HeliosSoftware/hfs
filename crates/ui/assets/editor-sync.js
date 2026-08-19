@@ -18,6 +18,9 @@
     g.querySelectorAll(".editor-row--hit").forEach(function (n) {
       n.classList.remove("editor-row--hit");
     });
+    g.querySelectorAll(".editor__source-mirror").forEach(function (m) {
+      m.textContent = "";
+    });
     g.__hitKey = null;
   }
 
@@ -74,7 +77,7 @@
     clear(g);
     g.__hitKey = key;
     if (row) {
-      lightJson(g, row.dataset.path);
+      if (!lightRaw(g, row.dataset.path)) lightJson(g, row.dataset.path);
     } else {
       var match = rowForJsonPath(g, line.dataset.jpath);
       if (match) match.classList.add("editor-row--hit");
@@ -107,6 +110,137 @@
     var input = row.querySelector("[data-set]");
     if (input) input.focus();
   });
+
+  /* ---- raw-mode highlight ----------------------------------------------- */
+
+  /* The character range a dotted path occupies in the JSON text: from its key
+     (or its opening bracket, for array items) to the end of its value. Same
+     structure-only scan as pathAtCaret, watching for the moment the walk
+     enters and leaves the target's subtree. */
+  function rangeOfPath(text, target) {
+    var frames = [];
+    var lastStr = null;
+    var lastStrStart = -1;
+    var start = -1;
+    function cur() {
+      if (!frames.length) return "";
+      var parts = [];
+      for (var j = 1; j < frames.length; j++) {
+        if (frames[j].segment != null) parts.push(frames[j].segment);
+      }
+      var tip = frames[frames.length - 1];
+      var c = tip.kind === "o" ? tip.key : String(tip.index);
+      if (c != null) parts.push(c);
+      return parts.join(".");
+    }
+    function inside() {
+      var p = cur();
+      return !!p && within(p, target);
+    }
+    for (var i = 0; i < text.length; i++) {
+      var ch = text[i];
+      if (ch === '"') {
+        var sStart = i;
+        var end = i + 1;
+        var esc = false;
+        var buf = "";
+        while (end < text.length) {
+          var c2 = text[end];
+          if (esc) { buf += c2; esc = false; }
+          else if (c2 === "\\") esc = true;
+          else if (c2 === '"') break;
+          else buf += c2;
+          end++;
+        }
+        lastStr = buf;
+        lastStrStart = sStart;
+        i = end;
+        continue;
+      }
+      if ("{}[]:,".indexOf(ch) === -1) continue;
+      var top = frames[frames.length - 1];
+      var before = inside();
+      var closedOwn = false;
+      if (ch === ":") {
+        if (top && top.kind === "o") top.key = lastStr;
+      } else if (ch === ",") {
+        if (top && top.kind === "a") top.index++;
+        else if (top) top.key = null;
+      } else if (ch === "{" || ch === "[") {
+        var seg = top ? (top.kind === "o" ? top.key : String(top.index)) : null;
+        frames.push({ kind: ch === "{" ? "o" : "a", key: null, index: 0, segment: seg });
+      } else {
+        // The bracket belongs to the target only when it closes the target's
+        // own container — closing an ancestor while a scalar tail is inside
+        // the subtree must not drag the ancestor's bracket into the range.
+        var segments = [];
+        for (var s = 1; s < frames.length; s++) {
+          if (frames[s].segment != null) segments.push(frames[s].segment);
+        }
+        closedOwn = segments.join(".") === target;
+        frames.pop();
+      }
+      var after = inside();
+      if (!before && after && start === -1) {
+        if (ch === ":" && lastStrStart !== -1) start = lastStrStart;
+        else if (ch === ",") {
+          start = i + 1;
+          while (start < text.length && /\s/.test(text[start])) start++;
+        } else start = i;
+      }
+      if (before && !after && start !== -1) {
+        return { start: start, end: ch === "," || (ch !== ":" && !closedOwn && "}]".indexOf(ch) !== -1) ? i : i + 1 };
+      }
+    }
+    return start === -1 ? null : { start: start, end: text.length };
+  }
+
+  /* A mirror <pre> behind the textarea carries the same text, invisible except
+     the <mark> around the highlighted range. Created on first use, cleared on
+     every keystroke (stale offsets would mark the wrong characters). */
+  function mirrorFor(rawPane, source) {
+    var mirror = rawPane.querySelector(".editor__source-mirror");
+    if (!mirror) {
+      mirror = document.createElement("pre");
+      mirror.className = "editor__source-mirror";
+      mirror.setAttribute("aria-hidden", "true");
+      rawPane.insertBefore(mirror, source);
+      rawPane.classList.add("editor-json__raw--mirrored");
+      source.addEventListener("scroll", function () {
+        mirror.scrollTop = source.scrollTop;
+        mirror.scrollLeft = source.scrollLeft;
+      });
+      source.addEventListener("input", function () {
+        mirror.textContent = "";
+      });
+    }
+    mirror.style.height = source.offsetHeight + "px";
+    return mirror;
+  }
+
+  /* Highlights `path` inside the raw textarea. Returns false when raw mode is
+     closed, so the caller falls back to the fold-view lines. */
+  function lightRaw(g, path) {
+    var rawPane = g.querySelector("#editor-json-raw");
+    if (!rawPane || rawPane.hidden) return false;
+    var source = rawPane.querySelector(".editor__source");
+    if (!source) return false;
+    var mirror = mirrorFor(rawPane, source);
+    var range = rangeOfPath(source.value, path);
+    mirror.textContent = "";
+    if (!range) return true;
+    mirror.appendChild(document.createTextNode(source.value.slice(0, range.start)));
+    var mark = document.createElement("mark");
+    mark.textContent = source.value.slice(range.start, range.end);
+    mirror.appendChild(mark);
+    mirror.appendChild(document.createTextNode(source.value.slice(range.end)));
+    if (mark.offsetTop < source.scrollTop || mark.offsetTop > source.scrollTop + source.clientHeight - 40) {
+      source.scrollTop = Math.max(0, mark.offsetTop - source.clientHeight / 3);
+    }
+    mirror.scrollTop = source.scrollTop;
+    mirror.scrollLeft = source.scrollLeft;
+    return true;
+  }
 
   /* ---- raw-edit caret follow ------------------------------------------- */
 
