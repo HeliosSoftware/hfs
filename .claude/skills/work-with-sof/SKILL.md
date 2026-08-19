@@ -24,13 +24,13 @@ Use this when working in `helios-sof`, `sof-cli`, `sof-server`, or ViewDefinitio
 
 - `GET /metadata`: return CapabilityStatement.
 - `GET /health`: health check.
-- `POST /ViewDefinition/$viewdefinition-run`: execute ViewDefinition transformation.
+- `POST /$sql-run`: execute ViewDefinition transformation.
 
-`$viewdefinition-run` accepts these parameters in the request body or query:
+`$sql-run` accepts these parameters in the request body or query:
 
 - `_format`: csv, ndjson, json, or parquet.
 - `header`: CSV header control, true or false.
-- `viewResource`: ViewDefinition resource.
+- `subjectResource`: ViewDefinition resource.
 - `resource`: FHIR resources to transform.
 - `patient`: filter by patient reference.
 - `_limit`: limit results, 1 to 10000.
@@ -45,9 +45,9 @@ Parameter precedence is request body, then query params, then Accept header.
 cargo run --bin sof-cli -- --view view.json --bundle data.json --format parquet
 
 # Server
-curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+curl -X POST http://localhost:8080/\$sql-run \
   -H "Content-Type: application/json" \
-  -d '{"_format": "parquet", "viewResource": {...}, "resource": [...]}'
+  -d '{"_format": "parquet", "subjectResource": {...}, "resource": [...]}'
 ```
 
 Parquet type mapping follows Pathling conventions:
@@ -65,7 +65,7 @@ Arrays map to Arrow List types. All fields are OPTIONAL. Snappy compression is t
 ## Async Export in the HFS Server
 
 The `hfs` binary embeds SQL-on-FHIR via `helios-rest` and exposes the async
-`$viewdefinition-export` and `$sqlquery-export` operations. These run in the
+`$sql-export` operation. These run in the
 background and write tabular shards to an *export sink*, configured with the
 `HFS_EXPORT_*` variables below (distinct from the standalone `sof-server`
 `SOF_*` vars above, and from Bulk Data Export's `HFS_BULK_EXPORT_*`).
@@ -76,7 +76,7 @@ in-process fallback.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR ops (`$viewdefinition-run`/`-export`, `$sqlquery-*`) |
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR ops (`$sql-run`, `$sql-export`) |
 | `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink |
 | `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3` |
