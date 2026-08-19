@@ -91,9 +91,6 @@
 
         <div class="editor-row__head">
           <span class="editor-row__label">{{ row.label }}</span>
-          {% if !row.short.is_empty() %}
-          <span class="editor-row__desc" title="{{ row.short }}">{{ row.short }}</span>
-          {% endif %}
 
           {% if !row.type_label.is_empty() %}
           <span class="editor-row__type">{{ row.type_label }}</span>
@@ -159,6 +156,10 @@
                   aria-label="{{ i18n.t("editor-remove") }}" title="{{ i18n.t("editor-remove") }}">×</button>
           {% endif %}
         </div>
+
+        {% if !row.short.is_empty() %}
+        <p class="editor-row__desc">{{ row.short }}</p>
+        {% endif %}
 
         {% for message in row.errors %}
         <p class="editor-row__error">{{ message }}</p>

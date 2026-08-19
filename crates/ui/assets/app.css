@@ -3115,6 +3115,7 @@ button.filter-rail__item {
 .editor-row__head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   min-height: 28px;
 }
@@ -3133,7 +3134,9 @@ button.filter-rail__item {
 
 .editor-row__input {
   flex: 1;
-  min-width: 0;
+  /* Never squeezed below a usable width — the head wraps it to its own line
+     instead of eating the content. */
+  min-width: 180px;
   max-width: 420px;
   height: 28px;
   padding: 0 10px;
@@ -3973,15 +3976,13 @@ body.has-nav-panel {
   font-weight: 600;
 }
 
-/* The element's short description rides second to its name, quiet, one line. */
+/* The element's short description sits on its own line under the head, so it
+   can never squeeze the input out of the row. */
 .editor-row__desc {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  margin: 2px 0 0;
   color: var(--muted);
   font-size: 11px;
+  line-height: 1.4;
 }
 
 .editor-row__ms,
