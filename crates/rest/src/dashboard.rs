@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardProvider, DashboardSeries, DashboardSnapshot, DashboardWindow,
-    ExportJobCounts,
+    ExportJobCounts, TypeCount,
 };
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, ExportStatus, ResourceStorage, bucket_floor,
@@ -32,19 +32,29 @@ use tracing::warn;
 
 use crate::config::ServerConfig;
 
-/// Resource types charted by the dashboard's "FHIR Resources over time" card.
-/// Mirrors the console handler's default set
-/// (`crate::handlers::console_metrics::DEFAULT_TYPES`).
-pub(crate) const DEFAULT_DASHBOARD_TYPES: &[&str] = &[
-    "Patient",
-    "Observation",
-    "Encounter",
-    "Condition",
-    "MedicationRequest",
-    "DiagnosticReport",
-    "Procedure",
-    "AllergyIntolerance",
+/// How many series the dashboard charts when the user has not picked any:
+/// the tenant's largest types, enough to compare without turning to spaghetti.
+const DEFAULT_CHARTED_TYPES: usize = 3;
+/// Definitional/infrastructure types the *default* selection skips — a server
+/// that seeds its own SearchParameters would otherwise chart those instead of
+/// the tenant's clinical data. They stay in `available`, so the picker still
+/// offers them; this only shapes the out-of-the-box view.
+const INFRASTRUCTURE_TYPES: &[&str] = &[
+    "CapabilityStatement",
+    "CodeSystem",
+    "CompartmentDefinition",
+    "ConceptMap",
+    "ImplementationGuide",
+    "OperationDefinition",
+    "SearchParameter",
+    "StructureDefinition",
+    "Subscription",
+    "ValueSet",
 ];
+/// Hard cap on a user selection — matches the palette (six series colors) and
+/// bounds the per-type delta queries. The default stays at three; this is how
+/// far an explicit selection can go.
+const MAX_CHARTED_TYPES: usize = 6;
 
 /// A span to chart, and the bucket width that samples it.
 ///
@@ -183,7 +193,6 @@ where
 pub(crate) struct StorageDashboardProvider<S> {
     default_tenant: String,
     fhir_version: String,
-    types: Vec<String>,
     storage: Arc<S>,
     /// Bulk-export job store, when the active backend provides one.
     export_jobs: Option<Arc<dyn BulkExportJobStore>>,
@@ -193,17 +202,14 @@ pub(crate) struct StorageDashboardProvider<S> {
 
 impl<S> StorageDashboardProvider<S> {
     /// Builds a provider for the server's default tenant and default FHIR
-    /// version, charting [`DEFAULT_DASHBOARD_TYPES`]. The window is chosen per
-    /// request by the UI, so it is not fixed here. Job-store counts start
-    /// unwired; call [`Self::with_job_stores`] to attach them.
+    /// version. The window and the charted types are chosen per request by the
+    /// UI, so neither is fixed here; the default selection is the tenant's
+    /// largest stored types (#555). Job-store counts start unwired; call
+    /// [`Self::with_job_stores`] to attach them.
     pub(crate) fn new(storage: Arc<S>, config: &ServerConfig) -> Self {
         Self {
             default_tenant: config.default_tenant.clone(),
             fhir_version: config.default_fhir_version.to_string(),
-            types: DEFAULT_DASHBOARD_TYPES
-                .iter()
-                .map(|t| t.to_string())
-                .collect(),
             storage,
             export_jobs: None,
             submit_jobs: None,
@@ -230,7 +236,12 @@ impl<S> DashboardProvider for StorageDashboardProvider<S>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
-    async fn snapshot(&self, window: DashboardWindow, tenant: &str) -> DashboardSnapshot {
+    async fn snapshot(
+        &self,
+        window: DashboardWindow,
+        tenant: &str,
+        types: &[String],
+    ) -> DashboardSnapshot {
         let tenant_id = if tenant.is_empty() {
             self.default_tenant.as_str()
         } else {
@@ -241,14 +252,65 @@ where
             TenantPermissions::full_access(),
         );
         let now = Utc::now();
-        let type_refs: Vec<&str> = self.types.iter().map(|t| t.as_str()).collect();
+
+        // What the tenant actually stores, largest first — the picker's option
+        // list, and the pool defaults are drawn from (#555).
+        let mut available: Vec<TypeCount> = self
+            .storage
+            .count_all_types(&tenant)
+            .await
+            .unwrap_or_else(|error| {
+                warn!(%error, "dashboard snapshot: distinct-type query failed");
+                Vec::new()
+            })
+            .into_iter()
+            .filter(|(_, total)| *total > 0)
+            .map(|(resource_type, total)| TypeCount {
+                resource_type,
+                total,
+            })
+            .collect();
+        available.sort_by(|a, b| {
+            b.total
+                .cmp(&a.total)
+                .then_with(|| a.resource_type.cmp(&b.resource_type))
+        });
+        let distinct_types = available.len();
+
+        // The charted set: the caller's selection filtered to real stored
+        // types, else the largest few. Capped so the query fan-out (one delta
+        // aggregate per type) and the palette stay bounded.
+        let selection: Vec<&str> = if types.is_empty() {
+            let mut defaults: Vec<&str> = available
+                .iter()
+                .filter(|t| !INFRASTRUCTURE_TYPES.contains(&t.resource_type.as_str()))
+                .take(DEFAULT_CHARTED_TYPES)
+                .map(|t| t.resource_type.as_str())
+                .collect();
+            // A store holding nothing but definitional resources still charts.
+            if defaults.is_empty() {
+                defaults = available
+                    .iter()
+                    .take(DEFAULT_CHARTED_TYPES)
+                    .map(|t| t.resource_type.as_str())
+                    .collect();
+            }
+            defaults
+        } else {
+            types
+                .iter()
+                .filter(|t| available.iter().any(|a| &a.resource_type == *t))
+                .take(MAX_CHARTED_TYPES)
+                .map(|t| t.as_str())
+                .collect()
+        };
 
         // Degrade to an empty/zeroed snapshot rather than surfacing an error —
         // the operator dashboard should render even if a count query hiccups.
         let series = match resource_count_series(
             self.storage.as_ref(),
             &tenant,
-            &type_refs,
+            &selection,
             SeriesWindow::from_dashboard_window(window),
             now,
         )
@@ -267,16 +329,6 @@ where
             .await
             .unwrap_or_else(|error| {
                 warn!(%error, "dashboard snapshot: total count query failed");
-                0
-            });
-
-        let distinct_types = self
-            .storage
-            .count_all_types(&tenant)
-            .await
-            .map(|types| types.len())
-            .unwrap_or_else(|error| {
-                warn!(%error, "dashboard snapshot: distinct-type query failed");
                 0
             });
 
@@ -320,6 +372,7 @@ where
             distinct_types,
             window,
             series,
+            available,
             export_jobs,
             import_jobs_active,
         }
@@ -346,23 +399,12 @@ mod tests {
         };
 
         let provider = StorageDashboardProvider::new(Arc::new(backend), &config);
-        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
+        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
 
-        // One series per charted type, each a dense 30-day window of zeros.
-        assert_eq!(snapshot.series.len(), DEFAULT_DASHBOARD_TYPES.len());
-        assert!(snapshot.series.iter().all(|s| s.total == 0));
-        assert!(
-            snapshot
-                .series
-                .iter()
-                .all(|s| s.points.len() == DashboardWindow::LastMonth.points())
-        );
-        assert!(
-            snapshot
-                .series
-                .iter()
-                .all(|s| s.points.iter().all(|p| p.cumulative == 0))
-        );
+        // An empty store has nothing to chart: no available types, no series —
+        // the UI renders its explicit empty state from this (#555).
+        assert!(snapshot.series.is_empty());
+        assert!(snapshot.available.is_empty());
         assert_eq!(snapshot.total_resources, 0);
         assert_eq!(snapshot.distinct_types, 0);
         assert!(!snapshot.fhir_version.is_empty());
@@ -568,7 +610,7 @@ mod tests {
         };
 
         let provider = StorageDashboardProvider::new(Arc::new(backend), &config);
-        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
+        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
 
         assert_eq!(snapshot.export_jobs, None);
         assert_eq!(snapshot.import_jobs_active, None);
@@ -591,7 +633,7 @@ mod tests {
         let submit_jobs = Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>;
         let provider = StorageDashboardProvider::new(Arc::clone(&backend), &config)
             .with_job_stores(Some(export_jobs), Some(submit_jobs));
-        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
+        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
 
         assert_eq!(
             snapshot.export_jobs,
@@ -653,7 +695,7 @@ mod tests {
         let submit_jobs = Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>;
         let provider = StorageDashboardProvider::new(Arc::clone(&backend), &config)
             .with_job_stores(Some(export_jobs), Some(submit_jobs));
-        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
+        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
 
         assert_eq!(
             snapshot.export_jobs,

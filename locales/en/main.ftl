@@ -147,7 +147,15 @@ card-uptime-sub = last 30 days
 
 chart-title = FHIR resources over time
 chart-expand = Expand chart
+chart-collapse = Collapse chart
 chart-window = Chart time window
+chart-pick-heading = Charted resource types
+chart-pick-filter = Filter types
+chart-empty = Nothing to chart yet — stored resources appear here as they are created.
+chart-sample-note = Sample data: no live metrics provider is registered on this build.
+chart-table-toggle = View as table
+chart-table-when = Time
+chart-remove-series = Remove from chart
 
 ## Footer
 

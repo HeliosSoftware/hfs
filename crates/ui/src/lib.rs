@@ -377,33 +377,68 @@ struct AxisTick {
     label_y: i64,
 }
 
-/// Server-computed SVG geometry for the "resources over time" chart, for a single
-/// selected resource type's cumulative series.
-struct ChartView {
-    /// Whether a non-empty series was plotted (`false` → axes only).
-    has_data: bool,
-    /// The resource type currently charted (a real, server-controlled type name).
-    selected_type: String,
+/// One plotted series of the "resources over time" chart: SVG geometry plus
+/// the identity the legend and tooltip need (#555).
+struct ChartSeriesView {
+    resource_type: String,
+    /// 1-based palette slot (`--series-N` custom properties, 6 defined).
+    color: usize,
     /// `"x,y x,y …"` coordinate list for the `<polyline>`.
     polyline: String,
+}
+
+/// One row of the chart's tabular alternative: a bucket label and the
+/// cumulative value of every plotted series at that bucket (#555, a11y).
+struct ChartTableRow {
+    label: String,
+    values: Vec<String>,
+}
+
+/// Server-computed SVG geometry for the "resources over time" chart.
+struct ChartView {
+    /// Whether any non-empty series was plotted (`false` → empty state).
+    has_data: bool,
+    series: Vec<ChartSeriesView>,
     /// Horizontal value gridlines, top (largest) to bottom (zero).
     y_ticks: Vec<AxisTick>,
     /// X-axis date labels at evenly spaced sample points.
     x_ticks: Vec<AxisTick>,
+    /// viewBox height — 300, or 520 when the card is expanded.
+    height: i64,
+    expanded: bool,
+    /// Inert JSON the tooltip script reads (`#chart-data`): bucket labels and
+    /// per-series values with their SVG coordinates, so the script does no
+    /// chart math of its own.
+    tip_json: String,
+    /// Sampled rows (the labeled buckets) for the accessible table.
+    table: Vec<ChartTableRow>,
+    /// Comma-joined plotted type names, for the SVG's accessible name.
+    types_label: String,
+    /// Compact picker-pill label: the first type plus a `+N` overflow count.
+    pick_label: String,
 }
 
-/// One entry in the chart legend, which doubles as the per-type series selector:
-/// each is a link that re-renders the page with that type charted.
+/// One entry in the chart legend: a plotted series, with a link that removes
+/// it from the charted set (present only while more than one is plotted).
 struct LegendEntry {
     resource_type: String,
     total: String,
+    color: usize,
+    href: Option<String>,
+}
+
+/// One option in the chart's type picker: a link that toggles the type in or
+/// out of the charted set, rendered as a checkbox row (#555).
+struct PickerEntry {
+    resource_type: String,
+    total: String,
     href: String,
-    active: bool,
+    selected: bool,
 }
 
 /// One entry in the time-window selector (`1h` / `24h` / `30d`): a link that
 /// re-renders the page with the chart sampled over that window, keeping the
-/// currently charted resource type.
+/// charted set and expansion.
 struct WindowEntry {
     label: String,
     href: String,
@@ -417,7 +452,13 @@ struct IndexPage {
     metrics: DashboardMetrics,
     chart: ChartView,
     legend: Vec<LegendEntry>,
+    picker: Vec<PickerEntry>,
     windows: Vec<WindowEntry>,
+    /// The expand/collapse link (the inverse of the current state).
+    expand_href: String,
+    /// True when no provider answered and the placeholder snapshot is shown —
+    /// rendered with an explicit "sample data" notice, never silently (#555).
+    sample_data: bool,
     i18n: I18n,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
@@ -970,11 +1011,12 @@ async fn revalidate_assets(request: axum::extract::Request, next: middleware::Ne
     response
 }
 
-/// Full landing page. `?type=<ResourceType>` selects which resource type's series
-/// the chart plots (defaults to the first charted type); the value is validated
-/// against the snapshot, so an unknown type harmlessly falls back to the default.
-/// `?window=<1h|24h|30d>` selects the time window the chart is sampled over,
-/// falling back to [`DashboardWindow::default`] for anything unrecognised.
+/// Full landing page. `?types=<A,B,…>` selects which resource types the chart
+/// plots (defaults to the tenant's largest stored types); unknown names are
+/// dropped by the provider, so the set is always real. The legacy `?type=`
+/// single selection still works. `?window=<1h|24h|30d>` selects the sampling
+/// window, falling back to [`DashboardWindow::default`] for anything
+/// unrecognised, and `?expand=1` renders the taller chart.
 async fn index(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -982,11 +1024,21 @@ async fn index(
     rt: RequestTenant,
     RawQuery(query): RawQuery,
 ) -> Response {
-    let selected = query_value(query.as_deref(), "type");
+    let types: Vec<String> = query_value(query.as_deref(), "types")
+        .or_else(|| query_value(query.as_deref(), "type"))
+        .map(|csv| {
+            csv.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let window = query_value(query.as_deref(), "window")
         .and_then(|slug| DashboardWindow::from_slug(&slug))
         .unwrap_or_default();
-    render(build_index_page(state.version, locale, selected, window, rv.0, &rt).await)
+    let expand = query_value(query.as_deref(), "expand").as_deref() == Some("1");
+    render(build_index_page(state.version, locale, types, window, expand, rv.0, &rt).await)
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -1243,8 +1295,9 @@ async fn status(
             build_index_page(
                 state.version,
                 locale,
-                None,
+                Vec::new(),
                 DashboardWindow::default(),
+                false,
                 rv.0,
                 &rt,
             )
@@ -1323,78 +1376,124 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
 }
 
 /// Assembles the landing page from the live dashboard snapshot, or from
-/// placeholder data when no provider is registered.
+/// placeholder data when no provider is registered — in which case the page
+/// says so explicitly rather than presenting invented numbers as real (#555).
 async fn build_index_page(
     version: &'static str,
     locale: RequestLocale,
-    selected: Option<String>,
+    types: Vec<String>,
     window: DashboardWindow,
+    expand: bool,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
 ) -> IndexPage {
     let status = current_status(version, fhir_version, tenant);
     let i18n = I18n::new(locale);
-    let snapshot = helios_observability::dashboard::snapshot(window, &tenant.id)
-        .await
-        .unwrap_or_else(|| sample_snapshot(window));
-    let (metrics, chart, legend, windows) = build_dashboard(&snapshot, selected.as_deref());
+    let live = helios_observability::dashboard::snapshot(window, &tenant.id, &types).await;
+    let sample_data = live.is_none();
+    let snapshot = live.unwrap_or_else(|| sample_snapshot(window));
+    let dash = build_dashboard(&snapshot, expand);
     IndexPage {
         status,
-        metrics,
-        chart,
-        legend,
-        windows,
+        metrics: dash.metrics,
+        chart: dash.chart,
+        legend: dash.legend,
+        picker: dash.picker,
+        windows: dash.windows,
+        expand_href: dash.expand_href,
+        sample_data,
         i18n,
         active_page: "home",
     }
 }
 
-/// Projects a [`DashboardSnapshot`] into the headline metrics, chart geometry,
-/// and the two selectors (resource type, time window) the template renders.
-fn build_dashboard(
-    snapshot: &DashboardSnapshot,
-    selected: Option<&str>,
-) -> (
-    DashboardMetrics,
-    ChartView,
-    Vec<LegendEntry>,
-    Vec<WindowEntry>,
-) {
-    // Resolve the charted type: the requested one if it exists, else the first
-    // series. `selected_type` is therefore always a real, server-controlled type
-    // name (or empty when there are no series at all).
-    let selected_type = selected
-        .filter(|s| {
-            snapshot
-                .series
-                .iter()
-                .any(|series| series.resource_type.as_str() == *s)
-        })
-        .map(|s| s.to_string())
-        .or_else(|| snapshot.series.first().map(|s| s.resource_type.clone()))
-        .unwrap_or_default();
+/// Everything `build_dashboard` hands the landing page.
+struct DashboardView {
+    metrics: DashboardMetrics,
+    chart: ChartView,
+    legend: Vec<LegendEntry>,
+    picker: Vec<PickerEntry>,
+    windows: Vec<WindowEntry>,
+    expand_href: String,
+}
 
-    let selected_series = snapshot
+/// A `/ui` link carrying the whole chart state: charted set, window, and
+/// expansion. Every selector emits these so changing one control keeps the
+/// other two.
+fn dash_href(types: &[String], window: DashboardWindow, expand: bool) -> String {
+    let mut href = format!("/ui?types={}&window={}", types.join(","), window.as_str());
+    if expand {
+        href.push_str("&expand=1");
+    }
+    href
+}
+
+/// Projects a [`DashboardSnapshot`] into the headline metrics, chart geometry,
+/// and the three selectors (type picker, legend, time window) the template
+/// renders. The charted set is `snapshot.series` itself — the provider already
+/// resolved the request to real stored types.
+fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView {
+    let charted: Vec<String> = snapshot
         .series
         .iter()
-        .find(|s| s.resource_type == selected_type);
+        .map(|s| s.resource_type.clone())
+        .collect();
 
-    let chart = build_chart(&selected_type, selected_series, snapshot.window);
+    let chart = build_chart(&snapshot.series, snapshot.window, expand);
 
-    // Both selectors carry the other's current value, so switching type keeps the
-    // window and vice versa.
+    // The picker offers every stored type; each option toggles membership.
+    let picker = snapshot
+        .available
+        .iter()
+        .map(|t| {
+            let selected = charted.contains(&t.resource_type);
+            let toggled: Vec<String> = if selected {
+                charted
+                    .iter()
+                    .filter(|c| **c != t.resource_type)
+                    .cloned()
+                    .collect()
+            } else {
+                // Selecting past the cap swaps the oldest series out
+                // (mirrors the provider's MAX_CHARTED_TYPES).
+                let mut set: Vec<String> = charted
+                    .iter()
+                    .skip(charted.len().saturating_sub(CHART_MAX_SERIES - 1))
+                    .cloned()
+                    .collect();
+                set.push(t.resource_type.clone());
+                set
+            };
+            PickerEntry {
+                resource_type: t.resource_type.clone(),
+                total: grouped(t.total),
+                href: dash_href(&toggled, snapshot.window, expand),
+                selected,
+            }
+        })
+        .collect();
+
+    // The legend names each plotted series; while more than one is plotted,
+    // an entry doubles as its own remove link.
     let legend = snapshot
         .series
         .iter()
-        .map(|s| LegendEntry {
-            resource_type: s.resource_type.clone(),
-            total: grouped(s.total),
-            href: format!(
-                "/ui?type={}&window={}",
-                s.resource_type,
-                snapshot.window.as_str()
-            ),
-            active: s.resource_type == selected_type,
+        .enumerate()
+        .map(|(i, s)| {
+            let href = (snapshot.series.len() > 1).then(|| {
+                let rest: Vec<String> = charted
+                    .iter()
+                    .filter(|c| **c != s.resource_type)
+                    .cloned()
+                    .collect();
+                dash_href(&rest, snapshot.window, expand)
+            });
+            LegendEntry {
+                resource_type: s.resource_type.clone(),
+                total: grouped(s.total),
+                color: i % SERIES_COLORS + 1,
+                href,
+            }
         })
         .collect();
 
@@ -1402,7 +1501,7 @@ fn build_dashboard(
         .into_iter()
         .map(|w| WindowEntry {
             label: w.as_str().to_string(),
-            href: format!("/ui?type={}&window={}", selected_type, w.as_str()),
+            href: dash_href(&charted, w, expand),
             active: w == snapshot.window,
         })
         .collect();
@@ -1415,48 +1514,88 @@ fn build_dashboard(
         import_jobs: snapshot.import_jobs_active,
         // Uptime is still a placeholder until #540 wires it to a real source.
         uptime_percent: "99.98".to_string(),
-        chart_total: selected_series
-            .map(|s| grouped(s.total))
-            .unwrap_or_else(|| "0".to_string()),
+        chart_total: {
+            let sum: u64 = snapshot.series.iter().map(|s| s.total).sum();
+            grouped(sum)
+        },
     };
 
-    (metrics, chart, legend, windows)
+    DashboardView {
+        metrics,
+        chart,
+        legend,
+        picker,
+        windows,
+        expand_href: dash_href(&charted, snapshot.window, !expand),
+    }
 }
 
-// Chart plot area within the `0 0 1060 300` viewBox: the value axis occupies the
-// left gutter (x < 40), the date axis the bottom (y > 278).
+// Chart plot area within the `0 0 1060 H` viewBox: the value axis occupies the
+// left gutter (x < 40), the date axis the bottom 22 units.
 const PLOT_LEFT: i64 = 40;
 const PLOT_RIGHT: i64 = 1060;
 const PLOT_TOP: i64 = 10;
-const PLOT_BOTTOM: i64 = 278;
+/// Default and expanded viewBox heights (#555).
+const CHART_HEIGHT: i64 = 300;
+const CHART_HEIGHT_EXPANDED: i64 = 520;
+/// Palette slots defined as `--series-N` custom properties in app.css.
+const SERIES_COLORS: usize = 6;
+/// Most series plotted at once — mirrors the provider's `MAX_CHARTED_TYPES`
+/// (and the palette), so a picker link never asks for more than the server
+/// will chart. The default selection is smaller (the provider's three).
+const CHART_MAX_SERIES: usize = 6;
 
 /// Computes the SVG geometry for one resource type's cumulative series. `window`
 /// decides only the x-axis label format — a calendar date over daily buckets, a
 /// UTC clock time over intraday ones.
-fn build_chart(
-    selected_type: &str,
-    series: Option<&DashboardSeries>,
-    window: DashboardWindow,
-) -> ChartView {
-    let points = match series {
-        Some(s) if !s.points.is_empty() => &s.points,
-        _ => {
-            // No data: render an empty 0-based axis so the card still frames.
-            return ChartView {
-                has_data: false,
-                selected_type: selected_type.to_string(),
-                polyline: String::new(),
-                y_ticks: y_axis_ticks(0),
-                x_ticks: Vec::new(),
-            };
-        }
+fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -> ChartView {
+    let height = if expand {
+        CHART_HEIGHT_EXPANDED
+    } else {
+        CHART_HEIGHT
+    };
+    let plot_bottom = height - 22;
+    let plotted: Vec<&DashboardSeries> = all.iter().filter(|s| !s.points.is_empty()).collect();
+    let has_data = plotted.iter().any(|s| s.total > 0) && !plotted.is_empty();
+    let types_label = plotted
+        .iter()
+        .map(|s| s.resource_type.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The pill stays one name wide however many series are plotted.
+    let pick_label = match plotted.len() {
+        0 => String::new(),
+        1 => plotted[0].resource_type.clone(),
+        n => format!("{} +{}", plotted[0].resource_type, n - 1),
     };
 
+    if plotted.is_empty() {
+        return ChartView {
+            has_data: false,
+            series: Vec::new(),
+            y_ticks: y_axis_ticks(0, height, plot_bottom),
+            x_ticks: Vec::new(),
+            height,
+            expanded: expand,
+            tip_json: "{}".to_string(),
+            table: Vec::new(),
+            types_label,
+            pick_label: String::new(),
+        };
+    }
+
     let width = PLOT_RIGHT - PLOT_LEFT;
-    let height = PLOT_BOTTOM - PLOT_TOP;
+    let plot_height = plot_bottom - PLOT_TOP;
+    // Every series shares the window, so bucket geometry comes from the first.
+    let points = &plotted[0].points;
     let n = points.len() as i64;
 
-    let peak = points.iter().map(|p| p.cumulative).max().unwrap_or(0);
+    // One y scale across every plotted series, so the curves are comparable.
+    let peak = plotted
+        .iter()
+        .flat_map(|s| s.points.iter().map(|p| p.cumulative))
+        .max()
+        .unwrap_or(0);
     let axis_max = nice_ceil(peak).max(1);
 
     // Map sample index -> x, cumulative value -> y (SVG y grows downward).
@@ -1467,18 +1606,29 @@ fn build_chart(
             PLOT_LEFT + width * i / (n - 1)
         }
     };
-    let y_at = |value: u64| -> i64 { PLOT_BOTTOM - (height * value as i64) / axis_max as i64 };
+    let y_at = |value: u64| -> i64 { plot_bottom - (plot_height * value as i64) / axis_max as i64 };
 
-    let polyline = points
+    let series: Vec<ChartSeriesView> = plotted
         .iter()
         .enumerate()
-        .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
-        .collect::<Vec<_>>()
-        .join(" ");
+        .map(|(si, s)| ChartSeriesView {
+            resource_type: s.resource_type.clone(),
+            color: si % SERIES_COLORS + 1,
+            polyline: s
+                .points
+                .iter()
+                .enumerate()
+                .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
+                .collect::<Vec<_>>()
+                .join(" "),
+        })
+        .collect();
 
-    // Up to six evenly spaced date labels along the window.
+    // Up to six evenly spaced date labels along the window; the same sampled
+    // buckets become the rows of the accessible table.
     let label_count = (n as usize).min(6);
     let mut x_ticks = Vec::with_capacity(label_count);
+    let mut table = Vec::with_capacity(label_count);
     for j in 0..label_count as i64 {
         let idx = if label_count <= 1 {
             0
@@ -1486,31 +1636,70 @@ fn build_chart(
             (n - 1) * j / (label_count as i64 - 1)
         };
         if let Some(point) = points.get(idx as usize) {
+            let label = axis_time_label(point.bucket_start, window);
             x_ticks.push(AxisTick {
-                label: axis_time_label(point.bucket_start, window),
+                label: label.clone(),
                 pos: x_at(idx),
                 // Date labels sit on the fixed bottom row of the viewBox.
-                label_y: 298,
+                label_y: height - 2,
+            });
+            table.push(ChartTableRow {
+                label,
+                values: plotted
+                    .iter()
+                    .map(|s| {
+                        s.points
+                            .get(idx as usize)
+                            .map(|p| grouped(p.cumulative))
+                            .unwrap_or_default()
+                    })
+                    .collect(),
             });
         }
     }
 
+    // Everything the tooltip script needs, precomputed: it does no scaling of
+    // its own beyond mapping the pointer to the nearest bucket x.
+    let tip_json = serde_json::json!({
+        "labels": points
+            .iter()
+            .map(|p| axis_time_label(p.bucket_start, window))
+            .collect::<Vec<_>>(),
+        "xs": (0..n).map(&x_at).collect::<Vec<_>>(),
+        "series": plotted
+            .iter()
+            .enumerate()
+            .map(|(si, s)| serde_json::json!({
+                "type": s.resource_type,
+                "color": si % SERIES_COLORS + 1,
+                "values": s.points.iter().map(|p| p.cumulative).collect::<Vec<_>>(),
+                "ys": s.points.iter().map(|p| y_at(p.cumulative)).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string();
+
     ChartView {
-        has_data: true,
-        selected_type: selected_type.to_string(),
-        polyline,
-        y_ticks: y_axis_ticks(axis_max),
+        has_data,
+        series,
+        y_ticks: y_axis_ticks(axis_max, height, plot_bottom),
         x_ticks,
+        height,
+        expanded: expand,
+        tip_json,
+        table,
+        types_label,
+        pick_label,
     }
 }
 
 /// Five horizontal value gridlines from `axis_max` (top) down to `0` (bottom).
-fn y_axis_ticks(axis_max: u64) -> Vec<AxisTick> {
-    let height = PLOT_BOTTOM - PLOT_TOP;
+fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64) -> Vec<AxisTick> {
+    let plot_height = plot_bottom - PLOT_TOP;
     (0..=4i64)
         .map(|k| {
             let value = axis_max * (4 - k) as u64 / 4;
-            let pos = PLOT_TOP + height * k / 4;
+            let pos = PLOT_TOP + plot_height * k / 4;
             AxisTick {
                 label: compact_count(value),
                 pos,
@@ -1629,6 +1818,13 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         series("Condition", 2_700, 700),
     ];
     let total_resources = series.iter().map(|s| s.total).sum();
+    let available = series
+        .iter()
+        .map(|s| helios_observability::dashboard::TypeCount {
+            resource_type: s.resource_type.clone(),
+            total: s.total,
+        })
+        .collect();
 
     DashboardSnapshot {
         fhir_version: "R4".to_string(),
@@ -1636,6 +1832,7 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         distinct_types: 142,
         window,
         series,
+        available,
         export_jobs: None,
         import_jobs_active: None,
     }
@@ -1696,8 +1893,7 @@ mod tests {
 
     /// Builds an `IndexPage` from the sample snapshot for template-rendering tests.
     fn sample_index_page(version: &'static str, checked_at: u64, i18n: I18n) -> IndexPage {
-        let (metrics, chart, legend, windows) =
-            build_dashboard(&sample_snapshot(DashboardWindow::default()), None);
+        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), false);
         IndexPage {
             status: Status {
                 version,
@@ -1707,10 +1903,13 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
             },
-            metrics,
-            chart,
-            legend,
-            windows,
+            metrics: dash.metrics,
+            chart: dash.chart,
+            legend: dash.legend,
+            picker: dash.picker,
+            windows: dash.windows,
+            expand_href: dash.expand_href,
+            sample_data: true,
             i18n,
             active_page: "home",
         }
@@ -1940,39 +2139,51 @@ mod tests {
 
     #[test]
     fn dashboard_projects_snapshot_counts_and_chart() {
-        let (metrics, chart, legend, _windows) = build_dashboard(
-            &sample_snapshot(DashboardWindow::default()),
-            Some("Observation"),
-        );
+        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), false);
 
-        // Selected type drives the chart + headline total.
-        assert_eq!(chart.selected_type, "Observation");
-        assert!(chart.has_data);
-        assert!(!chart.polyline.is_empty());
-        assert_eq!(chart.y_ticks.len(), 5);
+        // Every series the snapshot carries is plotted, on one shared y scale.
+        assert!(dash.chart.has_data);
+        assert_eq!(dash.chart.series.len(), 4);
+        assert!(dash.chart.series.iter().all(|s| !s.polyline.is_empty()));
+        assert_eq!(dash.chart.y_ticks.len(), 5);
+        assert!(dash.chart.types_label.contains("Observation"));
 
-        // Legend lists every series, with the selected one marked active. Each
-        // href carries the current window, so switching type does not reset it.
-        assert_eq!(legend.len(), 4);
-        let observation = legend
+        // The legend names each plotted series; while several are plotted each
+        // entry is a remove link that drops exactly itself and keeps the window.
+        assert_eq!(dash.legend.len(), 4);
+        let observation = dash
+            .legend
             .iter()
             .find(|e| e.resource_type == "Observation")
             .expect("Observation in legend");
-        assert!(observation.active);
-        assert_eq!(observation.href, "/ui?type=Observation&window=30d");
-        assert_eq!(legend.iter().filter(|e| e.active).count(), 1);
+        let href = observation
+            .href
+            .as_deref()
+            .expect("removable while several are plotted");
+        assert!(!href.contains("Observation"));
+        assert!(href.contains("Patient"));
+        assert!(href.contains("window=30d"));
 
-        assert_eq!(metrics.resource_types, "142");
+        // The picker offers every stored type, ticking the plotted ones; a
+        // selected option's link drops exactly itself.
+        assert_eq!(dash.picker.len(), 4);
+        assert!(dash.picker.iter().all(|p| p.selected));
+        let patient = dash
+            .picker
+            .iter()
+            .find(|p| p.resource_type == "Patient")
+            .expect("Patient offered");
+        assert!(!patient.href.contains("types=Patient"));
+        assert!(patient.href.contains("Observation"));
+
+        assert_eq!(dash.metrics.resource_types, "142");
     }
 
     /// The window selector offers every window, marks the snapshot's own as
     /// active, and carries the charted type across a window switch.
     #[test]
     fn window_selector_marks_the_active_window_and_keeps_the_charted_type() {
-        let (_metrics, _chart, _legend, windows) = build_dashboard(
-            &sample_snapshot(DashboardWindow::LastHour),
-            Some("Encounter"),
-        );
+        let windows = build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false).windows;
 
         assert_eq!(windows.len(), DashboardWindow::ALL.len());
         assert_eq!(windows.iter().filter(|w| w.active).count(), 1);
@@ -1981,18 +2192,18 @@ mod tests {
         assert!(
             windows
                 .iter()
-                .all(|w| w.href.starts_with("/ui?type=Encounter&window=")),
-            "every window link keeps the charted type"
+                .all(|w| w.href.starts_with("/ui?types=") && w.href.contains("Patient")),
+            "every window link keeps the charted set"
         );
-        assert_eq!(active.href, "/ui?type=Encounter&window=1h");
+        assert!(active.href.contains("Patient"));
+        assert!(active.href.ends_with("window=1h"));
     }
 
     /// Intraday windows label the x-axis with clock times; the 30-day window
     /// keeps calendar dates. Same series, different axis vocabulary.
     #[test]
     fn axis_labels_follow_the_window_resolution() {
-        let (_m, hour_chart, _l, _w) =
-            build_dashboard(&sample_snapshot(DashboardWindow::LastHour), None);
+        let hour_chart = build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false).chart;
         assert!(
             hour_chart
                 .x_ticks
@@ -2006,8 +2217,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let (_m, month_chart, _l, _w) =
-            build_dashboard(&sample_snapshot(DashboardWindow::LastMonth), None);
+        let month_chart =
+            build_dashboard(&sample_snapshot(DashboardWindow::LastMonth), false).chart;
         assert!(
             month_chart.x_ticks.iter().all(|t| !t.label.contains(':')),
             "30d axis should read as a calendar date, got {:?}",
@@ -2026,7 +2237,7 @@ mod tests {
     fn every_window_renders_a_bounded_chart() {
         for window in DashboardWindow::ALL {
             let snapshot = sample_snapshot(window);
-            let (_m, chart, _l, _w) = build_dashboard(&snapshot, None);
+            let chart = build_dashboard(&snapshot, false).chart;
             assert!(chart.has_data, "{}", window.as_str());
             assert_eq!(snapshot.series[0].points.len(), window.points());
             assert!(
@@ -2038,33 +2249,49 @@ mod tests {
         }
     }
 
+    /// The expanded chart grows the viewBox and moves the date row with it;
+    /// the tooltip carrier and the tabular alternative describe the same
+    /// buckets the axis labels sample.
     #[test]
-    fn unknown_selected_type_falls_back_to_first_series() {
-        let (_metrics, chart, _legend, _windows) = build_dashboard(
-            &sample_snapshot(DashboardWindow::default()),
-            Some("<script>"),
+    fn expand_grows_the_plot_and_the_carriers_stay_consistent() {
+        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), true);
+        assert!(dash.chart.expanded);
+        assert_eq!(dash.chart.height, 520);
+        assert!(dash.chart.x_ticks.iter().all(|t| t.label_y == 518));
+        // The expand link flips back to the compact view.
+        assert!(!dash.expand_href.contains("expand=1"));
+
+        let tip: serde_json::Value =
+            serde_json::from_str(&dash.chart.tip_json).expect("tip carrier is valid JSON");
+        assert_eq!(tip["series"].as_array().map(Vec::len), Some(4));
+        assert_eq!(
+            tip["labels"].as_array().map(Vec::len),
+            tip["xs"].as_array().map(Vec::len)
         );
-        assert_eq!(chart.selected_type, "Patient");
+        assert_eq!(dash.chart.table.len(), dash.chart.x_ticks.len());
+        assert!(dash.chart.table.iter().all(|r| r.values.len() == 4));
     }
 
     #[test]
-    fn empty_snapshot_renders_axes_without_a_series() {
+    fn empty_snapshot_renders_the_empty_state() {
         let empty = DashboardSnapshot {
             fhir_version: "R4".to_string(),
             total_resources: 0,
             distinct_types: 0,
             window: DashboardWindow::default(),
             series: Vec::new(),
+            available: Vec::new(),
             export_jobs: None,
             import_jobs_active: None,
         };
-        let (metrics, chart, legend, windows) = build_dashboard(&empty, None);
-        assert!(!chart.has_data);
-        assert!(chart.polyline.is_empty());
-        assert!(legend.is_empty());
-        assert_eq!(metrics.chart_total, "0");
+        let dash = build_dashboard(&empty, false);
+        assert!(!dash.chart.has_data);
+        assert!(dash.chart.series.is_empty());
+        assert!(dash.legend.is_empty());
+        assert!(dash.picker.is_empty());
+        assert_eq!(dash.metrics.chart_total, "0");
         // The window selector still renders, so an empty server is not a dead end.
-        assert_eq!(windows.len(), DashboardWindow::ALL.len());
+        assert_eq!(dash.windows.len(), DashboardWindow::ALL.len());
     }
 
     #[test]
@@ -2131,12 +2358,17 @@ mod tests {
             total: 5,
             points: vec![point_at(1_752_503_400, 5, 5)],
         };
-        let chart = build_chart("Patient", Some(&series), DashboardWindow::default());
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::default(),
+            false,
+        );
 
         assert!(chart.has_data);
         // A lone point produces a single "x,y" pair pinned to the left axis.
-        assert!(!chart.polyline.contains(' '));
-        assert!(chart.polyline.starts_with("40,"));
+        let polyline = &chart.series[0].polyline;
+        assert!(!polyline.contains(' '));
+        assert!(polyline.starts_with("40,"));
         assert_eq!(chart.x_ticks.len(), 1);
     }
 
@@ -2153,11 +2385,15 @@ mod tests {
                 point_at(1_752_503_520, 0, 4),
             ],
         };
-        let chart = build_chart("Patient", Some(&series), DashboardWindow::LastHour);
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            false,
+        );
 
         assert!(chart.has_data);
         // Every plotted y sits inside the plot area (10..=278 in the viewBox).
-        for pair in chart.polyline.split(' ') {
+        for pair in chart.series[0].polyline.split(' ') {
             let y: i64 = pair
                 .split_once(',')
                 .expect("x,y pair")
@@ -2165,7 +2401,7 @@ mod tests {
                 .parse()
                 .expect("integer y");
             assert!(
-                (PLOT_TOP..=PLOT_BOTTOM).contains(&y),
+                (PLOT_TOP..=CHART_HEIGHT - 22).contains(&y),
                 "y {y} escaped the plot"
             );
         }

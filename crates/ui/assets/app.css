@@ -64,6 +64,14 @@
   --outline: #e4e4e4;
   /* Chart */
   --grid-line: #dcdcdc;
+  /* Series palette (#555): six distinguishable strokes, legible on both
+     themes at 1.5px. Slot 1 is the brand accent. */
+  --series-1: #33b8ff;
+  --series-2: #7c6cff;
+  --series-3: #2fbf71;
+  --series-4: #f39c2d;
+  --series-5: #e35d8a;
+  --series-6: #8a93a6;
   --accent: #33b8ff;
   --accent-soft: rgb(51 184 255 / 15%);
   /* A darker cast of the accent for the one place the light celeste can't work:
@@ -828,6 +836,175 @@ button.pill {
   color: var(--text);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Functional chart (#555): multi-series, picker, tooltip -------- */
+
+/* Series palette: slot N styles both the polyline and its legend dot. */
+.chart .series--1 { stroke: var(--series-1); }
+.chart .series--2 { stroke: var(--series-2); }
+.chart .series--3 { stroke: var(--series-3); }
+.chart .series--4 { stroke: var(--series-4); }
+.chart .series--5 { stroke: var(--series-5); }
+.chart .series--6 { stroke: var(--series-6); }
+
+.chart-legend__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.chart-legend__dot--1 { background: var(--series-1); }
+.chart-legend__dot--2 { background: var(--series-2); }
+.chart-legend__dot--3 { background: var(--series-3); }
+.chart-legend__dot--4 { background: var(--series-4); }
+.chart-legend__dot--5 { background: var(--series-5); }
+.chart-legend__dot--6 { background: var(--series-6); }
+
+/* The expand control is a link; keep the pill look. */
+a.pill {
+  text-decoration: none;
+  color: inherit;
+}
+
+/* Type picker: the mockup's checkbox menu, as plain toggle links. */
+.chart-pick summary.pill {
+  cursor: pointer;
+  max-width: 320px;
+}
+
+.chart-pick .menu__panel {
+  min-width: 260px;
+}
+
+/* The option list scrolls on its own so the heading and the filter stay put
+   however many types the tenant stores. */
+.chart-pick__list {
+  max-height: min(340px, 50vh);
+  overflow-y: auto;
+}
+
+.chart-pick__option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+}
+
+.chart-pick__box {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: #ffffff;
+  border: 1.5px solid var(--surface-border);
+  border-radius: 4px;
+}
+
+.chart-pick__option--on .chart-pick__box {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+.chart-pick__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chart-pick__count {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-pick__none {
+  margin: 4px 8px 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Tooltip host: the wrapper is the positioning context for the readout and
+   the vertical guide the script moves along the buckets. */
+.chart-wrap {
+  position: relative;
+}
+
+.chart-tip {
+  position: absolute;
+  pointer-events: none;
+  min-width: 150px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 16%);
+  z-index: 5;
+  font-size: 12px;
+}
+
+.chart-tip__date {
+  margin-bottom: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.chart-tip__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 1px 0;
+}
+
+.chart-tip__name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.chart-tip__value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.chart-guide {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  background: var(--accent);
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.chart-empty {
+  padding: 56px 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* The tabular alternative to the plot — same numbers, as text. */
+.chart-table {
+  margin-top: 12px;
+}
+
+.chart-table > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+  width: fit-content;
+}
+
+.chart-table > summary:hover {
+  color: var(--text);
 }
 
 }
@@ -4380,7 +4557,7 @@ body.has-nav-panel {
 
 @layer pages {
 /* Bulk Export (#537): the resource-type checkbox grid. Its job-status chips
-   are .tag variants — one status-pill vocabulary, not a second .chip. */
+   are .tag variants — one status-pill vocabulary, not a second chip family. */
 .typegrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
