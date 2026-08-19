@@ -3,10 +3,16 @@
   precomputed boolean flags so Askama does not need to resolve enum
   discriminants through a `crate::` path. Each per-op partial POSTs
   to its literal-segment route (§7.6 F2) and swaps into
-  #hts-workbench-result. The wrapper id `hts-workbench-input` is the
-  shared swap target (§7.6 F15).
+  #hts-workbench-result.
+
+  Wrapping id contract (§7.6 F15): the per-op <form> inside carries
+  `id="hts-workbench-input"` and is the outerHTML swap target when
+  htmx replies to an op-selector click. This wrapper <div> only
+  provides the CSS hook and MUST NOT duplicate the id — a second
+  #hts-workbench-input element trips Playwright strict-mode locators
+  and gives htmx an ambiguous target on the initial swap.
 -#}
-<div id="hts-workbench-input" class="hts-op-workbench__input-wrap">
+<div class="hts-op-workbench__input-wrap">
   {% if flags.is_lookup %}
     {% include "partials/hts-op-lookup-input.html" %}
   {% else if flags.is_validate_code %}

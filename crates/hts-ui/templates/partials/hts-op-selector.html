@@ -1,16 +1,20 @@
 {#-
-  7-op selector strip (design doc §7.6). Every entry is a real <a>
-  so the nojs fallback works; the active entry gets aria-current="page".
+  7-op selector strip (design doc §7.6). Every entry is a real <a> so
+  the nojs fallback works; the active entry gets aria-current="page".
   Op-selector links do a full page swap (target=body) so the whole
   shell (banners, tab strip, progress region) re-renders per §7.6 F5/F6.
+
+  Semantics: this is a nav strip, NOT a tablist — the accessible role
+  stays on the implicit <a>/link, and `aria-current="page"` marks the
+  active entry per WAI-ARIA authoring practices. The `[role="tablist"]`
+  contract is reserved for the resource-family tab strip (§7.6 F5),
+  which is the ONLY nested tabpanel-bearing structure on this page.
 -#}
 <nav class="hts-op-selector" aria-label="{{ chrome.i18n.t("hts-operations-selector-label") }}">
-  <ul class="hts-op-selector__list" role="tablist">
+  <ul class="hts-op-selector__list">
     {% for entry in flags.op_selector_entries %}
-      <li class="hts-op-selector__item" role="none">
-        <a role="tab"
-           class="hts-op-selector__link{% if entry.active %} is-active{% endif %}"
-           aria-selected="{% if entry.active %}true{% else %}false{% endif %}"
+      <li class="hts-op-selector__item">
+        <a class="hts-op-selector__link{% if entry.active %} is-active{% endif %}"
            {% if entry.active %}aria-current="page"{% endif %}
            href="/ui/hts/operations?op={{ entry.slug }}&resource={{ entry.resource }}"
            hx-get="/ui/hts/operations?op={{ entry.slug }}&resource={{ entry.resource }}"

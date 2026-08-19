@@ -50,9 +50,11 @@ test.describe("HTS Operations workbench shell (§7.6)", () => {
     ).toHaveAttribute("aria-current", "page");
     // Widened CS Lookup surface: the `useSupplement` field is present
     // in the standalone workbench, but was deliberately NOT surfaced
-    // in the Slice B detail-page embed.
+    // in the Slice B detail-page embed. The field is a text input
+    // grouped under a <fieldset><legend> — no explicit <label for> —
+    // so the assertion pins the input by name, not by accessible label.
     await expect(
-      page.getByLabel(/Supplement/i).first(),
+      page.locator("input[name='useSupplement']"),
     ).toBeVisible();
   });
 
@@ -73,7 +75,9 @@ test.describe("HTS Operations workbench shell (§7.6)", () => {
   }) => {
     // §7.6 F12: the `<details>` Advanced panel that hosts the
     // `threshold` numeric input is scoped to `$expand`. Every other op
-    // omits the panel entirely.
+    // omits the panel entirely. The panel starts collapsed on $expand,
+    // so the input is attached-but-hidden — assert on existence rather
+    // than paint-visibility.
     await page.goto("/ui/hts/operations?op=lookup&resource=CodeSystem");
     await expect(
       page.locator("input[name='threshold']"),
@@ -81,7 +85,7 @@ test.describe("HTS Operations workbench shell (§7.6)", () => {
     await page.goto("/ui/hts/operations?op=expand&resource=ValueSet");
     await expect(
       page.locator("input[name='threshold']"),
-    ).toBeVisible();
+    ).toHaveCount(1);
   });
 
   test("resource-family tab strip appears only for validate-code and batch-validate", async ({
@@ -118,9 +122,11 @@ test.describe("HTS Operations workbench shell (§7.6)", () => {
     await page.getByRole("link", { name: "$expand", exact: true }).click();
     const workbench = page.locator("#hts-workbench-input");
     await expect(workbench).toBeVisible();
+    // Threshold lives inside a collapsed <details> Advanced panel; pin
+    // attach-in-DOM rather than paint-visibility to match §7.6 F12.
     await expect(
       workbench.locator("input[name='threshold']"),
-    ).toBeVisible({ timeout: 3_000 });
+    ).toHaveCount(1, { timeout: 3_000 });
     await expect(
       workbench.locator("input[name='designation']").first(),
     ).toBeVisible();
@@ -167,8 +173,11 @@ test.describe("HTS Operations workbench inputs (§7.6.F4)", () => {
     page,
   }) => {
     // §7.6 F6: closure input is `name` (required) + repeatable
-    // system+code rows. Slice E1 ships the input surface; the run
-    // handler is stubbed until Slice E2.
+    // system+code rows. Row inputs are namespaced `concept.system` /
+    // `concept.code` so the server-side parser can group them per row
+    // (see the E2 closure invocation spec below, which posts the same
+    // names). Slice E1 shipped the input surface; Slice E2 wired the
+    // real $closure handler.
     await page.goto("/ui/hts/operations?op=closure&resource=");
     await expect(page.locator("input[name='name']")).toBeVisible();
     await expect(
@@ -176,8 +185,12 @@ test.describe("HTS Operations workbench inputs (§7.6.F4)", () => {
     ).toHaveAttribute("required", "");
     // At least one coding row (system + code inputs) is present on
     // first load.
-    await expect(page.locator("input[name='system']").first()).toBeVisible();
-    await expect(page.locator("input[name='code']").first()).toBeVisible();
+    await expect(
+      page.locator("input[name='concept.system']").first(),
+    ).toBeVisible();
+    await expect(
+      page.locator("input[name='concept.code']").first(),
+    ).toBeVisible();
   });
 
   test("VS Validate free-scope input renders the three-way ValueSet source selector", async ({
@@ -201,16 +214,19 @@ test.describe("HTS Operations workbench inputs (§7.6.F4)", () => {
     // $validate-code. Slice E1 renders the input surface; the seed
     // handler currently returns a not-implemented outcome (per
     // tests/operations.rs). This spec asserts only on the input shell.
+    // The target-ValueSet field is `name="target"` and each seed row
+    // uses `name="row.code" / row.system / row.display` so the server
+    // parser can group them (§7.6 F1 collect_batch_rows).
     await page.goto(
       "/ui/hts/operations?op=batch-validate&resource=ValueSet",
     );
     // A target-ValueSet input (canonical URL or instance id) is
     // present at the top of the form.
-    await expect(
-      page.locator("input[name='url'], input[name='valueSet']").first(),
-    ).toBeVisible();
+    await expect(page.locator("input[name='target']")).toBeVisible();
     // At least one seed row is present (code input).
-    await expect(page.locator("input[name='code']").first()).toBeVisible();
+    await expect(
+      page.locator("input[name='row.code']").first(),
+    ).toBeVisible();
   });
 });
 

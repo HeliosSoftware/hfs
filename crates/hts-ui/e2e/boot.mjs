@@ -40,6 +40,7 @@ for (const suffix of ["", "-wal", "-shm"]) {
   try { rmSync(db + suffix, { force: true }); } catch {}
 }
 
+console.log(`[boot.mjs] spawning ${bin} on port ${port}, db=${db}`);
 const child = spawn(bin, [], {
   stdio: "inherit",
   env: {
@@ -51,9 +52,16 @@ const child = spawn(bin, [], {
     HTS_UI_ENABLED: "true",
   },
 });
+console.log(`[boot.mjs] child pid=${child.pid}`);
 
 const bye = () => { try { child.kill(); } catch {} };
 process.on("SIGTERM", bye);
 process.on("SIGINT", bye);
 process.on("exit", bye);
-child.on("exit", (code) => process.exit(code ?? 0));
+child.on("exit", (code, signal) => {
+  console.log(`[boot.mjs] child exited code=${code} signal=${signal}`);
+  process.exit(code ?? 0);
+});
+child.on("error", (err) => {
+  console.error(`[boot.mjs] child error:`, err);
+});
