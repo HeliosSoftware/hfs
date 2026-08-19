@@ -421,53 +421,35 @@ where
         + 'static,
 {
     Router::new()
-        // SQL-on-FHIR capabilities: GET /$sql-on-fhir-capabilities
+        // This server's own OperationDefinitions for `$sql-run` and
+        // `$sql-export`. HFS supports a subset of the guide's parameters
+        // (no `context`, no `source`), and
+        // operations-capability.html#partial-operation-support requires such a
+        // server to publish its own definition — with `base` naming the
+        // guide's — and to cite that from its CapabilityStatement.
         .route(
-            "/$sql-on-fhir-capabilities",
-            get(handlers::sof::sof_capabilities_handler::<S>),
+            "/OperationDefinition/{id}",
+            get(handlers::sof::sof_operation_definition_handler::<S>),
         )
-        // Run (system level): POST/GET /$viewdefinition-run
-        // Spec lists system-level invocation at [base]/$viewdefinition-run
-        // with no resource-type prefix, matching the export and sqlquery-run
-        // operations.
+        // `$sql-run` — system level only (`system=true, type=false,
+        // instance=false`). The subject is named by `subjectCanonical`,
+        // `subjectReference` or `subjectResource` rather than by the path,
+        // which is why one endpoint serves ViewDefinitions, SQLQuery Libraries
+        // and SQLView Libraries alike.
+        //
+        // GET is available whenever every supplied parameter is primitive —
+        // that is, when the subject arrives as `subjectCanonical` or
+        // `subjectReference` and no `resource` is supplied. That is what keeps
+        // the operation usable from a browser or a command line.
         .route(
-            "/$viewdefinition-run",
-            post(handlers::sof::run_view_definition_handler::<S>)
-                .get(handlers::sof::run_view_definition_handler::<S>),
+            "/$sql-run",
+            post(handlers::sof::sql_run_handler::<S>).get(handlers::sof::sql_run_handler::<S>),
         )
-        // Anonymous run (type level): POST /ViewDefinition/$viewdefinition-run
-        // GET is permitted per spec when the ViewDefinition is supplied via
-        // `viewReference` query parameter (no `viewResource`/`resource` body).
-        .route(
-            "/ViewDefinition/$viewdefinition-run",
-            post(handlers::sof::run_view_definition_handler::<S>)
-                .get(handlers::sof::run_view_definition_handler::<S>),
-        )
-        // Instance run: POST /ViewDefinition/{id}/$viewdefinition-run
-        // GET infers the ViewDefinition id from the URL path.
-        .route(
-            "/ViewDefinition/{id}/$viewdefinition-run",
-            post(handlers::sof::run_stored_view_definition_handler::<S>)
-                .get(handlers::sof::run_stored_view_definition_handler::<S>),
-        )
-        // Export (system level): POST /$viewdefinition-export
-        // Spec defines this operation at all three levels (system, type,
-        // instance); system-level lets callers submit multi-view exports
-        // without nesting under /ViewDefinition.
-        .route(
-            "/$viewdefinition-export",
-            post(handlers::sof::export_view_definition_handler::<S>),
-        )
-        // Export (type level): POST /ViewDefinition/$viewdefinition-export
-        .route(
-            "/ViewDefinition/$viewdefinition-export",
-            post(handlers::sof::export_view_definition_handler::<S>),
-        )
-        // Export (instance level): POST /ViewDefinition/{id}/$viewdefinition-export
-        .route(
-            "/ViewDefinition/{id}/$viewdefinition-export",
-            post(handlers::sof::export_stored_view_definition_handler::<S>),
-        )
+        // `$sql-export` — system level only, POST only, since it creates a job.
+        // Each repetition of `subject` names one artifact and produces one
+        // output entry in one manifest; any mixture of the three kinds may be
+        // named in a single request.
+        .route("/$sql-export", post(handlers::sof::sql_export_handler::<S>))
         // Export status: GET /export/{job-id}/status
         // (DELETE on the same URL cancels the job, per spec)
         .route(
@@ -490,35 +472,6 @@ where
         .route(
             "/export/{job_id}/{filename}",
             get(handlers::sof::download_export_file_handler::<S>),
-        )
-        // SQL-on-FHIR v2 `$sqlquery-run` — system, type, and instance levels.
-        .route(
-            "/$sqlquery-run",
-            post(handlers::sof::sqlquery_run_handler::<S>),
-        )
-        .route(
-            "/Library/$sqlquery-run",
-            post(handlers::sof::sqlquery_run_handler::<S>),
-        )
-        .route(
-            "/Library/{id}/$sqlquery-run",
-            post(handlers::sof::sqlquery_run_instance_handler::<S>),
-        )
-        // SQL-on-FHIR v2 `$sqlquery-export` — async export of SQL query
-        // results; system, type, and instance levels. Shares the
-        // /export/{job-id}/* status, cancel, and download routes with
-        // `$viewdefinition-export`.
-        .route(
-            "/$sqlquery-export",
-            post(handlers::sof::sqlquery_export_handler::<S>),
-        )
-        .route(
-            "/Library/$sqlquery-export",
-            post(handlers::sof::sqlquery_export_handler::<S>),
-        )
-        .route(
-            "/Library/{id}/$sqlquery-export",
-            post(handlers::sof::sqlquery_export_stored_handler::<S>),
         )
 }
 

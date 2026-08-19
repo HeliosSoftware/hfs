@@ -21,8 +21,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardProvider, DashboardSeries, DashboardSnapshot, DashboardWindow,
+    ExportJobCounts,
 };
-use helios_persistence::core::{ResourceStorage, bucket_floor};
+use helios_persistence::core::{
+    BulkExportJobStore, BulkSubmitJobStore, ExportStatus, ResourceStorage, bucket_floor,
+};
 use helios_persistence::error::StorageResult;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use tracing::warn;
@@ -182,12 +185,17 @@ pub(crate) struct StorageDashboardProvider<S> {
     fhir_version: String,
     types: Vec<String>,
     storage: Arc<S>,
+    /// Bulk-export job store, when the active backend provides one.
+    export_jobs: Option<Arc<dyn BulkExportJobStore>>,
+    /// Bulk-submit job store, when the active backend provides one.
+    submit_jobs: Option<Arc<dyn BulkSubmitJobStore>>,
 }
 
 impl<S> StorageDashboardProvider<S> {
     /// Builds a provider for the server's default tenant and default FHIR
     /// version, charting [`DEFAULT_DASHBOARD_TYPES`]. The window is chosen per
-    /// request by the UI, so it is not fixed here.
+    /// request by the UI, so it is not fixed here. Job-store counts start
+    /// unwired; call [`Self::with_job_stores`] to attach them.
     pub(crate) fn new(storage: Arc<S>, config: &ServerConfig) -> Self {
         Self {
             default_tenant: config.default_tenant.clone(),
@@ -197,7 +205,23 @@ impl<S> StorageDashboardProvider<S> {
                 .map(|t| t.to_string())
                 .collect(),
             storage,
+            export_jobs: None,
+            submit_jobs: None,
         }
+    }
+
+    /// Attaches the bulk-export and bulk-submit job stores, when the running
+    /// deployment has them. Passing `None` for either leaves the
+    /// corresponding snapshot field at `None` (unavailable) rather than a
+    /// fabricated zero.
+    pub(crate) fn with_job_stores(
+        mut self,
+        export_jobs: Option<Arc<dyn BulkExportJobStore>>,
+        submit_jobs: Option<Arc<dyn BulkSubmitJobStore>>,
+    ) -> Self {
+        self.export_jobs = export_jobs;
+        self.submit_jobs = submit_jobs;
+        self
     }
 }
 
@@ -256,12 +280,48 @@ where
                 0
             });
 
+        // Job counts degrade to `None` (unavailable) rather than zero on a read
+        // error: a zero here would tell an operator "no jobs" when the truth is
+        // "could not ask". `None` also covers the normal case of a deployment
+        // with no bulk-export/bulk-submit job store wired at all.
+        let export_jobs = match &self.export_jobs {
+            None => None,
+            Some(store) => {
+                let running = store
+                    .count_exports_by_status(&tenant, ExportStatus::InProgress)
+                    .await;
+                let queued = store
+                    .count_exports_by_status(&tenant, ExportStatus::Accepted)
+                    .await;
+                match (running, queued) {
+                    (Ok(running), Ok(queued)) => Some(ExportJobCounts { running, queued }),
+                    (Err(error), _) | (_, Err(error)) => {
+                        warn!(%error, "dashboard snapshot: export job count query failed");
+                        None
+                    }
+                }
+            }
+        };
+
+        let import_jobs_active = match &self.submit_jobs {
+            None => None,
+            Some(store) => match store.count_active_submissions(&tenant).await {
+                Ok(n) => Some(n),
+                Err(error) => {
+                    warn!(%error, "dashboard snapshot: import job count query failed");
+                    None
+                }
+            },
+        };
+
         DashboardSnapshot {
             fhir_version: self.fhir_version.clone(),
             total_resources,
             distinct_types,
             window,
             series,
+            export_jobs,
+            import_jobs_active,
         }
     }
 }
@@ -480,5 +540,128 @@ mod tests {
 
     fn test_tenant() -> TenantContext {
         TenantContext::new(TenantId::new("default"), TenantPermissions::full_access())
+    }
+
+    /// Wraps an `ExportRequest` in a `StartExportInput` with default kickoff
+    /// metadata, mirroring the sqlite backend's own test helper.
+    fn test_export_input(
+        request: helios_persistence::core::ExportRequest,
+    ) -> helios_persistence::core::StartExportInput {
+        helios_persistence::core::StartExportInput {
+            request,
+            transaction_time: Utc::now(),
+            request_url: "http://localhost/$export".to_string(),
+            owner_subject: Some("test-subject".to_string()),
+            fhir_version: helios_fhir::FhirVersion::default(),
+        }
+    }
+
+    /// With no job stores wired (the default from `new`), both job-count
+    /// fields stay `None` — this is a normal, unconfigured state, not an error.
+    #[tokio::test]
+    async fn job_counts_are_unavailable_when_no_job_stores_are_wired() {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite backend");
+        backend.init_schema().expect("init schema");
+        let config = ServerConfig {
+            default_tenant: "default".to_string(),
+            ..ServerConfig::for_testing()
+        };
+
+        let provider = StorageDashboardProvider::new(Arc::new(backend), &config);
+        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
+
+        assert_eq!(snapshot.export_jobs, None);
+        assert_eq!(snapshot.import_jobs_active, None);
+    }
+
+    /// With both job stores wired but nothing submitted yet, the counts are
+    /// real zeros — distinct from the "not wired" `None` case above.
+    #[tokio::test]
+    async fn job_counts_are_zero_over_empty_job_stores() {
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite backend"));
+        backend.init_schema().expect("init schema");
+        let config = ServerConfig {
+            default_tenant: "default".to_string(),
+            ..ServerConfig::for_testing()
+        };
+
+        // SqliteBackend implements both BulkExportJobStore and BulkSubmitJobStore,
+        // so the same Arc can stand in for storage and both job stores.
+        let export_jobs = Arc::clone(&backend) as Arc<dyn BulkExportJobStore>;
+        let submit_jobs = Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>;
+        let provider = StorageDashboardProvider::new(Arc::clone(&backend), &config)
+            .with_job_stores(Some(export_jobs), Some(submit_jobs));
+        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
+
+        assert_eq!(
+            snapshot.export_jobs,
+            Some(ExportJobCounts {
+                running: 0,
+                queued: 0
+            })
+        );
+        assert_eq!(snapshot.import_jobs_active, Some(0));
+    }
+
+    /// Real export jobs in `accepted` and `in-progress` state, plus a real
+    /// active submission, are reflected exactly in the snapshot.
+    #[tokio::test]
+    async fn job_counts_reflect_accepted_and_in_progress_exports() {
+        use helios_persistence::core::{
+            BulkExportStorage, BulkSubmitProvider, ExportClaimStrategy, ExportRequest,
+            ExportWorkerStorage, SubmissionId, WorkerId,
+        };
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite backend"));
+        backend.init_schema().expect("init schema");
+        let config = ServerConfig {
+            default_tenant: "default".to_string(),
+            ..ServerConfig::for_testing()
+        };
+        let tenant = test_tenant();
+
+        // Two export jobs: one stays `accepted`, the other is claimed and
+        // driven to `in-progress` through the real worker path.
+        backend
+            .start_export(&tenant, test_export_input(ExportRequest::system()))
+            .await
+            .expect("start export 1");
+        backend
+            .start_export(&tenant, test_export_input(ExportRequest::system()))
+            .await
+            .expect("start export 2");
+
+        let worker = WorkerId::new("worker-1");
+        let lease = backend
+            .claim_next(&worker, std::time::Duration::from_secs(60))
+            .await
+            .expect("claim_next succeeds")
+            .expect("a job should be claimable");
+        backend
+            .mark_export_in_progress(&tenant, &lease.job_id, &worker, lease.fencing_token)
+            .await
+            .expect("mark in progress");
+
+        // One active submission (freshly created submissions start `in-progress`).
+        let submission_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &submission_id, None)
+            .await
+            .expect("create submission");
+
+        let export_jobs = Arc::clone(&backend) as Arc<dyn BulkExportJobStore>;
+        let submit_jobs = Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>;
+        let provider = StorageDashboardProvider::new(Arc::clone(&backend), &config)
+            .with_job_stores(Some(export_jobs), Some(submit_jobs));
+        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
+
+        assert_eq!(
+            snapshot.export_jobs,
+            Some(ExportJobCounts {
+                running: 1,
+                queued: 1
+            })
+        );
+        assert_eq!(snapshot.import_jobs_active, Some(1));
     }
 }

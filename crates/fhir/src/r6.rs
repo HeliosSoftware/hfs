@@ -174741,16 +174741,16 @@ pub enum ViewDefinitionVersionAlgorithm {
 /// criteria are defined by FHIRPath expressions.
 ///
 /// ## Type: Resource type
-/// Base type: http://hl7.org/fhir/StructureDefinition/CanonicalResource
+/// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: draft
 /// FHIR Version: 5.0.0
 ///
-/// See: [ViewDefinition](https://sql-on-fhir.org/ig/StructureDefinition/ViewDefinition)
+/// See: [ViewDefinition](http://hl7.org/fhir/StructureDefinition/ViewDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(
     choice_elements = "versionAlgorithm",
-    summary_fields = "id,meta,implicit_rules,modifier_extension,url,identifier,version,version_algorithm,name,title,status,experimental,date,publisher,contact,use_context,jurisdiction"
+    summary_fields = "id,meta,implicit_rules,modifier_extension,url,identifier,version,version_algorithm,name,title,status,experimental,date,publisher,contact,use_context,jurisdiction,effective_period"
 )]
 pub struct ViewDefinition {
     /// Logical id of this artifact
@@ -174961,17 +174961,19 @@ pub struct ViewDefinition {
     /// extensions, user content
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// Canonical identifier for this {{title}}, represented as an absolute URI (globally unique)
+    /// Canonical identifier for this view definition, represented as an absolute URI (globally unique)
     ///
-    /// An absolute URI that is used to identify this {{title}} when it is referenced
-    /// in a specification, model, design or an instance; also called its canonical
-    /// identifier. This SHOULD be globally unique and SHOULD be a literal address at
-    /// which an authoritative instance of this {{title}} is (or will be) published.
-    /// This URL can be the target of a canonical reference. It SHALL remain the same
-    /// when the {{title}} is stored on different servers.
+    /// An absolute URI that is used to identify this view definition when it is
+    /// referenced in a specification, model, design or an instance; also called its
+    /// canonical identifier. This SHOULD be globally unique and SHOULD be a literal
+    /// address at which an authoritative instance of this view definition is (or
+    /// will be) published. This URL can be the target of a canonical reference. It
+    /// SHALL remain the same when the view definition is stored on different
+    /// servers.
     ///
     /// ## Requirements
-    /// Allows the {{title}} to be referenced by a single globally unique identifier.
+    /// Allows the view definition to be referenced by a single globally unique
+    /// identifier.
     ///
     /// ## Implementation Notes
     /// Can be a urn:uuid: or a urn:oid: but real http: addresses are preferred.
@@ -174980,12 +174982,12 @@ pub struct ViewDefinition {
     /// The determination of when to create a new version of a resource (same url,
     /// new version) vs. defining a new artifact is up to the author. Considerations
     /// for making this decision are found in [Technical and Business
-    /// Versions](http://hl7.org/fhir/R5/resource.html#versions).
+    /// Versions](resource.html#versions).
     ///
     /// In some cases, the resource can no longer be found at the stated url, but the
     /// url itself cannot change. Implementations can use the
-    /// [meta.source](http://hl7.org/fhir/R5/resource.html#meta) element to indicate
-    /// where the current master source of the resource can be found.
+    /// [meta.source](resource.html#meta) element to indicate where the current
+    /// master source of the resource can be found.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -174995,58 +174997,48 @@ pub struct ViewDefinition {
     /// ## Constraints
     /// - **cnl-1**: URL should not contain | or # - these characters make processing canonical references problematic (warning)
     ///   Expression: `exists() implies matches('^[^|# ]+$')`
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub url: Option<Uri>,
-    /// Additional identifier for the {{title}}
+    /// Additional identifier for the view definition
     ///
-    /// A formal identifier that is used to identify this {{title}} when it is
+    /// A formal identifier that is used to identify this view definition when it is
     /// represented in other formats, or referenced in a specification, model, design
     /// or an instance.
     ///
     /// ## Requirements
     /// Allows externally provided and/or usable business identifiers to be easily
-    /// associated with the {{title}}.
+    /// associated with the view definition.
     ///
     /// ## Implementation Notes
     /// Typically, this is used for identifiers that can go in an HL7 V3 II (instance
-    /// identifier) data type, and can then identify this {{title}} outside of FHIR,
-    /// where it is not possible to use the logical URI.
+    /// identifier) data type, and can then identify this view definition outside of
+    /// FHIR, where it is not possible to use the logical URI.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
     /// ## Special Semantics
     /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub identifier: Option<Vec<Identifier>>,
-    /// Business version of the {{title}}
+    /// Business version of the view definition
     ///
-    /// The identifier that is used to identify this version of the {{title}} when it
-    /// is referenced in a specification, model, design or instance. This is an
-    /// arbitrary value managed by the {{title}} author and is not expected to be
-    /// globally unique. For example, it might be a timestamp (e.g. yyyymmdd) if a
-    /// managed version is not available. There is also no expectation that versions
-    /// can be placed in a lexicographical sequence without additional knowledge.
-    /// (See the versionAlgorithm element.)
+    /// The identifier that is used to identify this version of the view definition
+    /// when it is referenced in a specification, model, design or instance. This is
+    /// an arbitrary value managed by the view definition author and is not expected
+    /// to be globally unique. For example, it might be a timestamp (e.g. yyyymmdd)
+    /// if a managed version is not available. There is also no expectation that
+    /// versions can be placed in a lexicographical sequence without additional
+    /// knowledge. (See the versionAlgorithm element.)
     ///
     /// ## Implementation Notes
-    /// There may be different {{title}}s that have the same url but different
+    /// There may be different view definitions that have the same url but different
     /// versions. The version can be appended to the url in a reference to allow a
-    /// reference to a particular business version of the {{title}} with the format
-    /// [url]|[version]. The version SHOULD NOT contain a '#' - see [Business
-    /// Version](http://hl7.org/fhir/R5/resource.html#bv-format).
+    /// reference to a particular business version of the view definition with the
+    /// format [url]|[version]. The version SHOULD NOT contain a '#' - see [Business
+    /// Version](resource.html#bv-format).
     ///
     /// ## Cardinality: Optional (0..1)
     ///
     /// ## Special Semantics
     /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub version: Option<String>,
     /// How to compare versions
     ///
@@ -175064,20 +175056,16 @@ pub struct ViewDefinition {
     /// ## Special Semantics
     /// - Included in summary
     ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    ///
     /// ## Binding
     /// - **Strength**: extensible
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/version-algorithm
     #[fhir_serde(flatten)]
     pub version_algorithm: Option<ViewDefinitionVersionAlgorithm>,
-    /// Name for this {{title}} (computer friendly)
+    /// Name for this view definition (computer friendly)
     ///
-    /// A natural language name identifying the {{title}}. This name should be usable
-    /// as an identifier for the resource by machine processing applications such as
-    /// code generation.
+    /// A natural language name identifying the view definition. This name should be
+    /// usable as an identifier for the resource by machine processing applications
+    /// such as code generation.
     ///
     /// ## Requirements
     /// Supports code generation.
@@ -175093,19 +175081,14 @@ pub struct ViewDefinition {
     /// - Included in summary
     ///
     /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     /// - **sql-name**: Name is limited to letters, numbers, or underscores and cannot start with an (error)
     ///   underscore -- i.e. with a regular expression of: ^[A-Za-z][A-Za-z0-9_]*$
     ///   This makes it usable as table names in a wide variety of databases.
     ///   Expression: `empty() or matches('^[A-Za-z][A-Za-z0-9_]*$')`
-    ///
-    /// ## Conditions
-    /// Used when: cnl-0
     pub name: Option<String>,
-    /// Name for this {{title}} (human friendly)
+    /// Name for this view definition (human friendly)
     ///
-    /// A short, descriptive, user-friendly title for the {{title}}.
+    /// A short, descriptive, user-friendly title for the view definition.
     ///
     /// ## Implementation Notes
     /// This name does not need to be machine-processing friendly and may contain
@@ -175115,94 +175098,78 @@ pub struct ViewDefinition {
     ///
     /// ## Special Semantics
     /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub title: Option<String>,
     /// draft | active | retired | unknown
     ///
-    /// The current state of this {{title}}.
+    /// The current state of this view definition.
     ///
     /// ## Requirements
-    /// Enables tracking the life-cycle of the content and filtering of {{title}}s
-    /// that are appropriate for use versus not.
+    /// Enables tracking the life-cycle of the content and filtering of view
+    /// definitions that are appropriate for use versus not.
     ///
     /// ## Implementation Notes
     /// A nominal state-transition diagram can be found in the [Definition
-    /// pattern](http://hl7.org/fhir/R5/definition.html#statemachine) documentation.
+    /// pattern](definition.html#statemachine) documentation.
     ///
     /// Unknown does not represent 'other' - one of the defined statuses must apply.
     /// Unknown is used when the authoring system is not sure what the current status
     /// is.
     ///
     /// See guidance around (not) making local changes to elements
-    /// [here](http://hl7.org/fhir/R5/canonicalresource.html#localization).
+    /// [here](canonicalresource.html#localization).
     ///
     /// ## Cardinality: Required (1..1)
     ///
     /// ## Special Semantics
-    /// - Modifier element - This is labeled as "Is Modifier" because applications should not use a retired {{title}} without due consideration
+    /// - Modifier element - This is labeled as "Is Modifier" because applications should not use a retired view definition without due consideration
     /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     ///
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|5.0.0
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status
     pub status: Code,
     /// For testing purposes, not real usage
     ///
-    /// A Boolean value to indicate that this {{title}} is authored for testing
+    /// A Boolean value to indicate that this view definition is authored for testing
     /// purposes (or education/evaluation/marketing) and is not intended for genuine
     /// usage.
     ///
     /// ## Requirements
     /// Enables experimental content to be developed following the same lifecycle
-    /// that would be used for a production-level {{title}}.
+    /// that would be used for a production-level view definition.
     ///
     /// ## Implementation Notes
-    /// Allows filtering of {{title}}s that are appropriate for use versus not.
+    /// Allows filtering of view definitions that are appropriate for use versus not.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
     /// ## Special Semantics
     /// - Included in summary
     /// - When missing: If absent, this resource is treated as though it is not experimental.
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub experimental: Option<Boolean>,
     /// Date last changed
     ///
-    /// The date (and optionally time) when the {{title}} was last significantly
-    /// changed. The date must change when the business version changes and it must
-    /// change if the status code changes. In addition, it should change when the
-    /// substantive content of the {{title}} changes.
+    /// The date (and optionally time) when the view definition was last
+    /// significantly changed. The date must change when the business version changes
+    /// and it must change if the status code changes. In addition, it should change
+    /// when the substantive content of the view definition changes.
     ///
     /// ## Implementation Notes
     /// The date is often not tracked until the resource is published, but may be
     /// present on draft content. Note that this is not the same as the resource
     /// last-modified-date, since the resource may be a secondary representation of
-    /// the {{title}}. Additional specific dates may be added as extensions or be
-    /// found by consulting Provenances associated with past versions of the
+    /// the view definition. Additional specific dates may be added as extensions or
+    /// be found by consulting Provenances associated with past versions of the
     /// resource.
     ///
     /// See guidance around (not) making local changes to elements
-    /// [here](http://hl7.org/fhir/R5/canonicalresource.html#localization).
+    /// [here](canonicalresource.html#localization).
     ///
     /// ## Cardinality: Optional (0..1)
     ///
     /// ## Special Semantics
     /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     ///
     /// ## Aliases
     /// Revision Date
@@ -175210,29 +175177,25 @@ pub struct ViewDefinition {
     /// Name of the publisher/steward (organization or individual)
     ///
     /// The name of the organization or individual responsible for the release and
-    /// ongoing maintenance of the {{title}}.
+    /// ongoing maintenance of the view definition.
     ///
     /// ## Requirements
-    /// Helps establish the "authority/credibility" of the {{title}}. May also allow
-    /// for contact.
+    /// Helps establish the "authority/credibility" of the view definition. May also
+    /// allow for contact.
     ///
     /// ## Implementation Notes
     /// Usually an organization but may be an individual. The publisher (or steward)
-    /// of the {{title}} is the organization or individual primarily responsible for
-    /// the maintenance and upkeep of the {{title}}. This is not necessarily the same
-    /// individual or organization that developed and initially authored the content.
-    /// The publisher is the primary point of contact for questions or issues with
-    /// the {{title}}. This item SHOULD be populated unless the information is
-    /// available from context.
+    /// of the view definition is the organization or individual primarily
+    /// responsible for the maintenance and upkeep of the view definition. This is
+    /// not necessarily the same individual or organization that developed and
+    /// initially authored the content. The publisher is the primary point of contact
+    /// for questions or issues with the view definition. This item SHOULD be
+    /// populated unless the information is available from context.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
     /// ## Special Semantics
     /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub publisher: Option<String>,
     /// Contact details for the publisher
     ///
@@ -175243,41 +175206,34 @@ pub struct ViewDefinition {
     /// May be a web site, an email address, a telephone number, etc.
     ///
     /// See guidance around (not) making local changes to elements
-    /// [here](http://hl7.org/fhir/R5/canonicalresource.html#localization).
+    /// [here](canonicalresource.html#localization).
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
     /// ## Special Semantics
     /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub contact: Option<Vec<ContactDetail>>,
-    /// Natural language description of the {{title}}
+    /// Natural language description of the view definition
     ///
-    /// A free text natural language description of the {{title}} from a consumer's
-    /// perspective.
+    /// A free text natural language description of the view definition from a
+    /// consumer's perspective.
     ///
     /// ## Implementation Notes
     /// This description can be used to capture details such as comments about
     /// misuse, instructions for clinical use and interpretation, literature
     /// references, examples from the paper world, etc. It is not a rendering of the
-    /// {{title}} as conveyed in the 'text' field of the resource itself. This item
-    /// SHOULD be populated unless the information is available from context.
+    /// view definition as conveyed in the 'text' field of the resource itself. This
+    /// item SHOULD be populated unless the information is available from context.
     ///
     /// ## Cardinality: Optional (0..1)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub description: Option<Markdown>,
     /// The context that the content is intended to support
     ///
     /// The content was developed with a focus and intent of supporting the contexts
     /// that are listed. These contexts may be general categories (gender, age, ...)
     /// or may be references to specific programs (insurance plans, studies, ...) and
-    /// may be used to assist with indexing and searching for appropriate {{title}}s.
+    /// may be used to assist with indexing and searching for appropriate view
+    /// definitions.
     ///
     /// ## Requirements
     /// Assist in searching for appropriate content.
@@ -175290,19 +175246,16 @@ pub struct ViewDefinition {
     ///
     /// ## Special Semantics
     /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "useContext")]
     pub use_context: Option<Vec<UsageContext>>,
-    /// Intended jurisdiction for {{title}} (if applicable)
+    /// Intended jurisdiction for view definition (if applicable)
     ///
-    /// A legal or geographic region in which the {{title}} is intended to be used.
+    /// A legal or geographic region in which the view definition is intended to be
+    /// used.
     ///
     /// ## Implementation Notes
-    /// It may be possible for the {{title}} to be used in jurisdictions other than
-    /// those for which it was originally designed or intended.
+    /// It may be possible for the view definition to be used in jurisdictions other
+    /// than those for which it was originally designed or intended.
     ///
     /// DEPRECATION NOTE: For consistency, implementations are encouraged to migrate
     /// to using the new 'jurisdiction' code in the useContext element. (I.e.
@@ -175315,51 +175268,39 @@ pub struct ViewDefinition {
     /// ## Special Semantics
     /// - Included in summary
     ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    ///
     /// ## Binding
     /// - **Strength**: extensible
     /// - **Description**: Countries and regions within which this artifact is targeted for use.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/jurisdiction
     pub jurisdiction: Option<Vec<CodeableConcept>>,
-    /// Why this {{title}} is defined
+    /// Why this view definition is defined
     ///
-    /// Explanation of why this {{title}} is needed and why it has been designed as
-    /// it has.
+    /// Explanation of why this view definition is needed and why it has been
+    /// designed as it has.
     ///
     /// ## Implementation Notes
-    /// This element does not describe the usage of the {{title}}. Instead, it
+    /// This element does not describe the usage of the view definition. Instead, it
     /// provides traceability of "why" the resource is either needed or "why" it is
     /// defined as it is. This may be used to point to source materials or
-    /// specifications that drove the structure of this {{title}}.
+    /// specifications that drove the structure of this view definition.
     ///
     /// ## Cardinality: Optional (0..1)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub purpose: Option<Markdown>,
     /// Use and/or publishing restrictions
     ///
-    /// A copyright statement relating to the {{title}} and/or its contents.
+    /// A copyright statement relating to the view definition and/or its contents.
     /// Copyright statements are generally legal restrictions on the use and
-    /// publishing of the {{title}}.
+    /// publishing of the view definition.
     ///
     /// ## Requirements
     /// Consumers must be able to determine any legal restrictions on the use of the
-    /// {{title}} and/or its content.
+    /// view definition and/or its content.
     ///
     /// ## Implementation Notes
     /// The short copyright declaration (e.g. (c) '2015+ xyz organization' should be
     /// sent in the copyrightLabel element.
     ///
     /// ## Cardinality: Optional (0..1)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     ///
     /// ## Aliases
     /// License, Restrictions
@@ -175368,7 +175309,7 @@ pub struct ViewDefinition {
     ///
     /// A short string (<50 characters), suitable for inclusion in a page footer that
     /// identifies the copyright holder, effective period, and optionally whether
-    /// rights are resctricted. (e.g. 'All rights reserved', 'Some rights reserved').
+    /// rights are restricted. (e.g. 'All rights reserved', 'Some rights reserved').
     ///
     /// ## Requirements
     /// Defines the content expected to be rendered in all representations of the
@@ -175380,12 +175321,148 @@ pub struct ViewDefinition {
     /// restrictions, warrantees, etc. goes in the more general 'copyright' element.
     ///
     /// ## Cardinality: Optional (0..1)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "copyrightLabel")]
     pub copyright_label: Option<String>,
+    /// When the view definition was approved by publisher
+    ///
+    /// The date on which the resource content was approved by the publisher.
+    /// Approval happens once when the content is officially approved for usage.
+    ///
+    /// ## Implementation Notes
+    /// The 'date' element may be more recent than the approval date because of minor
+    /// changes or editorial corrections.
+    ///
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional (0..1)
+    #[fhir_serde(rename = "approvalDate")]
+    pub approval_date: Option<Date>,
+    /// When the view definition was last reviewed by the publisher
+    ///
+    /// The date on which the resource content was last reviewed. Review happens
+    /// periodically after approval but does not change the original approval date.
+    ///
+    /// ## Requirements
+    /// Gives a sense of how "current" the content is. Resources that have not been
+    /// reviewed in a long time may have a risk of being less appropriate/relevant.
+    ///
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Implementation Notes
+    /// If specified, this date follows the original approval date.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    #[fhir_serde(rename = "lastReviewDate")]
+    pub last_review_date: Option<Date>,
+    /// When the view definition is expected to be used
+    ///
+    /// The period during which the view definition content was or is planned to be
+    /// in active use.
+    ///
+    /// ## Requirements
+    /// Allows establishing a transition before a resource comes into effect and also
+    /// allows for a sun-setting process when new versions of the view definition are
+    /// or are expected to be used instead.
+    ///
+    /// ## Implementation Notes
+    /// The effective period for a view definition determines when the content is
+    /// applicable for usage and is independent of publication and review dates. For
+    /// example, a measure intended to be used for the year 2016 might be published
+    /// in 2015.
+    ///
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    #[fhir_serde(rename = "effectivePeriod")]
+    pub effective_period: Option<Period>,
+    /// E.g. Education, Treatment, Assessment, etc
+    ///
+    /// Descriptive topics related to the content of the view definition. Topics
+    /// provide a high-level categorization as well as keywords for the view
+    /// definition that can be useful for filtering and searching.
+    ///
+    /// ## Requirements
+    /// Repositories must be able to determine how to categorize the view definition
+    /// so that it can be found by topical and keyword searches.
+    ///
+    /// ## Implementation Notes
+    /// This element provides topical categorization and keywords for the view
+    /// definition, as opposed to the more structured context-of-use information
+    /// provided in the useContext element.
+    ///
+    /// DEPRECATION NOTE: For consistency, implementations are encouraged to migrate
+    /// to using the new 'topic' code in the useContext element. (I.e.
+    /// useContext.code indicating
+    /// http://terminology.hl7.org/CodeSystem/usage-context-type#topic and
+    /// useContext.valueCodeableConcept indicating the topic)
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Binding
+    /// - **Strength**: example
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/definition-topic
+    pub topic: Option<Vec<CodeableConcept>>,
+    /// Who authored the view definition
+    ///
+    /// An individual or organization primarily involved in the creation and
+    /// maintenance of the view definition.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    pub author: Option<Vec<ContactDetail>>,
+    /// Who edited the view definition
+    ///
+    /// An individual or organization primarily responsible for internal coherence of
+    /// the view definition.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    pub editor: Option<Vec<ContactDetail>>,
+    /// Who reviewed the view definition
+    ///
+    /// An individual or organization asserted by the publisher to be primarily
+    /// responsible for review of some aspect of the view definition.
+    ///
+    /// ## Implementation Notes
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    pub reviewer: Option<Vec<ContactDetail>>,
+    /// Who endorsed the view definition
+    ///
+    /// An individual or organization asserted by the publisher to be responsible for
+    /// officially endorsing the view definition for use in some setting.
+    ///
+    /// ## Implementation Notes
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    pub endorser: Option<Vec<ContactDetail>>,
+    /// Additional documentation, citations, etc
+    ///
+    /// Related artifacts such as additional documentation, justification,
+    /// dependencies, bibliographic references, and predecessor and successor
+    /// artifacts.
+    ///
+    /// ## Requirements
+    /// A view definition must be able to provide enough information for consumers of
+    /// the content (and/or interventions or results produced by the content) to be
+    /// able to determine and understand the justification for and evidence in
+    /// support of the content.
+    ///
+    /// ## Implementation Notes
+    /// Each related artifact is either an attachment, or a reference to another
+    /// resource, but not both.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    #[fhir_serde(rename = "relatedArtifact")]
+    pub related_artifact: Option<Vec<RelatedArtifact>>,
     /// FHIR resource for the ViewDefinition
     ///
     /// The FHIR resource that the view is based upon, e.g. 'Patient' or
@@ -175425,10 +175502,6 @@ pub struct ViewDefinition {
     /// external constant with the same name.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub constant: Option<Vec<ViewDefinitionConstant>>,
     /// A collection of columns and nested selects to include in the view.
     ///
@@ -175440,9 +175513,7 @@ pub struct ViewDefinition {
     ///
     /// ## Constraints
     /// - **sql-expressions**: Can only have at most one of `forEach`, `forEachOrNull`, or `repeat`. (error)
-    ///   Expression: `(forEach | forEachOrNull | repeat).count() \<= 1`
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///   Expression: `(forEach.exists().toInteger() + forEachOrNull.exists().toInteger() + repeat.exists().toInteger()) \<= 1`
     pub select: Option<Vec<ViewDefinitionSelect>>,
     /// A series of zero or more FHIRPath constraints to filter resources for the view.
     ///
@@ -175451,10 +175522,6 @@ pub struct ViewDefinition {
     /// must evaluate to true for the resource to be included in the view.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "where")]
     pub r#where: Option<Vec<ViewDefinitionWhere>>,
 }
@@ -175529,96 +175596,9 @@ pub enum ViewDefinitionConstantValue {
 /// external constant with the same name.
 ///
 /// ## Cardinality: Optional, Multiple (0..*)
-///
-/// ## Constraints
-/// - **ele-1**: All FHIR elements must have a @value or children (error)
-///   Expression: `hasValue() or (children().count() > id.count())`
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(choice_elements = "value")]
 pub struct ViewDefinitionConstant {
-    /// Unique id for inter-element referencing
-    ///
-    /// Unique id for the element within a resource (for internal references). This
-    /// may be any string value that does not contain spaces.
-    ///
-    /// ## Cardinality: Optional (0..1)
-    ///
-    /// ## Conditions
-    /// Used when: ele-1
-    pub id: Option<String>,
-    /// Additional content defined by implementations
-    ///
-    /// May be used to represent additional information that is not part of the basic
-    /// definition of the element. To make the use of extensions safe and managable,
-    /// there is a strict set of governance applied to the definition and use of
-    /// extensions. Though any implementer can define an extension, there is a set of
-    /// requirements that SHALL be met as part of the definition of the extension.
-    ///
-    /// ## Implementation Notes
-    /// There can be no stigma associated with the use of extensions by any
-    /// application, project, or standard - regardless of the institution or
-    /// jurisdiction that uses or defines the extensions. The use of extensions is
-    /// what allows the FHIR specification to retain a core level of simplicity for
-    /// everyone.
-    ///
-    /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    /// - **ext-1**: Must have either extensions or value[x], not both (error)
-    ///   Expression: `extension.exists() != value.exists()`
-    ///
-    /// ## Aliases
-    /// extensions, user content
-    pub extension: Option<Vec<Extension>>,
-    /// Extensions that cannot be ignored even if unrecognized
-    ///
-    /// May be used to represent additional information that is not part of the basic
-    /// definition of the element and that modifies the understanding of the element
-    /// in which it is contained and/or the understanding of the containing element's
-    /// descendants. Usually modifier elements provide negation or qualification. To
-    /// make the use of extensions safe and managable, there is a strict set of
-    /// governance applied to the definition and use of extensions. Though any
-    /// implementer can define an extension, there is a set of requirements that
-    /// SHALL be met as part of the definition of the extension. Applications
-    /// processing a resource are required to check for modifier extensions.
-    ///
-    /// Modifier extensions SHALL NOT change the meaning of any elements on Resource
-    /// or DomainResource (including cannot change the meaning of modifierExtension
-    /// itself).
-    ///
-    /// ## Requirements
-    /// Modifier extensions allow for extensions that *cannot* be safely ignored to
-    /// be clearly distinguished from the vast majority of extensions which can be
-    /// safely ignored. This promotes interoperability by eliminating the need for
-    /// implementers to prohibit the presence of extensions. For further information,
-    /// see the [definition of modifier
-    /// extensions](http://hl7.org/fhir/R5/extensibility.html#modifierExtension).
-    ///
-    /// ## Implementation Notes
-    /// There can be no stigma associated with the use of extensions by any
-    /// application, project, or standard - regardless of the institution or
-    /// jurisdiction that uses or defines the extensions. The use of extensions is
-    /// what allows the FHIR specification to retain a core level of simplicity for
-    /// everyone.
-    ///
-    /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Special Semantics
-    /// - Modifier element - Modifier extensions are expected to modify the meaning or interpretation of the element that contains them
-    /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    /// - **ext-1**: Must have either extensions or value[x], not both (error)
-    ///   Expression: `extension.exists() != value.exists()`
-    ///
-    /// ## Aliases
-    /// extensions, user content, modifiers
-    #[fhir_serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
     /// Name of constant (referred to in FHIRPath as %[name])
     ///
     /// Name of constant (referred to in FHIRPath as %[name])
@@ -175656,94 +175636,9 @@ pub struct ViewDefinitionConstant {
 ///
 /// ## Constraints
 /// - **sql-expressions**: Can only have at most one of `forEach`, `forEachOrNull`, or `repeat`. (error)
-///   Expression: `(forEach | forEachOrNull | repeat).count() \<= 1`
-/// - **ele-1**: All FHIR elements must have a @value or children (error)
-///   Expression: `hasValue() or (children().count() > id.count())`
+///   Expression: `(forEach.exists().toInteger() + forEachOrNull.exists().toInteger() + repeat.exists().toInteger()) \<= 1`
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 pub struct ViewDefinitionSelect {
-    /// Unique id for inter-element referencing
-    ///
-    /// Unique id for the element within a resource (for internal references). This
-    /// may be any string value that does not contain spaces.
-    ///
-    /// ## Cardinality: Optional (0..1)
-    ///
-    /// ## Conditions
-    /// Used when: ele-1
-    pub id: Option<String>,
-    /// Additional content defined by implementations
-    ///
-    /// May be used to represent additional information that is not part of the basic
-    /// definition of the element. To make the use of extensions safe and managable,
-    /// there is a strict set of governance applied to the definition and use of
-    /// extensions. Though any implementer can define an extension, there is a set of
-    /// requirements that SHALL be met as part of the definition of the extension.
-    ///
-    /// ## Implementation Notes
-    /// There can be no stigma associated with the use of extensions by any
-    /// application, project, or standard - regardless of the institution or
-    /// jurisdiction that uses or defines the extensions. The use of extensions is
-    /// what allows the FHIR specification to retain a core level of simplicity for
-    /// everyone.
-    ///
-    /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    /// - **ext-1**: Must have either extensions or value[x], not both (error)
-    ///   Expression: `extension.exists() != value.exists()`
-    ///
-    /// ## Aliases
-    /// extensions, user content
-    pub extension: Option<Vec<Extension>>,
-    /// Extensions that cannot be ignored even if unrecognized
-    ///
-    /// May be used to represent additional information that is not part of the basic
-    /// definition of the element and that modifies the understanding of the element
-    /// in which it is contained and/or the understanding of the containing element's
-    /// descendants. Usually modifier elements provide negation or qualification. To
-    /// make the use of extensions safe and managable, there is a strict set of
-    /// governance applied to the definition and use of extensions. Though any
-    /// implementer can define an extension, there is a set of requirements that
-    /// SHALL be met as part of the definition of the extension. Applications
-    /// processing a resource are required to check for modifier extensions.
-    ///
-    /// Modifier extensions SHALL NOT change the meaning of any elements on Resource
-    /// or DomainResource (including cannot change the meaning of modifierExtension
-    /// itself).
-    ///
-    /// ## Requirements
-    /// Modifier extensions allow for extensions that *cannot* be safely ignored to
-    /// be clearly distinguished from the vast majority of extensions which can be
-    /// safely ignored. This promotes interoperability by eliminating the need for
-    /// implementers to prohibit the presence of extensions. For further information,
-    /// see the [definition of modifier
-    /// extensions](http://hl7.org/fhir/R5/extensibility.html#modifierExtension).
-    ///
-    /// ## Implementation Notes
-    /// There can be no stigma associated with the use of extensions by any
-    /// application, project, or standard - regardless of the institution or
-    /// jurisdiction that uses or defines the extensions. The use of extensions is
-    /// what allows the FHIR specification to retain a core level of simplicity for
-    /// everyone.
-    ///
-    /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Special Semantics
-    /// - Modifier element - Modifier extensions are expected to modify the meaning or interpretation of the element that contains them
-    /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    /// - **ext-1**: Must have either extensions or value[x], not both (error)
-    ///   Expression: `extension.exists() != value.exists()`
-    ///
-    /// ## Aliases
-    /// extensions, user content, modifiers
-    #[fhir_serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
     /// A column to be produced in the resulting table.
     ///
     /// A column to be produced in the resulting table. The column is relative to the
@@ -175751,10 +175646,6 @@ pub struct ViewDefinitionSelect {
     /// that contains it.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub column: Option<Vec<ViewDefinitionSelectColumn>>,
     /// Nested select relative to a parent expression.
     ///
@@ -175816,95 +175707,8 @@ pub struct ViewDefinitionSelect {
 /// that contains it.
 ///
 /// ## Cardinality: Optional, Multiple (0..*)
-///
-/// ## Constraints
-/// - **ele-1**: All FHIR elements must have a @value or children (error)
-///   Expression: `hasValue() or (children().count() > id.count())`
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 pub struct ViewDefinitionSelectColumn {
-    /// Unique id for inter-element referencing
-    ///
-    /// Unique id for the element within a resource (for internal references). This
-    /// may be any string value that does not contain spaces.
-    ///
-    /// ## Cardinality: Optional (0..1)
-    ///
-    /// ## Conditions
-    /// Used when: ele-1
-    pub id: Option<String>,
-    /// Additional content defined by implementations
-    ///
-    /// May be used to represent additional information that is not part of the basic
-    /// definition of the element. To make the use of extensions safe and managable,
-    /// there is a strict set of governance applied to the definition and use of
-    /// extensions. Though any implementer can define an extension, there is a set of
-    /// requirements that SHALL be met as part of the definition of the extension.
-    ///
-    /// ## Implementation Notes
-    /// There can be no stigma associated with the use of extensions by any
-    /// application, project, or standard - regardless of the institution or
-    /// jurisdiction that uses or defines the extensions. The use of extensions is
-    /// what allows the FHIR specification to retain a core level of simplicity for
-    /// everyone.
-    ///
-    /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    /// - **ext-1**: Must have either extensions or value[x], not both (error)
-    ///   Expression: `extension.exists() != value.exists()`
-    ///
-    /// ## Aliases
-    /// extensions, user content
-    pub extension: Option<Vec<Extension>>,
-    /// Extensions that cannot be ignored even if unrecognized
-    ///
-    /// May be used to represent additional information that is not part of the basic
-    /// definition of the element and that modifies the understanding of the element
-    /// in which it is contained and/or the understanding of the containing element's
-    /// descendants. Usually modifier elements provide negation or qualification. To
-    /// make the use of extensions safe and managable, there is a strict set of
-    /// governance applied to the definition and use of extensions. Though any
-    /// implementer can define an extension, there is a set of requirements that
-    /// SHALL be met as part of the definition of the extension. Applications
-    /// processing a resource are required to check for modifier extensions.
-    ///
-    /// Modifier extensions SHALL NOT change the meaning of any elements on Resource
-    /// or DomainResource (including cannot change the meaning of modifierExtension
-    /// itself).
-    ///
-    /// ## Requirements
-    /// Modifier extensions allow for extensions that *cannot* be safely ignored to
-    /// be clearly distinguished from the vast majority of extensions which can be
-    /// safely ignored. This promotes interoperability by eliminating the need for
-    /// implementers to prohibit the presence of extensions. For further information,
-    /// see the [definition of modifier
-    /// extensions](http://hl7.org/fhir/R5/extensibility.html#modifierExtension).
-    ///
-    /// ## Implementation Notes
-    /// There can be no stigma associated with the use of extensions by any
-    /// application, project, or standard - regardless of the institution or
-    /// jurisdiction that uses or defines the extensions. The use of extensions is
-    /// what allows the FHIR specification to retain a core level of simplicity for
-    /// everyone.
-    ///
-    /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Special Semantics
-    /// - Modifier element - Modifier extensions are expected to modify the meaning or interpretation of the element that contains them
-    /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    /// - **ext-1**: Must have either extensions or value[x], not both (error)
-    ///   Expression: `extension.exists() != value.exists()`
-    ///
-    /// ## Aliases
-    /// extensions, user content, modifiers
-    #[fhir_serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
     /// FHIRPath expression that creates a column and defines its content
     ///
     /// A FHIRPath expression that evaluates to the value that will be output in the
@@ -175972,10 +175776,6 @@ pub struct ViewDefinitionSelectColumn {
     /// directives or database-specific type hints.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
     pub tag: Option<Vec<ViewDefinitionSelectColumnTag>>,
 }
 
@@ -175986,95 +175786,8 @@ pub struct ViewDefinitionSelectColumn {
 /// directives or database-specific type hints.
 ///
 /// ## Cardinality: Optional, Multiple (0..*)
-///
-/// ## Constraints
-/// - **ele-1**: All FHIR elements must have a @value or children (error)
-///   Expression: `hasValue() or (children().count() > id.count())`
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 pub struct ViewDefinitionSelectColumnTag {
-    /// Unique id for inter-element referencing
-    ///
-    /// Unique id for the element within a resource (for internal references). This
-    /// may be any string value that does not contain spaces.
-    ///
-    /// ## Cardinality: Optional (0..1)
-    ///
-    /// ## Conditions
-    /// Used when: ele-1
-    pub id: Option<String>,
-    /// Additional content defined by implementations
-    ///
-    /// May be used to represent additional information that is not part of the basic
-    /// definition of the element. To make the use of extensions safe and managable,
-    /// there is a strict set of governance applied to the definition and use of
-    /// extensions. Though any implementer can define an extension, there is a set of
-    /// requirements that SHALL be met as part of the definition of the extension.
-    ///
-    /// ## Implementation Notes
-    /// There can be no stigma associated with the use of extensions by any
-    /// application, project, or standard - regardless of the institution or
-    /// jurisdiction that uses or defines the extensions. The use of extensions is
-    /// what allows the FHIR specification to retain a core level of simplicity for
-    /// everyone.
-    ///
-    /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    /// - **ext-1**: Must have either extensions or value[x], not both (error)
-    ///   Expression: `extension.exists() != value.exists()`
-    ///
-    /// ## Aliases
-    /// extensions, user content
-    pub extension: Option<Vec<Extension>>,
-    /// Extensions that cannot be ignored even if unrecognized
-    ///
-    /// May be used to represent additional information that is not part of the basic
-    /// definition of the element and that modifies the understanding of the element
-    /// in which it is contained and/or the understanding of the containing element's
-    /// descendants. Usually modifier elements provide negation or qualification. To
-    /// make the use of extensions safe and managable, there is a strict set of
-    /// governance applied to the definition and use of extensions. Though any
-    /// implementer can define an extension, there is a set of requirements that
-    /// SHALL be met as part of the definition of the extension. Applications
-    /// processing a resource are required to check for modifier extensions.
-    ///
-    /// Modifier extensions SHALL NOT change the meaning of any elements on Resource
-    /// or DomainResource (including cannot change the meaning of modifierExtension
-    /// itself).
-    ///
-    /// ## Requirements
-    /// Modifier extensions allow for extensions that *cannot* be safely ignored to
-    /// be clearly distinguished from the vast majority of extensions which can be
-    /// safely ignored. This promotes interoperability by eliminating the need for
-    /// implementers to prohibit the presence of extensions. For further information,
-    /// see the [definition of modifier
-    /// extensions](http://hl7.org/fhir/R5/extensibility.html#modifierExtension).
-    ///
-    /// ## Implementation Notes
-    /// There can be no stigma associated with the use of extensions by any
-    /// application, project, or standard - regardless of the institution or
-    /// jurisdiction that uses or defines the extensions. The use of extensions is
-    /// what allows the FHIR specification to retain a core level of simplicity for
-    /// everyone.
-    ///
-    /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Special Semantics
-    /// - Modifier element - Modifier extensions are expected to modify the meaning or interpretation of the element that contains them
-    /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    /// - **ext-1**: Must have either extensions or value[x], not both (error)
-    ///   Expression: `extension.exists() != value.exists()`
-    ///
-    /// ## Aliases
-    /// extensions, user content, modifiers
-    #[fhir_serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
     /// Name of tag
     ///
     /// A name that identifies the meaning of the tag. A namespace should be used to
@@ -176100,95 +175813,8 @@ pub struct ViewDefinitionSelectColumnTag {
 /// must evaluate to true for the resource to be included in the view.
 ///
 /// ## Cardinality: Optional, Multiple (0..*)
-///
-/// ## Constraints
-/// - **ele-1**: All FHIR elements must have a @value or children (error)
-///   Expression: `hasValue() or (children().count() > id.count())`
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 pub struct ViewDefinitionWhere {
-    /// Unique id for inter-element referencing
-    ///
-    /// Unique id for the element within a resource (for internal references). This
-    /// may be any string value that does not contain spaces.
-    ///
-    /// ## Cardinality: Optional (0..1)
-    ///
-    /// ## Conditions
-    /// Used when: ele-1
-    pub id: Option<String>,
-    /// Additional content defined by implementations
-    ///
-    /// May be used to represent additional information that is not part of the basic
-    /// definition of the element. To make the use of extensions safe and managable,
-    /// there is a strict set of governance applied to the definition and use of
-    /// extensions. Though any implementer can define an extension, there is a set of
-    /// requirements that SHALL be met as part of the definition of the extension.
-    ///
-    /// ## Implementation Notes
-    /// There can be no stigma associated with the use of extensions by any
-    /// application, project, or standard - regardless of the institution or
-    /// jurisdiction that uses or defines the extensions. The use of extensions is
-    /// what allows the FHIR specification to retain a core level of simplicity for
-    /// everyone.
-    ///
-    /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    /// - **ext-1**: Must have either extensions or value[x], not both (error)
-    ///   Expression: `extension.exists() != value.exists()`
-    ///
-    /// ## Aliases
-    /// extensions, user content
-    pub extension: Option<Vec<Extension>>,
-    /// Extensions that cannot be ignored even if unrecognized
-    ///
-    /// May be used to represent additional information that is not part of the basic
-    /// definition of the element and that modifies the understanding of the element
-    /// in which it is contained and/or the understanding of the containing element's
-    /// descendants. Usually modifier elements provide negation or qualification. To
-    /// make the use of extensions safe and managable, there is a strict set of
-    /// governance applied to the definition and use of extensions. Though any
-    /// implementer can define an extension, there is a set of requirements that
-    /// SHALL be met as part of the definition of the extension. Applications
-    /// processing a resource are required to check for modifier extensions.
-    ///
-    /// Modifier extensions SHALL NOT change the meaning of any elements on Resource
-    /// or DomainResource (including cannot change the meaning of modifierExtension
-    /// itself).
-    ///
-    /// ## Requirements
-    /// Modifier extensions allow for extensions that *cannot* be safely ignored to
-    /// be clearly distinguished from the vast majority of extensions which can be
-    /// safely ignored. This promotes interoperability by eliminating the need for
-    /// implementers to prohibit the presence of extensions. For further information,
-    /// see the [definition of modifier
-    /// extensions](http://hl7.org/fhir/R5/extensibility.html#modifierExtension).
-    ///
-    /// ## Implementation Notes
-    /// There can be no stigma associated with the use of extensions by any
-    /// application, project, or standard - regardless of the institution or
-    /// jurisdiction that uses or defines the extensions. The use of extensions is
-    /// what allows the FHIR specification to retain a core level of simplicity for
-    /// everyone.
-    ///
-    /// ## Cardinality: Optional, Multiple (0..*)
-    ///
-    /// ## Special Semantics
-    /// - Modifier element - Modifier extensions are expected to modify the meaning or interpretation of the element that contains them
-    /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    /// - **ext-1**: Must have either extensions or value[x], not both (error)
-    ///   Expression: `extension.exists() != value.exists()`
-    ///
-    /// ## Aliases
-    /// extensions, user content, modifiers
-    #[fhir_serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
     /// A FHIRPath expression defining a filter condition
     ///
     /// A FHIRPath expression that defines a filter that must evaluate to true for a
@@ -177893,7 +177519,7 @@ pub mod type_hierarchy {
             m.insert("TriggerDefinition", "DataType");
             m.insert("UsageContext", "DataType");
             m.insert("ValueSet", "DomainResource");
-            m.insert("ViewDefinition", "CanonicalResource");
+            m.insert("ViewDefinition", "DomainResource");
             m.insert("VirtualServiceDetail", "DataType");
             m.insert("VisionPrescription", "DomainResource");
             m.insert("base64Binary", "PrimitiveType");
@@ -203077,6 +202703,8 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
         true,
     ),
     ("ValueSetExpansionProperty", "uri", "uri", false),
+    ("ViewDefinition", "approvalDate", "date", false),
+    ("ViewDefinition", "author", "ContactDetail", true),
     ("ViewDefinition", "constant", "ViewDefinitionConstant", true),
     ("ViewDefinition", "contact", "ContactDetail", true),
     ("ViewDefinition", "contained", "Resource", true),
@@ -203084,6 +202712,9 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("ViewDefinition", "copyrightLabel", "string", false),
     ("ViewDefinition", "date", "dateTime", false),
     ("ViewDefinition", "description", "markdown", false),
+    ("ViewDefinition", "editor", "ContactDetail", true),
+    ("ViewDefinition", "effectivePeriod", "Period", false),
+    ("ViewDefinition", "endorser", "ContactDetail", true),
     ("ViewDefinition", "experimental", "boolean", false),
     ("ViewDefinition", "extension", "Extension", true),
     ("ViewDefinition", "fhirVersion", "code", true),
@@ -203092,17 +202723,21 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("ViewDefinition", "implicitRules", "uri", false),
     ("ViewDefinition", "jurisdiction", "CodeableConcept", true),
     ("ViewDefinition", "language", "code", false),
+    ("ViewDefinition", "lastReviewDate", "date", false),
     ("ViewDefinition", "meta", "Meta", false),
     ("ViewDefinition", "modifierExtension", "Extension", true),
     ("ViewDefinition", "name", "string", false),
     ("ViewDefinition", "profile", "canonical", true),
     ("ViewDefinition", "publisher", "string", false),
     ("ViewDefinition", "purpose", "markdown", false),
+    ("ViewDefinition", "relatedArtifact", "RelatedArtifact", true),
     ("ViewDefinition", "resource", "code", false),
+    ("ViewDefinition", "reviewer", "ContactDetail", true),
     ("ViewDefinition", "select", "ViewDefinitionSelect", true),
     ("ViewDefinition", "status", "code", false),
     ("ViewDefinition", "text", "Narrative", false),
     ("ViewDefinition", "title", "string", false),
+    ("ViewDefinition", "topic", "CodeableConcept", true),
     ("ViewDefinition", "url", "uri", false),
     ("ViewDefinition", "useContext", "UsageContext", true),
     ("ViewDefinition", "version", "string", false),
@@ -203115,14 +202750,6 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("ViewDefinition", "versionAlgorithmCoding", "Coding", false),
     ("ViewDefinition", "versionAlgorithmString", "string", false),
     ("ViewDefinition", "where", "ViewDefinitionWhere", true),
-    ("ViewDefinitionConstant", "extension", "Extension", true),
-    ("ViewDefinitionConstant", "id", "String", false),
-    (
-        "ViewDefinitionConstant",
-        "modifierExtension",
-        "Extension",
-        true,
-    ),
     ("ViewDefinitionConstant", "name", "string", false),
     (
         "ViewDefinitionConstant",
@@ -203180,16 +202807,8 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
         "ViewDefinitionSelectColumn",
         true,
     ),
-    ("ViewDefinitionSelect", "extension", "Extension", true),
     ("ViewDefinitionSelect", "forEach", "string", false),
     ("ViewDefinitionSelect", "forEachOrNull", "string", false),
-    ("ViewDefinitionSelect", "id", "String", false),
-    (
-        "ViewDefinitionSelect",
-        "modifierExtension",
-        "Extension",
-        true,
-    ),
     ("ViewDefinitionSelect", "repeat", "string", true),
     (
         "ViewDefinitionSelect",
@@ -203210,14 +202829,6 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
         "markdown",
         false,
     ),
-    ("ViewDefinitionSelectColumn", "extension", "Extension", true),
-    ("ViewDefinitionSelectColumn", "id", "String", false),
-    (
-        "ViewDefinitionSelectColumn",
-        "modifierExtension",
-        "Extension",
-        true,
-    ),
     ("ViewDefinitionSelectColumn", "name", "string", false),
     ("ViewDefinitionSelectColumn", "path", "string", false),
     (
@@ -203227,30 +202838,9 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
         true,
     ),
     ("ViewDefinitionSelectColumn", "type", "uri", false),
-    (
-        "ViewDefinitionSelectColumnTag",
-        "extension",
-        "Extension",
-        true,
-    ),
-    ("ViewDefinitionSelectColumnTag", "id", "String", false),
-    (
-        "ViewDefinitionSelectColumnTag",
-        "modifierExtension",
-        "Extension",
-        true,
-    ),
     ("ViewDefinitionSelectColumnTag", "name", "string", false),
     ("ViewDefinitionSelectColumnTag", "value", "string", false),
     ("ViewDefinitionWhere", "description", "string", false),
-    ("ViewDefinitionWhere", "extension", "Extension", true),
-    ("ViewDefinitionWhere", "id", "String", false),
-    (
-        "ViewDefinitionWhere",
-        "modifierExtension",
-        "Extension",
-        true,
-    ),
     ("ViewDefinitionWhere", "path", "string", false),
     ("VirtualServiceDetail", "additionalInfo", "url", true),
     (

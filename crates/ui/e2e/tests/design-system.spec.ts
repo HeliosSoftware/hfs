@@ -1,7 +1,6 @@
 import { test, expect } from "../pages/fixtures";
+import type { APIRequestContext, Page } from "@playwright/test";
 import { ROUTES, seedBulkImportDetail } from "../pages/routes";
-import * as fs from "fs";
-import * as path from "path";
 import postcss from "postcss";
 
 // The design-system guard (#543). The stylesheet defines one component
@@ -15,23 +14,40 @@ import postcss from "postcss";
 //   - a selector defined twice renders as the cascade-merge of two authors'
 //     blocks, which nobody wrote.
 
-const ASSETS = path.resolve(__dirname, "..", "..", "assets");
-const CSS_PATH = path.join(ASSETS, "app.css");
-
 // Classes added at runtime by vendored libraries, not defined in app.css.
 const RUNTIME_CLASSES = /^htmx-/;
+
+// The assets are read over HTTP from the server under test, not from the
+// source tree: the CI runner drives a packaged binary with no checkout
+// alongside it, and in HFS_E2E_BASE_URL mode the running server is the only
+// truth worth checking anyway.
+async function fetchAsset(request: APIRequestContext, path: string): Promise<string> {
+  const res = await request.get(path);
+  if (!res.ok()) throw new Error(`${path} -> ${res.status()}`);
+  return res.text();
+}
+
+async function stylesheet(request: APIRequestContext): Promise<string> {
+  return fetchAsset(request, "/ui/assets/app.css");
+}
 
 // A class is load-bearing if a rule styles it — or if shipped script selects
 // it (a JS hook like .json-line--foldable). Only dot-prefixed names inside JS
 // string literals count, so createElement("table") never legitimizes a dead
-// class="table".
-function definedClasses(): Set<string> {
+// class="table". The script list comes from the served pages themselves
+// (every page loads its scripts via the shared layout).
+async function definedClasses(page: Page, request: APIRequestContext): Promise<Set<string>> {
   const found = new Set<string>();
-  const css = fs.readFileSync(CSS_PATH, "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  const css = (await stylesheet(request)).replace(/\/\*[\s\S]*?\*\//g, "");
   for (const m of css.matchAll(/\.(-?[A-Za-z_][A-Za-z0-9_-]*)/g)) found.add(m[1]);
-  for (const file of fs.readdirSync(ASSETS)) {
-    if (!file.endsWith(".js") || file === "htmx.min.js") continue;
-    const js = fs.readFileSync(path.join(ASSETS, file), "utf8");
+
+  await page.goto("/ui", { waitUntil: "domcontentloaded" });
+  const sources = await page.$$eval("script[src]", (nodes) =>
+    nodes.map((n) => n.getAttribute("src") ?? "").filter((s) => s.startsWith("/ui/assets/")),
+  );
+  for (const src of sources) {
+    if (src.endsWith("htmx.min.js")) continue;
+    const js = await fetchAsset(request, src);
     for (const str of js.matchAll(/"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`/g)) {
       for (const m of str[0].matchAll(/\.(-?[A-Za-z_][A-Za-z0-9_-]*)/g)) found.add(m[1]);
     }
@@ -40,7 +56,7 @@ function definedClasses(): Set<string> {
 }
 
 test("every class used on every page matches a rule in app.css", async ({ page, request }) => {
-  const defined = definedClasses();
+  const defined = await definedClasses(page, request);
   const offenders: string[] = [];
   for (const route of [...ROUTES, await seedBulkImportDetail(request)]) {
     await page.goto(route, { waitUntil: "networkidle" });
@@ -96,8 +112,8 @@ test("primary buttons resolve to the same metrics on every page", async ({ page,
   expect(distinct.size, `primary buttons diverge across pages:\n${listing}`).toBeLessThanOrEqual(1);
 });
 
-test("no selector is defined twice in app.css", async () => {
-  const css = fs.readFileSync(CSS_PATH, "utf8");
+test("no selector is defined twice in app.css", async ({ request }) => {
+  const css = await stylesheet(request);
   const root = postcss.parse(css);
   const seen = new Map<string, number[]>();
   root.walkRules((rule) => {
