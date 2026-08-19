@@ -1038,7 +1038,10 @@ impl helios_observability::subscriptions::SubscriptionsProvider for EngineSubscr
             .map(|s| {
                 let ws_clients = matches!(s.channel.channel_type, ChannelType::Websocket)
                     .then(|| self.engine.ws_manager().client_count(&s.tenant_id, &s.id));
-                let window = self.engine.delivery_stats().window(&s.tenant_id, &s.id, now);
+                let window = self
+                    .engine
+                    .delivery_stats()
+                    .window(&s.tenant_id, &s.id, now);
                 SubscriptionRow {
                     id: s.id,
                     topic_url: s.topic_url,

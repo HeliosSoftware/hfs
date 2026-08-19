@@ -127,7 +127,10 @@ async fn the_page_goes_from_unavailable_to_the_live_dashboard() {
     );
 
     // Cards: 1 failing, 1 idle, 1 active, 4,500 notifications.
-    assert!(html.contains("4,493"), "delivered card sums the 24h counters");
+    assert!(
+        html.contains("4,493"),
+        "delivered card sums the 24h counters"
+    );
     assert!(html.contains("96.2"), "first-try rate renders");
 
     // Rows: the failing subscription leads (worst first), the idle websocket

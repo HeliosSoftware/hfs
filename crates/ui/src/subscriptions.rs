@@ -88,8 +88,12 @@ pub async fn page(
     // Tenant-wide delivery figures for the DELIVERED IN 24 H card (#586).
     let delivered_total: u64 = source_rows.iter().map(|r| r.delivered_24h).sum();
     let first_try_total: u64 = source_rows.iter().map(|r| r.first_try_24h).sum();
-    let rate = (delivered_total > 0)
-        .then(|| format!("{:.1}", first_try_total as f64 * 100.0 / delivered_total as f64));
+    let rate = (delivered_total > 0).then(|| {
+        format!(
+            "{:.1}",
+            first_try_total as f64 * 100.0 / delivered_total as f64
+        )
+    });
 
     let mut rows: Vec<SubscriptionRowView> = source_rows
         .into_iter()
