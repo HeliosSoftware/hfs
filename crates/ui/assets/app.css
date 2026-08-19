@@ -829,6 +829,23 @@ button.pill {
   margin-bottom: 16px;
 }
 
+/* Same scale as .card-head h3 — a toolbar is the in-card section header. */
+.toolbar__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.toolbar__count {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
 .toolbar__search {
   display: flex;
   align-items: center;
@@ -2682,12 +2699,10 @@ button.filter-rail__item {
   color: var(--muted);
 }
 
+/* The Ask button keeps the shared primary metrics (36px — design-system.spec
+   holds every page to one primary button); only its icon gap is local. */
 .nl-input .btn--primary {
-  display: inline-flex;
-  align-items: center;
   gap: 8px;
-  height: 44px;
-  padding: 0 20px;
   white-space: nowrap;
 }
 

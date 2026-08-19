@@ -15,15 +15,27 @@ import postcss from "postcss";
 //   - a selector defined twice renders as the cascade-merge of two authors'
 //     blocks, which nobody wrote.
 
-const CSS_PATH = path.resolve(__dirname, "..", "..", "assets", "app.css");
+const ASSETS = path.resolve(__dirname, "..", "..", "assets");
+const CSS_PATH = path.join(ASSETS, "app.css");
 
 // Classes added at runtime by vendored libraries, not defined in app.css.
 const RUNTIME_CLASSES = /^htmx-/;
 
+// A class is load-bearing if a rule styles it — or if shipped script selects
+// it (a JS hook like .json-line--foldable). Only dot-prefixed names inside JS
+// string literals count, so createElement("table") never legitimizes a dead
+// class="table".
 function definedClasses(): Set<string> {
-  const css = fs.readFileSync(CSS_PATH, "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
   const found = new Set<string>();
+  const css = fs.readFileSync(CSS_PATH, "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
   for (const m of css.matchAll(/\.(-?[A-Za-z_][A-Za-z0-9_-]*)/g)) found.add(m[1]);
+  for (const file of fs.readdirSync(ASSETS)) {
+    if (!file.endsWith(".js") || file === "htmx.min.js") continue;
+    const js = fs.readFileSync(path.join(ASSETS, file), "utf8");
+    for (const str of js.matchAll(/"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`/g)) {
+      for (const m of str[0].matchAll(/\.(-?[A-Za-z_][A-Za-z0-9_-]*)/g)) found.add(m[1]);
+    }
+  }
   return found;
 }
 
