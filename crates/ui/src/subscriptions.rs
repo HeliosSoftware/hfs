@@ -34,6 +34,8 @@ pub struct SubscriptionRowView {
     /// websocket subscription nobody is connected to.
     pub state: &'static str,
     pub sent: String,
+    /// Notifications delivered in the last 24 hours (#586).
+    pub last24: String,
     /// Consecutive delivery failures; `—` when the channel has no delivery
     /// (an idle websocket).
     pub streak: String,
@@ -44,7 +46,11 @@ pub struct SubscriptionCards {
     pub failing: usize,
     pub idle: usize,
     pub active: usize,
-    pub events: String,
+    /// Notifications delivered across the tenant in the last 24 hours.
+    pub delivered: String,
+    /// First-try success rate over that window ("96.4"), when anything was
+    /// delivered — absent means no deliveries, not a fabricated 100%.
+    pub rate: Option<String>,
 }
 
 #[derive(Template)]
@@ -78,9 +84,14 @@ pub async fn page(
         _ => "status",
     };
 
-    let mut rows: Vec<SubscriptionRowView> = snapshot
-        .map(|snap| snap.rows)
-        .unwrap_or_default()
+    let source_rows = snapshot.map(|snap| snap.rows).unwrap_or_default();
+    // Tenant-wide delivery figures for the DELIVERED IN 24 H card (#586).
+    let delivered_total: u64 = source_rows.iter().map(|r| r.delivered_24h).sum();
+    let first_try_total: u64 = source_rows.iter().map(|r| r.first_try_24h).sum();
+    let rate = (delivered_total > 0)
+        .then(|| format!("{:.1}", first_try_total as f64 * 100.0 / delivered_total as f64));
+
+    let mut rows: Vec<SubscriptionRowView> = source_rows
         .into_iter()
         .map(|row| {
             // A websocket subscription with no connected clients produces
@@ -111,6 +122,7 @@ pub async fn page(
                 endpoint: row.endpoint.unwrap_or_default(),
                 state,
                 sent: grouped(row.events_since_start),
+                last24: grouped(row.delivered_24h),
                 streak: if idle {
                     "—".to_string()
                 } else {
@@ -154,7 +166,8 @@ pub async fn page(
         failing: rows.iter().filter(|r| r.state == "error").count(),
         idle: rows.iter().filter(|r| r.state == "idle").count(),
         active: rows.iter().filter(|r| r.state == "active").count(),
-        events: grouped(rows.iter().map(|r| parse_grouped(&r.sent)).sum()),
+        delivered: grouped(delivered_total),
+        rate,
     };
 
     render(SubscriptionsPage {

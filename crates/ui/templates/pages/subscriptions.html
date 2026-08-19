@@ -31,9 +31,9 @@
     <span class="stat__sub">{{ i18n.t("subs-card-active-sub") }}</span>
   </article>
   <article class="card stat">
-    <span class="stat__label">{{ i18n.t("subs-card-events") }}</span>
-    <span class="stat__value">{{ cards.events }}</span>
-    <span class="stat__sub">{{ i18n.t("subs-card-events-sub") }}</span>
+    <span class="stat__label">{{ i18n.t("subs-card-delivered") }}</span>
+    <span class="stat__value">{{ cards.delivered }}</span>
+    <span class="stat__sub">{% if let Some(rate) = cards.rate %}{{ i18n.t_arg("subs-card-delivered-sub", "rate", rate.to_string()) }}{% else %}{{ i18n.t("subs-card-delivered-none") }}{% endif %}</span>
   </article>
 </section>
 
@@ -64,6 +64,7 @@
           <th>{{ i18n.t("subs-col-subscription") }}</th>
           <th>{{ i18n.t("subs-col-channel") }}</th>
           <th>{{ i18n.t("subs-col-status") }}</th>
+          <th class="col-num">{{ i18n.t("subs-col-last24") }}</th>
           <th class="col-num">{{ i18n.t("subs-col-sent") }}</th>
           <th class="col-num">{{ i18n.t("subs-col-fails") }}</th>
         </tr>
@@ -94,12 +95,13 @@
             <span class="tag tag--muted">{{ i18n.t("subs-state-off") }}</span>
             {% endif %}
           </td>
+          <td class="col-num">{{ row.last24 }}</td>
           <td class="col-num">{{ row.sent }}</td>
           <td class="col-num">{{ row.streak }}</td>
         </tr>
         {% endfor %}
         {% if rows.is_empty() %}
-        <tr class="data-table__empty"><td colspan="5">{{ i18n.t("subs-empty") }}</td></tr>
+        <tr class="data-table__empty"><td colspan="6">{{ i18n.t("subs-empty") }}</td></tr>
         {% endif %}
       </tbody>
     </table>

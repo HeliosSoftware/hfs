@@ -58,6 +58,9 @@ pub struct SubscriptionEngine {
     /// a subscriber outage) cannot drain the primary backend's connection pool
     /// and take reads down with it.
     status_write_slots: Arc<Semaphore>,
+    /// Rolling per-subscription delivery counters (#586) — the operator page's
+    /// last-24-hours figures. In-memory, like the rest of the engine's state.
+    delivery_stats: Arc<crate::delivery_stats::DeliveryStats>,
 }
 
 fn calculate_handshake_retry_delay(
@@ -133,6 +136,7 @@ impl SubscriptionEngine {
             base_url,
             status_store: None,
             status_write_slots,
+            delivery_stats: Arc::new(crate::delivery_stats::DeliveryStats::new()),
         }
     }
 
@@ -179,6 +183,12 @@ impl SubscriptionEngine {
     }
 
     /// Returns a reference to the WebSocket binding token manager.
+    /// The rolling delivery counters (#586) — the operator page reads its
+    /// last-24-hours figures from here.
+    pub fn delivery_stats(&self) -> &Arc<crate::delivery_stats::DeliveryStats> {
+        &self.delivery_stats
+    }
+
     pub fn ws_token_manager(&self) -> &Arc<WsBindingTokenManager> {
         &self.ws_token_manager
     }
@@ -802,8 +812,11 @@ impl SubscriptionEngine {
 
         let mut attempt: u32 = 0;
         loop {
+            let now = chrono::Utc::now().timestamp();
             match dispatcher.dispatch(subscription, bundle).await {
                 Ok(DispatchResult::Success) => {
+                    self.delivery_stats
+                        .record_success(tenant_id, sub_id, attempt == 0, now);
                     self.manager.reset_failures(tenant_id, sub_id);
                     info!(
                         tenant_id,
@@ -827,6 +840,7 @@ impl SubscriptionEngine {
                         error = %msg,
                         "Permanent delivery error"
                     );
+                    self.delivery_stats.record_failure(tenant_id, sub_id, now);
                     self.handle_delivery_failure(tenant_id, sub_id).await;
                     return;
                 }
@@ -844,6 +858,7 @@ impl SubscriptionEngine {
                             error = %msg,
                             "Max retries exhausted"
                         );
+                        self.delivery_stats.record_failure(tenant_id, sub_id, now);
                         self.handle_delivery_failure(tenant_id, sub_id).await;
                         return;
                     }
@@ -871,6 +886,7 @@ impl SubscriptionEngine {
                         error = %e,
                         "Dispatch error"
                     );
+                    self.delivery_stats.record_failure(tenant_id, sub_id, now);
                     self.handle_delivery_failure(tenant_id, sub_id).await;
                     return;
                 }

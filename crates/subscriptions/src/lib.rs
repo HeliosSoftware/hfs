@@ -21,6 +21,7 @@
 
 pub mod channels;
 pub mod config;
+pub mod delivery_stats;
 pub mod engine;
 pub mod error;
 pub mod evaluator;
@@ -32,6 +33,7 @@ pub mod topics;
 
 // Re-export key types for convenience.
 pub use channels::messaging::MessagingChannel;
+pub use delivery_stats::{DeliveryStats, DeliveryWindow};
 pub use channels::ws_manager::WebSocketManager;
 pub use channels::ws_token::WsBindingTokenManager;
 pub use config::{MessagingSettings, SubscriptionConfig};
