@@ -816,46 +816,161 @@ impl UpstreamClient {
         })
     }
 
-    /// `GET /CodeSystem/{id}` — CS detail page source.
+    /// Alt E helper — hop #1: search-list all resources of `resource_type`
+    /// in summary mode, split each entry's `resource.id` on `|` (the
+    /// backend's composite storage-id delimiter) and return the canonical
+    /// `url` whose base fhir id matches `id`.
     ///
-    /// A 404 surfaces as [`UpstreamError::NotFound`] so the detail handler
-    /// can render an explanatory OperationOutcome partial (design doc §7.3)
-    /// rather than propagating a page 404. Every other non-2xx flows
-    /// through the standard `Outcome` / `HttpStatus` arm.
+    /// Emits [`UpstreamError::NotFound`] when no entry matches so the
+    /// detail handlers can render an OperationOutcome page shell (design
+    /// doc §7.3.1 / §7.4.1 / §7.5 invariant #5) rather than a raw HTTP
+    /// 404.
+    async fn resolve_canonical_url(
+        &self,
+        resource_type: &'static str,
+        op: &'static str,
+        id: &str,
+    ) -> Result<String, UpstreamError> {
+        let list_url = format!("{}/{}?_count=1000", self.base_url, resource_type);
+        let response = self
+            .client
+            .get(&list_url)
+            .header("Accept", "application/fhir+json")
+            .send()
+            .await
+            .map_err(|e| UpstreamError::from_reqwest(op, &list_url, e))?;
+        let status = response.status();
+        let raw = response.text().await.map_err(|e| UpstreamError::Decode {
+            op,
+            url: list_url.clone(),
+            message: e.to_string(),
+        })?;
+        if !status.is_success() {
+            let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
+            return Err(status_to_error(op, &list_url, status.as_u16(), &parsed));
+        }
+        let bundle: Value = serde_json::from_str(&raw).map_err(|e| UpstreamError::Decode {
+            op,
+            url: list_url.clone(),
+            message: e.to_string(),
+        })?;
+        let notfound_url = format!("{}/{}/{}", self.base_url, resource_type, id);
+        bundle
+            .get("entry")
+            .and_then(|entries| entries.as_array())
+            .and_then(|entries| {
+                entries.iter().find_map(|entry| {
+                    let resource = entry.get("resource")?;
+                    let entry_id = resource.get("id").and_then(|v| v.as_str())?;
+                    let base = entry_id.split('|').next().unwrap_or(entry_id);
+                    if base == id {
+                        resource
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or(UpstreamError::NotFound {
+                op,
+                url: notfound_url,
+            })
+    }
+
+    /// Alt E helper — hop #2: fetch the full resource by canonical `url`.
+    /// The url filter forces HTS's non-summary search path, which serves
+    /// the stored `resource_json` blob (clean fhir id + full metadata) as
+    /// opposed to the synthetic composite-id projection.
+    ///
+    /// When the store keeps multiple versions under the same canonical
+    /// url, we re-apply the same composite-id split rule to pick the row
+    /// whose base fhir id matches `id`.
+    async fn fetch_by_url(
+        &self,
+        resource_type: &'static str,
+        op: &'static str,
+        id: &str,
+        canonical_url: &str,
+    ) -> Result<Value, UpstreamError> {
+        let full_endpoint = format!("{}/{}", self.base_url, resource_type);
+        let response = self
+            .client
+            .get(&full_endpoint)
+            .query(&[("url", canonical_url)])
+            .header("Accept", "application/fhir+json")
+            .send()
+            .await
+            .map_err(|e| UpstreamError::from_reqwest(op, &full_endpoint, e))?;
+        let status = response.status();
+        let raw = response.text().await.map_err(|e| UpstreamError::Decode {
+            op,
+            url: full_endpoint.clone(),
+            message: e.to_string(),
+        })?;
+        if !status.is_success() {
+            let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
+            return Err(status_to_error(op, &full_endpoint, status.as_u16(), &parsed));
+        }
+        let bundle: Value = serde_json::from_str(&raw).map_err(|e| UpstreamError::Decode {
+            op,
+            url: full_endpoint.clone(),
+            message: e.to_string(),
+        })?;
+        let notfound_url = format!("{}/{}/{}", self.base_url, resource_type, id);
+        bundle
+            .get("entry")
+            .and_then(|entries| entries.as_array())
+            .and_then(|entries| {
+                entries.iter().find_map(|entry| {
+                    let resource = entry.get("resource")?;
+                    let entry_id = resource.get("id").and_then(|v| v.as_str())?;
+                    let base = entry_id.split('|').next().unwrap_or(entry_id);
+                    if base == id {
+                        Some(resource.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or(UpstreamError::NotFound {
+                op,
+                url: notfound_url,
+            })
+    }
+
+    /// CS detail page source.
+    ///
+    /// Implementation note (Alt E — Phase 3b): HTS stores each imported
+    /// CodeSystem under a composite storage key `"{fhir_id}|{version}"` so
+    /// multiple versions can co-exist under a single canonical URL. The
+    /// standard read-by-id route (`GET /CodeSystem/{id}`) therefore only
+    /// resolves when the caller supplies that composite key — which the UI
+    /// does not have. To keep detail URLs stable as `/ui/hts/…/{fhir_id}`
+    /// without touching the backend or the templates, this reads the CS in
+    /// two search hops:
+    ///
+    /// 1. `GET /CodeSystem?_count=1000` — a summary-mode list that returns
+    ///    synthetic resources (composite ids + canonical url). We split the
+    ///    composite id on `|` and match the base against the caller's id
+    ///    to recover the canonical url.
+    /// 2. `GET /CodeSystem?url=<canonical>` — url filter forces the
+    ///    non-summary path, which serves the stored `resource_json` blob
+    ///    (clean fhir id + full metadata).
+    ///
+    /// Not finding the id in step 1 surfaces as [`UpstreamError::NotFound`]
+    /// so the detail handler can render an explanatory OperationOutcome
+    /// partial (design doc §7.3) rather than propagating a page 404.
     pub async fn read_code_system(
         &self,
         id: &str,
     ) -> Result<CodeSystemSummary, UpstreamError> {
-        let url = format!("{}/CodeSystem/{}", self.base_url, id);
-        let response = self
-            .client
-            .get(&url)
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("cs-read", &url, e))?;
-        let status = response.status();
-        let raw = response.text().await.map_err(|e| UpstreamError::Decode {
-            op: "cs-read",
-            url: url.clone(),
-            message: e.to_string(),
-        })?;
-        if !status.is_success() {
-            if status.as_u16() == 404 {
-                return Err(UpstreamError::NotFound {
-                    op: "cs-read",
-                    url,
-                });
-            }
-            let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
-            return Err(status_to_error("cs-read", &url, status.as_u16(), &parsed));
-        }
-        let parsed: Value = serde_json::from_str(&raw).map_err(|e| UpstreamError::Decode {
-            op: "cs-read",
-            url: url.clone(),
-            message: e.to_string(),
-        })?;
-        let pretty = serde_json::to_string_pretty(&parsed).unwrap_or(raw);
+        let canonical_url = self.resolve_canonical_url("CodeSystem", "cs-read", id).await?;
+        let parsed = self
+            .fetch_by_url("CodeSystem", "cs-read", id, &canonical_url)
+            .await?;
+        let pretty = serde_json::to_string_pretty(&parsed).unwrap_or_default();
         Ok(CodeSystemSummary::from_resource(&parsed, pretty))
     }
 
@@ -1712,42 +1827,18 @@ impl UpstreamClient {
         })
     }
 
-    /// `GET /ValueSet/{id}` — VS detail page source.
-    ///
-    /// 404 → [`UpstreamError::NotFound`] so the detail handler can render
-    /// an explanatory OperationOutcome partial inside the page shell
-    /// (design doc §7.4 states matrix, §7.4.1 invariant #5).
+    /// VS detail page source. See [`Self::read_code_system`] for the
+    /// two-hop-search rationale (Alt E — composite storage id workaround
+    /// without touching backend or templates). NotFound surfaces as
+    /// [`UpstreamError::NotFound`] so the detail handler can render an
+    /// explanatory OperationOutcome partial inside the page shell (design
+    /// doc §7.4 states matrix, §7.4.1 invariant #5).
     pub async fn read_value_set(&self, id: &str) -> Result<ValueSetSummary, UpstreamError> {
-        let url = format!("{}/ValueSet/{}", self.base_url, id);
-        let response = self
-            .client
-            .get(&url)
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("vs-read", &url, e))?;
-        let status = response.status();
-        let raw = response.text().await.map_err(|e| UpstreamError::Decode {
-            op: "vs-read",
-            url: url.clone(),
-            message: e.to_string(),
-        })?;
-        if !status.is_success() {
-            if status.as_u16() == 404 {
-                return Err(UpstreamError::NotFound {
-                    op: "vs-read",
-                    url,
-                });
-            }
-            let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
-            return Err(status_to_error("vs-read", &url, status.as_u16(), &parsed));
-        }
-        let parsed: Value = serde_json::from_str(&raw).map_err(|e| UpstreamError::Decode {
-            op: "vs-read",
-            url: url.clone(),
-            message: e.to_string(),
-        })?;
-        let pretty = serde_json::to_string_pretty(&parsed).unwrap_or(raw);
+        let canonical_url = self.resolve_canonical_url("ValueSet", "vs-read", id).await?;
+        let parsed = self
+            .fetch_by_url("ValueSet", "vs-read", id, &canonical_url)
+            .await?;
+        let pretty = serde_json::to_string_pretty(&parsed).unwrap_or_default();
         Ok(ValueSetSummary::from_resource(&parsed, pretty))
     }
 
@@ -2509,42 +2600,18 @@ impl UpstreamClient {
         })
     }
 
-    /// `GET /ConceptMap/{id}` — CM detail page source.
-    ///
-    /// 404 → [`UpstreamError::NotFound`] so the detail handler renders an
+    /// CM detail page source. See [`Self::read_code_system`] for the
+    /// two-hop-search rationale (Alt E — composite storage id workaround
+    /// without touching backend or templates). NotFound surfaces as
+    /// [`UpstreamError::NotFound`] so the detail handler renders an
     /// explanatory OperationOutcome partial inside the page shell (§7.5
     /// states matrix, mirroring §7.3.1 / §7.4.1 invariant #5).
     pub async fn read_concept_map(&self, id: &str) -> Result<ConceptMapSummary, UpstreamError> {
-        let url = format!("{}/ConceptMap/{}", self.base_url, id);
-        let response = self
-            .client
-            .get(&url)
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("cm-read", &url, e))?;
-        let status = response.status();
-        let raw = response.text().await.map_err(|e| UpstreamError::Decode {
-            op: "cm-read",
-            url: url.clone(),
-            message: e.to_string(),
-        })?;
-        if !status.is_success() {
-            if status.as_u16() == 404 {
-                return Err(UpstreamError::NotFound {
-                    op: "cm-read",
-                    url,
-                });
-            }
-            let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
-            return Err(status_to_error("cm-read", &url, status.as_u16(), &parsed));
-        }
-        let parsed: Value = serde_json::from_str(&raw).map_err(|e| UpstreamError::Decode {
-            op: "cm-read",
-            url: url.clone(),
-            message: e.to_string(),
-        })?;
-        let pretty = serde_json::to_string_pretty(&parsed).unwrap_or(raw);
+        let canonical_url = self.resolve_canonical_url("ConceptMap", "cm-read", id).await?;
+        let parsed = self
+            .fetch_by_url("ConceptMap", "cm-read", id, &canonical_url)
+            .await?;
+        let pretty = serde_json::to_string_pretty(&parsed).unwrap_or_default();
         Ok(ConceptMapSummary::from_resource(&parsed, pretty))
     }
 
