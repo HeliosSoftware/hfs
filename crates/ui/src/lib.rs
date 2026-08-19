@@ -385,7 +385,6 @@ struct ChartSeriesView {
     color: usize,
     /// `"x,y x,y …"` coordinate list for the `<polyline>`.
     polyline: String,
-    total: String,
 }
 
 /// One row of the chart's tabular alternative: a bucket label and the
@@ -1622,7 +1621,6 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -
                 .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
                 .collect::<Vec<_>>()
                 .join(" "),
-            total: grouped(s.total),
         })
         .collect();
 
