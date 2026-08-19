@@ -305,6 +305,13 @@ jobs:
           export HFS_DATA_DIR="$GITHUB_WORKSPACE/data"
           export HFS_NL_SEARCH_API_KEY="e2e-placeholder-not-a-real-key"
           export HFS_DEFAULT_FHIR_VERSION=R4
+          # The suite creates and immediately searches; on the ES composites
+          # the default asynchronous sync races the specs (nightly reds since
+          # the SearchParameter CRUD spec landed). Synchronous puts the write
+          # in ES before the API responds; the specs' waitSearchable covers
+          # the index-refresh window that remains. No effect on the other
+          # backends.
+          export HFS_COMPOSITE_SYNC_MODE=synchronous
 
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
