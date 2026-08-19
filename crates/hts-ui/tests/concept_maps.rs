@@ -557,6 +557,52 @@ async fn translate_tab_htmx_returns_input_partial_only() {
         html.contains("name=\"code\"") && html.contains("name=\"system\""),
         "forward-direction default must render `code` and `system` inputs",
     );
+    // §7.5 wire contract: the direction radios MUST carry
+    // `hx-params="none"` so htmx does not double the trigger radio's
+    // form value onto the `hx-get` URL. Without it the wire becomes
+    // `?direction=reverse&direction=reverse` and axum's
+    // `Query<TranslateInputForm>` rejects the duplicate scalar field
+    // with HTTP 400, silently skipping the swap. Full wire trace in
+    // `edson/docs/hts-ui-cm139-diagnosis.md`.
+    assert!(
+        html.contains("hx-params=\"none\""),
+        "direction radios must set hx-params=\"none\" to avoid duplicating direction on the URL",
+    );
+}
+
+#[tokio::test]
+async fn translate_input_hx_reverse_direction_renders_target_code() {
+    // Wire pin for the CM:139 bug: an htmx GET carrying
+    // `?direction=reverse` MUST land 200 with the reverse fieldset
+    // rendered (`translate-target-code` input, no `name="code"`
+    // source-side input). If a future maintainer removes
+    // `hx-params="none"` from the direction radios, the browser will
+    // start sending `?direction=reverse&direction=reverse` and this
+    // test still passes (query duplication is a client concern), but
+    // a paired e2e (`concept-maps.spec.ts:139`) will catch that. Here
+    // we lock the server-side contract so a plain-URL nav (bookmark,
+    // hard nav, or `hx-params="none"` in effect) always resolves.
+    let response = app()
+        .oneshot(
+            axum::http::Request::get(
+                "/ui/hts/concept-maps/example-cm/translate?direction=reverse",
+            )
+            .header("HX-Request", "true")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("translate-target-code"),
+        "reverse direction must render the `targetCode` input in the partial",
+    );
+    assert!(
+        !html.contains("id=\"translate-code\""),
+        "reverse direction must NOT render the forward-mode `code` input",
+    );
 }
 
 #[tokio::test]

@@ -48,17 +48,25 @@
   {% endif %}
 
   {#-
-    Direction toggle. `hx-trigger="click"` on the radios re-fetches the
-    input partial with the appropriate visibility. The URL carries
-    `direction=…` and the server re-renders this same partial with the
-    matching field group. Same-URL GET means the nojs fallback stays
-    coherent (a hard nav to /translate?direction=reverse still lands the
-    right form).
+    Direction toggle. Clicking a radio re-fetches this partial with the
+    appropriate visibility. The URL carries `direction=…` and the server
+    re-renders this same partial with the matching field group. Same-URL
+    GET means the nojs fallback stays coherent (a hard nav to
+    /translate?direction=reverse still lands the right form).
 
-    Trigger note: `change` fires on BOTH radios when the group value
-    flips (checked and unchecked both change state), so two GETs race
-    and the newly-unchecked radio's response can overwrite the intended
-    one. Scoping to `click` fires only on the operator's actual pick.
+    `hx-params="none"` is critical: without it, htmx serialises the
+    trigger radio's own form value (`name="direction"`, currently-
+    checked `value="reverse"`) onto the GET URL. Because the URL
+    already carries the literal `?direction=reverse` from `hx-get`,
+    the wire ends up as `?direction=reverse&direction=reverse`, which
+    axum's `Query<TranslateInputForm>` (serde_urlencoded's derived
+    Deserialize) rejects with HTTP 400 on the duplicate scalar field.
+    htmx's default 4xx handler is `swap: false`, so the reverse
+    fieldset never lands in the DOM and Playwright times out looking
+    for `Target code`. `hx-params="none"` short-circuits htmx's
+    FormData collection for these two triggers so the URL is emitted
+    verbatim. See edson/docs/hts-ui-cm139-diagnosis.md for the wire
+    trace and htmx-source references.
   -#}
   <fieldset class="hts-cm-workbench__field hts-cm-workbench__field--direction">
     <legend>{{ chrome.i18n.t("hts-cm-translate-direction-legend") }}</legend>
@@ -68,7 +76,8 @@
              hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=forward"
              hx-target="#hts-workbench-input"
              hx-swap="outerHTML"
-             hx-trigger="click">
+             hx-trigger="click"
+             hx-params="none">
       <span>{{ chrome.i18n.t("hts-cm-translate-direction-forward") }}</span>
     </label>
     <label class="hts-cm-workbench__radio">
@@ -77,7 +86,8 @@
              hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=reverse"
              hx-target="#hts-workbench-input"
              hx-swap="outerHTML"
-             hx-trigger="click">
+             hx-trigger="click"
+             hx-params="none">
       <span>{{ chrome.i18n.t("hts-cm-translate-direction-reverse") }}</span>
     </label>
   </fieldset>

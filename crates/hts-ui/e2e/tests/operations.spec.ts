@@ -564,40 +564,69 @@ test.describe("HTS Operations $batch-validate fan-out (§7.6 F1=D E2)", () => {
         r.request().method() === "POST",
     );
     await page.getByRole("button", { name: /Run/i, exact: false }).click();
-    await responsePromise;
+    const seedResponse = await responsePromise;
 
-    // Skeleton row 0: row polling target + aria-busy.
-    const row0 = page.locator("#hts-batch-row-0");
-    await expect(row0).toBeAttached({ timeout: 8_000 });
-    await expect(row0).toHaveAttribute(
-      "hx-get",
-      /\/ui\/hts\/operations\/batch-validate\/row\/0\?batch_id=/,
+    // §7.6.1 F1 = D contract: assert on the seed response BODY, not on
+    // the live DOM. The `hts-vs-batch-table.html` skeleton row emits
+    // `hx-trigger="load"`, which htmx fires immediately on insertion;
+    // the per-row endpoint returns in ~1 poll iteration because the
+    // fan-out `tokio::spawn` tasks complete while the seed HTML is
+    // still being rendered, so `hx-swap="outerHTML"` destroys each
+    // skeleton row (replacing it with `hts-vs-batch-row.html`, same
+    // `id`, no `hx-*`) inside ~10–60 ms. Playwright's locator polls
+    // at ~100 ms and cannot outrun that window, so DOM-locator
+    // assertions on `#hts-batch-row-N` deterministically catch the
+    // replacement. The wire body IS the skeleton contract — see
+    // edson/docs/hts-ui-ops531-diagnosis.md.
+    expect(seedResponse.status()).toBe(200);
+    const seedHtml = await seedResponse.text();
+
+    // Skeleton row 0: per-row polling target, aria-busy, load trigger.
+    expect(
+      seedHtml,
+      'skeleton row 0 must carry aria-busy="true"',
+    ).toMatch(
+      /<tr\b[^>]*\bid="hts-batch-row-0"[^>]*\baria-busy="true"[^>]*>/,
     );
-    await expect(row0).toHaveAttribute("aria-busy", "true");
-    await expect(row0).toHaveAttribute("hx-trigger", /load/i);
+    expect(
+      seedHtml,
+      "skeleton row 0 must carry its per-row hx-get target",
+    ).toMatch(
+      /<tr\b[^>]*\bid="hts-batch-row-0"[^>]*\bhx-get="\/ui\/hts\/operations\/batch-validate\/row\/0\?batch_id=[^"]+"[^>]*>/,
+    );
+    expect(
+      seedHtml,
+      'skeleton row 0 must fire hx-trigger="load"',
+    ).toMatch(
+      /<tr\b[^>]*\bid="hts-batch-row-0"[^>]*\bhx-trigger="[^"]*\bload\b[^"]*"[^>]*>/i,
+    );
 
     // Skeleton row 1: same shape, distinct row index.
-    const row1 = page.locator("#hts-batch-row-1");
-    await expect(row1).toBeAttached();
-    await expect(row1).toHaveAttribute(
-      "hx-get",
-      /\/ui\/hts\/operations\/batch-validate\/row\/1\?batch_id=/,
+    expect(
+      seedHtml,
+      "skeleton row 1 must carry its per-row hx-get target",
+    ).toMatch(
+      /<tr\b[^>]*\bid="hts-batch-row-1"[^>]*\bhx-get="\/ui\/hts\/operations\/batch-validate\/row\/1\?batch_id=[^"]+"[^>]*>/,
     );
 
     // Progress region: `hx-get` targets `…/batch-validate/progress?batch_id=…`
     // and `hx-trigger` includes the recurring `every Ns` interval.
-    // The interval is intentionally NOT hardcoded — Phase 3b may
-    // tune it under `HTS_UI_*` knobs.
-    const progress = page.locator("#hts-batch-progress");
-    await expect(progress).toBeAttached();
-    await expect(progress).toHaveAttribute(
-      "hx-get",
-      /\/ui\/hts\/operations\/batch-validate\/progress\?batch_id=/,
+    // Interval is intentionally NOT hardcoded — Phase 3b may tune it.
+    expect(
+      seedHtml,
+      "progress region must poll the batch-validate/progress endpoint",
+    ).toMatch(
+      /<div\b[^>]*\bid="hts-batch-progress"[^>]*\bhx-get="\/ui\/hts\/operations\/batch-validate\/progress\?batch_id=[^"]+"[^>]*>/,
     );
-    await expect(progress).toHaveAttribute(
-      "hx-trigger",
-      /every\s+\d+\s*s/i,
+    expect(
+      seedHtml,
+      "progress region must carry a recurring every Ns trigger",
+    ).toMatch(
+      /<div\b[^>]*\bid="hts-batch-progress"[^>]*\bhx-trigger="[^"]*\bevery\s+\d+\s*s\b[^"]*"[^>]*>/i,
     );
+
+    // Sanity: no OOB swaps on the seed response (§7.6.1 F1 bullet).
+    expect(seedHtml).not.toMatch(/hx-swap-oob/);
 
     // TODO(phase-3b): once local polling timings are confirmed, extend
     // this spec to assert that (a) each `#hts-batch-row-N` sheds its
