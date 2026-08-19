@@ -35,6 +35,10 @@ pub struct JsonLine {
     /// The shape shown on the opening line when it is folded (`{ … }`,
     /// `[ 3 ]`).
     pub summary: String,
+    /// Dotted document path of the node this line belongs to (`name.0.family`)
+    /// — the same spelling the guided form keys its rows on, so the two views
+    /// can point at each other. Empty on the root braces.
+    pub path: String,
     pub tokens: Vec<Token>,
 }
 
@@ -44,9 +48,18 @@ pub fn lines(value: &Value) -> Vec<JsonLine> {
         lines: Vec::new(),
         counter: 0,
     };
-    let mut root = Line::new(0, &[]);
+    let mut root = Line::new(0, &[], String::new());
     ctx.walk(value, &mut root, &[], true);
     ctx.lines
+}
+
+/// `name` + `0` → `name.0`; the root joins to just the segment.
+fn join(base: &str, segment: &str) -> String {
+    if base.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{base}.{segment}")
+    }
 }
 
 struct Ctx {
@@ -62,10 +75,11 @@ struct Line {
     foldable: bool,
     fold_id: String,
     summary: String,
+    path: String,
 }
 
 impl Line {
-    fn new(depth: usize, parents: &[String]) -> Self {
+    fn new(depth: usize, parents: &[String], path: String) -> Self {
         Line {
             depth,
             parents: parents.to_vec(),
@@ -73,6 +87,7 @@ impl Line {
             foldable: false,
             fold_id: String::new(),
             summary: String::new(),
+            path,
         }
     }
     fn punct(&mut self, text: &str) {
@@ -93,6 +108,7 @@ impl Ctx {
             fold_id: line.fold_id,
             parents: line.parents.join(" "),
             summary: line.summary,
+            path: line.path,
             tokens: line.tokens,
         });
     }
@@ -108,18 +124,23 @@ impl Ctx {
         match value {
             Value::Object(map) if !map.is_empty() => {
                 let id = self.next_id();
+                let base = line.path.clone();
                 line.foldable = true;
                 line.fold_id = id.clone();
                 line.summary = format!("{{ … }}{}", trailing.join(""));
                 line.punct("{");
-                let opener = std::mem::replace(line, Line::new(0, &[]));
+                let opener = std::mem::replace(line, Line::new(0, &[], String::new()));
                 self.push(opener);
 
                 let mut child_parents = self.parents_of_last();
                 child_parents.push(id.clone());
                 let len = map.len();
                 for (i, (key, child_value)) in map.iter().enumerate() {
-                    let mut child = Line::new(depth_after(&child_parents), &child_parents);
+                    let mut child = Line::new(
+                        depth_after(&child_parents),
+                        &child_parents,
+                        join(&base, key),
+                    );
                     child.tokens.push(Token {
                         text: format!("\"{}\"", escape(key)),
                         kind: "key",
@@ -129,32 +150,43 @@ impl Ctx {
                     self.walk(child_value, &mut child, &[comma], false);
                 }
 
-                let mut closer =
-                    Line::new(depth_after(&child_parents) - 1, &prefix(&child_parents));
+                let mut closer = Line::new(
+                    depth_after(&child_parents) - 1,
+                    &prefix(&child_parents),
+                    base,
+                );
                 closer.parents.push(id);
                 closer.punct(&format!("}}{}", trailing.join("")));
                 self.push(closer);
             }
             Value::Array(items) if !items.is_empty() => {
                 let id = self.next_id();
+                let base = line.path.clone();
                 line.foldable = true;
                 line.fold_id = id.clone();
                 line.summary = format!("[ {} ]{}", items.len(), trailing.join(""));
                 line.punct("[");
-                let opener = std::mem::replace(line, Line::new(0, &[]));
+                let opener = std::mem::replace(line, Line::new(0, &[], String::new()));
                 self.push(opener);
 
                 let mut child_parents = self.parents_of_last();
                 child_parents.push(id.clone());
                 let len = items.len();
                 for (i, child_value) in items.iter().enumerate() {
-                    let mut child = Line::new(depth_after(&child_parents), &child_parents);
+                    let mut child = Line::new(
+                        depth_after(&child_parents),
+                        &child_parents,
+                        join(&base, &i.to_string()),
+                    );
                     let comma = if i + 1 < len { "," } else { "" };
                     self.walk(child_value, &mut child, &[comma], false);
                 }
 
-                let mut closer =
-                    Line::new(depth_after(&child_parents) - 1, &prefix(&child_parents));
+                let mut closer = Line::new(
+                    depth_after(&child_parents) - 1,
+                    &prefix(&child_parents),
+                    base,
+                );
                 closer.parents.push(id);
                 closer.punct(&format!("]{}", trailing.join("")));
                 self.push(closer);
@@ -165,7 +197,7 @@ impl Ctx {
                 for t in trailing {
                     line.punct(t);
                 }
-                let done = std::mem::replace(line, Line::new(0, &[]));
+                let done = std::mem::replace(line, Line::new(0, &[], String::new()));
                 self.push(done);
             }
         }
