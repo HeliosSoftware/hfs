@@ -3065,6 +3065,21 @@ button.filter-rail__item {
   line-height: 1.6;
 }
 
+/* Form ↔ JSON cross-highlight (editor-sync.js): hovering or focusing a form
+   row lights the JSON lines that hold that node, and vice versa. */
+.json-line--hit {
+  background: var(--accent-soft);
+}
+
+.json-line[data-jpath] .json-line__code {
+  cursor: pointer;
+}
+
+.editor-row--hit {
+  background: var(--accent-soft);
+  border-radius: 8px;
+}
+
 .json-line {
   display: flex;
   align-items: baseline;
@@ -3178,6 +3193,7 @@ button.filter-rail__item {
 .editor-row__head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   min-height: 28px;
 }
@@ -3196,7 +3212,9 @@ button.filter-rail__item {
 
 .editor-row__input {
   flex: 1;
-  min-width: 0;
+  /* Never squeezed below a usable width — the head wraps it to its own line
+     instead of eating the content. */
+  min-width: 180px;
   max-width: 420px;
   height: 28px;
   padding: 0 10px;
@@ -3419,6 +3437,50 @@ button.filter-rail__item {
   border-radius: 10px;
   outline: none;
   resize: vertical;
+}
+
+/* Raw-mode highlight (editor-sync.js): a mirror <pre> sits behind the
+   textarea with identical metrics; its text is invisible and only the <mark>
+   around the hovered node's range shows through the textarea, whose own
+   background goes transparent while the mirror is present. */
+.editor-json__raw {
+  position: relative;
+}
+
+.editor-json__raw--mirrored .editor__source {
+  position: relative;
+  z-index: 1;
+  background: transparent;
+}
+
+.editor__source-mirror {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  pointer-events: none;
+  padding: 12px;
+  box-sizing: border-box;
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  color: transparent;
+  background: var(--input-bg);
+  border: 1px solid transparent;
+  border-radius: 10px;
+}
+
+.editor__source-mirror mark {
+  color: transparent;
+  background: var(--accent-soft);
+  border-radius: 3px;
+  box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
 .editor__source-hint {
@@ -3992,10 +4054,13 @@ body.has-nav-panel {
   font-weight: 600;
 }
 
-.editor-row__name {
+/* The element's short description sits on its own line under the head, so it
+   can never squeeze the input out of the row. */
+.editor-row__desc {
+  margin: 2px 0 0;
   color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
+  line-height: 1.4;
 }
 
 .editor-row__ms,

@@ -606,23 +606,58 @@ pub fn remove_at(document: &mut Value, path: &[Step]) -> bool {
 
 /// Sets a primitive value at `path`. An empty string removes the element rather
 /// than storing `""`, which is not a valid FHIR primitive.
-pub fn set_value(document: &mut Value, path: &[Step], raw: &str) -> bool {
+pub fn set_value(
+    resolver: &dyn SchemaResolver,
+    root_type: &str,
+    document: &mut Value,
+    path: &[Step],
+    raw: &str,
+) -> bool {
     if raw.is_empty() {
         return remove_at(document, path);
     }
+    let declared = schema_at(resolver, root_type, path).and_then(|schema| schema.type_.clone());
     let Some(node) = node_at_mut(document, path) else {
         return false;
     };
-    // Keep JSON types honest: booleans and numbers are not strings in FHIR.
-    *node = match raw {
-        "true" => Value::Bool(true),
-        "false" => Value::Bool(false),
-        _ => match raw.parse::<i64>() {
-            Ok(number) if !raw.starts_with('0') || raw == "0" => Value::from(number),
+    *node = coerce_primitive(declared.as_deref(), raw);
+    true
+}
+
+/// The JSON type the declared FHIR primitive demands. Only booleans and the
+/// numeric primitives leave string-land; a date of `1974`, an id of `123`, or
+/// an identifier value of `12345` merely *looks* numeric and must stay a
+/// string — guessing from the shape of the text turned all of them into JSON
+/// numbers the validator then rejected. (`integer64` stays a string too: FHIR
+/// serializes it that way.) An element the schema does not know keeps the old
+/// shape-based guess, so unknown keys still round-trip their JSON types.
+fn coerce_primitive(declared: Option<&str>, raw: &str) -> Value {
+    match declared {
+        Some("boolean") => match raw {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
             _ => Value::String(raw.to_string()),
         },
-    };
-    true
+        Some("integer") | Some("positiveInt") | Some("unsignedInt") => raw
+            .parse::<i64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(raw.to_string())),
+        Some("decimal") => match raw.parse::<f64>() {
+            Ok(number) if number.is_finite() => serde_json::Number::from_f64(number)
+                .map(Value::Number)
+                .unwrap_or_else(|| Value::String(raw.to_string())),
+            _ => Value::String(raw.to_string()),
+        },
+        Some(_) => Value::String(raw.to_string()),
+        None => match raw {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => match raw.parse::<i64>() {
+                Ok(number) if !raw.starts_with('0') || raw == "0" => Value::from(number),
+                _ => Value::String(raw.to_string()),
+            },
+        },
+    }
 }
 
 /// Picks a concrete arm of a `value[x]`: creates `valueString` and drops any
@@ -1077,15 +1112,60 @@ mod tests {
 
     #[test]
     fn setting_a_value_keeps_json_types_honest() {
+        let registry = registry();
+        let resolver = registry.as_ref();
         let mut patient = donald();
-        add_element(registry().as_ref(), "Patient", &mut patient, &[], "active").unwrap();
+        add_element(resolver, "Patient", &mut patient, &[], "active").unwrap();
 
-        set_value(&mut patient, &path_from_string("active"), "true");
+        set_value(resolver, "Patient", &mut patient, &path_from_string("active"), "true");
         assert_eq!(patient["active"], json!(true));
 
         // Clearing a field removes it rather than storing "".
-        set_value(&mut patient, &path_from_string("active"), "");
+        set_value(resolver, "Patient", &mut patient, &path_from_string("active"), "");
         assert!(patient.get("active").is_none());
+    }
+
+    #[test]
+    fn coercion_follows_the_declared_type_not_the_shape_of_the_text() {
+        let registry = registry();
+        let resolver = registry.as_ref();
+        let mut patient = donald();
+
+        // A year-precision date is legal FHIR and must stay a string, even
+        // though it parses as an integer.
+        add_element(resolver, "Patient", &mut patient, &[], "birthDate").unwrap();
+        set_value(resolver, "Patient", &mut patient, &path_from_string("birthDate"), "1974");
+        assert_eq!(patient["birthDate"], json!("1974"));
+
+        // Same for string-typed elements whose content merely looks numeric.
+        add_element(resolver, "Patient", &mut patient, &[], "identifier").unwrap();
+        add_element(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("identifier.0"),
+            "value",
+        )
+        .unwrap();
+        set_value(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("identifier.0.value"),
+            "12345",
+        );
+        assert_eq!(patient["identifier"][0]["value"], json!("12345"));
+
+        // A key the schema does not know keeps the old shape-based guess.
+        patient["unknownField"] = json!(0);
+        set_value(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("unknownField"),
+            "7",
+        );
+        assert_eq!(patient["unknownField"], json!(7));
     }
 }
 
