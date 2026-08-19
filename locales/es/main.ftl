@@ -140,7 +140,14 @@ card-uptime-sub = últimos 30 días
 
 chart-title = Recursos FHIR en el tiempo
 chart-expand = Ampliar el gráfico
+chart-collapse = Reducir el gráfico
 chart-window = Intervalo de tiempo del gráfico
+chart-pick-heading = Tipos de recurso graficados
+chart-empty = Nada que graficar todavía: los recursos almacenados aparecerán aquí a medida que se creen.
+chart-sample-note = Datos de muestra: esta build no tiene registrado un proveedor de métricas en vivo.
+chart-table-toggle = Ver como tabla
+chart-table-when = Momento
+chart-remove-series = Quitar del gráfico
 
 ## Pie de página
 
