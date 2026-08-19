@@ -1,6 +1,6 @@
 # SQL-on-FHIR
 
-The `helios-sof` crate implements the [SQL-on-FHIR specification](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2). It transforms FHIR resources into flat tabular data using declarative **ViewDefinitions** and ships two executables (`sof-cli` and `sof-server`).
+The `helios-sof` crate implements the [SQL-on-FHIR specification](http://hl7.org/fhir/uv/sql-on-fhir). It transforms FHIR resources into flat tabular data using declarative **ViewDefinitions** and ships two executables (`sof-cli` and `sof-server`).
 
 ---
 
@@ -284,7 +284,7 @@ SOF_SERVER_PORT=9090 sof-server
 
 ### Endpoint
 
-`POST /ViewDefinition/$viewdefinition-run`
+`POST /$sql-run`
 
 Request body (JSON):
 
@@ -292,7 +292,7 @@ Request body (JSON):
 |-----------|------|-------------|
 | `_format` | string | Output format: `csv`, `ndjson`, `json`, `parquet` |
 | `header` | boolean | Include CSV header row (`true` / `false`) |
-| `viewResource` | object | ViewDefinition resource |
+| `subjectResource` | object | ViewDefinition resource |
 | `resource` | array | FHIR resources to transform |
 | `patient` | string | Filter by patient reference |
 | `_limit` | integer | Limit results (1–10000) |
@@ -303,11 +303,11 @@ Parameter precedence: **request body > query params > `Accept` header**
 ### Example
 
 ```bash
-curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+curl -X POST http://localhost:8080/\$sql-run \
   -H "Content-Type: application/json" \
   -d '{
     "_format": "csv",
-    "viewResource": {
+    "subjectResource": {
       "resourceType": "ViewDefinition",
       "from": {"resourceType": "Patient"},
       "select": [{"column": [

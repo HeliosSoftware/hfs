@@ -1210,10 +1210,12 @@
   var railFilter = document.getElementById("type-rail-filter");
   var countFormat = new Intl.NumberFormat(lang);
 
-  function hydrateCounts() {
+  function hydrateCounts(onlyType) {
     if (!railList) return;
     var pending = Array.prototype.slice.call(
-      railList.querySelectorAll("[data-count-for]")
+      railList.querySelectorAll(
+        onlyType ? '[data-count-for="' + onlyType + '"]' : "[data-count-for]"
+      )
     );
     var CONCURRENCY = 4;
 
@@ -1391,6 +1393,9 @@
   }
 
   /* ---- Results: the FHIR search response, rendered in-page ------------- */
+
+  /* The last path handed to runSearch — what a data-changed re-run repeats. */
+  var lastSearchPath = null;
 
   var results = {
     card: document.getElementById("query-results"),
@@ -1581,6 +1586,7 @@
    * `record` adds it to the roaming recent list (explicit runs only, so
    * paging does not spam recents). */
   function runSearch(path, record) {
+    lastSearchPath = path;
     if (!results.card) {
       window.open(path, "_blank", "noopener");
     } else {
@@ -2031,6 +2037,15 @@
       });
     });
   }
+
+  /* Data changed behind the results (a save or delete in the Resources
+   * modal announces it): re-run the last search so the table shows what is
+   * actually stored, without recording a new recent, and refresh the rail
+   * count — only the affected type's when the event names one, not all 145. */
+  document.addEventListener("hfs:data-changed", function (event) {
+    if (lastSearchPath) runSearch(lastSearchPath, false);
+    hydrateCounts(event.detail && event.detail.type);
+  });
 
   reload();
   window.setTimeout(hydrateCounts, 50);

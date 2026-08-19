@@ -29,22 +29,10 @@ fn create_test_app() -> Router {
 
     Router::new()
         .route("/metadata", get(capability_statement_handler))
-        .route("/$sql-on-fhir-capabilities", get(sof_capabilities_handler))
-        // System-level alias (audit item #6).
-        .route(
-            "/$viewdefinition-run",
-            post(run_view_definition_handler).get(run_view_definition_get_handler),
-        )
-        .route(
-            "/ViewDefinition/$viewdefinition-run",
-            post(run_view_definition_handler).get(run_view_definition_get_handler),
-        )
-        // Instance-level: rejected with 400 because sof-server is
-        // stateless (audit item #7). Both GET and POST land here.
-        .route(
-            "/ViewDefinition/{id}/$viewdefinition-run",
-            get(run_view_definition_by_id_handler).post(run_view_definition_by_id_handler),
-        )
+        // `$sql-run` is invoked at the system level only. The pre-ballot
+        // type- and instance-level `$viewdefinition-run` endpoints were never
+        // published and are gone.
+        .route("/$sql-run", post(sql_run_handler).get(sql_run_get_handler))
         .route("/health", get(health_check))
         .layer(CorsLayer::permissive())
 }
@@ -87,18 +75,14 @@ async fn capability_statement_handler() -> axum::response::Response {
         ],
         "rest": [{
             "mode": "server",
-            "resource": [{
-                "type": "ViewDefinition",
-                "operation": [{
-                    "name": "viewdefinition-run",
-                    "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run",
-                    "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format"
-                }]
-            }],
+            // `$sql-run` is a system-level operation, so it is declared in
+            // `rest.operation` and carries no `rest.resource` entry.
+            // `definition` names this server's own OperationDefinition, since
+            // it supports only a subset of the guide's parameters.
             "operation": [{
-                "name": "viewdefinition-run",
-                "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run",
-                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, NDJSON, and Parquet output. Invoked at the system level (POST /$viewdefinition-run) or type level (POST /ViewDefinition/$viewdefinition-run); the ViewDefinition must be supplied inline in the request body via 'viewResource' (no resource store, so 'viewReference' and instance-level URLs are not supported)."
+                "name": "sql-run",
+                "definition": "/OperationDefinition/sof-sql-run",
+                "documentation": "Execute a ViewDefinition supplied inline and return the rows. Supports CSV, JSON, NDJSON, and Parquet output. Invoked at the system level (POST /$sql-run); the subject must be supplied inline via 'subjectResource', since there is no resource store to resolve 'subjectCanonical' or 'subjectReference'."
             }]
         }]
     });
@@ -111,45 +95,7 @@ async fn capability_statement_handler() -> axum::response::Response {
         .into_response()
 }
 
-/// Stub for the `GET /$sql-on-fhir-capabilities` endpoint (audit item
-/// #11). Mirrors the shape sof-server's production handler emits so
-/// integration tests can exercise the same client-facing response.
-async fn sof_capabilities_handler() -> axum::response::Response {
-    let caps = serde_json::json!({
-        "resourceType": "Parameters",
-        "parameter": [
-            {"name": "supportsViewDefinitionRun", "valueBoolean": true},
-            {"name": "supportsViewDefinitionExport", "valueBoolean": false},
-            {"name": "supportsSqlQueryRun", "valueBoolean": false},
-            {"name": "supportsInDbRunner", "valueBoolean": false},
-            {"name": "supportsRelativeReference", "valueBoolean": false},
-            {"name": "supportsCanonicalReference", "valueBoolean": false},
-            {"name": "supportsAbsoluteReference", "valueBoolean": false},
-            {"name": "supportedFormat", "valueCode": "ndjson"},
-            {"name": "supportedFormat", "valueCode": "json"},
-            {"name": "supportedFormat", "valueCode": "csv"},
-            {"name": "supportedFormat", "valueCode": "parquet"},
-            {
-                "name": "formatBinding",
-                "part": [
-                    {
-                        "name": "valueSet",
-                        "valueUri": "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes"
-                    },
-                    {"name": "strength", "valueCode": "extensible"}
-                ]
-            }
-        ]
-    });
-    (
-        axum::http::StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/fhir+json")],
-        Json(caps),
-    )
-        .into_response()
-}
-
-async fn run_view_definition_handler(
+async fn sql_run_handler(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
@@ -167,7 +113,7 @@ async fn run_view_definition_handler(
     // sof-server accepts two body shapes:
     //   - A FHIR `Parameters` resource (full form), or
     //   - A bare `ViewDefinition` resource (shortcut — equivalent to a
-    //     Parameters body with a single `viewResource` entry).
+    //     Parameters body with a single `subjectResource` entry).
     let is_bare_view_definition = body["resourceType"] == "ViewDefinition";
     if !is_bare_view_definition && body["resourceType"] != "Parameters" {
         return error_response(
@@ -190,14 +136,15 @@ async fn run_view_definition_handler(
     } else if let Some(parameters) = body["parameter"].as_array() {
         for param in parameters {
             match param["name"].as_str() {
-                Some("viewResource") => {
+                Some("subjectResource") => {
                     view_def_json = param["resource"].as_object().cloned();
                 }
-                Some("viewReference") => {
-                    // viewReference is not implemented
+                Some("subjectCanonical") | Some("subjectReference") => {
+                    // Both name the subject by URL, which needs a store to
+                    // resolve against. This server is stateless.
                     return error_response(
                         axum::http::StatusCode::NOT_IMPLEMENTED,
-                        "The viewReference parameter is not yet implemented. Please provide the ViewDefinition directly using the viewResource parameter.",
+                        "This stateless server resolves neither subjectCanonical nor subjectReference. Supply the subject inline with subjectResource.",
                     );
                 }
                 Some("group") => {
@@ -581,16 +528,16 @@ async fn health_check() -> impl axum::response::IntoResponse {
     }))
 }
 
-async fn run_view_definition_get_handler(
+async fn sql_run_get_handler(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     _headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     // Per FHIR spec, GET operations cannot use complex parameters
     // Validate that no complex parameters are provided
-    if params.contains_key("viewReference") {
+    if params.contains_key("subjectResource") {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
-            "GET operations cannot use complex parameters like viewReference. Use POST instead.",
+            "subjectResource carries a resource and cannot be supplied on a query string. Use POST instead.",
         );
     }
     if params.contains_key("patient") {
@@ -614,26 +561,11 @@ async fn run_view_definition_get_handler(
         );
     }
 
-    // For GET requests without a ViewDefinition, we cannot proceed
+    // GET can only name a subject by URL, and this stateless server resolves
+    // neither `subjectCanonical` nor `subjectReference`.
     error_response(
         axum::http::StatusCode::BAD_REQUEST,
-        "GET /ViewDefinition/$viewdefinition-run requires a ViewDefinition to be provided. Since complex parameters cannot be used in GET requests, please use POST with viewResource or viewReference parameter.",
-    )
-}
-
-async fn run_view_definition_by_id_handler(
-    axum::extract::Path(_id): axum::extract::Path<String>,
-    _query: axum::extract::Query<std::collections::HashMap<String, String>>,
-    _headers: axum::http::HeaderMap,
-) -> axum::response::Response {
-    // Audit item #7: stateless server rejects instance-level URLs with
-    // 400 (not 404 or 501) and points at the supported alternative.
-    error_response(
-        axum::http::StatusCode::BAD_REQUEST,
-        "Instance-level $viewdefinition-run (/ViewDefinition/{id}/$viewdefinition-run) is not \
-         supported by this stateless server — there is no resource store to look up a stored \
-         ViewDefinition by id. Use POST /ViewDefinition/$viewdefinition-run with a 'viewResource' \
-         parameter (or a bare ViewDefinition body) instead.",
+        "GET $sql-run requires the subject to be resolvable by canonical URL or reference; this stateless server resolves neither. Use POST with subjectResource instead.",
     )
 }
 

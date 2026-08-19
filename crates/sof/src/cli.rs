@@ -1,7 +1,7 @@
 //! # SQL-on-FHIR CLI Tool
 //!
 //! This module provides a command-line interface for the [SQL-on-FHIR
-//! specification](https://sql-on-fhir.org/ig/latest),
+//! specification](http://hl7.org/fhir/uv/sql-on-fhir),
 //! allowing users to execute ViewDefinition transformations on FHIR Bundle resources
 //! and output the results in various formats.
 //!

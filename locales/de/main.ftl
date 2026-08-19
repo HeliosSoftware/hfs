@@ -135,6 +135,9 @@ card-stored-resources = Gespeicherte Ressourcen
 card-stored-resources-sub = im aktiven Tenant
 card-export-jobs = Export-Jobs
 card-export-jobs-sub = laufend ({ $queued } in der Warteschlange)
+card-import-jobs = Import-Jobs
+card-import-jobs-sub = aktiv
+card-jobs-unavailable = nicht verfügbar
 card-uptime = Verfügbarkeit
 card-uptime-sub = letzte 30 Tage
 
@@ -596,6 +599,52 @@ editor-hint-date = FHIR date: YYYY, YYYY-MM oder YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD oder ein vollständiger Zeitstempel mit Zeitzone (2024-05-17T14:30:00+02:00)
 editor-hint-time = FHIR time: HH:MM:SS
 editor-hint-instant = FHIR instant: vollständiger Zeitstempel mit Zeitzone, z. B. 2024-05-17T14:30:00.000Z
+
+## Bulk Export workspace (#537)
+
+bulk-export-title = Massenexport
+bulk-export-active-title = Aktive Exporte
+bulk-export-active-link = Aktive Exporte
+bulk-export-new = Neuer Export
+bulk-export-unavailable = Das Storage-Backend hostet keinen Settings-Store; Exportaufträge können nicht verfolgt werden.
+bulk-export-scope = Was möchten Sie exportieren?
+bulk-export-scope-system = Alles
+bulk-export-scope-system-hint = Der gesamte Server — jeder unten ausgewählte Ressourcentyp.
+bulk-export-scope-patient = Patienten
+bulk-export-scope-patient-hint = Jeder Patient und die zugehörigen Datensätze. Nichts Patientenfremdes.
+bulk-export-scope-group = Gruppe
+bulk-export-scope-group-hint = Nur die Mitglieder einer bereits definierten Kohorte.
+bulk-export-field-group-id = Gruppen-ID
+bulk-export-field-group-id-hint = Erforderlich für den Gruppen-Umfang: die ID der zu exportierenden FHIR-Group.
+bulk-export-field-name = Name
+bulk-export-field-name-placeholder = Diabetes-Register 2024
+bulk-export-types = Ressourcentypen
+bulk-export-types-hint = Nichts ankreuzen, um alle Typen zu exportieren.
+bulk-export-narrow = Eingrenzen
+bulk-export-field-elements = FHIR-Elemente
+bulk-export-field-type-filter = Typfilter
+bulk-export-field-since = Seit
+bulk-export-since-all = Gesamter Zeitraum
+bulk-export-since-day = Letzter Tag
+bulk-export-since-week = Letzte 7 Tage
+bulk-export-since-month = Letzte 4 Wochen
+bulk-export-since-custom = Benutzerdefiniert
+bulk-export-field-since-custom = Benutzerdefinierter Zeitpunkt
+bulk-export-field-since-custom-hint = Gilt, wenn Seit auf Benutzerdefiniert steht. RFC 3339, z. B. 2026-08-01T00:00:00Z.
+bulk-export-start = Export starten
+bulk-export-running = laufend
+bulk-export-none = Noch keine Exporte. Starten Sie einen auf der Massenexport-Seite.
+bulk-export-status-in-progress = Läuft
+bulk-export-status-complete = Abgeschlossen
+bulk-export-status-failed = Fehlgeschlagen
+bulk-export-status-cancelled = Abgebrochen
+bulk-export-progress = Fortschritt
+bulk-export-progress-waiting = Warten auf den ersten Statusbericht …
+bulk-export-files = Dateien
+bulk-export-finished-in = fertig in
+bulk-export-error = Fehler
+bulk-export-cancel = Abbrechen
+bulk-export-retry = Erneut versuchen
 
 ## Abonnement-Seite (#580)
 

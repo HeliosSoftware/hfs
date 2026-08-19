@@ -589,11 +589,16 @@ where
     let storage_arc = storage;
 
     // Register the process-global dashboard data provider so the web UI can
-    // render real per-type resource counts (default tenant) without depending on
-    // the persistence layer. Storage-agnostic consumers read it via
-    // `helios_observability::dashboard::snapshot()`.
+    // render real per-type resource counts (default tenant), plus bulk-export
+    // and bulk-submit job counts when those subsystems are wired, without
+    // depending on the persistence layer. Storage-agnostic consumers read it
+    // via `helios_observability::dashboard::snapshot()`.
     helios_observability::dashboard::set_provider(Arc::new(
-        dashboard::StorageDashboardProvider::new(Arc::clone(&storage_arc), &config),
+        dashboard::StorageDashboardProvider::new(Arc::clone(&storage_arc), &config)
+            .with_job_stores(
+                bulk_export.as_ref().map(|b| Arc::clone(&b.jobs)),
+                bulk_submit.as_ref().map(|b| Arc::clone(&b.jobs)),
+            ),
     ));
 
     let (app_audit_sink, app_audit_source_observer) = audit_state
@@ -633,7 +638,7 @@ where
 
     // Wire SQL-on-FHIR runner and export controller. The SOF runtime path is
     // in-DB SQL only — backends without a SOF runner can't serve
-    // `$viewdefinition-run` and the handler returns 501 if SOF is enabled
+    // `$sql-run` and the handler returns 501 if SOF is enabled
     // without one.
     if config.sof_enabled {
         let Some(runner) = storage_arc.sof_runner() else {
