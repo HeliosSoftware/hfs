@@ -118,10 +118,13 @@
         <span class="icon">{% include "icons/book.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
       </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-subscriptions") }}">
+      <!-- Visible only when the subscriptions engine is advertised (#580). -->
+      {% if status.subscriptions_enabled() %}
+      <a class="nav-item" href="/ui/subscriptions"{% if active_page == "subscriptions" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-subscriptions") }}">
         <span class="icon">{% include "icons/sync.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-subscriptions") }}</span>
-      </span>
+      </a>
+      {% endif %}
     </nav>
 
     <!--

@@ -596,3 +596,33 @@ editor-hint-date = FHIR date: YYYY, YYYY-MM oder YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD oder ein vollständiger Zeitstempel mit Zeitzone (2024-05-17T14:30:00+02:00)
 editor-hint-time = FHIR time: HH:MM:SS
 editor-hint-instant = FHIR instant: vollständiger Zeitstempel mit Zeitzone, z. B. 2024-05-17T14:30:00.000Z
+
+## Abonnement-Seite (#580)
+
+subs-title = Abonnements
+subs-lede = Schreibgeschützte Sicht auf die Abonnement-Engine: jedes registrierte Abonnement, sein Kanal, Live-Status und Zustellzähler.
+subs-unavailable = Die Abonnement-Engine ist auf diesem Server nicht aktiviert.
+subs-empty = Für diesen Mandanten sind keine Abonnements registriert.
+subs-card-failing = Fehlgeschlagen
+subs-card-failing-sub = braucht Aufmerksamkeit
+subs-card-idle = Inaktiv
+subs-card-idle-sub = keine Clients
+subs-card-active = Aktiv
+subs-card-active-sub = wird zugestellt
+subs-card-events = Benachrichtigungen
+subs-card-events-sub = seit Registrierung
+subs-table-heading = Abonnements
+subs-sort = Sortieren
+subs-sort-status = Status
+subs-sort-sent = Meistgesendet
+subs-sort-fails = Fehlerserie
+subs-col-subscription = Abonnement
+subs-col-channel = Kanal
+subs-col-status = Status
+subs-col-sent = Gesendet
+subs-col-fails = Fehlerserie
+subs-state-active = aktiv
+subs-state-error = Fehler
+subs-state-idle = 0 Clients
+subs-state-requested = angefragt
+subs-state-off = aus

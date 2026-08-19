@@ -2017,6 +2017,32 @@ button.pill {
   background: var(--danger-soft);
   color: var(--danger);
 }
+
+/* Subscription states (#580): the cards and the STATUS column share this
+   vocabulary — active delivers, idle has no listeners, error needs attention. */
+.tag--active {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.tag--idle,
+.tag--requested {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tag--error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.subs-sort summary.btn {
+  list-style: none;
+}
+
+.subs-sort summary.btn::-webkit-details-marker {
+  display: none;
+}
 }
 
 @layer pages {
