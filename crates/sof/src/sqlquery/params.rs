@@ -1,35 +1,40 @@
-//! Parse the FHIR `Parameters` body for `$sqlquery-run`.
+//! Parse the FHIR `Parameters` body for a `$sql-run` whose subject is a
+//! SQLQuery or SQLView Library.
+//!
+//! The subject itself is named by the shared `subjectCanonical` /
+//! `subjectReference` / `subjectResource` trio and resolved before this runs
+//! (see `helios_sof::params` and the REST `sof::subject` module), so this
+//! struct covers only the parameters specific to executing a Library.
 
 use serde_json::Value;
 
-/// Parameters lifted out of a FHIR `Parameters` body for `$sqlquery-run`.
+/// Library-specific `$sql-run` parameters lifted out of a FHIR `Parameters`
+/// body.
 #[derive(Debug, Default, Clone)]
 pub struct SqlQueryRunParams {
     /// `_format` — `valueCode` (spec) or `valueString` (lenient). Optional;
-    /// defaults to `ndjson` per SoF v2 PR #353.
+    /// defaults to `ndjson`.
     pub format: Option<String>,
     /// `header` — CSV header control (default `true`).
     pub header: Option<bool>,
-    /// `queryReference` — extracted strictly from `valueReference.reference`
-    /// per the operation's `Reference` typing. May be a relative `Library/{id}`
-    /// or an absolute / canonical URL the server can resolve.
-    pub query_reference: Option<String>,
-    /// `queryResource` — inline `Library` resource carried in `parameter.resource`.
-    pub query_resource: Option<Value>,
     /// `parameters` — the nested `Parameters` resource of name-to-value bindings
     /// carried in `parameter.resource`. Left as raw JSON; bound after the
     /// Library's parameter declarations are known.
+    ///
+    /// Permitted only when the subject is a SQLQuery or SQLView. Supplying it
+    /// with a ViewDefinition subject is a `400`, because a ViewDefinition
+    /// declares no parameters.
     pub parameters: Option<Value>,
     /// `source` — external data source URL (out of scope v1).
     pub source: Option<String>,
     /// `_limit` — soft cap on the final result-set size, applied AFTER SQL
-    /// evaluation (including any in-query `LIMIT`). Per SoF v2 PR #353, the
-    /// server MAY return fewer rows than requested without erroring;
-    /// returning fewer rows than the supplied `_limit` is not an error.
+    /// evaluation (including any in-query `LIMIT`). The server MAY return
+    /// fewer rows than requested without erroring; returning fewer rows than
+    /// the supplied `_limit` is not an error.
     pub limit: Option<u32>,
 }
 
-/// Walks a `Parameters` body and pulls every `$sqlquery-run` field.
+/// Walks a `Parameters` body and pulls every Library-specific `$sql-run` field.
 pub fn extract_sqlquery_params_from_json(body: &Value) -> SqlQueryRunParams {
     let mut out = SqlQueryRunParams::default();
     if body.get("resourceType").and_then(|v| v.as_str()) != Some("Parameters") {
@@ -54,18 +59,6 @@ pub fn extract_sqlquery_params_from_json(body: &Value) -> SqlQueryRunParams {
                         out.header = Some(b);
                     } else if let Some(s) = p.get("valueString").and_then(|v| v.as_str()) {
                         out.header = Some(s == "true" || s == "1");
-                    }
-                }
-            }
-            "queryReference" => {
-                if out.query_reference.is_none() {
-                    out.query_reference = read_reference(p);
-                }
-            }
-            "queryResource" => {
-                if out.query_resource.is_none() {
-                    if let Some(r) = p.get("resource") {
-                        out.query_resource = Some(r.clone());
                     }
                 }
             }
@@ -109,16 +102,6 @@ fn read_str(p: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-/// Spec: `queryReference` is typed as `Reference`, so only
-/// `valueReference.reference` is honored. Other shapes (`valueString`,
-/// `valueUri`, `valueCanonical`) are ignored.
-fn read_reference(p: &Value) -> Option<String> {
-    p.get("valueReference")
-        .and_then(|v| v.get("reference"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,18 +122,20 @@ mod tests {
     }
 
     #[test]
-    fn extracts_query_reference_and_resource() {
+    fn extracts_parameter_bindings() {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "_format", "valueCode": "json"},
-                {"name": "queryReference", "valueReference": {"reference": "Library/foo"}},
-                {"name": "queryResource", "resource": {"resourceType": "Library"}}
+                {"name": "parameters", "resource": {
+                    "resourceType": "Parameters",
+                    "parameter": [{"name": "min_age", "valueInteger": 18}]
+                }}
             ]
         });
         let p = extract_sqlquery_params_from_json(&body);
-        assert_eq!(p.query_reference.as_deref(), Some("Library/foo"));
-        assert!(p.query_resource.is_some());
+        assert_eq!(p.format.as_deref(), Some("json"));
+        assert!(p.parameters.is_some());
     }
 
     #[test]
@@ -172,17 +157,20 @@ mod tests {
     }
 
     #[test]
-    fn query_reference_only_reads_value_reference() {
-        // valueString / valueUri / valueCanonical are NOT accepted — the spec
-        // types queryReference strictly as Reference.
+    fn pre_ballot_query_parameters_are_ignored() {
+        // `queryReference` / `queryResource` belonged to `$sqlquery-run`, which
+        // was consolidated into `$sql-run`. The subject now arrives through the
+        // shared `subject*` trio, so these names carry no meaning here.
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "_format", "valueCode": "json"},
-                {"name": "queryReference", "valueString": "Library/foo"}
+                {"name": "queryReference", "valueReference": {"reference": "Library/foo"}},
+                {"name": "queryResource", "resource": {"resourceType": "Library"}}
             ]
         });
         let p = extract_sqlquery_params_from_json(&body);
-        assert!(p.query_reference.is_none());
+        assert_eq!(p.format.as_deref(), Some("json"));
+        assert!(p.parameters.is_none());
     }
 }

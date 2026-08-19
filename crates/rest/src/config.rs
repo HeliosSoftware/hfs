@@ -1001,7 +1001,7 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
     pub elasticsearch_password: Option<String>,
 
-    /// Enable SQL-on-FHIR operations ($viewdefinition-run, $viewdefinition-export).
+    /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
@@ -1082,7 +1082,7 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_MAX_CONCURRENCY", default_value = "4")]
     pub export_max_concurrency: usize,
 
-    /// Target rows per output shard for `$viewdefinition-export`.
+    /// Target rows per output shard for `$sql-export`.
     /// Large result sets are split into multiple files of this size.
     #[arg(long, env = "HFS_EXPORT_SHARD_ROWS", default_value = "500000")]
     pub export_shard_rows: usize,
@@ -1104,11 +1104,11 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_CLEANUP_INTERVAL", default_value = "300")]
     pub export_cleanup_interval_secs: u64,
 
-    /// Maximum rows returned by `$sqlquery-run`.
+    /// Maximum rows returned by `$sql-run`.
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_ROWS", default_value = "100000")]
     pub sof_sqlquery_max_rows: usize,
 
-    /// Maximum rows materialized per depends-on ViewDefinition by `$sqlquery-run`.
+    /// Maximum rows materialized per depends-on ViewDefinition by `$sql-run`.
     #[arg(
         long,
         env = "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
@@ -1120,7 +1120,7 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_VDS", default_value = "16")]
     pub sof_sqlquery_max_vds: usize,
 
-    /// Hard timeout (seconds) for `$sqlquery-run` queries.
+    /// Hard timeout (seconds) for `$sql-run` queries.
     #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
     pub sof_sqlquery_timeout_secs: u64,
 

@@ -273,7 +273,7 @@ impl<S: ResourceStorage> AppState<S> {
     }
 
     /// Returns the SQL-on-FHIR runner, if one has been configured. The
-    /// `$viewdefinition-run` handler returns `501 Not Implemented` when this
+    /// `$sql-run` handler returns `501 Not Implemented` when this
     /// is `None` — there is no in-process fallback.
     pub fn sof_runner(&self) -> Option<&Arc<dyn SofRunner>> {
         self.sof_runner.as_ref()

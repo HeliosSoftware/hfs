@@ -25,8 +25,6 @@ use helios_persistence::search::SearchParameterRegistry;
 use helios_persistence::types::SearchParamType;
 use tracing::debug;
 
-use super::sof::capability::build_sof_capabilities;
-
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::fhir_types::get_resource_type_names_for_version;
@@ -206,13 +204,14 @@ where
     system_interactions.push(serde_json::json!({ "code": "history-system" }));
     system_interactions.push(serde_json::json!({ "code": "search-system" }));
 
-    // Standard operations, extended with SOF operations
+    // Standard operations, extended with the system-level SQL on FHIR
+    // operations. Partial parameter support is advertised through the
+    // OperationDefinitions those entries cite, not through an extension block —
+    // the pre-ballot `sof-capabilities` extension has no counterpart in
+    // 3.0.0-ballot.
     let mut operations = build_rest_operations(state);
 
-    // Optional SOF extension block on the rest[0] element
-    let sof_extension = build_sof_rest_extension(state);
-
-    let mut rest_entry = serde_json::json!({
+    let rest_entry = serde_json::json!({
         "mode": "server",
         "documentation": "Helios FHIR RESTful API",
         "security": {
@@ -222,11 +221,6 @@ where
         "resource": resources,
         "interaction": system_interactions
     });
-
-    // Inject the SOF extension array when present
-    if let Some(ext) = sof_extension {
-        rest_entry["extension"] = ext;
-    }
 
     let mut statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
@@ -276,14 +270,23 @@ where
     statement
 }
 
-/// Builds the `rest[0].operation` list, including SOF operations.
+/// Builds the `rest[0].operation` list, including the SQL on FHIR operations.
 ///
-/// `viewdefinition-run` and `sqlquery-run` are always declared when SOF is enabled.
-/// `viewdefinition-export` and `sqlquery-export` are declared only when an
-/// export controller is wired.
+/// Both data operations are invoked at the system level, so they are declared
+/// here rather than under a resource type. `$sql-run` is always declared when
+/// SOF is enabled; `$sql-export` only when an export controller is wired.
+///
+/// `definition` points at *this server's* OperationDefinition rather than the
+/// guide's. Citing the guide's would assert support for every parameter it
+/// declares, and HFS supports a subset (no `context`, no `source`); per
+/// operations-capability.html#partial-operation-support a server in that
+/// position publishes its own definition with `base` naming the guide's. See
+/// [`crate::handlers::sof::capability`].
 fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
     state: &AppState<S>,
 ) -> Vec<serde_json::Value> {
+    use crate::handlers::sof::capability::{SQL_EXPORT_DEFINITION_ID, SQL_RUN_DEFINITION_ID};
+
     let mut ops = vec![
         serde_json::json!({
             "name": "validate",
@@ -294,52 +297,19 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
             "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
         }),
         serde_json::json!({
-            "name": "viewdefinition-run",
-            "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run"
-        }),
-        serde_json::json!({
-            "name": "sqlquery-run",
-            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-run"
+            "name": "sql-run",
+            "definition": format!("/OperationDefinition/{SQL_RUN_DEFINITION_ID}")
         }),
     ];
 
     if state.export_controller().is_some() {
         ops.push(serde_json::json!({
-            "name": "viewdefinition-export",
-            "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-export"
-        }));
-        ops.push(serde_json::json!({
-            "name": "sqlquery-export",
-            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-export"
+            "name": "sql-export",
+            "definition": format!("/OperationDefinition/{SQL_EXPORT_DEFINITION_ID}")
         }));
     }
 
     ops
-}
-
-/// Builds the `extension` array on `rest[0]` advertising SOF-specific flags.
-fn build_sof_rest_extension<S: ResourceStorage + Send + Sync + 'static>(
-    state: &AppState<S>,
-) -> Option<serde_json::Value> {
-    let caps = build_sof_capabilities(state);
-    // Inline the SOF Parameters as a contained extension value so consumers
-    // that understand the SOF spec can discover the flags without an extra request.
-    Some(serde_json::json!([
-        {
-            "url": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/StructureDefinition-sof-capabilities.html",
-            "valueReference": {
-                "reference": "/$sql-on-fhir-capabilities",
-                "display": "SQL-on-FHIR Capabilities"
-            }
-        },
-        {
-            "url": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/StructureDefinition-sof-capabilities-inline.html",
-            "valueAttachment": {
-                "contentType": "application/json",
-                "data": serde_json::to_string(&caps).unwrap_or_default()
-            }
-        }
-    ]))
 }
 
 /// Builds the capability entry for a resource type.

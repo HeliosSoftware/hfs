@@ -1,5 +1,11 @@
-//! Tests for `GET /$sql-on-fhir-capabilities` and the SOF extensions on
-//! `GET /metadata`.
+//! Tests for how the server advertises its SQL on FHIR support.
+//!
+//! SQL on FHIR 3.0.0-ballot has no `$sql-on-fhir-capabilities` endpoint. A
+//! server declares which subset of an operation it supports by publishing its
+//! own OperationDefinition, whose `base` names the guide's, and citing that
+//! from `CapabilityStatement.rest.operation.definition`
+//! (operations-capability.html#partial-operation-support). Citing the guide's
+//! definition instead would assert support for every parameter it declares.
 
 mod sof_capability_tests {
     use axum::http::{HeaderName, HeaderValue, StatusCode};
@@ -10,6 +16,10 @@ mod sof_capability_tests {
     use std::sync::Arc;
 
     const X_TENANT_ID: HeaderName = HeaderName::from_static("x-tenant-id");
+
+    /// Canonical URL of the guide's `$sql-run` definition. Our own definition
+    /// must name this as its `base`.
+    const GUIDE_SQL_RUN: &str = "http://hl7.org/fhir/uv/sql-on-fhir/OperationDefinition/SQLRun";
 
     async fn create_test_server() -> TestServer {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
@@ -23,271 +33,234 @@ mod sof_capability_tests {
         TestServer::new(app).expect("failed to create test server")
     }
 
-    // =========================================================================
-    // GET /$sql-on-fhir-capabilities
-    // =========================================================================
-
-    #[tokio::test]
-    async fn test_sof_capabilities_returns_200() {
-        let server = create_test_server().await;
-
-        let response = server
-            .get("/$sql-on-fhir-capabilities")
-            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-            .await;
-
-        response.assert_status(StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_sof_capabilities_is_parameters_resource() {
-        let server = create_test_server().await;
-
-        let response = server
-            .get("/$sql-on-fhir-capabilities")
-            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-            .await;
-
-        let body: Value = serde_json::from_str(&response.text()).expect("body must be valid JSON");
-
-        assert_eq!(
-            body["resourceType"], "Parameters",
-            "must return a Parameters resource: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_sof_capabilities_has_required_params() {
-        let server = create_test_server().await;
-
-        let response = server
-            .get("/$sql-on-fhir-capabilities")
-            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-            .await;
-
-        let body: Value = serde_json::from_str(&response.text()).expect("body must be valid JSON");
-
-        let params = body["parameter"]
-            .as_array()
-            .expect("parameter must be an array");
-
-        let param_names: Vec<&str> = params.iter().filter_map(|p| p["name"].as_str()).collect();
-
-        for required in [
-            "supportsViewDefinitionRun",
-            "supportsViewDefinitionExport",
-            "supportsSqlQueryRun",
-            "supportsInDbRunner",
-            "supportedFormat",
-        ] {
-            assert!(
-                param_names.contains(&required),
-                "missing parameter '{required}', got: {param_names:?}"
-            );
-        }
-    }
-
-    /// With a plain SQLite backend (no in-DB runner wired), `$viewdefinition-run`
-    /// must be true and `supportsInDbRunner` must be false.
-    #[tokio::test]
-    async fn test_sof_capabilities_inprocess_backend_flags() {
-        let server = create_test_server().await;
-
-        let response = server
-            .get("/$sql-on-fhir-capabilities")
-            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-            .await;
-
-        let body: Value = serde_json::from_str(&response.text()).expect("body must be valid JSON");
-
-        let params = body["parameter"].as_array().unwrap();
-
-        let get_bool = |name: &str| -> bool {
-            params
-                .iter()
-                .find(|p| p["name"].as_str() == Some(name))
-                .and_then(|p| p["valueBoolean"].as_bool())
-                .unwrap_or(false)
-        };
-
-        assert!(
-            get_bool("supportsViewDefinitionRun"),
-            "supportsViewDefinitionRun must be true"
-        );
-        assert!(
-            !get_bool("supportsInDbRunner"),
-            "supportsInDbRunner must be false when using in-process runner"
-        );
-    }
-
-    /// The `supportedFormat` parameter must appear at least three times
-    /// (ndjson, json, csv) and all values must be strings.
-    #[tokio::test]
-    async fn test_sof_capabilities_supported_formats() {
-        let server = create_test_server().await;
-
-        let response = server
-            .get("/$sql-on-fhir-capabilities")
-            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-            .await;
-
-        let body: Value = serde_json::from_str(&response.text()).expect("body must be valid JSON");
-
-        let formats: Vec<&str> = body["parameter"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|p| p["name"].as_str() == Some("supportedFormat"))
-            .filter_map(|p| p["valueCode"].as_str())
-            .collect();
-
-        assert!(
-            formats.len() >= 3,
-            "expected at least 3 supportedFormat entries, got: {formats:?}"
-        );
-        assert!(formats.contains(&"ndjson"), "ndjson must be supported");
-        assert!(formats.contains(&"json"), "json must be supported");
-        assert!(formats.contains(&"csv"), "csv must be supported");
-    }
-
-    /// Audit item #13: the spec binds `_format` to the
-    /// `OutputFormatCodes` value set with `extensible` strength.
-    /// `/$sql-on-fhir-capabilities` declares the binding so audit
-    /// tools can discover it without dereferencing the
-    /// OperationDefinition. Same shape sof-server publishes.
-    #[tokio::test]
-    async fn test_sof_capabilities_declares_format_binding() {
-        let server = create_test_server().await;
-
-        let response = server
-            .get("/$sql-on-fhir-capabilities")
-            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-            .await;
-
-        let body: Value = serde_json::from_str(&response.text()).expect("body must be valid JSON");
-        let params = body["parameter"].as_array().unwrap();
-
-        let binding = params
-            .iter()
-            .find(|p| p["name"] == "formatBinding")
-            .expect("formatBinding parameter must be present");
-        let parts = binding["part"]
-            .as_array()
-            .expect("formatBinding must have part[]");
-
-        let value_set = parts
-            .iter()
-            .find(|p| p["name"] == "valueSet")
-            .and_then(|p| p["valueUri"].as_str())
-            .expect("formatBinding.valueSet must be a uri");
-        assert_eq!(
-            value_set, "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes",
-            "binding must reference the spec's OutputFormatCodes value set"
-        );
-
-        let strength = parts
-            .iter()
-            .find(|p| p["name"] == "strength")
-            .and_then(|p| p["valueCode"].as_str())
-            .expect("formatBinding.strength must be a code");
-        assert_eq!(
-            strength, "extensible",
-            "binding strength must be `extensible` per spec"
-        );
-
-        // Per spec PR #365, the export operations bind to a separate
-        // ExportOutputFormatCodes value set (no `fhir`). The capability
-        // response declares this second binding alongside the run binding.
-        let has_export_binding = params
-            .iter()
-            .filter(|p| p["name"] == "formatBinding")
-            .filter_map(|b| b["part"].as_array())
-            .flat_map(|parts| parts.iter())
-            .filter(|p| p["name"] == "valueSet")
-            .any(|p| {
-                p["valueUri"].as_str()
-                    == Some("https://sql-on-fhir.org/ig/ValueSet/ExportOutputFormatCodes")
-            });
-        assert!(
-            has_export_binding,
-            "capability must declare the ExportOutputFormatCodes binding for the export operations"
-        );
-    }
-
-    // =========================================================================
-    // GET /metadata — SOF operation extensions
-    // =========================================================================
-
-    #[tokio::test]
-    async fn test_metadata_includes_sof_operations() {
-        let server = create_test_server().await;
-
+    async fn metadata(server: &TestServer) -> Value {
         let response = server
             .get("/metadata")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
-
         response.assert_status(StatusCode::OK);
+        serde_json::from_str(&response.text()).expect("metadata must be valid JSON")
+    }
 
-        let body: Value = serde_json::from_str(&response.text()).expect("body must be valid JSON");
+    // =========================================================================
+    // CapabilityStatement
+    // =========================================================================
+
+    /// Both data operations are invoked at the system level, so they belong in
+    /// `rest.operation` rather than under a resource type.
+    #[tokio::test]
+    async fn test_metadata_declares_sql_run_at_system_level() {
+        let server = create_test_server().await;
+        let body = metadata(&server).await;
 
         let operations = body["rest"][0]["operation"]
             .as_array()
             .expect("rest[0].operation must be an array");
-
-        let op_names: Vec<&str> = operations
+        let names: Vec<&str> = operations
             .iter()
             .filter_map(|op| op["name"].as_str())
             .collect();
 
-        // `viewdefinition-run` and `sqlquery-run` are unconditional when SOF is
-        // enabled. The spec-conforming `$sqlquery-run` implementation uses an
-        // in-memory SQLite engine that any storage backend can drive via the
-        // shared SofRunner, so no extra wiring is required to advertise it.
         assert!(
-            op_names.contains(&"viewdefinition-run"),
-            "metadata must advertise viewdefinition-run, got: {op_names:?}"
-        );
-        assert!(
-            op_names.contains(&"sqlquery-run"),
-            "metadata must advertise sqlquery-run, got: {op_names:?}"
-        );
-        // `viewdefinition-export` is still gated on an export controller being
-        // wired. With the bare test server, none is wired.
-        assert!(
-            !op_names.contains(&"viewdefinition-export"),
-            "viewdefinition-export must NOT be advertised without an export controller, got: {op_names:?}"
+            names.contains(&"sql-run"),
+            "$sql-run must be declared: {names:?}"
         );
     }
 
+    /// The pre-ballot operation names were consolidated away and must not be
+    /// advertised: a client reading them would build requests we no longer route.
     #[tokio::test]
-    async fn test_metadata_sof_extension_references_capabilities_endpoint() {
+    async fn test_metadata_does_not_declare_pre_ballot_operations() {
+        let server = create_test_server().await;
+        let body = metadata(&server).await;
+
+        let names: Vec<&str> = body["rest"][0]["operation"]
+            .as_array()
+            .expect("rest[0].operation must be an array")
+            .iter()
+            .filter_map(|op| op["name"].as_str())
+            .collect();
+
+        for gone in [
+            "viewdefinition-run",
+            "viewdefinition-export",
+            "sqlquery-run",
+            "sqlquery-export",
+        ] {
+            assert!(
+                !names.contains(&gone),
+                "{gone} was consolidated into $sql-run/$sql-export: {names:?}"
+            );
+        }
+    }
+
+    /// We support a subset of `$sql-run` (no `context`, no `source`), so the
+    /// CapabilityStatement must cite our own definition rather than the
+    /// guide's — citing the guide's asserts full support.
+    #[tokio::test]
+    async fn test_metadata_cites_our_own_operation_definition() {
+        let server = create_test_server().await;
+        let body = metadata(&server).await;
+
+        let definition = body["rest"][0]["operation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|op| op["name"] == "sql-run")
+            .and_then(|op| op["definition"].as_str())
+            .expect("$sql-run must carry a definition");
+
+        assert_ne!(
+            definition, GUIDE_SQL_RUN,
+            "citing the guide's definition asserts support for every parameter it declares"
+        );
+        assert_eq!(definition, "/OperationDefinition/hfs-sql-run");
+    }
+
+    /// The pre-ballot `sof-capabilities` extension block has no counterpart in
+    /// 3.0.0-ballot.
+    #[tokio::test]
+    async fn test_metadata_has_no_sof_capabilities_extension() {
+        let server = create_test_server().await;
+        let body = metadata(&server).await;
+
+        if let Some(extensions) = body["rest"][0]["extension"].as_array() {
+            for ext in extensions {
+                let url = ext["url"].as_str().unwrap_or("");
+                assert!(
+                    !url.contains("sof-capabilities"),
+                    "the sof-capabilities extension is not part of 3.0.0-ballot: {url}"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // The published OperationDefinition
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_operation_definition_is_served() {
         let server = create_test_server().await;
 
         let response = server
-            .get("/metadata")
+            .get("/OperationDefinition/hfs-sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        let body: Value = serde_json::from_str(&response.text()).expect("body must be valid JSON");
+        response.assert_status(StatusCode::OK);
+        let body: Value = serde_json::from_str(&response.text()).expect("valid JSON");
+        assert_eq!(body["resourceType"], "OperationDefinition");
+        assert_eq!(body["code"], "sql-run");
+    }
 
-        let extensions = body["rest"][0]["extension"]
+    /// `base` is what tells a client this is a subset of the guide's operation
+    /// rather than an unrelated one.
+    #[tokio::test]
+    async fn test_operation_definition_bases_on_the_guides() {
+        let server = create_test_server().await;
+
+        let response = server
+            .get("/OperationDefinition/hfs-sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: Value = serde_json::from_str(&response.text()).expect("valid JSON");
+
+        assert_eq!(body["base"], GUIDE_SQL_RUN);
+    }
+
+    /// `system=true, type=false, instance=false` — the operation names its
+    /// subject by parameter, so it needs no resource-typed path.
+    #[tokio::test]
+    async fn test_operation_definition_is_system_level_only() {
+        let server = create_test_server().await;
+
+        let response = server
+            .get("/OperationDefinition/hfs-sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: Value = serde_json::from_str(&response.text()).expect("valid JSON");
+
+        assert_eq!(body["system"], true);
+        assert_eq!(body["type"], false);
+        assert_eq!(body["instance"], false);
+    }
+
+    /// The three subject-naming parameters are declared; the parameters we
+    /// reject are omitted, which is how a client learns not to send them.
+    #[tokio::test]
+    async fn test_operation_definition_declares_the_supported_subset() {
+        let server = create_test_server().await;
+
+        let response = server
+            .get("/OperationDefinition/hfs-sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: Value = serde_json::from_str(&response.text()).expect("valid JSON");
+
+        let names: Vec<&str> = body["parameter"]
             .as_array()
-            .expect("rest[0].extension must be an array when sof feature is enabled");
-
-        assert!(
-            !extensions.is_empty(),
-            "rest[0].extension must not be empty"
-        );
-
-        // At least one extension must reference the $sql-on-fhir-capabilities endpoint
-        let refs: Vec<&str> = extensions
+            .expect("parameter array")
             .iter()
-            .filter_map(|e| e["valueReference"]["reference"].as_str())
+            .filter_map(|p| p["name"].as_str())
             .collect();
-        assert!(
-            refs.iter().any(|r| r.contains("sql-on-fhir-capabilities")),
-            "no extension references the capabilities endpoint, got: {refs:?}"
+
+        for supported in ["subjectCanonical", "subjectReference", "subjectResource"] {
+            assert!(names.contains(&supported), "{supported} missing: {names:?}");
+        }
+        for unsupported in ["context", "source"] {
+            assert!(
+                !names.contains(&unsupported),
+                "{unsupported} is rejected and must not be declared: {names:?}"
+            );
+        }
+    }
+
+    /// `_format` carries the guide's `OutputFormatCodes` binding, so a client
+    /// can discover the format vocabulary from the definition alone.
+    #[tokio::test]
+    async fn test_operation_definition_binds_output_format_codes() {
+        let server = create_test_server().await;
+
+        let response = server
+            .get("/OperationDefinition/hfs-sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: Value = serde_json::from_str(&response.text()).expect("valid JSON");
+
+        let format = body["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "_format")
+            .expect("_format must be declared");
+
+        assert_eq!(format["binding"]["strength"], "extensible");
+        assert_eq!(
+            format["binding"]["valueSet"],
+            "http://hl7.org/fhir/uv/sql-on-fhir/ValueSet/OutputFormatCodes"
+        );
+    }
+
+    /// The pre-ballot capabilities endpoint no longer serves capabilities.
+    ///
+    /// The path is not routed any more, so it falls through to the generic
+    /// type-search handler and comes back as an empty searchset — which is
+    /// pre-existing behaviour for any unrecognised path segment. What matters
+    /// is that it no longer answers with a SoF capabilities `Parameters`.
+    #[tokio::test]
+    async fn test_pre_ballot_capabilities_endpoint_serves_no_capabilities() {
+        let server = create_test_server().await;
+
+        let response = server
+            .get("/$sql-on-fhir-capabilities")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        let body: Value = serde_json::from_str(&response.text()).expect("valid JSON");
+        assert_ne!(
+            body["resourceType"], "Parameters",
+            "3.0.0-ballot defines no $sql-on-fhir-capabilities endpoint: {body}"
         );
     }
 }
