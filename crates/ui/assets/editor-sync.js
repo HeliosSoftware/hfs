@@ -179,6 +179,64 @@
     return parts.join(".");
   }
 
+  /* ---- live raw → form sync -------------------------------------------- */
+
+  /* As soon as the textarea parses as JSON, the guided form catches up: the
+     document is re-rendered server-side and only the form pane (plus the
+     hidden document field and the binding datalists) is swapped, so the
+     textarea — and the caret in it — is never touched. Invalid JSON simply
+     waits; the form always reflects the last parseable state. */
+  var syncTimer = null;
+  var syncSeq = 0;
+  var lastSynced = null;
+  document.addEventListener("input", function (event) {
+    var source = event.target;
+    if (!source.classList || !source.classList.contains("editor__source")) return;
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(function () {
+      var text = source.value;
+      var parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch (invalid) {
+        return;
+      }
+      var canonical = JSON.stringify(parsed);
+      if (canonical === lastSynced) return;
+      var g = grid(source);
+      if (!g || !g.parentElement) return;
+      var seq = ++syncSeq;
+      var form = new URLSearchParams();
+      form.set("doc", text);
+      form.set("op", "");
+      fetch("/ui/editor/render", { method: "POST", body: form })
+        .then(function (r) { return r.text(); })
+        .then(function (html) {
+          if (seq !== syncSeq || !document.contains(source)) return;
+          lastSynced = canonical;
+          var fresh = new DOMParser().parseFromString(html, "text/html");
+          var container = g.parentElement;
+          var freshDoc = fresh.querySelector("#editor-form");
+          var oldDoc = container.querySelector("#editor-form");
+          if (freshDoc && oldDoc) oldDoc.replaceWith(freshDoc);
+          var freshForm = fresh.querySelector("section.editor-form");
+          var oldForm = g.querySelector("section.editor-form");
+          if (freshForm && oldForm) oldForm.replaceWith(freshForm);
+          // Required-binding datalists ride at the fragment's top level.
+          container.querySelectorAll(":scope > datalist").forEach(function (d) { d.remove(); });
+          fresh.querySelectorAll("body > datalist").forEach(function (d) { container.appendChild(d); });
+          g.__hitKey = null;
+          var path = pathAtCaret(text, source.selectionStart || 0);
+          var row = path ? rowForJsonPath(g, path) : null;
+          if (row) {
+            row.classList.add("editor-row--hit");
+            reveal(g.querySelector(".editor-tree"), row);
+          }
+        })
+        .catch(function () {});
+    }, 600);
+  });
+
   var caretTimer = null;
   document.addEventListener("selectionchange", function () {
     var source = document.activeElement;

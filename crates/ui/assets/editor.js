@@ -78,7 +78,9 @@
    * its filter text, and the tree's scroll position. Captured at response
    * time — where the user is *now*, not where they were at request time. */
   function captureUiState() {
-    var state = { focus: null, pickers: [], scroll: 0 };
+    var state = { focus: null, pickers: [], scroll: 0, rawOpen: false };
+    var raw = body.querySelector("#editor-json-raw");
+    state.rawOpen = !!(raw && !raw.hidden);
     var tree = body.querySelector(".editor-tree");
     if (tree) state.scroll = tree.scrollTop;
     var active = document.activeElement;
@@ -119,6 +121,19 @@
   }
 
   function restoreUiState(state) {
+    // Raw mode survives the swap: the fresh textarea already carries the
+    // updated document, so a guided edit refreshes the JSON in place instead
+    // of kicking the user back to the fold view.
+    if (state.rawOpen) {
+      var raw = body.querySelector("#editor-json-raw");
+      var viewEl = body.querySelector("#json-view");
+      var toggle = body.querySelector("#editor-json-edit");
+      if (raw && viewEl) {
+        raw.hidden = false;
+        viewEl.hidden = true;
+        if (toggle) toggle.classList.add("editor-json__act--on");
+      }
+    }
     state.pickers.forEach(function (saved) {
       var row = rowByPath(saved.path);
       if (!row) return;

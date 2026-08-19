@@ -98,7 +98,9 @@
    * and the tree scroll. The server marks the node a mutation created via
    * data-focus on #editor-form; the caret goes there first. */
   function captureEditorState() {
-    var state = { focus: null, pickers: [], scroll: 0 };
+    var state = { focus: null, pickers: [], scroll: 0, rawOpen: false };
+    var rawPane = editorBody.querySelector("#editor-json-raw");
+    state.rawOpen = !!(rawPane && !rawPane.hidden);
     var tree = editorBody.querySelector(".editor-tree");
     if (tree) state.scroll = tree.scrollTop;
     var active = document.activeElement;
@@ -126,6 +128,19 @@
   }
 
   function restoreEditorState(state) {
+    // Raw mode survives the swap: the fresh textarea already carries the
+    // updated document, so a guided edit refreshes the JSON in place instead
+    // of kicking the user back to the fold view.
+    if (state.rawOpen) {
+      var rawPane = editorBody.querySelector("#editor-json-raw");
+      var viewEl = editorBody.querySelector("#json-view");
+      var toggle = editorBody.querySelector("#editor-json-edit");
+      if (rawPane && viewEl) {
+        rawPane.hidden = false;
+        viewEl.hidden = true;
+        if (toggle) toggle.classList.add("editor-json__act--on");
+      }
+    }
     state.pickers.forEach(function (saved) {
       var row = saved.path ? editorNodeBy("data-path", saved.path) : editorBody;
       if (!row) return;
