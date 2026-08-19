@@ -4229,6 +4229,13 @@ body.has-nav-panel {
   gap: 10px;
 }
 
+.menu__heading--row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .addbox__x {
   border: 0;
   background: none;
