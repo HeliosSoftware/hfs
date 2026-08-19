@@ -37,6 +37,14 @@ pub struct SubscriptionRow {
     /// Connected WebSocket clients — `Some` only for websocket channels, where
     /// zero listeners means notifications go nowhere.
     pub ws_clients: Option<usize>,
+    /// Notifications delivered in the last 24 hours (#586). In-memory rolling
+    /// window: resets with the process, like the engine's other state.
+    pub delivered_24h: u64,
+    /// The subset of `delivered_24h` that landed on the first attempt.
+    pub first_try_24h: u64,
+    /// Deliveries abandoned in the last 24 hours (permanent errors and
+    /// exhausted retries).
+    pub failed_24h: u64,
 }
 
 /// The engine's current inventory for one tenant.
@@ -93,6 +101,9 @@ mod tests {
                     events_since_start: 1402,
                     consecutive_failures: 0,
                     ws_clients: Some(if tenant == "busy" { 3 } else { 0 }),
+                    delivered_24h: 12,
+                    first_try_24h: 11,
+                    failed_24h: 1,
                 }],
             }
         }

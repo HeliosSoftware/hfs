@@ -1028,6 +1028,7 @@ impl helios_observability::subscriptions::SubscriptionsProvider for EngineSubscr
         use helios_observability::subscriptions::{SubscriptionRow, SubscriptionsSnapshot};
         use helios_subscriptions::manager::ChannelType;
 
+        let now = chrono::Utc::now().timestamp();
         let rows = self
             .engine
             .manager()
@@ -1037,6 +1038,7 @@ impl helios_observability::subscriptions::SubscriptionsProvider for EngineSubscr
             .map(|s| {
                 let ws_clients = matches!(s.channel.channel_type, ChannelType::Websocket)
                     .then(|| self.engine.ws_manager().client_count(&s.tenant_id, &s.id));
+                let window = self.engine.delivery_stats().window(&s.tenant_id, &s.id, now);
                 SubscriptionRow {
                     id: s.id,
                     topic_url: s.topic_url,
@@ -1046,6 +1048,9 @@ impl helios_observability::subscriptions::SubscriptionsProvider for EngineSubscr
                     events_since_start: s.events_since_start,
                     consecutive_failures: s.consecutive_failures,
                     ws_clients,
+                    delivered_24h: window.delivered,
+                    first_try_24h: window.first_try,
+                    failed_24h: window.failed,
                 }
             })
             .collect();

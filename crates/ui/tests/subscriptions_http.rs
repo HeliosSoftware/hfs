@@ -66,6 +66,9 @@ impl SubscriptionsProvider for Fixed {
                     events_since_start: 4182,
                     consecutive_failures: 0,
                     ws_clients: None,
+                    delivered_24h: 4182,
+                    first_try_24h: 4031,
+                    failed_24h: 0,
                 },
                 SubscriptionRow {
                     id: "obs-critical".into(),
@@ -76,6 +79,9 @@ impl SubscriptionsProvider for Fixed {
                     events_since_start: 318,
                     consecutive_failures: 7,
                     ws_clients: None,
+                    delivered_24h: 311,
+                    first_try_24h: 290,
+                    failed_24h: 7,
                 },
                 SubscriptionRow {
                     id: "admit-feed".into(),
@@ -86,6 +92,9 @@ impl SubscriptionsProvider for Fixed {
                     events_since_start: 0,
                     consecutive_failures: 0,
                     ws_clients: Some(0),
+                    delivered_24h: 0,
+                    first_try_24h: 0,
+                    failed_24h: 0,
                 },
             ],
         }
@@ -118,7 +127,8 @@ async fn the_page_goes_from_unavailable_to_the_live_dashboard() {
     );
 
     // Cards: 1 failing, 1 idle, 1 active, 4,500 notifications.
-    assert!(html.contains("4,500"), "events card sums the counters");
+    assert!(html.contains("4,493"), "delivered card sums the 24h counters");
+    assert!(html.contains("96.2"), "first-try rate renders");
 
     // Rows: the failing subscription leads (worst first), the idle websocket
     // shows the 0-clients state with no streak, and the streak prints.
