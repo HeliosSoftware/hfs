@@ -34,17 +34,10 @@ async function stylesheet(request: APIRequestContext): Promise<string> {
 // A class is load-bearing if a rule styles it — or if shipped script selects
 // it (a JS hook like .json-line--foldable). Only dot-prefixed names inside JS
 // string literals count, so createElement("table") never legitimizes a dead
-// class="table". The script list comes from the served pages themselves
-// (every page loads its scripts via the shared layout).
-async function definedClasses(page: Page, request: APIRequestContext): Promise<Set<string>> {
+// class="table". Scripts load per page, so the sweep collects every
+// `<script src>` it encounters and legitimizes across the union.
+async function jsHookClasses(request: APIRequestContext, sources: Set<string>): Promise<Set<string>> {
   const found = new Set<string>();
-  const css = (await stylesheet(request)).replace(/\/\*[\s\S]*?\*\//g, "");
-  for (const m of css.matchAll(/\.(-?[A-Za-z_][A-Za-z0-9_-]*)/g)) found.add(m[1]);
-
-  await page.goto("/ui", { waitUntil: "domcontentloaded" });
-  const sources = await page.$$eval("script[src]", (nodes) =>
-    nodes.map((n) => n.getAttribute("src") ?? "").filter((s) => s.startsWith("/ui/assets/")),
-  );
   for (const src of sources) {
     if (src.endsWith("htmx.min.js")) continue;
     const js = await fetchAsset(request, src);
@@ -56,13 +49,31 @@ async function definedClasses(page: Page, request: APIRequestContext): Promise<S
 }
 
 test("every class used on every page matches a rule in app.css", async ({ page, request }) => {
-  const defined = await definedClasses(page, request);
-  const offenders: string[] = [];
+  const defined = new Set<string>();
+  const css = (await stylesheet(request)).replace(/\/\*[\s\S]*?\*\//g, "");
+  for (const m of css.matchAll(/\.(-?[A-Za-z_][A-Za-z0-9_-]*)/g)) defined.add(m[1]);
+
+  // One pass over every route: the classes in use, and the scripts each page
+  // actually ships.
+  const usedByRoute = new Map<string, string[]>();
+  const scripts = new Set<string>();
   for (const route of [...ROUTES, await seedBulkImportDetail(request)]) {
     await page.goto(route, { waitUntil: "networkidle" });
-    const used = await page.evaluate(() =>
-      Array.from(new Set(Array.from(document.querySelectorAll("*")).flatMap((el) => Array.from(el.classList)))),
-    );
+    const { used, sources } = await page.evaluate(() => ({
+      used: Array.from(
+        new Set(Array.from(document.querySelectorAll("*")).flatMap((el) => Array.from(el.classList))),
+      ),
+      sources: Array.from(document.querySelectorAll("script[src]"))
+        .map((n) => n.getAttribute("src") ?? "")
+        .filter((s) => s.startsWith("/ui/assets/")),
+    }));
+    usedByRoute.set(route, used);
+    sources.forEach((s) => scripts.add(s));
+  }
+  for (const cls of await jsHookClasses(request, scripts)) defined.add(cls);
+
+  const offenders: string[] = [];
+  for (const [route, used] of usedByRoute) {
     for (const cls of used) {
       if (RUNTIME_CLASSES.test(cls)) continue;
       if (!defined.has(cls)) offenders.push(`${route}: .${cls}`);
