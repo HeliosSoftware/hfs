@@ -296,6 +296,71 @@ async fn version_choice_persists_to_user_settings_and_redirects_back() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
+/// #562: the resource-type lists follow the sidebar's version choice
+/// end-to-end — selecting a version through `/ui/version` changes which
+/// compartment bundle the pickers enumerate. Ingredient exists only in R4B;
+/// EffectEvidenceSynthesis only in R4. Gated on the R4B feature (CI runs
+/// `--all-features`); a single-version build has nothing to flip.
+#[cfg(feature = "R4B")]
+#[tokio::test]
+async fn version_choice_changes_the_resource_type_lists() {
+    use helios_persistence::core::SettingsStore;
+
+    let backend = Arc::new({
+        let b = SqliteBackend::in_memory().expect("in-memory sqlite");
+        b.init_schema().expect("init schema");
+        b
+    });
+    let app = || {
+        helios_ui::mount_with_conformance_source(
+            Router::new(),
+            "9.9.9",
+            Some(std::path::PathBuf::from("../../data")),
+            helios_ui::NlSearch::default(),
+            None,
+            Some(backend.clone() as Arc<dyn SettingsStore>),
+            "default".to_string(),
+            Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+                std::path::Path::new("../../data"),
+            )),
+            FhirVersion::R4,
+            None,
+        )
+    };
+
+    // Default version (R4): the queries page's type rail carries the R4 set.
+    let res = app()
+        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = body_text(res).await;
+    // Anchored to the rail markup: bare `Ingredient` would also match R4's
+    // MedicinalProductIngredient.
+    assert!(body.contains(r#"data-rail-type="EffectEvidenceSynthesis""#));
+    assert!(!body.contains(r#"data-rail-type="Ingredient""#));
+
+    // Select R4B through the same endpoint the sidebar posts to.
+    let res = app()
+        .oneshot(
+            Request::post("/ui/version")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("version=R4B"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+
+    // The same page now enumerates the R4B set.
+    let res = app()
+        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = body_text(res).await;
+    assert!(body.contains(r#"data-rail-type="Ingredient""#));
+    assert!(!body.contains(r#"data-rail-type="EffectEvidenceSynthesis""#));
+}
+
 #[tokio::test]
 async fn tenant_choice_persists_and_the_selector_follows_it() {
     use helios_persistence::core::SettingsStore;
