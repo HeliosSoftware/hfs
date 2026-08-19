@@ -11,6 +11,10 @@ const baseURL = externalBase || `http://127.0.0.1:${PORT}`;
 
 export default defineConfig({
   testDir: "./tests",
+  // Runs after webServer readiness and before the first test. Seeds the hts
+  // SQLite via POST /import with the fixture roster the specs assume
+  // (ex-cs-1, ex-vs-1, ex-cm-1, plus fillers). See seed.mjs for the details.
+  globalSetup: "./seed.mjs",
   // Deterministic against a single shared server: no cross-test DB races.
   fullyParallel: false,
   workers: 1,

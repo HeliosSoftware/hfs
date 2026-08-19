@@ -48,7 +48,7 @@ const child = spawn(bin, [], {
     HTS_STORAGE_BACKEND: "sqlite",
     HTS_DATABASE_URL: db,
     HTS_LOG_LEVEL: "warn",
-    HTS_UI_ENABLED: "1",
+    HTS_UI_ENABLED: "true",
   },
 });
 
