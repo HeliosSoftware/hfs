@@ -47,7 +47,7 @@
     <div class="json-view" id="json-view">
       {% for line in json_lines %}
       <div class="json-line{% if line.foldable %} json-line--foldable{% endif %}"
-           data-fold-id="{{ line.fold_id }}" data-parents="{{ line.parents }}">
+           data-fold-id="{{ line.fold_id }}" data-parents="{{ line.parents }}"{% if !line.path.is_empty() %} data-jpath="{{ line.path }}"{% endif %}>
         <span class="json-line__num">{{ line.num }}</span>
         <span class="json-line__fold">{% if line.foldable %}<span class="json-line__arrow" data-fold="{{ line.fold_id }}">▾</span>{% endif %}</span>
         <span class="json-line__code" style="padding-left: {{ line.depth }}em">{% for t in line.tokens %}<span class="jt--{{ t.kind }}">{{ t.text }}</span>{% endfor %}<span class="json-line__summary">{{ line.summary }}</span></span>
@@ -90,11 +90,9 @@
            data-path="{{ row.path }}">
 
         <div class="editor-row__head">
-          {% if !row.short.is_empty() %}
-          <span class="editor-row__label" title="{{ row.label }}">{{ row.short }}</span>
-          <span class="editor-row__name">{{ row.label }}</span>
-          {% else %}
           <span class="editor-row__label">{{ row.label }}</span>
+          {% if !row.short.is_empty() %}
+          <span class="editor-row__desc" title="{{ row.short }}">{{ row.short }}</span>
           {% endif %}
 
           {% if !row.type_label.is_empty() %}

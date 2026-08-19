@@ -2987,6 +2987,21 @@ button.filter-rail__item {
   line-height: 1.6;
 }
 
+/* Form ↔ JSON cross-highlight (editor-sync.js): hovering or focusing a form
+   row lights the JSON lines that hold that node, and vice versa. */
+.json-line--hit {
+  background: var(--accent-soft);
+}
+
+.json-line[data-jpath] .json-line__code {
+  cursor: pointer;
+}
+
+.editor-row--hit {
+  background: var(--accent-soft);
+  border-radius: 8px;
+}
+
 .json-line {
   display: flex;
   align-items: baseline;
@@ -3914,9 +3929,14 @@ body.has-nav-panel {
   font-weight: 600;
 }
 
-.editor-row__name {
+/* The element's short description rides second to its name, quiet, one line. */
+.editor-row__desc {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
 }
 
