@@ -460,6 +460,7 @@ mod tests {
             provider.clone(),
             DashboardWindow::LastMonth,
             "default",
+            &[],
             ttl,
             cold,
         )
@@ -475,6 +476,7 @@ mod tests {
             provider.clone(),
             DashboardWindow::LastMonth,
             "default",
+            &[],
             ttl,
             cold,
         )
