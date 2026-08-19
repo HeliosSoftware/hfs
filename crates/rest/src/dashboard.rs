@@ -49,9 +49,10 @@ const INFRASTRUCTURE_TYPES: &[&str] = &[
     "Subscription",
     "ValueSet",
 ];
-/// Hard cap on a user selection — three series stay legible (the mockup's
-/// choice), and it bounds the per-type delta queries.
-const MAX_CHARTED_TYPES: usize = 3;
+/// Hard cap on a user selection — matches the palette (six series colors) and
+/// bounds the per-type delta queries. The default stays at three; this is how
+/// far an explicit selection can go.
+const MAX_CHARTED_TYPES: usize = 6;
 
 /// A span to chart, and the bucket width that samples it.
 ///

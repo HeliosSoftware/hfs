@@ -37,20 +37,21 @@ test("the time-window selector re-renders over the chosen window", async ({ page
   await expect(dashboard.chart).toBeVisible();
 });
 
-test("the picker toggles a type and never plots more than three", async ({ page, dashboard }) => {
+test("the picker toggles types on, capped at the palette", async ({ page, dashboard }) => {
   await dashboard.goto();
   await dashboard.waitForSeries();
 
   // Toggle every offered type on, a click at a time; the plotted set is
-  // capped at three — a fourth selection swaps the oldest out (#555).
-  for (let i = 0; i < 4; i++) {
+  // capped at six (the palette) — past that, the oldest swaps out (#555).
+  for (let i = 0; i < 7; i++) {
     await dashboard.openPicker();
     const off = page.locator(".chart-pick__option:not(.chart-pick__option--on)");
     if ((await off.count()) === 0) break;
     await off.first().click();
     await expect(page).toHaveURL(/types=/);
   }
-  expect(await dashboard.seriesLines.count()).toBeLessThanOrEqual(3);
+  expect(await dashboard.seriesLines.count()).toBeGreaterThan(1);
+  expect(await dashboard.seriesLines.count()).toBeLessThanOrEqual(6);
 
   // The legend removes: clicking an entry drops that series.
   const before = await dashboard.seriesLines.count();

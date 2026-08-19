@@ -1438,8 +1438,8 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
                     .cloned()
                     .collect()
             } else {
-                // Selecting past the cap swaps the oldest series out — three
-                // stay legible (mirrors the provider's MAX_CHARTED_TYPES).
+                // Selecting past the cap swaps the oldest series out
+                // (mirrors the provider's MAX_CHARTED_TYPES).
                 let mut set: Vec<String> = charted
                     .iter()
                     .skip(charted.len().saturating_sub(CHART_MAX_SERIES - 1))
@@ -1525,9 +1525,10 @@ const CHART_HEIGHT: i64 = 300;
 const CHART_HEIGHT_EXPANDED: i64 = 520;
 /// Palette slots defined as `--series-N` custom properties in app.css.
 const SERIES_COLORS: usize = 6;
-/// Most series plotted at once — mirrors the provider's `MAX_CHARTED_TYPES`,
-/// so a picker link never asks for more than the server will chart.
-const CHART_MAX_SERIES: usize = 3;
+/// Most series plotted at once — mirrors the provider's `MAX_CHARTED_TYPES`
+/// (and the palette), so a picker link never asks for more than the server
+/// will chart. The default selection is smaller (the provider's three).
+const CHART_MAX_SERIES: usize = 6;
 
 /// Computes the SVG geometry for one resource type's cumulative series. `window`
 /// decides only the x-axis label format — a calendar date over daily buckets, a
