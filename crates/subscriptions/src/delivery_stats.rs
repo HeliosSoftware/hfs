@@ -99,7 +99,9 @@ impl DeliveryStats {
             .rings
             .entry((tenant.to_string(), id.to_string()))
             .or_insert_with(|| Mutex::new([Bucket::default(); BUCKET_COUNT]));
-        let mut ring = entry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut ring = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let bucket = &mut ring[index];
         if bucket.start != start {
             // The slot's old half-hour aged out of the window; reuse it.
@@ -140,7 +142,10 @@ mod tests {
             }
         );
         // Another subscription is untouched.
-        assert_eq!(stats.window("t", "other", T0 + 30), DeliveryWindow::default());
+        assert_eq!(
+            stats.window("t", "other", T0 + 30),
+            DeliveryWindow::default()
+        );
     }
 
     #[test]
