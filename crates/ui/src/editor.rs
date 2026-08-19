@@ -300,7 +300,7 @@ fn apply(
             editor::remove_at(document, &path);
         }
         "set" => {
-            editor::set_value(document, &path, &form.value);
+            editor::set_value(resolver, resource_type, document, &path, &form.value);
         }
         // No op: a plain re-render (the first load, or a mode switch).
         _ => {}
