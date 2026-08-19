@@ -80,7 +80,10 @@
       if (!lightRaw(g, row.dataset.path)) lightJson(g, row.dataset.path);
     } else {
       var match = rowForJsonPath(g, line.dataset.jpath);
-      if (match) match.classList.add("editor-row--hit");
+      if (match) {
+        match.classList.add("editor-row--hit");
+        reveal(g.querySelector(".editor-tree"), match);
+      }
     }
   }
 
