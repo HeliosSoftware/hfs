@@ -56,6 +56,13 @@ pub struct ValidationOptions {
     pub use_meta_profiles: bool,
     /// What to do when a profile reference cannot be resolved.
     pub unknown_profile: UnknownProfilePolicy,
+    /// Warn when a known extension sits at a resource root outside its
+    /// declared context (#615). Off by default: HL7's own publisher places
+    /// `structuredefinition-*` metadata extensions on CodeSystem/ValueSet
+    /// roots throughout the published spec, so a faithful check flags
+    /// hundreds of canonical resources — useful to a profile author,
+    /// noise to everyone else.
+    pub check_extension_context: bool,
 }
 
 impl Default for ValidationOptions {
@@ -63,6 +70,7 @@ impl Default for ValidationOptions {
         Self {
             profiles: Vec::new(),
             use_meta_profiles: true,
+            check_extension_context: false,
             unknown_profile: UnknownProfilePolicy::default(),
         }
     }

@@ -164,6 +164,7 @@ impl ValidationService {
             profiles,
             use_meta_profiles: self.use_meta_profiles,
             unknown_profile: self.unknown_profile,
+            ..Default::default()
         };
         let handlers = EffectHandlers {
             constraints: self

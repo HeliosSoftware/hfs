@@ -85,6 +85,8 @@ pub(super) struct WalkCtx<'a> {
     errors: Vec<ValidationError>,
     deferred: Vec<Deferred>,
     pub(super) path: PathTracker,
+    /// Opt-in extension-context warnings (#615).
+    check_extension_context: bool,
 }
 
 impl WalkCtx<'_> {
@@ -118,6 +120,7 @@ pub(super) fn validate(
         errors: Vec::new(),
         deferred: Vec::new(),
         path: PathTracker::new(resource_type),
+        check_extension_context: opts.check_extension_context,
     };
 
     // Root schema-set: resourceType, then meta.profile claims, then
@@ -474,7 +477,7 @@ fn eval_element(
         // A known extension used outside its declared context draws a
         // warning (#615). Runs for every item, sliced or not — placement is
         // orthogonal to slicing.
-        if key == "extension" || key == "modifierExtension" {
+        if ctx.check_extension_context && (key == "extension" || key == "modifierExtension") {
             check_extension_context(ctx, items);
         }
 
@@ -513,15 +516,22 @@ fn eval_element(
 
 /// Warn when an extension item is used outside its declared context (#615).
 ///
-/// Conservative on purpose: only element-type contexts that read as
-/// resource-rooted paths (`Patient`, `Patient.name`) are judged, against the
-/// index-free parent path. A context naming a datatype (`HumanName`), an
-/// `Element`/`Resource`/`DomainResource` catch-all, or a FHIRPath expression
-/// makes the whole extension unjudgeable — we cannot resolve the parent's
-/// type here — so it passes silently rather than risking a false positive.
-/// Unknown urls and relative (sub-extension) urls always pass.
+/// Conservative on purpose, twice over. Only extensions at the **resource
+/// root** are judged: an element-level instance path cannot be compared to a
+/// declared context without mapping it back to the StructureDefinition path
+/// (recursive elements — `Questionnaire.item.item` — collapse to
+/// `Questionnaire.item` there, and the spec's own examples falsified the
+/// naive comparison at scale). And only element-type contexts that read as
+/// resource-rooted paths are judged: a context naming a datatype
+/// (`HumanName`), an `Element`/`Resource`/`DomainResource` catch-all, or a
+/// FHIRPath expression makes the extension unjudgeable here and passes
+/// silently. Unknown urls and relative (sub-extension) urls always pass.
 fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
     let parent = ctx.path.parent_element_path();
+    // Root only: the parent path is bare `ResourceType` with no dots.
+    if parent.is_empty() || parent.contains('.') {
+        return;
+    }
 
     for (index, item) in items.iter().enumerate() {
         let Some(url) = item.get("url").and_then(Value::as_str) else {
@@ -826,14 +836,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
     /// #615: a known extension outside its declared element context draws a
     /// warning; in context, or unknown, it stays silent.
     #[test]
     fn extension_context_mismatch_warns() {
         use crate::engine::Validator;
         let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
-        let opts = crate::ValidationOptions::default();
+        let opts = crate::ValidationOptions {
+            check_extension_context: true,
+            ..Default::default()
+        };
         let birthplace = "http://hl7.org/fhir/StructureDefinition/patient-birthPlace";
 
         let warnings = |resource: &serde_json::Value| {
