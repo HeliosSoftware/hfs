@@ -116,6 +116,13 @@ helios-observability = { path = "../observability", version = "0.2.1" }
 # depends on the rest of the server, never the reverse.
 helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4"] }
 
+# Tenant provisioning runs in the background (#581): the create handler hands
+# `register_tenant` + the conformance seed to `tokio::spawn` so the POST
+# response is not held open for it. Only `rt` is needed — the task runs on
+# whichever runtime the host process (the `hfs` binary) is already driving
+# `axum::serve` on.
+tokio = { version = "1", features = ["rt"] }
+
 
 [dev-dependencies]
 # Parses the .ftl sources so tests can enforce key-set parity across locales.

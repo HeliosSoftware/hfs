@@ -2,6 +2,16 @@
 <div class="form-error" role="alert">{{ msg }}</div>
 {% endif %}
 
+{% if polling %}
+<div
+  hx-get="/ui/tenants/rows"
+  hx-include="[name='q']"
+  hx-target="#tenant-rows"
+  hx-swap="innerHTML"
+  hx-trigger="every 3s"
+></div>
+{% endif %}
+
 <table class="data-table">
   <thead>
     <tr>
@@ -24,11 +34,38 @@
         <span class="tenant-id">
           <span class="tenant-id__name">
             {% match row.display_name %}{% when Some(name) %}{{ name }}{% when None %}{{ row.id }}{% endmatch %}
-            {% if !row.registered %}<span class="tag tag--muted">{{ i18n.t("tenants-unregistered") }}</span>{% endif %}
+            {% if !row.registered && !row.provisioning && row.failed.is_none() %}<span class="tag tag--muted">{{ i18n.t("tenants-unregistered") }}</span>{% endif %}
           </span>
           <span class="tenant-id__slug">{{ row.id }}</span>
         </span>
       </td>
+      {% if row.provisioning %}
+      <td class="col-num">
+        <span class="provisioning" role="status">
+          <span class="spinner" aria-hidden="true"></span>
+          {{ i18n.t("tenants-row-provisioning") }}
+        </span>
+      </td>
+      <td>—</td>
+      <td class="col-actions"></td>
+      {% else if let Some(msg) = row.failed %}
+      <td class="col-num">
+        <span class="tag tag--danger" title="{{ msg }}">{{ i18n.t("tenants-row-failed") }}</span>
+      </td>
+      <td>—</td>
+      <td class="col-actions">
+        <button
+          type="button"
+          class="icon-button icon-button--danger"
+          aria-label="{{ i18n.t("tenants-dismiss") }}"
+          hx-delete="/ui/tenants/{{ row.id }}"
+          hx-target="#tenant-rows"
+          hx-swap="innerHTML"
+        >
+          {% include "icons/trash.svg" %}
+        </button>
+      </td>
+      {% else %}
       <td class="col-num">{{ row.resources_human() }}</td>
       <td>{{ row.created_date() }}</td>
       <td class="col-actions">
@@ -44,6 +81,7 @@
           {% include "icons/trash.svg" %}
         </button>
       </td>
+      {% endif %}
     </tr>
     {% endfor %}
     {% endif %}

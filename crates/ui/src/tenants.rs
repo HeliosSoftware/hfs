@@ -11,11 +11,22 @@
 //! button issues `hx-delete /ui/tenants/{id}`. Every mutation returns the
 //! refreshed rows fragment, so the page works the same whether or not the
 //! browser ran the swap.
+//!
+//! Provisioning a tenant runs in the background (#581): a successful `POST`
+//! means the id was *accepted*, not that `register_tenant` and the
+//! conformance seed have finished. The id is claimed under
+//! [`ProvisioningRegistry`], the work is handed to a `tokio::spawn`, and the
+//! response returns immediately with `HX-Trigger: tenant-created` (so the
+//! page script resets the form) and a rows fragment that shows the tenant as
+//! a spinner row. The fragment polls itself every few seconds while any row
+//! is still in flight, so the table settles into a normal row — or a
+//! dismissable failure — without the client holding the original request
+//! open.
 
 use askama::Template;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use helios_persistence::core::ResourceStorage;
@@ -26,14 +37,43 @@ use std::sync::Arc;
 use crate::i18n::{I18n, RequestLocale};
 use crate::{RequestTenant, RequestVersion, WebState, current_status, render};
 
-/// One row of the tenant table (a registry record joined with its live count).
+/// In-flight and failed tenant provisioning jobs, keyed by tenant id (#581).
+/// In-memory only: a server restart loses these notices; the storage registry
+/// stays the source of truth for completed tenants.
+///
+/// A `std::sync::Mutex`, not `tokio::sync::Mutex`: every critical section
+/// below is a plain map lookup/insert with no `.await` inside it.
+pub(crate) type ProvisioningRegistry = Arc<std::sync::Mutex<HashMap<String, Provisioning>>>;
+
+/// State of one provisioning job.
+#[derive(Debug, Clone)]
+pub(crate) enum Provisioning {
+    /// `register_tenant` + conformance seeding are still running.
+    InFlight { display_name: Option<String> },
+    /// The background job failed; shown until the user dismisses the row.
+    Failed {
+        display_name: Option<String>,
+        message: String,
+    },
+}
+
+/// One row of the tenant table (a registry record joined with its live count),
+/// or a provisioning job row standing in for a tenant that is not registered
+/// yet (#581).
 struct TenantRow {
     id: String,
     display_name: Option<String>,
-    /// RFC 3339 date-time, or `None` for a tenant discovered from data only.
+    /// RFC 3339 date-time, or `None` for a tenant discovered from data only
+    /// (or still provisioning).
     created_at: Option<String>,
     registered: bool,
     resources: u64,
+    /// `register_tenant` + conformance seeding are still running in the
+    /// background for this id.
+    provisioning: bool,
+    /// The background job for this id failed; carries the error message shown
+    /// as the row's tooltip.
+    failed: Option<String>,
 }
 
 impl TenantRow {
@@ -77,7 +117,9 @@ impl TenantRow {
 
 /// Page template. `status` feeds the shared sidebar (brand version); `rows` is
 /// the table body, `total`/`registered_count` the summary stats, `q` the active
-/// search term, `available` whether the backend has a registry.
+/// search term, `available` whether the backend has a registry. `polling`
+/// mirrors the included rows partial's field (Askama `include` shares the
+/// enclosing template's context) — see [`TenantRowsPartial::polling`].
 #[derive(Template)]
 #[template(path = "pages/tenants.html")]
 struct TenantsPage {
@@ -90,6 +132,7 @@ struct TenantsPage {
     q: String,
     available: bool,
     error: Option<String>,
+    polling: bool,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
 }
@@ -103,6 +146,10 @@ struct TenantRowsPartial {
     /// fragment is always returned with `200` so htmx swaps it regardless, which
     /// keeps the error visible without the response-targets extension.
     error: Option<String>,
+    /// At least one row is still provisioning (#581): the fragment embeds a
+    /// self-polling `hx-get` so the table keeps refreshing until every job
+    /// settles, then the poller stops rendering on its own.
+    polling: bool,
 }
 
 /// Query string for the page and the rows fragment (`?q=` search term).
@@ -157,8 +204,14 @@ fn validate_id(id: &str) -> Result<(), String> {
 }
 
 /// Builds the tenant rows from the registry joined with live per-tenant counts,
-/// filtered by the search term (matches id or display name, case-insensitive).
-async fn load_rows(storage: &Arc<dyn ResourceStorage>, q: &str) -> Result<Vec<TenantRow>, String> {
+/// prefixed with any in-flight/failed provisioning jobs (#581) not yet
+/// reflected in the registry, filtered by the search term (matches id or
+/// display name, case-insensitive).
+async fn load_rows(
+    storage: &Arc<dyn ResourceStorage>,
+    q: &str,
+    jobs: &HashMap<String, Provisioning>,
+) -> Result<Vec<TenantRow>, String> {
     let registered = storage
         .list_tenants()
         .await
@@ -172,6 +225,42 @@ async fn load_rows(storage: &Arc<dyn ResourceStorage>, q: &str) -> Result<Vec<Te
 
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
+
+    // Provisioning jobs go first, in id order, skipping any id the registry
+    // already carries (the job settled between the registry read above and
+    // the lock read that produced `jobs`).
+    let mut job_ids: Vec<&String> = jobs.keys().collect();
+    job_ids.sort();
+    for id in job_ids {
+        if seen.contains(id) {
+            continue;
+        }
+        seen.insert(id.clone());
+        rows.push(match &jobs[id] {
+            Provisioning::InFlight { display_name } => TenantRow {
+                id: id.clone(),
+                display_name: display_name.clone(),
+                created_at: None,
+                registered: false,
+                resources: 0,
+                provisioning: true,
+                failed: None,
+            },
+            Provisioning::Failed {
+                display_name,
+                message,
+            } => TenantRow {
+                id: id.clone(),
+                display_name: display_name.clone(),
+                created_at: None,
+                registered: false,
+                resources: 0,
+                provisioning: false,
+                failed: Some(message.clone()),
+            },
+        });
+    }
+
     for rec in registered {
         seen.insert(rec.id.clone());
         rows.push(TenantRow {
@@ -180,6 +269,8 @@ async fn load_rows(storage: &Arc<dyn ResourceStorage>, q: &str) -> Result<Vec<Te
             created_at: Some(rec.created_at),
             display_name: rec.display_name,
             id: rec.id,
+            provisioning: false,
+            failed: None,
         });
     }
     // Data-only tenants (have rows but never registered), excluding the system tenant.
@@ -195,6 +286,8 @@ async fn load_rows(storage: &Arc<dyn ResourceStorage>, q: &str) -> Result<Vec<Te
             created_at: None,
             registered: false,
             resources: n,
+            provisioning: false,
+            failed: None,
         });
     }
 
@@ -232,16 +325,19 @@ pub async fn page(
             q: query.q,
             available: false,
             error: None,
+            polling: false,
             active_page: "tenants",
         });
     };
 
-    let (rows, error) = match load_rows(storage, &query.q).await {
+    let jobs = state.provisioning.lock().unwrap().clone();
+    let (rows, error) = match load_rows(storage, &query.q, &jobs).await {
         Ok(rows) => (rows, None),
         Err(e) => (Vec::new(), Some(e)),
     };
     let registered_count = rows.iter().filter(|r| r.registered).count();
     let resources_total = rows.iter().map(|r| r.resources).sum();
+    let polling = rows.iter().any(|r| r.provisioning);
     render(TenantsPage {
         total: rows.len(),
         registered_count,
@@ -252,11 +348,13 @@ pub async fn page(
         q: query.q,
         available: true,
         error,
+        polling,
         active_page: "tenants",
     })
 }
 
-/// `GET /ui/tenants/rows` — the table body fragment (htmx search + refresh).
+/// `GET /ui/tenants/rows` — the table body fragment (htmx search + refresh,
+/// and the self-poll while a provisioning job is in flight, #581).
 pub async fn rows(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -268,23 +366,37 @@ pub async fn rows(
             i18n,
             rows: Vec::new(),
             error: None,
+            polling: false,
         });
     };
-    let (rows, error) = match load_rows(storage, &query.q).await {
+    let jobs = state.provisioning.lock().unwrap().clone();
+    let (rows, error) = match load_rows(storage, &query.q, &jobs).await {
         Ok(rows) => (rows, None),
         Err(e) => (Vec::new(), Some(e)),
     };
-    render(TenantRowsPartial { i18n, rows, error })
+    rows_response(i18n, rows, error)
 }
 
 /// Returns the refreshed (unfiltered) rows fragment, with an optional error
-/// banner, always `200` so htmx swaps it.
+/// banner, always `200` so htmx swaps it. `polling` (whether the fragment
+/// re-embeds its own poller, #581) is derived here so every call site gets it
+/// for free.
 fn rows_response(i18n: I18n, rows: Vec<TenantRow>, error: Option<String>) -> Response {
-    render(TenantRowsPartial { i18n, rows, error })
+    let polling = rows.iter().any(|r| r.provisioning);
+    render(TenantRowsPartial {
+        i18n,
+        rows,
+        error,
+        polling,
+    })
 }
 
-/// `POST /ui/tenants` — register a tenant, then return the refreshed rows (with
-/// an inline error banner if the id was invalid or already taken).
+/// `POST /ui/tenants` — claim the id and return immediately with the
+/// refreshed rows (with an inline error banner if the id was invalid or
+/// already taken/claimed). On the accepted path the response carries
+/// `HX-Trigger: tenant-created`; the actual `register_tenant` call and
+/// conformance seed run in the background (#581), and the returned rows
+/// fragment already shows the tenant as an in-flight (spinner) row.
 pub async fn create(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -301,7 +413,8 @@ pub async fn create(
 
     let id = form.id.trim().to_string();
     let load = |err: Option<String>| async {
-        match load_rows(storage, "").await {
+        let jobs = state.provisioning.lock().unwrap().clone();
+        match load_rows(storage, "", &jobs).await {
             Ok(rows) => rows_response(i18n, rows, err),
             Err(e) => rows_response(i18n, Vec::new(), err.or(Some(e))),
         }
@@ -312,7 +425,11 @@ pub async fn create(
     }
     let display_name = {
         let d = form.display_name.trim();
-        if d.is_empty() { None } else { Some(d) }
+        if d.is_empty() {
+            None
+        } else {
+            Some(d.to_string())
+        }
     };
 
     match storage.get_tenant(&id).await {
@@ -320,25 +437,86 @@ pub async fn create(
         Ok(None) => {}
         Err(e) => return load(Some(e.to_string())).await,
     }
-    if let Err(e) = storage.register_tenant(&id, display_name).await {
-        return load(Some(e.to_string())).await;
+
+    // Claim the id under one lock so a double submit cannot race the check
+    // above: a second POST for the same id while this job is in flight is
+    // rejected here, not raced against `register_tenant`. The guard is
+    // dropped (block ends) before the `await` below — a `std::sync::Mutex`
+    // guard held across an await point would make this handler's future
+    // `!Send`, which axum's `Handler` bound rejects outright.
+    let already_in_flight = {
+        let mut jobs = state.provisioning.lock().unwrap();
+        if matches!(jobs.get(&id), Some(Provisioning::InFlight { .. })) {
+            true
+        } else {
+            // A leftover `Failed` entry for this id is replaced by the retry.
+            jobs.insert(
+                id.clone(),
+                Provisioning::InFlight {
+                    display_name: display_name.clone(),
+                },
+            );
+            false
+        }
+    };
+    if already_in_flight {
+        return load(Some(format!("Tenant '{id}' is already being provisioned."))).await;
     }
-    // Seed the new tenant with the conformance resources (SearchParameters and
-    // CompartmentDefinitions), matching the per-tenant startup seed. Best-effort:
-    // a failed seed still returns the refreshed rows; the next startup completes
-    // it.
+
+    // Provision in the background: the claimed row above reports progress,
+    // the page polls while the job runs, and a client disconnect no longer
+    // aborts the work halfway (axum drops the handler future, not the spawned
+    // task, when the socket closes).
+    let registry = state.provisioning.clone();
+    let job_storage = storage.clone();
     let data_dir = state
         .data_dir
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-    helios_persistence::search::seed_tenant_conformance(
-        storage.as_ref(),
-        state.fhir_version,
-        &data_dir,
-        &id,
-    )
-    .await;
-    load(None).await
+    let fhir_version = state.fhir_version;
+    let job_id = id.clone();
+    let job_name = display_name.clone();
+    tokio::spawn(async move {
+        match job_storage
+            .register_tenant(&job_id, job_name.as_deref())
+            .await
+        {
+            Ok(_) => {
+                // Seed the new tenant with the conformance resources
+                // (SearchParameters and CompartmentDefinitions), matching the
+                // per-tenant startup seed. Best-effort, as before: a failed
+                // seed still counts as provisioned; the next startup
+                // completes it.
+                helios_persistence::search::seed_tenant_conformance(
+                    job_storage.as_ref(),
+                    fhir_version,
+                    &data_dir,
+                    &job_id,
+                )
+                .await;
+                registry.lock().unwrap().remove(&job_id);
+            }
+            Err(e) => {
+                registry.lock().unwrap().insert(
+                    job_id.clone(),
+                    Provisioning::Failed {
+                        display_name: job_name,
+                        message: e.to_string(),
+                    },
+                );
+            }
+        }
+    });
+
+    // The rows fragment below already contains the in-flight row. Tell htmx
+    // the request was accepted: every path answers 200 with the rows fragment
+    // (error banners included), so this header is the only signal the client
+    // has to reset the form (tenants.js). Failures deliberately omit it.
+    let mut response = load(None).await;
+    response
+        .headers_mut()
+        .insert("HX-Trigger", HeaderValue::from_static("tenant-created"));
+    response
 }
 
 /// `DELETE /ui/tenants/{id}` — deregister (and optionally purge), return rows.
@@ -361,6 +539,14 @@ pub async fn delete(
             .into_response();
     };
 
+    let load = |err: Option<String>| async {
+        let jobs = state.provisioning.lock().unwrap().clone();
+        match load_rows(storage, "", &jobs).await {
+            Ok(rows) => rows_response(i18n, rows, err),
+            Err(e) => rows_response(i18n, Vec::new(), err.or(Some(e))),
+        }
+    };
+
     // Refuse reserved ids before touching the registry. This route is destructive
     // (`?purge=true` permanently deletes the tenant's data) and, unlike the
     // `/admin/tenants` API, it validated nothing — so `DELETE
@@ -372,8 +558,38 @@ pub async fn delete(
     // here; the storage-layer guard in `helios-persistence` backs this up
     // regardless of how the route is reached.
     if let Err(message) = validate_id(&id) {
-        let rows = load_rows(storage, "").await.unwrap_or_default();
-        return rows_response(i18n, rows, Some(message));
+        return load(Some(message)).await;
+    }
+
+    // A provisioning job owns this id (#581): an in-flight job is refused
+    // rather than raced against `register_tenant` finishing concurrently
+    // (nothing to deregister yet either way); a failed job never wrote
+    // anything to storage, so dismissing it just clears the registry entry.
+    // The lock guard is scoped to this block, dropped before either `await`
+    // below — held across an await it would make the handler's future
+    // `!Send`, which axum's `Handler` bound rejects outright.
+    enum JobOutcome {
+        InFlight,
+        Dismissed,
+        None,
+    }
+    let outcome = {
+        let mut jobs = state.provisioning.lock().unwrap();
+        match jobs.get(&id) {
+            Some(Provisioning::InFlight { .. }) => JobOutcome::InFlight,
+            Some(Provisioning::Failed { .. }) => {
+                jobs.remove(&id);
+                JobOutcome::Dismissed
+            }
+            None => JobOutcome::None,
+        }
+    };
+    match outcome {
+        JobOutcome::InFlight => {
+            return load(Some(format!("Tenant '{id}' is still being provisioned."))).await;
+        }
+        JobOutcome::Dismissed => return load(None).await,
+        JobOutcome::None => {}
     }
 
     let _ = storage.deregister_tenant(&id).await;
@@ -393,10 +609,7 @@ pub async fn delete(
         None
     };
 
-    match load_rows(storage, "").await {
-        Ok(rows) => rows_response(i18n, rows, purge_error),
-        Err(e) => rows_response(i18n, Vec::new(), purge_error.or(Some(e))),
-    }
+    load(purge_error).await
 }
 
 // (helpers below)

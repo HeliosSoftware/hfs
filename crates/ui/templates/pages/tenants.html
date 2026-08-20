@@ -63,18 +63,19 @@
           hx-post="/ui/tenants"
           hx-target="#tenant-rows"
           hx-swap="innerHTML"
+          hx-disabled-elt="find button[type=submit]"
         >
-          <label class="field">
-            <span class="field__label">{{ i18n.t("tenants-field-id") }}</span>
-            <input class="field__input" type="text" name="id" required autocomplete="off"
-                   placeholder="acme-health">
-            <span class="field__hint">{{ i18n.t("tenants-field-id-hint") }}</span>
-          </label>
           <label class="field">
             <span class="field__label">{{ i18n.t("tenants-field-name") }}</span>
             <input class="field__input" type="text" name="display_name" autocomplete="off"
-                   placeholder="Acme Health">
+                   placeholder="Acme Health" data-tenant-name>
             <span class="field__hint">{{ i18n.t("tenants-field-name-hint") }}</span>
+          </label>
+          <label class="field">
+            <span class="field__label">{{ i18n.t("tenants-field-id") }}</span>
+            <input class="field__input" type="text" name="id" required autocomplete="off"
+                   placeholder="acme-health" data-tenant-id>
+            <span class="field__hint">{{ i18n.t("tenants-field-id-hint") }}</span>
           </label>
           <div class="addbox__actions">
             <button type="button" class="btn" data-addbox-close>{{ i18n.t("ui-cancel") }}</button>
@@ -90,4 +91,5 @@
   </div>
 </section>
 {% endif %}
+<script src="/ui/assets/tenants.js" defer></script>
 {% endblock %}
