@@ -78,7 +78,9 @@
         window selector.
       -->
       <details class="menu chart-pick">
-        <summary class="pill">
+        <!-- The aria-label keeps the summary named even when pick_label is
+             empty (a backend with no count read path offers zero types). -->
+        <summary class="pill" aria-label="{{ i18n.t("chart-pick-heading") }}">
           <span class="icon">{% include "icons/layers-platforms.svg" %}</span>
           {{ chart.pick_label }}
           <span class="icon">{% include "icons/chevron-down.svg" %}</span>

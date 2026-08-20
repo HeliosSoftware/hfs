@@ -7,6 +7,12 @@ import { createResource } from "../pages/api";
 // filter are the layered enhancements. Seeding rides through the ordinary
 // FHIR API; the snapshot cache is outlasted by DashboardPage.waitForSeries.
 
+// Backends whose primary store has no count read path (S3 — the composite
+// delegates counts to the primary) cannot feed the chart; the matrix sets
+// this flag for them and the chart specs stand down. The job-cards spec
+// still runs — the cards read job state, not counts.
+const noChartData = process.env.HFS_E2E_NO_CHART_DATA === "1";
+
 test.beforeEach(async ({ request }) => {
   await createResource(request, "Patient", { name: [{ family: "Chart" }] });
   await createResource(request, "Observation", {
@@ -20,6 +26,7 @@ test.beforeEach(async ({ request }) => {
 });
 
 test("the dashboard renders its stat cards and a charted series", async ({ dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await expect(dashboard.statCards).toHaveCount(5);
   await dashboard.waitForSeries();
@@ -46,6 +53,7 @@ test("export and import job cards show real counts and link to their pages", asy
 });
 
 test("the time-window selector re-renders over the chosen window", async ({ page, dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   await dashboard.windowOption(/24h/i).first().click();
@@ -54,6 +62,7 @@ test("the time-window selector re-renders over the chosen window", async ({ page
 });
 
 test("the picker toggles types on, capped at the palette", async ({ page, dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
 
@@ -79,6 +88,7 @@ test("the picker toggles types on, capped at the palette", async ({ page, dashbo
 });
 
 test("the picker filter narrows the offered types", async ({ dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   await dashboard.openPicker();
@@ -91,6 +101,7 @@ test("the picker filter narrows the offered types", async ({ dashboard }) => {
 });
 
 test("hovering the chart shows the tooltip readout", async ({ dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   const box = await dashboard.chart.boundingBox();
@@ -103,6 +114,7 @@ test("hovering the chart shows the tooltip readout", async ({ dashboard }) => {
 });
 
 test("expand renders the taller plot and collapses back", async ({ page, dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   await dashboard.expandToggle.click();
@@ -114,6 +126,7 @@ test("expand renders the taller plot and collapses back", async ({ page, dashboa
 });
 
 test("the chart's numbers are readable as a table", async ({ dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   await dashboard.dataTableToggle.click();

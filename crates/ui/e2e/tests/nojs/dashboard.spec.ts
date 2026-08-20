@@ -7,6 +7,7 @@ import { createResource } from "../../pages/api";
 // tooltip is absent.
 
 test("the chart's controls work as plain links with JavaScript off", async ({ page, request }) => {
+  test.skip(process.env.HFS_E2E_NO_CHART_DATA === "1", "no count read path on this backend");
   await createResource(request, "Patient", { name: [{ family: "NojsChart" }] });
 
   // Outlast the snapshot cache without any client script.

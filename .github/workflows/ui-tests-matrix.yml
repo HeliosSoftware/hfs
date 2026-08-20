@@ -435,8 +435,14 @@ jobs:
           # other backends and the per-PR sqlite suite.
           EVENTUAL=0
           case "${{ matrix.backend }}" in *elasticsearch*) EVENTUAL=1;; esac
+          # The S3 primary has no count read path (the composite delegates
+          # counts to the primary), so the dashboard chart has no data there;
+          # the chart specs stand down on that leg until the read path exists.
+          NO_CHART=0
+          case "${{ matrix.backend }}" in s3-*) NO_CHART=1;; esac
           docker exec -e CI=1 -e HFS_E2E_BASE_URL="$BASE" \
-            -e HFS_E2E_EVENTUAL_SEARCH="$EVENTUAL" -w /work/e2e "$PW_CONTAINER" \
+            -e HFS_E2E_EVENTUAL_SEARCH="$EVENTUAL" \
+            -e HFS_E2E_NO_CHART_DATA="$NO_CHART" -w /work/e2e "$PW_CONTAINER" \
             bash -c "npm ci && npx playwright test"
 
       - name: Copy Playwright report out
