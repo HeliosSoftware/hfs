@@ -220,7 +220,7 @@ queries-unavailable = Saved queries are unavailable: this server's storage backe
 
 ## SearchParameter viewer (#238)
 
-sp-heading = Search parameters
+sp-heading = Search Parameters
 sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant.
 sp-version-label = FHIR version
 sp-spec-missing = The full spec bundle (search-parameters-*.json) was not found in the data directory — only the minimal embedded fallback parameters are shown.
