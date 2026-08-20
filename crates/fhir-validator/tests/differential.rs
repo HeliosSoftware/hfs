@@ -461,6 +461,7 @@ mod harness_tests {
             profiles: Vec::new(),
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Ignore,
+            ..Default::default()
         };
         for p in &files {
             let findings = our_findings(&validator, &opts, p);
