@@ -905,8 +905,8 @@ mod tests {
         });
         let path = path_from_string("extension.0");
 
-        let schema = schema_at_in(&*registry, "Patient", Some(&document), &path)
-            .expect("profile resolves");
+        let schema =
+            schema_at_in(&*registry, "Patient", Some(&document), &path).expect("profile resolves");
         assert_eq!(
             schema.url.as_deref(),
             Some("http://hl7.org/fhir/StructureDefinition/patient-birthPlace")
@@ -1427,7 +1427,13 @@ mod slice_tests {
             "seeded so it matches: {doc}"
         );
 
-        let label = slice_label(registry.as_ref(), "Sliced", &doc, &[], &doc["identifier"][0]);
+        let label = slice_label(
+            registry.as_ref(),
+            "Sliced",
+            &doc,
+            &[],
+            &doc["identifier"][0],
+        );
         assert_eq!(label, None, "slice_label reads the parent of the ITEM path");
         let label = slice_label(
             registry.as_ref(),

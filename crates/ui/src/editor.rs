@@ -520,7 +520,8 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
             .unwrap_or(false),
         slice: match path.split_last() {
             Some((Step::Index(_), parent_path)) => {
-                editor::slice_label(resolver, resource_type, document, parent_path, node).unwrap_or_default()
+                editor::slice_label(resolver, resource_type, document, parent_path, node)
+                    .unwrap_or_default()
             }
             _ => String::new(),
         },
