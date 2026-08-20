@@ -64,7 +64,7 @@ use axum_embed::ServeEmbed;
 use axum_htmx::{AutoVaryLayer, HxRequest};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
-    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts,
+    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, TypeCount,
 };
 use helios_persistence::core::{ResourceStorage, SettingsStore};
 use i18n::{I18n, RequestLocale};
@@ -517,6 +517,9 @@ struct SearchPage {
     /// The saved-query controls are the Saved Queries page's job, not this
     /// page's (see `partials/search-builder.html`).
     show_save: bool,
+    /// The type rail (#541), server-rendered from `resource_types` and the
+    /// dashboard snapshot's counts.
+    rail_entries: Vec<RailEntry>,
 }
 
 /// Resources page (#282): type filter + search + edit modal, on one screen.
@@ -533,6 +536,9 @@ struct ResourcesPage {
     /// The search-builder partial's save controls are the Saved Queries page's
     /// job, not this one's.
     show_save: bool,
+    /// The type rail (#541), server-rendered from `resource_types` and the
+    /// dashboard snapshot's counts.
+    rail_entries: Vec<RailEntry>,
 }
 
 /// Saved FHIR queries page (#234). The shell is server-rendered; the list is
@@ -546,9 +552,11 @@ struct QueriesPage {
     active_page: &'static str,
     /// The version's resource types for the picker rail, from the spec
     /// CompartmentDefinitions already vendored for the compartment viewer.
-    /// Counts hydrate client-side via `_summary=count`.
     resource_types: Vec<String>,
     show_save: bool,
+    /// The type rail (#541), server-rendered from `resource_types` and the
+    /// dashboard snapshot's counts.
+    rail_entries: Vec<RailEntry>,
 }
 
 /// SearchParameter viewer (#238). Read-only against the same snapshot the
@@ -1078,14 +1086,65 @@ async fn index(
     render(build_index_page(state.version, locale, types, window, expand, rv.0, &rt).await)
 }
 
+/// One resource-type rail item — the primitive Resources, Search, and Saved
+/// Queries share for their type picker (#541): a real link the server marks
+/// current, with an optional instance count. `count` is `None` when no
+/// dashboard provider is registered; the partial then omits the whole count
+/// span rather than mixing real counts with blanks.
+struct RailEntry {
+    name: String,
+    href: String,
+    count: Option<String>,
+    current: bool,
+}
+
+/// Builds the shared type-rail entries for Resources, Search, and Saved
+/// Queries: one entry per resource type, linking back to `base` with
+/// `?type=<name>`, marked `current` against `selected`. `available` is the
+/// dashboard snapshot's per-type totals (`None` when no provider answered —
+/// every entry then gets `count: None`, never a fabricated zero).
+fn build_rail_entries(
+    base: &str,
+    resource_types: &[String],
+    available: Option<&[TypeCount]>,
+    selected: Option<&str>,
+) -> Vec<RailEntry> {
+    let counts: Option<std::collections::HashMap<&str, u64>> = available.map(|types| {
+        types
+            .iter()
+            .map(|t| (t.resource_type.as_str(), t.total))
+            .collect()
+    });
+    resource_types
+        .iter()
+        .map(|name| RailEntry {
+            name: name.clone(),
+            href: format!("{base}?type={name}"),
+            count: counts
+                .as_ref()
+                .map(|by_name| by_name.get(name.as_str()).copied().unwrap_or(0).to_string()),
+            current: selected == Some(name.as_str()),
+        })
+        .collect()
+}
+
 /// Search page: natural language and the visual builder over one editable query.
 async fn search(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<SearchQuery>,
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
+    let live =
+        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[]).await;
+    let rail_entries = build_rail_entries(
+        "/ui/search",
+        &resource_types,
+        live.as_ref().map(|s| s.available.as_slice()),
+        query.resource_type.as_deref(),
+    );
     render(SearchPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1094,7 +1153,16 @@ async fn search(
         docs_url: NL_SEARCH_DOCS,
         resource_types,
         show_save: false,
+        rail_entries,
     })
+}
+
+/// Query string for the Search page: an optional pre-selected type, so the
+/// rail's own links round-trip through `/ui/search?type=Observation` (#541).
+#[derive(Deserialize, Default)]
+struct SearchQuery {
+    #[serde(rename = "type")]
+    resource_type: Option<String>,
 }
 
 /// Saved FHIR queries page.
@@ -1103,15 +1171,33 @@ async fn queries(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<QueriesQuery>,
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
+    let live =
+        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[]).await;
+    let rail_entries = build_rail_entries(
+        "/ui/queries",
+        &resource_types,
+        live.as_ref().map(|s| s.available.as_slice()),
+        query.resource_type.as_deref(),
+    );
     render(QueriesPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "queries",
         resource_types,
         show_save: true,
+        rail_entries,
     })
+}
+
+/// Query string for the Saved Queries page: an optional pre-selected type, so
+/// the rail's own links round-trip through `/ui/queries?type=Observation` (#541).
+#[derive(Deserialize, Default)]
+struct QueriesQuery {
+    #[serde(rename = "type")]
+    resource_type: Option<String>,
 }
 
 /// Resources page (#282): the primary read/write workspace. Ties together the
@@ -1127,6 +1213,16 @@ async fn resources(
     Query(query): Query<ResourcesQuery>,
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
+    // The type the rail opens focused on (from the nav submenu deep link).
+    let selected_type = query.resource_type.unwrap_or_else(|| "Patient".to_string());
+    let live =
+        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[]).await;
+    let rail_entries = build_rail_entries(
+        "/ui/resources",
+        &resource_types,
+        live.as_ref().map(|s| s.available.as_slice()),
+        Some(selected_type.as_str()),
+    );
     render(ResourcesPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1134,9 +1230,9 @@ async fn resources(
         nl: (*state.nl).clone(),
         docs_url: NL_SEARCH_DOCS,
         resource_types,
-        // The type the rail opens focused on (from the nav submenu deep link).
-        selected_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
+        selected_type,
         show_save: false,
+        rail_entries,
     })
 }
 
@@ -2051,6 +2147,8 @@ mod tests {
 
     #[test]
     fn queries_page_renders_shell_and_marks_nav_current() {
+        let resource_types = vec!["Patient".to_string(), "Observation".to_string()];
+        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None);
         let html = QueriesPage {
             status: Status {
                 version: "1.2.3",
@@ -2064,7 +2162,8 @@ mod tests {
             i18n: i18n("en"),
             active_page: "queries",
             show_save: true,
-            resource_types: vec!["Patient".to_string(), "Observation".to_string()],
+            resource_types,
+            rail_entries,
         }
         .render()
         .expect("queries page renders");
@@ -2081,11 +2180,11 @@ mod tests {
         // The Recent panel closes from an explicit X as well as outside
         // click / Esc (addbox.js covers details.menu too).
         assert!(html.contains("data-addbox-close"));
-        // Resource picker rail: the version's full type list, with count
-        // slots the script hydrates via _summary=count.
-        assert!(html.contains(r#"data-rail-type="Patient""#));
-        assert!(html.contains(r#"data-rail-type="Observation""#));
-        assert!(html.contains(r#"data-count-for="Patient""#));
+        // Resource picker rail (#541): a real link per type, server-marked
+        // current; no count without a dashboard provider.
+        assert!(html.contains(r#"data-type="Patient" href="/ui/queries?type=Patient""#));
+        assert!(html.contains(r#"data-type="Observation" href="/ui/queries?type=Observation""#));
+        assert!(!html.contains(r#"class="count""#));
         // Saved Queries has no nav entry any more (#282 folded search / editor
         // / history / saved-queries into Resources); the route still renders.
         assert!(!html.contains(r#"href="/ui/queries" aria-current="page""#));
@@ -2095,6 +2194,8 @@ mod tests {
 
     #[test]
     fn queries_page_renders_in_the_negotiated_locale() {
+        let resource_types = vec!["Patient".to_string()];
+        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None);
         let html = QueriesPage {
             status: Status {
                 version: "1.2.3",
@@ -2108,7 +2209,8 @@ mod tests {
             i18n: i18n("es"),
             active_page: "queries",
             show_save: true,
-            resource_types: vec!["Patient".to_string()],
+            resource_types,
+            rail_entries,
         }
         .render()
         .expect("queries page renders");

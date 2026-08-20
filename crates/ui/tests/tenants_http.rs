@@ -379,8 +379,8 @@ async fn version_choice_changes_the_resource_type_lists() {
     let body = body_text(res).await;
     // Anchored to the rail markup: bare `Ingredient` would also match R4's
     // MedicinalProductIngredient.
-    assert!(body.contains(r#"data-rail-type="EffectEvidenceSynthesis""#));
-    assert!(!body.contains(r#"data-rail-type="Ingredient""#));
+    assert!(body.contains(r#"data-type="EffectEvidenceSynthesis""#));
+    assert!(!body.contains(r#"data-type="Ingredient""#));
 
     // Select R4B through the same endpoint the sidebar posts to.
     let res = app()
@@ -400,8 +400,8 @@ async fn version_choice_changes_the_resource_type_lists() {
         .await
         .unwrap();
     let body = body_text(res).await;
-    assert!(body.contains(r#"data-rail-type="Ingredient""#));
-    assert!(!body.contains(r#"data-rail-type="EffectEvidenceSynthesis""#));
+    assert!(body.contains(r#"data-type="Ingredient""#));
+    assert!(!body.contains(r#"data-type="EffectEvidenceSynthesis""#));
 }
 
 #[tokio::test]

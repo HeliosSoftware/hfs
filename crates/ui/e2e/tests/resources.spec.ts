@@ -22,11 +22,35 @@ test("the rail filter narrows the visible types", async ({ resources }) => {
   await expect(resources.railItem("Patient")).toBeVisible();
 });
 
-test("live counts hydrate next to each type", async ({ resources, request }) => {
-  // Seed one so the count is unambiguous and non-empty.
+// Picking a type updates the URL (and back navigates) without a full reload —
+// the click handler is an enhancement over the rail's real <a href> (#541).
+test("picking a rail type updates the URL and back navigates", async ({ resources, page }) => {
+  await resources.goto("Patient");
+  await resources.pickType("Observation");
+  await expect(page).toHaveURL(/\/ui\/resources\?type=Observation/);
+  await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
+
+  await page.goBack();
+  await expect(page).toHaveURL(/\/ui\/resources\?type=Patient/);
+});
+
+test("counts render next to each type from the dashboard snapshot", async ({
+  resources,
+  request,
+}) => {
+  // Seed one so the count is unambiguous and non-empty. The dashboard
+  // snapshot is cached briefly (#541), so poll a fresh page load rather than
+  // waiting on a client-side hydration fetch.
   await createResource(request, "Device", {});
-  await resources.goto("Device");
-  await expect(resources.count("Device")).not.toHaveText("", { timeout: 10_000 });
+  await expect
+    .poll(
+      async () => {
+        await resources.goto("Device");
+        return await resources.count("Device").textContent();
+      },
+      { timeout: 20_000, intervals: [1_000, 2_000, 4_000] },
+    )
+    .not.toBe("");
 });
 
 test("every resource type is reachable — Create targets each one", async ({ resources }) => {

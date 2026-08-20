@@ -26,11 +26,19 @@
 
 <div class="filter-layout" hx-boost="true">
   <!--
-    Resource Filter rail — the primitive the Resources screen will share:
-    a search box over resource types, an "All types" row, a Recently-used
-    group (populated client-side; see resource-filter.js), and a live count
-    next to every type. The registry is already keyed base → code → param,
-    so the rail is a direct view of the outer map.
+    Resource Filter rail: a search box over resource types, an "All types"
+    row, a Recently-used group (populated client-side; see
+    resource-filter.js), and a live count next to every type. The registry is
+    already keyed base → code → param, so the rail is a direct view of the
+    outer map.
+
+    Resources, Search, and Saved Queries render their rail items from the
+    shared `partials/type_rail.html` macro (#541), producing the same
+    `<a class="filter-rail__item" data-type href aria-current>` markup this
+    loop already does. This page keeps its own loop rather than adopting the
+    macro: its counts are always-known parameter counts (`usize`), not the
+    dashboard snapshot's optional per-type totals the macro's `count: Option`
+    branch expects, and the "All types" row has no `data-type` equivalent.
   -->
   <aside class="card filter-rail" aria-label="{{ i18n.t("sp-rail-label") }}">
     <form class="filter-rail__search" method="get" action="/ui/search-parameters" role="search">

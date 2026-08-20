@@ -981,13 +981,15 @@
 
   /* Marks the picker rail's active type. */
   function markRailType(type) {
-    document.querySelectorAll("[data-rail-type]").forEach(function (item) {
-      if (item.dataset.railType === type) {
-        item.setAttribute("aria-current", "true");
-      } else {
-        item.removeAttribute("aria-current");
-      }
-    });
+    document
+      .querySelectorAll("#type-rail-list a.filter-rail__item")
+      .forEach(function (item) {
+        if (item.dataset.type === type) {
+          item.setAttribute("aria-current", "true");
+        } else {
+          item.removeAttribute("aria-current");
+        }
+      });
   }
 
   /* The last URL the rows themselves produced. A native `change` can fire on
@@ -1202,58 +1204,21 @@
   }
 
   /* ---- Resource picker rail --------------------------------------------
-   * The type list is server-rendered from the spec; counts hydrate here
-   * via the standard `_summary=count` search (Bundle.total only, no
-   * entries), a few at a time so 145 types don't stampede the server. */
+   * The type list, its links (`/ui/<page>?type=<name>`), and its counts are
+   * all server-rendered (#541) from the shared `partials/type_rail.html`
+   * macro. Without JavaScript the `<a>` navigates and the server marks the
+   * selection; with it, a click is intercepted so the action happens
+   * in-page and the URL still updates via `history.pushState`. */
 
   var railList = document.getElementById("type-rail-list");
   var railFilter = document.getElementById("type-rail-filter");
-  var countFormat = new Intl.NumberFormat(lang);
-
-  function hydrateCounts(onlyType) {
-    if (!railList) return;
-    var pending = Array.prototype.slice.call(
-      railList.querySelectorAll(
-        onlyType ? '[data-count-for="' + onlyType + '"]' : "[data-count-for]"
-      )
-    );
-    var CONCURRENCY = 4;
-
-    function next() {
-      var slot = pending.shift();
-      if (!slot) return;
-      /* _total=accurate as well: this server only computes Bundle.total
-       * when asked explicitly, even under _summary=count. */
-      fetch(
-        "/" +
-          encodeURIComponent(slot.dataset.countFor) +
-          "?_summary=count&_total=accurate",
-        {
-          headers: fhirHeaders(),
-          credentials: "same-origin",
-        }
-      )
-        .then(function (response) {
-          return response.ok ? response.json() : null;
-        })
-        .then(function (bundle) {
-          if (bundle && typeof bundle.total === "number") {
-            slot.textContent = countFormat.format(bundle.total);
-          }
-        })
-        .catch(function () {
-          /* count stays blank */
-        })
-        .then(next);
-    }
-    for (var i = 0; i < CONCURRENCY; i++) next();
-  }
 
   if (railList) {
     railList.addEventListener("click", function (event) {
-      var item = event.target.closest("[data-rail-type]");
+      var item = event.target.closest("a.filter-rail__item");
       if (!item || !urlInput) return;
-      var type = item.dataset.railType;
+      event.preventDefault();
+      var type = item.dataset.type;
       // Keep the Resources page's selected type in sync so "Create new" targets
       // it and the rail shows which type is active. (Both absent on the Saved
       // Queries page, where this rail only drives the search.)
@@ -1261,23 +1226,22 @@
       if (panel) panel.dataset.selectedType = type;
       var createBtn = document.getElementById("resource-create");
       if (createBtn) createBtn.dataset.type = type;
-      railList.querySelectorAll(".nav-panel__item--on").forEach(function (el) {
-        el.classList.remove("nav-panel__item--on");
-      });
-      item.classList.add("nav-panel__item--on");
+      markRailType(type);
       urlInput.value = "GET /" + type;
       renderBuilder();
       runSearch("/" + encodeURIComponent(type), false);
+      window.history.pushState({}, "", item.getAttribute("href"));
     });
   }
   if (railFilter && railList) {
     railFilter.addEventListener("input", function () {
       var needle = railFilter.value.trim().toLowerCase();
-      railList.querySelectorAll("[data-rail-type]").forEach(function (item) {
-        item.hidden =
-          !!needle &&
-          item.dataset.railType.toLowerCase().indexOf(needle) < 0;
-      });
+      railList
+        .querySelectorAll("a.filter-rail__item[data-type]")
+        .forEach(function (item) {
+          item.hidden =
+            !!needle && item.dataset.type.toLowerCase().indexOf(needle) < 0;
+        });
     });
   }
 
@@ -2040,15 +2004,13 @@
 
   /* Data changed behind the results (a save or delete in the Resources
    * modal announces it): re-run the last search so the table shows what is
-   * actually stored, without recording a new recent, and refresh the rail
-   * count — only the affected type's when the event names one, not all 145. */
-  document.addEventListener("hfs:data-changed", function (event) {
+   * actually stored, without recording a new recent. The rail's counts are
+   * server-rendered (#541) and catch up on the next full page load. */
+  document.addEventListener("hfs:data-changed", function () {
     if (lastSearchPath) runSearch(lastSearchPath, false);
-    hydrateCounts(event.detail && event.detail.type);
   });
 
   reload();
-  window.setTimeout(hydrateCounts, 50);
 
   /* Deep link: /ui/queries?url=/Patient?name=smith loads the builder and
    * runs immediately — also what saved/recent entries could link to. */

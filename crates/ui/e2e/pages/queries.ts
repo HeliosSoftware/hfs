@@ -20,10 +20,10 @@ export class QueriesPage {
     return this.page.locator("#type-rail-filter");
   }
   railItem(type: string): Locator {
-    return this.page.locator(`[data-rail-type='${type}']`);
+    return this.page.locator(`#type-rail-list [data-type='${type}']`);
   }
   count(type: string): Locator {
-    return this.page.locator(`[data-count-for='${type}']`);
+    return this.page.locator(`#type-rail-list [data-type='${type}'] .count`);
   }
   get savedList(): Locator {
     return this.page.locator("#saved-queries");

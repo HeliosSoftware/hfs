@@ -1,4 +1,5 @@
 {% extends "layouts/base.html" %}
+{% import "partials/type_rail.html" as rail %}
 
 {% block title %}{{ i18n.t("resources-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
@@ -22,12 +23,7 @@
            aria-label="{{ i18n.t("queries-rail-filter") }}">
   </div>
   <div class="nav-panel__list" id="type-rail-list">
-    {% for t in resource_types %}
-    <button type="button" class="nav-panel__item{% if t.as_str() == selected_type.as_str() %} nav-panel__item--on{% endif %}" data-rail-type="{{ t }}">
-      <span>{{ t }}</span>
-      <span class="count" data-count-for="{{ t }}"></span>
-    </button>
-    {% endfor %}
+    {% call rail::rail_items(rail_entries) %}{% endcall %}
   </div>
 </aside>
 {% endblock %}

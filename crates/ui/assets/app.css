@@ -2880,15 +2880,7 @@ a.pill {
   min-width: 0;
 }
 
-/* The picker rail reuses .filter-rail with <button> items. */
-button.filter-rail__item {
-  border: 0;
-  background-color: transparent;
-  font: inherit;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-}
+/* The picker rail reuses .filter-rail with real `<a>` items (#541). */
 
 @media (max-width: 1100px) {
   .queries-layout {
@@ -3954,38 +3946,8 @@ body.has-nav-panel {
   margin-top: 4px;
 }
 
-.nav-panel__item {
-  /* WCAG 2.2 target-size floor - font fallback must not shrink rows below it. */
-  min-height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  width: 100%;
-  padding: 9px 12px;
-  font: inherit;
-  font-size: 14px;
-  text-align: left;
-  color: var(--text);
-  background: transparent;
-  border: 0;
-  border-radius: 10px;
-  cursor: pointer;
-}
-
-.nav-panel__item:hover { background: var(--input-bg); }
-
-.nav-panel__item--on {
-  background: var(--accent-soft);
-  color: var(--accent-text);
-  font-weight: 600;
-}
-
-.nav-panel__item .count {
-  font-size: 12px;
-  color: var(--muted);
-}
-.nav-panel__item--on .count { color: var(--accent-text); }
+/* Items are `.filter-rail__item` (#541, shared with Search/Queries/Search
+   Parameters); this panel only needs the container rules above. */
 
 /* The Create-new primary button (blue + plus), top-right of the page head. */
 .resources-create {
