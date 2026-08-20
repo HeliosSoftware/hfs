@@ -82,6 +82,14 @@ async fn dashboard_renders_job_cards_with_unavailable_state_when_no_provider() {
     assert!(html.contains("unavailable"));
     assert!(!html.contains(">13<"));
     assert!(!html.contains("queued)"));
+
+    // The Uptime card follows the same honesty rule (#540): this test binary
+    // never calls helios_observability::uptime::init(), so the card renders
+    // the unavailable state, not the old hardcoded percentage. The
+    // initialized path lives in tests/dashboard_uptime_http.rs — a separate
+    // binary, because the tracker is process-global.
+    assert!(!html.contains("99.98"));
+    assert!(!html.contains("since process start"));
 }
 
 #[tokio::test]

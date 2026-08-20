@@ -45,6 +45,7 @@ mod history;
 mod i18n;
 mod json_view;
 mod search_params;
+mod subscriptions;
 mod tenants;
 
 #[doc(hidden)]
@@ -294,6 +295,9 @@ pub(crate) struct Status {
     tenant_display: Option<String>,
     /// Whether the sidebar renders the tenant picker (#544).
     show_tenant_picker: bool,
+    /// Whether the subscriptions engine is advertised — the sidebar entry and
+    /// the operator page only appear when it is (#580).
+    subscriptions_enabled: bool,
 }
 
 impl Status {
@@ -315,6 +319,11 @@ impl Status {
     /// Whether the sidebar renders the tenant picker (#544).
     pub(crate) fn show_tenant_picker(&self) -> bool {
         self.show_tenant_picker
+    }
+
+    /// Whether the subscriptions engine is advertised (#580).
+    pub(crate) fn subscriptions_enabled(&self) -> bool {
+        self.subscriptions_enabled
     }
 
     /// The effective tenant id, for the `hfs-tenant` meta tag browser calls
@@ -351,9 +360,9 @@ impl Status {
 ///
 /// `resource_types`, `stored_resources`, `fhir_version`, `export_jobs`,
 /// `import_jobs`, and `chart_total` are derived from the live
-/// [`DashboardSnapshot`] (default tenant). `uptime_percent` describes
-/// availability history, which is not part of that read path and remains a
-/// placeholder value until #540 wires it to a real source.
+/// [`DashboardSnapshot`] (default tenant). `uptime` is the process uptime from
+/// `helios_observability::uptime` (#540); in a cluster it describes only the
+/// node that served this request.
 struct DashboardMetrics {
     fhir_version: String,
     resource_types: String,
@@ -363,8 +372,30 @@ struct DashboardMetrics {
     /// Active bulk-submit (import) jobs for the tenant; `None` renders the
     /// unavailable state.
     import_jobs: Option<u64>,
-    uptime_percent: String,
+    /// Formatted process uptime; `None` renders the unavailable state (the
+    /// uptime tracker was never initialized).
+    uptime: Option<String>,
     chart_total: String,
+}
+
+/// Process uptime as a short human duration ("3d 4h", "5h 12m", "42m", "18s"),
+/// or `None` when the tracker was never initialized and no honest figure
+/// exists.
+fn format_uptime(seconds: f64) -> Option<String> {
+    if seconds <= 0.0 {
+        return None;
+    }
+    let s = seconds as u64;
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60);
+    Some(if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
+    })
 }
 
 /// A single axis gridline or tick, in the chart's `0 0 1060 300` viewBox. `pos`
@@ -649,6 +680,8 @@ pub fn mount(
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url,
         outbound_auth,
+        fhir_version,
+        data_dir.clone(),
     ));
     mount_with_conformance_source(
         fhir_app,
@@ -703,6 +736,7 @@ pub fn mount_with_conformance_source(
         .route("/ui/compartments", get(compartments_page))
         // Batch/Transaction workspace (#476): upload → preflight → response.
         .route("/ui/batch", get(batch_page))
+        .route("/ui/subscriptions", get(subscriptions::page))
         // Schema-driven resource editor (#264). One POST endpoint applies every
         // structural mutation and re-renders: the document rides with it.
         .route("/ui/editor", get(editor::page))
@@ -1048,10 +1082,7 @@ async fn search(
     rv: RequestVersion,
     rt: RequestTenant,
 ) -> Response {
-    let resource_types = state
-        .compartments
-        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(SearchPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1070,10 +1101,7 @@ async fn queries(
     rv: RequestVersion,
     rt: RequestTenant,
 ) -> Response {
-    let resource_types = state
-        .compartments
-        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(QueriesPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1095,10 +1123,7 @@ async fn resources(
     rt: RequestTenant,
     Query(query): Query<ResourcesQuery>,
 ) -> Response {
-    let resource_types = state
-        .compartments
-        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(ResourcesPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1128,16 +1153,14 @@ struct ParamsCatalogQuery {
 
 /// Parameter datalist for the search builder: the active parameters that
 /// apply to the given resource type (including `Resource` /
-/// `DomainResource`-level ones), from the default-version snapshot.
+/// `DomainResource`-level ones), from the selected version's snapshot.
 async fn query_params_catalog(
     State(state): State<WebState>,
     rt: RequestTenant,
+    rv: RequestVersion,
     Query(raw): Query<ParamsCatalogQuery>,
 ) -> Response {
-    let snapshot = state
-        .sp_catalog
-        .snapshot(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let snapshot = state.sp_catalog.snapshot(&rt.id, rv.0).await;
     let resource_type = raw.resource_type.unwrap_or_default();
     let mut params: Vec<ParamOption> = snapshot
         .params
@@ -1512,8 +1535,7 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
         stored_resources: compact_count(snapshot.total_resources),
         export_jobs: snapshot.export_jobs,
         import_jobs: snapshot.import_jobs_active,
-        // Uptime is still a placeholder until #540 wires it to a real source.
-        uptime_percent: "99.98".to_string(),
+        uptime: format_uptime(helios_observability::uptime::uptime_seconds()),
         chart_total: {
             let sum: u64 = snapshot.series.iter().map(|s| s.total).sum();
             grouped(sum)
@@ -1736,7 +1758,7 @@ fn compact_count(n: u64) -> String {
 }
 
 /// Thousands-separated integer for prominent totals: `1204 -> "1,204"`.
-fn grouped(n: u64) -> String {
+pub(crate) fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let bytes = digits.as_bytes();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -1767,7 +1789,7 @@ fn axis_time_label(bucket_start: DateTime<Utc>, window: DashboardWindow) -> Stri
 /// Both values we read this way (a FHIR resource type, a window slug) are
 /// alphanumeric, so no percent-decoding is needed; each is validated — against
 /// the snapshot's series, or `DashboardWindow::from_slug` — before use.
-fn query_value(query: Option<&str>, key: &str) -> Option<String> {
+pub(crate) fn query_value(query: Option<&str>, key: &str) -> Option<String> {
     let query = query?;
     query.split('&').find_map(|pair| {
         let (k, value) = pair.split_once('=')?;
@@ -1862,6 +1884,7 @@ pub(crate) fn current_status(
         tenant_id: tenant.id.clone(),
         tenant_display: tenant.display.clone(),
         show_tenant_picker: tenant.multi,
+        subscriptions_enabled: helios_observability::subscriptions::enabled(),
     }
 }
 
@@ -1902,6 +1925,7 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -1913,6 +1937,22 @@ mod tests {
             i18n,
             active_page: "home",
         }
+    }
+
+    #[test]
+    fn format_uptime_picks_the_two_leading_units() {
+        assert_eq!(format_uptime(0.0), None);
+        assert_eq!(format_uptime(-5.0), None);
+        assert_eq!(format_uptime(18.4), Some("18s".to_string()));
+        assert_eq!(format_uptime(42.0 * 60.0 + 30.0), Some("42m".to_string()));
+        assert_eq!(
+            format_uptime(5.0 * 3_600.0 + 12.0 * 60.0),
+            Some("5h 12m".to_string())
+        );
+        assert_eq!(
+            format_uptime(3.0 * 86_400.0 + 4.0 * 3_600.0 + 59.0 * 60.0),
+            Some("3d 4h".to_string())
+        );
     }
 
     /// A point at a fixed instant, for geometry tests that don't care when.
@@ -1959,6 +1999,7 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             i18n: i18n("en"),
         }
@@ -2015,6 +2056,7 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -2058,6 +2100,7 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             i18n: i18n("es"),
             active_page: "queries",

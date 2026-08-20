@@ -138,8 +138,8 @@ card-export-jobs-sub = laufend ({ $queued } in der Warteschlange)
 card-import-jobs = Import-Jobs
 card-import-jobs-sub = aktiv
 card-jobs-unavailable = nicht verfügbar
-card-uptime = Verfügbarkeit
-card-uptime-sub = letzte 30 Tage
+card-uptime = Betriebszeit
+card-uptime-sub = seit Prozessstart
 
 chart-title = FHIR-Ressourcen im Zeitverlauf
 chart-expand = Diagramm vergrößern
@@ -607,6 +607,38 @@ editor-hint-date = FHIR date: YYYY, YYYY-MM oder YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD oder ein vollständiger Zeitstempel mit Zeitzone (2024-05-17T14:30:00+02:00)
 editor-hint-time = FHIR time: HH:MM:SS
 editor-hint-instant = FHIR instant: vollständiger Zeitstempel mit Zeitzone, z. B. 2024-05-17T14:30:00.000Z
+
+## Abonnement-Seite (#580)
+
+subs-title = Abonnements
+subs-lede = Schreibgeschützte Sicht auf die Abonnement-Engine: jedes registrierte Abonnement, sein Kanal, Live-Status und Zustellzähler.
+subs-unavailable = Die Abonnement-Engine ist auf diesem Server nicht aktiviert.
+subs-empty = Für diesen Mandanten sind keine Abonnements registriert.
+subs-card-failing = Fehlgeschlagen
+subs-card-failing-sub = braucht Aufmerksamkeit
+subs-card-idle = Inaktiv
+subs-card-idle-sub = keine Clients
+subs-card-active = Aktiv
+subs-card-active-sub = wird zugestellt
+subs-card-delivered = Zugestellt in 24 h
+subs-card-delivered-sub = { $rate }% beim ersten Versuch
+subs-card-delivered-none = keine Zustellungen im Fenster
+subs-table-heading = Abonnements
+subs-sort = Sortieren
+subs-sort-status = Status
+subs-sort-sent = Meistgesendet
+subs-sort-fails = Fehlerserie
+subs-col-subscription = Abonnement
+subs-col-channel = Kanal
+subs-col-status = Status
+subs-col-last24 = Letzte 24 h
+subs-col-sent = Gesendet
+subs-col-fails = Fehlerserie
+subs-state-active = aktiv
+subs-state-error = Fehler
+subs-state-idle = 0 Clients
+subs-state-requested = angefragt
+subs-state-off = aus
 
 ## Bulk Export workspace (#537)
 

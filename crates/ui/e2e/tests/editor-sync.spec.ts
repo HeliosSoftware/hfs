@@ -12,6 +12,48 @@ function standalone(page: import("@playwright/test").Page): Editor {
   return new Editor(page, page.locator("#editor-body"));
 }
 
+test("the highlight scrolls its counterpart into view on a large document", async ({ page }) => {
+  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+  const ed = standalone(page);
+  // Enough repeating structure that both panes overflow their 70vh columns.
+  await ed.applyJson({
+    resourceType: "Patient",
+    identifier: Array.from({ length: 40 }, (_, i) => ({
+      system: "http://example.org/mrn",
+      value: String(10000 + i),
+    })),
+    gender: "female",
+  });
+
+  // Leaving raw shows the previous fold view immediately; the re-render with
+  // the big document lands a beat later — wait for its deepest row.
+  await page.locator('.editor-row[data-path="identifier.39.value"]').waitFor();
+
+  const jsonView = page.locator("#json-view");
+  const tree = page.locator(".editor-tree");
+  expect(await jsonView.evaluate((n) => n.scrollHeight > n.clientHeight)).toBe(true);
+  expect(await tree.evaluate((n) => n.scrollHeight > n.clientHeight)).toBe(true);
+
+  // Hovering a row deep in the form pulls the JSON pane down to its lines…
+  await tree.evaluate((n) => (n.scrollTop = n.scrollHeight));
+  await page.locator('.editor-row[data-path="identifier.39.value"]').hover();
+  await expect.poll(() => jsonView.evaluate((n) => n.scrollTop)).toBeGreaterThan(0);
+  const hit = page.locator('.json-line--hit[data-jpath="identifier.39.value"]');
+  expect(await hit.evaluate((n) => {
+    const view = document.getElementById("json-view")!;
+    const line = n.getBoundingClientRect();
+    const pane = view.getBoundingClientRect();
+    return line.top >= pane.top && line.bottom <= pane.bottom;
+  })).toBe(true);
+
+  // …and hovering a deep JSON line pulls the form pane to its row.
+  await jsonView.evaluate((n) => (n.scrollTop = n.scrollHeight));
+  await tree.evaluate((n) => (n.scrollTop = 0));
+  await page.locator('.json-line[data-jpath="identifier.35.value"]').hover();
+  await expect.poll(() => tree.evaluate((n) => n.scrollTop)).toBeGreaterThan(0);
+  await expect(page.locator('.editor-row--hit[data-path="identifier.35.value"]')).toHaveCount(1);
+});
+
 test("hovering a form row lights the node's JSON lines, and back", async ({ page }) => {
   await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
   const ed = standalone(page);
