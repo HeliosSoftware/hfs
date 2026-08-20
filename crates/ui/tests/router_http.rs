@@ -678,6 +678,15 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     assert!(html.contains(r#"id="type-rail-list""#));
     assert!(html.contains(r#"id="saved-query-form""#));
     assert!(html.contains(r#"id="resource-create""#));
+    // The "Recently used" group (#603) is present but hidden until
+    // resource-filter.js populates it from localStorage.
+    assert!(html.contains(r#"id="type-rail-recent""#));
+    assert!(html.contains(r#"data-recent-key="hfs-recent-types""#));
+    assert!(html.contains(r#"data-rail-list="type-rail-list""#));
+    let recent_start = html.find(r#"id="type-rail-recent""#).unwrap();
+    let recent_tag_end = html[recent_start..].find('>').unwrap() + recent_start;
+    assert!(html[recent_start..recent_tag_end].contains("hidden"));
+    assert!(html.contains(r#"src="/ui/assets/resource-filter.js" defer"#));
     // The edit modal shell, with its Edit / History tabs.
     assert!(html.contains(r#"id="resource-modal""#));
     assert!(html.contains(r#"data-modal-tab="history""#));

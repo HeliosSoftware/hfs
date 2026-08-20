@@ -23,6 +23,10 @@
            aria-label="{{ i18n.t("queries-rail-filter") }}">
   </div>
   <div class="nav-panel__list" id="type-rail-list">
+    <div class="filter-rail__group" id="type-rail-recent"
+         data-recent-key="hfs-recent-types" data-rail-list="type-rail-list" hidden>
+      <div class="filter-rail__heading">{{ i18n.t("sp-rail-recent") }}</div>
+    </div>
     {% call rail::rail_items(rail_entries) %}{% endcall %}
   </div>
 </aside>
@@ -167,5 +171,6 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 
 <script src="/ui/assets/saved-queries.js" defer></script>
 {% if nl.configured %}<script src="/ui/assets/nl-search.js" defer></script>{% endif %}
+<script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/resources.js" defer></script>
 {% endblock %}

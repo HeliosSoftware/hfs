@@ -23,27 +23,38 @@ export class ResourcesPage {
     return this.page.locator("#resource-create");
   }
 
+  // Direct-child combinator: `#type-rail-recent` (the "Recently used" group,
+  // #603) nests inside `#type-rail-list` too, and its clones carry the same
+  // `data-type`. `>` keeps this scoped to the full, unfiltered list.
   railItem(type: string): Locator {
-    return this.page.locator(`#type-rail-list [data-type='${type}']`);
+    return this.page.locator(`#type-rail-list > [data-type='${type}']`);
   }
   count(type: string): Locator {
-    return this.page.locator(`#type-rail-list [data-type='${type}'] .count`);
+    return this.page.locator(`#type-rail-list > [data-type='${type}'] .count`);
   }
 
   /** Every resource type the rail offers, in DOM order. */
   async railTypes(): Promise<string[]> {
-    return this.page.$$eval("#type-rail-list a.filter-rail__item[data-type]", (els) =>
+    return this.page.$$eval("#type-rail-list > a.filter-rail__item[data-type]", (els) =>
       els.map((e) => (e as HTMLElement).dataset.type!).filter(Boolean),
     );
   }
 
   /** Rail items currently visible (not filtered out). */
   async visibleRailTypes(): Promise<string[]> {
-    return this.page.$$eval("#type-rail-list a.filter-rail__item[data-type]", (els) =>
+    return this.page.$$eval("#type-rail-list > a.filter-rail__item[data-type]", (els) =>
       els
         .filter((e) => (e as HTMLElement).offsetParent !== null)
         .map((e) => (e as HTMLElement).dataset.type!),
     );
+  }
+
+  /** The "Recently used" group (#603): hidden until at least one entry. */
+  get recentGroup(): Locator {
+    return this.page.locator("#type-rail-recent");
+  }
+  recentItem(type: string): Locator {
+    return this.page.locator(`#type-rail-recent [data-type='${type}']`);
   }
 
   async pickType(type: string): Promise<void> {

@@ -69,6 +69,55 @@ test("every resource type is reachable — Create targets each one", async ({ re
   }
 });
 
+// "Recently used" group (#603): a per-browser convenience, populated by
+// resource-filter.js from explicit rail picks and re-rendered on load.
+test("the recently-used group tracks picks, most-recent-first, with counts matching the full list", async ({
+  resources,
+}) => {
+  await resources.goto("Patient");
+  await resources.pickType("Encounter");
+  await resources.pickType("Observation");
+  await resources.pickType("Encounter"); // re-selection: moves to front, no duplicate
+
+  // The group is client-rendered from localStorage on load, so it only
+  // reflects the picks above once the page (re)loads.
+  await resources.goto("Patient");
+  await expect(resources.recentGroup).toBeVisible();
+
+  const types = await resources.recentGroup
+    .locator("a.filter-rail__item[data-type]")
+    .evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.type));
+  expect(types).toEqual(["Encounter", "Observation"]);
+
+  for (const type of types) {
+    const listCount = await resources.count(type).textContent();
+    const recentCount = await resources.recentItem(type).locator(".count").textContent();
+    expect(recentCount).toBe(listCount);
+  }
+});
+
+test("clicking a recently-used entry selects that type for real", async ({ resources, page }) => {
+  await resources.goto("Patient");
+  await resources.pickType("Encounter");
+  await resources.goto("Patient"); // reload to populate the group
+
+  await resources.recentItem("Encounter").click();
+  await expect(page).toHaveURL(/\/ui\/resources\?type=Encounter/);
+  await expect(resources.railItem("Encounter")).toHaveAttribute("aria-current", "true");
+});
+
+test("Create new does not register a recently-used entry", async ({ resources }) => {
+  // The default selection (Patient, unpicked) still stamps "Create new" with
+  // data-type="Patient" — clicking it must not be mistaken for a rail pick.
+  await resources.goto("Patient");
+  await resources.createButton.click();
+  await resources.modal.waitOpen();
+  await resources.modal.closeWithEscape();
+
+  await resources.goto("Patient");
+  await expect(resources.recentGroup).toBeHidden();
+});
+
 test("the modal closes via the X and via Escape", async ({ resources }) => {
   await resources.goto("Patient");
   await resources.openCreate();
