@@ -158,7 +158,8 @@ chart-empty = Nothing to chart yet — stored resources appear here as they are 
 chart-sample-note = Sample data: no live metrics provider is registered on this build.
 chart-table-toggle = View as table
 chart-table-when = Time
-chart-remove-series = Remove from chart
+chart-focus-series = Focus this series
+chart-unfocus-series = Show all series
 
 ## Footer
 

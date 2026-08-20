@@ -25,6 +25,17 @@ test("the chart's controls work as plain links with JavaScript off", async ({ pa
   await expect(page).toHaveURL(/types=/);
   await expect(page.locator("svg.chart")).toBeVisible();
 
+  // The legend is plain links too: clicking focuses a series without
+  // removing anything (#602), and works with no script at all.
+  const plotted = await page.locator("svg.chart polyline").count();
+  if (plotted > 1) {
+    await page.locator("a.chart-legend__item").first().click();
+    await expect(page).toHaveURL(/focus=/);
+    expect(await page.locator("svg.chart polyline").count()).toBe(plotted);
+    await page.locator(".chart-legend__item--focused").click();
+    await expect(page).not.toHaveURL(/focus=/);
+  }
+
   // Window selector and expand are links too.
   await page.locator(".window-picker__option", { hasText: "24h" }).click();
   await expect(page).toHaveURL(/window=24h/);

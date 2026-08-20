@@ -154,7 +154,8 @@ chart-empty = Noch nichts darzustellen — gespeicherte Ressourcen erscheinen hi
 chart-sample-note = Beispieldaten: in diesem Build ist kein Live-Metrikanbieter registriert.
 chart-table-toggle = Als Tabelle anzeigen
 chart-table-when = Zeitpunkt
-chart-remove-series = Aus dem Diagramm entfernen
+chart-focus-series = Diese Serie fokussieren
+chart-unfocus-series = Alle Serien anzeigen
 
 ## Fußzeile
 

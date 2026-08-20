@@ -418,6 +418,9 @@ struct ChartSeriesView {
     color: usize,
     /// `"x,y x,y …"` coordinate list for the `<polyline>`.
     polyline: String,
+    /// Class suffix under a legend focus (#602): `" series--focused"`,
+    /// `" series--receded"`, or empty when nothing is focused.
+    emphasis: &'static str,
 }
 
 /// One row of the chart's tabular alternative: a bucket label and the
@@ -451,13 +454,16 @@ struct ChartView {
     pick_label: String,
 }
 
-/// One entry in the chart legend: a plotted series, with a link that removes
-/// it from the charted set (present only while more than one is plotted).
+/// One entry in the chart legend: a plotted series. While more than one is
+/// plotted the entry links to focusing that series — or, when it is already
+/// the focused one, back to the unfocused view (#602). Types leave the chart
+/// through the picker, never the legend.
 struct LegendEntry {
     resource_type: String,
     total: String,
     color: usize,
     href: Option<String>,
+    focused: bool,
 }
 
 /// One option in the chart's type picker: a link that toggles the type in or
@@ -1075,7 +1081,11 @@ async fn index(
         .and_then(|slug| DashboardWindow::from_slug(&slug))
         .unwrap_or_default();
     let expand = query_value(query.as_deref(), "expand").as_deref() == Some("1");
-    render(build_index_page(state.version, locale, types, window, expand, rv.0, &rt).await)
+    // `?focus=Type` marks one plotted series as the legend focus (#602);
+    // validation against the actually-plotted set happens in build_dashboard.
+    let focus = query_value(query.as_deref(), "focus")
+        .filter(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphanumeric()));
+    render(build_index_page(state.version, locale, types, window, expand, focus, rv.0, &rt).await)
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -1324,6 +1334,7 @@ async fn status(
                 Vec::new(),
                 DashboardWindow::default(),
                 false,
+                None,
                 rv.0,
                 &rt,
             )
@@ -1404,12 +1415,14 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
 /// Assembles the landing page from the live dashboard snapshot, or from
 /// placeholder data when no provider is registered — in which case the page
 /// says so explicitly rather than presenting invented numbers as real (#555).
+#[allow(clippy::too_many_arguments)]
 async fn build_index_page(
     version: &'static str,
     locale: RequestLocale,
     types: Vec<String>,
     window: DashboardWindow,
     expand: bool,
+    focus: Option<String>,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
 ) -> IndexPage {
@@ -1418,7 +1431,7 @@ async fn build_index_page(
     let live = helios_observability::dashboard::snapshot(window, &tenant.id, &types).await;
     let sample_data = live.is_none();
     let snapshot = live.unwrap_or_else(|| sample_snapshot(window));
-    let dash = build_dashboard(&snapshot, expand);
+    let dash = build_dashboard(&snapshot, expand, focus.as_deref());
     IndexPage {
         status,
         metrics: dash.metrics,
@@ -1443,13 +1456,24 @@ struct DashboardView {
     expand_href: String,
 }
 
-/// A `/ui` link carrying the whole chart state: charted set, window, and
-/// expansion. Every selector emits these so changing one control keeps the
-/// other two.
-fn dash_href(types: &[String], window: DashboardWindow, expand: bool) -> String {
+/// A `/ui` link carrying the whole chart state: charted set, window,
+/// expansion, and the focused series (#602). Every selector emits these so
+/// changing one control keeps the others.
+fn dash_href(
+    types: &[String],
+    window: DashboardWindow,
+    expand: bool,
+    focus: Option<&str>,
+) -> String {
     let mut href = format!("/ui?types={}&window={}", types.join(","), window.as_str());
     if expand {
         href.push_str("&expand=1");
+    }
+    // Focus survives a link only while the focused type is still charted.
+    if let Some(f) = focus
+        && types.iter().any(|t| t == f)
+    {
+        href.push_str(&format!("&focus={f}"));
     }
     href
 }
@@ -1458,14 +1482,22 @@ fn dash_href(types: &[String], window: DashboardWindow, expand: bool) -> String 
 /// and the three selectors (type picker, legend, time window) the template
 /// renders. The charted set is `snapshot.series` itself — the provider already
 /// resolved the request to real stored types.
-fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView {
+fn build_dashboard(
+    snapshot: &DashboardSnapshot,
+    expand: bool,
+    focus: Option<&str>,
+) -> DashboardView {
     let charted: Vec<String> = snapshot
         .series
         .iter()
         .map(|s| s.resource_type.clone())
         .collect();
 
-    let chart = build_chart(&snapshot.series, snapshot.window, expand);
+    // Focus only means something for a plotted series (#602); anything else
+    // in the query renders the ordinary unfocused view.
+    let focus = focus.filter(|f| charted.iter().any(|c| c == f));
+
+    let chart = build_chart(&snapshot.series, snapshot.window, expand, focus);
 
     // The picker offers every stored type; each option toggles membership.
     let picker = snapshot
@@ -1493,32 +1525,37 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
             PickerEntry {
                 resource_type: t.resource_type.clone(),
                 total: grouped(t.total),
-                href: dash_href(&toggled, snapshot.window, expand),
+                // dash_href drops the focus itself if this toggle removes
+                // the focused type.
+                href: dash_href(&toggled, snapshot.window, expand, focus),
                 selected,
             }
         })
         .collect();
 
     // The legend names each plotted series; while more than one is plotted,
-    // an entry doubles as its own remove link.
+    // an entry links to focusing that series — or back out of the focus when
+    // it already holds it (#602). Removal lives in the picker.
     let legend = snapshot
         .series
         .iter()
         .enumerate()
         .map(|(i, s)| {
+            let focused = focus == Some(s.resource_type.as_str());
             let href = (snapshot.series.len() > 1).then(|| {
-                let rest: Vec<String> = charted
-                    .iter()
-                    .filter(|c| **c != s.resource_type)
-                    .cloned()
-                    .collect();
-                dash_href(&rest, snapshot.window, expand)
+                let target = if focused {
+                    None
+                } else {
+                    Some(s.resource_type.as_str())
+                };
+                dash_href(&charted, snapshot.window, expand, target)
             });
             LegendEntry {
                 resource_type: s.resource_type.clone(),
                 total: grouped(s.total),
                 color: i % SERIES_COLORS + 1,
                 href,
+                focused,
             }
         })
         .collect();
@@ -1527,7 +1564,7 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
         .into_iter()
         .map(|w| WindowEntry {
             label: w.as_str().to_string(),
-            href: dash_href(&charted, w, expand),
+            href: dash_href(&charted, w, expand, focus),
             active: w == snapshot.window,
         })
         .collect();
@@ -1551,7 +1588,7 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
         legend,
         picker,
         windows,
-        expand_href: dash_href(&charted, snapshot.window, !expand),
+        expand_href: dash_href(&charted, snapshot.window, !expand, focus),
     }
 }
 
@@ -1572,8 +1609,16 @@ const CHART_MAX_SERIES: usize = 6;
 
 /// Computes the SVG geometry for one resource type's cumulative series. `window`
 /// decides only the x-axis label format — a calendar date over daily buckets, a
-/// UTC clock time over intraday ones.
-fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -> ChartView {
+/// UTC clock time over intraday ones. Under a legend `focus` (#602) the y axis
+/// re-fits the focused series so a small type is legible next to a large one;
+/// the other series stay plotted at their true values, receded, and the plot
+/// clip-path cuts them where they exceed the focused scale.
+fn build_chart(
+    all: &[DashboardSeries],
+    window: DashboardWindow,
+    expand: bool,
+    focus: Option<&str>,
+) -> ChartView {
     let height = if expand {
         CHART_HEIGHT_EXPANDED
     } else {
@@ -1615,9 +1660,11 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -
     let points = &plotted[0].points;
     let n = points.len() as i64;
 
-    // One y scale across every plotted series, so the curves are comparable.
+    // One y scale across every plotted series, so the curves are comparable —
+    // unless a series is focused, in which case the axis fits that series.
     let peak = plotted
         .iter()
+        .filter(|s| focus.is_none() || focus == Some(s.resource_type.as_str()))
         .flat_map(|s| s.points.iter().map(|p| p.cumulative))
         .max()
         .unwrap_or(0);
@@ -1646,6 +1693,11 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -
                 .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
                 .collect::<Vec<_>>()
                 .join(" "),
+            emphasis: match focus {
+                None => "",
+                Some(f) if f == s.resource_type => " series--focused",
+                Some(_) => " series--receded",
+            },
         })
         .collect();
 
@@ -1919,7 +1971,7 @@ mod tests {
 
     /// Builds an `IndexPage` from the sample snapshot for template-rendering tests.
     fn sample_index_page(version: &'static str, checked_at: u64, i18n: I18n) -> IndexPage {
-        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), false);
+        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), false, None);
         IndexPage {
             status: Status {
                 version,
@@ -1940,6 +1992,49 @@ mod tests {
             i18n,
             active_page: "home",
         }
+    }
+
+    /// #602: a legend focus keeps every series plotted, re-fits the y axis to
+    /// the focused one, and flips the focused entry's link into the way back.
+    #[test]
+    fn legend_focus_rescales_recedes_and_links_back() {
+        let snapshot = sample_snapshot(DashboardWindow::default());
+        let unfocused = build_dashboard(&snapshot, false, None);
+        // Patient is the smallest sample series, so focusing it must lower
+        // the axis ceiling relative to the shared (Observation-driven) scale.
+        let dash = build_dashboard(&snapshot, false, Some("Patient"));
+
+        assert_eq!(dash.chart.series.len(), unfocused.chart.series.len());
+        for s in &dash.chart.series {
+            if s.resource_type == "Patient" {
+                assert_eq!(s.emphasis, " series--focused");
+            } else {
+                assert_eq!(s.emphasis, " series--receded");
+            }
+        }
+        let top =
+            |d: &DashboardView| d.chart.y_ticks.first().map(|t| t.label.clone()).unwrap();
+        assert_ne!(top(&dash), top(&unfocused), "axis re-fits the focus");
+
+        let entry = |d: &DashboardView, t: &str| {
+            d.legend
+                .iter()
+                .find(|l| l.resource_type == t)
+                .expect("legend entry")
+                .href
+                .clone()
+                .expect("legend link")
+        };
+        // The focused entry links back out; the others move the focus.
+        assert!(entry(&dash, "Patient").ends_with("&focus=Patient") == false);
+        assert!(!entry(&dash, "Patient").contains("focus="));
+        assert!(entry(&dash, "Observation").contains("focus=Observation"));
+        // Nothing was removed: every legend link keeps the full charted set.
+        assert!(entry(&dash, "Observation").contains("Patient"));
+
+        // A focus that names an uncharted type renders the ordinary view.
+        let bogus = build_dashboard(&snapshot, false, Some("Nope"));
+        assert!(bogus.chart.series.iter().all(|s| s.emphasis.is_empty()));
     }
 
     #[test]
@@ -2185,7 +2280,7 @@ mod tests {
 
     #[test]
     fn dashboard_projects_snapshot_counts_and_chart() {
-        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), false);
+        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), false, None);
 
         // Every series the snapshot carries is plotted, on one shared y scale.
         assert!(dash.chart.has_data);
@@ -2195,7 +2290,8 @@ mod tests {
         assert!(dash.chart.types_label.contains("Observation"));
 
         // The legend names each plotted series; while several are plotted each
-        // entry is a remove link that drops exactly itself and keeps the window.
+        // entry is a focus link that keeps the whole charted set and the
+        // window (#602) — removal belongs to the picker.
         assert_eq!(dash.legend.len(), 4);
         let observation = dash
             .legend
@@ -2205,8 +2301,8 @@ mod tests {
         let href = observation
             .href
             .as_deref()
-            .expect("removable while several are plotted");
-        assert!(!href.contains("Observation"));
+            .expect("focusable while several are plotted");
+        assert!(href.contains("focus=Observation"));
         assert!(href.contains("Patient"));
         assert!(href.contains("window=30d"));
 
@@ -2229,7 +2325,7 @@ mod tests {
     /// active, and carries the charted type across a window switch.
     #[test]
     fn window_selector_marks_the_active_window_and_keeps_the_charted_type() {
-        let windows = build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false).windows;
+        let windows = build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false, None).windows;
 
         assert_eq!(windows.len(), DashboardWindow::ALL.len());
         assert_eq!(windows.iter().filter(|w| w.active).count(), 1);
@@ -2249,7 +2345,7 @@ mod tests {
     /// keeps calendar dates. Same series, different axis vocabulary.
     #[test]
     fn axis_labels_follow_the_window_resolution() {
-        let hour_chart = build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false).chart;
+        let hour_chart = build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false, None).chart;
         assert!(
             hour_chart
                 .x_ticks
@@ -2264,7 +2360,7 @@ mod tests {
         );
 
         let month_chart =
-            build_dashboard(&sample_snapshot(DashboardWindow::LastMonth), false).chart;
+            build_dashboard(&sample_snapshot(DashboardWindow::LastMonth), false, None).chart;
         assert!(
             month_chart.x_ticks.iter().all(|t| !t.label.contains(':')),
             "30d axis should read as a calendar date, got {:?}",
@@ -2283,7 +2379,7 @@ mod tests {
     fn every_window_renders_a_bounded_chart() {
         for window in DashboardWindow::ALL {
             let snapshot = sample_snapshot(window);
-            let chart = build_dashboard(&snapshot, false).chart;
+            let chart = build_dashboard(&snapshot, false, None).chart;
             assert!(chart.has_data, "{}", window.as_str());
             assert_eq!(snapshot.series[0].points.len(), window.points());
             assert!(
@@ -2300,7 +2396,7 @@ mod tests {
     /// buckets the axis labels sample.
     #[test]
     fn expand_grows_the_plot_and_the_carriers_stay_consistent() {
-        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), true);
+        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), true, None);
         assert!(dash.chart.expanded);
         assert_eq!(dash.chart.height, 520);
         assert!(dash.chart.x_ticks.iter().all(|t| t.label_y == 518));
@@ -2330,7 +2426,7 @@ mod tests {
             export_jobs: None,
             import_jobs_active: None,
         };
-        let dash = build_dashboard(&empty, false);
+        let dash = build_dashboard(&empty, false, None);
         assert!(!dash.chart.has_data);
         assert!(dash.chart.series.is_empty());
         assert!(dash.legend.is_empty());
@@ -2408,6 +2504,7 @@ mod tests {
             std::slice::from_ref(&series),
             DashboardWindow::default(),
             false,
+            None,
         );
 
         assert!(chart.has_data);
@@ -2435,6 +2532,7 @@ mod tests {
             std::slice::from_ref(&series),
             DashboardWindow::LastHour,
             false,
+            None,
         );
 
         assert!(chart.has_data);
