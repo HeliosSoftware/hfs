@@ -145,8 +145,6 @@ card-uptime = Tiempo activo
 card-uptime-sub = desde el arranque del proceso
 
 chart-title = Recursos FHIR en el tiempo
-chart-expand = Ampliar el gráfico
-chart-collapse = Reducir el gráfico
 chart-window = Intervalo de tiempo del gráfico
 chart-pick-heading = Tipos de recurso graficados
 chart-pick-filter = Filtrar tipos

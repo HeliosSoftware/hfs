@@ -47,9 +47,6 @@ export class DashboardPage {
   get tooltip(): Locator {
     return this.page.locator("#chart-tip");
   }
-  get expandToggle(): Locator {
-    return this.page.locator(".chart-card__tools a.pill--square");
-  }
   get dataTableToggle(): Locator {
     return this.page.locator(".chart-table > summary");
   }

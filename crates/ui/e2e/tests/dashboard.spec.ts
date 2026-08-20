@@ -2,10 +2,10 @@ import { test, expect } from "../pages/fixtures";
 import { createResource } from "../pages/api";
 
 // The landing dashboard (/ui) and its functional chart (#555): the type
-// picker, the window selector, and the expand toggle are plain links (they
-// work without JS — see the nojs project); the hover tooltip and the picker
-// filter are the layered enhancements. Seeding rides through the ordinary
-// FHIR API; the snapshot cache is outlasted by DashboardPage.waitForSeries.
+// picker and the window selector are plain links (they work without JS —
+// see the nojs project); the hover tooltip and the picker filter are the
+// layered enhancements. Seeding rides through the ordinary FHIR API; the
+// snapshot cache is outlasted by DashboardPage.waitForSeries.
 
 test.beforeEach(async ({ request }) => {
   await createResource(request, "Patient", { name: [{ family: "Chart" }] });
@@ -102,14 +102,11 @@ test("hovering the chart shows the tooltip readout", async ({ dashboard }) => {
   await expect(dashboard.tooltip).toBeHidden();
 });
 
-test("expand renders the taller plot and collapses back", async ({ page, dashboard }) => {
+test("the chart has no expand/collapse toggle", async ({ dashboard }) => {
   await dashboard.goto();
   await dashboard.waitForSeries();
-  await dashboard.expandToggle.click();
-  await expect(page).toHaveURL(/expand=1/);
-  await expect(dashboard.chart).toHaveAttribute("viewBox", /0 0 1060 520/);
-  await dashboard.expandToggle.click();
-  await expect(page).not.toHaveURL(/expand=1/);
+  await expect(dashboard.page.locator('[href*="expand=1"]')).toHaveCount(0);
+  await expect(dashboard.page.locator(".chart-card__tools a.pill--square")).toHaveCount(0);
   await expect(dashboard.chart).toHaveAttribute("viewBox", /0 0 1060 300/);
 });
 

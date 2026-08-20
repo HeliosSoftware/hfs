@@ -63,6 +63,21 @@ async fn index_serves_the_full_landing_page() {
 }
 
 #[tokio::test]
+async fn legacy_expand_query_param_is_ignored_and_harmless() {
+    // `?expand=1` used to render the taller chart (#601); the affordance is
+    // gone, but old bookmarks/links carrying the param must still resolve
+    // cleanly, and the response must never echo it back into a live href.
+    let response = app()
+        .oneshot(Request::get("/ui?expand=1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains("expand=1"));
+}
+
+#[tokio::test]
 async fn dashboard_renders_job_cards_with_unavailable_state_when_no_provider() {
     // No DashboardProvider is registered in this test router, so build_index_page
     // falls back to sample_snapshot, whose export_jobs/import_jobs_active are

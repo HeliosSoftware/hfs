@@ -436,9 +436,8 @@ struct ChartView {
     y_ticks: Vec<AxisTick>,
     /// X-axis date labels at evenly spaced sample points.
     x_ticks: Vec<AxisTick>,
-    /// viewBox height — 300, or 520 when the card is expanded.
+    /// viewBox height (always [`CHART_HEIGHT`]).
     height: i64,
-    expanded: bool,
     /// Inert JSON the tooltip script reads (`#chart-data`): bucket labels and
     /// per-series values with their SVG coordinates, so the script does no
     /// chart math of its own.
@@ -471,7 +470,7 @@ struct PickerEntry {
 
 /// One entry in the time-window selector (`1h` / `24h` / `30d`): a link that
 /// re-renders the page with the chart sampled over that window, keeping the
-/// charted set and expansion.
+/// charted set.
 struct WindowEntry {
     label: String,
     href: String,
@@ -487,8 +486,6 @@ struct IndexPage {
     legend: Vec<LegendEntry>,
     picker: Vec<PickerEntry>,
     windows: Vec<WindowEntry>,
-    /// The expand/collapse link (the inverse of the current state).
-    expand_href: String,
     /// True when no provider answered and the placeholder snapshot is shown —
     /// rendered with an explicit "sample data" notice, never silently (#555).
     sample_data: bool,
@@ -1053,7 +1050,7 @@ async fn revalidate_assets(request: axum::extract::Request, next: middleware::Ne
 /// dropped by the provider, so the set is always real. The legacy `?type=`
 /// single selection still works. `?window=<1h|24h|30d>` selects the sampling
 /// window, falling back to [`DashboardWindow::default`] for anything
-/// unrecognised, and `?expand=1` renders the taller chart.
+/// unrecognised.
 async fn index(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -1074,8 +1071,7 @@ async fn index(
     let window = query_value(query.as_deref(), "window")
         .and_then(|slug| DashboardWindow::from_slug(&slug))
         .unwrap_or_default();
-    let expand = query_value(query.as_deref(), "expand").as_deref() == Some("1");
-    render(build_index_page(state.version, locale, types, window, expand, rv.0, &rt).await)
+    render(build_index_page(state.version, locale, types, window, rv.0, &rt).await)
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -1323,7 +1319,6 @@ async fn status(
                 locale,
                 Vec::new(),
                 DashboardWindow::default(),
-                false,
                 rv.0,
                 &rt,
             )
@@ -1409,7 +1404,6 @@ async fn build_index_page(
     locale: RequestLocale,
     types: Vec<String>,
     window: DashboardWindow,
-    expand: bool,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
 ) -> IndexPage {
@@ -1418,7 +1412,7 @@ async fn build_index_page(
     let live = helios_observability::dashboard::snapshot(window, &tenant.id, &types).await;
     let sample_data = live.is_none();
     let snapshot = live.unwrap_or_else(|| sample_snapshot(window));
-    let dash = build_dashboard(&snapshot, expand);
+    let dash = build_dashboard(&snapshot);
     IndexPage {
         status,
         metrics: dash.metrics,
@@ -1426,7 +1420,6 @@ async fn build_index_page(
         legend: dash.legend,
         picker: dash.picker,
         windows: dash.windows,
-        expand_href: dash.expand_href,
         sample_data,
         i18n,
         active_page: "home",
@@ -1440,32 +1433,26 @@ struct DashboardView {
     legend: Vec<LegendEntry>,
     picker: Vec<PickerEntry>,
     windows: Vec<WindowEntry>,
-    expand_href: String,
 }
 
-/// A `/ui` link carrying the whole chart state: charted set, window, and
-/// expansion. Every selector emits these so changing one control keeps the
-/// other two.
-fn dash_href(types: &[String], window: DashboardWindow, expand: bool) -> String {
-    let mut href = format!("/ui?types={}&window={}", types.join(","), window.as_str());
-    if expand {
-        href.push_str("&expand=1");
-    }
-    href
+/// A `/ui` link carrying the whole chart state: charted set and window. Every
+/// selector emits these so changing one control keeps the other.
+fn dash_href(types: &[String], window: DashboardWindow) -> String {
+    format!("/ui?types={}&window={}", types.join(","), window.as_str())
 }
 
 /// Projects a [`DashboardSnapshot`] into the headline metrics, chart geometry,
 /// and the three selectors (type picker, legend, time window) the template
 /// renders. The charted set is `snapshot.series` itself — the provider already
 /// resolved the request to real stored types.
-fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView {
+fn build_dashboard(snapshot: &DashboardSnapshot) -> DashboardView {
     let charted: Vec<String> = snapshot
         .series
         .iter()
         .map(|s| s.resource_type.clone())
         .collect();
 
-    let chart = build_chart(&snapshot.series, snapshot.window, expand);
+    let chart = build_chart(&snapshot.series, snapshot.window);
 
     // The picker offers every stored type; each option toggles membership.
     let picker = snapshot
@@ -1493,7 +1480,7 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
             PickerEntry {
                 resource_type: t.resource_type.clone(),
                 total: grouped(t.total),
-                href: dash_href(&toggled, snapshot.window, expand),
+                href: dash_href(&toggled, snapshot.window),
                 selected,
             }
         })
@@ -1512,7 +1499,7 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
                     .filter(|c| **c != s.resource_type)
                     .cloned()
                     .collect();
-                dash_href(&rest, snapshot.window, expand)
+                dash_href(&rest, snapshot.window)
             });
             LegendEntry {
                 resource_type: s.resource_type.clone(),
@@ -1527,7 +1514,7 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
         .into_iter()
         .map(|w| WindowEntry {
             label: w.as_str().to_string(),
-            href: dash_href(&charted, w, expand),
+            href: dash_href(&charted, w),
             active: w == snapshot.window,
         })
         .collect();
@@ -1551,7 +1538,6 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
         legend,
         picker,
         windows,
-        expand_href: dash_href(&charted, snapshot.window, !expand),
     }
 }
 
@@ -1560,9 +1546,8 @@ fn build_dashboard(snapshot: &DashboardSnapshot, expand: bool) -> DashboardView 
 const PLOT_LEFT: i64 = 40;
 const PLOT_RIGHT: i64 = 1060;
 const PLOT_TOP: i64 = 10;
-/// Default and expanded viewBox heights (#555).
+/// The chart's fixed viewBox height (#555, #601).
 const CHART_HEIGHT: i64 = 300;
-const CHART_HEIGHT_EXPANDED: i64 = 520;
 /// Palette slots defined as `--series-N` custom properties in app.css.
 const SERIES_COLORS: usize = 6;
 /// Most series plotted at once — mirrors the provider's `MAX_CHARTED_TYPES`
@@ -1573,12 +1558,8 @@ const CHART_MAX_SERIES: usize = 6;
 /// Computes the SVG geometry for one resource type's cumulative series. `window`
 /// decides only the x-axis label format — a calendar date over daily buckets, a
 /// UTC clock time over intraday ones.
-fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -> ChartView {
-    let height = if expand {
-        CHART_HEIGHT_EXPANDED
-    } else {
-        CHART_HEIGHT
-    };
+fn build_chart(all: &[DashboardSeries], window: DashboardWindow) -> ChartView {
+    let height = CHART_HEIGHT;
     let plot_bottom = height - 22;
     let plotted: Vec<&DashboardSeries> = all.iter().filter(|s| !s.points.is_empty()).collect();
     let has_data = plotted.iter().any(|s| s.total > 0) && !plotted.is_empty();
@@ -1601,7 +1582,6 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -
             y_ticks: y_axis_ticks(0, height, plot_bottom),
             x_ticks: Vec::new(),
             height,
-            expanded: expand,
             tip_json: "{}".to_string(),
             table: Vec::new(),
             types_label,
@@ -1710,7 +1690,6 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, expand: bool) -
         y_ticks: y_axis_ticks(axis_max, height, plot_bottom),
         x_ticks,
         height,
-        expanded: expand,
         tip_json,
         table,
         types_label,
@@ -1919,7 +1898,7 @@ mod tests {
 
     /// Builds an `IndexPage` from the sample snapshot for template-rendering tests.
     fn sample_index_page(version: &'static str, checked_at: u64, i18n: I18n) -> IndexPage {
-        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), false);
+        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()));
         IndexPage {
             status: Status {
                 version,
@@ -1935,7 +1914,6 @@ mod tests {
             legend: dash.legend,
             picker: dash.picker,
             windows: dash.windows,
-            expand_href: dash.expand_href,
             sample_data: true,
             i18n,
             active_page: "home",
@@ -2185,7 +2163,7 @@ mod tests {
 
     #[test]
     fn dashboard_projects_snapshot_counts_and_chart() {
-        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), false);
+        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()));
 
         // Every series the snapshot carries is plotted, on one shared y scale.
         assert!(dash.chart.has_data);
@@ -2229,7 +2207,7 @@ mod tests {
     /// active, and carries the charted type across a window switch.
     #[test]
     fn window_selector_marks_the_active_window_and_keeps_the_charted_type() {
-        let windows = build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false).windows;
+        let windows = build_dashboard(&sample_snapshot(DashboardWindow::LastHour)).windows;
 
         assert_eq!(windows.len(), DashboardWindow::ALL.len());
         assert_eq!(windows.iter().filter(|w| w.active).count(), 1);
@@ -2249,7 +2227,7 @@ mod tests {
     /// keeps calendar dates. Same series, different axis vocabulary.
     #[test]
     fn axis_labels_follow_the_window_resolution() {
-        let hour_chart = build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false).chart;
+        let hour_chart = build_dashboard(&sample_snapshot(DashboardWindow::LastHour)).chart;
         assert!(
             hour_chart
                 .x_ticks
@@ -2263,8 +2241,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let month_chart =
-            build_dashboard(&sample_snapshot(DashboardWindow::LastMonth), false).chart;
+        let month_chart = build_dashboard(&sample_snapshot(DashboardWindow::LastMonth)).chart;
         assert!(
             month_chart.x_ticks.iter().all(|t| !t.label.contains(':')),
             "30d axis should read as a calendar date, got {:?}",
@@ -2283,7 +2260,7 @@ mod tests {
     fn every_window_renders_a_bounded_chart() {
         for window in DashboardWindow::ALL {
             let snapshot = sample_snapshot(window);
-            let chart = build_dashboard(&snapshot, false).chart;
+            let chart = build_dashboard(&snapshot).chart;
             assert!(chart.has_data, "{}", window.as_str());
             assert_eq!(snapshot.series[0].points.len(), window.points());
             assert!(
@@ -2293,29 +2270,6 @@ mod tests {
                 chart.x_ticks.len()
             );
         }
-    }
-
-    /// The expanded chart grows the viewBox and moves the date row with it;
-    /// the tooltip carrier and the tabular alternative describe the same
-    /// buckets the axis labels sample.
-    #[test]
-    fn expand_grows_the_plot_and_the_carriers_stay_consistent() {
-        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), true);
-        assert!(dash.chart.expanded);
-        assert_eq!(dash.chart.height, 520);
-        assert!(dash.chart.x_ticks.iter().all(|t| t.label_y == 518));
-        // The expand link flips back to the compact view.
-        assert!(!dash.expand_href.contains("expand=1"));
-
-        let tip: serde_json::Value =
-            serde_json::from_str(&dash.chart.tip_json).expect("tip carrier is valid JSON");
-        assert_eq!(tip["series"].as_array().map(Vec::len), Some(4));
-        assert_eq!(
-            tip["labels"].as_array().map(Vec::len),
-            tip["xs"].as_array().map(Vec::len)
-        );
-        assert_eq!(dash.chart.table.len(), dash.chart.x_ticks.len());
-        assert!(dash.chart.table.iter().all(|r| r.values.len() == 4));
     }
 
     #[test]
@@ -2330,7 +2284,7 @@ mod tests {
             export_jobs: None,
             import_jobs_active: None,
         };
-        let dash = build_dashboard(&empty, false);
+        let dash = build_dashboard(&empty);
         assert!(!dash.chart.has_data);
         assert!(dash.chart.series.is_empty());
         assert!(dash.legend.is_empty());
@@ -2404,11 +2358,7 @@ mod tests {
             total: 5,
             points: vec![point_at(1_752_503_400, 5, 5)],
         };
-        let chart = build_chart(
-            std::slice::from_ref(&series),
-            DashboardWindow::default(),
-            false,
-        );
+        let chart = build_chart(std::slice::from_ref(&series), DashboardWindow::default());
 
         assert!(chart.has_data);
         // A lone point produces a single "x,y" pair pinned to the left axis.
@@ -2431,11 +2381,7 @@ mod tests {
                 point_at(1_752_503_520, 0, 4),
             ],
         };
-        let chart = build_chart(
-            std::slice::from_ref(&series),
-            DashboardWindow::LastHour,
-            false,
-        );
+        let chart = build_chart(std::slice::from_ref(&series), DashboardWindow::LastHour);
 
         assert!(chart.has_data);
         // Every plotted y sits inside the plot area (10..=278 in the viewBox).

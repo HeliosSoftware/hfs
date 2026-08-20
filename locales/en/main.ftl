@@ -149,8 +149,6 @@ card-uptime = Uptime
 card-uptime-sub = since process start
 
 chart-title = FHIR resources over time
-chart-expand = Expand chart
-chart-collapse = Collapse chart
 chart-window = Chart time window
 chart-pick-heading = Charted resource types
 chart-pick-filter = Filter types
