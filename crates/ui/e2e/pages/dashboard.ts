@@ -44,6 +44,11 @@ export class DashboardPage {
   get pickerFilter(): Locator {
     return this.page.locator("[data-pick-filter]");
   }
+  /** "View all resources" (#599): offers every type of the active FHIR
+   * version, not just the ones the tenant stores. */
+  get viewAllToggle(): Locator {
+    return this.page.locator(".chart-pick__option--all");
+  }
   get tooltip(): Locator {
     return this.page.locator("#chart-tip");
   }

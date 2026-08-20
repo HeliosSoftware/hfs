@@ -34,7 +34,9 @@
 //! The chart is sampled over a [`DashboardWindow`], selected per request with
 //! `?window=` (`1h`, `24h`, or the default `30d`) alongside the `?type=` series
 //! selector. Both selectors are plain links, so the dashboard stays navigable
-//! without JavaScript.
+//! without JavaScript. `?all=1` is the "View all resources" toggle (#599): the
+//! picker's option list widens from the tenant's stored types to every
+//! resource type of the active FHIR version, offering the untouched ones at 0.
 
 mod bulk_export;
 mod bulk_import;
@@ -64,7 +66,7 @@ use axum_embed::ServeEmbed;
 use axum_htmx::{AutoVaryLayer, HxRequest};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
-    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts,
+    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, TypeCount,
 };
 use helios_persistence::core::{ResourceStorage, SettingsStore};
 use i18n::{I18n, RequestLocale};
@@ -429,7 +431,9 @@ struct ChartTableRow {
 
 /// Server-computed SVG geometry for the "resources over time" chart.
 struct ChartView {
-    /// Whether any non-empty series was plotted (`false` → empty state).
+    /// Whether any series was plotted (`false` → empty state). A plotted
+    /// series with a zero total — an "empty" type charted via #599 — still
+    /// counts: it renders as a real flat line, not the empty state.
     has_data: bool,
     series: Vec<ChartSeriesView>,
     /// Horizontal value gridlines, top (largest) to bottom (zero).
@@ -486,6 +490,12 @@ struct IndexPage {
     legend: Vec<LegendEntry>,
     picker: Vec<PickerEntry>,
     windows: Vec<WindowEntry>,
+    /// Whether "View all resources" (#599) is on: the picker offers every
+    /// resource type of the active FHIR version, not just the tenant's
+    /// stored ones.
+    all_types: bool,
+    /// Link that flips the "View all resources" toggle.
+    all_types_href: String,
     /// True when no provider answered and the placeholder snapshot is shown —
     /// rendered with an explicit "sample data" notice, never silently (#555).
     sample_data: bool,
@@ -1050,7 +1060,10 @@ async fn revalidate_assets(request: axum::extract::Request, next: middleware::Ne
 /// dropped by the provider, so the set is always real. The legacy `?type=`
 /// single selection still works. `?window=<1h|24h|30d>` selects the sampling
 /// window, falling back to [`DashboardWindow::default`] for anything
-/// unrecognised.
+/// unrecognised. `?all=1` is the "View all resources" toggle (#599): with it,
+/// the picker offers every resource type of the active FHIR version, not just
+/// the ones the tenant stores, and a type with no data can be charted as a
+/// flat zero line.
 async fn index(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -1071,7 +1084,27 @@ async fn index(
     let window = query_value(query.as_deref(), "window")
         .and_then(|slug| DashboardWindow::from_slug(&slug))
         .unwrap_or_default();
-    render(build_index_page(state.version, locale, types, window, rv.0, &rt).await)
+    let all_types = query_value(query.as_deref(), "all").as_deref() == Some("1");
+    // The full type list is only fetched when offered — the common,
+    // flag-off case pays nothing extra for it.
+    let spec_types = if all_types {
+        state.compartments.resource_type_names(&rt.id, rv.0).await
+    } else {
+        Vec::new()
+    };
+    render(
+        build_index_page(
+            state.version,
+            locale,
+            types,
+            window,
+            all_types,
+            spec_types,
+            rv.0,
+            &rt,
+        )
+        .await,
+    )
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -1319,6 +1352,8 @@ async fn status(
                 locale,
                 Vec::new(),
                 DashboardWindow::default(),
+                false,
+                Vec::new(),
                 rv.0,
                 &rt,
             )
@@ -1399,20 +1434,24 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
 /// Assembles the landing page from the live dashboard snapshot, or from
 /// placeholder data when no provider is registered — in which case the page
 /// says so explicitly rather than presenting invented numbers as real (#555).
+#[allow(clippy::too_many_arguments)]
 async fn build_index_page(
     version: &'static str,
     locale: RequestLocale,
     types: Vec<String>,
     window: DashboardWindow,
+    all_types: bool,
+    spec_types: Vec<String>,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
 ) -> IndexPage {
     let status = current_status(version, fhir_version, tenant);
     let i18n = I18n::new(locale);
-    let live = helios_observability::dashboard::snapshot(window, &tenant.id, &types).await;
+    let live =
+        helios_observability::dashboard::snapshot(window, &tenant.id, &types, all_types).await;
     let sample_data = live.is_none();
     let snapshot = live.unwrap_or_else(|| sample_snapshot(window));
-    let dash = build_dashboard(&snapshot);
+    let dash = build_dashboard(&snapshot, all_types, &spec_types);
     IndexPage {
         status,
         metrics: dash.metrics,
@@ -1420,6 +1459,8 @@ async fn build_index_page(
         legend: dash.legend,
         picker: dash.picker,
         windows: dash.windows,
+        all_types: dash.all_types,
+        all_types_href: dash.all_types_href,
         sample_data,
         i18n,
         active_page: "home",
@@ -1433,19 +1474,42 @@ struct DashboardView {
     legend: Vec<LegendEntry>,
     picker: Vec<PickerEntry>,
     windows: Vec<WindowEntry>,
+    /// Whether "View all resources" is on (#599).
+    all_types: bool,
+    /// Link that flips the "View all resources" toggle, keeping the charted
+    /// set and window.
+    all_types_href: String,
 }
 
-/// A `/ui` link carrying the whole chart state: charted set and window. Every
-/// selector emits these so changing one control keeps the other.
-fn dash_href(types: &[String], window: DashboardWindow) -> String {
-    format!("/ui?types={}&window={}", types.join(","), window.as_str())
+/// A `/ui` link carrying the whole chart state: charted set, window, and the
+/// "View all resources" toggle (#599). Every selector emits these so changing
+/// one control keeps the others.
+fn dash_href(types: &[String], window: DashboardWindow, all_types: bool) -> String {
+    let mut href = format!("/ui?types={}&window={}", types.join(","), window.as_str());
+    if all_types {
+        href.push_str("&all=1");
+    }
+    href
 }
 
 /// Projects a [`DashboardSnapshot`] into the headline metrics, chart geometry,
-/// and the three selectors (type picker, legend, time window) the template
-/// renders. The charted set is `snapshot.series` itself — the provider already
-/// resolved the request to real stored types.
-fn build_dashboard(snapshot: &DashboardSnapshot) -> DashboardView {
+/// and the selectors (type picker, legend, time window, "View all resources")
+/// the template renders. The charted set is `snapshot.series` itself — the
+/// provider already resolved the request to real (or, with `all_types`,
+/// explicitly requested) types.
+///
+/// `all_types` is the "View all resources" toggle (#599). When set,
+/// `spec_types` — every resource type of the active FHIR version, from
+/// [`compartments::CompartmentCatalog::resource_type_names`] — is unioned into
+/// the picker's option list alongside the tenant's stored types, so a type
+/// with no data can still be picked (and, once picked, charts as a flat zero
+/// line via the provider's relaxed selection guard). `spec_types` is ignored
+/// when `all_types` is `false`.
+fn build_dashboard(
+    snapshot: &DashboardSnapshot,
+    all_types: bool,
+    spec_types: &[String],
+) -> DashboardView {
     let charted: Vec<String> = snapshot
         .series
         .iter()
@@ -1454,9 +1518,28 @@ fn build_dashboard(snapshot: &DashboardSnapshot) -> DashboardView {
 
     let chart = build_chart(&snapshot.series, snapshot.window);
 
-    // The picker offers every stored type; each option toggles membership.
-    let picker = snapshot
-        .available
+    // The picker's option list: the tenant's stored types (largest first,
+    // from the provider), plus — with `all_types` — every other type of the
+    // active FHIR version, at 0, alphabetically after (never duplicating a
+    // type the provider already listed).
+    let mut options: Vec<TypeCount> = snapshot.available.clone();
+    if all_types {
+        let stored: std::collections::HashSet<&str> =
+            options.iter().map(|t| t.resource_type.as_str()).collect();
+        let mut empties: Vec<TypeCount> = spec_types
+            .iter()
+            .filter(|name| !stored.contains(name.as_str()))
+            .map(|name| TypeCount {
+                resource_type: name.clone(),
+                total: 0,
+            })
+            .collect();
+        empties.sort_by(|a, b| a.resource_type.cmp(&b.resource_type));
+        options.extend(empties);
+    }
+
+    // Each option toggles membership.
+    let picker = options
         .iter()
         .map(|t| {
             let selected = charted.contains(&t.resource_type);
@@ -1480,7 +1563,7 @@ fn build_dashboard(snapshot: &DashboardSnapshot) -> DashboardView {
             PickerEntry {
                 resource_type: t.resource_type.clone(),
                 total: grouped(t.total),
-                href: dash_href(&toggled, snapshot.window),
+                href: dash_href(&toggled, snapshot.window, all_types),
                 selected,
             }
         })
@@ -1499,7 +1582,7 @@ fn build_dashboard(snapshot: &DashboardSnapshot) -> DashboardView {
                     .filter(|c| **c != s.resource_type)
                     .cloned()
                     .collect();
-                dash_href(&rest, snapshot.window)
+                dash_href(&rest, snapshot.window, all_types)
             });
             LegendEntry {
                 resource_type: s.resource_type.clone(),
@@ -1514,7 +1597,7 @@ fn build_dashboard(snapshot: &DashboardSnapshot) -> DashboardView {
         .into_iter()
         .map(|w| WindowEntry {
             label: w.as_str().to_string(),
-            href: dash_href(&charted, w),
+            href: dash_href(&charted, w, all_types),
             active: w == snapshot.window,
         })
         .collect();
@@ -1538,6 +1621,8 @@ fn build_dashboard(snapshot: &DashboardSnapshot) -> DashboardView {
         legend,
         picker,
         windows,
+        all_types,
+        all_types_href: dash_href(&charted, snapshot.window, !all_types),
     }
 }
 
@@ -1562,7 +1647,10 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow) -> ChartView {
     let height = CHART_HEIGHT;
     let plot_bottom = height - 22;
     let plotted: Vec<&DashboardSeries> = all.iter().filter(|s| !s.points.is_empty()).collect();
-    let has_data = plotted.iter().any(|s| s.total > 0) && !plotted.is_empty();
+    // Something is charted as soon as a series is plotted, even an all-zero
+    // one (#599, "View all resources"): that renders as a real flat line at
+    // 0, not the "nothing to chart" empty state.
+    let has_data = !plotted.is_empty();
     let types_label = plotted
         .iter()
         .map(|s| s.resource_type.as_str())
@@ -1898,7 +1986,7 @@ mod tests {
 
     /// Builds an `IndexPage` from the sample snapshot for template-rendering tests.
     fn sample_index_page(version: &'static str, checked_at: u64, i18n: I18n) -> IndexPage {
-        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()));
+        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), false, &[]);
         IndexPage {
             status: Status {
                 version,
@@ -1914,6 +2002,8 @@ mod tests {
             legend: dash.legend,
             picker: dash.picker,
             windows: dash.windows,
+            all_types: dash.all_types,
+            all_types_href: dash.all_types_href,
             sample_data: true,
             i18n,
             active_page: "home",
@@ -2163,7 +2253,7 @@ mod tests {
 
     #[test]
     fn dashboard_projects_snapshot_counts_and_chart() {
-        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()));
+        let dash = build_dashboard(&sample_snapshot(DashboardWindow::default()), false, &[]);
 
         // Every series the snapshot carries is plotted, on one shared y scale.
         assert!(dash.chart.has_data);
@@ -2207,7 +2297,8 @@ mod tests {
     /// active, and carries the charted type across a window switch.
     #[test]
     fn window_selector_marks_the_active_window_and_keeps_the_charted_type() {
-        let windows = build_dashboard(&sample_snapshot(DashboardWindow::LastHour)).windows;
+        let windows =
+            build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false, &[]).windows;
 
         assert_eq!(windows.len(), DashboardWindow::ALL.len());
         assert_eq!(windows.iter().filter(|w| w.active).count(), 1);
@@ -2227,7 +2318,8 @@ mod tests {
     /// keeps calendar dates. Same series, different axis vocabulary.
     #[test]
     fn axis_labels_follow_the_window_resolution() {
-        let hour_chart = build_dashboard(&sample_snapshot(DashboardWindow::LastHour)).chart;
+        let hour_chart =
+            build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false, &[]).chart;
         assert!(
             hour_chart
                 .x_ticks
@@ -2241,7 +2333,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let month_chart = build_dashboard(&sample_snapshot(DashboardWindow::LastMonth)).chart;
+        let month_chart =
+            build_dashboard(&sample_snapshot(DashboardWindow::LastMonth), false, &[]).chart;
         assert!(
             month_chart.x_ticks.iter().all(|t| !t.label.contains(':')),
             "30d axis should read as a calendar date, got {:?}",
@@ -2260,7 +2353,7 @@ mod tests {
     fn every_window_renders_a_bounded_chart() {
         for window in DashboardWindow::ALL {
             let snapshot = sample_snapshot(window);
-            let chart = build_dashboard(&snapshot).chart;
+            let chart = build_dashboard(&snapshot, false, &[]).chart;
             assert!(chart.has_data, "{}", window.as_str());
             assert_eq!(snapshot.series[0].points.len(), window.points());
             assert!(
@@ -2284,7 +2377,7 @@ mod tests {
             export_jobs: None,
             import_jobs_active: None,
         };
-        let dash = build_dashboard(&empty);
+        let dash = build_dashboard(&empty, false, &[]);
         assert!(!dash.chart.has_data);
         assert!(dash.chart.series.is_empty());
         assert!(dash.legend.is_empty());
@@ -2292,6 +2385,125 @@ mod tests {
         assert_eq!(dash.metrics.chart_total, "0");
         // The window selector still renders, so an empty server is not a dead end.
         assert_eq!(dash.windows.len(), DashboardWindow::ALL.len());
+    }
+
+    /// `dash_href` only appends `&all=1` when the toggle is on — the common,
+    /// flag-off links must stay exactly as they were before #599.
+    #[test]
+    fn dash_href_carries_the_all_types_flag_only_when_on() {
+        let types = vec!["Patient".to_string()];
+        let off = dash_href(&types, DashboardWindow::LastDay, false);
+        let on = dash_href(&types, DashboardWindow::LastDay, true);
+        assert_eq!(off, "/ui?types=Patient&window=24h");
+        assert_eq!(on, "/ui?types=Patient&window=24h&all=1");
+    }
+
+    /// With "View all resources" (#599), the picker offers the tenant's stored
+    /// types (as today, largest first) plus every other type of the version at
+    /// 0, alphabetically after — never duplicating a type already stored, and
+    /// every option link carries `all=1` so the toggle survives a click.
+    #[test]
+    fn view_all_unions_spec_types_after_stored_ones_with_data_first() {
+        let snapshot = DashboardSnapshot {
+            fhir_version: "R4".to_string(),
+            total_resources: 5,
+            distinct_types: 1,
+            window: DashboardWindow::default(),
+            series: vec![DashboardSeries {
+                resource_type: "Patient".to_string(),
+                total: 5,
+                points: vec![point_at(1_752_451_200, 5, 5)],
+            }],
+            available: vec![helios_observability::dashboard::TypeCount {
+                resource_type: "Patient".to_string(),
+                total: 5,
+            }],
+            export_jobs: None,
+            import_jobs_active: None,
+        };
+        let spec_types = vec![
+            "Observation".to_string(),
+            "Aardvark".to_string(),
+            "Patient".to_string(), // already stored — must not be duplicated
+        ];
+
+        let dash = build_dashboard(&snapshot, true, &spec_types);
+
+        let names: Vec<&str> = dash
+            .picker
+            .iter()
+            .map(|p| p.resource_type.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Patient", "Aardvark", "Observation"],
+            "stored types first, then the rest of the version alphabetically"
+        );
+        let observation = dash
+            .picker
+            .iter()
+            .find(|p| p.resource_type == "Observation")
+            .expect("Observation offered even though unstored");
+        assert_eq!(observation.total, "0");
+        assert!(!observation.selected);
+        assert!(
+            observation.href.contains("all=1"),
+            "toggling an option keeps the flag on: {}",
+            observation.href
+        );
+
+        // Without the flag, the union never happens — today's behavior.
+        let off = build_dashboard(&snapshot, false, &spec_types);
+        assert_eq!(off.picker.len(), 1, "only the stored type is offered");
+        assert!(!off.picker[0].href.contains("all=1"));
+    }
+
+    /// The toggle link itself flips `all_types` while keeping the charted set
+    /// and window untouched.
+    #[test]
+    fn all_types_toggle_link_flips_the_flag_and_keeps_the_rest_of_the_state() {
+        let snapshot = DashboardSnapshot {
+            window: DashboardWindow::LastDay,
+            series: vec![DashboardSeries {
+                resource_type: "Patient".to_string(),
+                total: 5,
+                points: vec![point_at(1_752_451_200, 5, 5)],
+            }],
+            ..DashboardSnapshot::default()
+        };
+
+        let off = build_dashboard(&snapshot, false, &[]);
+        assert!(!off.all_types);
+        assert!(off.all_types_href.contains("Patient"));
+        assert!(off.all_types_href.contains("window=24h"));
+        assert!(off.all_types_href.ends_with("all=1"));
+
+        let on = build_dashboard(&snapshot, true, &[]);
+        assert!(on.all_types);
+        assert!(!on.all_types_href.contains("all=1"), "toggles back off");
+    }
+
+    /// A charted type with no data (#599: a "View all resources" selection) is
+    /// a real flat line at 0, not the chart's empty state.
+    #[test]
+    fn charting_a_zero_total_series_renders_a_flat_line_not_the_empty_state() {
+        let empty_type = DashboardSeries {
+            resource_type: "Observation".to_string(),
+            total: 0,
+            points: vec![
+                point_at(1_752_451_200, 0, 0),
+                point_at(1_752_454_800, 0, 0),
+                point_at(1_752_458_400, 0, 0),
+            ],
+        };
+        let chart = build_chart(std::slice::from_ref(&empty_type), DashboardWindow::LastHour);
+
+        assert!(chart.has_data, "a plotted series, even all-zero, has data");
+        assert_eq!(chart.series.len(), 1);
+        assert!(
+            !chart.series[0].polyline.is_empty(),
+            "the flat line is still drawn, not omitted"
+        );
     }
 
     #[test]

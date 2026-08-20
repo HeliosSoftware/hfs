@@ -78,6 +78,40 @@ test("the picker toggles types on, capped at the palette", async ({ page, dashbo
   }
 });
 
+test("\"View all resources\" offers empty types, charts a flat line at 0, and keeps state across window/type changes", async ({
+  page,
+  dashboard,
+}) => {
+  await dashboard.goto();
+  await dashboard.waitForSeries();
+
+  // Off by default: a type this tenant never stored (Condition) is not
+  // offered.
+  await dashboard.openPicker();
+  await expect(dashboard.pickerOption("Condition")).toHaveCount(0);
+
+  // The toggle is a plain link (works without JS) that flips `?all=1`.
+  await dashboard.viewAllToggle.click();
+  await expect(page).toHaveURL(/all=1/);
+
+  // With the flag, the never-stored type is offered, with a real 0 count.
+  await dashboard.openPicker();
+  const empty = dashboard.pickerOption("Condition");
+  await expect(empty).toBeVisible();
+  await expect(empty.locator(".chart-pick__count")).toHaveText("0");
+
+  // Picking it charts a flat zero line — a real plotted series, not absent.
+  await empty.click();
+  await expect(page).toHaveURL(/types=.*Condition/);
+  await expect(page).toHaveURL(/all=1/);
+  expect(await dashboard.seriesLines.count()).toBeGreaterThan(0);
+
+  // The flag survives a window change alongside the charted set.
+  await dashboard.windowOption(/24h/i).first().click();
+  await expect(page).toHaveURL(/window=24h/);
+  await expect(page).toHaveURL(/all=1/);
+});
+
 test("the picker filter narrows the offered types", async ({ dashboard }) => {
   await dashboard.goto();
   await dashboard.waitForSeries();

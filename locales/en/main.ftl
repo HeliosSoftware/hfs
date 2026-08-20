@@ -151,6 +151,7 @@ card-uptime-sub = since process start
 chart-title = FHIR resources over time
 chart-window = Chart time window
 chart-pick-heading = Charted resource types
+chart-pick-all = View all resource types
 chart-pick-filter = Filter types
 chart-empty = Nothing to chart yet — stored resources appear here as they are created.
 chart-sample-note = Sample data: no live metrics provider is registered on this build.

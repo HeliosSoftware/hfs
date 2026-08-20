@@ -892,6 +892,14 @@ button.pill {
   border-color: var(--accent-strong);
 }
 
+/* "View all resources" (#599) sits above the filter input, set off from the
+   scrolling option list below it by a divider. */
+.chart-pick__option--all {
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--divider);
+}
+
 .chart-pick__name {
   flex: 1;
   min-width: 0;

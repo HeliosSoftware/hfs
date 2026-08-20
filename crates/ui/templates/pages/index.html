@@ -85,6 +85,18 @@
         </summary>
         <div class="menu__panel menu__panel--right">
           <div class="menu__heading">{{ i18n.t("chart-pick-heading") }}</div>
+          <!--
+            "View all resources" (#599): with no JS, a plain link back to `/ui`
+            with `?all=1` toggled, so a type with no data can still be picked
+            (and charts as a flat zero line). Same checkbox-row styling as the
+            options below, rendered as a link with `aria-pressed` rather than
+            a real `<input type="checkbox">` since it has no enclosing form.
+          -->
+          <a class="menu__option chart-pick__option chart-pick__option--all{% if all_types %} chart-pick__option--on{% endif %}"
+             href="{{ all_types_href }}" aria-pressed="{% if all_types %}true{% else %}false{% endif %}">
+            <span class="chart-pick__box" aria-hidden="true">{% if all_types %}✓{% endif %}</span>
+            <span class="chart-pick__name">{{ i18n.t("chart-pick-all") }}</span>
+          </a>
           <div class="menu__search">
             <input type="search" placeholder="{{ i18n.t("chart-pick-filter") }}"
                    aria-label="{{ i18n.t("chart-pick-filter") }}" data-pick-filter>
