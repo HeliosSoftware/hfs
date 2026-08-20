@@ -1085,7 +1085,19 @@ async fn index(
     // validation against the actually-plotted set happens in build_dashboard.
     let focus = query_value(query.as_deref(), "focus")
         .filter(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphanumeric()));
-    render(build_index_page(state.version, locale, types, window, expand, focus, rv.0, &rt).await)
+    render(
+        build_index_page(
+            state.version,
+            locale,
+            types,
+            window,
+            expand,
+            focus,
+            rv.0,
+            &rt,
+        )
+        .await,
+    )
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -2012,8 +2024,7 @@ mod tests {
                 assert_eq!(s.emphasis, " series--receded");
             }
         }
-        let top =
-            |d: &DashboardView| d.chart.y_ticks.first().map(|t| t.label.clone()).unwrap();
+        let top = |d: &DashboardView| d.chart.y_ticks.first().map(|t| t.label.clone()).unwrap();
         assert_ne!(top(&dash), top(&unfocused), "axis re-fits the focus");
 
         let entry = |d: &DashboardView, t: &str| {
@@ -2325,7 +2336,8 @@ mod tests {
     /// active, and carries the charted type across a window switch.
     #[test]
     fn window_selector_marks_the_active_window_and_keeps_the_charted_type() {
-        let windows = build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false, None).windows;
+        let windows =
+            build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false, None).windows;
 
         assert_eq!(windows.len(), DashboardWindow::ALL.len());
         assert_eq!(windows.iter().filter(|w| w.active).count(), 1);
@@ -2345,7 +2357,8 @@ mod tests {
     /// keeps calendar dates. Same series, different axis vocabulary.
     #[test]
     fn axis_labels_follow_the_window_resolution() {
-        let hour_chart = build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false, None).chart;
+        let hour_chart =
+            build_dashboard(&sample_snapshot(DashboardWindow::LastHour), false, None).chart;
         assert!(
             hour_chart
                 .x_ticks
