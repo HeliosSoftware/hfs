@@ -5532,14 +5532,6 @@
       "reason": "Engine bug #424: `ElementDefinition.id` resolves to the `id` type in the R4B/R5 packs (`EdType::effective_code` prefers the `structuredefinition-fhir-type` extension over the authoritative `System.String` code), so element ids containing `[x]` or `:` are rejected."
     },
     {
-      "file": "questionnaire-cqf-example.json",
-      "issues": 1,
-      "kinds": [
-        "unknown-schema"
-      ],
-      "reason": "Documented gap: core extension StructureDefinitions (`extension-definitions.json`) are not in the vendored spec bundles, so these extension canonicals cannot be resolved."
-    },
-    {
       "file": "questionnaire.profile.json",
       "issues": 6,
       "kinds": [
