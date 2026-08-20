@@ -471,6 +471,13 @@ fn eval_element(
     // validator (the mismatched value still validates against the set).
 
     if let Some(items) = value.as_array() {
+        // A known extension used outside its declared context draws a
+        // warning (#615). Runs for every item, sliced or not — placement is
+        // orthogonal to slicing.
+        if key == "extension" || key == "modifierExtension" {
+            check_extension_context(ctx, items);
+        }
+
         // Whole-collection keywords, per schema: min then max.
         let schemas: Vec<Arc<FhirSchema>> = elset.schemas().cloned().collect();
         for schema in &schemas {
@@ -501,6 +508,60 @@ fn eval_element(
         }
     } else {
         validate_node(ctx, &elset, value);
+    }
+}
+
+/// Warn when an extension item is used outside its declared context (#615).
+///
+/// Conservative on purpose: only element-type contexts that read as
+/// resource-rooted paths (`Patient`, `Patient.name`) are judged, against the
+/// index-free parent path. A context naming a datatype (`HumanName`), an
+/// `Element`/`Resource`/`DomainResource` catch-all, or a FHIRPath expression
+/// makes the whole extension unjudgeable — we cannot resolve the parent's
+/// type here — so it passes silently rather than risking a false positive.
+/// Unknown urls and relative (sub-extension) urls always pass.
+fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
+    let parent = ctx.path.parent_element_path();
+
+    for (index, item) in items.iter().enumerate() {
+        let Some(url) = item.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        if !url.contains("://") {
+            continue;
+        }
+        let Some(schema) = ctx.resolver.resolve(url) else {
+            continue;
+        };
+        let Some(contexts) = schema.context.as_ref().filter(|c| !c.is_empty()) else {
+            continue;
+        };
+
+        let judgeable = |c: &String| {
+            // A resource-rooted element path: dotted segments, the first of
+            // which resolves to a resource schema. Everything else (datatype
+            // names, catch-alls, FHIRPath) is out of this check's reach.
+            !matches!(c.as_str(), "Element" | "Resource" | "DomainResource")
+                && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '.')
+                && c.split('.')
+                    .next()
+                    .and_then(|head| ctx.resolver.resolve(head))
+                    .is_some_and(|s| crate::editor::is_resource(&s))
+        };
+        if !contexts.iter().all(judgeable) {
+            continue;
+        }
+        // An element-type context names one exact spot: `Patient` is the
+        // resource root, `Patient.name` that element — not "anywhere in
+        // Patient".
+        if contexts.iter().any(|c| *c == parent) {
+            continue;
+        }
+
+        ctx.path.push_index(index);
+        let message = errors::msg_extension_context(url, &parent, contexts);
+        ctx.error_with_severity(ErrorKind::ExtensionContext, message, Severity::Warning);
+        ctx.path.pop();
     }
 }
 
@@ -764,6 +825,50 @@ pub(crate) fn is_partial_match(data: &Value, pattern: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    /// #615: a known extension outside its declared element context draws a
+    /// warning; in context, or unknown, it stays silent.
+    #[test]
+    fn extension_context_mismatch_warns() {
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let opts = crate::ValidationOptions::default();
+        let birthplace = "http://hl7.org/fhir/StructureDefinition/patient-birthPlace";
+
+        let warnings = |resource: &serde_json::Value| {
+            validator
+                .validate_sync(resource, &opts)
+                .errors
+                .into_iter()
+                .filter(|e| e.kind == ErrorKind::ExtensionContext)
+                .collect::<Vec<_>>()
+        };
+
+        // In context (the Patient root): silent.
+        let ok = json!({
+            "resourceType": "Patient",
+            "extension": [{ "url": birthplace, "valueAddress": {"city": "X"} }]
+        });
+        assert!(warnings(&ok).is_empty());
+
+        // Out of context (an Observation): one warning, warning-severity.
+        let wrong = json!({
+            "resourceType": "Observation", "status": "final", "code": {"text": "t"},
+            "extension": [{ "url": birthplace, "valueAddress": {"city": "X"} }]
+        });
+        let found = warnings(&wrong);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].severity, Severity::Warning);
+        assert_eq!(found[0].path, "Observation.extension.0");
+
+        // Unknown url: silent, wherever it sits.
+        let unknown = json!({
+            "resourceType": "Observation", "status": "final", "code": {"text": "t"},
+            "extension": [{ "url": "http://example.org/mystery", "valueString": "v" }]
+        });
+        assert!(warnings(&unknown).is_empty());
+    }
 
     #[test]
     fn partial_match_semantics() {
