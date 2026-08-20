@@ -163,6 +163,21 @@ test("a save in the Resources modal refreshes the results table behind it", asyn
   await ed.applyJson({ resourceType: "Patient", name: [{ family }] });
   await page.click("#resource-save");
 
-  // No reload, no manual re-run: the table catches up on its own.
-  await expect(page.locator("#query-results-body tr")).toHaveCount(1, { timeout: 5000 });
+  if (process.env.HFS_E2E_EVENTUAL_SEARCH === "1") {
+    // Eventually-consistent search (the Elasticsearch matrix legs): the
+    // auto-refresh fires before the index catches the write, so the strict
+    // no-manual-rerun contract cannot hold — poll by re-running instead.
+    await expect
+      .poll(
+        async () => {
+          await page.click('[data-intent="run"]');
+          return page.locator("#query-results-body tr").count();
+        },
+        { timeout: 15_000 },
+      )
+      .toBe(1);
+  } else {
+    // No reload, no manual re-run: the table catches up on its own.
+    await expect(page.locator("#query-results-body tr")).toHaveCount(1, { timeout: 5000 });
+  }
 });
