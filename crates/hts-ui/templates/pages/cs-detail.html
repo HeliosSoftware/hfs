@@ -36,7 +36,7 @@
           <span class="hts-cs-detail__version"> · v{{ summary.version }}</span>
         {% endif %}
         {% if !summary.status.is_empty() %}
-          <span class="pill pill--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
+          <span class="tag tag--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
             {{ chrome.i18n.t(format!("hts-cs-status-{}", summary.status).as_str()) }}
           </span>
         {% endif %}
@@ -105,55 +105,75 @@
     </div>
 
     {#-
+      Region wrapper (design doc §8.1). Tabs strip + workbench live inside
+      a single #hts-cs-detail-region div so a tab click can swap the whole
+      region as one unit — this is the only way the tabs' aria-current
+      stays in sync with the visible panel. `hx-select` picks the region
+      out of the full-page render the handler returns; `hx-push-url` keeps
+      the tab clickable as a deep-link.
+    -#}
+    <div id="hts-cs-detail-region">
+    {#-
       Tabs strip. Every tab is a real <a> so the nojs fallback works;
       htmx attributes hijack the click to swap the workbench region
-      without a full page reload. The Metadata tab links back to the
-      canonical detail URL. `role="tab"` + `aria-selected` + `aria-controls`
-      wire the WAI-ARIA tabs pattern per design doc §7.3 a11y clause.
+      without a full page reload. `role="tab"` + `aria-selected` +
+      `aria-controls` wire the WAI-ARIA tabs pattern per design doc §7.3
+      a11y clause.
     -#}
-    <div class="hts-cs-detail__tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-cs-detail-tabs-label") }}">
+    <nav class="tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-cs-detail-tabs-label") }}">
       <a role="tab"
-         class="hts-cs-detail__tab{% if tab == CsTab::Metadata %} is-active{% endif %}"
+         class="tab"
          aria-selected="{% if tab == CsTab::Metadata %}true{% else %}false{% endif %}"
+         {% if tab == CsTab::Metadata %}aria-current="true"{% endif %}
          aria-controls="hts-cs-workbench"
          href="/ui/hts/code-systems/{{ id }}"
          hx-get="/ui/hts/code-systems/{{ id }}"
-         hx-target="#hts-cs-workbench"
-         hx-select="#hts-cs-workbench"
-         hx-swap="outerHTML">
+         hx-target="#hts-cs-detail-region"
+         hx-select="#hts-cs-detail-region"
+         hx-swap="outerHTML"
+         hx-push-url="true">
         {{ chrome.i18n.t("hts-cs-detail-tab-metadata") }}
       </a>
       <a role="tab"
-         class="hts-cs-detail__tab{% if tab == CsTab::Lookup %} is-active{% endif %}"
+         class="tab"
          aria-selected="{% if tab == CsTab::Lookup %}true{% else %}false{% endif %}"
+         {% if tab == CsTab::Lookup %}aria-current="true"{% endif %}
          aria-controls="hts-cs-workbench"
          href="/ui/hts/code-systems/{{ id }}/lookup"
          hx-get="/ui/hts/code-systems/{{ id }}/lookup"
-         hx-target="#hts-workbench-input"
-         hx-swap="outerHTML">
+         hx-target="#hts-cs-detail-region"
+         hx-select="#hts-cs-detail-region"
+         hx-swap="outerHTML"
+         hx-push-url="true">
         {{ chrome.i18n.t("hts-cs-detail-tab-lookup") }}
       </a>
       <a role="tab"
-         class="hts-cs-detail__tab{% if tab == CsTab::Validate %} is-active{% endif %}"
+         class="tab"
          aria-selected="{% if tab == CsTab::Validate %}true{% else %}false{% endif %}"
+         {% if tab == CsTab::Validate %}aria-current="true"{% endif %}
          aria-controls="hts-cs-workbench"
          href="/ui/hts/code-systems/{{ id }}/validate"
          hx-get="/ui/hts/code-systems/{{ id }}/validate"
-         hx-target="#hts-workbench-input"
-         hx-swap="outerHTML">
+         hx-target="#hts-cs-detail-region"
+         hx-select="#hts-cs-detail-region"
+         hx-swap="outerHTML"
+         hx-push-url="true">
         {{ chrome.i18n.t("hts-cs-detail-tab-validate") }}
       </a>
       <a role="tab"
-         class="hts-cs-detail__tab{% if tab == CsTab::Subsumes %} is-active{% endif %}"
+         class="tab"
          aria-selected="{% if tab == CsTab::Subsumes %}true{% else %}false{% endif %}"
+         {% if tab == CsTab::Subsumes %}aria-current="true"{% endif %}
          aria-controls="hts-cs-workbench"
          href="/ui/hts/code-systems/{{ id }}/subsumes"
          hx-get="/ui/hts/code-systems/{{ id }}/subsumes"
-         hx-target="#hts-workbench-input"
-         hx-swap="outerHTML">
+         hx-target="#hts-cs-detail-region"
+         hx-select="#hts-cs-detail-region"
+         hx-swap="outerHTML"
+         hx-push-url="true">
         {{ chrome.i18n.t("hts-cs-detail-tab-subsumes") }}
       </a>
-    </div>
+    </nav>
 
     <div id="hts-cs-workbench" class="hts-cs-detail__workbench" role="tabpanel" aria-labelledby="hts-cs-detail-heading">
       {% match tab %}
@@ -188,6 +208,7 @@
         {% endif %}
       {% endif %}
     </div>
+    </div>{# /#hts-cs-detail-region #}
   {% endif %}
 </section>
 {% endblock %}

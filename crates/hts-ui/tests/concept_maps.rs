@@ -246,6 +246,12 @@ async fn start_mock() -> (String, MockState) {
         .route("/ConceptMap", get(mock_handler_get_search))
         .route("/ConceptMap/{id}", get(mock_handler_get_id))
         .route("/ConceptMap/{id}/$translate", post(mock_translate_handler))
+        // §8.2 canonical-url contract: run handlers prefer the type-level
+        // endpoint when the resource read resolves a canonical url. The
+        // seeded search Bundle already provides one, so the type-level
+        // route is what tests actually exercise now — keep the instance
+        // route above as a fallback that mirrors the pre-§8.2 path.
+        .route("/ConceptMap/$translate", post(mock_translate_handler))
         .fallback(mock_fallback)
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -305,11 +311,31 @@ async fn mock_handler_get_search(
         headers: parts.headers.clone(),
         body: String::new(),
     });
-    // Empty Bundle — most tests that hit this route only care about the
-    // browser shell rendering, not the row projection.
+    // Seed the mock with an `example-cm` entry so `read_concept_map`'s
+    // Alt-E two-hop (`resolve_canonical_url` + `fetch_by_url`) resolves
+    // successfully — the detail page can then render the workbench and
+    // the §8.2 canonical-url fallback in `translate_run` picks the
+    // type-level path instead of the instance-level fallback.
     (
         StatusCode::OK,
-        axum::Json(json!({"resourceType": "Bundle", "entry": []})),
+        axum::Json(json!({
+            "resourceType": "Bundle",
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "ConceptMap",
+                        "id": "example-cm",
+                        "url": "http://example.org/cm/example",
+                        "version": "1.0.0",
+                        "name": "ExampleMap",
+                        "title": "Example Concept Map",
+                        "status": "active",
+                        "sourceUri": "http://example.org/vs/source",
+                        "targetUri": "http://example.org/vs/target"
+                    }
+                }
+            ]
+        })),
     )
         .into_response()
 }
@@ -531,8 +557,13 @@ async fn detail_unknown_id_renders_outcome_inside_shell() {
 }
 
 #[tokio::test]
-async fn translate_tab_htmx_returns_input_partial_only() {
-    let response = app()
+async fn translate_tab_htmx_returns_full_page_for_region_swap() {
+    // Region-wrap contract (design doc §8.1): a tab-click GET returns
+    // the full detail page; htmx uses `hx-select="#hts-cm-detail-region"`
+    // to pick the tabs+workbench region out. Needs a mock upstream so
+    // read_concept_map resolves and the workbench form renders.
+    let (base, _state) = start_mock().await;
+    let response = app_pointing_at(&base)
         .oneshot(
             axum::http::Request::get("/ui/hts/concept-maps/example-cm/translate")
                 .header("HX-Request", "true")
@@ -545,11 +576,11 @@ async fn translate_tab_htmx_returns_input_partial_only() {
     let html = body_text(response).await;
     assert!(
         html.contains("hts-cm-workbench__input"),
-        "htmx tab load must return only the workbench input partial",
+        "workbench input partial must still render inside the region",
     );
     assert!(
-        !html.contains("<!doctype html>"),
-        "htmx tab load must not include the full page shell",
+        html.contains("<!doctype html>") || html.contains("<!DOCTYPE html>"),
+        "htmx tab load now returns the full page so htmx can hx-select the region",
     );
     // Default direction is forward — the source coding group must be
     // present with `code` and `system` inputs.
@@ -575,14 +606,10 @@ async fn translate_input_hx_reverse_direction_renders_target_code() {
     // Wire pin for the CM:139 bug: an htmx GET carrying
     // `?direction=reverse` MUST land 200 with the reverse fieldset
     // rendered (`translate-target-code` input, no `name="code"`
-    // source-side input). If a future maintainer removes
-    // `hx-params="none"` from the direction radios, the browser will
-    // start sending `?direction=reverse&direction=reverse` and this
-    // test still passes (query duplication is a client concern), but
-    // a paired e2e (`concept-maps.spec.ts:139`) will catch that. Here
-    // we lock the server-side contract so a plain-URL nav (bookmark,
-    // hard nav, or `hx-params="none"` in effect) always resolves.
-    let response = app()
+    // source-side input). Uses the mock upstream so read_concept_map
+    // resolves and §8.1 region-wrap actually renders the workbench.
+    let (base, _state) = start_mock().await;
+    let response = app_pointing_at(&base)
         .oneshot(
             axum::http::Request::get(
                 "/ui/hts/concept-maps/example-cm/translate?direction=reverse",
@@ -965,8 +992,12 @@ async fn translate_does_not_expose_unsupported_params() {
     // and lowercase `targetsystem` must never appear in the Translate
     // input form. Grep the rendered HTML to prove they leaked no
     // control (input, select, or textarea) that would let the operator
-    // send them to HTS.
-    let response = app()
+    // send them to HTS. Uses the mock upstream so §8.1 region-wrap
+    // actually renders the workbench form (closed-loopback would
+    // degrade to the banner and the negative assertions would pass
+    // vacuously).
+    let (base, _state) = start_mock().await;
+    let response = app_pointing_at(&base)
         .oneshot(
             axum::http::Request::get("/ui/hts/concept-maps/example-cm/translate")
                 .header("HX-Request", "true")

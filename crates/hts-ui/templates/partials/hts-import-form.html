@@ -11,6 +11,13 @@
       docs for a Phase-3 follow-up.
     - Submit is disabled when the shared degraded banner is showing
       (design doc §7 preamble degraded state).
+
+  Post form-polish (design doc §9): shared HFS primitives — the paste
+  textarea uses `.editor__source` (mono, min-height 460px, 12px line
+  height) so long Bundles get real scroll room instead of the 16-row
+  UA default; the submit is `.btn .btn--primary`; the source radios
+  are stacked in a bare fieldset so they read as a group above the
+  editor rather than crowding it inline.
 -#}
 <form class="hts-import__form"
       action="/ui/hts/import"
@@ -19,44 +26,50 @@
       hx-target="#hts-import-status"
       hx-swap="innerHTML"
       enctype="application/x-www-form-urlencoded">
-  <fieldset class="hts-import__source">
+  <fieldset>
     <legend>{{ chrome.i18n.t("hts-import-source-legend") }}</legend>
-    <label class="hts-import__source-option">
+    <label>
       <input type="radio" name="source" value="paste" checked>
       <span>{{ chrome.i18n.t("hts-import-source-paste") }}</span>
     </label>
-    <label class="hts-import__source-option hts-import__source-option--disabled">
+    <label>
       <input type="radio" name="source" value="file" disabled>
       <span>{{ chrome.i18n.t("hts-import-source-file") }}</span>
     </label>
   </fieldset>
 
-  <label class="hts-import__bundle-label" for="hts-import-bundle">
-    {{ chrome.i18n.t("hts-import-bundle-textarea-label") }}
-  </label>
-  <textarea id="hts-import-bundle"
-            class="hts-import__bundle"
-            name="bundle"
-            rows="16"
-            aria-label="{{ chrome.i18n.t("hts-import-bundle-textarea-label") }}"
-            spellcheck="false"
-            autocorrect="off"
-            autocapitalize="off"></textarea>
+  <div class="field">
+    <label class="field__label" for="hts-import-bundle">
+      {{ chrome.i18n.t("hts-import-bundle-textarea-label") }}
+    </label>
+    <textarea id="hts-import-bundle"
+              class="editor__source"
+              name="bundle"
+              rows="16"
+              aria-label="{{ chrome.i18n.t("hts-import-bundle-textarea-label") }}"
+              spellcheck="false"
+              autocorrect="off"
+              autocapitalize="off"></textarea>
+  </div>
 
-  <label class="hts-import__file-label" for="hts-import-file">
-    {{ chrome.i18n.t("hts-import-bundle-file-label") }}
-  </label>
-  <input id="hts-import-file"
-         class="hts-import__file"
-         name="bundle_file"
-         type="file"
-         accept="application/json,application/fhir+json,.json"
-         disabled>
+  <div class="field">
+    <label class="field__label" for="hts-import-file">
+      {{ chrome.i18n.t("hts-import-bundle-file-label") }}
+    </label>
+    <input id="hts-import-file"
+           class="field__input"
+           name="bundle_file"
+           type="file"
+           accept="application/json,application/fhir+json,.json"
+           disabled>
+  </div>
 
-  <button id="hts-import-submit"
-          class="hts-import__submit"
-          type="submit"
-          {% if degraded_reason.is_some() %}disabled{% endif %}>
-    {{ chrome.i18n.t("hts-import-submit") }}
-  </button>
+  <div class="form-actions">
+    <button id="hts-import-submit"
+            class="btn btn--primary"
+            type="submit"
+            {% if degraded_reason.is_some() %}disabled{% endif %}>
+      {{ chrome.i18n.t("hts-import-submit") }}
+    </button>
+  </div>
 </form>

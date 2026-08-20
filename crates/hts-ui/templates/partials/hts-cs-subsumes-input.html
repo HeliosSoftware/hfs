@@ -5,6 +5,9 @@
   (hts-details.md §`$subsumes` requires both codes to share a system), so
   the form only asks for codeA and codeB. The system field is echoed as
   a read-only note so the operator sees which CS is scoped.
+
+  Layout: `.field`/`.field__input` primitives; codeA/codeB share a
+  `.builder-grid` row (design doc §9 form contract).
 -#}
 <form id="hts-workbench-input"
       class="hts-cs-workbench__input"
@@ -27,23 +30,24 @@
     {% endif %}
   {% endif %}
 
-  <div class="hts-cs-workbench__field">
-    <label for="subsumes-codeA">{{ chrome.i18n.t("hts-cs-subsumes-code-a") }}</label>
-    <input id="subsumes-codeA" name="codeA" type="text" required autocomplete="off" spellcheck="false">
+  <div class="builder-grid">
+    <div class="field">
+      <label class="field__label" for="subsumes-codeA">{{ chrome.i18n.t("hts-cs-subsumes-code-a") }}</label>
+      <input class="field__input" id="subsumes-codeA" name="codeA" type="text" required autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label class="field__label" for="subsumes-codeB">{{ chrome.i18n.t("hts-cs-subsumes-code-b") }}</label>
+      <input class="field__input" id="subsumes-codeB" name="codeB" type="text" required autocomplete="off" spellcheck="false">
+    </div>
   </div>
 
-  <div class="hts-cs-workbench__field">
-    <label for="subsumes-codeB">{{ chrome.i18n.t("hts-cs-subsumes-code-b") }}</label>
-    <input id="subsumes-codeB" name="codeB" type="text" required autocomplete="off" spellcheck="false">
-  </div>
-
-  <div class="hts-cs-workbench__field">
-    <label for="subsumes-version">{{ chrome.i18n.t("hts-cs-lookup-version") }}</label>
-    <input id="subsumes-version" name="version" type="text" autocomplete="off" spellcheck="false"
+  <div class="field">
+    <label class="field__label" for="subsumes-version">{{ chrome.i18n.t("hts-cs-lookup-version") }}</label>
+    <input class="field__input" id="subsumes-version" name="version" type="text" autocomplete="off" spellcheck="false"
            value="{% if let Some(s) = summary %}{{ s.version }}{% endif %}">
   </div>
 
-  <div class="hts-cs-workbench__actions">
+  <div class="form-actions">
     <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
   </div>
 </form>

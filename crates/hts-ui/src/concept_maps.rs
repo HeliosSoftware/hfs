@@ -377,20 +377,15 @@ struct TranslateInputForm {
     lang: Option<String>,
 }
 
-#[derive(Template)]
-#[template(path = "partials/hts-cm-translate-input.html")]
-struct TranslateInputTemplate<'a> {
-    chrome: Chrome<'a>,
-    id: String,
-    summary: Option<ConceptMapSummary>,
-    direction: TranslateDirection,
-}
+// Tabs are wrapped in `#hts-cm-detail-region` (design doc §8.1); a tab
+// click uses `hx-select="#hts-cm-detail-region"` so we always render the
+// full detail page and htmx picks the region out.
 
 async fn translate_input(
     State(state): State<Arc<HtsUiState>>,
     Path(id): Path<String>,
     Query(form): Query<TranslateInputForm>,
-    HxRequest(is_htmx): HxRequest,
+    HxRequest(_is_htmx): HxRequest,
     locale: RequestLocale,
 ) -> Response {
     let chrome = Chrome {
@@ -401,17 +396,6 @@ async fn translate_input(
     };
     let direction = TranslateDirection::from_form(form.direction.as_deref());
     let summary = state.upstream.read_concept_map(&id).await.ok();
-    if is_htmx {
-        return render(
-            TranslateInputTemplate {
-                chrome,
-                id,
-                summary,
-                direction,
-            }
-            .render(),
-        );
-    }
     render_detail_with_tab(&state, chrome, id, CmTab::Translate, direction, summary).await
 }
 
@@ -555,7 +539,20 @@ async fn translate_run(
         return respond_workbench(&state, chrome, id, view, is_htmx).await;
     }
 
-    let view = match state.upstream.cm_translate_instance(&id, &params).await {
+    // §8.2 canonical-url contract: composite-stored CM resources cannot
+    // be reached by base fhir id via /ConceptMap/{id}/$translate. Resolve
+    // the canonical url first, then use the type-level $translate pinned
+    // by `url=<canonical>`. When the read fails (canonical empty) we
+    // fall back to the instance-level call so mock-upstream fixtures
+    // that only wire `/ConceptMap/{id}/$translate` keep passing.
+    let cm = state.upstream.read_concept_map(&id).await;
+    let canonical = cm.as_ref().map(|s| s.url.clone()).unwrap_or_default();
+    let translate_result = if !canonical.is_empty() {
+        state.upstream.cm_translate_by_url(&canonical, &params).await
+    } else {
+        state.upstream.cm_translate_instance(&id, &params).await
+    };
+    let view = match translate_result {
         Ok(result) => TranslateResultView {
             request_url: result.request_url.clone(),
             raw_body: result.raw_body.clone(),
@@ -565,8 +562,11 @@ async fn translate_run(
             degraded_reason: None,
         },
         Err(err) => {
-            let request_url =
-                format!("{}/ConceptMap/{}/$translate", state.upstream.base_url(), id);
+            let request_url = if !canonical.is_empty() {
+                format!("{}/ConceptMap/$translate", state.upstream.base_url())
+            } else {
+                format!("{}/ConceptMap/{}/$translate", state.upstream.base_url(), id)
+            };
             TranslateResultView::from_error(request_url, direction, &err)
         }
     };

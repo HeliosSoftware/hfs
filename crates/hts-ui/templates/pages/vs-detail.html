@@ -36,7 +36,7 @@
           <span class="hts-vs-detail__version"> · v{{ summary.version }}</span>
         {% endif %}
         {% if !summary.status.is_empty() %}
-          <span class="pill pill--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
+          <span class="tag tag--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
             {{ chrome.i18n.t(format!("hts-vs-status-{}", summary.status).as_str()) }}
           </span>
         {% endif %}
@@ -97,34 +97,44 @@
     </div>
 
     {#-
+      Region wrapper (design doc §8.1). Same region-swap contract as
+      cs-detail: tabs + workbench live inside #hts-vs-detail-region so
+      a tab click can swap them atomically.
+    -#}
+    <div id="hts-vs-detail-region">
+    {#-
       Tabs strip. §7.4.1 F9 removes the Validate tab — Metadata + Expand
       only. Both are real <a>s so the nojs fallback works; htmx
-      hijacks the click to swap the workbench region without a full
-      page reload.
+      hijacks the click to swap the region without a full page reload.
     -#}
-    <div class="hts-vs-detail__tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-vs-detail-tabs-label") }}">
+    <nav class="tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-vs-detail-tabs-label") }}">
       <a role="tab"
-         class="hts-vs-detail__tab{% if tab == VsTab::Metadata %} is-active{% endif %}"
+         class="tab"
          aria-selected="{% if tab == VsTab::Metadata %}true{% else %}false{% endif %}"
+         {% if tab == VsTab::Metadata %}aria-current="true"{% endif %}
          aria-controls="hts-vs-workbench"
          href="/ui/hts/value-sets/{{ id }}"
          hx-get="/ui/hts/value-sets/{{ id }}"
-         hx-target="#hts-vs-workbench"
-         hx-select="#hts-vs-workbench"
-         hx-swap="outerHTML">
+         hx-target="#hts-vs-detail-region"
+         hx-select="#hts-vs-detail-region"
+         hx-swap="outerHTML"
+         hx-push-url="true">
         {{ chrome.i18n.t("hts-vs-detail-tab-metadata") }}
       </a>
       <a role="tab"
-         class="hts-vs-detail__tab{% if tab == VsTab::Expand %} is-active{% endif %}"
+         class="tab"
          aria-selected="{% if tab == VsTab::Expand %}true{% else %}false{% endif %}"
+         {% if tab == VsTab::Expand %}aria-current="true"{% endif %}
          aria-controls="hts-vs-workbench"
          href="/ui/hts/value-sets/{{ id }}/expand"
          hx-get="/ui/hts/value-sets/{{ id }}/expand"
-         hx-target="#hts-workbench-input"
-         hx-swap="outerHTML">
+         hx-target="#hts-vs-detail-region"
+         hx-select="#hts-vs-detail-region"
+         hx-swap="outerHTML"
+         hx-push-url="true">
         {{ chrome.i18n.t("hts-vs-detail-tab-expand") }}
       </a>
-    </div>
+    </nav>
 
     <div id="hts-vs-workbench" class="hts-vs-detail__workbench" role="tabpanel" aria-labelledby="hts-vs-detail-heading">
       {% match tab %}
@@ -152,6 +162,7 @@
         {% endif %}
       {% endif %}
     </div>
+    </div>{# /#hts-vs-detail-region #}
   {% endif %}
 </section>
 {% endblock %}

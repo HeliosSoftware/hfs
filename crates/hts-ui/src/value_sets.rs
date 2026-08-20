@@ -354,30 +354,15 @@ async fn detail_page(
 }
 
 // ── Workbench input (GET Expand tab handler) ────────────────────────────
-
-#[derive(Template)]
-#[template(path = "partials/hts-vs-expand-input.html")]
-struct ExpandInputTemplate<'a> {
-    chrome: Chrome<'a>,
-    id: String,
-    summary: Option<ValueSetSummary>,
-    /// Current threshold seed for the Advanced numeric input — echoed
-    /// back from a prior submit (§7.4.1 F1/F4 per-request store).
-    threshold: Option<u64>,
-    /// Current tree/flat toggle state, so a re-render after "Load more"
-    /// preserves the mode. `None` == the input has never been submitted
-    /// (default: flat).
-    tree_mode: Option<bool>,
-    /// Ceiling exposed in the Advanced-panel `<summary>` tooltip
-    /// (§7.4 threshold clause). Kept on the template so translations
-    /// can format the tooltip.
-    ceiling: u64,
-}
+//
+// Tabs are wrapped in `#hts-vs-detail-region` (design doc §8.1); a tab
+// click uses `hx-select="#hts-vs-detail-region"` so we always render the
+// full detail page and htmx picks the region out.
 
 async fn expand_input(
     State(state): State<Arc<HtsUiState>>,
     Path(id): Path<String>,
-    HxRequest(is_htmx): HxRequest,
+    HxRequest(_is_htmx): HxRequest,
     locale: RequestLocale,
 ) -> Response {
     let chrome = Chrome {
@@ -387,19 +372,6 @@ async fn expand_input(
         version: state.version,
     };
     let summary = state.upstream.read_value_set(&id).await.ok();
-    if is_htmx {
-        return render(
-            ExpandInputTemplate {
-                chrome,
-                id,
-                summary,
-                threshold: None,
-                tree_mode: None,
-                ceiling: HTS_UI_MAX_EXPANSION_SIZE_HINT,
-            }
-            .render(),
-        );
-    }
     render_detail_with_tab(&state, chrome, id, VsTab::Expand, summary).await
 }
 
@@ -557,7 +529,20 @@ async fn expand_run(
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    let view = match state.upstream.vs_expand_instance(&id, &params).await {
+    // §8.2 canonical-url contract: composite-stored VS resources cannot
+    // be reached by base fhir id via /ValueSet/{id}/$expand. Resolve the
+    // canonical url first, then use the type-level $expand pinned by
+    // `url=<canonical>`. When the read fails (canonical empty) we fall
+    // back to the instance-level call so mock-upstream integration
+    // fixtures that only wire `/ValueSet/{id}/$expand` keep passing.
+    let vs = state.upstream.read_value_set(&id).await;
+    let canonical = vs.as_ref().map(|s| s.url.clone()).unwrap_or_default();
+    let expand_result = if !canonical.is_empty() {
+        state.upstream.vs_expand_by_url(&canonical, &params).await
+    } else {
+        state.upstream.vs_expand_instance(&id, &params).await
+    };
+    let view = match expand_result {
         Ok(result) => ExpandResultView {
             request_url: result.request_url.clone(),
             raw_body: result.raw_body.clone(),
@@ -568,7 +553,11 @@ async fn expand_run(
             degraded_reason: None,
         },
         Err(err) => {
-            let request_url = format!("{}/ValueSet/{}/$expand", state.upstream.base_url(), id);
+            let request_url = if !canonical.is_empty() {
+                format!("{}/ValueSet/$expand", state.upstream.base_url())
+            } else {
+                format!("{}/ValueSet/{}/$expand", state.upstream.base_url(), id)
+            };
             let mut v = ExpandResultView::from_error(request_url, &err);
             v.tree_mode = tree_mode;
             v.threshold = params.threshold;

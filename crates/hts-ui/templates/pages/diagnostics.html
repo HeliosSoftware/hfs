@@ -36,22 +36,33 @@
     {% include "partials/hts-degraded.html" %}
   {% endif %}
 
-  <div class="hts-diagnostics__tablist" role="tablist" aria-label="{{ chrome.i18n.t("hts-diagnostics-heading") }}">
+  {#-
+    Region wrapper (design doc §8.1). Tabs strip + panel live inside
+    #hts-diagnostics-region so a tab click swaps them atomically —
+    the tab's aria-current stays in sync with the visible panel. The
+    tab hx-get points at the shell URL and `hx-select` picks the
+    region out of the full-page render; the standalone panel endpoint
+    (/hts/diagnostics/panel) is kept alive for backward compat.
+  -#}
+  <div id="hts-diagnostics-region">
+  <nav class="tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-diagnostics-heading") }}">
     {% for tab in tabs %}
-      <a class="hts-diagnostics__tab{% if tab.active %} hts-diagnostics__tab--active{% endif %}"
+      <a class="tab"
          role="tab"
          id="hts-diagnostics-tab-{{ tab.slug }}"
          aria-selected="{% if tab.active %}true{% else %}false{% endif %}"
+         {% if tab.active %}aria-current="true"{% endif %}
          aria-controls="diag-panel"
          href="/ui/hts/diagnostics?tab={{ tab.slug }}"
-         hx-get="/ui/hts/diagnostics/panel?tab={{ tab.slug }}"
-         hx-target="#diag-panel"
-         hx-swap="innerHTML"
+         hx-get="/ui/hts/diagnostics?tab={{ tab.slug }}"
+         hx-target="#hts-diagnostics-region"
+         hx-select="#hts-diagnostics-region"
+         hx-swap="outerHTML"
          hx-push-url="true">
         {{ chrome.i18n.t(tab.label_key) }}
       </a>
     {% endfor %}
-  </div>
+  </nav>
 
   <section id="diag-panel"
            class="hts-diagnostics__panel"
@@ -60,5 +71,6 @@
            aria-atomic="false">
     {% include "partials/hts-diagnostics-panel.html" %}
   </section>
+  </div>{# /#hts-diagnostics-region #}
 </section>
 {% endblock %}

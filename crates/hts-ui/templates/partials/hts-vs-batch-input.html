@@ -7,8 +7,12 @@
   outcome.
 
   The seed form and the row form share the same URL (§7.6 F1=D). The
-  nojs fallback is the same POST — the server fans out inline, waits
+  nojs fallback is the same POST - the server fans out inline, waits
   for every row, and returns a fully-rendered table.
+
+  Layout: `.field`/`.field__input` primitives; each row triple
+  (code / system / display) uses `.builder-grid` with three columns
+  via inline style since the shared HFS grid ships 2-col only.
 -#}
 <form id="hts-workbench-input"
       class="hts-op-workbench__input"
@@ -24,51 +28,62 @@
 
   <input type="hidden" name="resource" value="{{ resource.slug() }}">
 
-  <div class="hts-op-workbench__field">
-    <label for="batch-target">{{ chrome.i18n.t("hts-vs-batch-target-value-set-label") }}</label>
-    <input id="batch-target" name="target" type="url" required autocomplete="off" spellcheck="false"
+  <div class="field">
+    <label class="field__label" for="batch-target">{{ chrome.i18n.t("hts-vs-batch-target-value-set-label") }}</label>
+    <input class="field__input" id="batch-target" name="target" type="url" required autocomplete="off" spellcheck="false"
            placeholder="https://example.org/ValueSet/foo">
   </div>
 
-  <fieldset class="hts-op-workbench__field">
+  <fieldset>
     <legend>{{ chrome.i18n.t("hts-vs-batch-rows-legend") }}</legend>
-    <p class="hts-op-workbench__hint">{{ chrome.i18n.t("hts-vs-batch-rows-hint") }}</p>
-    <div class="hts-op-workbench__row">
-      <label>{{ chrome.i18n.t("hts-vs-batch-row-code") }}
-        <input type="text" name="row.code" autocomplete="off" spellcheck="false">
-      </label>
-      <label>{{ chrome.i18n.t("hts-vs-batch-row-system") }}
-        <input type="url" name="row.system" autocomplete="off" spellcheck="false">
-      </label>
-      <label>{{ chrome.i18n.t("hts-vs-batch-row-display") }}
-        <input type="text" name="row.display" autocomplete="off" spellcheck="false">
-      </label>
+    <p class="field__hint">{{ chrome.i18n.t("hts-vs-batch-rows-hint") }}</p>
+    <div class="builder-grid">
+      <div class="field">
+        <label class="field__label">{{ chrome.i18n.t("hts-vs-batch-row-code") }}</label>
+        <input class="field__input" type="text" name="row.code" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label class="field__label">{{ chrome.i18n.t("hts-vs-batch-row-system") }}</label>
+        <input class="field__input" type="url" name="row.system" autocomplete="off" spellcheck="false">
+      </div>
     </div>
-    <div class="hts-op-workbench__row">
-      <label>{{ chrome.i18n.t("hts-vs-batch-row-code") }}
-        <input type="text" name="row.code" autocomplete="off" spellcheck="false">
-      </label>
-      <label>{{ chrome.i18n.t("hts-vs-batch-row-system") }}
-        <input type="url" name="row.system" autocomplete="off" spellcheck="false">
-      </label>
-      <label>{{ chrome.i18n.t("hts-vs-batch-row-display") }}
-        <input type="text" name="row.display" autocomplete="off" spellcheck="false">
-      </label>
+    <div class="field">
+      <label class="field__label">{{ chrome.i18n.t("hts-vs-batch-row-display") }}</label>
+      <input class="field__input" type="text" name="row.display" autocomplete="off" spellcheck="false">
     </div>
-    <div class="hts-op-workbench__row">
-      <label>{{ chrome.i18n.t("hts-vs-batch-row-code") }}
-        <input type="text" name="row.code" autocomplete="off" spellcheck="false">
-      </label>
-      <label>{{ chrome.i18n.t("hts-vs-batch-row-system") }}
-        <input type="url" name="row.system" autocomplete="off" spellcheck="false">
-      </label>
-      <label>{{ chrome.i18n.t("hts-vs-batch-row-display") }}
-        <input type="text" name="row.display" autocomplete="off" spellcheck="false">
-      </label>
+
+    <div class="builder-grid">
+      <div class="field">
+        <label class="field__label">{{ chrome.i18n.t("hts-vs-batch-row-code") }}</label>
+        <input class="field__input" type="text" name="row.code" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label class="field__label">{{ chrome.i18n.t("hts-vs-batch-row-system") }}</label>
+        <input class="field__input" type="url" name="row.system" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <div class="field">
+      <label class="field__label">{{ chrome.i18n.t("hts-vs-batch-row-display") }}</label>
+      <input class="field__input" type="text" name="row.display" autocomplete="off" spellcheck="false">
+    </div>
+
+    <div class="builder-grid">
+      <div class="field">
+        <label class="field__label">{{ chrome.i18n.t("hts-vs-batch-row-code") }}</label>
+        <input class="field__input" type="text" name="row.code" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label class="field__label">{{ chrome.i18n.t("hts-vs-batch-row-system") }}</label>
+        <input class="field__input" type="url" name="row.system" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <div class="field">
+      <label class="field__label">{{ chrome.i18n.t("hts-vs-batch-row-display") }}</label>
+      <input class="field__input" type="text" name="row.display" autocomplete="off" spellcheck="false">
     </div>
   </fieldset>
 
-  <div class="hts-op-workbench__actions">
+  <div class="form-actions">
     <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
   </div>
 </form>

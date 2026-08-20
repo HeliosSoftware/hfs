@@ -252,6 +252,15 @@ async fn start_mock() -> (String, MockState) {
             "/ValueSet/{id}/$expand",
             post(mock_handler),
         )
+        // §8.2 canonical-url contract: expand_run prefers the type-level
+        // endpoint when the resource read resolves a canonical url. The
+        // seeded search Bundle already provides one, so the type-level
+        // route is what tests actually exercise now — keep the instance
+        // route above as a fallback that mirrors the pre-§8.2 path.
+        .route(
+            "/ValueSet/$expand",
+            post(mock_handler),
+        )
         // Fallback catches routing misses so an unexpected URL becomes a
         // captured request (with method GET-through-{method} inferred by
         // axum) rather than a silent 404 the test can't attribute.
@@ -321,11 +330,29 @@ async fn mock_handler_get_search(
         headers: parts.headers.clone(),
         body: String::new(),
     });
-    // Empty Bundle — the tests that exercise this route only care about
-    // the browser shell, not the row rendering.
+    // Seed the mock with the `example-vs` entry so `read_value_set`'s
+    // Alt-E two-hop (`resolve_canonical_url` + `fetch_by_url`) resolves
+    // successfully — the detail page can render the workbench and the
+    // §8.2 canonical-url fallback in `expand_run` picks the type-level
+    // path instead of the instance-level fallback.
     (
         StatusCode::OK,
-        axum::Json(json!({"resourceType": "Bundle", "entry": []})),
+        axum::Json(json!({
+            "resourceType": "Bundle",
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "ValueSet",
+                        "id": "example-vs",
+                        "url": "http://example.org/vs/example",
+                        "version": "1.0.0",
+                        "name": "ExampleVS",
+                        "title": "Example ValueSet",
+                        "status": "active"
+                    }
+                }
+            ]
+        })),
     )
         .into_response()
 }
@@ -522,7 +549,13 @@ async fn detail_unknown_id_renders_outcome_inside_shell() {
 }
 
 #[tokio::test]
-async fn expand_tab_htmx_returns_input_partial_only() {
+async fn expand_tab_htmx_returns_full_page_for_region_swap() {
+    // Region-wrap contract (design doc §8.1): a tab-click GET returns
+    // the full detail page; htmx uses `hx-select="#hts-vs-detail-region"`
+    // to pick the tabs+workbench region out. Against the closed-loopback
+    // upstream read_value_set fails so the outcome banner renders in
+    // place of the workbench; the assertion is that the response is a
+    // full HTML page (previously the input partial only).
     let response = app()
         .oneshot(
             axum::http::Request::get("/ui/hts/value-sets/example-vs/expand")
@@ -535,12 +568,12 @@ async fn expand_tab_htmx_returns_input_partial_only() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("hts-vs-workbench__input"),
-        "htmx tab load must return only the workbench input partial",
+        html.contains("<!doctype html>") || html.contains("<!DOCTYPE html>"),
+        "htmx tab load now returns the full page so htmx can hx-select the region",
     );
     assert!(
-        !html.contains("<!doctype html>"),
-        "htmx tab load must not include the full page shell",
+        html.contains("hts-degraded") || html.contains("hts-outcome"),
+        "closed-loopback upstream must surface the degraded banner (Connect) or outcome banner (NotFound)",
     );
 }
 
@@ -548,7 +581,11 @@ async fn expand_tab_htmx_returns_input_partial_only() {
 async fn expand_input_shows_advanced_details_and_threshold_field() {
     // The Expand tab renders the always-visible controls + Advanced
     // <details> panel with the threshold input (§7.4 / §7.4.1 F1/F4).
-    let response = app()
+    // Needs a mock upstream so read_value_set succeeds (§8.1 region-wrap
+    // contract: the workbench renders only when detail is Ok).
+    let (base, state) = start_mock().await;
+    state.set_canned(CannedResponse::ok_expansion_flat()).await;
+    let response = app_pointing_at(&base)
         .oneshot(
             axum::http::Request::get("/ui/hts/value-sets/example-vs/expand")
                 .header("HX-Request", "true")

@@ -67,6 +67,15 @@
   --accent-text: #0a5f96;
   /* Menu panel input */
   --input-bg: #f5f5f5;
+  /* Semantic status tokens (referenced by .tag--*, .lint__item--*, .notice--warn,
+     .btn--danger, .batch-badge--*, and .tag--stored/config/conflict families).
+     Colors clear 4.5:1 on the light surfaces per WCAG 2.2 AA. */
+  --ok: #1a7a3a;
+  --ok-soft: rgb(26 122 58 / 12%);
+  --warn: #a45d00;
+  --warn-soft: rgb(164 93 0 / 12%);
+  --danger: #b3261e;
+  --danger-soft: rgb(179 38 30 / 12%);
 
   font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
@@ -91,6 +100,14 @@
   --outline: #353535;
   --grid-line: rgb(255 255 255 / 12%);
   --input-bg: #1a1a1a;
+  /* Semantic status tokens (dark theme): each raised for 4.5:1 on the
+     dark surfaces; the -soft variants stay translucent to sit on cards. */
+  --ok: #6bd48b;
+  --ok-soft: rgb(107 212 139 / 15%);
+  --warn: #f4b95a;
+  --warn-soft: rgb(244 185 90 / 15%);
+  --danger: #ff8a80;
+  --danger-soft: rgb(255 138 128 / 15%);
 }
 
 * {
@@ -966,6 +983,15 @@ button.pill {
   margin-top: 4px;
 }
 
+/* Form action bar: submit/cancel row at the bottom of `.field`-stacked
+   forms. Used by the HTS workbench + import pages so the button sits
+   under the last `.field` without collapsing its margin. */
+.form-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
+}
+
 /* Centered-popup variant of the addbox (the Bulk Import dialogs, #527): the
    same no-JS <details> mechanics, presented as a modal. While open, the
    summary itself stretches over the viewport as the backdrop, so clicking
@@ -1172,9 +1198,12 @@ button.pill {
 .history__id { width: 200px; }
 .history__slash { color: var(--muted); }
 
-/* Tabs (Instance / Type feed / System feed). */
+/* Tabs (Instance / Type feed / System feed).
+   `flex-wrap: wrap` is needed for tab strips with many items (e.g. the HTS
+   operations selector — 7 ops). Short strips fit on one line either way. */
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   margin-bottom: 16px;
   border-bottom: 1px solid var(--surface-border);
@@ -2051,7 +2080,8 @@ button.pill {
 }
 
 .tag--stored,
-.tag--member {
+.tag--member,
+.tag--matched {
   background: var(--ok-soft);
   color: var(--ok);
 }
@@ -2067,6 +2097,31 @@ button.pill {
 .tag--excluded {
   background: var(--danger-soft);
   color: var(--danger);
+}
+
+/* FHIR publication-status tags (HTS browsers + resource detail headers).
+   Distinct from the .tag--stored/config/conflict family: those describe
+   configuration/lint outcomes, these describe a resource's own status. */
+.tag--active {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.tag--draft {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tag--retired {
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  color: var(--muted);
+}
+
+.tag--unknown {
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  color: var(--muted);
 }
 
 /* Detail panel (right rail on the SearchParameter viewer) */
@@ -2342,7 +2397,8 @@ button.pill {
   color: var(--text);
 }
 
-.tab[aria-current="true"] {
+.tab[aria-current="true"],
+.tab[aria-current="page"] {
   background: var(--accent-soft);
   color: var(--text-strong);
 }

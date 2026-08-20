@@ -25,6 +25,9 @@
     tree_mode  : Option<bool>             — echoed tree/flat toggle position
     ceiling    : u64                       — build-time HTS_UI_MAX_EXPANSION
                                             _SIZE_HINT for the tooltip
+
+  Post form-polish (design doc §9): `.field`/`.field__input` primitives
+  everywhere; count/offset paginate as a `.builder-grid` row.
 -#}
 <form id="hts-workbench-input"
       class="hts-vs-workbench__input"
@@ -47,33 +50,36 @@
     {% endif %}
   {% endif %}
 
-  <div class="hts-vs-workbench__field">
-    <label for="expand-filter">{{ chrome.i18n.t("hts-vs-expand-filter") }}</label>
-    <input id="expand-filter" name="filter" type="text" autocomplete="off" spellcheck="false"
+  <div class="field">
+    <label class="field__label" for="expand-filter">{{ chrome.i18n.t("hts-vs-expand-filter") }}</label>
+    <input class="field__input" id="expand-filter" name="filter" type="text" autocomplete="off" spellcheck="false"
            placeholder="{{ chrome.i18n.t("hts-vs-expand-filter-placeholder") }}">
   </div>
 
-  <div class="hts-vs-workbench__field hts-vs-workbench__field--paging">
-    <label for="expand-count">{{ chrome.i18n.t("hts-vs-expand-count") }}</label>
-    <input id="expand-count" name="count" type="number" min="0" value="50" autocomplete="off">
-
-    <label for="expand-offset">{{ chrome.i18n.t("hts-vs-expand-offset") }}</label>
-    <input id="expand-offset" name="offset" type="number" min="0" value="0" autocomplete="off">
+  <div class="builder-grid">
+    <div class="field">
+      <label class="field__label" for="expand-count">{{ chrome.i18n.t("hts-vs-expand-count") }}</label>
+      <input class="field__input" id="expand-count" name="count" type="number" min="0" value="50" autocomplete="off">
+    </div>
+    <div class="field">
+      <label class="field__label" for="expand-offset">{{ chrome.i18n.t("hts-vs-expand-offset") }}</label>
+      <input class="field__input" id="expand-offset" name="offset" type="number" min="0" value="0" autocomplete="off">
+    </div>
   </div>
 
-  <div class="hts-vs-workbench__field">
-    <label for="expand-display-language">{{ chrome.i18n.t("hts-vs-expand-display-language") }}</label>
-    <input id="expand-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false"
+  <div class="field">
+    <label class="field__label" for="expand-display-language">{{ chrome.i18n.t("hts-vs-expand-display-language") }}</label>
+    <input class="field__input" id="expand-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false"
            placeholder="{{ chrome.i18n.t("hts-vs-expand-display-language-placeholder") }}">
   </div>
 
-  <fieldset class="hts-vs-workbench__field hts-vs-workbench__field--flags">
+  <fieldset>
     <legend>{{ chrome.i18n.t("hts-vs-expand-flags-legend") }}</legend>
-    <label class="hts-vs-workbench__checkbox">
+    <label>
       <input type="checkbox" name="activeOnly" value="true">
       <span>{{ chrome.i18n.t("hts-vs-expand-active-only") }}</span>
     </label>
-    <label class="hts-vs-workbench__checkbox">
+    <label>
       <input type="checkbox" name="includeDesignations" value="true">
       <span>{{ chrome.i18n.t("hts-vs-expand-include-designations") }}</span>
     </label>
@@ -84,26 +90,32 @@
     submit still communicates the mode (§7.4.1 F14). The default is
     `flat` unless the operator selected tree on a prior submit.
   -#}
-  <fieldset class="hts-vs-workbench__field hts-vs-workbench__field--mode">
+  <fieldset>
     <legend>{{ chrome.i18n.t("hts-vs-expand-mode-legend") }}</legend>
-    <label class="hts-vs-workbench__radio">
+    <label>
       <input type="radio" name="mode" value="flat"
              {% match tree_mode %}{% when Some(true) %}{% when _ %} checked{% endmatch %}>
       <span>{{ chrome.i18n.t("hts-vs-expand-mode-flat") }}</span>
     </label>
-    <label class="hts-vs-workbench__radio">
+    <label>
       <input type="radio" name="mode" value="tree"
              {% match tree_mode %}{% when Some(true) %} checked{% when _ %}{% endmatch %}>
       <span>{{ chrome.i18n.t("hts-vs-expand-mode-tree") }}</span>
     </label>
   </fieldset>
 
-  <fieldset class="hts-vs-workbench__field hts-vs-workbench__field--repeatable">
+  <fieldset>
     <legend>{{ chrome.i18n.t("hts-vs-expand-use-supplement-legend") }}</legend>
-    <input name="useSupplement" type="text" autocomplete="off" spellcheck="false"
-           placeholder="{{ chrome.i18n.t("hts-vs-expand-use-supplement-placeholder") }}">
-    <input name="useSupplement" type="text" autocomplete="off" spellcheck="false"
-           placeholder="{{ chrome.i18n.t("hts-vs-expand-use-supplement-placeholder") }}">
+    <div class="builder-grid">
+      <div class="field">
+        <input class="field__input" name="useSupplement" type="text" autocomplete="off" spellcheck="false"
+               placeholder="{{ chrome.i18n.t("hts-vs-expand-use-supplement-placeholder") }}">
+      </div>
+      <div class="field">
+        <input class="field__input" name="useSupplement" type="text" autocomplete="off" spellcheck="false"
+               placeholder="{{ chrome.i18n.t("hts-vs-expand-use-supplement-placeholder") }}">
+      </div>
+    </div>
   </fieldset>
 
   <details class="hts-vs-workbench__advanced">
@@ -112,62 +124,76 @@
       {{ chrome.i18n.t("hts-vs-expand-advanced-summary") }}
     </summary>
 
-    <div class="hts-vs-workbench__field">
-      <label for="expand-date">{{ chrome.i18n.t("hts-vs-expand-date") }}</label>
-      <input id="expand-date" name="date" type="text" autocomplete="off" spellcheck="false"
+    <div class="field">
+      <label class="field__label" for="expand-date">{{ chrome.i18n.t("hts-vs-expand-date") }}</label>
+      <input class="field__input" id="expand-date" name="date" type="text" autocomplete="off" spellcheck="false"
              placeholder="{{ chrome.i18n.t("hts-vs-expand-date-placeholder") }}">
     </div>
 
-    <fieldset class="hts-vs-workbench__field hts-vs-workbench__field--repeatable">
+    <fieldset>
       <legend>{{ chrome.i18n.t("hts-vs-expand-property-legend") }}</legend>
-      <input name="property" type="text" autocomplete="off" spellcheck="false"
-             placeholder="{{ chrome.i18n.t("hts-vs-expand-property-placeholder") }}">
-      <input name="property" type="text" autocomplete="off" spellcheck="false"
-             placeholder="{{ chrome.i18n.t("hts-vs-expand-property-placeholder") }}">
+      <div class="builder-grid">
+        <div class="field">
+          <input class="field__input" name="property" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="{{ chrome.i18n.t("hts-vs-expand-property-placeholder") }}">
+        </div>
+        <div class="field">
+          <input class="field__input" name="property" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="{{ chrome.i18n.t("hts-vs-expand-property-placeholder") }}">
+        </div>
+      </div>
     </fieldset>
 
-    <fieldset class="hts-vs-workbench__field hts-vs-workbench__field--repeatable">
+    <fieldset>
       <legend>{{ chrome.i18n.t("hts-vs-expand-tx-resource-legend") }}</legend>
-      <input name="tx-resource" type="text" autocomplete="off" spellcheck="false"
-             placeholder="{{ chrome.i18n.t("hts-vs-expand-tx-resource-placeholder") }}">
+      <div class="field">
+        <input class="field__input" name="tx-resource" type="text" autocomplete="off" spellcheck="false"
+               placeholder="{{ chrome.i18n.t("hts-vs-expand-tx-resource-placeholder") }}">
+      </div>
     </fieldset>
 
-    <fieldset class="hts-vs-workbench__field hts-vs-workbench__field--repeatable">
+    <fieldset>
       <legend>{{ chrome.i18n.t("hts-vs-expand-system-version-legend") }}</legend>
-      <input name="system-version" type="text" autocomplete="off" spellcheck="false"
-             placeholder="{{ chrome.i18n.t("hts-vs-expand-system-version-placeholder") }}">
+      <div class="field">
+        <input class="field__input" name="system-version" type="text" autocomplete="off" spellcheck="false"
+               placeholder="{{ chrome.i18n.t("hts-vs-expand-system-version-placeholder") }}">
+      </div>
     </fieldset>
 
-    <fieldset class="hts-vs-workbench__field hts-vs-workbench__field--repeatable">
+    <fieldset>
       <legend>{{ chrome.i18n.t("hts-vs-expand-check-system-version-legend") }}</legend>
-      <input name="check-system-version" type="text" autocomplete="off" spellcheck="false"
-             placeholder="{{ chrome.i18n.t("hts-vs-expand-system-version-placeholder") }}">
+      <div class="field">
+        <input class="field__input" name="check-system-version" type="text" autocomplete="off" spellcheck="false"
+               placeholder="{{ chrome.i18n.t("hts-vs-expand-system-version-placeholder") }}">
+      </div>
     </fieldset>
 
-    <fieldset class="hts-vs-workbench__field hts-vs-workbench__field--repeatable">
+    <fieldset>
       <legend>{{ chrome.i18n.t("hts-vs-expand-force-system-version-legend") }}</legend>
-      <input name="force-system-version" type="text" autocomplete="off" spellcheck="false"
-             placeholder="{{ chrome.i18n.t("hts-vs-expand-system-version-placeholder") }}">
+      <div class="field">
+        <input class="field__input" name="force-system-version" type="text" autocomplete="off" spellcheck="false"
+               placeholder="{{ chrome.i18n.t("hts-vs-expand-system-version-placeholder") }}">
+      </div>
     </fieldset>
 
-    <div class="hts-vs-workbench__field">
-      <label for="expand-default-vs-version">{{ chrome.i18n.t("hts-vs-expand-default-valueset-version") }}</label>
-      <input id="expand-default-vs-version" name="default-valueset-version" type="text" autocomplete="off" spellcheck="false">
+    <div class="field">
+      <label class="field__label" for="expand-default-vs-version">{{ chrome.i18n.t("hts-vs-expand-default-valueset-version") }}</label>
+      <input class="field__input" id="expand-default-vs-version" name="default-valueset-version" type="text" autocomplete="off" spellcheck="false">
     </div>
 
-    <div class="hts-vs-workbench__field">
-      <label for="expand-threshold">
+    <div class="field">
+      <label class="field__label" for="expand-threshold">
         {{ chrome.i18n.t("hts-vs-expand-threshold") }}
         <small class="hts-vs-workbench__ceiling-hint">
           {{ chrome.i18n.t_arg("hts-vs-expand-ceiling-note", "ceiling", ceiling.to_string()) }}
         </small>
       </label>
-      <input id="expand-threshold" name="threshold" type="number" min="0" autocomplete="off"
+      <input class="field__input" id="expand-threshold" name="threshold" type="number" min="0" autocomplete="off"
              value="{% match threshold %}{% when Some(t) %}{{ t }}{% when None %}{% endmatch %}">
     </div>
   </details>
 
-  <div class="hts-vs-workbench__actions">
+  <div class="form-actions">
     <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
   </div>
 </form>

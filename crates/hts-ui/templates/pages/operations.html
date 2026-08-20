@@ -29,6 +29,14 @@
 
   {% include "partials/hts-op-selector.html" %}
 
+  {#-
+    Region wrapper (design doc §8.1). The resource-family strip, closure
+    banner, workbench, and batch-progress slot must all swap as one so
+    the resource-family aria-current stays in sync with the visible input.
+    The op-selector stays *outside* the region — it targets `body` and
+    triggers a full-shell reload.
+  -#}
+  <div id="hts-op-region">
   {% if flags.supports_resource_tabs %}
     {% include "partials/hts-resource-family-tabs.html" %}
   {% endif %}
@@ -51,5 +59,6 @@
     <div id="hts-batch-progress-slot" class="hts-op-workbench__batch-progress"
          aria-live="polite" aria-atomic="true"></div>
   {% endif %}
+  </div>{# /#hts-op-region #}
 </section>
 {% endblock %}

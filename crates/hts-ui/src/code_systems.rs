@@ -345,35 +345,17 @@ async fn detail_page(
 }
 
 // ── Workbench inputs (GET tab handlers) ─────────────────────────────────
-
-#[derive(Template)]
-#[template(path = "partials/hts-cs-lookup-input.html")]
-struct LookupInputTemplate<'a> {
-    chrome: Chrome<'a>,
-    id: String,
-    summary: Option<CodeSystemSummary>,
-}
-
-#[derive(Template)]
-#[template(path = "partials/hts-cs-validate-input.html")]
-struct ValidateInputTemplate<'a> {
-    chrome: Chrome<'a>,
-    id: String,
-    summary: Option<CodeSystemSummary>,
-}
-
-#[derive(Template)]
-#[template(path = "partials/hts-cs-subsumes-input.html")]
-struct SubsumesInputTemplate<'a> {
-    chrome: Chrome<'a>,
-    id: String,
-    summary: Option<CodeSystemSummary>,
-}
+//
+// The tabs are wrapped in `#hts-cs-detail-region` (design doc §8.1) and
+// each tab click uses `hx-select="#hts-cs-detail-region"`, so the handler
+// always renders the full detail page and htmx picks the region out. No
+// separate htmx-fragment branch — that used to leave the tabs strip with
+// a stale `aria-current` attribute (Bug 1 in the tab-active-state fix).
 
 async fn lookup_input(
     State(state): State<Arc<HtsUiState>>,
     Path(id): Path<String>,
-    HxRequest(is_htmx): HxRequest,
+    HxRequest(_is_htmx): HxRequest,
     locale: RequestLocale,
 ) -> Response {
     let chrome = Chrome {
@@ -383,23 +365,13 @@ async fn lookup_input(
         version: state.version,
     };
     let summary = state.upstream.read_code_system(&id).await.ok();
-    if is_htmx {
-        return render(
-            LookupInputTemplate {
-                chrome,
-                id,
-                summary,
-            }
-            .render(),
-        );
-    }
     render_detail_with_tab(&state, chrome, id, CsTab::Lookup, summary).await
 }
 
 async fn validate_input(
     State(state): State<Arc<HtsUiState>>,
     Path(id): Path<String>,
-    HxRequest(is_htmx): HxRequest,
+    HxRequest(_is_htmx): HxRequest,
     locale: RequestLocale,
 ) -> Response {
     let chrome = Chrome {
@@ -409,23 +381,13 @@ async fn validate_input(
         version: state.version,
     };
     let summary = state.upstream.read_code_system(&id).await.ok();
-    if is_htmx {
-        return render(
-            ValidateInputTemplate {
-                chrome,
-                id,
-                summary,
-            }
-            .render(),
-        );
-    }
     render_detail_with_tab(&state, chrome, id, CsTab::Validate, summary).await
 }
 
 async fn subsumes_input(
     State(state): State<Arc<HtsUiState>>,
     Path(id): Path<String>,
-    HxRequest(is_htmx): HxRequest,
+    HxRequest(_is_htmx): HxRequest,
     locale: RequestLocale,
 ) -> Response {
     let chrome = Chrome {
@@ -435,16 +397,6 @@ async fn subsumes_input(
         version: state.version,
     };
     let summary = state.upstream.read_code_system(&id).await.ok();
-    if is_htmx {
-        return render(
-            SubsumesInputTemplate {
-                chrome,
-                id,
-                summary,
-            }
-            .render(),
-        );
-    }
     render_detail_with_tab(&state, chrome, id, CsTab::Subsumes, summary).await
 }
 
@@ -575,13 +527,30 @@ async fn lookup_run(
         fhir_version: state.fhir_version,
         version: state.version,
     };
+    // §8.2 canonical-url contract: the HTS backend stores resources with
+    // composite ids (`{fhir_id}|{version}`) so the instance route
+    // `/CodeSystem/{id}/$lookup` misses when passed the base fhir id.
+    // Resolve the canonical url first, then delegate to the type-level
+    // `$lookup` that pins the CS via `system=<canonical>`. If the read
+    // fails (composite unknown, closed-loopback test upstream, transient
+    // 5xx) we fall back to the instance-level call so the operator still
+    // sees an actionable outcome — mirrors validate/subsumes semantics
+    // and preserves closed-loopback pre-flight tests that never touch
+    // canonical resolution.
+    let cs = state.upstream.read_code_system(&id).await;
+    let canonical = cs.as_ref().map(|s| s.url.clone()).unwrap_or_default();
     let view = if params.code.trim().is_empty() {
         WorkbenchResultView {
             outcome: Some(OutcomeView::invalid_input("code is required".to_string())),
             ..WorkbenchResultView::empty(CsTab::Lookup)
         }
     } else {
-        match state.upstream.cs_lookup(&id, params).await {
+        let result = if !canonical.is_empty() {
+            state.upstream.cs_lookup_type_level(&canonical, params).await
+        } else {
+            state.upstream.cs_lookup(&id, params).await
+        };
+        match result {
             Ok(result) => WorkbenchResultView {
                 op: CsTab::Lookup,
                 request_url: result.request_url.clone(),
@@ -593,11 +562,11 @@ async fn lookup_run(
                 degraded_reason: None,
             },
             Err(err) => {
-                let request_url = format!(
-                    "{}/CodeSystem/{}/$lookup",
-                    state.upstream.base_url(),
-                    id
-                );
+                let request_url = if !canonical.is_empty() {
+                    format!("{}/CodeSystem/$lookup", state.upstream.base_url())
+                } else {
+                    format!("{}/CodeSystem/{}/$lookup", state.upstream.base_url(), id)
+                };
                 WorkbenchResultView::from_error(CsTab::Lookup, request_url, &err)
             }
         }

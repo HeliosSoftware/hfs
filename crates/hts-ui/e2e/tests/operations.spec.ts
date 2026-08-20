@@ -109,6 +109,26 @@ test.describe("HTS Operations workbench shell (§7.6)", () => {
     ).toHaveAttribute("aria-selected", "true");
   });
 
+  test("clicking a resource-family tab updates aria-current on the tab strip (Bug 3 regression)", async ({
+    page,
+  }) => {
+    // Region-wrap contract (design doc §8.1) for the operations page.
+    // Before the region wrapper the tabs strip lived outside the htmx
+    // swap target so clicking `Value set` under `batch-validate` (or
+    // any resource-family strip) rendered the VS input body but left
+    // aria-current on the previous `Code system` tab. Assert both
+    // tabs' aria-current move together with the visible input.
+    await page.goto("/ui/hts/operations?op=batch-validate&resource=CodeSystem");
+    const csTab = page.getByRole("tab", { name: /CodeSystem/i, exact: false });
+    const vsTab = page.getByRole("tab", { name: /ValueSet/i, exact: false });
+    await expect(csTab).toHaveAttribute("aria-current", "true");
+    await vsTab.click();
+    // htmx swap completes when the VS input renders.
+    await expect(page.locator("#hts-op-region")).toBeVisible({ timeout: 3_000 });
+    await expect(vsTab).toHaveAttribute("aria-current", "true");
+    await expect(csTab).not.toHaveAttribute("aria-current", "true");
+  });
+
   test("switching the op selector swaps the input partial via htmx without a full reload", async ({
     page,
   }) => {

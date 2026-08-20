@@ -284,8 +284,11 @@ test.describe("HTS Import a11y and dual-mode contract (§7.7)", () => {
     await expect(textarea).toBeVisible();
     // Belt-and-braces: the DOM `<label for>` value must match the
     // textarea id so screen readers announce the accessible name.
+    // Post form-polish (design doc §9), the label is a shared
+    // `.field__label`; we anchor on the semantic `for=` target instead
+    // of the removed BEM class.
     const forAttr = await page
-      .locator("label.hts-import__bundle-label")
+      .locator('label[for="hts-import-bundle"]')
       .getAttribute("for");
     expect(forAttr).toBe("hts-import-bundle");
   });

@@ -218,7 +218,17 @@ async fn detail_soft_deleted_would_render_outcome_not_page_404() {
 }
 
 #[tokio::test]
-async fn lookup_input_hx_renders_input_partial_only() {
+async fn lookup_input_hx_returns_full_page_for_region_swap() {
+    // Region-wrap contract (design doc §8.1): a tab-click GET now returns
+    // the full detail page; htmx uses `hx-select="#hts-cs-detail-region"`
+    // to pick the tabs+workbench region out of the response so the
+    // aria-current attribute on the tab strip stays in sync with the
+    // panel the operator sees. This test runs against the closed-loopback
+    // upstream so read_code_system fails and the outcome banner renders
+    // in place of the region — the important assertion is that the
+    // response is a full HTML page (previously it was the input partial
+    // only), which unlocks htmx to `hx-select` the region when the read
+    // succeeds against a real HTS.
     let response = app()
         .oneshot(
             Request::get("/ui/hts/code-systems/example-system/lookup")
@@ -231,12 +241,12 @@ async fn lookup_input_hx_renders_input_partial_only() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("hts-cs-workbench__input"),
-        "htmx tab load must return only the workbench input partial",
+        html.contains("<!doctype html>") || html.contains("<!DOCTYPE html>"),
+        "htmx tab load now returns the full page so htmx can hx-select the region",
     );
     assert!(
-        !html.contains("<!doctype html>"),
-        "htmx tab load must not include the full page shell",
+        html.contains("hts-degraded") || html.contains("hts-outcome"),
+        "closed-loopback upstream must surface the degraded banner (Connect) or outcome banner (NotFound) in place of the workbench",
     );
 }
 

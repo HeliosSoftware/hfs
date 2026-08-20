@@ -92,7 +92,7 @@
                   {% if row.status.is_empty() %}
                     &mdash;
                   {% else %}
-                    <span class="pill pill--{{ row.status }}">{{ chrome.i18n.t(format!("hts-cm-status-{}", row.status).as_str()) }}</span>
+                    <span class="tag tag--{{ row.status }}">{{ chrome.i18n.t(format!("hts-cm-status-{}", row.status).as_str()) }}</span>
                   {% endif %}
                 </td>
               </tr>

@@ -114,6 +114,28 @@ test.describe("HTS CodeSystem detail + workbench (§7.3)", () => {
     ).toBeVisible({ timeout: 3_000 });
   });
 
+  test("clicking a tab moves the aria-current highlight off Metadata (Bug 1 regression)", async ({
+    page,
+  }) => {
+    // Region-wrap contract (design doc §8.1). Before the region wrapper
+    // the tabs strip lived outside the htmx swap target, so a tab click
+    // updated the panel without refreshing aria-current — Metadata
+    // stayed highlighted even after Lookup rendered. Assert the swap
+    // now updates the whole `#hts-cs-detail-region`, so aria-current
+    // moves with the visible panel.
+    await page.goto("/ui/hts/code-systems/ex-cs-1");
+    const metadata = page.getByRole("tab", { name: "Metadata", exact: true });
+    const lookup = page.getByRole("tab", { name: "Lookup", exact: true });
+    await expect(metadata).toHaveAttribute("aria-current", "true");
+    await lookup.click();
+    // htmx swap completes when the run button appears.
+    await expect(
+      page.getByRole("button", { name: "Run", exact: true }),
+    ).toBeVisible({ timeout: 3_000 });
+    await expect(lookup).toHaveAttribute("aria-current", "true");
+    await expect(metadata).not.toHaveAttribute("aria-current", "true");
+  });
+
   test("running $lookup with the seed code renders a designation + property panel", async ({
     page,
   }) => {

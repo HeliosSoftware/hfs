@@ -77,12 +77,12 @@
     <article class="hts-cs-workbench__result hts-cs-workbench__result--validate">
       <header class="hts-cs-workbench__result-head">
         {% if result.result %}
-          <span class="pill pill--active hts-cs-workbench__badge hts-cs-workbench__badge--true"
+          <span class="tag tag--matched hts-cs-workbench__badge hts-cs-workbench__badge--true"
                 aria-label="{{ chrome.i18n.t("hts-cs-validate-badge-true") }}">
             {{ chrome.i18n.t("hts-cs-validate-badge-true") }}
           </span>
         {% else %}
-          <span class="pill pill--retired hts-cs-workbench__badge hts-cs-workbench__badge--false"
+          <span class="tag tag--excluded hts-cs-workbench__badge hts-cs-workbench__badge--false"
                 aria-label="{{ chrome.i18n.t("hts-cs-validate-badge-false") }}">
             {{ chrome.i18n.t("hts-cs-validate-badge-false") }}
           </span>

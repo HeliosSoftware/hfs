@@ -329,20 +329,23 @@ async fn slice_e_shell_input_and_stubs_hold_together() {
     );
 
     // ── Resource-family tab strip: rendered for validate-code + batch.
+    // Sentinel is the stable `id="hts-op-resource-tabs"` (post form-polish
+    // refactor: BEM `.hts-op-tabs` replaced by the shared `.tabs`
+    // primitive + this id for tests).
     let (_, body_vc) =
         get("/ui/hts/operations?op=validate-code&resource=CodeSystem").await;
     assert!(
-        body_vc.contains("hts-op-tabs"),
+        body_vc.contains("id=\"hts-op-resource-tabs\""),
         "validate-code shell must expose the resource-family tab strip"
     );
     let (_, body_batch) =
         get("/ui/hts/operations?op=batch-validate&resource=CodeSystem").await;
     assert!(
-        body_batch.contains("hts-op-tabs"),
+        body_batch.contains("id=\"hts-op-resource-tabs\""),
         "batch-validate shell must expose the resource-family tab strip"
     );
     assert!(
-        !body_lookup.contains("hts-op-tabs"),
+        !body_lookup.contains("id=\"hts-op-resource-tabs\""),
         "lookup shell must NOT expose the resource-family tab strip"
     );
 

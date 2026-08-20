@@ -2027,6 +2027,137 @@ impl UpstreamClient {
         })
     }
 
+    /// Type-level `POST /ValueSet/$expand` pinned by canonical `url`
+    /// (design doc §8.2). Used by the VS detail workbench when the
+    /// upstream stores resources with composite ids (`{fhir_id}|{version}`);
+    /// the instance route (`/ValueSet/{id}/$expand`) can't be reached
+    /// without the composite, but the canonical URL always resolves.
+    ///
+    /// The parameter matrix mirrors [`Self::vs_expand_instance`] modulo
+    /// the leading `url` parameter and the header contract.
+    pub async fn vs_expand_by_url(
+        &self,
+        canonical_url: &str,
+        params: &ExpandParams,
+    ) -> Result<ExpansionResult, UpstreamError> {
+        let mut parameters: Vec<Value> = vec![json!({"name": "url", "valueUri": canonical_url})];
+        if let Some(v) = params.filter.as_deref().and_then(non_empty_str) {
+            parameters.push(json!({"name": "filter", "valueString": v}));
+        }
+        if let Some(c) = params.count {
+            parameters.push(json!({"name": "count", "valueInteger": c}));
+        }
+        if let Some(o) = params.offset {
+            parameters.push(json!({"name": "offset", "valueInteger": o}));
+        }
+        if let Some(v) = params.display_language.as_deref().and_then(non_empty_str) {
+            parameters.push(json!({"name": "displayLanguage", "valueCode": v}));
+        }
+        if let Some(true) = params.active_only {
+            parameters.push(json!({"name": "activeOnly", "valueBoolean": true}));
+        }
+        if let Some(true) = params.include_designations {
+            parameters.push(json!({"name": "includeDesignations", "valueBoolean": true}));
+        }
+        for v in params.use_supplement.iter().filter_map(|s| non_empty_str(s)) {
+            parameters.push(json!({"name": "useSupplement", "valueCanonical": v}));
+        }
+        if let Some(v) = params.date.as_deref().and_then(non_empty_str) {
+            parameters.push(json!({"name": "date", "valueDateTime": v}));
+        }
+        for v in params.property.iter().filter_map(|s| non_empty_str(s)) {
+            parameters.push(json!({"name": "property", "valueString": v}));
+        }
+        for v in params.tx_resource.iter().filter_map(|s| non_empty_str(s)) {
+            parameters.push(json!({"name": "tx-resource", "valueString": v}));
+        }
+        for v in params.system_version.iter().filter_map(|s| non_empty_str(s)) {
+            parameters.push(json!({"name": "system-version", "valueCanonical": v}));
+        }
+        for v in params
+            .check_system_version
+            .iter()
+            .filter_map(|s| non_empty_str(s))
+        {
+            parameters.push(json!({"name": "check-system-version", "valueCanonical": v}));
+        }
+        for v in params
+            .force_system_version
+            .iter()
+            .filter_map(|s| non_empty_str(s))
+        {
+            parameters.push(json!({"name": "force-system-version", "valueCanonical": v}));
+        }
+        if let Some(v) = params
+            .default_valueset_version
+            .as_deref()
+            .and_then(non_empty_str)
+        {
+            parameters.push(
+                json!({"name": "default-valueset-version", "valueCanonical": v}),
+            );
+        }
+        if let Some(true) = params.hierarchical {
+            parameters.push(json!({"name": "hierarchical", "valueBoolean": true}));
+        } else if let Some(true) = params.exclude_nested {
+            parameters.push(json!({"name": "excludeNested", "valueBoolean": true}));
+        }
+
+        let (attach_threshold, ceiling_warning) = match params.threshold {
+            Some(n) if n <= HTS_UI_MAX_EXPANSION_SIZE_HINT => (Some(n), None),
+            Some(n) => (None, Some(n)),
+            None => (None, None),
+        };
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": parameters,
+        });
+        let url = format!("{}/ValueSet/$expand", self.base_url);
+        let (raw, parsed) = self
+            .post_parameters_with_headers(
+                "vs-expand",
+                &url,
+                &body,
+                attach_threshold.map(|n| ("X-TOO-COSTLY-THRESHOLD".to_owned(), n.to_string())),
+            )
+            .await?;
+
+        let expansion = parsed.get("expansion").cloned().unwrap_or(Value::Null);
+        let contains = parse_expansion_contains(expansion.get("contains"));
+        let is_tree = contains_has_children(&contains);
+        let echoed_parameters = parse_expansion_parameters(expansion.get("parameter"));
+        let total = expansion.get("total").and_then(|v| v.as_u64());
+        let offset = expansion.get("offset").and_then(|v| v.as_u64());
+        let timestamp = expansion
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let identifier = expansion
+            .get("identifier")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned();
+
+        Ok(ExpansionResult {
+            total,
+            offset,
+            timestamp,
+            identifier,
+            contains,
+            is_tree,
+            echoed_parameters,
+            request_url: url,
+            raw_body: raw,
+            requested_filter: params.filter.clone().unwrap_or_default(),
+            requested_count: params.count.unwrap_or(0),
+            requested_offset: params.offset.unwrap_or(0),
+            requested_threshold: params.threshold,
+            ceiling_warning,
+        })
+    }
+
     /// Variant of [`Self::post_parameters`] that also accepts an
     /// optional extra header (used for `X-TOO-COSTLY-THRESHOLD`). Kept
     /// distinct from `post_parameters` so the CS operation methods stay
@@ -2740,6 +2871,89 @@ impl UpstreamClient {
                         // kind. HTS emits either `equivalence` (R4/R4B) or
                         // `relationship` (R5/R6) uniformly across all
                         // matches in one response, so first-wins is safe.
+                        if out.mapping_kind == MappingKind::Unknown {
+                            out.mapping_kind = kind;
+                        }
+                        out.matches.push(mat);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Type-level `POST /ConceptMap/$translate` pinned by canonical `url`
+    /// (design doc §8.2). Used by the CM detail workbench when the
+    /// upstream stores resources with composite ids (`{fhir_id}|{version}`);
+    /// the instance route (`/ConceptMap/{id}/$translate`) can't be reached
+    /// without the composite, but the canonical URL always resolves.
+    ///
+    /// The parameter matrix mirrors [`Self::cm_translate_instance`] modulo
+    /// the leading `url` parameter.
+    pub async fn cm_translate_by_url(
+        &self,
+        canonical_url: &str,
+        params: &TranslateParams,
+    ) -> Result<TranslateResult, UpstreamError> {
+        let mut parameters: Vec<Value> =
+            vec![json!({"name": "url", "valueCanonical": canonical_url})];
+        match params.direction {
+            TranslateDirection::Forward => {
+                if let Some(v) = params.code.as_deref().and_then(non_empty_str) {
+                    parameters.push(json!({"name": "code", "valueCode": v}));
+                }
+                if let Some(v) = params.system.as_deref().and_then(non_empty_str) {
+                    parameters.push(json!({"name": "system", "valueUri": v}));
+                }
+                if let Some(v) = params.display.as_deref().and_then(non_empty_str) {
+                    parameters.push(json!({"name": "display", "valueString": v}));
+                }
+            }
+            TranslateDirection::Reverse => {
+                parameters.push(json!({"name": "reverse", "valueBoolean": true}));
+                if let Some(v) = params.target_code.as_deref().and_then(non_empty_str) {
+                    parameters.push(json!({"name": "targetCode", "valueCode": v}));
+                }
+            }
+        }
+        if let Some(v) = params.target_system.as_deref().and_then(non_empty_str) {
+            parameters.push(json!({"name": "targetSystem", "valueUri": v}));
+        }
+        if let Some(v) = params.source_url.as_deref().and_then(non_empty_str) {
+            parameters.push(json!({"name": "source", "valueUri": v}));
+        }
+        if let Some(v) = params.target_url.as_deref().and_then(non_empty_str) {
+            parameters.push(json!({"name": "target", "valueUri": v}));
+        }
+        if let Some(v) = params.date.as_deref().and_then(non_empty_str) {
+            parameters.push(json!({"name": "date", "valueDateTime": v}));
+        }
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": parameters,
+        });
+        let url = format!("{}/ConceptMap/$translate", self.base_url);
+        let (raw, parsed) = self.post_parameters("cm-translate", &url, &body).await?;
+
+        let mut out = TranslateResult {
+            raw_body: raw,
+            request_url: url.clone(),
+            ..TranslateResult::default()
+        };
+        for (name, value_obj) in iter_parameters(&parsed) {
+            match name {
+                "result" => {
+                    out.result = value_obj
+                        .get("valueBoolean")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                }
+                "message" => {
+                    out.message = value_obj_str(value_obj, "valueString").to_owned();
+                }
+                "match" => {
+                    if let Some((mat, kind)) = parse_translate_match(value_obj) {
                         if out.mapping_kind == MappingKind::Unknown {
                             out.mapping_kind = kind;
                         }

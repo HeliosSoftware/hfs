@@ -38,7 +38,7 @@
           <span class="hts-cm-detail__version"> · v{{ summary.version }}</span>
         {% endif %}
         {% if !summary.status.is_empty() %}
-          <span class="pill pill--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
+          <span class="tag tag--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
             {{ chrome.i18n.t(format!("hts-cm-status-{}", summary.status).as_str()) }}
           </span>
         {% endif %}
@@ -109,33 +109,43 @@
     </div>
 
     {#-
-      Tabs strip. §7.5 ships two tabs: Metadata + Translate. Real <a>s
-      so the nojs fallback works; htmx hijacks the click to swap only
-      the workbench region.
+      Region wrapper (design doc §8.1). Same region-swap contract as
+      cs-detail: tabs + workbench live inside #hts-cm-detail-region.
     -#}
-    <div class="hts-cm-detail__tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-cm-detail-tabs-label") }}">
+    <div id="hts-cm-detail-region">
+    {#-
+      Tabs strip. §7.5 ships two tabs: Metadata + Translate. Real <a>s
+      so the nojs fallback works; htmx hijacks the click to swap the
+      region.
+    -#}
+    <nav class="tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-cm-detail-tabs-label") }}">
       <a role="tab"
-         class="hts-cm-detail__tab{% if tab == CmTab::Metadata %} is-active{% endif %}"
+         class="tab"
          aria-selected="{% if tab == CmTab::Metadata %}true{% else %}false{% endif %}"
+         {% if tab == CmTab::Metadata %}aria-current="true"{% endif %}
          aria-controls="hts-cm-workbench"
          href="/ui/hts/concept-maps/{{ id }}"
          hx-get="/ui/hts/concept-maps/{{ id }}"
-         hx-target="#hts-cm-workbench"
-         hx-select="#hts-cm-workbench"
-         hx-swap="outerHTML">
+         hx-target="#hts-cm-detail-region"
+         hx-select="#hts-cm-detail-region"
+         hx-swap="outerHTML"
+         hx-push-url="true">
         {{ chrome.i18n.t("hts-cm-detail-tab-metadata") }}
       </a>
       <a role="tab"
-         class="hts-cm-detail__tab{% if tab == CmTab::Translate %} is-active{% endif %}"
+         class="tab"
          aria-selected="{% if tab == CmTab::Translate %}true{% else %}false{% endif %}"
+         {% if tab == CmTab::Translate %}aria-current="true"{% endif %}
          aria-controls="hts-cm-workbench"
          href="/ui/hts/concept-maps/{{ id }}/translate"
          hx-get="/ui/hts/concept-maps/{{ id }}/translate"
-         hx-target="#hts-workbench-input"
-         hx-swap="outerHTML">
+         hx-target="#hts-cm-detail-region"
+         hx-select="#hts-cm-detail-region"
+         hx-swap="outerHTML"
+         hx-push-url="true">
         {{ chrome.i18n.t("hts-cm-detail-tab-translate") }}
       </a>
-    </div>
+    </nav>
 
     <div id="hts-cm-workbench" class="hts-cm-detail__workbench" role="tabpanel" aria-labelledby="hts-cm-detail-heading">
       {% match tab %}
@@ -162,6 +172,7 @@
         {% endif %}
       {% endif %}
     </div>
+    </div>{# /#hts-cm-detail-region #}
   {% endif %}
 </section>
 {% endblock %}

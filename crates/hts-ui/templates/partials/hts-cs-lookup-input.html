@@ -2,10 +2,13 @@
   CodeSystem `$lookup` input form (design doc §7.3, ui-design-map §2).
 
   Inputs mirror the parameter matrix at hts-details.md §CodeSystem `$lookup`
-  minus `expression` (HTS returns 501 for it — design doc §7.3 forbids
+  minus `expression` (HTS returns 501 for it - design doc §7.3 forbids
   exposing). `useSupplement` is deferred to Slice E's standalone workbench;
   the CS detail workbench keeps the field set small so the inline surface
   reads at a glance.
+
+  Layout: `.field`/`.field__input` primitives; code and version share a
+  `.builder-grid` row (design doc §9 form contract).
 -#}
 <form id="hts-workbench-input"
       class="hts-cs-workbench__input"
@@ -19,24 +22,25 @@
     {{ chrome.i18n.t("hts-cs-lookup-heading") }}
   </h3>
 
-  <div class="hts-cs-workbench__field">
-    <label for="lookup-code">{{ chrome.i18n.t("hts-cs-lookup-code") }}</label>
-    <input id="lookup-code" name="code" type="text" required autocomplete="off" spellcheck="false">
+  <div class="builder-grid">
+    <div class="field">
+      <label class="field__label" for="lookup-code">{{ chrome.i18n.t("hts-cs-lookup-code") }}</label>
+      <input class="field__input" id="lookup-code" name="code" type="text" required autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label class="field__label" for="lookup-version">{{ chrome.i18n.t("hts-cs-lookup-version") }}</label>
+      <input class="field__input" id="lookup-version" name="version" type="text" autocomplete="off" spellcheck="false"
+             value="{% if let Some(s) = summary %}{{ s.version }}{% endif %}">
+    </div>
   </div>
 
-  <div class="hts-cs-workbench__field">
-    <label for="lookup-version">{{ chrome.i18n.t("hts-cs-lookup-version") }}</label>
-    <input id="lookup-version" name="version" type="text" autocomplete="off" spellcheck="false"
-           value="{% if let Some(s) = summary %}{{ s.version }}{% endif %}">
-  </div>
-
-  <div class="hts-cs-workbench__field">
-    <label for="lookup-display-language">{{ chrome.i18n.t("hts-cs-lookup-display-language") }}</label>
-    <input id="lookup-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false"
+  <div class="field">
+    <label class="field__label" for="lookup-display-language">{{ chrome.i18n.t("hts-cs-lookup-display-language") }}</label>
+    <input class="field__input" id="lookup-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false"
            placeholder="{{ chrome.i18n.t("hts-cs-lookup-display-language-placeholder") }}">
   </div>
 
-  <fieldset class="hts-cs-workbench__field hts-cs-workbench__field--properties">
+  <fieldset>
     <legend>{{ chrome.i18n.t("hts-cs-lookup-properties-legend") }}</legend>
     {#-
       Repeatable `property` values. Passing `*` requests all properties
@@ -45,25 +49,25 @@
       generated from a Rust array because Askama 0.16 has no
       &&str == &str fallback for iteration variables.
     -#}
-    <label class="hts-cs-workbench__checkbox">
+    <label>
       <input type="checkbox" name="property" value="*" checked>
       <code>*</code>
     </label>
-    <label class="hts-cs-workbench__checkbox">
+    <label>
       <input type="checkbox" name="property" value="parent">
       <code>parent</code>
     </label>
-    <label class="hts-cs-workbench__checkbox">
+    <label>
       <input type="checkbox" name="property" value="child">
       <code>child</code>
     </label>
-    <label class="hts-cs-workbench__checkbox">
+    <label>
       <input type="checkbox" name="property" value="definition">
       <code>definition</code>
     </label>
   </fieldset>
 
-  <div class="hts-cs-workbench__actions">
+  <div class="form-actions">
     <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
   </div>
 </form>
