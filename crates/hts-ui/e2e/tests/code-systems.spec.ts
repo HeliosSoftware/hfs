@@ -82,6 +82,28 @@ test.describe("HTS CodeSystem detail + workbench (§7.3)", () => {
     await expect(page.getByText("http://example.org/cs")).toBeVisible();
   });
 
+  test("clicking a filler row from the browser opens its Metadata tab", async ({ page }) => {
+    // Regression: HTS's summary-mode search projects `id="{fhir_id}|{version}"`.
+    // Row projection must strip the `|version` suffix or the /detail Alt E
+    // lookup (see upstream.rs base_id + resolve_canonical_url) never
+    // matches and the page renders only chrome + a not-found banner.
+    await page.goto("/ui/hts/code-systems");
+    const link = page.getByRole("link", { name: "FillerCS2", exact: true });
+    await expect(link).toBeVisible();
+    // Link href must not carry a composite id (`|` character).
+    const href = await link.getAttribute("href");
+    expect(href).not.toContain("|");
+    await link.click();
+    // The detail page must land on the Metadata tab with the resource's
+    // canonical URL visible — proving Alt E fully resolved the resource.
+    await expect(
+      page.getByRole("tab", { name: "Metadata", exact: true }),
+    ).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByText("http://example.org/cs/filler-2")).toBeVisible();
+    // And the not-found banner must be absent.
+    await expect(page.locator(".hts-outcome--error")).toHaveCount(0);
+  });
+
   test("clicking the Lookup tab swaps in the workbench input via htmx", async ({ page }) => {
     await page.goto("/ui/hts/code-systems/ex-cs-1");
     await page.getByRole("tab", { name: "Lookup", exact: true }).click();

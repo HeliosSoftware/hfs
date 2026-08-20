@@ -78,6 +78,25 @@ test.describe("HTS ValueSet detail + $expand workbench (Â§7.4)", () => {
     ).toHaveCount(0);
   });
 
+  test("clicking a row from the browser opens its Metadata tab", async ({ page }) => {
+    // Regression mirror of code-systems.spec.ts: HTS emits composite
+    // `id="{fhir_id}|{version}"` on summary search. Row projection must
+    // strip the `|version` or the detail Alt E lookup returns not-found
+    // and the page renders only chrome + a banner. See upstream.rs
+    // base_id + resolve_canonical_url.
+    await page.goto("/ui/hts/value-sets");
+    const link = page.getByRole("link", { name: "ExampleTreeVS", exact: true });
+    await expect(link).toBeVisible();
+    const href = await link.getAttribute("href");
+    expect(href).not.toContain("|");
+    await link.click();
+    await expect(
+      page.getByRole("tab", { name: "Metadata", exact: true }),
+    ).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByText("http://example.org/vs/tree")).toBeVisible();
+    await expect(page.locator(".hts-outcome--error")).toHaveCount(0);
+  });
+
   test("clicking the Expand tab swaps in the workbench input via htmx", async ({
     page,
   }) => {

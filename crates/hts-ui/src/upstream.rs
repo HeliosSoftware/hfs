@@ -492,7 +492,7 @@ impl CsBrowserRow {
                 .to_owned()
         };
         Self {
-            id: s("id"),
+            id: base_id(&s("id")).to_owned(),
             url: s("url"),
             version: s("version"),
             name: s("name"),
@@ -524,9 +524,12 @@ impl CsBrowserPage {
         }
     }
 
-    /// Row count for the localized "Showing N" strip (§7.2 wireframe).
+    /// Cumulative rows loaded into the table for the "Showing N" strip
+    /// (§7.2). Load-more appends pages via `beforeend` + OOB footer swap,
+    /// so N must be `offset + len(this page)` (e.g. 25 then 34), not the
+    /// latest page size alone (which would regress to "Showing 9").
     pub fn showing_count(&self) -> usize {
-        self.rows.len()
+        (self.filters.offset as usize).saturating_add(self.rows.len())
     }
 }
 
@@ -878,6 +881,7 @@ impl UpstreamClient {
             message: e.to_string(),
         })?;
         let notfound_url = format!("{}/{}/{}", self.base_url, resource_type, id);
+        let want = base_id(id);
         bundle
             .get("entry")
             .and_then(|entries| entries.as_array())
@@ -885,8 +889,7 @@ impl UpstreamClient {
                 entries.iter().find_map(|entry| {
                     let resource = entry.get("resource")?;
                     let entry_id = resource.get("id").and_then(|v| v.as_str())?;
-                    let base = entry_id.split('|').next().unwrap_or(entry_id);
-                    if base == id {
+                    if base_id(entry_id) == want {
                         resource
                             .get("url")
                             .and_then(|v| v.as_str())
@@ -942,6 +945,7 @@ impl UpstreamClient {
             message: e.to_string(),
         })?;
         let notfound_url = format!("{}/{}/{}", self.base_url, resource_type, id);
+        let want = base_id(id);
         bundle
             .get("entry")
             .and_then(|entries| entries.as_array())
@@ -949,8 +953,7 @@ impl UpstreamClient {
                 entries.iter().find_map(|entry| {
                     let resource = entry.get("resource")?;
                     let entry_id = resource.get("id").and_then(|v| v.as_str())?;
-                    let base = entry_id.split('|').next().unwrap_or(entry_id);
-                    if base == id {
+                    if base_id(entry_id) == want {
                         Some(resource.clone())
                     } else {
                         None
@@ -1485,7 +1488,7 @@ impl VsBrowserRow {
                 .to_owned()
         };
         Self {
-            id: s("id"),
+            id: base_id(&s("id")).to_owned(),
             url: s("url"),
             version: s("version"),
             name: s("name"),
@@ -1517,8 +1520,9 @@ impl VsBrowserPage {
         }
     }
 
+    /// Cumulative rows loaded — see [`CsBrowserPage::showing_count`].
     pub fn showing_count(&self) -> usize {
-        self.rows.len()
+        (self.filters.offset as usize).saturating_add(self.rows.len())
     }
 }
 
@@ -2307,7 +2311,7 @@ impl CmBrowserRow {
             &["targetUri", "targetCanonical", "targetScopeUri", "targetScopeCanonical"],
         );
         Self {
-            id: s("id"),
+            id: base_id(&s("id")).to_owned(),
             url: s("url"),
             version: s("version"),
             name: s("name"),
@@ -2338,8 +2342,9 @@ impl CmBrowserPage {
         }
     }
 
+    /// Cumulative rows loaded — see [`CsBrowserPage::showing_count`].
     pub fn showing_count(&self) -> usize {
-        self.rows.len()
+        (self.filters.offset as usize).saturating_add(self.rows.len())
     }
 }
 
@@ -2815,6 +2820,15 @@ fn parse_translate_match(param: &Value) -> Option<(TranslateMatch, MappingKind)>
         }
     }
     Some((mat, kind))
+}
+
+/// HTS's SQLite summary search projects `resource.id` as the composite
+/// storage key `"{fhir_id}|{version}"` (Alt E workaround, see
+/// [`UpstreamClient::resolve_canonical_url`]). Row projections need the
+/// bare fhir id so links and detail lookups round-trip; the version
+/// already rides in its own column. `id` without `|` is returned as-is.
+fn base_id(id: &str) -> &str {
+    id.split('|').next().unwrap_or(id)
 }
 
 /// Pick the first non-empty string value at any of the given keys — used
@@ -3974,6 +3988,84 @@ mod tests {
             },
         };
         assert_eq!(page.next_offset(), Some(75));
+    }
+
+    #[test]
+    fn browser_page_showing_count_is_cumulative_across_offset() {
+        // First page: offset 0, 25 rows → "Showing 25".
+        let page = CsBrowserPage {
+            rows: vec![CsBrowserRow::default(); 25],
+            filters: CsBrowserFilters {
+                count: 25,
+                offset: 0,
+                ..CsBrowserFilters::default()
+            },
+        };
+        assert_eq!(page.showing_count(), 25);
+
+        // Load-more page: offset 25, 9 rows → "Showing 34" (not 9).
+        let page = CsBrowserPage {
+            rows: vec![CsBrowserRow::default(); 9],
+            filters: CsBrowserFilters {
+                count: 25,
+                offset: 25,
+                ..CsBrowserFilters::default()
+            },
+        };
+        assert_eq!(page.showing_count(), 34);
+    }
+
+    #[test]
+    fn base_id_splits_composite_storage_key() {
+        assert_eq!(base_id("ex-cs-2|1.0.0"), "ex-cs-2");
+        assert_eq!(base_id("ex-cs-2"), "ex-cs-2");
+        assert_eq!(base_id(""), "");
+    }
+
+    #[test]
+    fn browser_row_from_resource_normalizes_composite_id() {
+        // HTS SQLite summary path emits `id="{fhir_id}|{version}"`. The
+        // row projection must return the bare fhir id so the browser link
+        // and the Alt E detail lookup round-trip; version already rides
+        // in its own column.
+        let resource = serde_json::json!({
+            "id": "ex-cs-2|1.0.0",
+            "url": "http://example.org/cs/filler-2",
+            "version": "1.0.0",
+            "name": "FillerCS2",
+            "title": "",
+            "status": "active",
+        });
+        let row = CsBrowserRow::from_resource(&resource);
+        assert_eq!(row.id, "ex-cs-2", "CS row id must drop the |version suffix");
+        assert_eq!(row.version, "1.0.0");
+        assert_eq!(row.name, "FillerCS2");
+
+        let vs_resource = serde_json::json!({
+            "id": "ex-vs-7|2.1.0",
+            "url": "http://example.org/vs/filler-7",
+            "version": "2.1.0",
+            "name": "FillerVS7",
+            "title": "",
+            "status": "active",
+        });
+        let vs_row = VsBrowserRow::from_resource(&vs_resource);
+        assert_eq!(vs_row.id, "ex-vs-7");
+        assert_eq!(vs_row.version, "2.1.0");
+
+        let cm_resource = serde_json::json!({
+            "id": "ex-cm-3|1.0.0",
+            "url": "http://example.org/cm/filler-3",
+            "version": "1.0.0",
+            "name": "FillerCM3",
+            "title": "",
+            "status": "active",
+            "sourceUri": "http://example.org/cs/source",
+            "targetUri": "http://example.org/cs/target",
+        });
+        let cm_row = CmBrowserRow::from_resource(&cm_resource);
+        assert_eq!(cm_row.id, "ex-cm-3");
+        assert_eq!(cm_row.version, "1.0.0");
     }
 
     #[test]
