@@ -19,6 +19,7 @@ app-tagline = A fast, multi-version FHIR server
 
 nav-dashboard = Dashboard
 nav-terminology = Terminology
+nav-terminology-new-window = Terminology (opens in a new tab)
 nav-resources = Resources
 nav-settings = Settings
 nav-signout = Sign out
@@ -54,6 +55,17 @@ resource-count = { $count ->
 
 ## Terminology browsing
 
+terminology-heading = Terminology server
+terminology-lede = Connect HFS to a FHIR terminology server.
+terminology-configured-heading = Terminology server configured
+terminology-configured-body = HFS_TERMINOLOGY_SERVER points to a valid server URL.
+terminology-configured-open = Open terminology server
+terminology-invalid-heading = HFS_TERMINOLOGY_SERVER is invalid
+terminology-invalid-body = Use an absolute HTTP or HTTPS URL with a host. Paths and a trailing slash are allowed. Do not include credentials, a query string, or a fragment.
+terminology-invalid-note = Update the environment variable, then restart HFS.
+terminology-setup-heading = Connect a terminology server
+terminology-setup-body = Set HFS_TERMINOLOGY_SERVER to the base URL of the FHIR terminology server that HFS should use.
+terminology-setup-note = Set the variable in the environment that starts HFS, then restart the server.
 terminology-search-label = Search CodeSystems and ValueSets
 terminology-search-placeholder = e.g. 73211009, "diabetes", http://snomed.info/sct
 terminology-display-language = Display language

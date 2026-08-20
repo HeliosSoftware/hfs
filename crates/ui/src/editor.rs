@@ -191,7 +191,7 @@ pub async fn page(
     Query(query): Query<EditorQuery>,
 ) -> Response {
     render(EditorPage {
-        status: crate::current_status(state.version, rv.0, &rt),
+        status: crate::current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "editor",
         resource_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),

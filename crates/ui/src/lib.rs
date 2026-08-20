@@ -300,6 +300,44 @@ pub(crate) struct Status {
     /// Whether the subscriptions engine is advertised — the sidebar entry and
     /// the operator page only appear when it is (#580).
     subscriptions_enabled: bool,
+    /// The safe navigation state derived from `HFS_TERMINOLOGY_SERVER` (#611).
+    /// The raw value is never exposed to templates unless it is a valid HTTP(S)
+    /// base URL.
+    terminology: TerminologyNavigation,
+}
+
+enum TerminologyNavigation {
+    Unconfigured,
+    Invalid,
+    Valid(String),
+}
+
+impl TerminologyNavigation {
+    fn from_config(value: Option<&str>) -> Self {
+        let Some(raw) = value else {
+            return Self::Unconfigured;
+        };
+
+        if raw.is_empty() || raw.trim() != raw {
+            return Self::Invalid;
+        }
+
+        let Ok(url) = reqwest::Url::parse(raw) else {
+            return Self::Invalid;
+        };
+        let valid = matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none();
+
+        if valid {
+            Self::Valid(raw.to_string())
+        } else {
+            Self::Invalid
+        }
+    }
 }
 
 impl Status {
@@ -326,6 +364,21 @@ impl Status {
     /// Whether the subscriptions engine is advertised (#580).
     pub(crate) fn subscriptions_enabled(&self) -> bool {
         self.subscriptions_enabled
+    }
+
+    /// A browser-safe terminology destination, when the configured value is a
+    /// valid absolute HTTP(S) URL (#611).
+    pub(crate) fn terminology_url(&self) -> Option<&str> {
+        match &self.terminology {
+            TerminologyNavigation::Valid(url) => Some(url),
+            TerminologyNavigation::Unconfigured | TerminologyNavigation::Invalid => None,
+        }
+    }
+
+    /// Whether the environment variable exists but cannot be used as a safe
+    /// browser destination (#611).
+    pub(crate) fn terminology_invalid(&self) -> bool {
+        matches!(self.terminology, TerminologyNavigation::Invalid)
     }
 
     /// The effective tenant id, for the `hfs-tenant` meta tag browser calls
@@ -547,6 +600,16 @@ struct ResourcesPage {
     show_save: bool,
 }
 
+/// Explains how to configure terminology navigation, or why the configured
+/// value cannot be used (#611).
+#[derive(Template)]
+#[template(path = "pages/terminology.html")]
+struct TerminologyPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+}
+
 /// Saved FHIR queries page (#234). The shell is server-rendered; the list is
 /// hydrated client-side from `/_user/settings` by `assets/saved-queries.js`,
 /// the same per-user document (and fetch pattern) the theme toggle uses.
@@ -747,6 +810,7 @@ pub fn mount_with_conformance_source(
         .route("/ui/queries", get(queries))
         .route("/ui/queries/params", get(query_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
+        .route("/ui/terminology", get(terminology_page))
         .route("/ui/compartments", get(compartments_page))
         // Batch/Transaction workspace (#476): upload → preflight → response.
         .route("/ui/batch", get(batch_page))
@@ -1091,19 +1155,7 @@ async fn index(
     // validation against the actually-plotted set happens in build_dashboard.
     let focus = query_value(query.as_deref(), "focus")
         .filter(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphanumeric()));
-    render(
-        build_index_page(
-            state.version,
-            locale,
-            types,
-            window,
-            expand,
-            focus,
-            rv.0,
-            &rt,
-        )
-        .await,
-    )
+    render(build_index_page(&state, locale, types, window, expand, focus, rv.0, &rt).await)
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -1115,7 +1167,7 @@ async fn search(
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(SearchPage {
-        status: current_status(state.version, rv.0, &rt),
+        status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "search",
         nl: (*state.nl).clone(),
@@ -1134,7 +1186,7 @@ async fn queries(
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(QueriesPage {
-        status: current_status(state.version, rv.0, &rt),
+        status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "queries",
         resource_types,
@@ -1156,7 +1208,7 @@ async fn resources(
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(ResourcesPage {
-        status: current_status(state.version, rv.0, &rt),
+        status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "resources",
         nl: (*state.nl).clone(),
@@ -1165,6 +1217,21 @@ async fn resources(
         // The type the rail opens focused on (from the nav submenu deep link).
         selected_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
         show_save: false,
+    })
+}
+
+/// Terminology setup state (#611). The sidebar links here when the environment
+/// variable is absent or cannot be used as a safe browser destination.
+async fn terminology_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render(TerminologyPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "terminology",
     })
 }
 
@@ -1251,7 +1318,7 @@ async fn search_parameters(
         .snapshot(&rt.id, query.fhir_version())
         .await;
     render(SearchParametersPage {
-        status: current_status(state.version, rv.0, &rt),
+        status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "search-parameters",
         view: search_params::build_view(&snapshot, &query),
@@ -1283,7 +1350,7 @@ async fn batch_page(
     rt: RequestTenant,
 ) -> Response {
     render(BatchPage {
-        status: current_status(state.version, rv.0, &rt),
+        status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "batch",
     })
@@ -1315,7 +1382,7 @@ async fn compartments_page(
         .await;
     match compartments::build_view(&query, &defs) {
         Some(view) => render(CompartmentsPage {
-            status: current_status(state.version, rv.0, &rt),
+            status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "compartments",
             view,
@@ -1324,7 +1391,7 @@ async fn compartments_page(
         // without an outbound token, #320) — a warning, not a 404. The failed
         // fetch is not cached, so the next request re-attempts it.
         None => render(CompartmentsDegradedPage {
-            status: current_status(state.version, rv.0, &rt),
+            status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "compartments",
         }),
@@ -1340,14 +1407,14 @@ async fn status(
     rt: RequestTenant,
     HxRequest(is_htmx): HxRequest,
 ) -> Response {
-    let status = current_status(state.version, rv.0, &rt);
+    let status = current_status(&state, rv.0, &rt);
     let i18n = I18n::new(locale);
     if is_htmx {
         render(StatusPartial { status, i18n })
     } else {
         render(
             build_index_page(
-                state.version,
+                &state,
                 locale,
                 Vec::new(),
                 DashboardWindow::default(),
@@ -1369,7 +1436,7 @@ async fn history_page(
     rt: RequestTenant,
 ) -> Response {
     render(HistoryPage {
-        status: current_status(state.version, rv.0, &rt),
+        status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "history",
     })
@@ -1435,7 +1502,7 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
 /// says so explicitly rather than presenting invented numbers as real (#555).
 #[allow(clippy::too_many_arguments)]
 async fn build_index_page(
-    version: &'static str,
+    state: &WebState,
     locale: RequestLocale,
     types: Vec<String>,
     window: DashboardWindow,
@@ -1444,7 +1511,7 @@ async fn build_index_page(
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
 ) -> IndexPage {
-    let status = current_status(version, fhir_version, tenant);
+    let status = current_status(state, fhir_version, tenant);
     let i18n = I18n::new(locale);
     let live = helios_observability::dashboard::snapshot(window, &tenant.id, &types).await;
     let sample_data = live.is_none();
@@ -1964,18 +2031,19 @@ fn bucket_floor_utc(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
 }
 
 pub(crate) fn current_status(
-    version: &'static str,
+    state: &WebState,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
 ) -> Status {
     Status {
-        version,
+        version: state.version,
         checked_at: unix_timestamp_seconds(),
         fhir_version,
         tenant_id: tenant.id.clone(),
         tenant_display: tenant.display.clone(),
         show_tenant_picker: tenant.multi,
         subscriptions_enabled: helios_observability::subscriptions::enabled(),
+        terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
     }
 }
 
@@ -2017,6 +2085,7 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 subscriptions_enabled: false,
+                terminology: TerminologyNavigation::Unconfigured,
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -2147,6 +2216,7 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 subscriptions_enabled: false,
+                terminology: TerminologyNavigation::Unconfigured,
             },
             i18n: i18n("en"),
         }
@@ -2204,6 +2274,7 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 subscriptions_enabled: false,
+                terminology: TerminologyNavigation::Unconfigured,
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -2248,6 +2319,7 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 subscriptions_enabled: false,
+                terminology: TerminologyNavigation::Unconfigured,
             },
             i18n: i18n("es"),
             active_page: "queries",
