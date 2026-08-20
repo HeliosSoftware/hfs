@@ -226,18 +226,24 @@ async fn load_rows(
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
 
-    // Provisioning jobs go first, in id order, skipping any id the registry
-    // already carries (the job settled between the registry read above and
-    // the lock read that produced `jobs`).
+    let registered_ids: std::collections::HashSet<&str> =
+        registered.iter().map(|r| r.id.as_str()).collect();
+
+    // Provisioning jobs go first, in id order. The provisioning row wins
+    // while the job is in flight: an `InFlight` id always renders here, even
+    // if the registry read above already shows it registered (registration
+    // finishes in milliseconds, seeding takes far longer, so that window is
+    // routine, not a race to paper over). A `Failed` leftover for an id that
+    // *is* registered yields to the registered row below instead — `Failed`
+    // is only ever written when `register_tenant` itself failed, so a
+    // registered id with a `Failed` entry is a stale notice, not the tenant
+    // that failed.
     let mut job_ids: Vec<&String> = jobs.keys().collect();
     job_ids.sort();
     for id in job_ids {
-        if seen.contains(id) {
-            continue;
-        }
         seen.insert(id.clone());
-        rows.push(match &jobs[id] {
-            Provisioning::InFlight { display_name } => TenantRow {
+        match &jobs[id] {
+            Provisioning::InFlight { display_name } => rows.push(TenantRow {
                 id: id.clone(),
                 display_name: display_name.clone(),
                 created_at: None,
@@ -245,23 +251,32 @@ async fn load_rows(
                 resources: 0,
                 provisioning: true,
                 failed: None,
-            },
+            }),
             Provisioning::Failed {
                 display_name,
                 message,
-            } => TenantRow {
-                id: id.clone(),
-                display_name: display_name.clone(),
-                created_at: None,
-                registered: false,
-                resources: 0,
-                provisioning: false,
-                failed: Some(message.clone()),
-            },
-        });
+            } => {
+                if !registered_ids.contains(id.as_str()) {
+                    rows.push(TenantRow {
+                        id: id.clone(),
+                        display_name: display_name.clone(),
+                        created_at: None,
+                        registered: false,
+                        resources: 0,
+                        provisioning: false,
+                        failed: Some(message.clone()),
+                    });
+                }
+            }
+        }
     }
 
     for rec in registered {
+        // An in-flight job for this id already rendered its spinner row above;
+        // the registered row would just duplicate it until the seed finishes.
+        if matches!(jobs.get(&rec.id), Some(Provisioning::InFlight { .. })) {
+            continue;
+        }
         seen.insert(rec.id.clone());
         rows.push(TenantRow {
             resources: counts.get(&rec.id).copied().unwrap_or(0),
@@ -613,3 +628,53 @@ pub async fn delete(
 }
 
 // (helpers below)
+
+#[cfg(test)]
+mod provisioning_row_tests {
+    use super::*;
+    use helios_persistence::backends::sqlite::SqliteBackend;
+
+    /// Regression for the double-row bug: while a job is still in flight the
+    /// tenant is already registered (seeding runs long after registration), and
+    /// the table must show the provisioning row only.
+    #[tokio::test]
+    async fn an_in_flight_job_suppresses_the_registered_row() {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+        backend.init_schema().expect("init schema");
+        let storage: Arc<dyn ResourceStorage> = Arc::new(backend);
+        storage
+            .register_tenant("acme", Some("Acme Health"))
+            .await
+            .expect("register");
+
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "acme".to_string(),
+            Provisioning::InFlight {
+                display_name: Some("Acme Health".to_string()),
+            },
+        );
+
+        let rows = load_rows(&storage, "", &jobs).await.expect("rows");
+        let acme: Vec<_> = rows.iter().filter(|r| r.id == "acme").collect();
+        assert_eq!(acme.len(), 1, "one row per tenant, not one per source");
+        assert!(acme[0].provisioning, "the provisioning row wins");
+
+        // A Failed leftover for a registered id yields to the registered row.
+        jobs.insert(
+            "acme".to_string(),
+            Provisioning::Failed {
+                display_name: None,
+                message: "boom".to_string(),
+            },
+        );
+        let rows = load_rows(&storage, "", &jobs).await.expect("rows");
+        let acme: Vec<_> = rows.iter().filter(|r| r.id == "acme").collect();
+        assert_eq!(acme.len(), 1);
+        assert!(!acme[0].provisioning);
+        assert!(
+            acme[0].failed.is_none(),
+            "registered row, not the failed notice"
+        );
+    }
+}
