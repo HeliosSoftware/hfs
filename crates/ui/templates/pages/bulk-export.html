@@ -21,9 +21,14 @@
 <div class="card notice">{{ message }}</div>
 {% when None %}{% endmatch %}
 
-<form method="post" action="/ui/bulk-export">
-  <section class="card detail">
+<form method="post" action="/ui/bulk-export" class="bulk-export-form">
+  <section class="card form-panel">
     <h2 class="toolbar__title">{{ i18n.t("bulk-export-scope") }}</h2>
+    <label class="field">
+      <span class="field__label">{{ i18n.t("bulk-export-field-name") }}</span>
+      <input class="field__input" type="text" name="name" autocomplete="off"
+             placeholder="{{ i18n.t("bulk-export-field-name-placeholder") }}">
+    </label>
     <label class="field">
       <input type="radio" name="scope" value="system" checked>
       <b>{{ i18n.t("bulk-export-scope-system") }}</b>
@@ -39,15 +44,10 @@
       <b>{{ i18n.t("bulk-export-scope-group") }}</b>
       <span class="field__hint">{{ i18n.t("bulk-export-scope-group-hint") }}</span>
     </label>
-    <label class="field">
+    <label class="field field--group-id">
       <span class="field__label">{{ i18n.t("bulk-export-field-group-id") }}</span>
       <input class="field__input" type="text" name="group_id" autocomplete="off">
       <span class="field__hint">{{ i18n.t("bulk-export-field-group-id-hint") }}</span>
-    </label>
-    <label class="field">
-      <span class="field__label">{{ i18n.t("bulk-export-field-name") }}</span>
-      <input class="field__input" type="text" name="name" autocomplete="off"
-             placeholder="{{ i18n.t("bulk-export-field-name-placeholder") }}">
     </label>
   </section>
 
@@ -55,15 +55,15 @@
     <div class="toolbar">
       <h2 class="toolbar__title">{{ i18n.t("bulk-export-types") }}</h2>
     </div>
+    <p class="field__hint">{{ i18n.t("bulk-export-types-hint") }}</p>
     <div class="typegrid">
       {% for t in resource_types %}
       <label class="typegrid__item"><input type="checkbox" name="types" value="{{ t }}"> {{ t }}</label>
       {% endfor %}
     </div>
-    <p class="field__hint">{{ i18n.t("bulk-export-types-hint") }}</p>
   </section>
 
-  <section class="card detail">
+  <section class="card form-panel">
     <h2 class="toolbar__title">{{ i18n.t("bulk-export-narrow") }}</h2>
     <label class="field">
       <span class="field__label">{{ i18n.t("bulk-export-field-elements") }}</span>
