@@ -3781,7 +3781,11 @@ button.filter-rail__item {
   display: flex;
   flex-direction: column;
   width: min(1200px, 100%);
-  max-height: 90vh;
+  /* A fixed height, not a ceiling (#607): the dialog occupies the same
+     rectangle whichever pane is showing, so switching Edit/History or a
+     status message appearing never moves the header. The taller pane
+     scrolls inside .modal__body. */
+  height: 90vh;
   background: var(--bg-content);
   border: 1px solid var(--surface-border);
   border-radius: 18px;
@@ -3871,6 +3875,7 @@ button.filter-rail__item {
 }
 
 .modal__body {
+  flex: 1;
   padding: 16px 18px;
   overflow-y: auto;
 }
@@ -3886,7 +3891,7 @@ button.filter-rail__item {
 }
 
 @media (max-width: 900px) {
-  .modal__box { max-height: 96vh; }
+  .modal__box { height: 96vh; }
   .modal__head { flex-wrap: wrap; }
 }
 }
