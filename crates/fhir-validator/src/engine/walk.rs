@@ -554,7 +554,7 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
         // An element-type context names one exact spot: `Patient` is the
         // resource root, `Patient.name` that element — not "anywhere in
         // Patient".
-        if contexts.iter().any(|c| *c == parent) {
+        if contexts.contains(&parent) {
             continue;
         }
 
