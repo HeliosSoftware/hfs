@@ -68,16 +68,22 @@ test("a ?url= deep link still wins over the default Patient context", async ({ r
 });
 
 // Long type names (#605): the button truncates instead of widening the page
-// head row past the viewport.
+// head row past the viewport. At the suite's default desktop viewport the
+// page-head row has more room than the button's own max-width (320px) ever
+// needs, so the cap never actually engages and no real type name reaches it
+// (`.resources-create` never gets squeezed below its natural, un-clamped
+// width). Narrow the viewport so the row runs out of space and the button
+// (`flex: 0 1 auto`) is forced to shrink past its content width — only then
+// does the label's ellipsis engage for real.
 test("a long type name truncates the Create label instead of breaking the header", async ({
   resources,
   page,
 }) => {
+  await page.setViewportSize({ width: 480, height: 800 });
   await resources.goto("MedicinalProductContraindication");
   await expect(resources.createLabel).toHaveText("Create new MedicinalProductContraindication");
-  // Ellipsis, not layout overflow: the label's box is narrower than its text
-  // (`.resources-create` caps `max-width` and truncates), and the page never
-  // gains horizontal scroll because of it.
+  // Ellipsis, not layout overflow: the label's box is narrower than its text,
+  // and the page never gains horizontal scroll because of it.
   const labelOverflowsItsBox = await resources.createLabel.evaluate(
     (el) => el.scrollWidth > el.clientWidth,
   );

@@ -3968,6 +3968,7 @@ body.has-nav-panel {
    pushing the header row wider than the page. */
 .resources-create {
   flex: 0 1 auto;
+  min-width: 0;
   max-width: 320px;
 }
 
