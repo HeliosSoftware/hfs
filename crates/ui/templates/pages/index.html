@@ -127,7 +127,10 @@
     is complete without it.
   -->
   <div class="chart-wrap" id="chart-wrap">
-    <svg class="chart" viewBox="0 0 1060 {{ chart.height }}" role="img"
+    <!-- role=group, not img: the plotted lines are focus links (#602), and
+         an image must not contain interactive controls (axe
+         nested-interactive). The name stays on the group. -->
+    <svg class="chart" viewBox="0 0 1060 {{ chart.height }}" role="group"
          aria-label="{{ i18n.t("chart-title") }} — {{ chart.types_label }}">
       <defs>
         <!-- Under a legend focus the y axis fits the focused series; receded
