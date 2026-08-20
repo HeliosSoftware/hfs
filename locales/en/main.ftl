@@ -121,6 +121,9 @@ tenants-empty = No tenants match.
 tenants-unregistered = unregistered
 tenants-delete = Delete tenant
 tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept unless purged via the API.
+tenants-row-provisioning = Provisioning… this may take a moment.
+tenants-row-failed = Provisioning failed
+tenants-dismiss = Dismiss
 
 tenant-heading = Tenants
 tenant-all = All tenants

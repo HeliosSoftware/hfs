@@ -115,6 +115,8 @@ struct WebState {
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
     tenants: Option<Arc<dyn ResourceStorage>>,
+    /// Tenant provisioning jobs started from the tenants page (#581).
+    provisioning: tenants::ProvisioningRegistry,
     /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
     /// tenant's conformance resources from the tenant-maintenance page.
     data_dir: Option<PathBuf>,
@@ -839,6 +841,7 @@ pub fn mount_with_conformance_source(
         compartments: Arc::new(compartments::CompartmentCatalog::new(source)),
         nl: Arc::new(nl),
         tenants,
+        provisioning: Default::default(),
         settings,
         data_dir,
         fhir_version,

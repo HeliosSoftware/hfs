@@ -117,6 +117,9 @@ tenants-empty = Ningún tenant coincide.
 tenants-unregistered = sin registrar
 tenants-delete = Eliminar tenant
 tenants-delete-confirm = ¿Dar de baja el tenant «{ $id }»? Sus datos se conservan salvo que se purguen vía API.
+tenants-row-provisioning = Aprovisionando… puede tardar un momento.
+tenants-row-failed = El aprovisionamiento falló
+tenants-dismiss = Descartar
 
 tenant-heading = Tenants
 tenant-all = Todos los tenants

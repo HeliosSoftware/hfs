@@ -117,6 +117,9 @@ tenants-empty = Keine Mandanten gefunden.
 tenants-unregistered = nicht registriert
 tenants-delete = Mandant löschen
 tenants-delete-confirm = Mandant „{ $id }" abmelden? Die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
+tenants-row-provisioning = Wird bereitgestellt … das kann einen Moment dauern.
+tenants-row-failed = Bereitstellung fehlgeschlagen
+tenants-dismiss = Verwerfen
 
 tenant-heading = Tenants
 tenant-all = Alle Tenants
