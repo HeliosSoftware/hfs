@@ -167,6 +167,9 @@ test("a save in the Resources modal refreshes the results table behind it", asyn
     // Eventually-consistent search (the Elasticsearch matrix legs): the
     // auto-refresh fires before the index catches the write, so the strict
     // no-manual-rerun contract cannot hold — poll by re-running instead.
+    // Save keeps the modal open, and the run button sits behind it: close
+    // first or the click never becomes actionable.
+    await resources.modal.close();
     await expect
       .poll(
         async () => {
