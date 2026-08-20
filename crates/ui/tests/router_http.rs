@@ -205,11 +205,26 @@ async fn search_parameters_page_serves_the_registry_view() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("<title>Search Parameters — Helios FHIR Server</title>"));
+    assert!(html.contains(r#"<h1 class="page-head__title">Search Parameters</h1>"#));
+    assert!(html.contains(
+        r#"<table class="data-table" data-row-navigation aria-label="Search Parameters">"#
+    ));
+    assert!(html.contains(r#"<script src="/ui/assets/search-parameters.js" defer></script>"#));
     // The Resource Filter rail and the facet rows are server-rendered.
     assert!(html.contains(r#"id="sp-rail-list""#));
     assert!(html.contains("base=Patient"));
     // Real registry data, not placeholders: Patient supports `name`.
     assert!(html.contains("http://hl7.org/fhir/SearchParameter/Patient-name"));
+    // Each result row keeps exactly one native link for keyboard and no-JS use.
+    let table_body = html
+        .split_once("<tbody>")
+        .and_then(|(_, rest)| rest.split_once("</tbody>"))
+        .map(|(body, _)| body)
+        .expect("SearchParameter table body");
+    let row_count = table_body.matches("<tr").count();
+    assert!(row_count > 0);
+    assert_eq!(table_body.matches(r#"class="row-link""#).count(), row_count);
     // This page, not Home, carries aria-current in the sidebar.
     assert!(html.contains(r#"href="/ui/search-parameters" aria-current="page""#));
 }

@@ -2185,6 +2185,10 @@ a.pill {
   background: var(--accent-soft);
 }
 
+.data-table[data-row-navigation] tbody tr {
+  cursor: pointer;
+}
+
 .row-link {
   display: flex;
   flex-direction: column;
