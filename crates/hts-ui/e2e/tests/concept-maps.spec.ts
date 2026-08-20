@@ -156,6 +156,37 @@ test.describe("HTS ConceptMap detail + $translate workbench (§7.5)", () => {
     });
   });
 
+  test("reverse translate with targetCode + targetSystem renders a match", async ({
+    page,
+  }) => {
+    // Pins the §3.5 demo instruction (reverse happy-path). ex-cm-1
+    // maps source A → target T1 with equivalence=equivalent, so a
+    // reverse translate on T1 + the target CS must return one match
+    // row. Filling both the target-side inputs is what discriminates
+    // this from the pre-flight test above.
+    await page.goto("/ui/hts/concept-maps/ex-cm-1/translate");
+    await page.getByLabel("Reverse", { exact: true }).check();
+    await expect(
+      page.getByLabel("Target code", { exact: true }),
+    ).toBeVisible({ timeout: 3_000 });
+    await page
+      .getByLabel("Target code", { exact: true })
+      .fill("T1");
+    await page
+      .getByLabel("Target system", { exact: true })
+      .fill("http://example.org/cs/target");
+    await page
+      .getByRole("button", { name: "Translate", exact: true })
+      .click();
+    const result = page.locator("#hts-workbench-result");
+    await expect(
+      result.locator(".hts-cm-workbench__result--translate"),
+    ).toBeVisible({ timeout: 3_000 });
+    await expect(result.locator(".hts-outcome--error")).toHaveCount(0);
+    // Backend surfaces the equivalence as a value on the match row.
+    await expect(result).toContainText(/equivalent/i);
+  });
+
   test("a translate with no matches renders the neutral state, not the error partial", async ({
     page,
   }) => {

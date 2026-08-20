@@ -148,6 +148,32 @@ test.describe("HTS ValueSet detail + $expand workbench (Â§7.4)", () => {
     await expect(result).toContainText(/showing full tree/i);
   });
 
+  test("toggling tree mode on a flat CS degrades silently to a flat table", async ({
+    page,
+  }) => {
+    // Pins the §3.4 demo instruction. ex-vs-1's underlying CS
+    // (ex-cs-limbs) has no `hierarchyMeaning`, so the HTS expansion
+    // never carries a parent/child edge. The workbench posts
+    // `mode=tree` but the response comes back flat, and rather than
+    // surface an OperationOutcome the workbench renders a flat
+    // table — tree mode degrades gracefully. Bound `count=10` to
+    // stay under HTS_MAX_EXPANSION_SIZE so the too-costly guard does
+    // not fire and mask this contract.
+    await page.goto("/ui/hts/value-sets/ex-vs-1/expand");
+    await page.locator('input[name="count"]').fill("10");
+    await page.getByLabel("Tree", { exact: true }).check();
+    await page.getByRole("button", { name: "Run", exact: true }).click();
+    const result = page.locator("#hts-workbench-result");
+    await expect(
+      result.locator(".hts-vs-workbench__result--expand"),
+    ).toBeVisible({ timeout: 3_000 });
+    await expect(result.locator('[role="tree"]')).toHaveCount(0);
+    await expect(result.locator(".hts-outcome--error")).toHaveCount(0);
+    await expect(
+      result.locator(".hts-vs-workbench__too-costly"),
+    ).toHaveCount(0);
+  });
+
   test("a too-costly expansion renders the banner with the Raise form", async ({
     page,
   }) => {

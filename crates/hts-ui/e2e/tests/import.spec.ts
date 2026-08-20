@@ -300,9 +300,13 @@ test.describe("HTS Import a11y and dual-mode contract (§7.7)", () => {
     await expect(region).toBeVisible();
     // The status region lives inside that landmark, wrapped in a
     // polite live region so htmx swaps announce without stealing
-    // focus (§7.7 a11y note).
+    // focus (§7.7 a11y note). On initial GET the container only holds
+    // a visually-hidden placeholder — the sr-only helper collapses it
+    // to 0×0, which Playwright reports as "hidden". The a11y contract
+    // is presence + aria-live, not visual footprint, so we assert on
+    // attachment instead of visibility.
     const status = region.locator("#hts-import-status");
-    await expect(status).toBeVisible();
+    await expect(status).toBeAttached();
     await expect(status).toHaveAttribute("aria-live", "polite");
   });
 
