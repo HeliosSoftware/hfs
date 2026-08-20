@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use helios_fhir::FhirVersion;
 use mongodb::{
     Cursor,
@@ -45,6 +45,22 @@ fn bson_to_chrono(dt: &BsonDateTime) -> DateTime<Utc> {
 
 fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
     BsonDateTime::from_millis(dt.timestamp_millis())
+}
+
+/// The exclusive end of the period a partial date names: `1995` → 1996-01-01,
+/// `1995-10` → 1995-11-01, `1995-10-02` → 1995-10-03. `None` for values that
+/// carry a time component — those are instants, not periods.
+fn implied_period_end(raw: &str, start: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    match raw.len() {
+        4 => Some(
+            start
+                .with_year(start.year() + 1)
+                .expect("year+1 stays in range"),
+        ),
+        7 => Some(start + chrono::Months::new(1)),
+        10 => Some(start + chrono::Duration::days(1)),
+        _ => None,
+    }
 }
 
 fn parse_date_for_query(value: &str) -> Option<DateTime<Utc>> {
@@ -1025,28 +1041,38 @@ impl MongoBackend {
             })
         })?;
 
-        let bson_date = chrono_to_bson(parsed);
+        // A partial date names a *period*, not an instant (#519, mirroring the
+        // SQLite semantics #463 pinned): `1995` is the whole year, `1995-10`
+        // the whole month, `1995-10-02` the whole day. `eq` used to compare
+        // the exact start instant, so month/year queries matched nothing.
+        let end = implied_period_end(&value.value, parsed).map(chrono_to_bson);
+        let start = chrono_to_bson(parsed);
 
-        match value.prefix {
-            SearchPrefix::Ap => {
+        let filter = match (value.prefix, end) {
+            (SearchPrefix::Ap, _) => {
                 let lower = chrono_to_bson(parsed - chrono::Duration::hours(12));
                 let upper = chrono_to_bson(parsed + chrono::Duration::hours(12));
-                Ok(doc! {
-                    field: {
-                        "$gte": lower,
-                        "$lte": upper,
-                    }
-                })
+                doc! { field: { "$gte": lower, "$lte": upper } }
             }
-            _ => {
-                let op = Self::prefix_to_mongo_operator(value.prefix)?;
-                Ok(doc! {
-                    field: {
-                        op: bson_date,
-                    }
-                })
-            }
-        }
+            (SearchPrefix::Eq, Some(end)) => doc! { field: { "$gte": start, "$lt": end } },
+            (SearchPrefix::Eq, None) => doc! { field: { "$eq": start } },
+            (SearchPrefix::Ne, Some(end)) => doc! {
+                "$or": [
+                    { field: { "$lt": start } },
+                    { field: { "$gte": end } },
+                ]
+            },
+            (SearchPrefix::Ne, None) => doc! { field: { "$ne": start } },
+            // gt / sa: strictly after the whole period.
+            (SearchPrefix::Gt | SearchPrefix::Sa, Some(end)) => doc! { field: { "$gte": end } },
+            (SearchPrefix::Gt | SearchPrefix::Sa, None) => doc! { field: { "$gt": start } },
+            // lt / eb: strictly before the whole period.
+            (SearchPrefix::Lt | SearchPrefix::Eb, _) => doc! { field: { "$lt": start } },
+            (SearchPrefix::Ge, _) => doc! { field: { "$gte": start } },
+            (SearchPrefix::Le, Some(end)) => doc! { field: { "$lt": end } },
+            (SearchPrefix::Le, None) => doc! { field: { "$lte": start } },
+        };
+        Ok(filter)
     }
 
     /// Builds a MongoDB filter for a quantity parameter.
