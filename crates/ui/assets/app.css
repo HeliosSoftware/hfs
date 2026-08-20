@@ -606,7 +606,6 @@ button.menu__option {
 .content {
   flex: 1;
   padding: 24px 32px 32px;
-  max-width: 1161px;
 }
 
 /* ---------- Cards ---------- */
@@ -1906,11 +1905,6 @@ a.pill {
 }
 @layer components {
 /* ---- Registry viewers: shared filter layout (#237/#238) ----------------- */
-
-/* These pages want the full pane width; .content keeps its dashboard cap. */
-.content--wide {
-  max-width: none;
-}
 
 .notice {
   margin: 0 0 16px;
