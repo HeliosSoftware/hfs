@@ -22,7 +22,7 @@ export class DashboardPage {
     return this.page.locator("svg.chart");
   }
   get seriesLines(): Locator {
-    return this.page.locator("svg.chart polyline");
+    return this.page.locator("svg.chart polyline.series");
   }
   windowOption(label: RegExp | string): Locator {
     return this.page.locator(".window-picker__option", { hasText: label });

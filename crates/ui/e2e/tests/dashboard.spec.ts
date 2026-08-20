@@ -94,6 +94,23 @@ test("legend click focuses a series; clicking it again restores the shared view"
   await expect(page).not.toHaveURL(/focus=/);
   await expect(page.locator(".series--focused")).toHaveCount(0);
   expect(await dashboard.seriesLines.count()).toBe(before);
+
+  // The line itself is the same link: clicking a plotted series focuses it
+  // (native SVG anchor, via the widened hit corridor). Playwright's default
+  // click aims at the bounding-box centre — empty air for a polyline with
+  // pointer-events: stroke — so aim at an actual vertex, mapped from
+  // viewBox units to screen pixels.
+  const hit = page.locator(".series-hit").first();
+  const vertex = (await hit.getAttribute("points"))!.split(" ")[2].split(",").map(Number);
+  const svg = page.locator("svg.chart");
+  const viewBox = (await svg.getAttribute("viewBox"))!.split(" ").map(Number);
+  const svgBox = (await svg.boundingBox())!;
+  await page.mouse.click(
+    svgBox.x + (vertex[0] / viewBox[2]) * svgBox.width,
+    svgBox.y + (vertex[1] / viewBox[3]) * svgBox.height,
+  );
+  await expect(page).toHaveURL(/focus=/);
+  await expect(page.locator(".series--focused")).toHaveCount(1);
 });
 
 test("the picker filter narrows the offered types", async ({ dashboard }) => {

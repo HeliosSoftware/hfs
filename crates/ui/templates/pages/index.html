@@ -141,9 +141,21 @@
       <text class="axis-label" x="0" y="{{ tick.label_y }}">{{ tick.label }}</text>
       {% endfor %}
       {% for s in chart.series %}
+      {% if let Some(href) = s.href %}
+      <!-- The line is the same focus link as its legend entry — a native SVG
+           anchor, no script. The transparent twin widens the hit area. -->
+      <a href="{{ href }}"
+         aria-label="{{ s.resource_type }} — {% if s.focused %}{{ i18n.t("chart-unfocus-series") }}{% else %}{{ i18n.t("chart-focus-series") }}{% endif %}">
+        <polyline class="series series--{{ s.color }}{{ s.emphasis }}"
+                  data-series="{{ s.resource_type }}"
+                  clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+        <polyline class="series-hit" clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+      </a>
+      {% else %}
       <polyline class="series series--{{ s.color }}{{ s.emphasis }}"
                 data-series="{{ s.resource_type }}"
                 clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+      {% endif %}
       {% endfor %}
       {% for tick in chart.x_ticks %}
       <text class="axis-label" x="{{ tick.pos }}" y="{{ tick.label_y }}">{{ tick.label }}</text>

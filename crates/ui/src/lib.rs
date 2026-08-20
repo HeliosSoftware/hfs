@@ -421,6 +421,12 @@ struct ChartSeriesView {
     /// Class suffix under a legend focus (#602): `" series--focused"`,
     /// `" series--receded"`, or empty when nothing is focused.
     emphasis: &'static str,
+    /// The same focus/unfocus link the legend entry carries (#602): the line
+    /// itself is clickable, as a native SVG `<a>`. `None` while only one
+    /// series is plotted.
+    href: Option<String>,
+    /// Whether this series holds the focus — picks the link's label.
+    focused: bool,
 }
 
 /// One row of the chart's tabular alternative: a bucket label and the
@@ -1509,7 +1515,21 @@ fn build_dashboard(
     // in the query renders the ordinary unfocused view.
     let focus = focus.filter(|f| charted.iter().any(|c| c == f));
 
-    let chart = build_chart(&snapshot.series, snapshot.window, expand, focus);
+    let mut chart = build_chart(&snapshot.series, snapshot.window, expand, focus);
+
+    // The plotted lines carry the same focus links as their legend entries
+    // (#602): clicking a line focuses its series, clicking the focused one
+    // links back. Native SVG anchors, so the no-JS contract holds.
+    if chart.series.len() > 1 {
+        for s in &mut chart.series {
+            let target = if s.focused {
+                None
+            } else {
+                Some(s.resource_type.as_str())
+            };
+            s.href = Some(dash_href(&charted, snapshot.window, expand, target));
+        }
+    }
 
     // The picker offers every stored type; each option toggles membership.
     let picker = snapshot
@@ -1710,6 +1730,10 @@ fn build_chart(
                 Some(f) if f == s.resource_type => " series--focused",
                 Some(_) => " series--receded",
             },
+            // build_dashboard fills the focus link in; geometry stays the
+            // only concern here.
+            href: None,
+            focused: focus == Some(s.resource_type.as_str()),
         })
         .collect();
 
@@ -2042,6 +2066,21 @@ mod tests {
         assert!(entry(&dash, "Observation").contains("focus=Observation"));
         // Nothing was removed: every legend link keeps the full charted set.
         assert!(entry(&dash, "Observation").contains("Patient"));
+
+        // The plotted lines carry the same links as their legend entries:
+        // the focused one links back out, the others move the focus.
+        let line = |d: &DashboardView, t: &str| {
+            d.chart
+                .series
+                .iter()
+                .find(|s| s.resource_type == t)
+                .expect("series")
+                .href
+                .clone()
+                .expect("line link")
+        };
+        assert!(!line(&dash, "Patient").contains("focus="));
+        assert!(line(&dash, "Observation").contains("focus=Observation"));
 
         // A focus that names an uncharted type renders the ordinary view.
         let bogus = build_dashboard(&snapshot, false, Some("Nope"));

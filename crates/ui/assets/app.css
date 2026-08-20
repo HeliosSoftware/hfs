@@ -839,6 +839,16 @@ button.pill {
 .chart .series--focused { stroke-width: 3; }
 .chart .series--receded { opacity: 0.25; }
 
+/* The invisible twin polyline inside each line's focus anchor: a 14px hit
+   corridor, since a 1.5px stroke is no click target. */
+.chart .series-hit {
+  stroke: transparent;
+  stroke-width: 14;
+  fill: none;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
 .chart-legend__item--focused {
   font-weight: 600;
   color: var(--text-strong);
