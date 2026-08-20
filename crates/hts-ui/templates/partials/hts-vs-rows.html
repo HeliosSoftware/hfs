@@ -78,7 +78,11 @@
 
     {% if let Some(page) = view.page() %}
       {% if !page.rows.is_empty() %}
-      <div class="table-foot">
+      {#-
+        Stable foot id + hx-select-oob: see hts-cs-rows.html. Same stale-
+        button duplication bug otherwise.
+      -#}
+      <div class="table-foot" id="hts-vs-rows-foot">
         <span>
           {{ chrome.i18n.t_arg("hts-vs-browser-showing-count", "count", page.showing_count().to_string()) }}
         </span>
@@ -87,7 +91,8 @@
                   hx-get="{{ view.filters.load_more_url(next) }}"
                   hx-target="#hts-vs-rows tbody"
                   hx-swap="beforeend"
-                  hx-select="#hts-vs-rows tbody > tr">
+                  hx-select="#hts-vs-rows tbody > tr"
+                  hx-select-oob="#hts-vs-rows-foot">
             {{ chrome.i18n.t("hts-vs-browser-load-more") }}
           </button>
         {% endif %}

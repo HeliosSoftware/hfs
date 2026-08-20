@@ -85,25 +85,25 @@
 
     {% if let Some(page) = view.page() %}
       {% if !page.rows.is_empty() %}
-      <div class="table-foot">
+      {#-
+        Stable foot id so Load-more can OOB-replace this footer while
+        `beforeend`-appending rows. Without OOB, `hx-select` on `<tr>`
+        alone discards the response's refreshed button, leaving a stale
+        `_offset` URL that re-appends the same page (duplicates).
+        When `next_offset()` is None the foot still swaps in — minus the
+        button — so Load more disappears at end-of-list.
+      -#}
+      <div class="table-foot" id="hts-cs-rows-foot">
         <span>
           {{ chrome.i18n.t_arg("hts-cs-browser-showing-count", "count", page.showing_count().to_string()) }}
         </span>
         {% if let Some(next) = page.next_offset() %}
-          {#-
-            `hx-swap="beforeend"` appends the next tbody's rows without
-            replacing the current ones; the surrounding rows partial is
-            re-fetched with the new offset preserving every active
-            filter (values + modes). The button keeps focus post-swap
-            per §7.2 a11y clause. `load_more_url` centralizes the
-            FHIR-modifier-aware serialization so template drift can't
-            silently drop a filter (Phase 5 audit).
-          -#}
           <button type="button" class="btn btn--secondary"
                   hx-get="{{ view.filters.load_more_url(next) }}"
                   hx-target="#hts-cs-rows tbody"
                   hx-swap="beforeend"
-                  hx-select="#hts-cs-rows tbody > tr">
+                  hx-select="#hts-cs-rows tbody > tr"
+                  hx-select-oob="#hts-cs-rows-foot">
             {{ chrome.i18n.t("hts-cs-browser-load-more") }}
           </button>
         {% endif %}
