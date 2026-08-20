@@ -778,6 +778,17 @@ async fn terminology_navigation_reflects_the_configuration() {
     assert!(html.contains("opens in a new tab"));
     assert!(!html.contains(r#"href="/ui/terminology""#));
 
+    let response = app_with_terminology(Some(valid.to_string()))
+        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(&format!(r#"href="{valid}""#)));
+    assert!(html.contains(r#"target="_blank""#));
+    assert!(html.contains(r#"rel="noopener noreferrer""#));
+    assert!(html.contains(r#"hx-boost="false""#));
+
     let invalid = "javascript:alert(1)";
     let response = app_with_terminology(Some(invalid.to_string()))
         .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
