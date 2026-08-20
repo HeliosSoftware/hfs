@@ -274,6 +274,7 @@ fn run_version(version: FhirVersion, version_dir: &str) {
         // Same posture as `spec_examples.rs`: a core-spec sweep ignores
         // unknown (US Core / IHE) profiles rather than drowning in noise.
         unknown_profile: UnknownProfilePolicy::Ignore,
+        ..Default::default()
     };
 
     // Diff each file the reference validator actually processed.
