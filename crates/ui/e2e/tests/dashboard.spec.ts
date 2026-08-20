@@ -77,14 +77,49 @@ test("the picker toggles types on, capped at the palette", async ({ page, dashbo
   }
   expect(await dashboard.seriesLines.count()).toBeGreaterThan(1);
   expect(await dashboard.seriesLines.count()).toBeLessThanOrEqual(6);
+});
 
-  // The legend removes: clicking an entry drops that series.
+test("legend click focuses a series; clicking it again restores the shared view", async ({
+  page,
+  dashboard,
+}) => {
+  test.skip(process.env.HFS_E2E_NO_CHART_DATA === "1", "no count read path on this backend");
+  await dashboard.goto();
+  await dashboard.waitForSeries();
   const before = await dashboard.seriesLines.count();
-  if (before > 1) {
-    await dashboard.legendItems.first().click();
-    await expect(page).toHaveURL(/types=/);
-    expect(await dashboard.seriesLines.count()).toBe(before - 1);
-  }
+  test.skip(before < 2, "focus needs at least two series");
+
+  // Focus: nothing is removed, the URL carries the focus, the focused line
+  // and legend entry are marked, the rest recede (#602).
+  await dashboard.legendItems.first().click();
+  await expect(page).toHaveURL(/focus=/);
+  expect(await dashboard.seriesLines.count()).toBe(before);
+  await expect(page.locator(".series--focused")).toHaveCount(1);
+  await expect(page.locator(".series--receded")).toHaveCount(before - 1);
+  await expect(page.locator(".chart-legend__item--focused")).toHaveCount(1);
+
+  // The way back is the same entry.
+  await page.locator(".chart-legend__item--focused").click();
+  await expect(page).not.toHaveURL(/focus=/);
+  await expect(page.locator(".series--focused")).toHaveCount(0);
+  expect(await dashboard.seriesLines.count()).toBe(before);
+
+  // The line itself is the same link: clicking a plotted series focuses it
+  // (native SVG anchor, via the widened hit corridor). Playwright's default
+  // click aims at the bounding-box centre — empty air for a polyline with
+  // pointer-events: stroke — so aim at an actual vertex, mapped from
+  // viewBox units to screen pixels.
+  const hit = page.locator(".series-hit").first();
+  const vertex = (await hit.getAttribute("points"))!.split(" ")[2].split(",").map(Number);
+  const svg = page.locator("svg.chart");
+  const viewBox = (await svg.getAttribute("viewBox"))!.split(" ").map(Number);
+  const svgBox = (await svg.boundingBox())!;
+  await page.mouse.click(
+    svgBox.x + (vertex[0] / viewBox[2]) * svgBox.width,
+    svgBox.y + (vertex[1] / viewBox[3]) * svgBox.height,
+  );
+  await expect(page).toHaveURL(/focus=/);
+  await expect(page.locator(".series--focused")).toHaveCount(1);
 });
 
 test("the picker filter narrows the offered types", async ({ dashboard }) => {

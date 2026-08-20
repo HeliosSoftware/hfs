@@ -834,6 +834,30 @@ button.pill {
 
 /* ---------- Functional chart (#555): multi-series, picker, tooltip -------- */
 
+/* Legend focus (#602): the focused line carries the weight, the rest recede
+   but stay on the chart at their true values. */
+.chart .series--focused { stroke-width: 3; }
+.chart .series--receded { opacity: 0.25; }
+
+/* The invisible twin polyline inside each line's focus anchor: a 14px hit
+   corridor, since a 1.5px stroke is no click target. */
+.chart .series-hit {
+  stroke: transparent;
+  stroke-width: 14;
+  fill: none;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.chart-legend__item--focused {
+  font-weight: 600;
+  color: var(--text-strong);
+}
+.chart-legend__item--focused .chart-legend__dot {
+  outline: 2px solid var(--text-strong);
+  outline-offset: 1px;
+}
+
 /* Series palette: slot N styles both the polyline and its legend dot. */
 .chart .series--1 { stroke: var(--series-1); }
 .chart .series--2 { stroke: var(--series-2); }
