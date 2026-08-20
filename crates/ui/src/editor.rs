@@ -335,8 +335,7 @@ fn build_body(
     // terminology server), so an out-of-value-set code — e.g. gender
     // "masculino" — surfaces in the editor exactly as it does at `$validate`.
     errors.extend(
-        helios_fhir_validator::core_terminology(version)
-            .required_binding_errors(&deferred),
+        helios_fhir_validator::core_terminology(version).required_binding_errors(&deferred),
     );
 
     // Anchor each issue to its node. The validator reports `Patient.name.0.given`
