@@ -54,6 +54,10 @@ helios-auth = { path = "../auth", version = "0.2.1" }
 # Web framework (matches the version used by helios-hfs / helios-rest)
 axum = "0.8"
 
+# Spec-bundle reads for non-default FHIR versions run off the async threads
+# (#562). Runtime only — the server (axum) always provides one.
+tokio = { version = "1", features = ["rt"] }
+
 # Chart bucket timestamps: formatting x-axis labels, and shaping the placeholder
 # series rendered when no dashboard provider is registered.
 chrono.workspace = true

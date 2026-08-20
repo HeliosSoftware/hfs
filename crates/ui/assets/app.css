@@ -648,12 +648,6 @@ button.menu__option {
   color: var(--text);
 }
 
-.stat__unit {
-  font-size: 17px;
-  letter-spacing: -0.3px;
-  vertical-align: 12px;
-}
-
 .stat__sub {
   display: block;
   margin-top: 6px;
@@ -2262,6 +2256,24 @@ a.pill {
   color: var(--danger);
 }
 
+/* Subscription states (#580): the cards and the STATUS column share this
+   vocabulary — active delivers, idle has no listeners, error needs attention. */
+.tag--active {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.tag--idle,
+.tag--requested {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tag--error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
 /* Bulk Export job states (#537) — the same status-pill vocabulary. */
 .tag--in-progress {
   background: var(--warn-soft);
@@ -2281,6 +2293,14 @@ a.pill {
 .tag--cancelled {
   background: var(--accent-soft);
   color: var(--muted);
+}
+
+.subs-sort summary.btn {
+  list-style: none;
+}
+
+.subs-sort summary.btn::-webkit-details-marker {
+  display: none;
 }
 }
 
@@ -3240,13 +3260,23 @@ button.filter-rail__item {
 .editor-json__act:hover { color: var(--text); }
 .editor-json__act--on { color: var(--accent); border-color: var(--accent); }
 
-.editor-tree { padding: 12px 14px; }
+/* Both panes are viewport-bound scroll containers, so a large document
+   scrolls inside its own column and the cross-highlight's reveal always has
+   a scrollbar to move — with page-level scrolling, the highlighted
+   counterpart could sit far off-screen (#573 follow-up). */
+.editor-tree {
+  padding: 12px 14px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
 
 /* ---- the foldable JSON view ---- */
 
 .json-view {
   padding: 10px 0;
   overflow-x: auto;
+  max-height: 70vh;
+  overflow-y: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.6;

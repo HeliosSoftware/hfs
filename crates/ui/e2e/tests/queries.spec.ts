@@ -1,5 +1,5 @@
 import { test, expect } from "../pages/fixtures";
-import { createResource } from "../pages/api";
+import { createResource, waitSearchable } from "../pages/api";
 
 // The Saved Queries workspace (/ui/queries): the shared query builder and the
 // in-page results table — run a query, add builder rows, page through results,
@@ -32,7 +32,10 @@ test.describe("query builder", () => {
     queries,
     request,
   }) => {
-    for (let i = 0; i < 3; i++) await createResource(request, "Device", {});
+    const devices = [];
+    for (let i = 0; i < 3; i++) devices.push(await createResource(request, "Device", {}));
+    // Indices refresh per resource type: wait on each device, not just the last.
+    for (const id of devices) await waitSearchable(request, "Device", id);
 
     await queries.goto();
     await queries.builder.run("Device?_count=2");
@@ -62,11 +65,15 @@ test.describe("query builder", () => {
       name: [{ family: "ChainLinked" }],
       generalPractitioner: [{ reference: `Practitioner/${gp}` }],
     });
-    await createResource(request, "Observation", {
+    const observation = await createResource(request, "Observation", {
       status: "final",
       code: { coding: [{ code: `chain-94-${tag}` }] },
       subject: { reference: `Patient/${patient}` },
     });
+    // The chained query touches three indices; each refreshes on its own tick.
+    await waitSearchable(request, "Practitioner", gp);
+    await waitSearchable(request, "Patient", patient);
+    await waitSearchable(request, "Observation", observation);
 
     await queries.goto();
     await queries.builder.run(

@@ -1,5 +1,5 @@
 import { test, expect } from "../pages/fixtures";
-import { createResource } from "../pages/api";
+import { createResource, waitSearchable } from "../pages/api";
 
 // The Resources workspace beyond the edit flows: the type rail (filter + live
 // counts), the modal's open/close/tab surface, the delete flow, and the promise
@@ -58,6 +58,7 @@ test("the modal closes via the X and via Escape", async ({ resources }) => {
 
 test("a created resource can be deleted from its modal", async ({ resources, page, request }) => {
   const id = await createResource(request, "Patient", { name: [{ family: "ToDelete" }] });
+  await waitSearchable(request, "Patient", id);
 
   // Open it in the modal by searching for it and clicking the result row.
   await resources.goto("Patient");

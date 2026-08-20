@@ -38,8 +38,13 @@
   </a>
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("card-uptime") }}</span>
-    <span class="stat__value">{{ metrics.uptime_percent }}<span class="stat__unit">%</span></span>
+    {% if let Some(uptime) = metrics.uptime %}
+    <span class="stat__value">{{ uptime }}</span>
     <span class="stat__sub">{{ i18n.t("card-uptime-sub") }}</span>
+    {% else %}
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("card-jobs-unavailable") }}">&mdash;</span>
+    <span class="stat__sub">{{ i18n.t("card-jobs-unavailable") }}</span>
+    {% endif %}
   </article>
 </section>
 

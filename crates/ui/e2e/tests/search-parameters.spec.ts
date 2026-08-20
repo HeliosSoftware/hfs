@@ -1,5 +1,5 @@
 import { test, expect } from "../pages/fixtures";
-import { createResource } from "../pages/api";
+import { createResource, waitSearchable } from "../pages/api";
 
 // The SearchParameter registry viewer (/ui/search-parameters): the htmx filter
 // rail, the type/source facet chips, row selection into the detail panel, and
@@ -57,6 +57,10 @@ test("a stored parameter can be created, offers Edit, and deletes", async ({
     base: ["Patient"],
     expression: "Patient.identifier",
   });
+  // The page lists via FHIR search; on the ES composites the write is not
+  // searchable until the index refreshes, and the refetched snapshot would
+  // cache without it.
+  await waitSearchable(request, "SearchParameter", id);
 
   // refresh=1 drops the server's cached snapshot so the new parameter shows.
   await searchParameters.goto(`?refresh=1&sel=${encodeURIComponent(url)}`);

@@ -68,7 +68,7 @@ jobs:
       - name: Build HFS
         run: |
           cargo build -p helios-hfs --no-default-features \
-            --features R4,ui,sqlite,elasticsearch,postgres,mongodb,s3
+            --features R4,ui,subscriptions,sqlite,elasticsearch,postgres,mongodb,s3
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v7
@@ -305,6 +305,13 @@ jobs:
           export HFS_DATA_DIR="$GITHUB_WORKSPACE/data"
           export HFS_NL_SEARCH_API_KEY="e2e-placeholder-not-a-real-key"
           export HFS_DEFAULT_FHIR_VERSION=R4
+          # The suite creates and immediately searches; on the ES composites
+          # the default asynchronous sync races the specs (nightly reds since
+          # the SearchParameter CRUD spec landed). Synchronous puts the write
+          # in ES before the API responds; the specs' waitSearchable covers
+          # the index-refresh window that remains. No effect on the other
+          # backends.
+          export HFS_COMPOSITE_SYNC_MODE=synchronous
 
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
@@ -406,7 +413,14 @@ jobs:
             --label github.workflow=ui-tests-matrix \
             --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
           docker cp crates/ui/e2e "$PW_CONTAINER":/work/e2e
-          docker exec -e CI=1 -e HFS_E2E_BASE_URL="$BASE" -w /work/e2e "$PW_CONTAINER" \
+          # The ES composites index asynchronously: specs that assert an
+          # immediate post-write search relax to a bounded poll under this
+          # flag; the strict read-your-write contract stays guarded by the
+          # other backends and the per-PR sqlite suite.
+          EVENTUAL=0
+          case "${{ matrix.backend }}" in *elasticsearch*) EVENTUAL=1;; esac
+          docker exec -e CI=1 -e HFS_E2E_BASE_URL="$BASE" \
+            -e HFS_E2E_EVENTUAL_SEARCH="$EVENTUAL" -w /work/e2e "$PW_CONTAINER" \
             bash -c "npm ci && npx playwright test"
 
       - name: Copy Playwright report out
