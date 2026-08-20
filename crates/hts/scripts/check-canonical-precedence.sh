@@ -17,6 +17,10 @@ cd "$(dirname "$0")/.."
 # `code_systems.version`, …) so a query cannot dodge the guard by renaming its
 # alias — the earlier three-literal form let exactly that slip through.
 #
+# The exclusion pattern tolerates a repeated slash: BSD grep (the macOS lint
+# runners) prints `src//backends/mod.rs` for a `src/` root, so a literal
+# `src/backends/mod.rs` filter missed it and the guard failed on macOS only.
+#
 # `backends/mod.rs` is the one sanctioned home of the ordering: the shared
 # helpers there emit `COALESCE({alias}.version, '') DESC` with a `{alias}`
 # placeholder, which does not match the concrete-alias pattern anyway, but it is
@@ -24,7 +28,7 @@ cd "$(dirname "$0")/.."
 # rewritten to use a literal alias.
 if hits=$(grep -rnE --include=*.rs \
         "COALESCE\(([A-Za-z_][A-Za-z0-9_]*\.)?version, ''\) DESC" \
-        src/ 2>/dev/null | grep -v 'src/backends/mod.rs'); then
+        src/ 2>/dev/null | grep -vE 'src/+backends/mod\.rs'); then
     echo "ERROR: hand-rolled same-URL ordering found." >&2
     echo "Use crate::backends::cs_precedence_order_by() / vs_precedence_order_by() instead." >&2
     echo "See crates/hts/docs/ig-publisher-compatibility.md §2a (issue #200)." >&2

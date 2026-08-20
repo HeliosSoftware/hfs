@@ -1,0 +1,111 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("subs-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("subs-title") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("subs-lede") }}</p>
+</section>
+
+{% if !available %}
+<div class="card notice">{{ i18n.t("subs-unavailable") }}</div>
+{% else %}
+
+<!-- The four headline cards from Brett's design. The delivery-window card
+     waits for engine instrumentation (#580): figures here are real or absent. -->
+<section class="stat-grid">
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("subs-card-failing") }}</span>
+    <span class="stat__value">{{ cards.failing }}</span>
+    <span class="stat__sub">{{ i18n.t("subs-card-failing-sub") }}</span>
+  </article>
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("subs-card-idle") }}</span>
+    <span class="stat__value">{{ cards.idle }}</span>
+    <span class="stat__sub">{{ i18n.t("subs-card-idle-sub") }}</span>
+  </article>
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("subs-card-active") }}</span>
+    <span class="stat__value">{{ cards.active }}</span>
+    <span class="stat__sub">{{ i18n.t("subs-card-active-sub") }}</span>
+  </article>
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("subs-card-delivered") }}</span>
+    <span class="stat__value">{{ cards.delivered }}</span>
+    <span class="stat__sub">{% if let Some(rate) = cards.rate %}{{ i18n.t_arg("subs-card-delivered-sub", "rate", rate.to_string()) }}{% else %}{{ i18n.t("subs-card-delivered-none") }}{% endif %}</span>
+  </article>
+</section>
+
+<section class="card table-card">
+  <div class="toolbar">
+    <h2 class="toolbar__title">
+      {{ i18n.t("subs-table-heading") }}
+      <span class="toolbar__count">{{ rows.len() }}</span>
+    </h2>
+    <!-- Sort is a plain-links menu, so it works without JavaScript. -->
+    <details class="menu subs-sort">
+      <summary class="btn">
+        {{ i18n.t("subs-sort") }}:
+        {% if sort == "sent" %}{{ i18n.t("subs-sort-sent") }}{% else if sort == "fails" %}{{ i18n.t("subs-sort-fails") }}{% else %}{{ i18n.t("subs-sort-status") }}{% endif %}
+      </summary>
+      <div class="menu__panel menu__panel--right">
+        <a class="menu__option" href="/ui/subscriptions?sort=status"{% if sort == "status" %} aria-current="true"{% endif %}>{{ i18n.t("subs-sort-status") }}</a>
+        <a class="menu__option" href="/ui/subscriptions?sort=sent"{% if sort == "sent" %} aria-current="true"{% endif %}>{{ i18n.t("subs-sort-sent") }}</a>
+        <a class="menu__option" href="/ui/subscriptions?sort=fails"{% if sort == "fails" %} aria-current="true"{% endif %}>{{ i18n.t("subs-sort-fails") }}</a>
+      </div>
+    </details>
+  </div>
+
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>{{ i18n.t("subs-col-subscription") }}</th>
+          <th>{{ i18n.t("subs-col-channel") }}</th>
+          <th>{{ i18n.t("subs-col-status") }}</th>
+          <th class="col-num">{{ i18n.t("subs-col-last24") }}</th>
+          <th class="col-num">{{ i18n.t("subs-col-sent") }}</th>
+          <th class="col-num">{{ i18n.t("subs-col-fails") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td>
+            <span class="code">{{ row.id }}</span>
+            <span class="url" title="{{ row.topic_url }}">{{ row.topic }}</span>
+          </td>
+          <td>
+            {{ row.channel }}
+            {% if !row.endpoint.is_empty() %}
+            <span class="url" title="{{ row.endpoint }}">{{ row.endpoint }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if row.state == "active" %}
+            <span class="tag tag--active">{{ i18n.t("subs-state-active") }}</span>
+            {% else if row.state == "error" %}
+            <span class="tag tag--error">{{ i18n.t("subs-state-error") }}</span>
+            {% else if row.state == "idle" %}
+            <span class="tag tag--idle">{{ i18n.t("subs-state-idle") }}</span>
+            {% else if row.state == "requested" %}
+            <span class="tag tag--requested">{{ i18n.t("subs-state-requested") }}</span>
+            {% else %}
+            <span class="tag tag--muted">{{ i18n.t("subs-state-off") }}</span>
+            {% endif %}
+          </td>
+          <td class="col-num">{{ row.last24 }}</td>
+          <td class="col-num">{{ row.sent }}</td>
+          <td class="col-num">{{ row.streak }}</td>
+        </tr>
+        {% endfor %}
+        {% if rows.is_empty() %}
+        <tr class="data-table__empty"><td colspan="6">{{ i18n.t("subs-empty") }}</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

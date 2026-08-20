@@ -62,7 +62,7 @@ jobs:
         run: cargo test -p helios-ui
 
       - name: Build hfs (ui feature)
-        run: cargo build -p helios-hfs --features ui
+        run: cargo build -p helios-hfs --features ui,subscriptions
 
       # The browser ring, inside the Playwright container on the remote daemon.
       # boot.mjs starts the copied-in hfs and Playwright drives it — both live in

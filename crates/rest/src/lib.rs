@@ -849,6 +849,15 @@ where
             }
             let engine = Arc::new(engine);
             spawn_subscription_rehydration(Arc::clone(&engine), Arc::clone(&storage_arc), &config);
+            // The operator page's read path (#580): a plain-data snapshot of the
+            // engine's inventory, registered process-globally so the UI crate
+            // reads it without depending on the engine. Registration doubles as
+            // the "subscriptions advertised" signal that unhides the page.
+            helios_observability::subscriptions::set_provider(Arc::new(
+                EngineSubscriptionsProvider {
+                    engine: Arc::clone(&engine),
+                },
+            ));
             state.with_subscription_engine(engine)
         } else {
             state
@@ -1000,6 +1009,56 @@ where
 
     // Apply remaining middleware
     router.layer(service_builder)
+}
+
+/// The subscriptions operator page's read path (#580): projects the engine's
+/// in-memory inventory — statuses, event counters, failure streaks, connected
+/// WebSocket clients — into the plain-data snapshot
+/// `helios-observability` hands the UI. Registered in `build_app` for the same
+/// reason rehydration is wired there: it is the only place that holds the
+/// engine.
+#[cfg(feature = "subscriptions")]
+struct EngineSubscriptionsProvider {
+    engine: Arc<helios_subscriptions::SubscriptionEngine>,
+}
+
+#[cfg(feature = "subscriptions")]
+impl helios_observability::subscriptions::SubscriptionsProvider for EngineSubscriptionsProvider {
+    fn snapshot(&self, tenant: &str) -> helios_observability::subscriptions::SubscriptionsSnapshot {
+        use helios_observability::subscriptions::{SubscriptionRow, SubscriptionsSnapshot};
+        use helios_subscriptions::manager::ChannelType;
+
+        let now = chrono::Utc::now().timestamp();
+        let rows = self
+            .engine
+            .manager()
+            .all_subscriptions()
+            .into_iter()
+            .filter(|s| s.tenant_id == tenant)
+            .map(|s| {
+                let ws_clients = matches!(s.channel.channel_type, ChannelType::Websocket)
+                    .then(|| self.engine.ws_manager().client_count(&s.tenant_id, &s.id));
+                let window = self
+                    .engine
+                    .delivery_stats()
+                    .window(&s.tenant_id, &s.id, now);
+                SubscriptionRow {
+                    id: s.id,
+                    topic_url: s.topic_url,
+                    channel_type: s.channel.channel_type.as_fhir_str().to_string(),
+                    endpoint: s.channel.endpoint,
+                    status: s.status.as_fhir_str().to_string(),
+                    events_since_start: s.events_since_start,
+                    consecutive_failures: s.consecutive_failures,
+                    ws_clients,
+                    delivered_24h: window.delivered,
+                    first_try_24h: window.first_try,
+                    failed_24h: window.failed,
+                }
+            })
+            .collect();
+        SubscriptionsSnapshot { rows }
+    }
 }
 
 /// Spawns the startup rehydration of the subscription engine (issue #305).

@@ -499,6 +499,15 @@ curl -X POST http://localhost:8080/ \
   }'
 ```
 
+### Entry Methods
+
+`Bundle.entry.request.method` is matched **case-sensitively** in both bundle types.
+It is a `code` with a required binding to `http://hl7.org/fhir/ValueSet/http-verb`,
+whose concepts are `caseSensitive: true` and uppercase in every supported FHIR
+version — so a lowercase `"post"` is invalid instance data and is refused with
+`400`, not silently accepted. `GET`, `POST`, `PUT` and `DELETE` dispatch; `PATCH`
+and `HEAD` are refused as described under Current Limitations.
+
 ### Conditional Operations in Bundles
 
 - `ifMatch` — **supported.** ETag for optimistic locking on `PUT` **and `DELETE`**
@@ -528,7 +537,8 @@ endpoints and **not** for bundle entries; reconciling the two is #511.
 The following FHIR transaction features are not yet implemented:
 - **Conditional interactions in bundle entries** - `[type]?[criteria]` URLs are refused rather than resolved (#511)
 - **Conditional reference resolution** - References like `Patient?identifier=12345` are not resolved
-- **PATCH method** - PATCH operations in bundles return 501 Not Implemented
+- **PATCH method** - PATCH operations in bundles return 501 Not Implemented, in both `batch` (per entry) and `transaction` (whole bundle). Send the patch to the instance endpoint instead
+- **HEAD entries** - refused with 405. `HEAD` is a legal `http-verb` code and is served on the instance-read route, but not inside a Bundle
 - **Prefer header** - `return=minimal` and `return=OperationOutcome` not honored
 - **Duplicate detection** - Same resource appearing twice in a transaction is not detected
 

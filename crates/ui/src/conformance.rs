@@ -6,11 +6,18 @@
 //! `/CompartmentDefinition`. This crate reads them from that FHIR API over
 //! HTTP rather than from disk, so the UI shows exactly what the server holds.
 //!
+//! Storage only ever holds the server's default FHIR version (seeding is
+//! keyed on `HFS_DEFAULT_FHIR_VERSION`), so a fetch for any *other* enabled
+//! version answers from the shipped `data/` spec bundles instead (#562) —
+//! the correct per-version spec set, minus tenant-stored custom resources,
+//! which only exist for the seeded default.
+//!
 //! [`ConformanceSource`] abstracts the fetch so tests can inject a
 //! [`StaticConformanceSource`] (offline, from the shipped `data/` bundles)
 //! instead of standing up a real server.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -40,18 +47,69 @@ pub(crate) struct HttpConformanceSource {
     client: reqwest::Client,
     base_url: String,
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    /// The version the server seeds into storage (`HFS_DEFAULT_FHIR_VERSION`).
+    /// Fetches for this version go over HTTP; any other enabled version
+    /// answers from the spec bundles in `data_dir` (#562).
+    default_version: FhirVersion,
+    data_dir: Option<PathBuf>,
 }
 
 impl HttpConformanceSource {
     pub fn new(
         base_url: String,
         outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+        default_version: FhirVersion,
+        data_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             outbound_auth,
+            default_version,
+            data_dir,
         }
+    }
+
+    /// Loads `resource_type` for a non-default `version` from the shipped
+    /// `data/` spec bundles. Storage cannot answer these: seeding only writes
+    /// the default version, and the FHIR search surface has no per-version
+    /// filter, so the bundle is the authoritative set for the version.
+    async fn fetch_spec_bundle(
+        &self,
+        resource_type: &str,
+        version: FhirVersion,
+    ) -> Result<Vec<Value>, String> {
+        let Some(dir) = self.data_dir.clone() else {
+            return Err(format!(
+                "no {resource_type} data for FHIR {}: storage holds the server default ({}) and no data directory is configured",
+                version.as_str(),
+                self.default_version.as_str(),
+            ));
+        };
+        let resource_type = resource_type.to_string();
+        tokio::task::spawn_blocking(move || match resource_type.as_str() {
+            "SearchParameter" => helios_fhir::search::SearchParameterLoader::new(version)
+                .load_spec_resources(&dir)
+                .map_err(|e| {
+                    format!(
+                        "loading the FHIR {} SearchParameter bundle failed: {e}",
+                        version.as_str()
+                    )
+                }),
+            "CompartmentDefinition" => {
+                helios_fhir::compartment::CompartmentDefinitionLoader::new(version)
+                    .load_spec_resources(&dir)
+                    .map_err(|e| {
+                        format!(
+                            "loading the FHIR {} CompartmentDefinition bundle failed: {e}",
+                            version.as_str()
+                        )
+                    })
+            }
+            other => Err(format!("unsupported conformance type {other}")),
+        })
+        .await
+        .map_err(|e| format!("spec bundle load failed: {e}"))?
     }
 }
 
@@ -60,9 +118,14 @@ impl ConformanceSource for HttpConformanceSource {
     async fn fetch(
         &self,
         resource_type: &str,
-        _version: FhirVersion,
+        version: FhirVersion,
         tenant: &str,
     ) -> Result<Vec<Value>, String> {
+        // Storage only holds the seeded default version; any other enabled
+        // version answers from the shipped spec bundles (#562).
+        if version != self.default_version {
+            return self.fetch_spec_bundle(resource_type, version).await;
+        }
         // Ask for everything at once, then follow `next` links for whatever
         // the server's `_count` policy withheld (#460): the request says
         // 10000, but a server capping at 1000 used to silently truncate the
@@ -72,10 +135,13 @@ impl ConformanceSource for HttpConformanceSource {
         let mut resources = Vec::new();
         // Generous page bound — only a runaway self-linking server hits it.
         for _ in 0..100 {
-            let mut request = self
-                .client
-                .get(&url)
-                .header("Accept", "application/fhir+json");
+            let mut request = self.client.get(&url).header(
+                "Accept",
+                format!(
+                    "application/fhir+json; fhirVersion={}",
+                    version.as_mime_param()
+                ),
+            );
             // Scope the self-call to the effective tenant (#344); an empty id
             // means the server default and needs no header.
             if !tenant.is_empty() {
@@ -244,14 +310,83 @@ mod tests {
         );
     }
 
+    /// #562: a fetch for a version other than the server default answers from
+    /// the shipped spec bundles without touching HTTP — nothing listens at the
+    /// base URL, so reaching for it would fail the fetch.
+    #[cfg(feature = "R4B")]
+    #[tokio::test]
+    async fn non_default_versions_answer_from_the_spec_bundles() {
+        let source = HttpConformanceSource::new(
+            "http://127.0.0.1:1".to_string(),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            Some(std::path::PathBuf::from("../../data")),
+        );
+        let defs = source
+            .fetch("CompartmentDefinition", FhirVersion::R4B, "")
+            .await
+            .expect("spec bundle load");
+        let patient = defs
+            .iter()
+            .find(|d| d["code"] == "Patient")
+            .expect("patient compartment");
+        let codes: Vec<&str> = patient["resource"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["code"].as_str())
+            .collect();
+        // The set is genuinely the R4B one: Ingredient joined in R4B,
+        // EffectEvidenceSynthesis left after R4.
+        assert!(codes.contains(&"Ingredient"));
+        assert!(!codes.contains(&"EffectEvidenceSynthesis"));
+    }
+
+    /// #562: with no data directory a non-default version cannot be served —
+    /// the fetch fails loudly (degraded page) instead of silently answering
+    /// with the wrong version's set.
+    #[cfg(feature = "R4B")]
+    #[tokio::test]
+    async fn non_default_version_without_a_data_dir_fails_loudly() {
+        let source = HttpConformanceSource::new(
+            "http://127.0.0.1:1".to_string(),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+        let err = source
+            .fetch("CompartmentDefinition", FhirVersion::R4B, "")
+            .await
+            .expect_err("no data dir to answer from");
+        assert!(err.contains(FhirVersion::R4B.as_str()), "{err}");
+    }
+
     /// #460: a server that caps `_count` answers in pages; the fetch must
     /// follow `next` links and return the union, not the first page.
+    /// The self-call also names the requested version on the Accept header
+    /// (#562) — the handler rejects a request without it.
     #[tokio::test]
     async fn http_fetch_follows_next_links() {
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
         use axum::{Router, extract::Query, routing::get};
         use std::collections::HashMap;
 
-        async fn page(Query(q): Query<HashMap<String, String>>) -> axum::Json<Value> {
+        async fn page(
+            headers: HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::response::Response {
+            let accept = headers
+                .get("accept")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if !accept.contains("fhirVersion=4.0") {
+                return axum::http::StatusCode::NOT_ACCEPTABLE.into_response();
+            }
+            inner(q).into_response()
+        }
+
+        fn inner(q: HashMap<String, String>) -> axum::Json<Value> {
             let offset: usize = q.get("_offset").map(|o| o.parse().unwrap()).unwrap_or(0);
             let mut bundle = serde_json::json!({
                 "resourceType": "Bundle",
@@ -277,6 +412,8 @@ mod tests {
         let source = HttpConformanceSource::new(
             format!("http://{addr}"),
             std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
         );
         let resources = source
             .fetch("SearchParameter", FhirVersion::R4, "")

@@ -68,7 +68,7 @@ jobs:
       - name: Build HFS
         run: |
           cargo build -p helios-hfs --no-default-features \
-            --features R4,ui,sqlite,elasticsearch,postgres,mongodb,s3
+            --features R4,ui,subscriptions,sqlite,elasticsearch,postgres,mongodb,s3
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v7
