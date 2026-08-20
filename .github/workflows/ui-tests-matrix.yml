@@ -309,9 +309,13 @@ jobs:
           # the default asynchronous sync races the specs (nightly reds since
           # the SearchParameter CRUD spec landed). Synchronous puts the write
           # in ES before the API responds; the specs' waitSearchable covers
-          # the index-refresh window that remains. No effect on the other
-          # backends.
-          export HFS_COMPOSITE_SYNC_MODE=synchronous
+          # the index-refresh window that remains. Only on the sqlite leg:
+          # against real S3 the extra per-write latency tipped the seed-heavy
+          # dashboard specs over their budgets (run 62), so that leg stays
+          # asynchronous and leans on the polls alone.
+          if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
+            export HFS_COMPOSITE_SYNC_MODE=synchronous
+          fi
 
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
