@@ -1,5 +1,6 @@
 {#-
-  ConceptMap browser rows partial (design doc §7.5 mirror of §7.4/§7.2).
+  ConceptMap browser rows partial (design doc §7.5 mirror of §7.4/§7.2,
+  Phase 5 columns).
 
   Rendered inline by `pages/cm-browser.html` on the first hard nav, and
   swapped in by every subsequent filter change or Load-more click. Every
@@ -10,13 +11,16 @@
   The pre-flight `_count > MAX` branch (Slice B invariant #1) renders the
   invalid-input OperationOutcome above an empty table so the operator can
   still see the filter form's other values echoed back.
+
+  Phase 5 columns: Name · Title · URL · Source / Target (stacked in a
+  single 2-line cell prefixed with `S:` / `T:`) · Status. `Version` is
+  dropped because HTS ignores CM version on `$translate` (design doc
+  §7.5) and the browser tracked it as a silent column with no filter.
+  The stacked Source/Target cell (Gate 1 decision) preserves scannable
+  "does this map X → Y" grammar without pushing the table wider than
+  the CS/VS mirror.
 -#}
-<div id="hts-cm-rows" class="hts-cm-browser__rows">
-  {#-
-    Inline degraded banner — same shape as `hts-vs-rows.html` /
-    `hts-cs-rows.html` so caches stay consistent across the three
-    browsers.
-  -#}
+<div id="hts-cm-rows">
   {% if let Some(reason) = view.degraded_reason() %}
   <aside class="hts-degraded" role="alert" aria-live="assertive">
     <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
@@ -31,72 +35,91 @@
     {% include "partials/hts-outcome.html" %}
   {% endif %}
 
-  <table class="data-table hts-cm-browser__table" aria-describedby="hts-cm-browser-heading">
-    <caption class="visually-hidden">{{ chrome.i18n.t("hts-cm-browser-table-caption") }}</caption>
-    <thead>
-      <tr>
-        <th scope="col">{{ chrome.i18n.t("hts-cm-browser-column-url") }}</th>
-        <th scope="col">{{ chrome.i18n.t("hts-cm-browser-column-version") }}</th>
-        <th scope="col">{{ chrome.i18n.t("hts-cm-browser-column-title") }}</th>
-        <th scope="col">{{ chrome.i18n.t("hts-cm-browser-column-status") }}</th>
-      </tr>
-    </thead>
-    <tbody aria-live="polite">
-      {% if let Some(page) = view.page() %}
-        {% if page.rows.is_empty() %}
-          {% if !view.count_over_max %}
-          <tr class="hts-cm-browser__empty">
-            <td colspan="4">{{ chrome.i18n.t("hts-cm-browser-empty") }}</td>
-          </tr>
-          {% endif %}
-        {% else %}
-          {% for row in page.rows %}
+  <section class="card">
+    <div class="table-wrap">
+      <table class="data-table" aria-describedby="hts-cm-browser-heading">
+        <caption class="visually-hidden">{{ chrome.i18n.t("hts-cm-browser-table-caption") }}</caption>
+        <thead>
           <tr>
-            <td>{% if row.url.is_empty() %}&mdash;{% else %}<code class="hts-cm-browser__url">{{ row.url }}</code>{% endif %}</td>
-            <td>{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
-            <td>
-              <a class="hts-cm-browser__row-link" href="/ui/hts/concept-maps/{{ row.id }}">
-                {% if !row.title.is_empty() %}{{ row.title }}
-                {%- else if !row.name.is_empty() %}{{ row.name }}
-                {%- else %}{{ row.id }}
-                {%- endif %}
-              </a>
-            </td>
-            <td>
-              {% if row.status.is_empty() %}
-                &mdash;
-              {% else %}
-                <span class="pill pill--{{ row.status }}">{{ chrome.i18n.t(format!("hts-cm-status-{}", row.status).as_str()) }}</span>
-              {% endif %}
-            </td>
+            <th scope="col" class="col-name">{{ chrome.i18n.t("hts-cm-browser-column-name") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-cm-browser-column-title") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-cm-browser-column-url") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-cm-browser-column-mapping") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-cm-browser-column-status") }}</th>
           </tr>
-          {% endfor %}
-        {% endif %}
-      {% endif %}
-    </tbody>
-  </table>
-
-  {% if let Some(page) = view.page() %}
-    {% if !page.rows.is_empty() %}
-    <div class="hts-cm-browser__pager">
-      <span class="hts-cm-browser__count">
-        {{ chrome.i18n.t_arg("hts-cm-browser-showing-count", "count", page.showing_count().to_string()) }}
-      </span>
-      {% if let Some(next) = page.next_offset() %}
-        {#-
-          `hx-swap="beforeend"` appends the next tbody's rows without
-          replacing the current ones; the surrounding rows partial is
-          re-fetched with the new offset preserving all active filters.
-        -#}
-        <button type="button" class="btn btn--secondary"
-                hx-get="/ui/hts/concept-maps/rows?{%- if let Some(u) = view.filters.url -%}url={{ u }}&{%- endif -%}{%- if let Some(n) = view.filters.name -%}name={{ n }}&{%- endif -%}{%- if let Some(t) = view.filters.title -%}title={{ t }}&{%- endif -%}{%- if let Some(s) = view.filters.source -%}source={{ s }}&{%- endif -%}{%- if let Some(t) = view.filters.target -%}target={{ t }}&{%- endif -%}{%- if let Some(s) = view.filters.status -%}status={{ s }}&{%- endif -%}_count={{ view.filters.effective_count() }}&_offset={{ next }}"
-                hx-target="#hts-cm-rows tbody"
-                hx-swap="beforeend"
-                hx-select="#hts-cm-rows tbody > tr">
-          {{ chrome.i18n.t("hts-cm-browser-load-more") }}
-        </button>
-      {% endif %}
+        </thead>
+        <tbody aria-live="polite">
+          {% if let Some(page) = view.page() %}
+            {% if page.rows.is_empty() %}
+              {% if !view.count_over_max %}
+              <tr>
+                <td colspan="5">{{ chrome.i18n.t("hts-cm-browser-empty") }}</td>
+              </tr>
+              {% endif %}
+            {% else %}
+              {% for row in page.rows %}
+              <tr>
+                <td class="col-name">
+                  <a href="/ui/hts/concept-maps/{{ row.id }}">
+                    {% if !row.name.is_empty() %}{{ row.name }}
+                    {%- else %}{{ row.id }}
+                    {%- endif %}
+                  </a>
+                </td>
+                <td>{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
+                <td>{% if row.url.is_empty() %}&mdash;{% else %}<code class="url">{{ row.url }}</code>{% endif %}</td>
+                <td>
+                  {#-
+                    Stacked mapping cell: prefix labels (`S:` / `T:`) let
+                    a screen reader announce "S colon <uri>", and the
+                    prefixes double as visual anchors so the operator
+                    can eye-scan a column of vertically-aligned pairs.
+                    Empty sides render an em-dash rather than being
+                    dropped so alignment stays consistent across rows.
+                  -#}
+                  <div class="cm-mapping">
+                    <span class="cm-mapping__line">
+                      <span class="cm-mapping__prefix" aria-label="{{ chrome.i18n.t("hts-cm-browser-column-source") }}">{{ chrome.i18n.t("hts-cm-browser-mapping-source-prefix") }}</span>
+                      {% if row.source_uri.is_empty() %}&mdash;{% else %}<code class="url">{{ row.source_uri }}</code>{% endif %}
+                    </span>
+                    <span class="cm-mapping__line">
+                      <span class="cm-mapping__prefix" aria-label="{{ chrome.i18n.t("hts-cm-browser-column-target") }}">{{ chrome.i18n.t("hts-cm-browser-mapping-target-prefix") }}</span>
+                      {% if row.target_uri.is_empty() %}&mdash;{% else %}<code class="url">{{ row.target_uri }}</code>{% endif %}
+                    </span>
+                  </div>
+                </td>
+                <td>
+                  {% if row.status.is_empty() %}
+                    &mdash;
+                  {% else %}
+                    <span class="pill pill--{{ row.status }}">{{ chrome.i18n.t(format!("hts-cm-status-{}", row.status).as_str()) }}</span>
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            {% endif %}
+          {% endif %}
+        </tbody>
+      </table>
     </div>
+
+    {% if let Some(page) = view.page() %}
+      {% if !page.rows.is_empty() %}
+      <div class="table-foot">
+        <span>
+          {{ chrome.i18n.t_arg("hts-cm-browser-showing-count", "count", page.showing_count().to_string()) }}
+        </span>
+        {% if let Some(next) = page.next_offset() %}
+          <button type="button" class="btn btn--secondary"
+                  hx-get="{{ view.filters.load_more_url(next) }}"
+                  hx-target="#hts-cm-rows tbody"
+                  hx-swap="beforeend"
+                  hx-select="#hts-cm-rows tbody > tr">
+            {{ chrome.i18n.t("hts-cm-browser-load-more") }}
+          </button>
+        {% endif %}
+      </div>
+      {% endif %}
     {% endif %}
-  {% endif %}
+  </section>
 </div>

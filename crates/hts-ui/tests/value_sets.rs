@@ -388,8 +388,8 @@ async fn browser_renders_full_page_with_translated_heading() {
         "browser heading must be Fluent-resolved (en value: ValueSets)",
     );
     assert!(
-        html.contains("hts-vs-browser__filters"),
-        "filter form must render",
+        html.contains("id=\"hts-vs-filters\""),
+        "filter form must render (stable id anchor for tests)",
     );
     for key in [
         "hts-vs-browser-title",

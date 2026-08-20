@@ -2,11 +2,18 @@
   Dashboard cards fragment (design doc §7.1).
   Rendered once on hard navigation as part of `pages/dashboard.html`, and
   again on every 15 s htmx refresh via `GET /ui/hts/dashboard/cards`. Same
-  markup either way — the `hx-swap-oob` degraded banner replaces the outer
-  region so a partial failure does not blank the healthy tiles.
+  markup either way — the outer `#hts-dashboard-cards` region is swapped
+  wholesale, so a partial failure never blanks the healthy tiles.
+
+  Style: reuse the HFS `.stat-grid` / `.card.stat` primitives from
+  `crates/ui/assets/app.css` so the terminology dashboard reads with the
+  same visual grammar as the FHIR-server dashboard. HTS-namespaced hooks
+  (`.hts-dashboard`, `.hts-quick-strip`, `.hts-quick-links`) carry no
+  visual weight beyond the two-rule quick-strip polish — they exist so
+  this fragment can be selected in tests without renaming.
 -#}
-<div class="hts-dashboard__cards"
-     id="hts-dashboard-cards"
+<div id="hts-dashboard-cards"
+     class="hts-dashboard"
      aria-live="polite"
      aria-busy="false">
 
@@ -21,103 +28,104 @@
   {% endif %}
 
   {#-- Row 1: Status / Backend / Uptime / FHIR version --#}
-  <section class="hts-card-row hts-card-row--status" aria-labelledby="hts-dashboard-row-status">
+  <section class="stat-grid" aria-labelledby="hts-dashboard-row-status">
     <h2 id="hts-dashboard-row-status" class="visually-hidden">{{ chrome.i18n.t("hts-dashboard-row-status") }}</h2>
 
-    <article class="hts-card hts-card--status">
-      <p class="hts-card__label">{{ chrome.i18n.t("hts-dashboard-tile-status") }}</p>
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-dashboard-tile-status") }}</span>
       {% match cards.health %}
         {% when Ok(h) %}
-          <p class="hts-card__value hts-card__value--ok">
+          <span class="stat__value stat__value--ok">
             {{ chrome.i18n.t(format!("hts-dashboard-status-{}", h.status).as_str()) }}
-          </p>
+          </span>
         {% when Err(_) %}
-          <p class="hts-card__value hts-card__value--err">&mdash;</p>
+          <span class="stat__value">&mdash;</span>
       {% endmatch %}
     </article>
 
-    <article class="hts-card">
-      <p class="hts-card__label">{{ chrome.i18n.t("hts-dashboard-tile-backend") }}</p>
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-dashboard-tile-backend") }}</span>
       {% match cards.health %}
-        {% when Ok(h) %}<p class="hts-card__value"><code>{{ h.backend }}</code></p>
-        {% when Err(_) %}<p class="hts-card__value">&mdash;</p>
+        {% when Ok(h) %}<span class="stat__value"><code>{{ h.backend }}</code></span>
+        {% when Err(_) %}<span class="stat__value">&mdash;</span>
       {% endmatch %}
     </article>
 
-    <article class="hts-card">
-      <p class="hts-card__label">{{ chrome.i18n.t("hts-dashboard-tile-uptime") }}</p>
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-dashboard-tile-uptime") }}</span>
       {% match cards.health %}
-        {% when Ok(h) %}<p class="hts-card__value">{{ h.uptime_pretty() }}</p>
-        {% when Err(_) %}<p class="hts-card__value">&mdash;</p>
+        {% when Ok(h) %}<span class="stat__value">{{ h.uptime_pretty() }}</span>
+        {% when Err(_) %}<span class="stat__value">&mdash;</span>
       {% endmatch %}
     </article>
 
-    <article class="hts-card">
-      <p class="hts-card__label">{{ chrome.i18n.t("hts-dashboard-tile-fhir-version") }}</p>
-      <p class="hts-card__value">
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-dashboard-tile-fhir-version") }}</span>
+      <span class="stat__value">
         {%- match cards.capabilities -%}
           {%- when Ok(c) -%}
             {%- if c.fhir_version.is_empty() -%}{{ chrome.fhir_version }}{%- else -%}{{ c.fhir_version }}{%- endif -%}
           {%- when Err(_) -%}
             {{ chrome.fhir_version }}
         {%- endmatch -%}
-      </p>
+      </span>
     </article>
   </section>
 
   {#-- Row 2: Loaded systems / Bundled data --#}
-  <section class="hts-card-row hts-card-row--inventory" aria-labelledby="hts-dashboard-row-inventory">
+  <section class="stat-grid stat-grid--2" aria-labelledby="hts-dashboard-row-inventory">
     <h2 id="hts-dashboard-row-inventory" class="visually-hidden">{{ chrome.i18n.t("hts-dashboard-row-inventory") }}</h2>
 
-    <article class="hts-card hts-card--wide">
-      <p class="hts-card__label">{{ chrome.i18n.t("hts-dashboard-tile-loaded-systems") }}</p>
-      <p class="hts-card__value">
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-dashboard-tile-loaded-systems") }}</span>
+      <span class="stat__value">
         {%- match cards.loaded_system_count() -%}
           {%- when Some(n) -%}{{ n }}
           {%- when None -%}&mdash;
         {%- endmatch -%}
-      </p>
-      <p class="hts-card__hint">{{ chrome.i18n.t("hts-dashboard-tile-loaded-systems-hint") }}</p>
+      </span>
+      <span class="stat__sub">{{ chrome.i18n.t("hts-dashboard-tile-loaded-systems-hint") }}</span>
     </article>
 
-    <article class="hts-card hts-card--wide">
-      <p class="hts-card__label">{{ chrome.i18n.t("hts-dashboard-tile-bundled-data") }}</p>
-      <p class="hts-card__value">
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-dashboard-tile-bundled-data") }}</span>
+      <span class="stat__value">
         {%- match cards.bundled_data_mib() -%}
           {%- when Some(mib) -%}{{ chrome.i18n.t_arg("hts-dashboard-tile-bundled-data-value", "mib", mib.to_string()) }}
           {%- when None -%}&mdash;
         {%- endmatch -%}
-      </p>
-      <p class="hts-card__hint">{{ chrome.i18n.t("hts-dashboard-tile-bundled-data-hint") }}</p>
+      </span>
+      <span class="stat__sub">{{ chrome.i18n.t("hts-dashboard-tile-bundled-data-hint") }}</span>
     </article>
   </section>
 
-  {#-- Row 3: Metrics (placeholder for Wave 2; the shape is here so slice B/C… inherit the pattern) --#}
-  <section class="hts-card-row hts-card-row--metrics" aria-labelledby="hts-dashboard-row-metrics">
+  {#-- Row 3: Metrics placeholder (Wave 2 wiring — no chart per §7.1 states matrix). --#}
+  <section class="stat-grid stat-grid--2" aria-labelledby="hts-dashboard-row-metrics">
     <h2 id="hts-dashboard-row-metrics" class="visually-hidden">{{ chrome.i18n.t("hts-dashboard-row-metrics") }}</h2>
 
-    <article class="hts-card hts-card--soon">
-      <p class="hts-card__label">{{ chrome.i18n.t("hts-dashboard-tile-requests") }}</p>
-      <p class="hts-card__value">&mdash;</p>
-      <p class="hts-card__hint">{{ chrome.i18n.t("hts-dashboard-tile-metrics-hint") }}</p>
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-dashboard-tile-requests") }}</span>
+      <span class="stat__value">&mdash;</span>
+      <span class="stat__sub">{{ chrome.i18n.t("hts-dashboard-tile-metrics-hint") }}</span>
     </article>
 
-    <article class="hts-card hts-card--soon">
-      <p class="hts-card__label">{{ chrome.i18n.t("hts-dashboard-tile-avg-latency") }}</p>
-      <p class="hts-card__value">&mdash;</p>
-      <p class="hts-card__hint">{{ chrome.i18n.t("hts-dashboard-tile-metrics-hint") }}</p>
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-dashboard-tile-avg-latency") }}</span>
+      <span class="stat__value">&mdash;</span>
+      <span class="stat__sub">{{ chrome.i18n.t("hts-dashboard-tile-metrics-hint") }}</span>
     </article>
   </section>
 
-  {#-- Row 4: Quick links to the working areas. Real `<a>` first — nojs. --#}
-  <section class="hts-card-row hts-card-row--links" aria-labelledby="hts-dashboard-row-links">
-    <h2 id="hts-dashboard-row-links" class="hts-card-row__heading">{{ chrome.i18n.t("hts-dashboard-quick-links") }}</h2>
+  {#-- Row 4: Quick links — real `<a>` first (nojs-safe), styled as pills. --#}
+  <section class="card hts-quick-strip" aria-labelledby="hts-dashboard-row-links">
+    <h2 id="hts-dashboard-row-links" class="visually-hidden">{{ chrome.i18n.t("hts-dashboard-quick-links") }}</h2>
+    <span class="stat__label">{{ chrome.i18n.t("hts-dashboard-quick-links") }}</span>
     <nav class="hts-quick-links" aria-label="{{ chrome.i18n.t("hts-dashboard-quick-links") }}">
-      <a class="hts-quick-link" href="/ui/hts/code-systems">{{ chrome.i18n.t("hts-nav-code-systems") }}</a>
-      <a class="hts-quick-link" href="/ui/hts/value-sets">{{ chrome.i18n.t("hts-nav-value-sets") }}</a>
-      <a class="hts-quick-link" href="/ui/hts/concept-maps">{{ chrome.i18n.t("hts-nav-concept-maps") }}</a>
-      <a class="hts-quick-link hts-quick-link--emphasis" href="/ui/hts/operations">{{ chrome.i18n.t("hts-nav-operations") }}</a>
-      <a class="hts-quick-link" href="/ui/hts/import">{{ chrome.i18n.t("hts-nav-import") }}</a>
+      <a class="pill" href="/ui/hts/code-systems">{{ chrome.i18n.t("hts-nav-code-systems") }}</a>
+      <a class="pill" href="/ui/hts/value-sets">{{ chrome.i18n.t("hts-nav-value-sets") }}</a>
+      <a class="pill" href="/ui/hts/concept-maps">{{ chrome.i18n.t("hts-nav-concept-maps") }}</a>
+      <a class="pill" href="/ui/hts/operations">{{ chrome.i18n.t("hts-nav-operations") }}</a>
+      <a class="pill" href="/ui/hts/import">{{ chrome.i18n.t("hts-nav-import") }}</a>
     </nav>
   </section>
 </div>

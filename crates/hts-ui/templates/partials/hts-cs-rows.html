@@ -1,5 +1,5 @@
 {#-
-  CodeSystem browser rows partial (design doc §7.2).
+  CodeSystem browser rows partial (design doc §7.2, Phase 5 columns).
 
   Rendered inline by `pages/cs-browser.html` on the first hard nav, and
   swapped in by every subsequent filter change or Load-more click. The
@@ -7,8 +7,13 @@
   connection-level degrade. The pre-flight `_count > MAX` branch renders
   the invalid-input OperationOutcome above an empty table so the operator
   can still see the filter form's other values echoed back.
+
+  Phase 5 column set: Name · Title · URL · Version · Status. `Name` is
+  first because the operator's mental key on a computer-friendly catalog
+  is the resource's `name` — the `title` used to occupy the anchor cell
+  and hide `name` behind a fallback, which broke column identity.
 -#}
-<div id="hts-cs-rows" class="hts-cs-browser__rows">
+<div id="hts-cs-rows">
   {#-
     Inline degraded banner (mirrors dashboard-cards.html §7.1). Included
     here rather than reusing partials/hts-degraded.html to sidestep
@@ -29,73 +34,81 @@
     {% include "partials/hts-outcome.html" %}
   {% endif %}
 
-  <table class="data-table hts-cs-browser__table" aria-describedby="hts-cs-browser-heading">
-    <caption class="visually-hidden">{{ chrome.i18n.t("hts-cs-browser-table-caption") }}</caption>
-    <thead>
-      <tr>
-        <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-url") }}</th>
-        <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-version") }}</th>
-        <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-title") }}</th>
-        <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-status") }}</th>
-      </tr>
-    </thead>
-    <tbody aria-live="polite">
-      {% if let Some(page) = view.page() %}
-        {% if page.rows.is_empty() %}
-          {% if !view.count_over_max %}
-          <tr class="hts-cs-browser__empty">
-            <td colspan="4">{{ chrome.i18n.t("hts-cs-browser-empty") }}</td>
-          </tr>
-          {% endif %}
-        {% else %}
-          {% for row in page.rows %}
+  <section class="card">
+    <div class="table-wrap">
+      <table class="data-table" aria-describedby="hts-cs-browser-heading">
+        <caption class="visually-hidden">{{ chrome.i18n.t("hts-cs-browser-table-caption") }}</caption>
+        <thead>
           <tr>
-            <td>{% if row.url.is_empty() %}&mdash;{% else %}<code class="hts-cs-browser__url">{{ row.url }}</code>{% endif %}</td>
-            <td>{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
-            <td>
-              <a class="hts-cs-browser__row-link" href="/ui/hts/code-systems/{{ row.id }}">
-                {% if !row.title.is_empty() %}{{ row.title }}
-                {%- else if !row.name.is_empty() %}{{ row.name }}
-                {%- else %}{{ row.id }}
-                {%- endif %}
-              </a>
-            </td>
-            <td>
-              {% if row.status.is_empty() %}
-                &mdash;
-              {% else %}
-                <span class="pill pill--{{ row.status }}">{{ chrome.i18n.t(format!("hts-cs-status-{}", row.status).as_str()) }}</span>
-              {% endif %}
-            </td>
+            <th scope="col" class="col-name">{{ chrome.i18n.t("hts-cs-browser-column-name") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-title") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-url") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-version") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-status") }}</th>
           </tr>
-          {% endfor %}
-        {% endif %}
-      {% endif %}
-    </tbody>
-  </table>
-
-  {% if let Some(page) = view.page() %}
-    {% if !page.rows.is_empty() %}
-    <div class="hts-cs-browser__pager">
-      <span class="hts-cs-browser__count">
-        {{ chrome.i18n.t_arg("hts-cs-browser-showing-count", "count", page.showing_count().to_string()) }}
-      </span>
-      {% if let Some(next) = page.next_offset() %}
-        {#-
-          `hx-swap="beforeend"` appends the next tbody's rows without
-          replacing the current ones; the surrounding rows partial is
-          re-fetched with the new offset preserving all active filters.
-          The button keeps focus post-swap per §7.2 a11y clause.
-        -#}
-        <button type="button" class="btn btn--secondary"
-                hx-get="/ui/hts/code-systems/rows?{%- if let Some(u) = view.filters.url -%}url={{ u }}&{%- endif -%}{%- if let Some(v) = view.filters.version -%}version={{ v }}&{%- endif -%}{%- if let Some(n) = view.filters.name -%}name={{ n }}&{%- endif -%}{%- if let Some(t) = view.filters.title -%}title={{ t }}&{%- endif -%}{%- if let Some(s) = view.filters.status -%}status={{ s }}&{%- endif -%}_count={{ view.filters.effective_count() }}&_offset={{ next }}"
-                hx-target="#hts-cs-rows tbody"
-                hx-swap="beforeend"
-                hx-select="#hts-cs-rows tbody > tr">
-          {{ chrome.i18n.t("hts-cs-browser-load-more") }}
-        </button>
-      {% endif %}
+        </thead>
+        <tbody aria-live="polite">
+          {% if let Some(page) = view.page() %}
+            {% if page.rows.is_empty() %}
+              {% if !view.count_over_max %}
+              <tr>
+                <td colspan="5">{{ chrome.i18n.t("hts-cs-browser-empty") }}</td>
+              </tr>
+              {% endif %}
+            {% else %}
+              {% for row in page.rows %}
+              <tr>
+                <td class="col-name">
+                  <a href="/ui/hts/code-systems/{{ row.id }}">
+                    {% if !row.name.is_empty() %}{{ row.name }}
+                    {%- else %}{{ row.id }}
+                    {%- endif %}
+                  </a>
+                </td>
+                <td>{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
+                <td>{% if row.url.is_empty() %}&mdash;{% else %}<code class="url">{{ row.url }}</code>{% endif %}</td>
+                <td>{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
+                <td>
+                  {% if row.status.is_empty() %}
+                    &mdash;
+                  {% else %}
+                    <span class="pill pill--{{ row.status }}">{{ chrome.i18n.t(format!("hts-cs-status-{}", row.status).as_str()) }}</span>
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            {% endif %}
+          {% endif %}
+        </tbody>
+      </table>
     </div>
+
+    {% if let Some(page) = view.page() %}
+      {% if !page.rows.is_empty() %}
+      <div class="table-foot">
+        <span>
+          {{ chrome.i18n.t_arg("hts-cs-browser-showing-count", "count", page.showing_count().to_string()) }}
+        </span>
+        {% if let Some(next) = page.next_offset() %}
+          {#-
+            `hx-swap="beforeend"` appends the next tbody's rows without
+            replacing the current ones; the surrounding rows partial is
+            re-fetched with the new offset preserving every active
+            filter (values + modes). The button keeps focus post-swap
+            per §7.2 a11y clause. `load_more_url` centralizes the
+            FHIR-modifier-aware serialization so template drift can't
+            silently drop a filter (Phase 5 audit).
+          -#}
+          <button type="button" class="btn btn--secondary"
+                  hx-get="{{ view.filters.load_more_url(next) }}"
+                  hx-target="#hts-cs-rows tbody"
+                  hx-swap="beforeend"
+                  hx-select="#hts-cs-rows tbody > tr">
+            {{ chrome.i18n.t("hts-cs-browser-load-more") }}
+          </button>
+        {% endif %}
+      </div>
+      {% endif %}
     {% endif %}
-  {% endif %}
+  </section>
 </div>

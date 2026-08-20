@@ -1,11 +1,11 @@
-# Helios FHIR Server â€” UI message catalog
-# Locale: English (en) â€” SOURCE LOCALE. Every key defined here is the
+# Helios FHIR Server — UI message catalog
+# Locale: English (en) — SOURCE LOCALE. Every key defined here is the
 # canonical set; other locales are expected to provide the same keys.
 #
 # Syntax: Project Fluent (https://projectfluent.org/). Terms (prefixed with
 # `-`) are reusable snippets; messages (bare identifiers) are what the UI
 # looks up. Placeables `{ $var }` are interpolated by the caller. Do NOT put
-# markup or logic here â€” translations are data, the template renders them.
+# markup or logic here — translations are data, the template renders them.
 
 ## Brand / shared terms
 
@@ -45,7 +45,7 @@ health-status-ok = All systems operational
 health-status-degraded = Some systems are degraded
 health-uptime = Uptime: { $duration }
 
-# Pluralized count â€” every locale must supply the plural categories its
+# Pluralized count — every locale must supply the plural categories its
 # grammar requires (CLDR rules; Fluent selects the branch automatically).
 resource-count = { $count ->
     [one] { $count } resource
@@ -66,7 +66,7 @@ action-save = Save
 action-cancel = Cancel
 action-retry = Retry
 
-## Errors (mirrors OperationOutcome text; see docs/multi-language.md Â§5)
+## Errors (mirrors OperationOutcome text; see docs/multi-language.md §5)
 
 error-not-found = The requested resource was not found.
 error-unauthorized = You are not authorized to perform this action.
@@ -105,7 +105,7 @@ tenants-stat-total-sub = { $count ->
 }
 tenants-stat-resources = Resources stored
 tenants-stat-resources-sub = across all tenants
-tenants-search-placeholder = Search by name or tenant idâ€¦
+tenants-search-placeholder = Search by name or tenant id…
 tenants-add = Add tenant
 tenants-add-title = Add a tenant
 tenants-field-id = Tenant id
@@ -148,7 +148,7 @@ chart-window = Chart time window
 
 ## Footer
 
-footer-copyright = Â© { $year } { -org-name }
+footer-copyright = © { $year } { -org-name }
 
 ## History & Versions (#236)
 
@@ -170,7 +170,7 @@ history-to = To
 history-show-metadata = Show metadata changes
 history-empty = Load a resource, then pick two versions to compare.
 history-load-error = Could not load that resource's history.
-history-not-found = No history for that resource â€” check the type and id.
+history-not-found = No history for that resource — check the type and id.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } metadata change hidden
@@ -179,7 +179,7 @@ history-metadata-hidden = { $count ->
 history-textual = Show full text diff
 history-only-metadata = Only metadata changed between these versions.
 history-identical = These two versions are identical.
-history-deleted = { $version } is a deletion â€” there is nothing to diff against.
+history-deleted = { $version } is a deletion — there is nothing to diff against.
 history-parse-error = Those versions could not be read as JSON.
 ## Saved queries (#234)
 
@@ -208,7 +208,7 @@ queries-unavailable = Saved queries are unavailable: this server's storage backe
 sp-heading = Search parameters
 sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant.
 sp-version-label = FHIR version
-sp-spec-missing = The full spec bundle (search-parameters-*.json) was not found in the data directory â€” only the minimal embedded fallback parameters are shown.
+sp-spec-missing = The full spec bundle (search-parameters-*.json) was not found in the data directory — only the minimal embedded fallback parameters are shown.
 sp-rail-label = Resource filter
 sp-rail-search = Filter types
 sp-rail-recent = Recently used
@@ -236,7 +236,7 @@ sp-page-next = Next
 sp-detail-label = Parameter detail
 sp-detail-empty = No parameter selected
 sp-detail-empty-hint = Select a row to inspect its definition, expression, and how it resolves against the registry.
-sp-detail-readonly = Spec parameter (compiled in from the data file) â€” read-only.
+sp-detail-readonly = Spec parameter (compiled in from the data file) — read-only.
 sp-field-url = Canonical URL
 sp-field-name = Name
 sp-field-status = Status
@@ -246,7 +246,7 @@ sp-field-description = Description
 sp-field-target = Target types
 sp-field-components = Components
 sp-status-hint = The loader promotes the spec's draft status to active on load.
-sp-note-conflict = Duplicate (base, code) within the same source as { $url } â€” the registry rejects this collision (DuplicateCode).
+sp-note-conflict = Duplicate (base, code) within the same source as { $url } — the registry rejects this collision (DuplicateCode).
 sp-note-overrides = Overrides { $url } on (base, code): a Stored definition outranks the spec parameter, so this one resolves searches. The registry logs a WARN naming both URLs.
 sp-note-shadowed = Shadowed by { $url } on (base, code): a higher-precedence source resolves searches for this slot.
 sp-note-empty-expression = Empty expression: the extractor indexes zero rows, so every search on this parameter silently returns empty.
@@ -268,7 +268,7 @@ cmp-heading = Compartments
 cmp-lede = The compartment definitions this server routes /{"{"}compartment{"}"}/{"{"}id{"}"}/{"{"}type{"}"} requests with, and a tester that answers: is this type in this compartment, via which parameters, and what search does the server run?
 cmp-rail-label = Compartment definitions
 cmp-rail-heading = Compartments
-cmp-degraded = Compartment definitions could not be loaded from this server right now â€” the self-call to /CompartmentDefinition failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
+cmp-degraded = Compartment definitions could not be loaded from this server right now — the self-call to /CompartmentDefinition failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
 cmp-rail-note = Definitions are stored resources, seeded from the FHIR spec at startup. Edits and deletions here are tenant-scoped.
 cmp-tabs-label = Compartment sections
 cmp-tab-definition = Definition
@@ -296,23 +296,23 @@ cmp-excluded = excluded
 cmp-tester-id = Id
 cmp-tester-target = Target type (or *)
 cmp-tester-run = Test
-cmp-result-member = âœ“ member â€” via { $params }
+cmp-result-member = ✓ member — via { $params }
 cmp-result-flat = // equivalent flat search
 cmp-result-member-note = The server resolves the compartment route to this search over the type's reference parameters.
-cmp-result-self = âœ“ member â€” the compartment resource itself ({"{"}def{"}"})
+cmp-result-self = ✓ member — the compartment resource itself ({"{"}def{"}"})
 cmp-result-self-note = The compartment instance is trivially in its own compartment; the route reads the resource directly.
-cmp-result-notmember = âœ• { $type } is not a member of this compartment
+cmp-result-notmember = ✕ { $type } is not a member of this compartment
 cmp-result-notmember-note = The server returns 404 with an OperationOutcome for types that are not compartment members.
 cmp-result-fanout = Fans out to { $count } member types
-cmp-result-fanout-note = Excluded types are skipped, not failed â€” the fan-out drops non-member types rather than erroring.
+cmp-result-fanout-note = Excluded types are skipped, not failed — the fan-out drops non-member types rather than erroring.
 queries-builder-heading = Search builder
 queries-url-label = FHIR search URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edit the GET URL directly or through the rows below â€” they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
+queries-builder-hint = Edit the GET URL directly or through the rows below — they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
 queries-recent = Recent
 queries-recent-heading = Recent searches
-queries-recent-empty = No recent searches yet â€” Run one to record it here.
-queries-invalid-url = Enter a search like GET /Patient?name=smith â€” the resource type comes from the path.
+queries-recent-empty = No recent searches yet — Run one to record it here.
+queries-invalid-url = Enter a search like GET /Patient?name=smith — the resource type comes from the path.
 
 queries-conditions = Conditions
 queries-add-condition = Add condition
@@ -326,7 +326,7 @@ plain-find = Find {"{type}"} records
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-and = and
 plain-or = or
-plain-arrow = â€™s
+plain-arrow = 's
 plain-has = that have a related {"{type}"} whose {"{param}"} {"{verb}"} {"{value}"}
 plain-include = Also returning the {"{param}"} of each {"{type}"}{"{target}"}
 plain-revinclude = Plus every {"{type}"} whose {"{param}"} points here
@@ -380,7 +380,7 @@ queries-has-pill = has a related
 queries-has-type-placeholder = resource type
 queries-has-via = linked via
 queries-has-where = where its
-queries-add-has = â§‰ Filter a resource that links here
+queries-add-has = ⧉ Filter a resource that links here
 queries-param-placeholder = parameter
 queries-value-placeholder = value
 queries-results = Results
@@ -395,7 +395,7 @@ queries-next = Next
 queries-rail-heading = Resource types
 queries-rail-filter = Filter types
 
-## Search â€” natural language & visual builder (#255)
+## Search — natural language & visual builder (#255)
 
 search-heading = Search
 search-lede = Describe what you're looking for, or build the query by hand. Either way you get a FHIR search query you can read, correct, and run.
@@ -407,9 +407,9 @@ search-mode-nl = Natural language
 search-mode-builder = Visual builder
 
 search-nl-label = Describe the search
-search-nl-placeholder = Describe what you're looking for â€” e.g. patients named Smith born after 1980
+search-nl-placeholder = Describe what you're looking for — e.g. patients named Smith born after 1980
 search-nl-hint = Your text and this server's search parameters go to the language model. Patient data never does. The query it writes is shown below for you to check and run.
-search-nl-working = Translatingâ€¦
+search-nl-working = Translating…
 search-nl-caveats = Worth knowing:
 search-nl-unsupported = That isn't a search this server can run. Try describing the records you want to find.
 
@@ -418,15 +418,15 @@ search-nl-example-2 = Observations from the last 30 days, most recent first
 search-nl-example-3 = Encounters at Boston General still in progress
 
 search-setup-heading = Natural-language search is available
-search-setup-body = Turn plain-language descriptions into FHIR search queries. It needs an API key for a language model â€” the server reads it from the environment, and it never reaches this page. Until one is set, use the visual builder below.
+search-setup-body = Turn plain-language descriptions into FHIR search queries. It needs an API key for a language model — the server reads it from the environment, and it never reaches this page. Until one is set, use the visual builder below.
 search-setup-key-placeholder = your API key
-search-setup-disable = To remove the feature entirely â€” endpoint, page, and this notice â€” set HFS_NL_SEARCH_ENABLED=false.
+search-setup-disable = To remove the feature entirely — endpoint, page, and this notice — set HFS_NL_SEARCH_ENABLED=false.
 search-setup-docs = Read the how-to
 
 ## Resource editor (#264)
 
 editor-heading = Resource editor
-editor-lede = Edit a resource against its schema: add any element the schema allows, at any depth â€” including extensions, on any node that accepts one.
+editor-lede = Edit a resource against its schema: add any element the schema allows, at any depth — including extensions, on any node that accepts one.
 editor-title = Edit resource
 editor-view-label = How to edit
 editor-view-form = Guided form
@@ -442,7 +442,7 @@ editor-source-hint = Edit the source directly. Switching back to the guided form
 
 editor-add = Add element
 editor-must-support-badge = MS
-editor-binding-hint = Bound to a value set â€” codes come from it; strength shown
+editor-binding-hint = Bound to a value set — codes come from it; strength shown
 editor-legend-live = Checked as you type: structure, cardinality, required bindings
 editor-legend-save = Checked on save: constraints and terminology
 editor-deferred-badge = on save
@@ -450,7 +450,7 @@ editor-deferred-hint = Codes are verified against the value set when you save (a
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
 editor-add-filter = Filter elements
 editor-add-another = add another
-editor-pick-type = Pick a typeâ€¦
+editor-pick-type = Pick a type…
 editor-extension-url = Extension URL
 editor-add-extension = Add extension
 
@@ -480,7 +480,7 @@ resources-heading = Resources
 resources-lede = Browse, search, create, and edit FHIR resources. Search in natural language or build the query by hand, then open any result to edit it.
 resources-create = Create new
 resources-save-blocked = Fix the validation issues before saving.
-resources-save-invalid = The JSON is not valid â€” fix it before saving.
+resources-save-invalid = The JSON is not valid — fix it before saving.
 resources-edit-title = Edit resource
 resources-tab-edit = Edit
 resources-tab-history = History
@@ -500,11 +500,11 @@ batch-not-a-bundle = That JSON is not a FHIR Bundle
 batch-bad-type = Only Bundles of type batch or transaction can be executed here
 batch-request = Request
 batch-entries = entries
-batch-semantics-batch = Batch: entries run independently â€” a failed entry does not stop or undo the others.
-batch-semantics-transaction = Transaction: all or nothing â€” if any entry fails, the server rolls the whole bundle back.
+batch-semantics-batch = Batch: entries run independently — a failed entry does not stop or undo the others.
+batch-semantics-transaction = Transaction: all or nothing — if any entry fails, the server rolls the whole bundle back.
 batch-tab-actions = Actions
 batch-tab-json = Bundle JSON
-batch-no-body = (no body â€” this entry only addresses a resource)
+batch-no-body = (no body — this entry only addresses a resource)
 batch-cancel = Cancel
 batch-upload-another = Upload another
 batch-execute = Execute
@@ -586,17 +586,17 @@ bulk-import-field-submitter-hint = Must match an identifier registered with the 
 bulk-import-field-submission-id = Submission ID
 bulk-import-field-submission-id-hint = Unique per submitter. Leave empty to generate a UUID.
 bulk-import-processing = Processing
-bulk-import-processing-waiting = Waiting for the recipient's first status reportâ€¦
+bulk-import-processing-waiting = Waiting for the recipient's first status report…
 bulk-import-result = Result
 bulk-import-result-finished = Processing finished at
 bulk-import-result-outputs = Output files
 bulk-import-result-errors = Error files
 bulk-import-abort-manifest = Abort
 
-## HTS administrative UI (crates/hts-ui) â€” Phase 1 scaffold stubs
+## HTS administrative UI (crates/hts-ui) — Phase 1 scaffold stubs
 ##
 ## The full catalog for the HTS UI is filled in during Phase 1.4 / Phase 2
-## slices per `edson/docs/hts-ui-design.md` Â§7 (Fluent convention:
+## slices per `edson/docs/hts-ui-design.md` §7 (Fluent convention:
 ## hts-<page>-<role>-<control>). These stubs cover the base layout, sidebar
 ## nav, and the dashboard scaffold placeholder rendered by the Phase 1 blocker
 ## slice. They must be kept in parity with es/de/main.ftl.
@@ -621,7 +621,7 @@ hts-fhir-version = FHIR { $version }
 hts-dashboard-title = Dashboard
 hts-dashboard-subtitle = Terminology server health, catalog inventory, and quick actions.
 
-## Dashboard rows (row headings are visually hidden â€” they're for screen readers).
+## Dashboard rows (row headings are visually hidden — they're for screen readers).
 
 hts-dashboard-row-status = Server status
 hts-dashboard-row-inventory = Loaded inventory
@@ -641,13 +641,13 @@ hts-dashboard-tile-bundled-data-value = { $mib } MiB
 hts-dashboard-tile-bundled-data-hint = From HTS_BOOTSTRAP_DIR footprint
 hts-dashboard-tile-requests = Requests
 hts-dashboard-tile-avg-latency = Avg latency
-hts-dashboard-tile-metrics-hint = From /metrics â€” Wave 2
+hts-dashboard-tile-metrics-hint = From /metrics — Wave 2
 
 ## /health `status` values, keyed for translation.
 
 hts-dashboard-status-ok = OK
 
-## Degraded banner (design doc Â§7 header contract).
+## Degraded banner (design doc §7 header contract).
 
 hts-degraded-title = Terminology backend not fully available
 hts-degraded-body = Some tiles are hidden until HTS becomes reachable again. Interactive controls are disabled on affected pages.
@@ -659,14 +659,14 @@ hts-degraded-reason-upstream-shape = The terminology server returned an unexpect
 hts-degraded-reason-bootstrapping = The terminology server is still loading its bootstrap data.
 hts-degraded-reason-unknown = The terminology server is temporarily unavailable.
 
-## Dialect chip (topbar, session-wide displayLanguage / Accept-Language per Â§7.1).
+## Dialect chip (topbar, session-wide displayLanguage / Accept-Language per §7.1).
 
 hts-dialect-label = Dialect
 hts-dialect-prefix = dialect:
 hts-dialect-heading = Session dialect
 hts-dialect-hint = Controls displayLanguage on expansions and Accept-Language on reads. Per-op fields on Operations override this.
 
-## OperationOutcome partial (shared, design doc Â§7 / Â§11).
+## OperationOutcome partial (shared, design doc §7 / §11).
 
 hts-outcome-severity = Severity: { $severity }
 hts-outcome-request-id = Request id: { $id }
@@ -676,8 +676,8 @@ hts-outcome-code-too-costly = The requested operation was rejected as too expens
 hts-outcome-code-unknown = The server returned an issue the UI does not recognise.
 hts-degraded-since = Since { $timestamp }
 
-## HTS Slice B â€” CodeSystem browser + detail with embedded workbench
-## (design doc Â§7.2 + Â§7.3). Every key here has a peer in es/de/main.ftl.
+## HTS Slice B — CodeSystem browser + detail with embedded workbench
+## (design doc §7.2 + §7.3). Every key here has a peer in es/de/main.ftl.
 
 ## CodeSystem status pills (used by browser rows and detail header).
 
@@ -710,10 +710,17 @@ hts-cs-browser-column-version = Version
 hts-cs-browser-column-title = Title
 hts-cs-browser-column-status = Status
 hts-cs-browser-error-title = CodeSystems could not be listed
+hts-cs-browser-column-name = Name
+
+## Phase 5 — HTS search-form shared strings (used by CS / VS / CM browsers).
+
+hts-search-rail-label = Search filters
+hts-search-rail-heading = Filters
+hts-facet-status-any = Any status
 
 ## CS detail page.
 
-hts-cs-detail-title = { $name } Â· CodeSystem
+hts-cs-detail-title = { $name } · CodeSystem
 hts-cs-detail-title-fallback = CodeSystem
 hts-cs-detail-eyebrow = CodeSystem
 hts-cs-detail-section-identity = Identity
@@ -779,12 +786,12 @@ hts-workbench-copy-url = Request URL
 hts-workbench-format-json = JSON
 hts-workbench-format-xml = XML
 
-## Additional degraded reason for CS-read 404s (design doc Â§7.3 states matrix).
+## Additional degraded reason for CS-read 404s (design doc §7.3 states matrix).
 
 hts-degraded-reason-upstream-not-found = The terminology server did not find that resource.
 
-## HTS Slice C â€” ValueSet browser + detail with embedded $expand workbench
-## (design doc Â§7.4 + Â§7.4.1). Every key here has a peer in es/de/main.ftl.
+## HTS Slice C — ValueSet browser + detail with embedded $expand workbench
+## (design doc §7.4 + §7.4.1). Every key here has a peer in es/de/main.ftl.
 
 ## ValueSet status pills.
 
@@ -816,10 +823,11 @@ hts-vs-browser-column-url = URL
 hts-vs-browser-column-version = Version
 hts-vs-browser-column-title = Title
 hts-vs-browser-column-status = Status
+hts-vs-browser-column-name = Name
 
 ## VS detail page.
 
-hts-vs-detail-title = { $name } Â· ValueSet
+hts-vs-detail-title = { $name } · ValueSet
 hts-vs-detail-title-fallback = ValueSet
 hts-vs-detail-eyebrow = ValueSet
 hts-vs-detail-section-identity = Identity
@@ -871,7 +879,7 @@ hts-vs-expand-threshold = Too-costly threshold
 hts-vs-expand-ceiling-tooltip = UI ceiling: { $ceiling } (values above are dropped)
 hts-vs-expand-ceiling-note = ceiling: { $ceiling }
 hts-vs-expand-ceiling-warning-title = Threshold above the UI ceiling
-hts-vs-expand-ceiling-warning-body = You requested threshold { $requested }, which is above the UI ceiling â€” the header was not attached.
+hts-vs-expand-ceiling-warning-body = You requested threshold { $requested }, which is above the UI ceiling — the header was not attached.
 hts-vs-expand-ceiling-value = ceiling: { $ceiling }
 hts-vs-expand-too-costly-title = Expansion rejected as too costly
 hts-vs-expand-too-costly-body = HTS refused the expansion above the current threshold. Raise it below and re-run, or narrow the filter.
@@ -892,8 +900,8 @@ hts-vs-expand-column-system = System
 hts-vs-expand-load-more = Load more
 hts-vs-expand-echoed-parameters = Echoed parameters
 
-## HTS Slice D â€” ConceptMap browser + detail with embedded $translate
-## workbench (design doc Â§7.5). Every key here has a peer in
+## HTS Slice D — ConceptMap browser + detail with embedded $translate
+## workbench (design doc §7.5). Every key here has a peer in
 ## es/de/main.ftl.
 
 ## ConceptMap status pills.
@@ -927,10 +935,16 @@ hts-cm-browser-column-url = URL
 hts-cm-browser-column-version = Version
 hts-cm-browser-column-title = Title
 hts-cm-browser-column-status = Status
+hts-cm-browser-column-name = Name
+hts-cm-browser-column-source = Source system
+hts-cm-browser-column-target = Target system
+hts-cm-browser-column-mapping = Mapping
+hts-cm-browser-mapping-source-prefix = S:
+hts-cm-browser-mapping-target-prefix = T:
 
 ## CM detail page.
 
-hts-cm-detail-title = { $name } Â· ConceptMap
+hts-cm-detail-title = { $name } · ConceptMap
 hts-cm-detail-title-fallback = ConceptMap
 hts-cm-detail-eyebrow = ConceptMap
 hts-cm-detail-section-identity = Identity

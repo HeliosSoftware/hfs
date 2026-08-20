@@ -86,6 +86,34 @@ async fn dashboard_serves_full_page_at_ui_hts() {
 }
 
 #[tokio::test]
+async fn dashboard_trailing_slash_redirects_to_canonical() {
+    // `/ui/hts/` (trailing slash) must 308-redirect to the canonical
+    // `/ui/hts`. Axum matches paths exactly, so without an explicit route
+    // the trailing-slash variant would 404 — which is exactly what
+    // `edson/docs/hts-demo.md` (Phase 4) tried to describe as "redirects
+    // from /ui/hts/". Locked here so any regression fails the ring.
+    let response = app()
+        .oneshot(Request::get("/ui/hts/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::PERMANENT_REDIRECT,
+        "GET /ui/hts/ must 308-redirect to the canonical path",
+    );
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .expect("308 must carry a Location header")
+        .to_str()
+        .expect("Location header must be ASCII");
+    assert_eq!(
+        location, "/ui/hts",
+        "trailing-slash redirect must point at the browser-canonical /ui/hts",
+    );
+}
+
+#[tokio::test]
 async fn dashboard_advertises_vary_hx_request_for_htmx_caching() {
     // `AutoVaryLayer` (axum-htmx) appends `Vary: HX-Request` only when the
     // request carried the `HX-Request` header — that's what makes it safe

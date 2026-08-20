@@ -621,6 +621,13 @@ button.menu__option {
   color: var(--text);
 }
 
+/* The single accent moment on a stat tile — used sparingly (currently only
+   the "up" state of the HTS dashboard Status tile). Reuses the accent token
+   already tuned for AA contrast per theme, so no new palette values enter. */
+.stat__value--ok {
+  color: var(--accent-text);
+}
+
 .stat__unit {
   font-size: 17px;
   letter-spacing: -0.3px;
@@ -789,6 +796,37 @@ button.pill {
 .stat-grid--2 {
   grid-template-columns: repeat(2, 1fr);
   max-width: 620px;
+}
+
+/* Quick-links strip on the HTS dashboard: a full-width `.card` that stacks
+   the eyebrow label above a wrapping row of `.pill` anchors. Kept HTS-scoped
+   via the class name so it never interferes with HFS card layouts. */
+.hts-quick-strip {
+  padding: 16px 20px;
+  display: grid;
+  gap: 12px;
+}
+.hts-quick-strip .hts-quick-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Accessible sr-only helper — hides the element visually while keeping it
+   in the accessibility tree. Referenced by row headings in the HTS
+   dashboard partial and by outcome/import announcements. Without this rule
+   those `<h2>`s would render at browser default size and break the
+   visual hierarchy. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .notice {
@@ -1827,6 +1865,29 @@ button.pill {
   gap: 14px;
   min-width: 0;
 }
+
+/* HTS Phase-5 filter-rail field group: label above a row of
+   mode-select + text-input. Input skin comes from
+   `.builder-row__value` / `.builder-row__modifier`; rules below
+   only handle the stacked layout and the sticky action row. */
+.filter-rail__field { display: flex; flex-direction: column; gap: 4px; padding: 0 4px; }
+.filter-rail__field-label { margin: 0 2px; font-size: 11px; font-weight: 600; color: var(--muted); }
+.filter-rail__field-row { display: flex; gap: 6px; align-items: center; }
+.filter-rail__field-row .builder-row__value { flex: 1; min-width: 0; }
+.filter-rail__actions {
+  display: flex; gap: 8px; padding: 10px 4px 0; margin-top: 4px;
+  border-top: 1px solid var(--surface-border);
+}
+/* HTS browsers: bound Name column so long computer-friendly names
+   (`hl7.terminology.r4.CodeSystem-*`) don't crowd Title. */
+.data-table .col-name { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* HTS ConceptMap stacked source/target cell (Phase-5 §7.5 Gate 1):
+   two vertically-stacked lines with a monospace `S:` / `T:` prefix
+   so the mapping direction stays scannable in-row. */
+.cm-mapping { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cm-mapping__line { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.cm-mapping__prefix { font-size: 11px; font-weight: 600; color: var(--muted); flex: none; }
+.cm-mapping__line .url { min-width: 0; }
 
 /* Facet chip rows */
 

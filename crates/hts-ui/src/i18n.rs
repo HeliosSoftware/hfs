@@ -282,4 +282,49 @@ mod tests {
         assert_eq!(locale, &DE);
         assert!(explicit);
     }
+
+    /// Guards against the mojibake regression fixed 2026-08-19: the shared
+    /// Fluent catalogs at `locales/{en,es,de}/main.ftl` had been round-tripped
+    /// through cp1252 at some point, so every non-ASCII character rendered as
+    /// double-encoded UTF-8 in the browser (e.g. `InglÃ©s` instead of
+    /// `Inglés`, `â€"` instead of `—`). If a future edit re-introduces the
+    /// corruption — for example by opening a `.ftl` in an editor that
+    /// silently converts the file — this test fails loudly on the exact
+    /// keys the language switcher renders.
+    #[test]
+    fn spanish_language_switcher_labels_are_valid_utf8() {
+        let i18n = I18n { locale: &ES };
+        assert_eq!(i18n.t("language-en"), "Inglés");
+        assert_eq!(i18n.t("language-es"), "Español");
+        assert_eq!(i18n.t("language-de"), "Alemán");
+    }
+
+    #[test]
+    fn locale_catalogs_contain_no_mojibake_markers() {
+        // A hit on any of these byte sequences means the catalog was
+        // written through cp1252 mojibake. Checked across all three
+        // shipped locales via the Fluent loader so the assertion travels
+        // with any future locale additions.
+        let mojibake_pairs = ["Ã©", "Ã¡", "Ã±", "â€", "Ã¢", "Â "];
+        for locale in [&EN, &ES, &DE] {
+            let i18n = I18n { locale };
+            for key in [
+                "language-en",
+                "language-es",
+                "language-de",
+                "home-lede",
+                "hts-dashboard-title",
+            ] {
+                let rendered = i18n.t(key);
+                for pair in &mojibake_pairs {
+                    assert!(
+                        !rendered.contains(pair),
+                        "{}.ftl key `{}` contains mojibake sequence `{}` \
+                         (rendered: {rendered:?}). See `locales/{}/main.ftl`.",
+                        locale, key, pair, locale,
+                    );
+                }
+            }
+        }
+    }
 }

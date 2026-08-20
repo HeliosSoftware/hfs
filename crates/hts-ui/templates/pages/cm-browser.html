@@ -2,80 +2,115 @@
 
 {% block title %}{{ chrome.i18n.t("hts-cm-browser-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
 
+{% block content_class %} content--wide{% endblock %}
+
 {% block content %}
 <section class="hts-cm-browser" aria-labelledby="hts-cm-browser-heading">
-  <header class="page-header">
-    <h1 id="hts-cm-browser-heading">{{ chrome.i18n.t("hts-cm-browser-title") }}</h1>
-    <p class="page-header__subtitle">{{ chrome.i18n.t("hts-cm-browser-subtitle") }}</p>
+  <header class="page-head">
+    <h1 id="hts-cm-browser-heading" class="page-head__title">{{ chrome.i18n.t("hts-cm-browser-title") }}</h1>
+    <p class="page-head__lede">{{ chrome.i18n.t("hts-cm-browser-subtitle") }}</p>
   </header>
 
   {#-
-    Filter form. `hx-trigger="input changed delay:300ms, submit"` from
-    §7.5 mirror of §7.4/§7.2 debounces typeahead and still submits on
-    Enter. The form's real `<form action>` is the rows fragment path so
-    the nojs fallback still delivers a full page.
+    Same `.filter-layout--two` grammar as CS / VS. CM diverges in the
+    field list: `version` is deliberately absent (design doc §7.5 —
+    HTS ignores CM version on `$translate`) and `Source system` /
+    `Target system` are added. Both source/target route to the FHIR
+    `source-uri` / `target-uri` canonical search parameters upstream.
   -#}
-  <form class="hts-cm-browser__filters"
-        method="get"
-        action="/ui/hts/concept-maps/rows"
-        hx-get="/ui/hts/concept-maps/rows"
-        hx-target="#hts-cm-rows"
-        hx-swap="outerHTML"
-        hx-trigger="input changed delay:300ms, submit"
-        aria-label="{{ chrome.i18n.t("hts-cm-browser-filter-legend") }}">
-    <div class="hts-cm-browser__field">
-      <label for="filter-url">{{ chrome.i18n.t("hts-cm-browser-filter-url") }}</label>
-      <input id="filter-url" type="text" name="url" value="{% if let Some(u) = view.filters.url %}{{ u }}{% endif %}" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="hts-cm-browser__field">
-      <label for="filter-name">{{ chrome.i18n.t("hts-cm-browser-filter-name") }}</label>
-      <input id="filter-name" type="text" name="name" value="{% if let Some(n) = view.filters.name %}{{ n }}{% endif %}" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="hts-cm-browser__field">
-      <label for="filter-title">{{ chrome.i18n.t("hts-cm-browser-filter-title") }}</label>
-      <input id="filter-title" type="text" name="title" value="{% if let Some(t) = view.filters.title %}{{ t }}{% endif %}" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="hts-cm-browser__field">
-      <label for="filter-source">{{ chrome.i18n.t("hts-cm-browser-filter-source") }}</label>
-      <input id="filter-source" type="text" name="source" value="{% if let Some(s) = view.filters.source %}{{ s }}{% endif %}" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="hts-cm-browser__field">
-      <label for="filter-target">{{ chrome.i18n.t("hts-cm-browser-filter-target") }}</label>
-      <input id="filter-target" type="text" name="target" value="{% if let Some(t) = view.filters.target %}{{ t }}{% endif %}" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="hts-cm-browser__field">
-      <label for="filter-status">{{ chrome.i18n.t("hts-cm-browser-filter-status") }}</label>
-      {#-
-        Status options: hard-coded rather than iterated because Askama
-        0.16 can't compare an iteration variable (`&&str`) with a
-        `&String` from `view.filters.status` — matches Slice B / C shape.
-      -#}
-      {% match view.filters.status %}
-        {% when Some(sel) %}
-      <select id="filter-status" name="status">
-        <option value=""></option>
-        <option value="draft"{% if sel == "draft" %} selected{% endif %}>{{ chrome.i18n.t("hts-cm-status-draft") }}</option>
-        <option value="active"{% if sel == "active" %} selected{% endif %}>{{ chrome.i18n.t("hts-cm-status-active") }}</option>
-        <option value="retired"{% if sel == "retired" %} selected{% endif %}>{{ chrome.i18n.t("hts-cm-status-retired") }}</option>
-        <option value="unknown"{% if sel == "unknown" %} selected{% endif %}>{{ chrome.i18n.t("hts-cm-status-unknown") }}</option>
-      </select>
-        {% when None %}
-      <select id="filter-status" name="status">
-        <option value="" selected></option>
-        <option value="draft">{{ chrome.i18n.t("hts-cm-status-draft") }}</option>
-        <option value="active">{{ chrome.i18n.t("hts-cm-status-active") }}</option>
-        <option value="retired">{{ chrome.i18n.t("hts-cm-status-retired") }}</option>
-        <option value="unknown">{{ chrome.i18n.t("hts-cm-status-unknown") }}</option>
-      </select>
-      {% endmatch %}
-    </div>
-    <input type="hidden" name="_count" value="{{ view.filters.effective_count() }}">
-    <div class="hts-cm-browser__actions">
-      <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-cm-browser-filter-search") }}</button>
-      <a class="btn btn--ghost" href="/ui/hts/concept-maps">{{ chrome.i18n.t("hts-cm-browser-filter-reset") }}</a>
-    </div>
-  </form>
+  <div class="filter-layout filter-layout--two">
+    <aside class="card filter-rail" aria-label="{{ chrome.i18n.t("hts-search-rail-label") }}">
+      <form id="hts-cm-filters"
+            method="get"
+            action="/ui/hts/concept-maps/rows"
+            hx-get="/ui/hts/concept-maps/rows"
+            hx-target="#hts-cm-rows"
+            hx-swap="outerHTML"
+            hx-trigger="input changed delay:300ms, change, submit"
+            aria-label="{{ chrome.i18n.t("hts-cm-browser-filter-legend") }}">
+        <div class="filter-rail__heading">{{ chrome.i18n.t("hts-search-rail-heading") }}</div>
 
-  {% include "partials/hts-cm-rows.html" %}
+        <div class="filter-rail__field">
+          <label class="filter-rail__field-label" for="filter-url">{{ chrome.i18n.t("hts-cm-browser-filter-url") }}</label>
+          <div class="filter-rail__field-row">
+            <input class="builder-row__value" id="filter-url" type="text" name="url"
+                   value="{% if let Some(u) = view.filters.url %}{{ u }}{% endif %}"
+                   autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+
+        <div class="filter-rail__field">
+          <label class="filter-rail__field-label" for="filter-name">{{ chrome.i18n.t("hts-cm-browser-filter-name") }}</label>
+          <div class="filter-rail__field-row">
+            <input class="builder-row__value" id="filter-name" type="text" name="name"
+                   value="{% if let Some(n) = view.filters.name %}{{ n }}{% endif %}"
+                   autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+
+        <div class="filter-rail__field">
+          <label class="filter-rail__field-label" for="filter-title">{{ chrome.i18n.t("hts-cm-browser-filter-title") }}</label>
+          <div class="filter-rail__field-row">
+            <input class="builder-row__value" id="filter-title" type="text" name="title"
+                   value="{% if let Some(t) = view.filters.title %}{{ t }}{% endif %}"
+                   autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+
+        <div class="filter-rail__field">
+          <label class="filter-rail__field-label" for="filter-source">{{ chrome.i18n.t("hts-cm-browser-filter-source") }}</label>
+          <div class="filter-rail__field-row">
+            <input class="builder-row__value" id="filter-source" type="text" name="source"
+                   value="{% if let Some(s) = view.filters.source %}{{ s }}{% endif %}"
+                   autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+
+        <div class="filter-rail__field">
+          <label class="filter-rail__field-label" for="filter-target">{{ chrome.i18n.t("hts-cm-browser-filter-target") }}</label>
+          <div class="filter-rail__field-row">
+            <input class="builder-row__value" id="filter-target" type="text" name="target"
+                   value="{% if let Some(t) = view.filters.target %}{{ t }}{% endif %}"
+                   autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+
+        <div class="filter-rail__field">
+          <label class="filter-rail__field-label" for="filter-status">{{ chrome.i18n.t("hts-cm-browser-filter-status") }}</label>
+          <div class="filter-rail__field-row">
+            {% match view.filters.status %}
+              {% when Some(sel) %}
+            <select class="builder-row__value" id="filter-status" name="status">
+              <option value="">{{ chrome.i18n.t("hts-facet-status-any") }}</option>
+              <option value="draft"{% if sel == "draft" %} selected{% endif %}>{{ chrome.i18n.t("hts-cm-status-draft") }}</option>
+              <option value="active"{% if sel == "active" %} selected{% endif %}>{{ chrome.i18n.t("hts-cm-status-active") }}</option>
+              <option value="retired"{% if sel == "retired" %} selected{% endif %}>{{ chrome.i18n.t("hts-cm-status-retired") }}</option>
+              <option value="unknown"{% if sel == "unknown" %} selected{% endif %}>{{ chrome.i18n.t("hts-cm-status-unknown") }}</option>
+            </select>
+              {% when None %}
+            <select class="builder-row__value" id="filter-status" name="status">
+              <option value="" selected>{{ chrome.i18n.t("hts-facet-status-any") }}</option>
+              <option value="draft">{{ chrome.i18n.t("hts-cm-status-draft") }}</option>
+              <option value="active">{{ chrome.i18n.t("hts-cm-status-active") }}</option>
+              <option value="retired">{{ chrome.i18n.t("hts-cm-status-retired") }}</option>
+              <option value="unknown">{{ chrome.i18n.t("hts-cm-status-unknown") }}</option>
+            </select>
+            {% endmatch %}
+          </div>
+        </div>
+
+        <input type="hidden" name="_count" value="{{ view.filters.effective_count() }}">
+
+        <div class="filter-rail__actions">
+          <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-cm-browser-filter-search") }}</button>
+          <a class="btn btn--ghost" href="/ui/hts/concept-maps">{{ chrome.i18n.t("hts-cm-browser-filter-reset") }}</a>
+        </div>
+      </form>
+    </aside>
+
+    <div class="filter-center">
+      {% include "partials/hts-cm-rows.html" %}
+    </div>
+  </div>
 </section>
 {% endblock %}

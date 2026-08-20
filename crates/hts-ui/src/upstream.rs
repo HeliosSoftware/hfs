@@ -435,6 +435,36 @@ impl CsBrowserFilters {
     pub fn count_exceeds_cap(&self) -> bool {
         self.count > Self::MAX_COUNT
     }
+
+    /// URL for the Load-more button that preserves every active filter
+    /// and bumps the offset. Extracted from the template so
+    /// `form_urlencoded` handles spaces / `&` / unicode correctly,
+    /// closing the URL-injection hazard the previous string
+    /// concatenation had.
+    ///
+    /// Signature accepts `&u32` (rather than `u32`) so Askama's
+    /// `if let Some(next) = page.next_offset()` binding — which yields
+    /// `next: &u32` — can pass it straight in without a filter or
+    /// dereference gymnastic.
+    pub fn load_more_url(&self, next_offset: &u32) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.url),
+            ("version", &self.version),
+            ("name", &self.name),
+            ("title", &self.title),
+            ("status", &self.status),
+        ] {
+            if let Some(v) = value {
+                if !v.is_empty() {
+                    ser.append_pair(field, v);
+                }
+            }
+        }
+        ser.append_pair("_count", &self.effective_count().to_string());
+        ser.append_pair("_offset", &next_offset.to_string());
+        format!("/ui/hts/code-systems/rows?{}", ser.finish())
+    }
 }
 
 /// One row of the CS browser table (§7.2 wireframe).
@@ -751,34 +781,22 @@ impl UpstreamClient {
         &self,
         filters: &CsBrowserFilters,
     ) -> Result<CsBrowserPage, UpstreamError> {
-        let mut query: Vec<(&str, String)> = Vec::new();
-        if let Some(ref v) = filters.url {
-            if !v.is_empty() {
-                query.push(("url", v.clone()));
+        let mut query: Vec<(String, String)> = Vec::new();
+        for (field, value) in [
+            ("url", &filters.url),
+            ("version", &filters.version),
+            ("name", &filters.name),
+            ("title", &filters.title),
+            ("status", &filters.status),
+        ] {
+            if let Some(v) = value {
+                if !v.is_empty() {
+                    query.push((field.to_owned(), v.clone()));
+                }
             }
         }
-        if let Some(ref v) = filters.version {
-            if !v.is_empty() {
-                query.push(("version", v.clone()));
-            }
-        }
-        if let Some(ref v) = filters.name {
-            if !v.is_empty() {
-                query.push(("name", v.clone()));
-            }
-        }
-        if let Some(ref v) = filters.title {
-            if !v.is_empty() {
-                query.push(("title", v.clone()));
-            }
-        }
-        if let Some(ref v) = filters.status {
-            if !v.is_empty() {
-                query.push(("status", v.clone()));
-            }
-        }
-        query.push(("_count", filters.effective_count().to_string()));
-        query.push(("_offset", filters.offset.to_string()));
+        query.push(("_count".to_owned(), filters.effective_count().to_string()));
+        query.push(("_offset".to_owned(), filters.offset.to_string()));
 
         let url = format!("{}/CodeSystem", self.base_url);
         let response = self
@@ -1423,6 +1441,27 @@ impl VsBrowserFilters {
     pub fn count_exceeds_cap(&self) -> bool {
         self.count > Self::MAX_COUNT
     }
+
+    /// See [`CsBrowserFilters::load_more_url`].
+    pub fn load_more_url(&self, next_offset: &u32) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.url),
+            ("version", &self.version),
+            ("name", &self.name),
+            ("title", &self.title),
+            ("status", &self.status),
+        ] {
+            if let Some(v) = value {
+                if !v.is_empty() {
+                    ser.append_pair(field, v);
+                }
+            }
+        }
+        ser.append_pair("_count", &self.effective_count().to_string());
+        ser.append_pair("_offset", &next_offset.to_string());
+        format!("/ui/hts/value-sets/rows?{}", ser.finish())
+    }
 }
 
 /// One row of the VS browser table (§7.4 mirror of §7.2 wireframe).
@@ -1762,34 +1801,22 @@ impl UpstreamClient {
         &self,
         filters: &VsBrowserFilters,
     ) -> Result<VsBrowserPage, UpstreamError> {
-        let mut query: Vec<(&str, String)> = Vec::new();
-        if let Some(ref v) = filters.url {
-            if !v.is_empty() {
-                query.push(("url", v.clone()));
+        let mut query: Vec<(String, String)> = Vec::new();
+        for (field, value) in [
+            ("url", &filters.url),
+            ("version", &filters.version),
+            ("name", &filters.name),
+            ("title", &filters.title),
+            ("status", &filters.status),
+        ] {
+            if let Some(v) = value {
+                if !v.is_empty() {
+                    query.push((field.to_owned(), v.clone()));
+                }
             }
         }
-        if let Some(ref v) = filters.version {
-            if !v.is_empty() {
-                query.push(("version", v.clone()));
-            }
-        }
-        if let Some(ref v) = filters.name {
-            if !v.is_empty() {
-                query.push(("name", v.clone()));
-            }
-        }
-        if let Some(ref v) = filters.title {
-            if !v.is_empty() {
-                query.push(("title", v.clone()));
-            }
-        }
-        if let Some(ref v) = filters.status {
-            if !v.is_empty() {
-                query.push(("status", v.clone()));
-            }
-        }
-        query.push(("_count", filters.effective_count().to_string()));
-        query.push(("_offset", filters.offset.to_string()));
+        query.push(("_count".to_owned(), filters.effective_count().to_string()));
+        query.push(("_offset".to_owned(), filters.offset.to_string()));
 
         let url = format!("{}/ValueSet", self.base_url);
         let response = self
@@ -2214,6 +2241,30 @@ impl CmBrowserFilters {
     pub fn count_exceeds_cap(&self) -> bool {
         self.count > Self::MAX_COUNT
     }
+
+    /// See [`CsBrowserFilters::load_more_url`]. CM omits `version` from
+    /// the filter strip (design doc §7.5: HTS ignores CM version on
+    /// `$translate`) and adds `source-uri` / `target-uri`.
+    pub fn load_more_url(&self, next_offset: &u32) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.url),
+            ("name", &self.name),
+            ("title", &self.title),
+            ("source", &self.source),
+            ("target", &self.target),
+            ("status", &self.status),
+        ] {
+            if let Some(v) = value {
+                if !v.is_empty() {
+                    ser.append_pair(field, v);
+                }
+            }
+        }
+        ser.append_pair("_count", &self.effective_count().to_string());
+        ser.append_pair("_offset", &next_offset.to_string());
+        format!("/ui/hts/concept-maps/rows?{}", ser.finish())
+    }
 }
 
 /// One row of the CM browser table (§7.5 wireframe row shape).
@@ -2530,39 +2581,23 @@ impl UpstreamClient {
         &self,
         filters: &CmBrowserFilters,
     ) -> Result<CmBrowserPage, UpstreamError> {
-        let mut query: Vec<(&str, String)> = Vec::new();
-        if let Some(ref v) = filters.url {
-            if !v.is_empty() {
-                query.push(("url", v.clone()));
+        let mut query: Vec<(String, String)> = Vec::new();
+        for (field, value) in [
+            ("url", &filters.url),
+            ("name", &filters.name),
+            ("title", &filters.title),
+            ("source-uri", &filters.source),
+            ("target-uri", &filters.target),
+            ("status", &filters.status),
+        ] {
+            if let Some(v) = value {
+                if !v.is_empty() {
+                    query.push((field.to_owned(), v.clone()));
+                }
             }
         }
-        if let Some(ref v) = filters.name {
-            if !v.is_empty() {
-                query.push(("name", v.clone()));
-            }
-        }
-        if let Some(ref v) = filters.title {
-            if !v.is_empty() {
-                query.push(("title", v.clone()));
-            }
-        }
-        if let Some(ref v) = filters.source {
-            if !v.is_empty() {
-                query.push(("source-uri", v.clone()));
-            }
-        }
-        if let Some(ref v) = filters.target {
-            if !v.is_empty() {
-                query.push(("target-uri", v.clone()));
-            }
-        }
-        if let Some(ref v) = filters.status {
-            if !v.is_empty() {
-                query.push(("status", v.clone()));
-            }
-        }
-        query.push(("_count", filters.effective_count().to_string()));
-        query.push(("_offset", filters.offset.to_string()));
+        query.push(("_count".to_owned(), filters.effective_count().to_string()));
+        query.push(("_offset".to_owned(), filters.offset.to_string()));
 
         let url = format!("{}/ConceptMap", self.base_url);
         let response = self

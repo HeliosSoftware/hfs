@@ -17,7 +17,7 @@ use axum::{
     Router,
     extract::State,
     http::StatusCode,
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use axum_htmx::HxRequest;
@@ -100,6 +100,12 @@ struct DashboardCardsPartial<'a> {
 pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
     Router::new()
         .route("/hts", get(dashboard_page))
+        // Trailing-slash canonicalization: axum matches paths exactly, so
+        // `/ui/hts/` would 404 without this. Redirect to the canonical form
+        // used by every internal link in the UI. `Redirect::permanent` emits
+        // 308 (preserves method + body); safe here since GET is the only
+        // dashboard verb.
+        .route("/hts/", get(|| async { Redirect::permanent("/ui/hts") }))
         .route("/hts/dashboard/cards", get(dashboard_cards_fragment))
 }
 
