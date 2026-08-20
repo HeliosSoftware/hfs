@@ -703,7 +703,7 @@ async fn resources_deep_links_focus_the_selected_type() {
     // list is the nav panel now (part of the menu), not a card in the content.
     assert!(html.contains(r#"data-selected-type="Observation""#));
     assert!(html.contains(
-        r#"data-type="Observation" href="/ui/resources?type=Observation" aria-current="true""#
+        r#"data-type="Observation" href="/ui/resources?type=Observation" title="Observation" aria-current="true""#
     ));
     assert!(html.contains(r#"class="nav-panel""#));
 }

@@ -2022,12 +2022,24 @@ a.pill {
   align-items: center;
   gap: 8px;
   width: 100%;
+  min-width: 0;
   padding: 7px 10px;
   border-radius: 9px;
   font-size: 13px;
   font-weight: 500;
   color: var(--text);
   text-decoration: none;
+}
+
+/* Long resource type names (e.g. "MedicinalProductContraindication", 32
+   chars) truncate with an ellipsis instead of colliding with the count or
+   forcing horizontal scroll on the rail; the full name stays available via
+   `title` (#604). */
+.filter-rail__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .filter-rail__item:hover {
@@ -2041,6 +2053,7 @@ a.pill {
 }
 
 .filter-rail__item .count {
+  flex: none;
   margin-left: auto;
   font-size: 11px;
   color: var(--muted);

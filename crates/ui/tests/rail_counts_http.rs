@@ -111,6 +111,10 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
             "{path}: the deep-linked type is marked current: {item}"
         );
         assert!(
+            item.contains(r#"title="Observation""#),
+            "{path}: the full type name is accessible via title (#604): {item}"
+        );
+        assert!(
             !html.contains(r#"class="count""#),
             "{path}: no provider means no count span at all"
         );
