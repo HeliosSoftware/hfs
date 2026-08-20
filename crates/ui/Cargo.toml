@@ -55,7 +55,11 @@ helios-auth = { path = "../auth", version = "0.2.1" }
 axum = "0.8"
 
 # Spec-bundle reads for non-default FHIR versions run off the async threads
-# (#562). Runtime only — the server (axum) always provides one.
+# (#562), and tenant provisioning runs in the background (#581): the create
+# handler hands `register_tenant` + the conformance seed to `tokio::spawn` so
+# the POST response is not held open for it. Runtime only — the task runs on
+# whichever runtime the host process (the `hfs` binary) is already driving
+# `axum::serve` on.
 tokio = { version = "1", features = ["rt"] }
 
 # Chart bucket timestamps: formatting x-axis labels, and shaping the placeholder
@@ -119,13 +123,6 @@ helios-observability = { path = "../observability", version = "0.2.1" }
 # registry (list/register/deregister) + per-tenant resource counts. The UI
 # depends on the rest of the server, never the reverse.
 helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4"] }
-
-# Tenant provisioning runs in the background (#581): the create handler hands
-# `register_tenant` + the conformance seed to `tokio::spawn` so the POST
-# response is not held open for it. Only `rt` is needed — the task runs on
-# whichever runtime the host process (the `hfs` binary) is already driving
-# `axum::serve` on.
-tokio = { version = "1", features = ["rt"] }
 
 
 [dev-dependencies]
