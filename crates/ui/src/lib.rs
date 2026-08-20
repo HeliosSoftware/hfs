@@ -2061,7 +2061,6 @@ mod tests {
                 .expect("legend link")
         };
         // The focused entry links back out; the others move the focus.
-        assert!(entry(&dash, "Patient").ends_with("&focus=Patient") == false);
         assert!(!entry(&dash, "Patient").contains("focus="));
         assert!(entry(&dash, "Observation").contains("focus=Observation"));
         // Nothing was removed: every legend link keeps the full charted set.
