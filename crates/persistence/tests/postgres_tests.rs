@@ -56,6 +56,13 @@ mod fts_purge_suite;
 #[path = "search/meta_params_suite.rs"]
 mod meta_params_suite;
 
+/// The backend-agnostic day-precision date-boundary suite (issue #519):
+/// the #456 boundary table, which #463 fixed and pinned for SQLite only.
+/// Declared at the top level for the same `#[path]` resolution reason as
+/// `if_match_suite` above.
+#[path = "search/date_boundary_suite.rs"]
+mod date_boundary_suite;
+
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
 // ============================================================================
@@ -5680,6 +5687,16 @@ mod postgres_integration {
 
     fn unique_base(label: &str) -> String {
         format!("{}_{}", label, uuid::Uuid::new_v4().simple())
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_day_precision_date_boundaries() {
+        let backend = create_backend().await;
+        super::date_boundary_suite::day_precision_boundaries(
+            &backend,
+            &unique_base("date_boundary"),
+        )
+        .await;
     }
 
     #[tokio::test]
