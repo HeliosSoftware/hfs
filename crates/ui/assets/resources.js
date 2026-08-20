@@ -344,7 +344,10 @@
   var createBtn = document.getElementById("resource-create");
   if (createBtn) {
     createBtn.addEventListener("click", function () {
-      openNew(root.dataset.selectedType || createBtn.dataset.type || "Patient");
+      // `panel.dataset.selectedType` (the rail's `<aside>`) is the single
+      // source of truth for the selected type (#605) — the button carries no
+      // type of its own any more.
+      openNew(root.dataset.selectedType || "Patient");
     });
   }
 

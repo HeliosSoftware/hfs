@@ -124,6 +124,31 @@ async fn htmx_fragment_is_localized_too() {
 }
 
 #[tokio::test]
+async fn resources_create_label_names_the_selected_type_per_locale() {
+    // #605: "Create new { $type }" carries the resource type name untranslated
+    // inside the localized sentence, in every supported locale.
+    for (lang, sentence) in [
+        ("en", "Create new Patient"),
+        ("es", "Crear Patient"),
+        ("de", "Patient erstellen"),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui/resources?lang={lang}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert!(
+            html.contains(sentence),
+            "{lang} resources page must contain {sentence:?}, got: {html}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn default_is_english() {
     let response = app()
         .oneshot(Request::get("/ui").body(Body::empty()).unwrap())

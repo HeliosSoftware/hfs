@@ -39,9 +39,9 @@
     <p class="page-head__lede" id="resources-subtitle">{{ i18n.t("resources-lede") }}</p>
   </div>
   <button type="button" class="btn btn--primary resources-create" id="resource-create"
-          data-type="{{ selected_type }}">
+          data-msg-create="{{ i18n.t_arg("resources-create-typed", "type", "{type}".to_string()) }}">
     <span class="icon">{% include "icons/plus.svg" %}</span>
-    {{ i18n.t("resources-create") }}
+    <span class="resources-create__label">{{ i18n.t_arg("resources-create-typed", "type", selected_type.clone()) }}</span>
   </button>
 </section>
 

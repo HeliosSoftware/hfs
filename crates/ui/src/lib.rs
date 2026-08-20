@@ -520,6 +520,10 @@ struct SearchPage {
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
+    /// No-JS prefill for the builder's URL input (see `ResourcesPage`'s field
+    /// of the same name); this page opens with no type context, so it is
+    /// always `None`.
+    builder_url: Option<String>,
 }
 
 /// Resources page (#282): type filter + search + edit modal, on one screen.
@@ -539,6 +543,9 @@ struct ResourcesPage {
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
+    /// No-JS prefill for the builder's URL input (#605): `GET /{selected_type}`,
+    /// so the form already shows the query the client JS runs on load.
+    builder_url: Option<String>,
 }
 
 /// Saved FHIR queries page (#234). The shell is server-rendered; the list is
@@ -557,6 +564,10 @@ struct QueriesPage {
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
+    /// No-JS prefill for the builder's URL input (see `ResourcesPage`'s field
+    /// of the same name); this page opens with no type context, so it is
+    /// always `None`.
+    builder_url: Option<String>,
 }
 
 /// SearchParameter viewer (#238). Read-only against the same snapshot the
@@ -1154,6 +1165,7 @@ async fn search(
         resource_types,
         show_save: false,
         rail_entries,
+        builder_url: None,
     })
 }
 
@@ -1189,6 +1201,7 @@ async fn queries(
         resource_types,
         show_save: true,
         rail_entries,
+        builder_url: None,
     })
 }
 
@@ -1223,6 +1236,7 @@ async fn resources(
         live.as_ref().map(|s| s.available.as_slice()),
         Some(selected_type.as_str()),
     );
+    let builder_url = Some(format!("/{selected_type}"));
     render(ResourcesPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1233,6 +1247,7 @@ async fn resources(
         selected_type,
         show_save: false,
         rail_entries,
+        builder_url,
     })
 }
 
@@ -2164,6 +2179,7 @@ mod tests {
             show_save: true,
             resource_types,
             rail_entries,
+            builder_url: None,
         }
         .render()
         .expect("queries page renders");
@@ -2211,6 +2227,7 @@ mod tests {
             show_save: true,
             resource_types,
             rail_entries,
+            builder_url: None,
         }
         .render()
         .expect("queries page renders");

@@ -3,12 +3,17 @@
 // hosts the shared Editor component and the in-modal history diff.
 import type { Page, Locator } from "@playwright/test";
 import { Editor } from "./editor";
+import { SearchBuilder, SearchResults } from "./search-builder";
 
 export class ResourcesPage {
   readonly modal: ResourceModal;
+  readonly builder: SearchBuilder;
+  readonly results: SearchResults;
 
   constructor(readonly page: Page) {
     this.modal = new ResourceModal(page);
+    this.builder = new SearchBuilder(page);
+    this.results = new SearchResults(page);
   }
 
   async goto(type?: string): Promise<void> {
@@ -21,6 +26,10 @@ export class ResourcesPage {
   }
   get createButton(): Locator {
     return this.page.locator("#resource-create");
+  }
+  /** The type-naming text inside Create ("Create new Patient"), #605. */
+  get createLabel(): Locator {
+    return this.page.locator("#resource-create .resources-create__label");
   }
 
   // Direct-child combinator: `#type-rail-recent` (the "Recently used" group,

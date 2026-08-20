@@ -3962,9 +3962,20 @@ body.has-nav-panel {
 /* Items are `.filter-rail__item` (#541, shared with Search/Queries/Search
    Parameters); this panel only needs the container rules above. */
 
-/* The Create-new primary button (blue + plus), top-right of the page head. */
+/* The Create-new primary button (blue + plus), top-right of the page head.
+   The label names the selected type ("Create new Patient") and can grow long
+   (#605) — the button caps its width and truncates the label rather than
+   pushing the header row wider than the page. */
 .resources-create {
-  flex: none;
+  flex: 0 1 auto;
+  max-width: 320px;
+}
+
+.resources-create__label {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (max-width: 1100px) {

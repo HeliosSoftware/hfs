@@ -492,7 +492,7 @@ editor-versions-none = No prior versions.
 
 resources-heading = Resources
 resources-lede = Browse, search, create, and edit FHIR resources. Search in natural language or build the query by hand, then open any result to edit it.
-resources-create = Create new
+resources-create-typed = Create new { $type }
 resources-save-blocked = Fix the validation issues before saving.
 resources-save-invalid = The JSON is not valid — fix it before saving.
 resources-edit-title = Edit resource

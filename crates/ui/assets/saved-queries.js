@@ -1213,23 +1213,36 @@
   var railList = document.getElementById("type-rail-list");
   var railFilter = document.getElementById("type-rail-filter");
 
+  /* Selects a resource type: syncs the rail, the builder, and the results —
+   * the one path both the rail click and the initial page load (#605) drive,
+   * so the two never drift apart.
+   *
+   * On the Resources page, `panel.dataset.selectedType` (the rail's
+   * `<aside>`) is the single source of truth for "which type is selected";
+   * this also keeps the "Create new" button's label in sync with it, from
+   * the localized template the server put on `data-msg-create`. Both the
+   * panel and the button are absent on the Saved Queries / Search pages,
+   * where this rail only drives the search. */
+  function selectType(type) {
+    var panel = document.getElementById("resources");
+    if (panel) panel.dataset.selectedType = type;
+    var createBtn = document.getElementById("resource-create");
+    if (createBtn && createBtn.dataset.msgCreate) {
+      var label = createBtn.querySelector(".resources-create__label");
+      if (label) label.textContent = createBtn.dataset.msgCreate.replace("{type}", type);
+    }
+    markRailType(type);
+    urlInput.value = "GET /" + type;
+    renderBuilder();
+    runSearch("/" + encodeURIComponent(type), false);
+  }
+
   if (railList) {
     railList.addEventListener("click", function (event) {
       var item = event.target.closest("a.filter-rail__item");
       if (!item || !urlInput) return;
       event.preventDefault();
-      var type = item.dataset.type;
-      // Keep the Resources page's selected type in sync so "Create new" targets
-      // it and the rail shows which type is active. (Both absent on the Saved
-      // Queries page, where this rail only drives the search.)
-      var panel = document.getElementById("resources");
-      if (panel) panel.dataset.selectedType = type;
-      var createBtn = document.getElementById("resource-create");
-      if (createBtn) createBtn.dataset.type = type;
-      markRailType(type);
-      urlInput.value = "GET /" + type;
-      renderBuilder();
-      runSearch("/" + encodeURIComponent(type), false);
+      selectType(item.dataset.type);
       window.history.pushState({}, "", item.getAttribute("href"));
     });
   }
@@ -2021,6 +2034,15 @@
     if (parsedDeep)
       runSearch(searchPath(parsedDeep.type, parsedDeep.query), true);
   } else {
-    renderBuilder();
+    // Resources opens in Patient (or `?type=`) context (#605): the same
+    // path as a rail click, so the builder and results match the type the
+    // server already selected — without registering a "recently used" entry,
+    // since that only fires on an actual rail click (resource-filter.js).
+    var initialPanel = document.getElementById("resources");
+    if (initialPanel && urlInput) {
+      selectType(initialPanel.dataset.selectedType || "Patient");
+    } else {
+      renderBuilder();
+    }
   }
 })();

@@ -678,6 +678,14 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     assert!(html.contains(r#"id="type-rail-list""#));
     assert!(html.contains(r#"id="saved-query-form""#));
     assert!(html.contains(r#"id="resource-create""#));
+    // The Create button names the selected type (#605), defaulting to
+    // Patient, and the builder's URL is pre-filled so the no-JS form already
+    // shows the query the client also runs on load.
+    assert!(html.contains("Create new Patient"));
+    assert!(html.contains(r#"value="GET /Patient""#));
+    // The client-side template for the label update on rail clicks (#605):
+    // the literal `{type}` placeholder, not the interpolated per-request value.
+    assert!(html.contains(r#"data-msg-create="Create new {type}""#));
     // The "Recently used" group (#603) is present but hidden until
     // resource-filter.js populates it from localStorage.
     assert!(html.contains(r#"id="type-rail-recent""#));
@@ -715,6 +723,9 @@ async fn resources_deep_links_focus_the_selected_type() {
         r#"data-type="Observation" href="/ui/resources?type=Observation" title="Observation" aria-current="true""#
     ));
     assert!(html.contains(r#"class="nav-panel""#));
+    // Create and the builder prefill both follow the deep-linked type.
+    assert!(html.contains("Create new Observation"));
+    assert!(html.contains(r#"value="GET /Observation""#));
 }
 
 #[tokio::test]
