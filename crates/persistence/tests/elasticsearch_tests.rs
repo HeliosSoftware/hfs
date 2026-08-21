@@ -595,6 +595,12 @@ mod parameter_handler_tests {
 ///
 /// Skip if no Docker:
 ///   cargo test -p helios-persistence --features elasticsearch -- --skip es_integration
+/// The backend-agnostic day-precision date-boundary suite (issue #519) — the
+/// #456 table that #463 pinned for SQLite only; the ES date handler was
+/// explicitly unverified. `#[path]`-included like the other shared suites.
+#[path = "search/date_boundary_suite.rs"]
+mod date_boundary_suite;
+
 #[cfg(test)]
 mod es_integration {
     use std::path::PathBuf;
@@ -742,6 +748,13 @@ mod es_integration {
 
     fn create_tenant(id: &str) -> TenantContext {
         TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
+    }
+
+    /// #519: the #456 boundary table over the real ES search path.
+    #[tokio::test]
+    async fn es_day_precision_date_boundaries() {
+        let backend = create_backend().await;
+        super::date_boundary_suite::day_precision_boundaries(&backend, "date-boundary-519").await;
     }
 
     // ========================================================================
