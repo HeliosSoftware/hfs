@@ -224,9 +224,19 @@ impl SearchParameterDefinition {
     pub fn applies_to(&self, resource_type: &str) -> bool {
         self.base
             .iter()
-            .any(|b| b == resource_type || b == "Resource" || b == "DomainResource")
+            .any(|b| b == resource_type || ABSTRACT_BASE_TYPES.contains(&b.as_str()))
     }
 }
+
+/// The abstract base types every FHIR resource conforms to.
+///
+/// A `SearchParameter.base` naming one of these applies to every resource, and
+/// a FHIRPath expression may likewise be written against one of them instead of
+/// a concrete type (`Resource.meta.source`). Both readings are the same set, so
+/// it lives here once rather than being re-spelled at each use site: the
+/// registry's [`SearchParameterDefinition::applies_to`], the index extractor's
+/// prefix strip, and the UI's extension-context list all consult it.
+pub const ABSTRACT_BASE_TYPES: [&str; 2] = ["Resource", "DomainResource"];
 
 /// In-memory registry of SearchParameter definitions.
 ///

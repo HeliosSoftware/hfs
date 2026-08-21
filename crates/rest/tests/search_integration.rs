@@ -851,6 +851,29 @@ mod string_search {
     }
 
     #[tokio::test]
+    async fn test_membership_parameter_in_is_rejected() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `_in` asks whether the resource belongs to a referenced List or
+        // Group. That is unimplemented, and it must not fall through: on R5/R6
+        // it is a registered `reference` parameter, so lenient handling would
+        // not drop it and the spec's placeholder `Resource.id` expression makes
+        // the backends answer a membership question with an identity test
+        // (PostgreSQL) or with the entire resource type (SQLite). Rejecting is
+        // the only answer that is not silently wrong (#535).
+        let response = server
+            .get("/Patient?_in=42")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["code"], "invalid");
+    }
+
+    #[tokio::test]
     async fn test_modifier_invalid_for_param_type_returns_400() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
