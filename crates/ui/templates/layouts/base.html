@@ -116,10 +116,18 @@
       </span>
 
       <div class="nav__section">{{ i18n.t("nav-section-conditional") }}</div>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-terminology") }}">
+      {% if let Some(url) = status.terminology_url() %}
+      <a class="nav-item" href="{{ url }}" target="_blank" rel="noopener noreferrer" hx-boost="false"
+         aria-label="{{ i18n.t("nav-terminology-new-window") }}" title="{{ i18n.t("nav-terminology-new-window") }}">
         <span class="icon">{% include "icons/book.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
-      </span>
+      </a>
+      {% else %}
+      <a class="nav-item" href="/ui/terminology"{% if active_page == "terminology" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-terminology") }}">
+        <span class="icon">{% include "icons/book.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
+      </a>
+      {% endif %}
       <!-- Visible only when the subscriptions engine is advertised (#580). -->
       {% if status.subscriptions_enabled() %}
       <a class="nav-item" href="/ui/subscriptions"{% if active_page == "subscriptions" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-subscriptions") }}">

@@ -19,6 +19,7 @@ app-tagline = A fast, multi-version FHIR server
 
 nav-dashboard = Dashboard
 nav-terminology = Terminology
+nav-terminology-new-window = Terminology (opens in a new tab)
 nav-resources = Resources
 nav-settings = Settings
 nav-signout = Sign out
@@ -54,6 +55,17 @@ resource-count = { $count ->
 
 ## Terminology browsing
 
+terminology-heading = Terminology server
+terminology-lede = Connect HFS to a FHIR terminology server.
+terminology-configured-heading = Terminology server configured
+terminology-configured-body = HFS_TERMINOLOGY_SERVER points to a valid server URL.
+terminology-configured-open = Open terminology server
+terminology-invalid-heading = HFS_TERMINOLOGY_SERVER is invalid
+terminology-invalid-body = Use an absolute HTTP or HTTPS URL with a host. Paths and a trailing slash are allowed. Do not include credentials, a query string, or a fragment.
+terminology-invalid-note = Update the environment variable, then restart HFS.
+terminology-setup-heading = Connect a terminology server
+terminology-setup-body = Set HFS_TERMINOLOGY_SERVER to the base URL of the FHIR terminology server that HFS should use.
+terminology-setup-note = Set the variable in the environment that starts HFS, then restart the server.
 terminology-search-label = Search CodeSystems and ValueSets
 terminology-search-placeholder = e.g. 73211009, "diabetes", http://snomed.info/sct
 terminology-display-language = Display language
@@ -149,16 +161,16 @@ card-uptime = Uptime
 card-uptime-sub = since process start
 
 chart-title = FHIR resources over time
-chart-expand = Expand chart
-chart-collapse = Collapse chart
 chart-window = Chart time window
 chart-pick-heading = Charted resource types
+chart-pick-all = View all resource types
 chart-pick-filter = Filter types
 chart-empty = Nothing to chart yet — stored resources appear here as they are created.
 chart-sample-note = Sample data: no live metrics provider is registered on this build.
 chart-table-toggle = View as table
 chart-table-when = Time
-chart-remove-series = Remove from chart
+chart-focus-series = Focus this series
+chart-unfocus-series = Show all series
 
 ## Footer
 
@@ -219,7 +231,7 @@ queries-unavailable = Saved queries are unavailable: this server's storage backe
 
 ## SearchParameter viewer (#238)
 
-sp-heading = Search parameters
+sp-heading = Search Parameters
 sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant.
 sp-version-label = FHIR version
 sp-spec-missing = The full spec bundle (search-parameters-*.json) was not found in the data directory — only the minimal embedded fallback parameters are shown.

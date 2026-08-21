@@ -630,7 +630,6 @@ button.menu__option {
 .content {
   flex: 1;
   padding: 24px 32px 32px;
-  max-width: 1161px;
 }
 
 /* App-shell rules live at the end of the file in @layer pages: they override
@@ -738,12 +737,6 @@ button.menu__option {
   box-shadow: var(--surface-shadow);
   font-weight: 500;
   color: var(--muted);
-}
-
-.pill--square {
-  width: 42px;
-  padding: 0;
-  justify-content: center;
 }
 
 /* A pill rendered as a real <button> (e.g. the chart-expand affordance) keeps
@@ -863,6 +856,30 @@ button.pill {
 
 /* ---------- Functional chart (#555): multi-series, picker, tooltip -------- */
 
+/* Legend focus (#602): the focused line carries the weight, the rest recede
+   but stay on the chart at their true values. */
+.chart .series--focused { stroke-width: 3; }
+.chart .series--receded { opacity: 0.25; }
+
+/* The invisible twin polyline inside each line's focus anchor: a 14px hit
+   corridor, since a 1.5px stroke is no click target. */
+.chart .series-hit {
+  stroke: transparent;
+  stroke-width: 14;
+  fill: none;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.chart-legend__item--focused {
+  font-weight: 600;
+  color: var(--text-strong);
+}
+.chart-legend__item--focused .chart-legend__dot {
+  outline: 2px solid var(--text-strong);
+  outline-offset: 1px;
+}
+
 /* Series palette: slot N styles both the polyline and its legend dot. */
 .chart .series--1 { stroke: var(--series-1); }
 .chart .series--2 { stroke: var(--series-2); }
@@ -884,12 +901,6 @@ button.pill {
 .chart-legend__dot--4 { background: var(--series-4); }
 .chart-legend__dot--5 { background: var(--series-5); }
 .chart-legend__dot--6 { background: var(--series-6); }
-
-/* The expand control is a link; keep the pill look. */
-a.pill {
-  text-decoration: none;
-  color: inherit;
-}
 
 /* Type picker: the mockup's checkbox menu, as plain toggle links. */
 .chart-pick summary.pill {
@@ -933,6 +944,14 @@ a.pill {
   border-color: var(--accent-strong);
 }
 
+/* "View all resources" (#599) sits above the filter input, set off from the
+   scrolling option list below it by a divider. */
+.chart-pick__option--all {
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--divider);
+}
+
 .chart-pick__name {
   flex: 1;
   min-width: 0;
@@ -956,6 +975,10 @@ a.pill {
    the vertical guide the script moves along the buckets. */
 .chart-wrap {
   position: relative;
+  /* The svg scales its viewBox (text included) with rendered width; cap it so
+     axis labels stay near their designed size on wide panes. */
+  max-width: 1440px;
+  margin: 0 auto;
 }
 
 .chart-tip {
@@ -1075,6 +1098,14 @@ a.pill {
   font-size: 12px;
   font-weight: 500;
   color: var(--muted);
+}
+
+/* A .toolbar__count inside a .btn (e.g. "Active Exports N") stays plain and
+   matches the label color; only the gap separates it from the text (#608). */
+.btn .toolbar__count {
+  margin-left: 8px;
+  color: inherit;
+  font-variant-numeric: tabular-nums;
 }
 
 .toolbar__search {
@@ -1596,6 +1627,7 @@ a.pill {
   border-radius: 9px;
   box-shadow: var(--surface-shadow);
   cursor: pointer;
+  text-decoration: none;
 }
 
 .btn:hover {
@@ -1936,11 +1968,6 @@ a.pill {
 @layer components {
 /* ---- Registry viewers: shared filter layout (#237/#238) ----------------- */
 
-/* These pages want the full pane width; .content keeps its dashboard cap. */
-.content--wide {
-  max-width: none;
-}
-
 .notice {
   margin: 0 0 16px;
   padding: 10px 14px;
@@ -2232,6 +2259,10 @@ a.pill {
   background: var(--accent-soft);
 }
 
+.data-table[data-row-navigation] tbody tr {
+  cursor: pointer;
+}
+
 .row-link {
   display: flex;
   flex-direction: column;
@@ -2387,6 +2418,33 @@ a.pill {
   max-height: calc(100vh - 110px);
   padding: 16px;
   overflow-y: auto;
+}
+
+/* Full-width form sections (bulk export): the flex/gap/padding of .detail
+   without its sticky sidebar behavior (#608). */
+.form-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+/* Vertical gap between the stacked .form-panel/table-card sections of the
+   bulk export form (#608). */
+.bulk-export-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* The Group ID field only applies to the Group scope; hide it otherwise.
+   Browsers without :has() keep it always visible — today's behavior. */
+.bulk-export-form .field--group-id {
+  display: none;
+}
+
+.bulk-export-form:has(input[name="scope"][value="group"]:checked) .field--group-id {
+  display: block;
 }
 
 .detail__title {
@@ -3847,7 +3905,11 @@ a.pill {
   display: flex;
   flex-direction: column;
   width: min(1200px, 100%);
-  max-height: 90vh;
+  /* A fixed height, not a ceiling (#607): the dialog occupies the same
+     rectangle whichever pane is showing, so switching Edit/History or a
+     status message appearing never moves the header. The taller pane
+     scrolls inside .modal__body. */
+  height: 90vh;
   background: var(--bg-content);
   border: 1px solid var(--surface-border);
   border-radius: 18px;
@@ -3937,6 +3999,7 @@ a.pill {
 }
 
 .modal__body {
+  flex: 1;
   padding: 16px 18px;
   overflow-y: auto;
 }
@@ -3952,7 +4015,7 @@ a.pill {
 }
 
 @media (max-width: 900px) {
-  .modal__box { max-height: 96vh; }
+  .modal__box { height: 96vh; }
   .modal__head { flex-wrap: wrap; }
 }
 }

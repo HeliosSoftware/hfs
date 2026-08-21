@@ -22,7 +22,7 @@ export class DashboardPage {
     return this.page.locator("svg.chart");
   }
   get seriesLines(): Locator {
-    return this.page.locator("svg.chart polyline");
+    return this.page.locator("svg.chart polyline.series");
   }
   windowOption(label: RegExp | string): Locator {
     return this.page.locator(".window-picker__option", { hasText: label });
@@ -44,11 +44,13 @@ export class DashboardPage {
   get pickerFilter(): Locator {
     return this.page.locator("[data-pick-filter]");
   }
+  /** "View all resources" (#599): offers every type of the active FHIR
+   * version, not just the ones the tenant stores. */
+  get viewAllToggle(): Locator {
+    return this.page.locator(".chart-pick__option--all");
+  }
   get tooltip(): Locator {
     return this.page.locator("#chart-tip");
-  }
-  get expandToggle(): Locator {
-    return this.page.locator(".chart-card__tools a.pill--square");
   }
   get dataTableToggle(): Locator {
     return this.page.locator(".chart-table > summary");

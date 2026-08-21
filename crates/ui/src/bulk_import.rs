@@ -255,7 +255,7 @@ pub async fn page(
     principal: Option<Extension<helios_auth::Principal>>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let status = current_status(state.version, rv.0, &rt);
+    let status = current_status(&state, rv.0, &rt);
     let available = state.settings.is_some();
     let user_key = settings_user_key(principal.as_deref());
 
@@ -368,7 +368,7 @@ pub async fn detail(
     Path(id): Path<String>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let status = current_status(state.version, rv.0, &rt);
+    let status = current_status(&state, rv.0, &rt);
     let user_key = settings_user_key(principal.as_deref());
 
     let Some(s) = load_one(&state, &user_key, &rt.id, &id).await else {

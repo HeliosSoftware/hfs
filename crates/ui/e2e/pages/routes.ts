@@ -11,6 +11,7 @@ export const ROUTES = [
   "/ui/batch",
   "/ui/compartments",
   "/ui/search-parameters",
+  "/ui/terminology",
   "/ui/queries",
   "/ui/history",
   "/ui/search",

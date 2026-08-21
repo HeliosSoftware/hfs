@@ -333,6 +333,7 @@ fn converted_ordered_slicing_is_enforced_by_the_engine() {
         profiles: vec![PROFILE_URL.to_string()],
         use_meta_profiles: true,
         unknown_profile: UnknownProfilePolicy::Error,
+        ..Default::default()
     };
     let kinds = |data: &Value| -> Vec<String> {
         validator

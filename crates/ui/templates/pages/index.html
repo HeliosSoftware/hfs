@@ -78,13 +78,27 @@
         window selector.
       -->
       <details class="menu chart-pick">
-        <summary class="pill">
+        <!-- The aria-label keeps the summary named even when pick_label is
+             empty (a backend with no count read path offers zero types). -->
+        <summary class="pill" aria-label="{{ i18n.t("chart-pick-heading") }}">
           <span class="icon">{% include "icons/layers-platforms.svg" %}</span>
           {{ chart.pick_label }}
           <span class="icon">{% include "icons/chevron-down.svg" %}</span>
         </summary>
         <div class="menu__panel menu__panel--right">
           <div class="menu__heading">{{ i18n.t("chart-pick-heading") }}</div>
+          <!--
+            "View all resources" (#599): with no JS, a plain link back to `/ui`
+            with `?all=1` toggled, so a type with no data can still be picked
+            (and charts as a flat zero line). Same checkbox-row styling as the
+            options below, rendered as a link with `aria-pressed` rather than
+            a real `<input type="checkbox">` since it has no enclosing form.
+          -->
+          <a class="menu__option chart-pick__option chart-pick__option--all{% if all_types %} chart-pick__option--on{% endif %}"
+             href="{{ all_types_href }}" aria-pressed="{% if all_types %}true{% else %}false{% endif %}">
+            <span class="chart-pick__box" aria-hidden="true">{% if all_types %}✓{% endif %}</span>
+            <span class="chart-pick__name">{{ i18n.t("chart-pick-all") }}</span>
+          </a>
           <div class="menu__search">
             <input type="search" placeholder="{{ i18n.t("chart-pick-filter") }}"
                    aria-label="{{ i18n.t("chart-pick-filter") }}" data-pick-filter>
@@ -104,11 +118,6 @@
           </div>
         </div>
       </details>
-      <a class="pill pill--square" href="{{ expand_href }}"
-         aria-label="{% if chart.expanded %}{{ i18n.t("chart-collapse") }}{% else %}{{ i18n.t("chart-expand") }}{% endif %}"
-         title="{% if chart.expanded %}{{ i18n.t("chart-collapse") }}{% else %}{{ i18n.t("chart-expand") }}{% endif %}">
-        <span class="icon">{% include "icons/expand.svg" %}</span>
-      </a>
     </div>
   </header>
 
@@ -127,14 +136,38 @@
     is complete without it.
   -->
   <div class="chart-wrap" id="chart-wrap">
-    <svg class="chart" viewBox="0 0 1060 {{ chart.height }}" role="img"
+    <!-- role=group, not img: the plotted lines are focus links (#602), and
+         an image must not contain interactive controls (axe
+         nested-interactive). The name stays on the group. -->
+    <svg class="chart" viewBox="0 0 1060 {{ chart.height }}" role="group"
          aria-label="{{ i18n.t("chart-title") }} — {{ chart.types_label }}">
+      <defs>
+        <!-- Under a legend focus the y axis fits the focused series; receded
+             series keep their true values and clip where they exceed it. -->
+        <clipPath id="chart-plot">
+          <rect x="40" y="0" width="1020" height="{{ chart.height }}" />
+        </clipPath>
+      </defs>
       {% for tick in chart.y_ticks %}
       <line class="grid-line" x1="40" y1="{{ tick.pos }}" x2="1060" y2="{{ tick.pos }}" />
       <text class="axis-label" x="0" y="{{ tick.label_y }}">{{ tick.label }}</text>
       {% endfor %}
       {% for s in chart.series %}
-      <polyline class="series series--{{ s.color }}" points="{{ s.polyline }}" />
+      {% if let Some(href) = s.href %}
+      <!-- The line is the same focus link as its legend entry — a native SVG
+           anchor, no script. The transparent twin widens the hit area. -->
+      <a href="{{ href }}"
+         aria-label="{{ s.resource_type }} — {% if s.focused %}{{ i18n.t("chart-unfocus-series") }}{% else %}{{ i18n.t("chart-focus-series") }}{% endif %}">
+        <polyline class="series series--{{ s.color }}{{ s.emphasis }}"
+                  data-series="{{ s.resource_type }}"
+                  clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+        <polyline class="series-hit" clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+      </a>
+      {% else %}
+      <polyline class="series series--{{ s.color }}{{ s.emphasis }}"
+                data-series="{{ s.resource_type }}"
+                clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+      {% endif %}
       {% endfor %}
       {% for tick in chart.x_ticks %}
       <text class="axis-label" x="{{ tick.pos }}" y="{{ tick.label_y }}">{{ tick.label }}</text>
@@ -170,14 +203,19 @@
 
   <!--
     Legend: one entry per plotted series, colored to match its line. While
-    more than one series is plotted, an entry is a link that removes it from
-    the charted set; types are added from the picker above.
+    more than one series is plotted, an entry is a link that focuses that
+    series — the y axis re-fits it and the others recede (#602); clicking
+    the focused entry restores the shared view. Types are added and removed
+    through the picker above, never here.
   -->
   <ul class="chart-legend">
     {% for item in legend %}
     <li>
       {% if let Some(href) = item.href %}
-      <a class="chart-legend__item" href="{{ href }}" title="{{ i18n.t("chart-remove-series") }}">
+      <a class="chart-legend__item{% if item.focused %} chart-legend__item--focused{% endif %}"
+         href="{{ href }}"
+         {% if item.focused %}aria-current="true"{% endif %}
+         title="{% if item.focused %}{{ i18n.t("chart-unfocus-series") }}{% else %}{{ i18n.t("chart-focus-series") }}{% endif %}">
         <span class="chart-legend__dot chart-legend__dot--{{ item.color }}" aria-hidden="true"></span>
         <span>{{ item.resource_type }}</span>
         <span class="chart-legend__total">{{ item.total }}</span>

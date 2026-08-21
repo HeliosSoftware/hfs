@@ -63,6 +63,21 @@ async fn index_serves_the_full_landing_page() {
 }
 
 #[tokio::test]
+async fn legacy_expand_query_param_is_ignored_and_harmless() {
+    // `?expand=1` used to render the taller chart (#601); the affordance is
+    // gone, but old bookmarks/links carrying the param must still resolve
+    // cleanly, and the response must never echo it back into a live href.
+    let response = app()
+        .oneshot(Request::get("/ui?expand=1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains("expand=1"));
+}
+
+#[tokio::test]
 async fn dashboard_renders_job_cards_with_unavailable_state_when_no_provider() {
     // No DashboardProvider is registered in this test router, so build_index_page
     // falls back to sample_snapshot, whose export_jobs/import_jobs_active are
@@ -205,11 +220,26 @@ async fn search_parameters_page_serves_the_registry_view() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("<title>Search Parameters — Helios FHIR Server</title>"));
+    assert!(html.contains(r#"<h1 class="page-head__title">Search Parameters</h1>"#));
+    assert!(html.contains(
+        r#"<table class="data-table" data-row-navigation aria-label="Search Parameters">"#
+    ));
+    assert!(html.contains(r#"<script src="/ui/assets/search-parameters.js" defer></script>"#));
     // The Resource Filter rail and the facet rows are server-rendered.
     assert!(html.contains(r#"id="sp-rail-list""#));
     assert!(html.contains("base=Patient"));
     // Real registry data, not placeholders: Patient supports `name`.
     assert!(html.contains("http://hl7.org/fhir/SearchParameter/Patient-name"));
+    // Each result row keeps exactly one native link for keyboard and no-JS use.
+    let table_body = html
+        .split_once("<tbody>")
+        .and_then(|(_, rest)| rest.split_once("</tbody>"))
+        .map(|(body, _)| body)
+        .expect("SearchParameter table body");
+    let row_count = table_body.matches("<tr").count();
+    assert!(row_count > 0);
+    assert_eq!(table_body.matches(r#"class="row-link""#).count(), row_count);
     // This page, not Home, carries aria-current in the sidebar.
     assert!(html.contains(r#"href="/ui/search-parameters" aria-current="page""#));
     // The rail matches the flat Resources look (#603 follow-up): no bordered
@@ -779,6 +809,92 @@ fn app_with_terminology(terminology: Option<String>) -> Router {
         helios_fhir::FhirVersion::R4,
         terminology,
     )
+}
+
+#[tokio::test]
+async fn terminology_navigation_reflects_the_configuration() {
+    let response = app_with_terminology(None)
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"href="/ui/terminology""#));
+
+    let response = app_with_terminology(None)
+        .oneshot(Request::get("/ui/terminology").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="terminology-setup""#));
+    assert!(html.contains("HFS_TERMINOLOGY_SERVER=http://localhost:8090"));
+    assert!(html.contains(r#"href="/ui/terminology" aria-current="page""#));
+
+    let valid = "https://terminology.example/fhir/";
+    let response = app_with_terminology(Some(valid.to_string()))
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(&format!(r#"href="{valid}""#)));
+    assert!(html.contains(r#"target="_blank""#));
+    assert!(html.contains(r#"rel="noopener noreferrer""#));
+    assert!(html.contains(r#"hx-boost="false""#));
+    assert!(html.contains("opens in a new tab"));
+    assert!(!html.contains(r#"href="/ui/terminology""#));
+
+    let response = app_with_terminology(Some(valid.to_string()))
+        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(&format!(r#"href="{valid}""#)));
+    assert!(html.contains(r#"target="_blank""#));
+    assert!(html.contains(r#"rel="noopener noreferrer""#));
+    assert!(html.contains(r#"hx-boost="false""#));
+
+    let invalid = "javascript:alert(1)";
+    let response = app_with_terminology(Some(invalid.to_string()))
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"href="/ui/terminology""#));
+    assert!(!html.contains(invalid));
+
+    let response = app_with_terminology(Some(invalid.to_string()))
+        .oneshot(Request::get("/ui/terminology").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="terminology-invalid" role="alert""#));
+    assert!(html.contains("absolute HTTP or HTTPS URL"));
+    assert!(html.contains("HFS_TERMINOLOGY_SERVER=http://localhost:8090"));
+    assert!(!html.contains(invalid));
+
+    for invalid in [
+        "",
+        " https://terminology.example/fhir",
+        "/fhir",
+        "ftp://terminology.example/fhir",
+        "https://user:secret@terminology.example/fhir",
+        "https://terminology.example/fhir?mode=test",
+        "https://terminology.example/fhir#codes",
+    ] {
+        let response = app_with_terminology(Some(invalid.to_string()))
+            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{invalid}");
+        let html = body_text(response).await;
+        assert!(html.contains(r#"href="/ui/terminology""#), "{invalid}");
+        assert!(!html.contains(&format!(r#"href="{invalid}""#)), "{invalid}");
+    }
 }
 
 /// A loopback stand-in for the terminology server: one canned response for

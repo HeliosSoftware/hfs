@@ -327,7 +327,7 @@ pub async fn page(
     Query(query): Query<TenantsQuery>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let status = current_status(state.version, rv.0, &rt);
+    let status = current_status(&state, rv.0, &rt);
 
     let Some(storage) = state.tenants.as_ref() else {
         return render(TenantsPage {

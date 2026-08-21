@@ -17,6 +17,7 @@ app-tagline = Un servidor FHIR rápido y multiversión
 
 nav-dashboard = Panel
 nav-terminology = Terminología
+nav-terminology-new-window = Terminología (se abre en una pestaña nueva)
 nav-resources = Recursos
 nav-settings = Configuración
 nav-signout = Cerrar sesión
@@ -50,6 +51,17 @@ resource-count = { $count ->
 
 ## Exploración de terminología
 
+terminology-heading = Servidor de terminología
+terminology-lede = Conecta HFS con un servidor de terminología FHIR.
+terminology-configured-heading = Servidor de terminología configurado
+terminology-configured-body = HFS_TERMINOLOGY_SERVER apunta a una URL válida.
+terminology-configured-open = Abrir servidor de terminología
+terminology-invalid-heading = HFS_TERMINOLOGY_SERVER no es válida
+terminology-invalid-body = Usa una URL HTTP o HTTPS absoluta con un host. Se permiten rutas y una barra final. No incluyas credenciales, parámetros de consulta ni fragmentos.
+terminology-invalid-note = Actualiza la variable de entorno y luego reinicia HFS.
+terminology-setup-heading = Conectar un servidor de terminología
+terminology-setup-body = Define HFS_TERMINOLOGY_SERVER con la URL base del servidor de terminología FHIR que debe usar HFS.
+terminology-setup-note = Define la variable en el entorno desde el que se inicia HFS y luego reinicia el servidor.
 terminology-search-label = Buscar CodeSystems y ValueSets
 terminology-search-placeholder = p. ej. 73211009, «diabetes», http://snomed.info/sct
 terminology-display-language = Idioma de visualización
@@ -145,16 +157,16 @@ card-uptime = Tiempo activo
 card-uptime-sub = desde el arranque del proceso
 
 chart-title = Recursos FHIR en el tiempo
-chart-expand = Ampliar el gráfico
-chart-collapse = Reducir el gráfico
 chart-window = Intervalo de tiempo del gráfico
 chart-pick-heading = Tipos de recurso graficados
+chart-pick-all = Ver todos los tipos de recurso
 chart-pick-filter = Filtrar tipos
 chart-empty = Nada que graficar todavía: los recursos almacenados aparecerán aquí a medida que se creen.
 chart-sample-note = Datos de muestra: esta build no tiene registrado un proveedor de métricas en vivo.
 chart-table-toggle = Ver como tabla
 chart-table-when = Momento
-chart-remove-series = Quitar del gráfico
+chart-focus-series = Enfocar esta serie
+chart-unfocus-series = Mostrar todas las series
 
 ## Pie de página
 
