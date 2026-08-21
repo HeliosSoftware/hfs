@@ -2094,6 +2094,14 @@ button.pill {
   padding-right: 6px;
 }
 
+/* The list scrolls; its children keep their natural size. Without this the
+   flex algorithm crushes shrinkable rows before overflowing — the empty
+   1px divider collapses to 0 height the moment the list becomes a
+   height-bound scroll region. */
+.filter-rail__list > * {
+  flex: none;
+}
+
 .filter-rail__group {
   display: flex;
   flex-direction: column;
