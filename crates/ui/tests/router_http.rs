@@ -774,6 +774,92 @@ fn app_with_terminology(terminology: Option<String>) -> Router {
     )
 }
 
+#[tokio::test]
+async fn terminology_navigation_reflects_the_configuration() {
+    let response = app_with_terminology(None)
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"href="/ui/terminology""#));
+
+    let response = app_with_terminology(None)
+        .oneshot(Request::get("/ui/terminology").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="terminology-setup""#));
+    assert!(html.contains("HFS_TERMINOLOGY_SERVER=http://localhost:8090"));
+    assert!(html.contains(r#"href="/ui/terminology" aria-current="page""#));
+
+    let valid = "https://terminology.example/fhir/";
+    let response = app_with_terminology(Some(valid.to_string()))
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(&format!(r#"href="{valid}""#)));
+    assert!(html.contains(r#"target="_blank""#));
+    assert!(html.contains(r#"rel="noopener noreferrer""#));
+    assert!(html.contains(r#"hx-boost="false""#));
+    assert!(html.contains("opens in a new tab"));
+    assert!(!html.contains(r#"href="/ui/terminology""#));
+
+    let response = app_with_terminology(Some(valid.to_string()))
+        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(&format!(r#"href="{valid}""#)));
+    assert!(html.contains(r#"target="_blank""#));
+    assert!(html.contains(r#"rel="noopener noreferrer""#));
+    assert!(html.contains(r#"hx-boost="false""#));
+
+    let invalid = "javascript:alert(1)";
+    let response = app_with_terminology(Some(invalid.to_string()))
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"href="/ui/terminology""#));
+    assert!(!html.contains(invalid));
+
+    let response = app_with_terminology(Some(invalid.to_string()))
+        .oneshot(Request::get("/ui/terminology").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="terminology-invalid" role="alert""#));
+    assert!(html.contains("absolute HTTP or HTTPS URL"));
+    assert!(html.contains("HFS_TERMINOLOGY_SERVER=http://localhost:8090"));
+    assert!(!html.contains(invalid));
+
+    for invalid in [
+        "",
+        " https://terminology.example/fhir",
+        "/fhir",
+        "ftp://terminology.example/fhir",
+        "https://user:secret@terminology.example/fhir",
+        "https://terminology.example/fhir?mode=test",
+        "https://terminology.example/fhir#codes",
+    ] {
+        let response = app_with_terminology(Some(invalid.to_string()))
+            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{invalid}");
+        let html = body_text(response).await;
+        assert!(html.contains(r#"href="/ui/terminology""#), "{invalid}");
+        assert!(!html.contains(&format!(r#"href="{invalid}""#)), "{invalid}");
+    }
+}
+
 /// A loopback stand-in for the terminology server: one canned response for
 /// `GET /ValueSet/$expand`.
 async fn mock_terminology(status: StatusCode, body: &'static str) -> String {

@@ -260,7 +260,7 @@ pub async fn page(
     principal: Option<Extension<helios_auth::Principal>>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let status = current_status(state.version, rv.0, &rt);
+    let status = current_status(&state, rv.0, &rt);
     let user_key = settings_user_key(principal.as_deref());
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     let active_count = load_jobs(&state, &user_key, &rt.id)
@@ -428,7 +428,7 @@ pub async fn active(
     principal: Option<Extension<helios_auth::Principal>>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let status = current_status(state.version, rv.0, &rt);
+    let status = current_status(&state, rv.0, &rt);
     let user_key = settings_user_key(principal.as_deref());
     let jobs = load_jobs(&state, &user_key, &rt.id).await;
     let mut entries: Vec<(String, ExportJob)> = jobs
