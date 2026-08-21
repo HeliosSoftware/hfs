@@ -2,9 +2,8 @@ import { test, expect } from "../../pages/fixtures";
 import { createResource } from "../../pages/api";
 
 // The chart card without JavaScript (#555): the picker, the window selector,
-// the expand toggle, and the legend are plain links, and the tabular
-// alternative is a native <details> — everything works, only the hover
-// tooltip is absent.
+// and the legend are plain links, and the tabular alternative is a native
+// <details> — everything works, only the hover tooltip is absent.
 
 test("the chart's controls work as plain links with JavaScript off", async ({ page, request }) => {
   test.skip(process.env.HFS_E2E_NO_CHART_DATA === "1", "no count read path on this backend");
@@ -37,11 +36,9 @@ test("the chart's controls work as plain links with JavaScript off", async ({ pa
     await expect(page).not.toHaveURL(/focus=/);
   }
 
-  // Window selector and expand are links too.
+  // Window selector is a link too.
   await page.locator(".window-picker__option", { hasText: "24h" }).click();
   await expect(page).toHaveURL(/window=24h/);
-  await page.locator(".chart-card__tools a.pill--square").click();
-  await expect(page).toHaveURL(/expand=1/);
 
   // The tabular alternative opens natively.
   await page.locator(".chart-table > summary").click();

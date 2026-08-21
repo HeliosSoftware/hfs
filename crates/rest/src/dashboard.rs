@@ -241,6 +241,7 @@ where
         window: DashboardWindow,
         tenant: &str,
         types: &[String],
+        include_empty: bool,
     ) -> DashboardSnapshot {
         let tenant_id = if tenant.is_empty() {
             self.default_tenant.as_str()
@@ -255,16 +256,34 @@ where
 
         // What the tenant actually stores, largest first — the picker's option
         // list, and the pool defaults are drawn from (#555).
-        let mut available: Vec<TypeCount> = self
+        let raw_counts = self
             .storage
             .count_all_types(&tenant)
             .await
             .unwrap_or_else(|error| {
                 warn!(%error, "dashboard snapshot: distinct-type query failed");
                 Vec::new()
-            })
+            });
+        // The stat card counts only types the tenant actually stores —
+        // `include_empty` (#599, "View all resources") never changes this
+        // figure, so it must be taken before the flag relaxes the filter
+        // below.
+        let distinct_types = raw_counts.iter().filter(|(_, total)| *total > 0).count();
+
+        // With `include_empty`, a type storage reports with a zero live count
+        // is kept instead of dropped, coherent with the selection guard below
+        // (which also stops requiring a requested type to already be
+        // stored). Backends currently only ever return types with at least
+        // one live row (`GROUP BY` over non-deleted rows), so in practice
+        // this filter alone rarely surfaces anything new — a type the tenant
+        // has *never* stored still isn't known to this provider at all. The
+        // union with the FHIR version's full type list (so the picker can
+        // offer those too, at 0) is done on the UI side against
+        // `resource_type_names()`, the same spec-derived source the other
+        // pickers use; see `helios_ui::build_dashboard`.
+        let mut available: Vec<TypeCount> = raw_counts
             .into_iter()
-            .filter(|(_, total)| *total > 0)
+            .filter(|(_, total)| include_empty || *total > 0)
             .map(|(resource_type, total)| TypeCount {
                 resource_type,
                 total,
@@ -275,7 +294,6 @@ where
                 .cmp(&a.total)
                 .then_with(|| a.resource_type.cmp(&b.resource_type))
         });
-        let distinct_types = available.len();
 
         // The charted set: the caller's selection filtered to real stored
         // types, else the largest few. Capped so the query fan-out (one delta
@@ -299,7 +317,12 @@ where
         } else {
             types
                 .iter()
-                .filter(|t| available.iter().any(|a| &a.resource_type == *t))
+                // With `include_empty`, a requested type need not already be
+                // stored: the UI only ever sends one it validated against the
+                // version's real type list, and an unstored type still charts
+                // cleanly (`resource_count_series` degrades to a flat zero
+                // series rather than erroring or omitting it).
+                .filter(|t| include_empty || available.iter().any(|a| &a.resource_type == *t))
                 .take(MAX_CHARTED_TYPES)
                 .map(|t| t.as_str())
                 .collect()
@@ -399,7 +422,9 @@ mod tests {
         };
 
         let provider = StorageDashboardProvider::new(Arc::new(backend), &config);
-        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
+        let snapshot = provider
+            .snapshot(DashboardWindow::default(), "", &[], false)
+            .await;
 
         // An empty store has nothing to chart: no available types, no series —
         // the UI renders its explicit empty state from this (#555).
@@ -580,6 +605,120 @@ mod tests {
         assert!(patients.points.iter().all(|p| p.cumulative == 3));
     }
 
+    /// Without `include_empty`, requesting a type the tenant has never stored
+    /// is silently dropped (today's behavior) and the selection falls back to
+    /// nothing plotted for it — the guard at `:302` is untouched by the flag.
+    #[tokio::test]
+    async fn unstored_type_is_dropped_without_the_flag() {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite backend");
+        backend.init_schema().expect("init schema");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("create");
+        let config = ServerConfig {
+            default_tenant: "default".to_string(),
+            ..ServerConfig::for_testing()
+        };
+
+        let provider = StorageDashboardProvider::new(Arc::new(backend), &config);
+        let snapshot = provider
+            .snapshot(
+                DashboardWindow::default(),
+                "",
+                &["Observation".to_string()],
+                false,
+            )
+            .await;
+
+        assert!(
+            snapshot.series.is_empty(),
+            "an unstored type with no flag charts nothing"
+        );
+    }
+
+    /// With `include_empty` (#599, "View all resources"), a type the tenant
+    /// has never stored is still accepted and charted — a dense series of
+    /// flat zeros, not an absent series or an error. `distinct_types` (the
+    /// stat card) is unaffected by the flag either way.
+    #[tokio::test]
+    async fn unstored_type_charts_a_flat_zero_series_with_the_flag() {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite backend");
+        backend.init_schema().expect("init schema");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("create");
+        let config = ServerConfig {
+            default_tenant: "default".to_string(),
+            ..ServerConfig::for_testing()
+        };
+
+        let provider = StorageDashboardProvider::new(Arc::new(backend), &config);
+        let requested = vec!["Patient".to_string(), "Observation".to_string()];
+
+        let without_flag = provider
+            .snapshot(DashboardWindow::default(), "", &requested, false)
+            .await;
+        let with_flag = provider
+            .snapshot(DashboardWindow::default(), "", &requested, true)
+            .await;
+
+        // The stat card counts only what the tenant actually stores — the
+        // flag never moves it.
+        assert_eq!(without_flag.distinct_types, 1);
+        assert_eq!(with_flag.distinct_types, 1);
+
+        // Without the flag, the never-stored type is dropped from the
+        // selection; only Patient is charted.
+        assert_eq!(
+            without_flag
+                .series
+                .iter()
+                .map(|s| s.resource_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Patient"]
+        );
+
+        // With the flag, both are charted: Observation's series is present,
+        // dense (same point count as Patient's), and flat at zero.
+        let observation = with_flag
+            .series
+            .iter()
+            .find(|s| s.resource_type == "Observation")
+            .expect("Observation is charted with the flag");
+        assert_eq!(observation.total, 0);
+        assert!(!observation.points.is_empty(), "series must not be absent");
+        assert!(
+            observation.points.iter().all(|p| p.cumulative == 0),
+            "an unstored type is a flat line at 0, not invented data"
+        );
+        let patient_points = with_flag
+            .series
+            .iter()
+            .find(|s| s.resource_type == "Patient")
+            .expect("Patient still charted")
+            .points
+            .len();
+        assert_eq!(
+            observation.points.len(),
+            patient_points,
+            "every plotted series shares the window's dense bucket count"
+        );
+    }
+
     fn test_tenant() -> TenantContext {
         TenantContext::new(TenantId::new("default"), TenantPermissions::full_access())
     }
@@ -610,7 +749,9 @@ mod tests {
         };
 
         let provider = StorageDashboardProvider::new(Arc::new(backend), &config);
-        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
+        let snapshot = provider
+            .snapshot(DashboardWindow::default(), "", &[], false)
+            .await;
 
         assert_eq!(snapshot.export_jobs, None);
         assert_eq!(snapshot.import_jobs_active, None);
@@ -633,7 +774,9 @@ mod tests {
         let submit_jobs = Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>;
         let provider = StorageDashboardProvider::new(Arc::clone(&backend), &config)
             .with_job_stores(Some(export_jobs), Some(submit_jobs));
-        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
+        let snapshot = provider
+            .snapshot(DashboardWindow::default(), "", &[], false)
+            .await;
 
         assert_eq!(
             snapshot.export_jobs,
@@ -695,7 +838,9 @@ mod tests {
         let submit_jobs = Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>;
         let provider = StorageDashboardProvider::new(Arc::clone(&backend), &config)
             .with_job_stores(Some(export_jobs), Some(submit_jobs));
-        let snapshot = provider.snapshot(DashboardWindow::default(), "", &[]).await;
+        let snapshot = provider
+            .snapshot(DashboardWindow::default(), "", &[], false)
+            .await;
 
         assert_eq!(
             snapshot.export_jobs,

@@ -710,12 +710,6 @@ button.menu__option {
   color: var(--muted);
 }
 
-.pill--square {
-  width: 42px;
-  padding: 0;
-  justify-content: center;
-}
-
 /* A pill rendered as a real <button> (e.g. the chart-expand affordance) keeps
    the pill look but sheds the native button chrome and inherits type. */
 button.pill {
@@ -879,12 +873,6 @@ button.pill {
 .chart-legend__dot--5 { background: var(--series-5); }
 .chart-legend__dot--6 { background: var(--series-6); }
 
-/* The expand control is a link; keep the pill look. */
-a.pill {
-  text-decoration: none;
-  color: inherit;
-}
-
 /* Type picker: the mockup's checkbox menu, as plain toggle links. */
 .chart-pick summary.pill {
   cursor: pointer;
@@ -925,6 +913,14 @@ a.pill {
 .chart-pick__option--on .chart-pick__box {
   background: var(--accent-strong);
   border-color: var(--accent-strong);
+}
+
+/* "View all resources" (#599) sits above the filter input, set off from the
+   scrolling option list below it by a divider. */
+.chart-pick__option--all {
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--divider);
 }
 
 .chart-pick__name {

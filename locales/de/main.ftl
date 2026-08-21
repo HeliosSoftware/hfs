@@ -145,10 +145,9 @@ card-uptime = Betriebszeit
 card-uptime-sub = seit Prozessstart
 
 chart-title = FHIR-Ressourcen im Zeitverlauf
-chart-expand = Diagramm vergrößern
-chart-collapse = Diagramm verkleinern
 chart-window = Zeitfenster des Diagramms
 chart-pick-heading = Dargestellte Ressourcentypen
+chart-pick-all = Alle Ressourcentypen anzeigen
 chart-pick-filter = Typen filtern
 chart-empty = Noch nichts darzustellen — gespeicherte Ressourcen erscheinen hier, sobald sie angelegt werden.
 chart-sample-note = Beispieldaten: in diesem Build ist kein Live-Metrikanbieter registriert.
