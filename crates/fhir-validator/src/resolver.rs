@@ -224,4 +224,25 @@ mod extension_catalogue_tests {
             "contexts scope the offer"
         );
     }
+
+    /// #488: the R4B pack carries its own core extension catalogue, same
+    /// contract as R4. (R5/R6 stay empty until the Extensions Pack IG is
+    /// sourced — the decision is recorded on the issue.)
+    #[cfg(feature = "R4B")]
+    #[test]
+    fn r4b_pack_offers_profiled_extensions_by_context() {
+        let registry = core_registry(FhirVersion::R4B);
+        let for_patient = registry.extensions_applicable(&["Patient"]);
+        assert!(
+            for_patient.iter().any(|s| s.url.as_deref()
+                == Some("http://hl7.org/fhir/StructureDefinition/patient-birthPlace")),
+            "birthPlace applies to Patient in R4B"
+        );
+        assert!(
+            !registry
+                .extensions_applicable(&["HumanName.family"])
+                .is_empty(),
+            "element-scoped contexts populated"
+        );
+    }
 }
