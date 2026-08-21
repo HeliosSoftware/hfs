@@ -274,6 +274,7 @@ fn run_version(version: FhirVersion, version_dir: &str) {
         // Same posture as `spec_examples.rs`: a core-spec sweep ignores
         // unknown (US Core / IHE) profiles rather than drowning in noise.
         unknown_profile: UnknownProfilePolicy::Ignore,
+        ..Default::default()
     };
 
     // Diff each file the reference validator actually processed.
@@ -461,6 +462,7 @@ mod harness_tests {
             profiles: Vec::new(),
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Ignore,
+            ..Default::default()
         };
         for p in &files {
             let findings = our_findings(&validator, &opts, p);

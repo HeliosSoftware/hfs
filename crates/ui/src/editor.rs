@@ -325,6 +325,10 @@ fn build_body(
         mut errors,
         deferred,
     } = validator.validate_sync(&document, &ValidationOptions::default());
+    // The editor's issue count blocks saving, so only error-severity issues
+    // belong in it — warnings (e.g. extension context, #615) are $validate
+    // guidance, not save blockers.
+    errors.retain(|e| e.severity == helios_fhir_validator::Severity::Error);
 
     // Required-binding checks against the embedded core value sets (offline, no
     // terminology server), so an out-of-value-set code — e.g. gender
