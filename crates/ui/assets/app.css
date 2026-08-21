@@ -926,6 +926,10 @@ a.pill {
    the vertical guide the script moves along the buckets. */
 .chart-wrap {
   position: relative;
+  /* The svg scales its viewBox (text included) with rendered width; cap it so
+     axis labels stay near their designed size on wide panes. */
+  max-width: 1440px;
+  margin: 0 auto;
 }
 
 .chart-tip {
