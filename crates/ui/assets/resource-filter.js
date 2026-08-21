@@ -84,3 +84,24 @@
 
   renderRecents();
 })();
+
+/* Reveal the selected type on arrival: the rail list scrolls itself so the
+   `aria-current` item (the deep-linked type, or the default Patient the page
+   scripts mark on load) sits near the middle of the list instead of below
+   the fold. Runs on window load, after the deferred page scripts have marked
+   the selection. When a recent-group clone also carries the mark, the last
+   match is the main-list occurrence, which is the one worth revealing. */
+(function () {
+  "use strict";
+  window.addEventListener("load", function () {
+    document.querySelectorAll(".filter-rail__list").forEach(function (list) {
+      var marked = list.querySelectorAll('[aria-current="true"]');
+      if (!marked.length) return;
+      var current = marked[marked.length - 1];
+      var offset =
+        current.getBoundingClientRect().top - list.getBoundingClientRect().top;
+      var target = list.scrollTop + offset - (list.clientHeight - current.offsetHeight) / 2;
+      if (target > 0) list.scrollTop = target;
+    });
+  });
+})();

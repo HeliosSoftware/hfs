@@ -65,6 +65,17 @@ export class ResourcesPage {
   recentItem(type: string): Locator {
     return this.page.locator(`#type-rail-recent [data-type='${type}']`);
   }
+  /** Separates Recently used from the general list (#603 follow-up): only
+   * visible once the recent group actually has entries. */
+  get recentDivider(): Locator {
+    return this.page.locator("#type-rail-list > .filter-rail__divider");
+  }
+  /** The general list's own section heading (#603 follow-up). */
+  get generalHeading(): Locator {
+    return this.page.locator("#type-rail-list > .filter-rail__heading--group", {
+      hasText: "All types",
+    });
+  }
 
   async pickType(type: string): Promise<void> {
     await this.railItem(type).click();

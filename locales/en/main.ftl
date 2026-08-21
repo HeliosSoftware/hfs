@@ -499,6 +499,7 @@ resources-edit-title = Edit resource
 resources-tab-edit = Edit
 resources-tab-history = History
 resources-types-heading = Resource types
+rail-all-types-heading = All types
 
 queries-saved-group = Saved
 

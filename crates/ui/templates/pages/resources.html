@@ -3,35 +3,16 @@
 
 {% block title %}{{ i18n.t("resources-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
-{% block body_class %}has-nav-panel{% endblock %}
-{% block content_class %} content--wide{% endblock %}
+{% block body_class %}app-shell{% endblock %}
+{% block content_class %} content--app{% endblock %}
 
 <!--
-  Resources workspace (#282), following Brett's "Resources" frame (Figma
-  142:2): the resource-type list is a panel flush against the sidebar — part of
-  the menu, not a card in the content — and the centre is search + a "Create
-  new" primary button + the results table.
+  Resources workspace (#282): the resource-type rail lives in the content
+  under the fixed page head — the same app-shell pattern as Search
+  Parameters (the page never scrolls; the rail list and the main column each
+  scroll on their own) — and the centre is search + a "Create new" primary
+  button + the results table.
 -->
-{% block nav_panel %}
-<aside class="nav-panel" id="resources" aria-label="{{ i18n.t("queries-rail-heading") }}"
-       data-selected-type="{{ selected_type }}">
-  <div class="nav-panel__head">{{ i18n.t("resources-types-heading") }}</div>
-  <div class="nav-panel__search">
-    <span class="icon">{% include "icons/search.svg" %}</span>
-    <input type="search" id="type-rail-filter"
-           placeholder="{{ i18n.t("queries-rail-filter") }}"
-           aria-label="{{ i18n.t("queries-rail-filter") }}">
-  </div>
-  <div class="nav-panel__list" id="type-rail-list">
-    <div class="filter-rail__group" id="type-rail-recent"
-         data-recent-key="hfs-recent-types" data-rail-list="type-rail-list" hidden>
-      <div class="filter-rail__heading">{{ i18n.t("sp-rail-recent") }}</div>
-    </div>
-    {% call rail::rail_items(rail_entries) %}{% endcall %}
-  </div>
-</aside>
-{% endblock %}
-
 {% block content %}
 <section class="page-head page-head--row">
   <div>
@@ -45,7 +26,28 @@
   </button>
 </section>
 
-<div class="queries-main search-page" data-mode="{% if nl.configured %}nl{% else %}builder{% endif %}">
+<div class="queries-layout search-page" data-mode="{% if nl.configured %}nl{% else %}builder{% endif %}">
+  <aside class="filter-rail" id="resources" aria-label="{{ i18n.t("queries-rail-heading") }}"
+         data-selected-type="{{ selected_type }}">
+    <div class="filter-rail__heading">{{ i18n.t("resources-types-heading") }}</div>
+    <div class="filter-rail__search">
+      <span class="icon">{% include "icons/search.svg" %}</span>
+      <input type="search" id="type-rail-filter"
+             placeholder="{{ i18n.t("queries-rail-filter") }}"
+             aria-label="{{ i18n.t("queries-rail-filter") }}">
+    </div>
+    <div class="filter-rail__list" id="type-rail-list">
+      <div class="filter-rail__group" id="type-rail-recent"
+           data-recent-key="hfs-recent-types" data-rail-list="type-rail-list" hidden>
+        <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("sp-rail-recent") }}</div>
+      </div>
+      <div class="filter-rail__divider" aria-hidden="true"></div>
+      <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
+      {% call rail::rail_items(rail_entries) %}{% endcall %}
+    </div>
+  </aside>
+
+  <div class="queries-main">
     <section class="card query-form-card">
       {% if nl.configured %}
       <div class="seg" role="group" aria-label="{{ i18n.t("search-mode-label") }}">
@@ -103,6 +105,7 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 
     {% include "partials/search-results.html" %}
     {% include "partials/search-messages.html" %}
+  </div>
 </div>
 
 <!--

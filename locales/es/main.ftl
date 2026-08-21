@@ -496,6 +496,7 @@ resources-edit-title = Editar recurso
 resources-tab-edit = Editar
 resources-tab-history = Historial
 resources-types-heading = Tipos de recurso
+rail-all-types-heading = Todos los tipos
 
 queries-saved-group = Guardadas
 

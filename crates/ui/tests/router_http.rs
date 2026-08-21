@@ -212,6 +212,15 @@ async fn search_parameters_page_serves_the_registry_view() {
     assert!(html.contains("http://hl7.org/fhir/SearchParameter/Patient-name"));
     // This page, not Home, carries aria-current in the sidebar.
     assert!(html.contains(r#"href="/ui/search-parameters" aria-current="page""#));
+    // The rail matches the flat Resources look (#603 follow-up): no bordered
+    // card wrapper, and a divider + "All types" heading separate the
+    // Recently used group from the general list.
+    assert!(!html.contains(r#"class="card filter-rail""#));
+    assert!(html.contains(r#"class="filter-rail""#));
+    assert!(html.contains(r#"class="filter-rail__divider""#));
+    // "All types" now renders twice: the new section heading, and the
+    // existing "clear filter" row it sits above.
+    assert_eq!(html.matches(">All types<").count(), 2);
 }
 
 #[tokio::test]
@@ -695,6 +704,11 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     let recent_tag_end = html[recent_start..].find('>').unwrap() + recent_start;
     assert!(html[recent_start..recent_tag_end].contains("hidden"));
     assert!(html.contains(r#"src="/ui/assets/resource-filter.js" defer"#));
+    // A divider and an "All types" heading separate the Recently used group
+    // from the general list (#603 follow-up), between the recent group and
+    // the rail items.
+    assert!(html.contains(r#"class="filter-rail__divider""#));
+    assert!(html.contains(">All types<"));
     // The edit modal shell, with its Edit / History tabs.
     assert!(html.contains(r#"id="resource-modal""#));
     assert!(html.contains(r#"data-modal-tab="history""#));
@@ -717,12 +731,13 @@ async fn resources_deep_links_focus_the_selected_type() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     // The rail marks the deep-linked type, and Create targets it. The type
-    // list is the nav panel now (part of the menu), not a card in the content.
+    // list is a flat rail in the content under the fixed page head (app-shell
+    // pattern shared with Search Parameters), not a full-height menu panel.
     assert!(html.contains(r#"data-selected-type="Observation""#));
     assert!(html.contains(
         r#"data-type="Observation" href="/ui/resources?type=Observation" title="Observation" aria-current="true""#
     ));
-    assert!(html.contains(r#"class="nav-panel""#));
+    assert!(html.contains(r#"class="filter-rail" id="resources""#));
     // Create and the builder prefill both follow the deep-linked type.
     assert!(html.contains("Create new Observation"));
     assert!(html.contains(r#"value="GET /Observation""#));

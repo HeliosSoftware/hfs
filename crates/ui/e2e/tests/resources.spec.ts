@@ -143,6 +143,10 @@ test("the recently-used group tracks picks, most-recent-first, with counts match
   // reflects the picks above once the page (re)loads.
   await resources.goto("Patient");
   await expect(resources.recentGroup).toBeVisible();
+  // The divider and "All types" heading (#603 follow-up) give the general
+  // list its own clearly separated section once Recently used has entries.
+  await expect(resources.recentDivider).toBeVisible();
+  await expect(resources.generalHeading).toBeVisible();
 
   const types = await resources.recentGroup
     .locator("a.filter-rail__item[data-type]")
@@ -178,6 +182,10 @@ test("Create new does not register a recently-used entry", async ({ resources })
 
   await resources.goto("Patient");
   await expect(resources.recentGroup).toBeHidden();
+  // Nothing to divide from: the divider stays hidden too, but the general
+  // list still carries its own heading.
+  await expect(resources.recentDivider).toBeHidden();
+  await expect(resources.generalHeading).toBeVisible();
 });
 
 test("the modal closes via the X and via Escape", async ({ resources }) => {

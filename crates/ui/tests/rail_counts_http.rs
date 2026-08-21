@@ -101,6 +101,12 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
             html.contains(r#"id="type-rail-list""#),
             "{path}: rail present"
         );
+        // The rail's chrome is unified across the four pages (#603
+        // follow-up): the flat Resources look, not a bordered card.
+        assert!(
+            !html.contains(r#"class="card filter-rail""#),
+            "{path}: no bordered card around the type rail"
+        );
         let item = rail_item(&html, "Observation");
         assert!(
             item.contains(&format!(r#"href="{base}?type=Observation""#)),
