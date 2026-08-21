@@ -81,7 +81,13 @@ The `CompositeStorage` pattern combines backends (e.g., SQLite for CRUD + Elasti
 ## Project Skills
 
 Detailed operational guidance lives in project skills under `.claude/skills/`.
-Use those skills instead of expanding this always-loaded file:
+Use those skills instead of expanding this always-loaded file.
+
+Cursor project skills (shared with the repo) live under `.cursor/skills/`:
+
+- `fhir-developer` - Anthropic FHIR R4 developer skill (resources, cardinality, coding systems, REST/SMART, OperationOutcome). Use for generic FHIR/HL7 API modeling; compose with the HFS-specific skills below for runtime behavior.
+
+HFS / Claude Code skills:
 
 - `/run-hfs-server` - HFS server runtime, storage backends, multi-tenancy, compression, and API endpoints.
 - `/work-with-fhirpath` - FHIRPath CLI, server, expressions, terminology integration, and tests.
