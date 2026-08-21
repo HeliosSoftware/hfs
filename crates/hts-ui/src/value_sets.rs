@@ -6,7 +6,9 @@
 //!
 //! - `GET  /hts/value-sets`                — full-page browser.
 //! - `GET  /hts/value-sets/rows`           — filter-form target (rows partial).
-//! - `GET  /hts/value-sets/{id}`           — full-page detail; Metadata tab active.
+//! - `GET  /hts/value-sets/{id}`           — 302 redirect to `/{id}/expand`
+//!   (design doc §8.3: operation-first landing; the former "Metadata" tab
+//!   is gone and the facts block is always visible above the tab strip).
 //! - `GET  /hts/value-sets/{id}/expand`    — Expand tab input partial (or
 //!   full page on hard nav).
 //! - `POST /hts/value-sets/{id}/expand`    — runs `$expand` and returns the
@@ -22,7 +24,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::{Path, Query, State},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use axum_htmx::HxRequest;
@@ -49,14 +51,13 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
         )
 }
 
-/// Which detail-page tab a render targets. `Metadata` is the default; the
-/// `Expand` variant swaps in the workbench input partial.
-///
-/// Slice C ships two tabs only: `$validate-code` defers to Slice E's
-/// standalone workbench (§7.4.1 F9).
+/// Which detail-page tab a render targets. `Expand` is the only variant
+/// today (design doc §8.3 — operation-first landing; the former
+/// `Metadata` variant is gone). `$validate-code` defers to Slice E's
+/// standalone workbench (§7.4.1 F9); a Validate variant would land here
+/// when that slice ships.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VsTab {
-    Metadata,
     Expand,
 }
 
@@ -67,7 +68,6 @@ impl VsTab {
     #[allow(dead_code)]
     pub fn slug(self) -> &'static str {
         match self {
-            Self::Metadata => "metadata",
             Self::Expand => "expand",
         }
     }
@@ -327,30 +327,12 @@ impl<'a> DetailPageTemplate<'a> {
     }
 }
 
-async fn detail_page(
-    State(state): State<Arc<HtsUiState>>,
-    Path(id): Path<String>,
-    HxRequest(_is_htmx): HxRequest,
-    locale: RequestLocale,
-) -> Response {
-    let chrome = Chrome {
-        i18n: I18n::new(locale),
-        active_page: "value-sets",
-        fhir_version: state.fhir_version,
-        version: state.version,
-    };
-    let detail = state.upstream.read_value_set(&id).await;
-    render(
-        DetailPageTemplate {
-            chrome,
-            id,
-            detail,
-            tab: VsTab::Metadata,
-            workbench: None,
-            ceiling: HTS_UI_MAX_EXPANSION_SIZE_HINT,
-        }
-        .render(),
-    )
+/// Base detail URL — permanent-redirects to the default operation tab
+/// (§8.3 operation-first landing). The Expand handler renders the full
+/// detail: facts block above the tab strip, Expand input as the active
+/// tab.
+async fn detail_page(Path(id): Path<String>) -> Response {
+    Redirect::permanent(&format!("/ui/hts/value-sets/{id}/expand")).into_response()
 }
 
 // ── Workbench input (GET Expand tab handler) ────────────────────────────

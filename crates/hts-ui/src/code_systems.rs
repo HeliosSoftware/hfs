@@ -4,7 +4,9 @@
 //!
 //! - `GET /hts/code-systems` — full-page browser.
 //! - `GET /hts/code-systems/rows` — filter-form target (rows partial).
-//! - `GET /hts/code-systems/{id}` — full-page detail; Metadata tab active.
+//! - `GET /hts/code-systems/{id}` — 302 redirect to `/{id}/lookup` (design
+//!   doc §8.3: operation-first landing; the former "Metadata" tab is gone
+//!   and the facts block is always visible above the tab strip).
 //! - `GET /hts/code-systems/{id}/{op}` — Lookup / Validate / Subsumes tabs
 //!   (full page on hard nav, workbench input partial on htmx request).
 //! - `POST /hts/code-systems/{id}/{op}` — runs the operation and returns
@@ -19,7 +21,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::{Path, Query, State},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use axum_htmx::HxRequest;
@@ -55,11 +57,12 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
         )
 }
 
-/// Which workbench tab a detail-page render targets. `Metadata` is the
-/// default; the other three each swap in a workbench input partial.
+/// Which workbench tab a detail-page render targets. `Lookup` is the
+/// default (design doc §8.3 — operation-first landing); the former
+/// `Metadata` variant is gone and the facts block is always rendered
+/// above the tab strip regardless of which operation is active.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CsTab {
-    Metadata,
     Lookup,
     Validate,
     Subsumes,
@@ -74,7 +77,6 @@ impl CsTab {
     #[allow(dead_code)]
     pub fn slug(self) -> &'static str {
         match self {
-            Self::Metadata => "metadata",
             Self::Lookup => "lookup",
             Self::Validate => "validate",
             Self::Subsumes => "subsumes",
@@ -319,29 +321,13 @@ impl<'a> DetailPageTemplate<'a> {
     }
 }
 
-async fn detail_page(
-    State(state): State<Arc<HtsUiState>>,
-    Path(id): Path<String>,
-    HxRequest(_is_htmx): HxRequest,
-    locale: RequestLocale,
-) -> Response {
-    let chrome = Chrome {
-        i18n: I18n::new(locale),
-        active_page: "code-systems",
-        fhir_version: state.fhir_version,
-        version: state.version,
-    };
-    let detail = state.upstream.read_code_system(&id).await;
-    render(
-        DetailPageTemplate {
-            chrome,
-            id,
-            detail,
-            tab: CsTab::Metadata,
-            workbench: None,
-        }
-        .render(),
-    )
+/// Base detail URL — permanent-redirects to the default operation tab
+/// (§8.3 operation-first landing). The Lookup handler renders the full
+/// detail: facts block above the tab strip, Lookup input as the active
+/// tab. Redirecting instead of rendering keeps the browser URL and the
+/// `aria-current` tab always in sync.
+async fn detail_page(Path(id): Path<String>) -> Response {
+    Redirect::permanent(&format!("/ui/hts/code-systems/{id}/lookup")).into_response()
 }
 
 // ── Workbench inputs (GET tab handlers) ─────────────────────────────────

@@ -64,33 +64,43 @@ test.describe("HTS ConceptMap browser (§7.5)", () => {
 });
 
 test.describe("HTS ConceptMap detail + $translate workbench (§7.5)", () => {
-  test("landing on /ui/hts/concept-maps/{id} shows Metadata tab active", async ({
+  test("landing on /ui/hts/concept-maps/{id} redirects to /translate with Translate tab active", async ({
     page,
   }) => {
+    // §8.3 operation-first landing: the naked `/{id}` URL 308-redirects
+    // to `/{id}/translate`; Playwright follows the redirect transparently.
+    // The Metadata tab was retired — the facts block stays visible above
+    // the tab strip regardless of which operation is active.
     const response = await page.goto("/ui/hts/concept-maps/ex-cm-1");
     expect(response?.status()).toBe(200);
+    expect(page.url()).toContain("/ui/hts/concept-maps/ex-cm-1/translate");
     await expect(
-      page.getByRole("tab", { name: "Metadata", exact: true }),
+      page.getByRole("tab", { name: "Translate", exact: true }),
     ).toHaveAttribute("aria-selected", "true");
-    // Identity section renders the seed CM's canonical URL and target.
+    // Facts block above the tab strip renders the seed CM's canonical
+    // URL and target.
     await expect(
       page.getByText("http://example.org/cm/example"),
     ).toBeVisible();
     await expect(
       page.getByText("http://example.org/vs/target"),
     ).toBeVisible();
-    // §7.5: only Metadata + Translate tabs — no Lookup / Validate /
-    // Expand / Subsumes tabs leak in from Slice B / C.
-    for (const wrong of ["Lookup", "Validate", "Subsumes", "Expand"]) {
+    // §8.3 + §7.5: only Translate tab in the strip — no Metadata /
+    // Lookup / Validate / Expand / Subsumes leak in from Slice B / C.
+    for (const wrong of ["Metadata", "Lookup", "Validate", "Subsumes", "Expand"]) {
       await expect(
         page.getByRole("tab", { name: wrong, exact: true }),
       ).toHaveCount(0);
     }
   });
 
-  test("clicking the Translate tab swaps in the workbench input via htmx", async ({
+  test("clicking the Translate tab keeps its aria-current highlight", async ({
     page,
   }) => {
+    // §8.3: Translate is the only tab on CM detail, and lands active on
+    // the naked `/{id}` URL after the redirect chain. Clicking it is a
+    // no-op self-click; the important guarantee is that the run button
+    // is available and the tab keeps its highlight.
     await page.goto("/ui/hts/concept-maps/ex-cm-1");
     await page.getByRole("tab", { name: "Translate", exact: true }).click();
     // The GET /translate handler renders the input partial with the

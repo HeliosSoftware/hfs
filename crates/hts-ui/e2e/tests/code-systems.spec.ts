@@ -72,21 +72,35 @@ test.describe("HTS CodeSystem browser (§7.2)", () => {
 });
 
 test.describe("HTS CodeSystem detail + workbench (§7.3)", () => {
-  test("landing on /ui/hts/code-systems/{id} shows Metadata tab active", async ({ page }) => {
+  test("landing on /ui/hts/code-systems/{id} redirects to /lookup with Lookup tab active", async ({ page }) => {
+    // §8.3 operation-first landing: the naked `/{id}` URL 308-redirects
+    // to the default operation tab (`/{id}/lookup`); Playwright follows
+    // the redirect transparently, so the final URL and the active tab
+    // are both Lookup. The Metadata tab was retired — the facts block
+    // stays visible above the tab strip regardless of which operation
+    // is active.
     const response = await page.goto("/ui/hts/code-systems/ex-cs-1");
     expect(response?.status()).toBe(200);
+    expect(page.url()).toContain("/ui/hts/code-systems/ex-cs-1/lookup");
+    await expect(
+      page.getByRole("tab", { name: "Lookup", exact: true }),
+    ).toHaveAttribute("aria-selected", "true");
+    // Facts block above the tab strip renders the seed CS's canonical URL.
+    await expect(page.getByText("http://example.org/cs")).toBeVisible();
+    // §8.3: the Metadata tab is gone from the tab strip.
     await expect(
       page.getByRole("tab", { name: "Metadata", exact: true }),
-    ).toHaveAttribute("aria-selected", "true");
-    // Identity section renders the seed CS's canonical URL.
-    await expect(page.getByText("http://example.org/cs")).toBeVisible();
+    ).toHaveCount(0);
   });
 
-  test("clicking a filler row from the browser opens its Metadata tab", async ({ page }) => {
+  test("clicking a filler row from the browser opens its detail page with Lookup active", async ({ page }) => {
     // Regression: HTS's summary-mode search projects `id="{fhir_id}|{version}"`.
     // Row projection must strip the `|version` suffix or the /detail Alt E
     // lookup (see upstream.rs base_id + resolve_canonical_url) never
     // matches and the page renders only chrome + a not-found banner.
+    //
+    // §8.3: browser row links point at `/{id}` and the redirect chain
+    // resolves to `/{id}/lookup` with the Lookup tab active.
     await page.goto("/ui/hts/code-systems");
     const link = page.getByRole("link", { name: "FillerCS2", exact: true });
     await expect(link).toBeVisible();
@@ -94,10 +108,10 @@ test.describe("HTS CodeSystem detail + workbench (§7.3)", () => {
     const href = await link.getAttribute("href");
     expect(href).not.toContain("|");
     await link.click();
-    // The detail page must land on the Metadata tab with the resource's
-    // canonical URL visible — proving Alt E fully resolved the resource.
+    // Detail page lands on the Lookup tab with the canonical URL visible
+    // in the facts block above — proving Alt E fully resolved the resource.
     await expect(
-      page.getByRole("tab", { name: "Metadata", exact: true }),
+      page.getByRole("tab", { name: "Lookup", exact: true }),
     ).toHaveAttribute("aria-selected", "true");
     await expect(page.getByText("http://example.org/cs/filler-2")).toBeVisible();
     // And the not-found banner must be absent.
@@ -105,7 +119,9 @@ test.describe("HTS CodeSystem detail + workbench (§7.3)", () => {
   });
 
   test("clicking the Lookup tab swaps in the workbench input via htmx", async ({ page }) => {
-    await page.goto("/ui/hts/code-systems/ex-cs-1");
+    // Start on `/validate` so the "click Lookup" step is a real
+    // navigation, not a no-op self-click.
+    await page.goto("/ui/hts/code-systems/ex-cs-1/validate");
     await page.getByRole("tab", { name: "Lookup", exact: true }).click();
     // The GET /lookup handler renders the input partial; the run button
     // is Fluent-resolved from hts-workbench-run ("Run" in en).
@@ -114,26 +130,27 @@ test.describe("HTS CodeSystem detail + workbench (§7.3)", () => {
     ).toBeVisible({ timeout: 3_000 });
   });
 
-  test("clicking a tab moves the aria-current highlight off Metadata (Bug 1 regression)", async ({
+  test("clicking a tab moves the aria-current highlight (Bug 1 regression)", async ({
     page,
   }) => {
     // Region-wrap contract (design doc §8.1). Before the region wrapper
     // the tabs strip lived outside the htmx swap target, so a tab click
-    // updated the panel without refreshing aria-current — Metadata
-    // stayed highlighted even after Lookup rendered. Assert the swap
-    // now updates the whole `#hts-cs-detail-region`, so aria-current
-    // moves with the visible panel.
+    // updated the panel without refreshing aria-current. §8.3 replaces
+    // the original "Metadata → Lookup" click path with a "Lookup →
+    // Validate" one: the naked `/{id}` URL now lands directly on
+    // `/lookup`, so Lookup is the active tab on arrival. Clicking
+    // Validate must move `aria-current` off Lookup and onto Validate.
     await page.goto("/ui/hts/code-systems/ex-cs-1");
-    const metadata = page.getByRole("tab", { name: "Metadata", exact: true });
     const lookup = page.getByRole("tab", { name: "Lookup", exact: true });
-    await expect(metadata).toHaveAttribute("aria-current", "true");
-    await lookup.click();
-    // htmx swap completes when the run button appears.
-    await expect(
-      page.getByRole("button", { name: "Run", exact: true }),
-    ).toBeVisible({ timeout: 3_000 });
+    const validate = page.getByRole("tab", { name: "Validate", exact: true });
     await expect(lookup).toHaveAttribute("aria-current", "true");
-    await expect(metadata).not.toHaveAttribute("aria-current", "true");
+    await validate.click();
+    // htmx swap completes when the Validate form's Code input appears.
+    await expect(
+      page.getByLabel("Code", { exact: true }),
+    ).toBeVisible({ timeout: 3_000 });
+    await expect(validate).toHaveAttribute("aria-current", "true");
+    await expect(lookup).not.toHaveAttribute("aria-current", "true");
   });
 
   test("running $lookup with the seed code renders a designation + property panel", async ({

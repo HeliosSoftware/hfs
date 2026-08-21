@@ -97,30 +97,15 @@
     </div>
 
     {#-
-      Region wrapper (design doc §8.1). Same region-swap contract as
-      cs-detail: tabs + workbench live inside #hts-vs-detail-region so
-      a tab click can swap them atomically.
+      Region wrapper (design doc §8.1 + §8.3). Same contract as
+      cs-detail: tabs + workbench live inside #hts-vs-detail-region.
+      Facts block stays outside the region — it does not change with
+      the operation tab. §8.3 removes the former "Metadata" tab; the
+      strip lists operations only (Expand today; Validate deferred
+      by §7.4.1 F9).
     -#}
     <div id="hts-vs-detail-region">
-    {#-
-      Tabs strip. §7.4.1 F9 removes the Validate tab — Metadata + Expand
-      only. Both are real <a>s so the nojs fallback works; htmx
-      hijacks the click to swap the region without a full page reload.
-    -#}
     <nav class="tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-vs-detail-tabs-label") }}">
-      <a role="tab"
-         class="tab"
-         aria-selected="{% if tab == VsTab::Metadata %}true{% else %}false{% endif %}"
-         {% if tab == VsTab::Metadata %}aria-current="true"{% endif %}
-         aria-controls="hts-vs-workbench"
-         href="/ui/hts/value-sets/{{ id }}"
-         hx-get="/ui/hts/value-sets/{{ id }}"
-         hx-target="#hts-vs-detail-region"
-         hx-select="#hts-vs-detail-region"
-         hx-swap="outerHTML"
-         hx-push-url="true">
-        {{ chrome.i18n.t("hts-vs-detail-tab-metadata") }}
-      </a>
       <a role="tab"
          class="tab"
          aria-selected="{% if tab == VsTab::Expand %}true{% else %}false{% endif %}"
@@ -138,13 +123,6 @@
 
     <div id="hts-vs-workbench" class="hts-vs-detail__workbench" role="tabpanel" aria-labelledby="hts-vs-detail-heading">
       {% match tab %}
-        {% when VsTab::Metadata %}
-          <p class="hts-vs-detail__workbench-hint">{{ chrome.i18n.t("hts-vs-detail-workbench-hint") }}</p>
-          {#-
-            Empty swap target so the Expand tab can hx-swap="outerHTML"
-            into `#hts-workbench-input` from the Metadata landing.
-          -#}
-          <div id="hts-workbench-input" hidden></div>
         {% when VsTab::Expand %}
           {% let summary = Some(summary.clone()) %}
           {% let threshold = self.threshold() %}
@@ -155,11 +133,9 @@
       {% if let Some(view) = workbench %}
         {% include "partials/hts-vs-expand-result.html" %}
       {% else %}
-        {% if tab != VsTab::Metadata %}
-          <div id="hts-workbench-result" class="hts-vs-detail__result" aria-live="polite">
-            <p class="hts-vs-detail__result-empty">{{ chrome.i18n.t("hts-vs-detail-result-empty") }}</p>
-          </div>
-        {% endif %}
+        <div id="hts-workbench-result" class="hts-vs-detail__result" aria-live="polite">
+          <p class="hts-vs-detail__result-empty">{{ chrome.i18n.t("hts-vs-detail-result-empty") }}</p>
+        </div>
       {% endif %}
     </div>
     </div>{# /#hts-vs-detail-region #}

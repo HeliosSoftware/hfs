@@ -7,8 +7,10 @@
 //! - `GET  /hts/concept-maps`                    — full-page browser.
 //! - `GET  /hts/concept-maps/rows`               — filter-form target
 //!   (rows partial).
-//! - `GET  /hts/concept-maps/{id}`               — full-page detail;
-//!   Metadata tab active.
+//! - `GET  /hts/concept-maps/{id}`               — 302 redirect to
+//!   `/{id}/translate` (design doc §8.3: operation-first landing; the
+//!   former "Metadata" tab is gone and the facts block is always
+//!   visible above the tab strip).
 //! - `GET  /hts/concept-maps/{id}/translate`     — Translate tab input
 //!   partial (or full page on hard nav).
 //! - `POST /hts/concept-maps/{id}/translate`     — runs `$translate` and
@@ -35,7 +37,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::{Path, Query, State},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use axum_htmx::HxRequest;
@@ -62,13 +64,12 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
         )
 }
 
-/// Which detail-page tab a render targets. `Metadata` is the default
-/// (mirrors Slice C's VS shape; Slice B's CS default was `Metadata` too
-/// once the tab strip was in place). The `Translate` variant swaps in
-/// the workbench input partial and, on POST, the result partial.
+/// Which detail-page tab a render targets. `Translate` is the only
+/// variant today (design doc §8.3 — operation-first landing; the former
+/// `Metadata` variant is gone). The `Translate` variant swaps in the
+/// workbench input partial and, on POST, the result partial.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmTab {
-    Metadata,
     Translate,
 }
 
@@ -77,7 +78,6 @@ impl CmTab {
     #[allow(dead_code)]
     pub fn slug(self) -> &'static str {
         match self {
-            Self::Metadata => "metadata",
             Self::Translate => "translate",
         }
     }
@@ -339,30 +339,12 @@ impl<'a> DetailPageTemplate<'a> {
     }
 }
 
-async fn detail_page(
-    State(state): State<Arc<HtsUiState>>,
-    Path(id): Path<String>,
-    HxRequest(_is_htmx): HxRequest,
-    locale: RequestLocale,
-) -> Response {
-    let chrome = Chrome {
-        i18n: I18n::new(locale),
-        active_page: "concept-maps",
-        fhir_version: state.fhir_version,
-        version: state.version,
-    };
-    let detail = state.upstream.read_concept_map(&id).await;
-    render(
-        DetailPageTemplate {
-            chrome,
-            id,
-            detail,
-            tab: CmTab::Metadata,
-            direction: None,
-            workbench: None,
-        }
-        .render(),
-    )
+/// Base detail URL — permanent-redirects to the default operation tab
+/// (§8.3 operation-first landing). The Translate handler renders the
+/// full detail: facts block above the tab strip, Translate input as the
+/// active tab.
+async fn detail_page(Path(id): Path<String>) -> Response {
+    Redirect::permanent(&format!("/ui/hts/concept-maps/{id}/translate")).into_response()
 }
 
 // ── Translate tab input (GET handler) ───────────────────────────────────

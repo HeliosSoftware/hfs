@@ -109,29 +109,14 @@
     </div>
 
     {#-
-      Region wrapper (design doc §8.1). Same region-swap contract as
+      Region wrapper (design doc §8.1 + §8.3). Same contract as
       cs-detail: tabs + workbench live inside #hts-cm-detail-region.
+      Facts block stays outside the region — it does not change with
+      the operation tab. §8.3 removes the former "Metadata" tab; the
+      strip lists operations only (Translate today).
     -#}
     <div id="hts-cm-detail-region">
-    {#-
-      Tabs strip. §7.5 ships two tabs: Metadata + Translate. Real <a>s
-      so the nojs fallback works; htmx hijacks the click to swap the
-      region.
-    -#}
     <nav class="tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-cm-detail-tabs-label") }}">
-      <a role="tab"
-         class="tab"
-         aria-selected="{% if tab == CmTab::Metadata %}true{% else %}false{% endif %}"
-         {% if tab == CmTab::Metadata %}aria-current="true"{% endif %}
-         aria-controls="hts-cm-workbench"
-         href="/ui/hts/concept-maps/{{ id }}"
-         hx-get="/ui/hts/concept-maps/{{ id }}"
-         hx-target="#hts-cm-detail-region"
-         hx-select="#hts-cm-detail-region"
-         hx-swap="outerHTML"
-         hx-push-url="true">
-        {{ chrome.i18n.t("hts-cm-detail-tab-metadata") }}
-      </a>
       <a role="tab"
          class="tab"
          aria-selected="{% if tab == CmTab::Translate %}true{% else %}false{% endif %}"
@@ -149,13 +134,6 @@
 
     <div id="hts-cm-workbench" class="hts-cm-detail__workbench" role="tabpanel" aria-labelledby="hts-cm-detail-heading">
       {% match tab %}
-        {% when CmTab::Metadata %}
-          <p class="hts-cm-detail__workbench-hint">{{ chrome.i18n.t("hts-cm-detail-workbench-hint") }}</p>
-          {#-
-            Empty swap target so the Translate tab can hx-swap="outerHTML"
-            into `#hts-workbench-input` from the Metadata landing.
-          -#}
-          <div id="hts-workbench-input" hidden></div>
         {% when CmTab::Translate %}
           {% let summary = Some(summary.clone()) %}
           {% let direction = self.effective_direction() %}
@@ -165,11 +143,9 @@
       {% if let Some(view) = workbench %}
         {% include "partials/hts-cm-translate-result.html" %}
       {% else %}
-        {% if tab != CmTab::Metadata %}
-          <div id="hts-workbench-result" class="hts-cm-detail__result" aria-live="polite">
-            <p class="hts-cm-detail__result-empty">{{ chrome.i18n.t("hts-cm-detail-result-empty") }}</p>
-          </div>
-        {% endif %}
+        <div id="hts-workbench-result" class="hts-cm-detail__result" aria-live="polite">
+          <p class="hts-cm-detail__result-empty">{{ chrome.i18n.t("hts-cm-detail-result-empty") }}</p>
+        </div>
       {% endif %}
     </div>
     </div>{# /#hts-cm-detail-region #}

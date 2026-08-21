@@ -502,9 +502,13 @@ async fn browser_over_max_count_renders_invalid_input_outcome() {
 async fn detail_renders_shell_and_degraded_on_upstream_failure() {
     // Closed-loopback upstream: `read_concept_map` fails with `Connect`.
     // The handler must degrade to the banner + shell rather than a 5xx.
+    //
+    // §8.3: the naked `/{id}` URL now 308-redirects to `/{id}/translate`,
+    // so this test hits the effective landing directly. The redirect
+    // is covered by `detail_base_url_redirects_to_translate` below.
     let response = app()
         .oneshot(
-            axum::http::Request::get("/ui/hts/concept-maps/example-cm")
+            axum::http::Request::get("/ui/hts/concept-maps/example-cm/translate")
                 .header(header::ACCEPT_LANGUAGE, "en")
                 .body(Body::empty())
                 .unwrap(),
@@ -528,15 +532,40 @@ async fn detail_renders_shell_and_degraded_on_upstream_failure() {
 }
 
 #[tokio::test]
+async fn detail_base_url_redirects_to_translate() {
+    // §8.3 operation-first landing: the naked `/ui/hts/concept-maps/{id}`
+    // URL 308-redirects to the default operation tab (`/{id}/translate`).
+    let response = app()
+        .oneshot(
+            axum::http::Request::get("/ui/hts/concept-maps/example-cm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/ui/hts/concept-maps/example-cm/translate"),
+    );
+}
+
+#[tokio::test]
 async fn detail_unknown_id_renders_outcome_inside_shell() {
     // §7.5 states matrix + Slice B invariant #5: HTS returns 404 for
     // both truly-missing and soft-deleted resources; the UI renders an
     // OperationOutcome inside the shell rather than a hard page 404.
+    //
+    // §8.3: request targets `/{id}/translate` directly (naked `/{id}`
+    // now 308-redirects; see `detail_base_url_redirects_to_translate`).
     let (base, state) = start_mock().await;
     state.set_canned(CannedResponse::not_found()).await;
     let response = app_pointing_at(&base)
         .oneshot(
-            axum::http::Request::get("/ui/hts/concept-maps/no-such-cm")
+            axum::http::Request::get("/ui/hts/concept-maps/no-such-cm/translate")
                 .header(header::ACCEPT_LANGUAGE, "en")
                 .body(Body::empty())
                 .unwrap(),

@@ -96,7 +96,12 @@ const ROUTES: &[Route] = &[
         // loopback port in tests, so the handler renders the shared
         // degraded banner + the outer section wrapper. Marker is chosen
         // to be present in every state (loaded / degraded / outcome).
-        path: "/ui/hts/code-systems/does-not-exist",
+        //
+        // §8.3: the naked `/{id}` URL 308-redirects to the default
+        // operation tab; the matrix walks `/{id}/lookup` directly (the
+        // effective landing) so the shell-marker assertion still fires.
+        // The redirect itself is asserted in `tests/code_systems.rs`.
+        path: "/ui/hts/code-systems/does-not-exist/lookup",
         expect: "hts-cs-detail",
     },
     // Slice C: ValueSet browser + rows fragment + detail page. The
@@ -115,7 +120,10 @@ const ROUTES: &[Route] = &[
         expect: "hts-vs-rows",
     },
     Route {
-        path: "/ui/hts/value-sets/does-not-exist",
+        // §8.3: naked `/{id}` 308-redirects to `/expand`; matrix walks
+        // the effective landing directly. Redirect asserted in
+        // `tests/value_sets.rs::detail_base_url_redirects_to_expand`.
+        path: "/ui/hts/value-sets/does-not-exist/expand",
         expect: "hts-vs-detail",
     },
     // Slice D: ConceptMap browser + rows fragment + detail page. The
@@ -134,7 +142,10 @@ const ROUTES: &[Route] = &[
         expect: "hts-cm-rows",
     },
     Route {
-        path: "/ui/hts/concept-maps/does-not-exist",
+        // §8.3: naked `/{id}` 308-redirects to `/translate`; matrix walks
+        // the effective landing directly. Redirect asserted in
+        // `tests/concept_maps.rs::detail_base_url_redirects_to_translate`.
+        path: "/ui/hts/concept-maps/does-not-exist/translate",
         expect: "hts-cm-detail",
     },
     // Slice E: standalone Operations workbench. The default landing

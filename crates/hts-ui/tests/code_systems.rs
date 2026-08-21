@@ -165,9 +165,13 @@ async fn detail_renders_shell_and_outcome_on_upstream_failure() {
     // banner. The important guarantee is that the request completes 200
     // with a full HTML page — not a 5xx or blank body — so operators can
     // read the banner and retry once HTS returns.
+    //
+    // §8.3: the naked `/{id}` URL now 308-redirects to `/{id}/lookup`,
+    // so this test hits the effective landing directly. The redirect
+    // itself is covered by `detail_base_url_redirects_to_lookup` below.
     let response = app()
         .oneshot(
-            Request::get("/ui/hts/code-systems/example-system")
+            Request::get("/ui/hts/code-systems/example-system/lookup")
                 .header(header::ACCEPT_LANGUAGE, "en")
                 .body(Body::empty())
                 .unwrap(),
@@ -191,6 +195,31 @@ async fn detail_renders_shell_and_outcome_on_upstream_failure() {
 }
 
 #[tokio::test]
+async fn detail_base_url_redirects_to_lookup() {
+    // §8.3 operation-first landing: the naked `/ui/hts/code-systems/{id}`
+    // URL 308-redirects to the default operation tab (`/{id}/lookup`).
+    // This keeps the browser URL and the `aria-current` tab always in
+    // sync — the workbench never renders at a URL that doesn't name the
+    // active operation.
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/code-systems/example-system")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/ui/hts/code-systems/example-system/lookup"),
+    );
+}
+
+#[tokio::test]
 async fn detail_soft_deleted_would_render_outcome_not_page_404() {
     // Documented behavior contract (§7.3 states matrix): HTS returns 404
     // for both truly-missing and soft-deleted resources, and the UI
@@ -201,9 +230,13 @@ async fn detail_soft_deleted_would_render_outcome_not_page_404() {
     // degraded banner; the parallel test in a wiremock ring (deferred to
     // the follow-up integration slice per docs update) covers the 404 →
     // outcome path directly. Either way, the response status stays 200.
+    //
+    // §8.3: the request targets the default landing tab directly
+    // (`/{id}/lookup`) rather than the naked `/{id}` URL, since the
+    // latter now 308-redirects (see `detail_base_url_redirects_to_lookup`).
     let response = app()
         .oneshot(
-            Request::get("/ui/hts/code-systems/definitely-soft-deleted")
+            Request::get("/ui/hts/code-systems/definitely-soft-deleted/lookup")
                 .body(Body::empty())
                 .unwrap(),
         )

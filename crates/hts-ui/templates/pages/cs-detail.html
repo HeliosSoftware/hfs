@@ -105,35 +105,24 @@
     </div>
 
     {#-
-      Region wrapper (design doc §8.1). Tabs strip + workbench live inside
-      a single #hts-cs-detail-region div so a tab click can swap the whole
-      region as one unit — this is the only way the tabs' aria-current
-      stays in sync with the visible panel. `hx-select` picks the region
-      out of the full-page render the handler returns; `hx-push-url` keeps
-      the tab clickable as a deep-link.
+      Region wrapper (design doc §8.1 + §8.3). Tabs strip + workbench
+      live inside #hts-cs-detail-region so a tab click can swap them as
+      one unit — this keeps the tabs' aria-current in sync with the
+      visible panel. The facts block above stays outside the region:
+      it is derived from `read_code_system` and does not change when
+      the operation tab switches, so re-rendering it on every swap
+      would only cost latency. §8.3 removes the former "Metadata" tab
+      — the facts block is always visible, and the tab strip lists
+      operations only.
     -#}
     <div id="hts-cs-detail-region">
     {#-
       Tabs strip. Every tab is a real <a> so the nojs fallback works;
-      htmx attributes hijack the click to swap the workbench region
-      without a full page reload. `role="tab"` + `aria-selected` +
-      `aria-controls` wire the WAI-ARIA tabs pattern per design doc §7.3
-      a11y clause.
+      htmx attributes hijack the click to swap the region without a
+      full page reload. `role="tab"` + `aria-selected` + `aria-controls`
+      wire the WAI-ARIA tabs pattern per design doc §7.3 a11y clause.
     -#}
     <nav class="tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-cs-detail-tabs-label") }}">
-      <a role="tab"
-         class="tab"
-         aria-selected="{% if tab == CsTab::Metadata %}true{% else %}false{% endif %}"
-         {% if tab == CsTab::Metadata %}aria-current="true"{% endif %}
-         aria-controls="hts-cs-workbench"
-         href="/ui/hts/code-systems/{{ id }}"
-         hx-get="/ui/hts/code-systems/{{ id }}"
-         hx-target="#hts-cs-detail-region"
-         hx-select="#hts-cs-detail-region"
-         hx-swap="outerHTML"
-         hx-push-url="true">
-        {{ chrome.i18n.t("hts-cs-detail-tab-metadata") }}
-      </a>
       <a role="tab"
          class="tab"
          aria-selected="{% if tab == CsTab::Lookup %}true{% else %}false{% endif %}"
@@ -177,16 +166,6 @@
 
     <div id="hts-cs-workbench" class="hts-cs-detail__workbench" role="tabpanel" aria-labelledby="hts-cs-detail-heading">
       {% match tab %}
-        {% when CsTab::Metadata %}
-          <p class="hts-cs-detail__workbench-hint">{{ chrome.i18n.t("hts-cs-detail-workbench-hint") }}</p>
-          {#-
-            Empty swap target so the operation tabs (Lookup/Validate/Subsumes)
-            can hx-swap="outerHTML" into `#hts-workbench-input` from the
-            Metadata landing. Without this placeholder htmx's target lookup
-            fails silently and the workbench never renders on first click
-            (see Playwright group C tab-click failures).
-          -#}
-          <div id="hts-workbench-input" hidden></div>
         {% when CsTab::Lookup %}
           {% let summary = Some(summary.clone()) %}
           {% include "partials/hts-cs-lookup-input.html" %}
@@ -201,11 +180,9 @@
       {% if let Some(view) = workbench %}
         {% include "partials/hts-cs-workbench-result.html" %}
       {% else %}
-        {% if tab != CsTab::Metadata %}
-          <div id="hts-workbench-result" class="hts-cs-detail__result" aria-live="polite">
-            <p class="hts-cs-detail__result-empty">{{ chrome.i18n.t("hts-cs-detail-result-empty") }}</p>
-          </div>
-        {% endif %}
+        <div id="hts-workbench-result" class="hts-cs-detail__result" aria-live="polite">
+          <p class="hts-cs-detail__result-empty">{{ chrome.i18n.t("hts-cs-detail-result-empty") }}</p>
+        </div>
       {% endif %}
     </div>
     </div>{# /#hts-cs-detail-region #}

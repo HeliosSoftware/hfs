@@ -60,30 +60,42 @@ test.describe("HTS ValueSet browser (Â§7.4)", () => {
 });
 
 test.describe("HTS ValueSet detail + $expand workbench (Â§7.4)", () => {
-  test("landing on /ui/hts/value-sets/{id} shows Metadata tab active", async ({
+  test("landing on /ui/hts/value-sets/{id} redirects to /expand with Expand tab active", async ({
     page,
   }) => {
+    // Â§8.3 operation-first landing: the naked `/{id}` URL 308-redirects
+    // to `/{id}/expand`; Playwright follows the redirect transparently.
+    // The Metadata tab was retired â€” the facts block stays visible
+    // above the tab strip regardless of which operation is active.
     const response = await page.goto("/ui/hts/value-sets/ex-vs-1");
     expect(response?.status()).toBe(200);
+    expect(page.url()).toContain("/ui/hts/value-sets/ex-vs-1/expand");
     await expect(
-      page.getByRole("tab", { name: "Metadata", exact: true }),
+      page.getByRole("tab", { name: "Expand", exact: true }),
     ).toHaveAttribute("aria-selected", "true");
-    // Identity section renders the seed VS's canonical URL.
+    // Facts block above the tab strip renders the seed VS's canonical URL.
     await expect(
       page.getByText("http://example.org/vs/limbs"),
     ).toBeVisible();
+    // Â§8.3: the Metadata tab is gone from the tab strip.
+    await expect(
+      page.getByRole("tab", { name: "Metadata", exact: true }),
+    ).toHaveCount(0);
     // Â§7.4.1 F9: NO Validate tab in Slice C.
     await expect(
       page.getByRole("tab", { name: "Validate", exact: true }),
     ).toHaveCount(0);
   });
 
-  test("clicking a row from the browser opens its Metadata tab", async ({ page }) => {
+  test("clicking a row from the browser opens its detail page with Expand active", async ({ page }) => {
     // Regression mirror of code-systems.spec.ts: HTS emits composite
     // `id="{fhir_id}|{version}"` on summary search. Row projection must
     // strip the `|version` or the detail Alt E lookup returns not-found
     // and the page renders only chrome + a banner. See upstream.rs
     // base_id + resolve_canonical_url.
+    //
+    // Â§8.3: the browser row link points at `/{id}` and the redirect
+    // chain resolves to `/{id}/expand` with the Expand tab active.
     await page.goto("/ui/hts/value-sets");
     const link = page.getByRole("link", { name: "ExampleTreeVS", exact: true });
     await expect(link).toBeVisible();
@@ -91,7 +103,7 @@ test.describe("HTS ValueSet detail + $expand workbench (Â§7.4)", () => {
     expect(href).not.toContain("|");
     await link.click();
     await expect(
-      page.getByRole("tab", { name: "Metadata", exact: true }),
+      page.getByRole("tab", { name: "Expand", exact: true }),
     ).toHaveAttribute("aria-selected", "true");
     await expect(page.getByText("http://example.org/vs/tree")).toBeVisible();
     await expect(page.locator(".hts-outcome--error")).toHaveCount(0);
