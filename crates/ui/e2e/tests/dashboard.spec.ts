@@ -3,9 +3,11 @@ import { createResource } from "../pages/api";
 
 // The landing dashboard (/ui) and its functional chart (#555): the type
 // picker and the window selector are plain links (they work without JS —
-// see the nojs project); the hover tooltip and the picker filter are the
-// layered enhancements. Seeding rides through the ordinary FHIR API; the
-// snapshot cache is outlasted by DashboardPage.waitForSeries.
+// see the nojs project); the hover tooltip, the picker filter, and the
+// picker's in-place chart-card swap (#599 — every option row, not just
+// "view all") are the layered enhancements. Seeding rides through the
+// ordinary FHIR API; the snapshot cache is outlasted by
+// DashboardPage.waitForSeries.
 
 test.beforeEach(async ({ request }) => {
   await createResource(request, "Patient", { name: [{ family: "Chart" }] });
@@ -56,11 +58,15 @@ test("the time-window selector re-renders over the chosen window", async ({ page
 test("the picker toggles types on, capped at the palette", async ({ page, dashboard }) => {
   await dashboard.goto();
   await dashboard.waitForSeries();
+  await dashboard.openPicker();
 
   // Toggle every offered type on, a click at a time; the plotted set is
   // capped at six (the palette) — past that, the oldest swaps out (#555).
+  // Picking swaps the chart card in place instead of navigating (#599
+  // follow-up), so the picker only needs opening once — it stays open
+  // across the whole loop.
   for (let i = 0; i < 7; i++) {
-    await dashboard.openPicker();
+    await expect(dashboard.picker).toHaveAttribute("open", "");
     const off = page.locator(".chart-pick__option:not(.chart-pick__option--on)");
     if ((await off.count()) === 0) break;
     await off.first().click();
@@ -90,20 +96,44 @@ test("\"View all resources\" offers empty types, charts a flat line at 0, and ke
   await dashboard.openPicker();
   await expect(dashboard.pickerOption("Condition")).toHaveCount(0);
 
-  // The toggle is a plain link (works without JS) that flips `?all=1`.
+  // The toggle is a plain link (works without JS) that flips `?all=1`; with
+  // JS it swaps the chart card in place instead of navigating (#599 follow-
+  // up), so the picker menu it lives in stays open and there is no full
+  // page load. A marker set on `window` before the click only survives a
+  // same-document swap, not a hard reload — a simpler tell than watching
+  // for navigation events, which also fire for the `history.pushState`
+  // call the swap makes.
+  await page.evaluate(() => {
+    (window as unknown as { __e2eNavMarker: boolean }).__e2eNavMarker = true;
+  });
   await dashboard.viewAllToggle.click();
   await expect(page).toHaveURL(/all=1/);
+  await expect(dashboard.picker).toHaveAttribute("open", "");
+  expect(
+    await page.evaluate(() => (window as unknown as { __e2eNavMarker?: boolean }).__e2eNavMarker),
+  ).toBe(true);
+
+  // The chart's hover tooltip (#555) still works on the freshly swapped-in
+  // nodes — dashboard.js re-binds it via the "hfs:chart-swapped" event.
+  const swappedBox = await dashboard.chart.boundingBox();
+  if (!swappedBox) throw new Error("chart has no box");
+  await page.mouse.move(swappedBox.x + swappedBox.width * 0.6, swappedBox.y + swappedBox.height * 0.5);
+  await expect(dashboard.tooltip).toBeVisible();
+  await page.mouse.move(swappedBox.x - 40, swappedBox.y - 40);
+  await expect(dashboard.tooltip).toBeHidden();
 
   // With the flag, the never-stored type is offered, with a real 0 count.
-  await dashboard.openPicker();
   const empty = dashboard.pickerOption("Condition");
   await expect(empty).toBeVisible();
   await expect(empty.locator(".chart-pick__count")).toHaveText("0");
 
   // Picking it charts a flat zero line — a real plotted series, not absent.
+  // This click is also swapped in place (#599 follow-up covers every picker
+  // option, not just the toggle), so the menu stays open here too.
   await empty.click();
   await expect(page).toHaveURL(/types=.*Condition/);
   await expect(page).toHaveURL(/all=1/);
+  await expect(dashboard.picker).toHaveAttribute("open", "");
   expect(await dashboard.seriesLines.count()).toBeGreaterThan(0);
 
   // The flag survives a window change alongside the charted set.
