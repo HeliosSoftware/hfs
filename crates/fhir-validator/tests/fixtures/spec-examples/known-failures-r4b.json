@@ -473,36 +473,12 @@
       "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
     },
     {
-      "file": "codesystem-contract-legalstate.json",
-      "issues": 2,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
-    },
-    {
-      "file": "codesystem-contract-publicationstatus.json",
-      "issues": 2,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
-    },
-    {
       "file": "codesystem-contract-signer-type.json",
       "issues": 1,
       "kinds": [
         "required"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
-    },
-    {
-      "file": "codesystem-contract-status.json",
-      "issues": 2,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
     },
     {
       "file": "codesystem-contract-subtype.json",
@@ -1074,12 +1050,11 @@
     },
     {
       "file": "codesystem-medicationrequest-status.json",
-      "issues": 3,
+      "issues": 2,
       "kinds": [
-        "primitive-value",
         "required"
       ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts. Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`). The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone; the `required` half is unchanged and still the example's own defect."
     },
     {
       "file": "codesystem-message-reason-encounter.json",
@@ -1179,12 +1154,11 @@
     },
     {
       "file": "codesystem-program.json",
-      "issues": 2,
+      "issues": 1,
       "kinds": [
-        "primitive-value",
         "required"
       ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts. Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`). The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone; the `required` half is unchanged and still the example's own defect."
     },
     {
       "file": "codesystem-provenance-agent-type.json",
@@ -1355,21 +1329,12 @@
       "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
     },
     {
-      "file": "codesystem-statistic-type.json",
-      "issues": 2,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
-    },
-    {
       "file": "codesystem-subscription-search-modifier.json",
-      "issues": 2,
+      "issues": 1,
       "kinds": [
-        "primitive-value",
         "required"
       ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts. Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`). The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone; the `required` half is unchanged and still the example's own defect."
     },
     {
       "file": "codesystem-substance-grade.json",
@@ -1498,14 +1463,6 @@
         "required"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
-    },
-    {
-      "file": "codesystem-target-species.json",
-      "issues": 1,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
     },
     {
       "file": "codesystem-task-code.json",
@@ -1730,14 +1687,6 @@
         "primitive-value"
       ],
       "reason": "Engine bug #424: `ElementDefinition.id` resolves to the `id` type in the R4B/R5 packs (`EdType::effective_code` prefers the `structuredefinition-fhir-type` extension over the authoritative `System.String` code), so element ids containing `[x]` or `:` are rejected."
-    },
-    {
-      "file": "diagnosticreport-example-gingival-mass.json",
-      "issues": 1,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
     },
     {
       "file": "diagnosticreport-genetics.profile.json",
@@ -5172,14 +5121,6 @@
       "reason": "Engine bug #424: `ElementDefinition.id` resolves to the `id` type in the R4B/R5 packs (`EdType::effective_code` prefers the `structuredefinition-fhir-type` extension over the authoritative `System.String` code), so element ids containing `[x]` or `:` are rejected."
     },
     {
-      "file": "json-edge-cases.json",
-      "issues": 1,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
-    },
-    {
       "file": "ldlcholesterol.profile.json",
       "issues": 4,
       "kinds": [
@@ -5901,12 +5842,11 @@
     },
     {
       "file": "valuesets.json",
-      "issues": 14,
+      "issues": 2,
       "kinds": [
-        "primitive-value",
         "required"
       ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts. Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`). The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone; the `required` half is unchanged and still the example's own defect."
     },
     {
       "file": "vitalsigns.profile.json",

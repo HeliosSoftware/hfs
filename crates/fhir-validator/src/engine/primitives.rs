@@ -10,20 +10,48 @@
 //! FHIR spec regexes are implicitly anchored: they must match the whole
 //! value, so patterns are compiled as `^(?:...)$`.
 //!
-//! The patterns are XSD `pattern` facets published by FHIR, and XSD defines the
-//! shorthand classes as ASCII (`\s` == `[#x20#x9#xD#xA]`). Rust's `regex` crate,
-//! by contrast, makes `\s`/`\S` Unicode-aware, so a value containing U+00A0
-//! (non-breaking space) — Unicode whitespace but *not* XSD whitespace — is
-//! wrongly rejected by `string`/`markdown` (`[ \r\n\t\S]+`) on R4/R4B and by
-//! `code` (`[^\s]+...`) on every version (issue #425). We therefore compile with
-//! ASCII class semantics (`unicode(false)`) so `\s`/`\S`/`\d`/`\w` mean what the
-//! XSD author intended. Because `unicode(false)` on the `&str` engine rejects any
-//! program that could match invalid UTF-8 (which `\S`/`[^\s]` can), the patterns
-//! are compiled on the `regex::bytes` engine and matched against the value's
-//! UTF-8 bytes; the value is always valid UTF-8, so the only observable effect is
-//! that the shorthand classes become ASCII. Across every primitive pattern in
-//! all four versions, `\s` and `\S` are the *only* shorthands that appear (no
-//! `.`, `\d`, or `\w`), so byte matching is exactly equivalent to XSD here.
+//! # Why the shorthand classes are compiled as ASCII
+//!
+//! The regexes are not the authority on what a primitive may hold. FHIR says
+//! so outright: "The regexes are provided to assist with tooling, but are
+//! informative, not normative." The normative definition of `string` is "a
+//! sequence of Unicode characters", capped at 1,048,576 characters, with prose
+//! that it SHOULD NOT carry code points below 32 other than tab, CR and LF.
+//!
+//! Rust's `regex` makes `\s`/`\S` Unicode-aware, which put the engine at odds
+//! with that normative text: U+00A0 (non-breaking space) is Unicode whitespace,
+//! so it matched neither the literal `[ \r\n\t]` branch nor `\S` in the R4/R4B
+//! `string`/`markdown` pattern `[ \r\n\t\S]+`, and a plainly valid FHIR string
+//! was reported invalid (issue #425). `code` (`[^\s]+...`, every version) had
+//! the same defect: FHIR's "no whitespace other than single spaces" means XML
+//! whitespace, and U+00A0 is deliberately not in that set.
+//!
+//! Compiling with `unicode(false)` restores the intended reading. Because that
+//! flag on the `&str` engine rejects any program that could match invalid UTF-8
+//! (which `\S`/`[^\s]` can), the patterns are compiled on the `regex::bytes`
+//! engine and matched against the value's UTF-8 bytes. The value always comes
+//! from `Value::as_str()`, so it is always valid UTF-8.
+//!
+//! ## The invariant this relies on
+//!
+//! Byte matching with ASCII classes is only equivalent to codepoint matching
+//! because of two properties, which hold across every primitive pattern shipped
+//! in all four packs:
+//!
+//! - `\s` and `\S` are the only shorthand classes that appear. Nothing uses
+//!   `.`, `\d`, `\w`, a backreference, or a lookaround.
+//! - Every bounded quantifier (`id`'s `{1,64}`, `base64Binary`'s `{4}`, the
+//!   date/time and uuid groups) is applied to an explicit ASCII class, where
+//!   one byte is one character, so the counts cannot drift.
+//!
+//! Note that this is *not* strict XSD semantics, and should not be described as
+//! such. XSD defines only `\s` as ASCII (`[#x20#x9#xD#xA]`); its `\d` is
+//! `\p{Nd}` and its `\w` is Unicode-aware, both of which `unicode(false)`
+//! narrows to ASCII. Rust's ASCII `\s` is also `[\t\n\v\f\r ]`, which is wider
+//! than XSD's by VT and FF. Neither divergence is reachable through the shipped
+//! patterns — that is exactly what the invariant above asserts — but a pack
+//! carrying a `\d`/`\w` pattern in some future primitive would land outside it,
+//! so the invariant has to be rechecked when the packs change.
 
 use super::errors::{self, ErrorKind};
 use super::walk::WalkCtx;
@@ -103,10 +131,11 @@ fn expected_json_class(type_name: &str) -> Option<JsonClass> {
 /// reported... never: they are simply skipped — the converter emits spec
 /// patterns, and a bad pattern must not fail validation.
 ///
-/// Patterns are compiled on the byte engine with `unicode(false)` so the
-/// shorthand classes carry XSD/ASCII semantics (see the module docs). The cache
-/// key is the raw pattern string: every entry is compiled under the same fixed
-/// flag set, so the pattern alone is a total key.
+/// Patterns are compiled on the byte engine with `unicode(false)`, so `\s`/`\S`
+/// are ASCII; see the module docs for why, and for the invariant over the
+/// shipped patterns that makes byte matching equivalent. The cache key is the
+/// raw pattern string: every entry is compiled under the same fixed flag set,
+/// so the pattern alone is a total key.
 fn compiled(pattern: &str) -> Option<Arc<Regex>> {
     static CACHE: OnceLock<RwLock<HashMap<String, Option<Arc<Regex>>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
@@ -149,11 +178,11 @@ mod tests {
         assert!(compiled("([unclosed").is_none());
     }
 
-    // The FHIR primitive regexes are XSD `pattern` facets, and XSD `\s` is
-    // ASCII-only (`[#x20#x9#xD#xA]`). Rust's `regex` makes `\s`/`\S`
-    // Unicode-aware by default, which wrongly rejected values containing U+00A0
-    // (non-breaking space) — a valid FHIR string. #425. The engine now compiles
-    // with ASCII class semantics, so these pin the XSD behaviour directly.
+    // Rust's `regex` makes `\s`/`\S` Unicode-aware by default, which wrongly
+    // rejected values containing U+00A0 (non-breaking space) — a valid FHIR
+    // string under the normative "a sequence of Unicode characters" definition.
+    // #425. The engine now compiles the shorthand classes as ASCII; these pin
+    // that behaviour on the patterns the packs actually ship.
 
     /// The R4/R4B `string`/`markdown` pattern. `\S` must be ASCII, so U+00A0 is
     /// a non-whitespace codepoint and a valid string. This is the exact case
@@ -194,7 +223,9 @@ mod tests {
     }
 
     /// `uri`/`url`/`canonical` is `\S*`: a real space is rejected, U+00A0 is
-    /// accepted (XSD non-whitespace), and empty is allowed by `*`.
+    /// accepted (not ASCII whitespace), and empty is allowed by `*`. The regex
+    /// was never RFC 3986 enforcement — it admits any space-free string — so
+    /// the widening here costs nothing that was being caught.
     #[test]
     fn uri_star_s_semantics() {
         let p = r"\S*";

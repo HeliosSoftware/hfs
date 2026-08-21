@@ -273,30 +273,6 @@
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
     },
     {
-      "file": "codesystem-contract-legalstate.json",
-      "issues": 2,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
-    },
-    {
-      "file": "codesystem-contract-publicationstatus.json",
-      "issues": 2,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
-    },
-    {
-      "file": "codesystem-contract-status.json",
-      "issues": 2,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
-    },
-    {
       "file": "codesystem-extensions-CodeSystem-author.json",
       "issues": 1,
       "kinds": [
@@ -335,22 +311,6 @@
         "required"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
-    },
-    {
-      "file": "codesystem-medicationrequest-status.json",
-      "issues": 1,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
-    },
-    {
-      "file": "codesystem-program.json",
-      "issues": 1,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
     },
     {
       "file": "codesystem-questionnaire.json",
@@ -527,14 +487,6 @@
         "required"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
-    },
-    {
-      "file": "diagnosticreport-example-gingival-mass.json",
-      "issues": 1,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
     },
     {
       "file": "diagnosticreport-genetics-questionnaire.json",
@@ -823,14 +775,6 @@
         "required"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
-    },
-    {
-      "file": "json-edge-cases.json",
-      "issues": 1,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
     },
     {
       "file": "ldlcholesterol-questionnaire.json",
@@ -1665,14 +1609,6 @@
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
     },
     {
-      "file": "v2-tables.json",
-      "issues": 6,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
-    },
-    {
       "file": "valueset-extensions-ValueSet-author.json",
       "issues": 1,
       "kinds": [
@@ -1719,14 +1655,6 @@
         "required"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
-    },
-    {
-      "file": "valuesets.json",
-      "issues": 8,
-      "kinds": [
-        "primitive-value"
-      ],
-      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
     },
     {
       "file": "verificationresult-questionnaire.json",
