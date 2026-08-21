@@ -36,6 +36,19 @@ export default defineConfig({
       testMatch: "**/nojs/**/*.spec.ts",
       use: { ...devices["Desktop Chrome"], javaScriptEnabled: false },
     },
+    // The Keycloak smoke (#444): an external server whose auth is backed by a
+    // real IdP runs the same conformance assertions as the local auth leg —
+    // the spec is identical, only who minted the token differs. Opted into
+    // explicitly so ordinary external runs (the backend matrix) skip it.
+    ...(externalBase && process.env.HFS_E2E_AUTH_SMOKE === "1"
+      ? [
+          {
+            name: "auth-external",
+            testMatch: "**/auth/conformance.spec.ts",
+            use: { ...devices["Desktop Chrome"] },
+          },
+        ]
+      : []),
     // The auth legs (#320) drive their own servers (see webServer below), so
     // they only exist when this run boots its servers itself.
     ...(externalBase

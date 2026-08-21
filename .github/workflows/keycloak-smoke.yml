@@ -1,0 +1,181 @@
+name: Keycloak smoke (UI self-call)
+
+# #444, the last checkbox of #320: the e2e auth legs validate against a local
+# throwaway JWKS with locally-minted tokens; this smoke proves the same
+# conformance self-call against a *real* IdP with out-of-the-box defaults —
+# stock Keycloak, a service-account client, client_credentials, no extra
+# client configuration. The Playwright assertions are the very same
+# auth/conformance.spec.ts the local leg runs; only who minted the token
+# differs (the `auth-external` project, opted in via HFS_E2E_AUTH_SMOKE).
+#
+# Manual + nightly, like ui-tests-matrix and for the same reason: it needs the
+# remote Docker host (sibling containers, no `container:` jobs, no bind
+# mounts — the realm rides in with `docker cp` + kcadm, not a mount).
+#
+# The planned JwtAssertionOutboundAuthProvider (SMART Backend Services,
+# crates/auth/src/outbound.rs) would supersede the static-token provisioning
+# step here; the boot and assertion halves stay as they are.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 06:30 UTC nightly, offset from ui-tests-matrix to share the host politely.
+    - cron: "30 6 * * *"
+
+concurrency:
+  group: keycloak-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+  # Keep in step with @playwright/test in crates/ui/e2e/package.json.
+  PLAYWRIGHT_IMAGE: mcr.microsoft.com/playwright:v1.49.1-noble
+  KEYCLOAK_IMAGE: quay.io/keycloak/keycloak:26.0
+  HFS_PORT: 19090
+
+jobs:
+  smoke:
+    name: conformance self-call against stock Keycloak
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: GC the Docker host
+        uses: ./.github/actions/docker-host-gc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Build HFS
+        run: cargo build -p helios-hfs --no-default-features --features R4,ui,sqlite
+
+      - name: Determine runner and Docker host IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+
+      - name: Start Keycloak and create the stock realm
+        run: |
+          KC_CONTAINER="kc-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -fv "$KC_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$KC_CONTAINER" -p 0:8080 \
+            --label hfs-ci=true \
+            --label github.run_id=${{ github.run_id }} \
+            --label github.workflow=keycloak-smoke \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            "$KEYCLOAK_IMAGE" start-dev
+          echo "KC_CONTAINER=$KC_CONTAINER" >> "$GITHUB_ENV"
+
+          echo "Waiting for Keycloak..."
+          for i in {1..80}; do
+            KC_PORT=$(docker port "$KC_CONTAINER" 8080 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$KC_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$KC_PORT/realms/master" > /dev/null 2>&1; then
+              echo "KC_PORT=$KC_PORT" >> "$GITHUB_ENV"
+              break
+            fi
+            sleep 3
+          done
+          [ -n "$KC_PORT" ] || { echo "Keycloak never came up"; docker logs "$KC_CONTAINER" | tail -50; exit 1; }
+
+          # No bind mounts on this daemon: the realm rides in with docker cp
+          # and lands through the admin API (kcadm), nested clients included.
+          docker cp crates/ui/e2e/keycloak/hfs-smoke-realm.json "$KC_CONTAINER":/tmp/realm.json
+          docker exec "$KC_CONTAINER" /opt/keycloak/bin/kcadm.sh config credentials \
+            --server http://127.0.0.1:8080 --realm master --user admin --password admin
+          docker exec "$KC_CONTAINER" /opt/keycloak/bin/kcadm.sh create realms -f /tmp/realm.json
+
+      - name: Obtain the service-account token
+        run: |
+          TOKEN=$(curl -sf \
+            -d grant_type=client_credentials \
+            -d client_id=hfs-ui-smoke \
+            -d client_secret=hfs-smoke-secret \
+            "http://$DOCKER_HOST_IP:$KC_PORT/realms/hfs-smoke/protocol/openid-connect/token" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+          [ -n "$TOKEN" ] || { echo "no token"; exit 1; }
+          echo "::add-mask::$TOKEN"
+          echo "OUTBOUND_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Start HFS against Keycloak
+        run: |
+          mkdir -p smoke-results
+          export NO_PROXY="$DOCKER_HOST_IP,$RUNNER_IP,localhost,127.0.0.1${NO_PROXY:+,$NO_PROXY}"
+          export no_proxy="$NO_PROXY"
+          HFS_DATA_DIR="$GITHUB_WORKSPACE/data" \
+          HFS_AUTH_ENABLED=true \
+          HFS_AUTH_ISSUER="http://$DOCKER_HOST_IP:$KC_PORT/realms/hfs-smoke" \
+          HFS_AUTH_JWKS_URL="http://$DOCKER_HOST_IP:$KC_PORT/realms/hfs-smoke/protocol/openid-connect/certs" \
+          HFS_OUTBOUND_BEARER_TOKEN="$OUTBOUND_TOKEN" \
+          HFS_STORAGE_BACKEND=sqlite \
+          ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > smoke-results/hfs.log 2>&1 &
+          echo $! > /tmp/hfs-kc-smoke.pid
+
+          for i in {1..120}; do
+            curl -sf "http://localhost:$HFS_PORT/ui" > /dev/null 2>&1 && exit 0
+            kill -0 "$(cat /tmp/hfs-kc-smoke.pid)" 2>/dev/null || { cat smoke-results/hfs.log; exit 1; }
+            sleep 2
+          done
+          echo "HFS never became ready"; cat smoke-results/hfs.log; exit 1
+
+      - name: Run the auth smoke (Playwright)
+        run: |
+          set -euo pipefail
+          BASE="http://$RUNNER_IP:$HFS_PORT"
+          PW_CONTAINER="pw-kc-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "PW_CONTAINER=$PW_CONTAINER" >> "$GITHUB_ENV"
+          docker rm -fv "$PW_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PW_CONTAINER" \
+            --label hfs-ci=true \
+            --label github.run_id=${{ github.run_id }} \
+            --label github.workflow=keycloak-smoke \
+            --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 1800
+          docker cp crates/ui/e2e "$PW_CONTAINER":/work/e2e
+          docker exec -e CI=1 -e HFS_E2E_BASE_URL="$BASE" \
+            -e HFS_E2E_AUTH_SMOKE=1 -w /work/e2e "$PW_CONTAINER" \
+            bash -c "npm ci && npx playwright test --project=auth-external"
+
+      - name: Copy Playwright report out
+        if: always()
+        run: |
+          docker cp "$PW_CONTAINER":/work/e2e/playwright-report \
+            smoke-results/playwright-report 2>/dev/null || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: keycloak-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: smoke-results/
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -fv "${PW_CONTAINER:-}" 2>/dev/null || true
+          docker rm -fv "${KC_CONTAINER:-}" 2>/dev/null || true
+          if [ -f /tmp/hfs-kc-smoke.pid ]; then
+            kill -9 "$(cat /tmp/hfs-kc-smoke.pid)" 2>/dev/null || true
+            rm -f /tmp/hfs-kc-smoke.pid
+          fi
