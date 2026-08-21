@@ -1075,6 +1075,14 @@ a.pill {
   color: var(--muted);
 }
 
+/* A .toolbar__count inside a .btn (e.g. "Active Exports N") stays plain and
+   matches the label color; only the gap separates it from the text (#608). */
+.btn .toolbar__count {
+  margin-left: 8px;
+  color: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
 .toolbar__search {
   display: flex;
   align-items: center;
@@ -1594,6 +1602,7 @@ a.pill {
   border-radius: 9px;
   box-shadow: var(--surface-shadow);
   cursor: pointer;
+  text-decoration: none;
 }
 
 .btn:hover {
@@ -2342,6 +2351,33 @@ a.pill {
   max-height: calc(100vh - 110px);
   padding: 16px;
   overflow-y: auto;
+}
+
+/* Full-width form sections (bulk export): the flex/gap/padding of .detail
+   without its sticky sidebar behavior (#608). */
+.form-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+/* Vertical gap between the stacked .form-panel/table-card sections of the
+   bulk export form (#608). */
+.bulk-export-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* The Group ID field only applies to the Group scope; hide it otherwise.
+   Browsers without :has() keep it always visible — today's behavior. */
+.bulk-export-form .field--group-id {
+  display: none;
+}
+
+.bulk-export-form:has(input[name="scope"][value="group"]:checked) .field--group-id {
+  display: block;
 }
 
 .detail__title {
