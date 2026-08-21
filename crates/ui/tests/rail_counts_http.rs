@@ -66,6 +66,7 @@ impl DashboardProvider for Fixed {
         _window: DashboardWindow,
         tenant: &str,
         _types: &[String],
+        _include_empty: bool,
     ) -> DashboardSnapshot {
         if tenant != "default" {
             return DashboardSnapshot::default();
