@@ -148,6 +148,32 @@ async fn the_export_page_offers_scopes_types_and_filters() {
 }
 
 #[tokio::test]
+async fn the_export_page_uses_form_panels_with_name_and_hint_up_top() {
+    let (base, _) = serve().await;
+    let (status, html) = get_text(&base, "/ui/bulk-export").await;
+    assert_eq!(status, 200);
+
+    // The form sections use the non-sticky .form-panel, not the sticky
+    // .detail sidebar layout (#608).
+    assert!(html.contains("card form-panel"));
+    assert!(!html.contains("card detail"));
+
+    // The Name field comes before the scope radios in the first panel.
+    let name_pos = html.find(r#"name="name""#).expect("name field present");
+    let scope_pos = html.find(r#"name="scope""#).expect("scope radios present");
+    assert!(name_pos < scope_pos, "Name should precede the scope radios");
+
+    // The types hint sits above the checkbox grid, not below it.
+    let hint_pos = html
+        .find("Leave everything unchecked to export every type.")
+        .expect("types hint present");
+    let grid_pos = html
+        .find(r#"class="typegrid""#)
+        .expect("types grid present");
+    assert!(hint_pos < grid_pos, "hint should precede the types grid");
+}
+
+#[tokio::test]
 async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     let (base, mock) = serve().await;
 

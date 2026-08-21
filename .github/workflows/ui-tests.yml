@@ -137,3 +137,121 @@ jobs:
           }
 
           reap "$RUN_CONTAINER"
+
+  # T3 (#600): one extra leg, not a version matrix — builds hfs with every
+  # FHIR version feature and runs only the dedicated multi-version spec
+  # against it, so the sidebar's resource-type selector is proven against a
+  # real multi-version binary and not just the single-version default the
+  # `ui-tests` job above (and the rest of this suite) builds. Split into a
+  # build + test job, artifact-handed-off, the same shape
+  # ui-tests-matrix.yml uses for its backend matrix.
+  ui-multiversion-build:
+    name: Build HFS (multi-version + ui)
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
+
+      - name: Build HFS (R4 + R4B + R5 + R6)
+        run: |
+          cargo build -p helios-hfs --no-default-features \
+            --features R4,R4B,R5,R6,ui,sqlite
+
+      - name: Upload HFS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-ui-multiversion-binary
+          path: target/debug/hfs
+          retention-days: 1
+
+  ui-multiversion-tests:
+    name: helios-ui browser suite (multi-version selector)
+    needs: ui-multiversion-build
+    runs-on: [self-hosted, Linux]
+    env:
+      # Job-scoped override of the workflow-level RUN_CONTAINER: this job runs
+      # concurrently with `ui-tests` above and must not fight it for the same
+      # container name on the shared remote Docker host.
+      RUN_CONTAINER: ui-e2e-multiversion-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-ui-multiversion-binary
+          path: target/debug
+
+      - name: Make HFS binary executable
+        run: chmod +x target/debug/hfs
+
+      - name: Run browser suite (Playwright) — multi-version spec only
+        run: |
+          set -euo pipefail
+          docker rm -fv "$RUN_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$RUN_CONTAINER" \
+            --label hfs-ci=true \
+            --label github.run_id=${{ github.run_id }} \
+            --label github.workflow=ui-tests \
+            --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+          docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui
+          docker cp target/debug/hfs "$RUN_CONTAINER":/work/target/debug/hfs
+          docker cp data "$RUN_CONTAINER":/work/data
+          docker cp crates/ui/e2e "$RUN_CONTAINER":/work/crates/ui/e2e
+          # Pinned away from the build's natural first-enabled version (R4) so
+          # this leg also catches an "always the seed" regression (#600).
+          # boot.mjs forwards its whole environment to the spawned hfs
+          # process unchanged, so no boot.mjs change was needed for this.
+          docker exec -e CI=1 -e HFS_DEFAULT_FHIR_VERSION=R6 -w /work/crates/ui/e2e "$RUN_CONTAINER" \
+            bash -c "npm ci && npx playwright test tests/dashboard-multiversion.spec.ts"
+
+      - name: Copy Playwright report out
+        if: always()
+        run: |
+          docker cp "$RUN_CONTAINER":/work/crates/ui/e2e/playwright-report \
+            ./crates/ui/e2e/playwright-report-multiversion 2>/dev/null || true
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-multiversion
+          path: crates/ui/e2e/playwright-report-multiversion/
+          retention-days: 7
+
+      - name: Remove Playwright container
+        if: always()
+        run: |
+          # See the `ui-tests` job's identical step for why this is not
+          # `2>/dev/null || true`.
+          reap() {
+            local name="${1:-}"
+            [ -n "$name" ] || return 0
+            if ! docker inspect "$name" >/dev/null 2>&1; then
+              echo "$name already gone"
+              return 0
+            fi
+            if err=$(docker rm -fv "$name" 2>&1) && ! docker inspect "$name" >/dev/null 2>&1; then
+              echo "Removed $name"
+            else
+              if [ -n "$err" ]; then echo "$err"; fi
+              echo "::warning::Could not remove $name; it is leaking on the Docker host."
+            fi
+          }
+
+          reap "$RUN_CONTAINER"

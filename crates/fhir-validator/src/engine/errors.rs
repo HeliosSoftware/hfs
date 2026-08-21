@@ -60,6 +60,10 @@ pub enum ErrorKind {
     /// A profile named in `meta.profile` or the caller's profile list could
     /// not be resolved.
     UnknownProfile,
+    /// A known extension used outside its declared context (#615). Always
+    /// warning severity: context matching is conservative and ad-hoc
+    /// extensions must stay permissive.
+    ExtensionContext,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the
@@ -158,6 +162,13 @@ pub(crate) fn msg_expected_object_comma(json_type: &str) -> String {
 }
 
 /// [reference] `expected {min} > {actual_len}`
+pub(crate) fn msg_extension_context(url: &str, at: &str, contexts: &[String]) -> String {
+    format!(
+        "extension {url} is not declared for use at {at}; its contexts are [{}]",
+        contexts.join(", ")
+    )
+}
+
 pub(crate) fn msg_min(min: u64, actual_len: usize) -> String {
     format!("expected {min} > {actual_len}")
 }

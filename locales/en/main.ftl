@@ -161,10 +161,9 @@ card-uptime = Uptime
 card-uptime-sub = since process start
 
 chart-title = FHIR resources over time
-chart-expand = Expand chart
-chart-collapse = Collapse chart
 chart-window = Chart time window
 chart-pick-heading = Charted resource types
+chart-pick-all = View all resource types
 chart-pick-filter = Filter types
 chart-empty = Nothing to chart yet — stored resources appear here as they are created.
 chart-sample-note = Sample data: no live metrics provider is registered on this build.
@@ -232,7 +231,7 @@ queries-unavailable = Saved queries are unavailable: this server's storage backe
 
 ## SearchParameter viewer (#238)
 
-sp-heading = Search parameters
+sp-heading = Search Parameters
 sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant.
 sp-version-label = FHIR version
 sp-spec-missing = The full spec bundle (search-parameters-*.json) was not found in the data directory — only the minimal embedded fallback parameters are shown.

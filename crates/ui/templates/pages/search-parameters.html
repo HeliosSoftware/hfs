@@ -2,8 +2,6 @@
 
 {% block title %}{{ i18n.t("sp-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
-{% block content_class %} content--wide{% endblock %}
-
 {% block content %}
 <section class="page-head">
   <h1 class="page-head__title">{{ i18n.t("sp-heading") }}</h1>
@@ -83,7 +81,7 @@
 
     <section class="card">
       <div class="table-wrap">
-        <table class="data-table" aria-label="{{ i18n.t("sp-heading") }}">
+        <table class="data-table" data-row-navigation aria-label="{{ i18n.t("sp-heading") }}">
           <thead>
             <tr>
               <th>{{ i18n.t("sp-col-code") }}</th>
@@ -208,5 +206,6 @@
 </div>
 
 <script src="/ui/assets/resource-filter.js" defer></script>
+<script src="/ui/assets/search-parameters.js" defer></script>
 <script src="/ui/assets/conformance-crud.js" defer></script>
 {% endblock %}
