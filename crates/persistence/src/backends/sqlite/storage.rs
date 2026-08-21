@@ -44,6 +44,58 @@ fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
 }
 
+/// Whether the optional `resource_fts` FTS5 virtual table exists on this
+/// database.
+///
+/// FTS5 is an optional SQLite compile-time feature. `create_fts_table`
+/// (`schema.rs`) succeeds silently when it is absent, so `resource_fts` may
+/// legitimately not exist — and a database created by an FTS5-less build keeps
+/// no table even once reopened by an FTS5-capable one, because the `v2 -> v3`
+/// migration is already recorded as done.
+///
+/// Callers therefore probe before touching the table, and treat "table absent"
+/// (a determinate fact: there is nothing indexed, so nothing to erase) very
+/// differently from "the statement failed" (an unknown, which must never be
+/// swallowed on a purge path — see the `DELETE FROM resource_fts` call sites).
+///
+/// Cheap: `sqlite_master` is answered from the connection's in-memory schema
+/// cache and does not touch disk.
+pub(crate) fn fts_table_exists(conn: &rusqlite::Connection) -> StorageResult<bool> {
+    use rusqlite::OptionalExtension;
+
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'",
+        [],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+    .map_err(|e| internal_error(format!("Failed to probe for resource_fts: {e}")))
+}
+
+/// Runs a `DELETE FROM resource_fts …` on a purge path, skipping it when FTS5
+/// is unavailable and propagating any other failure.
+///
+/// The error handling is the point. Elsewhere in this backend an FTS delete is
+/// best-effort (`let _ = …`), which is tolerable on an index-maintenance path
+/// where the worst case is a stale entry. On a *purge* path it is not: a
+/// swallowed failure means the API answers `200` — "the record is gone" — while
+/// the resource's full text is still on disk. That is a false erasure
+/// attestation, and it is the same class of defect issue #386 reports, just
+/// reached by a different route. So: probe, then be strict.
+fn purge_fts_rows(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> StorageResult<()> {
+    if !fts_table_exists(conn)? {
+        return Ok(());
+    }
+    conn.execute(sql, params)
+        .map_err(|e| internal_error(format!("purge fts delete: {e}")))?;
+    Ok(())
+}
+
 /// Extracts the `value[x]` payload from a FHIRPath Patch `Parameters.part`
 /// entry whose `name` is `"value"`. Returns the value of the first key
 /// matching `value[A-Z]…` (e.g. `valueString`, `valueQuantity`,
@@ -862,7 +914,12 @@ impl ResourceStorage for SqliteBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
-        crate::tenant::ensure_mutable_tenant(id)?;
+        // Backstop for the canonical tenant-id contract (issue #385). SQLite
+        // keys tenants by an exact-match `tenant_id` column, so it has no
+        // collision of its own to defend against — this guards the *registry*
+        // from minting an id the other backends could not keep distinct, and
+        // keeps the precondition uniform across every implementation.
+        self.ensure_canonical_tenant_id(id)?;
         let conn = self.get_connection()?;
         // Plain INSERT so a duplicate id surfaces as a constraint error; the
         // admin handler pre-checks existence and returns 409, so reaching here
@@ -898,7 +955,15 @@ impl ResourceStorage for SqliteBackend {
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
         crate::tenant::ensure_mutable_tenant(id)?;
         let mut conn = self.get_connection()?;
-        let tx = conn.transaction().or_query_error("purge begin")?;
+        // IMMEDIATE, not the DEFERRED default: this transaction reads (the count
+        // below) before it writes. Under WAL a deferred transaction takes a read
+        // snapshot on that first read and then fails the read-to-write upgrade
+        // with SQLITE_BUSY_SNAPSHOT if another connection committed in between —
+        // and the busy handler is *not* invoked for that code, so the configured
+        // busy_timeout does not cover it. Taking the write lock up front does.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .or_query_error("purge begin")?;
         // Count current-version rows first so we can report what was removed.
         let removed: i64 = tx
             .query_row(
@@ -909,6 +974,8 @@ impl ResourceStorage for SqliteBackend {
             .or_query_error("purge count")?;
         // search_index has ON DELETE CASCADE from resources, but delete it
         // explicitly too in case foreign keys are not enforced on this handle.
+        // (That explicit delete is also what fires the `search_index_fts`
+        // triggers, though a cascade fires them too.)
         for sql in [
             "DELETE FROM search_index WHERE tenant_id = ?1",
             "DELETE FROM resource_history WHERE tenant_id = ?1",
@@ -917,6 +984,22 @@ impl ResourceStorage for SqliteBackend {
             tx.execute(sql, params![id])
                 .or_query_error("purge delete")?;
         }
+        // `resource_fts` is an FTS5 *virtual* table: it can carry no foreign key,
+        // so the cascade above never reaches it and it must be deleted explicitly
+        // (issue #386). Left behind, the purged resource's narrative and its
+        // entire serialized body stay in the database, and are resurrected as a
+        // match oracle the moment a resource reuses the same logical id.
+        //
+        // Deliberately NOT gated on `is_search_offloaded()`: that flag is a
+        // write-path optimisation ("don't maintain an index nobody reads"),
+        // whereas this is an erasure guarantee. A deployment that indexed
+        // locally and later moved search to Elasticsearch still has rows here,
+        // and a purge is precisely when they must go.
+        purge_fts_rows(
+            &tx,
+            "DELETE FROM resource_fts WHERE tenant_id = ?1",
+            params![id],
+        )?;
         // Per-user settings are keyed by user, not tenant, so they are not swept
         // by the deletes above — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313). Same transaction: this
@@ -1112,16 +1195,7 @@ impl SqliteBackend {
     ) -> StorageResult<()> {
         use super::search::fts::extract_searchable_content;
 
-        // Check if FTS table exists (created in schema v3)
-        let fts_exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if !fts_exists {
+        if !fts_table_exists(conn)? {
             // FTS5 not available - skip silently
             return Ok(());
         }
@@ -2351,11 +2425,23 @@ impl PurgableStorage for SqliteBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
+        // One transaction for the whole purge. Previously these were four
+        // independent autocommit statements, so a failure (or a crash) partway
+        // through left the resource deleted but its full text still in
+        // `resource_fts` — the exact orphan state this method now exists to
+        // prevent — and the caller could not tell a partial purge from a failed
+        // one, because a retry hits the not-found guard below and reports
+        // `NotFound` while the residue remains. IMMEDIATE for the same
+        // read-then-write / WAL reason as `purge_tenant_data`.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("purge begin: {e}")))?;
+
         // Check if resource exists (in any state)
-        let exists: bool = conn
+        let exists: bool = tx
             .query_row(
                 "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
                 params![tenant_id, resource_type, id],
@@ -2365,7 +2451,7 @@ impl PurgableStorage for SqliteBackend {
 
         if !exists {
             // Also check history in case it was already purged from main table
-            let history_exists: bool = conn
+            let history_exists: bool = tx
                 .query_row(
                     "SELECT 1 FROM resource_history WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
                     params![tenant_id, resource_type, id],
@@ -2382,35 +2468,51 @@ impl PurgableStorage for SqliteBackend {
         }
 
         // Delete from resources table
-        conn.execute(
+        tx.execute(
             "DELETE FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
             params![tenant_id, resource_type, id],
         )
         .or_query_error("Failed to purge resource")?;
 
         // Delete from history table
-        conn.execute(
+        tx.execute(
             "DELETE FROM resource_history WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
             params![tenant_id, resource_type, id],
         )
         .or_query_error("Failed to purge resource history")?;
 
         // Delete from search index
-        conn.execute(
+        tx.execute(
             "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
             params![tenant_id, resource_type, id],
         )
         .or_query_error("Failed to purge search index")?;
 
+        // Delete the full-text rows: no cascade reaches an FTS5 virtual table.
+        // See `purge_tenant_data` for why this is strict and ungated.
+        purge_fts_rows(
+            &tx,
+            "DELETE FROM resource_fts WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+            params![tenant_id, resource_type, id],
+        )?;
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+
         Ok(())
     }
 
     async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
+        // Single transaction — see `purge` for the rationale.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("purge_all begin: {e}")))?;
+
         // Count how many we're about to delete
-        let count: i64 = conn
+        let count: i64 = tx
             .query_row(
                 "SELECT COUNT(DISTINCT id) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2",
                 params![tenant_id, resource_type],
@@ -2419,25 +2521,36 @@ impl PurgableStorage for SqliteBackend {
             .unwrap_or(0);
 
         // Delete from resources table
-        conn.execute(
+        tx.execute(
             "DELETE FROM resources WHERE tenant_id = ?1 AND resource_type = ?2",
             params![tenant_id, resource_type],
         )
         .or_query_error("Failed to purge resources")?;
 
         // Delete from history table
-        conn.execute(
+        tx.execute(
             "DELETE FROM resource_history WHERE tenant_id = ?1 AND resource_type = ?2",
             params![tenant_id, resource_type],
         )
         .or_query_error("Failed to purge resource history")?;
 
         // Delete from search index
-        conn.execute(
+        tx.execute(
             "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2",
             params![tenant_id, resource_type],
         )
         .or_query_error("Failed to purge search index")?;
+
+        // Delete the full-text rows: no cascade reaches an FTS5 virtual table.
+        // See `purge_tenant_data` for why this is strict and ungated.
+        purge_fts_rows(
+            &tx,
+            "DELETE FROM resource_fts WHERE tenant_id = ?1 AND resource_type = ?2",
+            params![tenant_id, resource_type],
+        )?;
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("purge_all commit: {e}")))?;
 
         Ok(count as u64)
     }
@@ -3055,6 +3168,13 @@ impl SqliteBackend {
 
 #[async_trait]
 impl BundleProvider for SqliteBackend {
+    /// SQLite provides real ACID transactions; `SqliteBackend` also implements
+    /// [`TransactionProvider`](crate::core::TransactionProvider), and
+    /// `process_transaction` runs inside one, so a failure unwinds completely.
+    fn supports_atomic_transactions(&self) -> bool {
+        true
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
@@ -3143,26 +3263,6 @@ impl BundleProvider for SqliteBackend {
 
         Ok(BundleResult {
             bundle_type: BundleType::Transaction,
-            entries: results,
-        })
-    }
-
-    async fn process_batch(
-        &self,
-        tenant: &TenantContext,
-        entries: Vec<BundleEntry>,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleResult> {
-        let mut results = Vec::with_capacity(entries.len());
-
-        // Process each entry independently
-        for entry in &entries {
-            let result = self.process_batch_entry(tenant, entry, fhir_version).await;
-            results.push(result);
-        }
-
-        Ok(BundleResult {
-            bundle_type: BundleType::Batch,
             entries: results,
         })
     }
@@ -3285,147 +3385,6 @@ impl SqliteBackend {
                     }),
                 ))
             }
-        }
-    }
-
-    /// Process a single batch entry (independent, no transaction).
-    async fn process_batch_entry(
-        &self,
-        tenant: &TenantContext,
-        entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> BundleEntryResult {
-        match self
-            .process_batch_entry_inner(tenant, entry, fhir_version)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => BundleEntryResult::error(
-                500,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "error", "code": "exception", "diagnostics": e.to_string()}]
-                }),
-            ),
-        }
-    }
-
-    async fn process_batch_entry_inner(
-        &self,
-        tenant: &TenantContext,
-        entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleEntryResult> {
-        match entry.method {
-            BundleMethod::Get => {
-                let (resource_type, id) = self.parse_url(&entry.url)?;
-                match self.read(tenant, &resource_type, &id).await? {
-                    Some(resource) => Ok(BundleEntryResult::ok(resource)),
-                    None => Ok(BundleEntryResult::error(
-                        404,
-                        serde_json::json!({
-                            "resourceType": "OperationOutcome",
-                            "issue": [{"severity": "error", "code": "not-found"}]
-                        }),
-                    )),
-                }
-            }
-            BundleMethod::Post => {
-                let resource = entry.resource.clone().ok_or_else(|| {
-                    StorageError::Validation(crate::error::ValidationError::MissingRequiredField {
-                        field: "resource".to_string(),
-                    })
-                })?;
-
-                let resource_type = resource
-                    .get("resourceType")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| {
-                        StorageError::Validation(
-                            crate::error::ValidationError::MissingRequiredField {
-                                field: "resourceType".to_string(),
-                            },
-                        )
-                    })?;
-
-                let created = self
-                    .create(tenant, &resource_type, resource, fhir_version)
-                    .await?;
-                Ok(BundleEntryResult::created(created))
-            }
-            BundleMethod::Put => {
-                let resource = entry.resource.clone().ok_or_else(|| {
-                    StorageError::Validation(crate::error::ValidationError::MissingRequiredField {
-                        field: "resource".to_string(),
-                    })
-                })?;
-
-                let (resource_type, id) = self.parse_url(&entry.url)?;
-
-                // `ifMatch` was previously dropped on the floor in the BATCH
-                // path (the transaction path did check it), so optimistic
-                // locking silently disappeared for anyone who wrapped a PUT in a
-                // `type: batch` Bundle — a lost update reported as 200 OK.
-                // Only pay for the extra read when a precondition was supplied.
-                if entry.if_match.is_some() {
-                    // A deleted resource has no current representation, so
-                    // `Gone` is `None` here; real storage errors must not be
-                    // swallowed into a bogus precondition failure.
-                    let existing = match self.read(tenant, &resource_type, &id).await {
-                        Ok(v) => v,
-                        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-                        Err(e) => return Err(e),
-                    };
-                    if let Some(failure) = bundle_if_match_gate(
-                        entry.if_match.as_deref(),
-                        existing.as_ref().map(|r| r.version_id()),
-                    ) {
-                        return Ok(failure);
-                    }
-                }
-
-                let (stored, _created) = self
-                    .create_or_update(tenant, &resource_type, &id, resource, fhir_version)
-                    .await?;
-                Ok(BundleEntryResult::ok(stored))
-            }
-            BundleMethod::Delete => {
-                let (resource_type, id) = self.parse_url(&entry.url)?;
-
-                // As above: `ifMatch` on DELETE was ignored here entirely.
-                if entry.if_match.is_some() {
-                    // A deleted resource has no current representation, so
-                    // `Gone` is `None` here; real storage errors must not be
-                    // swallowed into a bogus precondition failure.
-                    let existing = match self.read(tenant, &resource_type, &id).await {
-                        Ok(v) => v,
-                        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-                        Err(e) => return Err(e),
-                    };
-                    if let Some(failure) = bundle_if_match_gate(
-                        entry.if_match.as_deref(),
-                        existing.as_ref().map(|r| r.version_id()),
-                    ) {
-                        return Ok(failure);
-                    }
-                }
-
-                match self.delete(tenant, &resource_type, &id).await {
-                    Ok(()) => Ok(BundleEntryResult::deleted()),
-                    Err(StorageError::Resource(ResourceError::NotFound { .. })) => {
-                        Ok(BundleEntryResult::deleted()) // Idempotent delete
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            BundleMethod::Patch => Ok(BundleEntryResult::error(
-                501,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "error", "code": "not-supported", "diagnostics": "PATCH not implemented"}]
-                }),
-            )),
         }
     }
 
@@ -3693,6 +3652,29 @@ impl ReindexTarget for SqliteBackend {
             content,
         )?;
 
+        // Rebuild the full-text row as well. Without this, `$reindex` was a
+        // *destructive* operation for `_text`/`_content`: `run_reindex` deletes
+        // each resource's search entries via `delete_search_entries` ->
+        // `delete_search_index`, which does drop the FTS row, and nothing here
+        // put it back. That happened on every reindex, with or without
+        // `clear_existing`, so the documented recovery operation silently
+        // disabled full-text search until each resource was next written.
+        //
+        // Not counted in `count`: that value is the number of `search_index`
+        // entries, which `$reindex-status` reports, and an FTS row is not one.
+        //
+        // Safe against duplicates because `run_reindex` always calls
+        // `delete_search_entries` for the resource immediately before this, and
+        // SQLite's `index_fts_content` is a bare INSERT with no delete-first.
+        // If that ordering ever changes, this must become delete-then-insert.
+        self.index_fts_content(
+            &conn,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            resource_id,
+            content,
+        )?;
+
         Ok(count)
     }
 
@@ -3706,6 +3688,19 @@ impl ReindexTarget for SqliteBackend {
                 params![tenant_id],
             )
             .or_query_error("Failed to clear search index")?;
+
+        // Clear the full-text rows too, matching PostgreSQL. This is only sound
+        // because `write_search_entries` above now repopulates them; adding this
+        // delete on its own would have made `$reindex --clear-existing` wipe
+        // `_text`/`_content` permanently.
+        //
+        // The returned count deliberately stays the `search_index` total —
+        // callers and tests treat it as the number of index entries cleared.
+        purge_fts_rows(
+            &conn,
+            "DELETE FROM resource_fts WHERE tenant_id = ?1",
+            params![tenant_id],
+        )?;
 
         Ok(deleted as u64)
     }
@@ -6174,46 +6169,13 @@ mod tests {
     // BundleProvider Tests
     // ========================================================================
 
-    #[tokio::test]
-    async fn test_batch_create_multiple() {
-        use crate::core::transaction::BundleProvider;
-
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-
-        let entries = vec![
-            BundleEntry {
-                method: BundleMethod::Post,
-                url: "Patient".to_string(),
-                resource: Some(json!({"resourceType": "Patient", "id": "batch-p1"})),
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                full_url: None,
-            },
-            BundleEntry {
-                method: BundleMethod::Post,
-                url: "Patient".to_string(),
-                resource: Some(json!({"resourceType": "Patient", "id": "batch-p2"})),
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                full_url: None,
-            },
-        ];
-
-        let result = backend
-            .process_batch(&tenant, entries, helios_fhir::FhirVersion::default())
-            .await
-            .unwrap();
-
-        assert_eq!(result.entries.len(), 2);
-        assert_eq!(result.entries[0].status, 201);
-        assert_eq!(result.entries[1].status, 201);
-    }
-
     /// #350: bundle-created resources must be stamped with the bundle's
     /// negotiated version, not the compile-time default.
+    ///
+    /// This covers the transaction arm only. The batch arm is executed by the
+    /// REST layer, and its half of #350 is pinned by
+    /// `batch_entries_stamp_the_configured_default` in
+    /// `helios-rest/tests/default_version_fallback.rs`.
     #[cfg(feature = "R5")]
     #[tokio::test]
     async fn test_bundle_writes_stamp_the_negotiated_version() {
@@ -6238,131 +6200,16 @@ mod tests {
             .unwrap();
         assert_eq!(tx_result.entries[0].status, 201);
 
-        let batch_result = backend
-            .process_batch(
-                &tenant,
-                vec![entry("batch-r5")],
-                helios_fhir::FhirVersion::R5,
-            )
+        let stored = backend
+            .read(&tenant, "Patient", "tx-r5")
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(batch_result.entries[0].status, 201);
-
-        for id in ["tx-r5", "batch-r5"] {
-            let stored = backend.read(&tenant, "Patient", id).await.unwrap().unwrap();
-            assert_eq!(
-                stored.fhir_version(),
-                helios_fhir::FhirVersion::R5,
-                "{id} should be stamped R5"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_batch_mixed_operations() {
-        use crate::core::transaction::BundleProvider;
-
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-
-        // Create a resource first
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "existing"}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        let entries = vec![
-            // Read existing
-            BundleEntry {
-                method: BundleMethod::Get,
-                url: "Patient/existing".to_string(),
-                resource: None,
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                full_url: None,
-            },
-            // Create new
-            BundleEntry {
-                method: BundleMethod::Post,
-                url: "Patient".to_string(),
-                resource: Some(json!({"resourceType": "Patient", "id": "new"})),
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                full_url: None,
-            },
-            // Read nonexistent
-            BundleEntry {
-                method: BundleMethod::Get,
-                url: "Patient/nonexistent".to_string(),
-                resource: None,
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                full_url: None,
-            },
-        ];
-
-        let result = backend
-            .process_batch(&tenant, entries, helios_fhir::FhirVersion::default())
-            .await
-            .unwrap();
-
-        assert_eq!(result.entries.len(), 3);
-        assert_eq!(result.entries[0].status, 200); // Read existing
-        assert_eq!(result.entries[1].status, 201); // Create new
-        assert_eq!(result.entries[2].status, 404); // Read nonexistent
-    }
-
-    #[tokio::test]
-    async fn test_batch_delete() {
-        use crate::core::transaction::BundleProvider;
-
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-
-        // Create a resource
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "to-delete"}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        let entries = vec![BundleEntry {
-            method: BundleMethod::Delete,
-            url: "Patient/to-delete".to_string(),
-            resource: None,
-            if_match: None,
-            if_none_match: None,
-            if_none_exist: None,
-            full_url: None,
-        }];
-
-        let result = backend
-            .process_batch(&tenant, entries, helios_fhir::FhirVersion::default())
-            .await
-            .unwrap();
-
-        assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.entries[0].status, 204);
-
-        // Verify deletion (read returns Gone error or None)
-        let read_result = backend.read(&tenant, "Patient", "to-delete").await;
-        match read_result {
-            Ok(None) => {}                                                // Resource not found
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {} // Soft deleted
-            other => panic!("Expected None or Gone, got {:?}", other),
-        }
+        assert_eq!(
+            stored.fhir_version(),
+            helios_fhir::FhirVersion::R5,
+            "tx-r5 should be stamped R5"
+        );
     }
 
     #[tokio::test]

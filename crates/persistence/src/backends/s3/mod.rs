@@ -14,6 +14,7 @@ mod keyspace;
 mod models;
 mod output_store;
 mod storage;
+mod submit_worker;
 mod user_settings;
 
 pub use backend::S3Backend;

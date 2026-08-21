@@ -102,6 +102,13 @@ export class Editor {
   get addPanel(): Locator {
     return this.root.locator(".editor-add").first();
   }
+  /** Opens the add panel if it isn't already — the root picker auto-opens on
+   *  an empty document (#547), and a blind summary click would close it. */
+  async openAddPanel(): Promise<void> {
+    if ((await this.addPanel.getAttribute("open")) === null) {
+      await this.addPanel.locator("summary").first().click();
+    }
+  }
   addFilter(): Locator {
     return this.root.locator(".editor-add__filter").first();
   }

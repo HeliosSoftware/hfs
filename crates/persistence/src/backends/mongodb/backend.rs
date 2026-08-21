@@ -219,6 +219,8 @@ impl MongoBackend {
             BackendCapability::Transactions,
             BackendCapability::OptimisticLocking,
             BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::BulkSubmitRestWorker,
             BackendCapability::InDbSofRunner,
             BackendCapability::SharedSchema,
         ]

@@ -30,7 +30,7 @@ test("add-node adds a top-level field to the document", async ({ resources }) =>
   const ed = resources.modal.editor;
   expect(await ed.currentDoc()).not.toHaveProperty("gender");
 
-  await ed.addPanel.locator("summary").first().click();
+  await ed.openAddPanel();
   await ed.addFilter().fill("gender");
   await ed.addItem("gender").click();
 
@@ -55,12 +55,14 @@ test("the value[x] choice select adds the chosen variant", async ({ resources, p
   await resources.openCreate("Observation");
   const ed = resources.modal.editor;
 
-  // The value[x] choice select lives inside a collapsed add-node <details>;
-  // open it first, then pick a concrete arm.
+  // The value[x] choice select lives inside the add-node <details>, which
+  // auto-opens on an empty document (#547) -- open it only when closed.
   const panel = ed.root.locator(".editor-add", {
     has: page.locator("select[data-declarer='value']"),
   });
-  await panel.locator("summary").click();
+  if ((await panel.getAttribute("open")) === null) {
+    await panel.locator("summary").click();
+  }
   const choose = panel.locator("select[data-declarer='value']");
   const arms = await choose.locator("option").allInnerTexts();
   const arm = arms.find((a) => /string/i.test(a)) ?? arms[1];
@@ -76,7 +78,7 @@ test("an ad-hoc extension can be attached by URL", async ({ resources }) => {
   await resources.openCreate();
   const ed = resources.modal.editor;
 
-  await ed.addPanel.locator("summary").first().click();
+  await ed.openAddPanel();
   const ext = ed.root.locator(".editor-add__ext").first();
   await ext.locator(".editor-add__ext-url").fill("http://example.org/fhir/StructureDefinition/e2e");
   // The ad-hoc button is the plain .btn; profiled-extension entries carry

@@ -1037,7 +1037,12 @@ impl ResourceStorage for CompositeStorage {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
-        crate::tenant::ensure_mutable_tenant(id)?;
+        // Checked here as well as in the primary (issue #385). The composite is
+        // what a search-backed deployment actually calls, and its secondaries —
+        // Elasticsearch above all — derive index names from the tenant id. The
+        // primary's own check would still catch this, but only after the
+        // composite had already accepted the id as legitimate.
+        self.ensure_canonical_tenant_id(id)?;
         self.primary.register_tenant(id, display_name).await
     }
 
@@ -1678,6 +1683,21 @@ impl SystemHistoryProvider for CompositeStorage {
 
 #[async_trait]
 impl BundleProvider for CompositeStorage {
+    /// Delegated to the primary, never assumed.
+    ///
+    /// A composite is exactly as atomic as the backend holding the resources —
+    /// `sqlite-elasticsearch` is atomic, `s3-elasticsearch` is not. Answering
+    /// `true` unconditionally is what let an `s3-elasticsearch` deployment
+    /// advertise transaction support it could not honour (#489).
+    ///
+    /// Absent a bundle provider there is nothing to delegate to, so the answer
+    /// is `false` — `process_transaction` fails on the same condition below.
+    fn supports_atomic_transactions(&self) -> bool {
+        self.bundle_provider
+            .as_ref()
+            .is_some_and(|p| p.supports_atomic_transactions())
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
@@ -1697,30 +1717,6 @@ impl BundleProvider for CompositeStorage {
             .await?;
 
         // Sync successful entries to secondaries by reading resources from primary
-        self.sync_bundle_results(tenant, &result, fhir_version)
-            .await;
-
-        Ok(result)
-    }
-
-    async fn process_batch(
-        &self,
-        tenant: &TenantContext,
-        entries: Vec<BundleEntry>,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleResult> {
-        let provider = self.bundle_provider.as_ref().ok_or_else(|| {
-            StorageError::Backend(BackendError::UnsupportedCapability {
-                backend_name: "composite".to_string(),
-                capability: "BundleProvider".to_string(),
-            })
-        })?;
-
-        let result = provider
-            .process_batch(tenant, entries, fhir_version)
-            .await?;
-
-        // Sync successful entries to secondaries
         self.sync_bundle_results(tenant, &result, fhir_version)
             .await;
 
@@ -2254,7 +2250,14 @@ impl CapabilityProvider for CompositeStorage {
         let resource_caps = HashMap::new();
 
         let mut system_interactions = HashSet::new();
-        system_interactions.insert(crate::core::SystemInteraction::Transaction);
+        // Advertise `transaction` only when the primary can actually honour it.
+        // This was inserted unconditionally, so an `s3-elasticsearch`
+        // deployment published transaction support in its CapabilityStatement
+        // while the S3 primary had no way to roll back (#489). `batch` is
+        // unconditional — every bundle provider can do independent entries.
+        if self.supports_atomic_transactions() {
+            system_interactions.insert(crate::core::SystemInteraction::Transaction);
+        }
         system_interactions.insert(crate::core::SystemInteraction::Batch);
         system_interactions.insert(crate::core::SystemInteraction::SearchSystem);
         system_interactions.insert(crate::core::SystemInteraction::HistorySystem);
@@ -3680,23 +3683,6 @@ mod tests {
         match result.unwrap_err() {
             StorageError::Backend(BackendError::UnsupportedCapability { capability, .. }) => {
                 assert!(capability.contains("InstanceHistoryProvider"));
-            }
-            other => panic!("unexpected error: {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_bundle_provider_process_batch_no_capability() {
-        use crate::core::BundleProvider;
-        let composite = make_composite_no_secondary();
-        let tenant = make_tenant();
-        let result = composite
-            .process_batch(&tenant, vec![], helios_fhir::FhirVersion::default())
-            .await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            StorageError::Backend(BackendError::UnsupportedCapability { capability, .. }) => {
-                assert!(capability.contains("BundleProvider"));
             }
             other => panic!("unexpected error: {:?}", other),
         }

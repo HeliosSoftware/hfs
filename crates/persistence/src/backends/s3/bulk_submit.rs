@@ -61,9 +61,16 @@ impl BulkSubmitProvider for S3Backend {
         let state = SubmissionState {
             summary: summary.clone(),
             abort_reason: None,
+            owner_subject: None,
+            request_url: None,
+            requires_access_token: None,
+            poll_token: None,
+            transaction_time: None,
         };
 
         self.save_submission_state(&location, id, &state).await?;
+        self.touch_submit_registry(tenant, id, summary.status)
+            .await?;
         Ok(summary)
     }
 
@@ -145,6 +152,8 @@ impl BulkSubmitProvider for S3Backend {
         state.summary.completed_at = Some(now);
 
         self.save_submission_state(&location, id, &state).await?;
+        self.touch_submit_registry(tenant, id, state.summary.status)
+            .await?;
         Ok(state.summary)
     }
 
@@ -171,8 +180,14 @@ impl BulkSubmitProvider for S3Backend {
                 ManifestStatus::Pending | ManifestStatus::Processing
             ) {
                 pending_count += 1;
+                let manifest_id = manifest.manifest.manifest_id.clone();
                 manifest.manifest.status = ManifestStatus::Failed;
+                manifest.worker_id = None;
+                manifest.lease_expiry = None;
                 self.save_manifest_state(&location, id, &manifest).await?;
+                // An aborted submission's manifests must leave the claim queue,
+                // or a worker keeps picking up work the submitter cancelled.
+                self.dequeue_manifest(tenant, id, &manifest_id).await?;
             }
         }
 
@@ -183,6 +198,8 @@ impl BulkSubmitProvider for S3Backend {
         state.abort_reason = Some(reason.to_string());
 
         self.save_submission_state(&location, id, &state).await?;
+        self.touch_submit_registry(tenant, id, state.summary.status)
+            .await?;
         Ok(pending_count)
     }
 
@@ -228,15 +245,23 @@ impl BulkSubmitProvider for S3Backend {
         self.save_manifest_state(
             &location,
             submission_id,
-            &SubmissionManifestState {
-                manifest: manifest.clone(),
-            },
+            &SubmissionManifestState::new(manifest.clone()),
         )
         .await?;
+
+        // A manifest with somewhere to fetch from is work for the REST worker;
+        // one without (a status-only kickoff) is not. This is the same predicate
+        // the SQL job stores put in their claim query's `WHERE`.
+        if manifest.manifest_url.is_some() {
+            self.enqueue_manifest(tenant, submission_id, &manifest)
+                .await?;
+        }
 
         submission.summary.manifest_count += 1;
         submission.summary.updated_at = Utc::now();
         self.save_submission_state(&location, submission_id, &submission)
+            .await?;
+        self.touch_submit_registry(tenant, submission_id, submission.summary.status)
             .await?;
 
         Ok(manifest)
@@ -317,6 +342,7 @@ impl BulkSubmitProvider for S3Backend {
 
         let mut results = Vec::new();
         let mut error_count = 0u32;
+        let file_url = options.file_url.as_deref();
 
         for entry in entries {
             if options.max_errors > 0 && error_count >= options.max_errors {
@@ -334,13 +360,19 @@ impl BulkSubmitProvider for S3Backend {
                     &entry.resource_type,
                     "max errors exceeded",
                 );
-                self.persist_entry_result(&location, submission_id, manifest_id, &skipped)
-                    .await?;
+                self.persist_entry_result(
+                    &location,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    &skipped,
+                )
+                .await?;
                 results.push(skipped);
                 continue;
             }
 
-            self.persist_raw_entry(&location, submission_id, manifest_id, &entry)
+            self.persist_raw_entry(&location, submission_id, manifest_id, file_url, &entry)
                 .await?;
 
             let result = match self
@@ -359,7 +391,7 @@ impl BulkSubmitProvider for S3Backend {
                 error_count += 1;
             }
 
-            self.persist_entry_result(&location, submission_id, manifest_id, &result)
+            self.persist_entry_result(&location, submission_id, manifest_id, file_url, &result)
                 .await?;
             results.push(result);
         }
@@ -374,11 +406,17 @@ impl BulkSubmitProvider for S3Backend {
         manifest_state.manifest.total_entries += results.len() as u64;
         manifest_state.manifest.processed_entries += results.len() as u64;
         manifest_state.manifest.failed_entries += failed_count;
-        manifest_state.manifest.status = if failed_count > 0 {
-            ManifestStatus::Failed
-        } else {
-            ManifestStatus::Completed
-        };
+        // A leased manifest's terminal status belongs to the worker, which calls
+        // this once per manifest output file and only then decides. Settling it
+        // here would take the manifest out of `processing` mid-run, so a worker
+        // that died on the next file would never be reclaimed.
+        if manifest_state.worker_id.is_none() {
+            manifest_state.manifest.status = if failed_count > 0 {
+                ManifestStatus::Failed
+            } else {
+                ManifestStatus::Completed
+            };
+        }
 
         self.save_manifest_state(&location, submission_id, &manifest_state)
             .await?;
@@ -389,6 +427,8 @@ impl BulkSubmitProvider for S3Backend {
         submission.summary.skipped_count += skipped_count;
         submission.summary.updated_at = Utc::now();
         self.save_submission_state(&location, submission_id, &submission)
+            .await?;
+        self.touch_submit_registry(tenant, submission_id, submission.summary.status)
             .await?;
 
         Ok(results)
@@ -747,19 +787,23 @@ impl S3Backend {
 
     /// Archives the raw NDJSON payload for a single entry to S3.
     ///
-    /// Stored under `raw/<manifest>/<line>.ndjson` so that the original data
-    /// is preserved for auditing after ingestion.
+    /// Stored under `raw/<manifest>/<file>/<line>.ndjson` so that the original
+    /// data is preserved for auditing after ingestion. `file_url` is the
+    /// manifest output file the line came from, and is required for the same
+    /// reason it is on [`Self::persist_entry_result`].
     async fn persist_raw_entry(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,
         manifest_id: &str,
+        file_url: Option<&str>,
         entry: &NdjsonEntry,
     ) -> StorageResult<()> {
         let key = location.keyspace.submit_raw_line_key(
             &submission_id.submitter,
             &submission_id.submission_id,
             manifest_id,
+            file_url,
             entry.line_number,
         );
 
@@ -783,17 +827,25 @@ impl S3Backend {
     }
 
     /// Persists the processing result for a single entry to S3.
+    ///
+    /// `file_url` is the manifest output file the line came from. It is part of
+    /// the key because line numbers restart in every file, so without it the
+    /// results of a multi-file manifest overwrite each other — the S3 shape of
+    /// issue #457, silent here because a `PutObject` has no primary key to
+    /// violate.
     async fn persist_entry_result(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,
         manifest_id: &str,
+        file_url: Option<&str>,
         result: &BulkEntryResult,
     ) -> StorageResult<()> {
         let key = location.keyspace.submit_result_line_key(
             &submission_id.submitter,
             &submission_id.submission_id,
             manifest_id,
+            file_url,
             result.line_number,
         );
         let payload = self.serialize_json(result)?;
@@ -950,7 +1002,7 @@ impl S3Backend {
     }
 
     /// Lists all manifest state objects for a submission.
-    async fn list_manifest_states(
+    pub(super) async fn list_manifest_states(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,

@@ -737,11 +737,25 @@ pub trait ResourceStorage: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// How many concurrent `create` calls this backend absorbs well during bulk
-    /// writes (e.g. conformance seeding). Latency-bound backends — object
-    /// stores, networked databases — override this so a ~1.4k-resource seed is
+    /// How many concurrent storage calls this backend absorbs well when a
+    /// caller fans out over a collection of resources. Latency-bound backends —
+    /// object stores, networked databases — override this so a large fan-out is
     /// bounded by round trips divided by this factor rather than their sum. The
     /// default of 1 keeps single-writer backends (SQLite) strictly sequential.
+    ///
+    /// Two callers rely on this, and both are request- or startup-scoped rather
+    /// than global:
+    ///
+    /// - conformance seeding ([`crate::search::seeder`]), a ~1.4k-resource
+    ///   startup write;
+    /// - `batch` Bundle entries (`helios_rest::handlers::batch`), where the
+    ///   fan-out is caller-controlled and must finish inside the HTTP request
+    ///   timeout.
+    ///
+    /// Consumers must clamp: a bound of 0 never polls anything, and no backend
+    /// should be trusted to bound request-scoped traffic on its own. The batch
+    /// caller additionally caps this with `HFS_BATCH_MAX_CONCURRENCY`, so the
+    /// number returned here is a tolerance an operator may lower, never a floor.
     fn bulk_write_concurrency(&self) -> usize {
         1
     }
@@ -778,21 +792,49 @@ pub trait ResourceStorage: Send + Sync {
         Ok(None)
     }
 
+    /// Rejects a tenant id that does not satisfy the canonical definition.
+    ///
+    /// Every implementation of [`register_tenant`](Self::register_tenant) calls
+    /// this first. It is a **backstop**, not the primary control: ids are
+    /// validated at each REST ingress (header, URL prefix, JWT claim, admin
+    /// body). Its job is to make the storage-layer precondition documented in
+    /// [`crate::tenant`] true by construction, so a future ingress — or an
+    /// embedder using this crate directly — cannot mint a tenant that skipped
+    /// validation. Issue #385.
+    ///
+    /// Deliberately **not** applied to `deregister_tenant`, `purge_tenant_data`,
+    /// or any read path. Those are how an operator cleans up a non-canonical
+    /// tenant that predates this validator; rejecting there would make bad data
+    /// permanently undeletable. Only the mint point is guarded.
+    fn ensure_canonical_tenant_id(&self, id: &str) -> StorageResult<()> {
+        crate::tenant::TenantId::parse(id).map(|_| ()).map_err(|e| {
+            StorageError::Tenant(crate::error::TenantError::NonCanonicalTenantId {
+                tenant_id: id.to_string(),
+                reason: e,
+            })
+        })
+    }
+
     /// Registers (provisions) a new tenant, stamping `created_at` with the
     /// current time. Returns [`StorageError`] if the tenant is already
     /// registered. Default: unsupported-capability error.
     ///
     /// # Implementor contract
     ///
-    /// This method, [`deregister_tenant`](Self::deregister_tenant) and
-    /// [`purge_tenant_data`](Self::purge_tenant_data) take a bare `&str` and
-    /// mutate or destroy tenant state, so an override **must** begin with
-    /// [`ensure_mutable_tenant`](crate::tenant::ensure_mutable_tenant) to refuse
-    /// reserved ids. `__system__` holds the AuditEvent trail and shared
-    /// terminology; a purge of it is an anti-forensic primitive (issue #317).
-    /// The REST ingress rejects reserved ids first, but this family is reachable
-    /// from more than one handler, so the guard is the backstop rather than the
-    /// only control.
+    /// An override **must** begin with
+    /// [`ensure_canonical_tenant_id`](Self::ensure_canonical_tenant_id) before
+    /// writing anything. That check runs the full [`TenantId::parse`]
+    /// (issue #385), whose per-segment reserved check also refuses the
+    /// reserved ids of issue #317 — `__system__` holds the AuditEvent trail and
+    /// shared terminology, and provisioning over it is the first step of an
+    /// anti-forensic primitive. [`deregister_tenant`](Self::deregister_tenant)
+    /// and [`purge_tenant_data`](Self::purge_tenant_data) take the same bare
+    /// `&str` but guard with
+    /// [`ensure_mutable_tenant`](crate::tenant::ensure_mutable_tenant) instead,
+    /// because they must stay able to act on a non-canonical id that predates
+    /// the validator. The REST ingress rejects reserved ids first, but this
+    /// family is reachable from more than one handler, so these guards are the
+    /// backstop rather than the only control.
     async fn register_tenant(
         &self,
         _id: &str,

@@ -40,6 +40,11 @@ const PAGE_PARAM: &str = "page";
 
 /// The code system for the `submissionStatus` Coding (per the IG).
 const SUBMISSION_STATUS_SYSTEM: &str = "http://hl7.org/fhir/event-status";
+/// The pre-STU4 draft's status system, still sent by providers tracking the
+/// older spec (the SMART reference provider among them). Accepted leniently;
+/// its `complete`/`aborted` codes map onto `completed`/`stopped`.
+const LEGACY_SUBMISSION_STATUS_SYSTEM: &str =
+    "http://hl7.org/fhir/uv/bulkdata/ValueSet/submission-status";
 
 fn not_implemented() -> RestError {
     RestError::NotImplemented {
@@ -259,7 +264,9 @@ fn parse_submit_request(body: &Value) -> RestResult<SubmitRequest> {
                 // Bulk Data submission-status system.
                 if let Some(coding) = p.get("valueCoding") {
                     if let Some(system) = coding.get("system").and_then(|v| v.as_str()) {
-                        if system != SUBMISSION_STATUS_SYSTEM {
+                        if system != SUBMISSION_STATUS_SYSTEM
+                            && system != LEGACY_SUBMISSION_STATUS_SYSTEM
+                        {
                             return Err(bad_request(format!(
                                 "submissionStatus.system must be '{SUBMISSION_STATUS_SYSTEM}', got '{system}'"
                             )));
@@ -273,7 +280,13 @@ fn parse_submit_request(body: &Value) -> RestResult<SubmitRequest> {
                     .map(String::from)
                     .or_else(|| scalar(p));
                 if let Some(code) = code {
-                    req.submission_status = code;
+                    // Providers tracking the pre-STU4 draft (the SMART
+                    // reference among them) code these two differently.
+                    req.submission_status = match code.as_str() {
+                        "complete" => "completed".to_string(),
+                        "aborted" => "stopped".to_string(),
+                        _ => code,
+                    };
                 }
             }
             "manifestUrl" => req.manifest_url = scalar(p),
@@ -1083,6 +1096,40 @@ mod tests {
         assert_eq!(req.submission_id, "sub-1");
         assert_eq!(req.submitter_key(), "http://ehr|ehr-1");
         assert_eq!(req.submission_status, "in-progress");
+    }
+
+    /// Providers on the pre-STU4 draft (the SMART reference among them) code
+    /// the status against the old ValueSet URL with `complete`/`aborted`.
+    /// Both are accepted and normalized onto the spec vocabulary.
+    #[test]
+    fn test_parse_legacy_status_vocabulary() {
+        for (legacy, normalized) in [("complete", "completed"), ("aborted", "stopped")] {
+            let body = json!({
+                "resourceType": "Parameters",
+                "parameter": [
+                    param("submitter", "valueIdentifier", json!({"system": "http://ehr", "value": "ehr-1"})),
+                    param("submissionId", "valueString", json!("sub-1")),
+                    param("submissionStatus", "valueCoding", json!({
+                        "system": LEGACY_SUBMISSION_STATUS_SYSTEM,
+                        "code": legacy
+                    })),
+                ]
+            });
+            let req = parse_submit_request(&body).expect("legacy accepted");
+            assert_eq!(req.submission_status, normalized);
+        }
+        // An unknown system is still rejected.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                param("submitter", "valueIdentifier", json!({"system": "http://ehr", "value": "ehr-1"})),
+                param("submissionId", "valueString", json!("sub-1")),
+                param("submissionStatus", "valueCoding", json!({
+                    "system": "http://example.org/other", "code": "completed"
+                })),
+            ]
+        });
+        assert!(parse_submit_request(&body).is_err());
     }
 
     #[test]

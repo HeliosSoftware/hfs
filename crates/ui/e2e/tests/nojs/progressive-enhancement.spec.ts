@@ -12,6 +12,23 @@ test("the landing page renders server-side with no JavaScript", async ({ page, c
   await expect(chrome.sidebar).toBeVisible();
 });
 
+test("the sidebar brand is an accessible native Home link", async ({ page }) => {
+  await page.goto("/ui/resources");
+  const brand = page.locator("a.brand");
+  const name = /^Helios FHIR Server hfs v.+ — Home$/;
+
+  await expect(brand).toHaveAttribute("href", "/ui");
+  await expect(brand).not.toHaveAttribute("aria-current", "page");
+  await expect(brand).toHaveAccessibleName(name);
+  await expect(brand.locator("img")).toHaveAttribute("alt", "");
+
+  await brand.focus();
+  await expect(brand).toHaveAccessibleName(name);
+  await brand.press("Enter");
+  await expect(page).toHaveURL(/\/ui$/);
+  await expect(page.locator("h1.page-head__title")).toHaveText("Home");
+});
+
 test("the language switcher works as plain links (en → es → de)", async ({ page, chrome }) => {
   await page.goto("/ui");
   await expect(chrome.langLink("es")).toHaveAttribute("href", /lang=es/);
@@ -42,7 +59,7 @@ for (const { href, url } of NAV) {
     await expect(link).toBeVisible();
     await link.click();
     await expect(page).toHaveURL(url);
-    await expect(page.locator("h1.page-head__title, h1.page-title")).toBeVisible();
+    await expect(page.locator("h1.page-head__title, h1.page-head__title")).toBeVisible();
   });
 }
 

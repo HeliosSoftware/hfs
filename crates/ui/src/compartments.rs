@@ -99,8 +99,12 @@ impl CompartmentCatalog {
         defs.sort_by(|a, b| a.code.cmp(&b.code));
         let built = Arc::new(defs);
         // A failed fetch is served empty for this request only — caching it
-        // would pin the page to the failure until restart.
-        if !fetch_ok {
+        // would pin the page to the failure until restart. An *empty success*
+        // is treated the same (#462): the server seeds the spec definitions
+        // at startup, so emptiness means the search path hasn't caught up
+        // (a composite backend's index still syncing), and caching it would
+        // keep the page broken long after the sync lands.
+        if !fetch_ok || built.is_empty() {
             return built;
         }
         self.cache
@@ -122,8 +126,11 @@ impl CompartmentCatalog {
     }
 
     /// Every resource type of the version, from the first CompartmentDefinition
-    /// (each enumerates the full set — 145 in R4). Used by the queries page's
-    /// resource picker rail.
+    /// (each enumerates the full set — 145 in R4, 157 in R5). Used by the
+    /// resource pickers on the Search, Queries, Resources, and Bulk Export
+    /// pages, which pass the sidebar's selected version (#562). For versions
+    /// other than the server's seeded default the definitions come from the
+    /// shipped spec bundles, not storage — see [`crate::conformance`].
     pub async fn resource_type_names(&self, tenant: &str, version: FhirVersion) -> Vec<String> {
         self.definitions(tenant, version)
             .await
@@ -543,6 +550,44 @@ mod tests {
 
     #[cfg(feature = "R4")]
     const R4: FhirVersion = FhirVersion::R4;
+
+    /// A source whose first fetch is empty and later fetches carry data, the
+    /// way a composite backend behaves while its search index still syncs.
+    struct WarmingSource(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ConformanceSource for WarmingSource {
+        async fn fetch(
+            &self,
+            _rt: &str,
+            _v: FhirVersion,
+            _t: &str,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![serde_json::json!({
+                "resourceType": "CompartmentDefinition",
+                "url": "http://example.org/CompartmentDefinition/patient",
+                "status": "active",
+                "code": "Patient",
+                "search": true,
+                "resource": []
+            })])
+        }
+    }
+
+    /// #462: an empty success must not be cached — the next request retries
+    /// and sees the definitions once the backend's index catches up.
+    #[tokio::test]
+    async fn empty_definitions_are_not_pinned() {
+        let catalog = CompartmentCatalog::new(Arc::new(WarmingSource(0.into())));
+        let cold = catalog.definitions("t", FhirVersion::default()).await;
+        assert!(cold.is_empty(), "first fetch is empty");
+        let warm = catalog.definitions("t", FhirVersion::default()).await;
+        assert_eq!(warm.len(), 1, "second request re-fetched");
+    }
 
     /// The R4 compartment definitions, parsed from the shipped `data/` bundle
     /// exactly as an HTTP fetch would deliver them — keeps the test offline.

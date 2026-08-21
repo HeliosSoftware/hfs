@@ -1510,7 +1510,11 @@ impl ResourceStorage for MongoBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
-        crate::tenant::ensure_mutable_tenant(id)?;
+        // Backstop for the canonical tenant-id contract (issue #385). MongoDB
+        // matches `tenant_id` as an exact BSON string under the default
+        // (case-sensitive) collation, so it has no derivation to protect — this
+        // keeps the precondition uniform across every implementation.
+        self.ensure_canonical_tenant_id(id)?;
         let db = self.get_database().await?;
         let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
         // RFC 3339 string, matching the SQLite registry's `created_at` format so
@@ -2517,6 +2521,18 @@ impl SystemHistoryProvider for MongoBackend {
 
 #[async_trait]
 impl BundleProvider for MongoBackend {
+    /// MongoDB bundles run inside a server-side session transaction
+    /// (`begin_required_bundle_transaction_session` … `commit_transaction`),
+    /// so the server unwinds on abort or on a dropped session — including the
+    /// cancellation case that defeats an in-process compensation log.
+    ///
+    /// Requires a replica set; `begin_required_bundle_transaction_session`
+    /// fails the bundle when transactions are unavailable rather than silently
+    /// degrading to non-atomic writes.
+    fn supports_atomic_transactions(&self) -> bool {
+        true
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
@@ -2611,18 +2627,6 @@ impl BundleProvider for MongoBackend {
             bundle_type: BundleType::Transaction,
             entries: results,
         })
-    }
-
-    async fn process_batch(
-        &self,
-        _tenant: &TenantContext,
-        _entries: Vec<BundleEntry>,
-        _fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleResult> {
-        Err(StorageError::Backend(BackendError::UnsupportedCapability {
-            backend_name: "mongodb".to_string(),
-            capability: "BundleProvider".to_string(),
-        }))
     }
 }
 

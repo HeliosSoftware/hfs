@@ -1,5 +1,5 @@
 import { test, expect } from "../pages/fixtures";
-import { createResource } from "../pages/api";
+import { createResource, waitSearchable } from "../pages/api";
 
 // The Resources workspace beyond the edit flows: the type rail (filter + live
 // counts), the modal's open/close/tab surface, the delete flow, and the promise
@@ -58,6 +58,7 @@ test("the modal closes via the X and via Escape", async ({ resources }) => {
 
 test("a created resource can be deleted from its modal", async ({ resources, page, request }) => {
   const id = await createResource(request, "Patient", { name: [{ family: "ToDelete" }] });
+  await waitSearchable(request, "Patient", id);
 
   // Open it in the modal by searching for it and clicking the result row.
   await resources.goto("Patient");
@@ -77,4 +78,38 @@ test("a created resource can be deleted from its modal", async ({ resources, pag
     headers: { Accept: "application/fhir+json" },
   });
   expect(res.status()).toBe(410);
+});
+
+test("the dialog stays put across tab switches and status messages", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "Anchored" }] });
+  await waitSearchable(request, "Patient", id);
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await page.locator("#query-results-body a.url").first().click();
+  await resources.modal.waitOpen();
+
+  // The dialog occupies a fixed rectangle (#607): switching panes or a
+  // status message appearing changes what is inside, never where it sits.
+  const head = page.locator(".modal__head");
+  const before = await head.boundingBox();
+  if (!before) throw new Error("modal header has no box");
+
+  await page.locator('[data-modal-tab="history"]').click();
+  await expect(page.locator('[data-modal-pane="history"]')).toBeVisible();
+  const onHistory = await head.boundingBox();
+  expect(onHistory?.y).toBe(before.y);
+  expect(onHistory?.height).toBe(before.height);
+
+  await page.locator('[data-modal-tab="edit"]').click();
+  await expect(page.locator('[data-modal-pane="edit"]')).toBeVisible();
+
+  await page.click("#resource-save");
+  await expect(page.locator("#resource-modal-status")).not.toBeEmpty();
+  const withStatus = await head.boundingBox();
+  expect(withStatus?.y).toBe(before.y);
 });

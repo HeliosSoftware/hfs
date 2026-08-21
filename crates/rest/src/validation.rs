@@ -164,6 +164,7 @@ impl ValidationService {
             profiles,
             use_meta_profiles: self.use_meta_profiles,
             unknown_profile: self.unknown_profile,
+            ..Default::default()
         };
         let handlers = EffectHandlers {
             constraints: self
@@ -411,6 +412,9 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
             IssueType::Value
         }
         ErrorKind::FhirpathConstraint => IssueType::Invariant,
+        // A known extension outside its declared context (#615): invalid
+        // content by placement, not a structural malformation.
+        ErrorKind::ExtensionContext => IssueType::Invalid,
         ErrorKind::TerminologyBinding => IssueType::CodeInvalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,

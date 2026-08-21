@@ -1,21 +1,28 @@
-//! `$viewdefinition-export` and `$sqlquery-export` operation handlers.
+//! `$sql-export` operation handler.
 //!
-//! Implements the SQL-on-FHIR async bulk export operations:
+//! Implements the SQL on FHIR
+//! [`$sql-export`](http://hl7.org/fhir/uv/sql-on-fhir/OperationDefinition-SQLExport.html)
+//! operation: asynchronous export of one or more subjects as a single job,
+//! following the FHIR Asynchronous Interaction Request Pattern.
 //!
 //! | Route | Method | Description |
 //! |-------|--------|-------------|
-//! | `/$viewdefinition-export`, `/ViewDefinition/$viewdefinition-export` | POST | Submit a view export job |
-//! | `/ViewDefinition/{id}/$viewdefinition-export` | POST | Submit for stored view |
-//! | `/$sqlquery-export`, `/Library/$sqlquery-export` | POST | Submit a SQL query export job |
-//! | `/Library/{id}/$sqlquery-export` | POST | Submit for stored Library |
-//! | `/export/{job-id}/status` | GET | Poll for job status / fetch manifest |
+//! | `/$sql-export` | POST | Submit an export job naming one or more subjects |
+//! | `/export/{job-id}/status` | GET | Poll for job status |
 //! | `/export/{job-id}/status` | DELETE | Cancel job |
+//! | `/export/{job-id}/result` | GET | Fetch the completion manifest |
 //! | `/export/{job-id}/{filename}` | GET | Download output file |
 //!
-//! Both operations share the status/cancel/download flow and the export
-//! output format set (`ndjson` default, `csv`, `json`, `parquet`). The `fhir`
-//! format is intentionally not offered here: per the spec's Common Operation
-//! Behavior it applies to the synchronous run operations only.
+//! The operation is invoked at the **system level** and names what it acts on
+//! through a repeating `subject` parameter, so one job may mix ViewDefinitions,
+//! SQLQuery Libraries and SQLView Libraries. That mixture is the point: every
+//! subject is computed against a single snapshot of the data, under one set of
+//! filters, so a view output and a query output can be joined on a shared key
+//! without a skew window.
+//!
+//! Output formats are bound to `ExportOutputFormatCodes` (`ndjson` default,
+//! `csv`, `json`, `parquet`). `fhir` is deliberately absent: it applies to
+//! `$sql-run` only, since an export produces flat files.
 //!
 //! ## Submit response (202)
 //!
@@ -51,16 +58,14 @@ use axum::{
 };
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::core::search::SearchProvider;
-use helios_persistence::tenant::TenantContext;
-use helios_persistence::types::{
-    SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
-};
 use helios_sof::fhir_format::accept_requires_unsupported_fhir_xml;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::references::resolve_resource_canonical_or_relative;
 use super::sqlquery::{sqlquery_err_to_rest, validate_select_only};
+use super::subject::{SubjectKind, SubjectRef, resolve_subject};
+use super::view_sources::extract_table_source_views;
 use crate::error::RestError;
 use crate::export::controller::{
     ExportTask, ExportWork, JobStatus, NamedSqlQuery, NamedView, SqlExportLimits, SqlTableSource,
@@ -68,12 +73,16 @@ use crate::export::controller::{
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
 
-/// Top-level Parameters body parameter names recognised by the operation.
+/// Top-level `Parameters` body parameter names recognised by `$sql-export`.
 /// Anything outside this list is rejected with 400 per the spec's
 /// "reject unsupported parameters" rule.
+///
+/// `_limit` is deliberately absent: it caps the rows returned to the client in
+/// an operation response, and an export delivers files rather than rows, so
+/// there is nothing for it to cap. Supplying it here is a 400.
 const ALLOWED_BODY_PARAMS: &[&str] = &[
-    "view",
-    "viewResource", // back-compat single-view form
+    "subject",
+    "context",
     "_format",
     "header",
     "patient",
@@ -88,17 +97,17 @@ const ALLOWED_BODY_PARAMS: &[&str] = &[
 /// (`csv`, `ndjson`, `parquet`, `json`); we reject anything outside this list
 /// with 400 per the spec's "reject unsupported parameters" rule rather than
 /// silently downgrading the output to NDJSON. `fhir` is deliberately absent:
-/// per the spec's Common Operation Behavior it applies to the synchronous run
-/// operations only, since a newline-delimited `Parameters` file has no
-/// established media type or consumer.
+/// per the spec's Common Operation Behavior it applies to `$sql-run` only,
+/// since an export produces flat files.
 const SUPPORTED_FORMATS: &[&str] = &["ndjson", "csv", "json", "parquet"];
 
-/// Query parameters for `$viewdefinition-export`.
+/// Query parameters for `$sql-export`.
 ///
 /// `deny_unknown_fields` enforces the spec's "reject unsupported parameters
 /// with 400 Bad Request" rule on the query string. Any parameter outside this
 /// struct (whether spec-defined-but-unsupported or simply unknown) surfaces
-/// as a serde error, which axum/serde maps to a 400 response.
+/// as a serde error, which axum/serde maps to a 400 response — including
+/// `_limit`, which the export operation does not offer.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportQueryParams {
@@ -132,17 +141,29 @@ pub struct ExportQueryParams {
 }
 
 // ============================================================================
-// Submit: POST /ViewDefinition/$viewdefinition-export
+// Submit: POST [base]/$sql-export
 // ============================================================================
 
-/// Submit an export job. Accepts:
-/// - A bare `ViewDefinition` resource (single, unnamed view), or
-/// - A FHIR `Parameters` resource with one or more `view` parameters whose
-///   `part` entries supply `name`, `viewResource`, or `viewReference`, plus
-///   optional top-level filter parameters (`_format`, `header`, `patient`,
-///   `group`, `_since`, `clientTrackingId`). Query-string values take
-///   precedence over body values for the same parameter.
-pub async fn export_view_definition_handler<S>(
+/// Submit an export job.
+///
+/// `$sql-export` is invoked at the **system level** with `POST`, since it
+/// creates a job. Each repetition of the `subject` parameter names one artifact
+/// — a ViewDefinition, a SQLQuery Library or a SQLView Library — and produces
+/// exactly one `output` entry in the manifest. Any mixture may be named in one
+/// request, and every subject is computed against a single snapshot of the
+/// data, under one set of filters.
+///
+/// Accepts:
+/// - A FHIR `Parameters` resource with one or more `subject` parameters whose
+///   `part` entries supply `name`, one of `subjectCanonical` /
+///   `subjectReference` / `subjectResource`, and optional `parameters`
+///   bindings; plus job-wide `_format`, `header`, `patient`, `group`,
+///   `_since` and `clientTrackingId`.
+/// - A bare `ViewDefinition` resource, as shorthand for a single unnamed
+///   subject.
+///
+/// Query-string values take precedence over body values for the same parameter.
+pub async fn sql_export_handler<S>(
     tenant: TenantExtractor,
     State(state): State<AppState<S>>,
     headers: HeaderMap,
@@ -162,9 +183,7 @@ where
     let body_value = body.map(|axum::Json(v)| v);
 
     if let Some(b) = body_value.as_ref() {
-        if let Some(resp) =
-            validate_unknown_body_params(b, ALLOWED_BODY_PARAMS, "$viewdefinition-export")
-        {
+        if let Some(resp) = validate_unknown_body_params(b, ALLOWED_BODY_PARAMS, "$sql-export") {
             return Ok(resp);
         }
     }
@@ -173,257 +192,99 @@ where
     }
 
     let Some(body) = body_value else {
-        return Ok(missing_view_response());
+        return Ok(missing_subject_response());
     };
-    let views = extract_views_from_body(&state, &tenant, &body).await?;
-    if views.is_empty() {
-        return Ok(missing_view_response());
+
+    let work = extract_subjects_from_body(&state, &tenant, &body).await?;
+    if work.is_empty() {
+        return Ok(missing_subject_response());
     }
 
     let inputs = merge_export_inputs(&params, Some(&body));
-
-    submit_export_job(&state, &tenant, views, inputs).await
+    submit_export_job(&state, &tenant, work, inputs).await
 }
 
-/// Submit an export job for a stored ViewDefinition.
-pub async fn export_stored_view_definition_handler<S>(
-    tenant: TenantExtractor,
-    State(state): State<AppState<S>>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
-    body: Option<axum::Json<Value>>,
-) -> Result<Response, RestError>
-where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
-{
-    if let Err(resp) = check_prefer_async(&headers) {
-        return Ok(resp);
-    }
-    // Spec scopes every input parameter (`view`, `_format`, `header`,
-    // `patient`, `group`, `_since`, `clientTrackingId`, `source`) to
-    // "system, type" — none are defined at instance level, where the
-    // ViewDefinition is identified entirely by the URL path. Reject any
-    // attempt to supply them with 400 + OperationOutcome.
-    if let Some(resp) = reject_instance_level_params(
-        raw_query.as_deref(),
-        body.as_ref(),
-        "$viewdefinition-export",
-    ) {
-        return Ok(resp);
-    }
-    // body and query are guaranteed empty of spec params at this point; we
-    // still drop the body so subsequent code doesn't peek at it by accident.
-    drop(body);
-
-    // Fetch the stored ViewDefinition
-    let stored = state
-        .storage()
-        .read(tenant.context(), "ViewDefinition", &id)
-        .await
-        .map_err(|e| RestError::InternalError {
-            message: format!("failed to read ViewDefinition: {e}"),
-        })?
-        .ok_or_else(|| RestError::NotFound {
-            resource_type: "ViewDefinition".to_string(),
-            id: id.clone(),
-        })?;
-
-    let view = stored.content().clone();
-    let view_name = view
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| id.clone());
-
-    let inputs = merge_export_inputs(&ExportQueryParams::default(), None);
-
-    submit_export_job(
-        &state,
-        &tenant,
-        vec![NamedView {
-            name: view_name,
-            view,
-        }],
-        inputs,
-    )
-    .await
-}
-
-// ============================================================================
-// Submit: POST /$sqlquery-export and /Library/$sqlquery-export
-// ============================================================================
-
-/// Top-level Parameters body parameter names recognised by
-/// `$sqlquery-export`. Anything outside this list is rejected with 400 per
-/// the spec's "reject unsupported parameters" rule.
-const SQLQUERY_ALLOWED_BODY_PARAMS: &[&str] = &[
-    "query",
-    "view",
-    "_format",
-    "header",
-    "patient",
-    "group",
-    "_since",
-    "clientTrackingId",
-    "source",
-];
-
-/// Submit a `$sqlquery-export` job (system and type level).
-///
-/// Accepts a FHIR `Parameters` resource with one or more `query` parameters
-/// whose `part` entries supply `name`, `queryReference` or `queryResource`,
-/// and optional per-query `parameters` bindings; optional `view` parameters
-/// supply ViewDefinition table sources for the Libraries' `depends-on`
-/// entries (resolved from storage when not supplied inline). Top-level filter
-/// parameters mirror `$viewdefinition-export`.
-pub async fn sqlquery_export_handler<S>(
-    tenant: TenantExtractor,
-    State(state): State<AppState<S>>,
-    headers: HeaderMap,
-    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
-    body: Option<axum::Json<Value>>,
-) -> Result<Response, RestError>
-where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
-{
-    if let Err(resp) = check_prefer_async(&headers) {
-        return Ok(resp);
-    }
-    let params = match parse_export_query(raw_query.as_deref()) {
-        Ok(p) => p,
-        Err(resp) => return Ok(resp),
-    };
-    let body_value = body.map(|axum::Json(v)| v);
-
-    if let Some(b) = body_value.as_ref() {
-        if let Some(resp) =
-            validate_unknown_body_params(b, SQLQUERY_ALLOWED_BODY_PARAMS, "$sqlquery-export")
-        {
-            return Ok(resp);
-        }
-    }
-    if let Some(resp) = reject_unsupported_source(&params, body_value.as_ref()) {
-        return Ok(resp);
-    }
-
-    let Some(body) = body_value else {
-        return Ok(missing_query_response());
-    };
-    if body.get("resourceType").and_then(|v| v.as_str()) != Some("Parameters") {
-        return Err(RestError::BadRequest {
-            message: format!(
-                "Expected Parameters, got '{}'",
-                body.get("resourceType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-            ),
-        });
-    }
-
-    let table_sources = extract_table_source_views(&state, &tenant, &body).await?;
-    let queries = extract_sql_queries_from_body(&state, &tenant, &body, &table_sources).await?;
-    if queries.is_empty() {
-        return Ok(missing_query_response());
-    }
-
-    let inputs = merge_export_inputs(&params, Some(&body));
-
-    submit_sqlquery_export_job(&state, &tenant, queries, inputs).await
-}
-
-/// Submit a `$sqlquery-export` job for a stored Library (instance level).
-///
-/// The bound Library identified by the URL path is the query source; per the
-/// spec, every input parameter is scoped to system/type level only, so any
-/// query or body parameter is rejected. `Library.parameter` declarations must
-/// all carry defaults (there is no way to supply bindings at instance level).
-pub async fn sqlquery_export_stored_handler<S>(
-    tenant: TenantExtractor,
-    State(state): State<AppState<S>>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
-    body: Option<axum::Json<Value>>,
-) -> Result<Response, RestError>
-where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
-{
-    if let Err(resp) = check_prefer_async(&headers) {
-        return Ok(resp);
-    }
-    if let Some(resp) =
-        reject_instance_level_params(raw_query.as_deref(), body.as_ref(), "$sqlquery-export")
-    {
-        return Ok(resp);
-    }
-    drop(body);
-
-    let stored = state
-        .storage()
-        .read(tenant.context(), "Library", &id)
-        .await
-        .map_err(|e| RestError::InternalError {
-            message: format!("failed to read Library: {e}"),
-        })?
-        .ok_or_else(|| RestError::NotFound {
-            resource_type: "Library".to_string(),
-            id: id.clone(),
-        })?;
-    let library_json = stored.content().clone();
-
-    let query = prepare_named_sqlquery(&state, &tenant, None, &library_json, None, &[]).await?;
-
-    let inputs = merge_export_inputs(&ExportQueryParams::default(), None);
-    submit_sqlquery_export_job(&state, &tenant, vec![query], inputs).await
-}
-
-/// 422 response for bodies that don't supply at least one valid query.
-fn missing_query_response() -> Response {
+/// 400 response for a request that names no subject. `subject` is `1..*`, and
+/// the spec is explicit that a request supplying none is rejected.
+fn missing_subject_response() -> Response {
     (
-        StatusCode::UNPROCESSABLE_ENTITY,
+        StatusCode::BAD_REQUEST,
         axum::Json(json!({
             "resourceType": "OperationOutcome",
-            "issue": [{"severity": "error", "code": "invalid",
-                "diagnostics": "at least one SQLQuery Library is required (use `query.queryResource` or `query.queryReference`)"}]
+            "issue": [{"severity": "error", "code": "required",
+                "diagnostics": "$sql-export requires at least one `subject`; each repetition \
+                                supplies one of `subjectCanonical`, `subjectReference` or \
+                                `subjectResource`",
+                "expression": ["subject"]}]
         })),
     )
         .into_response()
 }
 
-/// A ViewDefinition table source supplied via a body `view` parameter:
-/// optional friendly name plus the resolved ViewDefinition JSON. These are
-/// materialized as tables for the SQL to query against — they do not produce
-/// their own `output` entries.
-struct SuppliedTableView {
-    name: Option<String>,
-    view: Value,
-}
-
-/// Extracts and resolves the body's `view` table-source parameters.
-async fn extract_table_source_views<S>(
+/// Walks the body's repeating `subject` parameter, resolving each named
+/// artifact and sorting it into the views or queries half of the job.
+///
+/// A Library subject is fully prepared here — its dependency graph resolved and
+/// its parameter bindings applied — so the background job needs no storage
+/// access once it starts.
+async fn extract_subjects_from_body<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     body: &Value,
-) -> Result<Vec<SuppliedTableView>, RestError>
+) -> Result<ExportWork, RestError>
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
+    let mut work = ExportWork {
+        limits: SqlExportLimits {
+            max_source_rows_per_vd: state.config().sof_sqlquery_max_source_rows_per_vd,
+            max_rows: state.config().sof_sqlquery_max_rows,
+            timeout_secs: state.config().sof_sqlquery_timeout_secs,
+        },
+        ..Default::default()
+    };
+
+    let rt = body
+        .get("resourceType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Shorthand: a bare ViewDefinition body is a single unnamed subject.
+    if rt == "ViewDefinition" {
+        work.views.push(NamedView {
+            name: subject_output_name(None, body, 0),
+            view: body.clone(),
+        });
+        return Ok(work);
+    }
+
+    if rt != "Parameters" {
+        return Err(RestError::BadRequest {
+            message: format!("Expected Parameters or ViewDefinition, got '{rt}'"),
+        });
+    }
+
     let entries = body
         .get("parameter")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| RestError::BadRequest {
+            message: "Parameters.parameter must be an array".to_string(),
+        })?;
 
-    let mut out: Vec<SuppliedTableView> = Vec::new();
-    for p in &entries {
-        if p.get("name").and_then(|n| n.as_str()) != Some("view") {
+    // Supporting artifacts supplied once for the whole job, matched to
+    // dependencies by canonical URL.
+    let table_sources = extract_table_source_views(body)?;
+
+    let mut index = 0usize;
+    for p in entries {
+        if p.get("name").and_then(|n| n.as_str()) != Some("subject") {
             continue;
         }
         let parts = p.get("part").and_then(|v| v.as_array());
         let mut name: Option<String> = None;
-        let mut inline: Option<Value> = None;
-        let mut reference: Option<String> = None;
+        let mut subject_ref = SubjectRef::default();
+        let mut bindings: Option<Value> = None;
+
         if let Some(arr) = parts {
             for part in arr {
                 match part.get("name").and_then(|v| v.as_str()) {
@@ -433,128 +294,81 @@ where
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
                     }
-                    Some("viewResource") => inline = part.get("resource").cloned(),
-                    Some("viewReference") => {
-                        reference = part
+                    Some("subjectResource") => subject_ref.resource = part.get("resource").cloned(),
+                    Some("subjectCanonical") => {
+                        subject_ref.canonical = ["valueCanonical", "valueUri", "valueString"]
+                            .iter()
+                            .find_map(|k| part.get(*k).and_then(|v| v.as_str()))
+                            .map(|s| s.to_string());
+                    }
+                    Some("subjectReference") => {
+                        subject_ref.reference = part
                             .get("valueReference")
                             .and_then(|r| r.get("reference"))
                             .and_then(|v| v.as_str())
                             .or_else(|| part.get("valueString").and_then(|v| v.as_str()))
                             .map(|s| s.to_string());
                     }
+                    Some("parameters") => bindings = part.get("resource").cloned(),
                     _ => {}
                 }
             }
         }
-        let view = match (inline, reference) {
-            (Some(v), _) => v,
-            (None, Some(r)) => {
-                resolve_resource_canonical_or_relative(
-                    state,
-                    tenant.context(),
-                    "ViewDefinition",
-                    &r,
-                )
-                .await?
-            }
-            (None, None) => {
-                return Err(RestError::BadRequest {
-                    message: "each `view` parameter must supply `viewResource` or `viewReference`"
-                        .to_string(),
-                });
-            }
-        };
-        out.push(SuppliedTableView { name, view });
-    }
-    Ok(out)
-}
 
-/// Extracts the body's `query` parameters, resolving Libraries and their
-/// `depends-on` ViewDefinitions and binding `Library.parameter` values, so
-/// the background job has everything it needs without storage access.
-async fn extract_sql_queries_from_body<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    body: &Value,
-    table_sources: &[SuppliedTableView],
-) -> Result<Vec<NamedSqlQuery>, RestError>
-where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
-{
-    let entries = body
-        .get("parameter")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        let subject = resolve_subject(state, tenant.context(), &subject_ref, "$sql-export").await?;
 
-    let mut out: Vec<NamedSqlQuery> = Vec::new();
-    for p in &entries {
-        if p.get("name").and_then(|n| n.as_str()) != Some("query") {
-            continue;
+        // `parameters` binds values the subject declares. A ViewDefinition
+        // declares none, so supplying them for one is a 400.
+        if bindings.is_some() && !subject.kind.accepts_parameters() {
+            return Err(RestError::BadRequest {
+                message: format!(
+                    "subject '{}' is a ViewDefinition, which declares no parameters; \
+                     the `parameters` part requires a SQLQuery or SQLView subject",
+                    subject_output_name(name.as_deref(), &subject.resource, index)
+                ),
+            });
         }
-        let parts = p.get("part").and_then(|v| v.as_array());
-        let mut name: Option<String> = None;
-        let mut inline: Option<Value> = None;
-        let mut reference: Option<String> = None;
-        let mut bindings_resource: Option<Value> = None;
-        if let Some(arr) = parts {
-            for part in arr {
-                match part.get("name").and_then(|v| v.as_str()) {
-                    Some("name") => {
-                        name = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("queryResource") => inline = part.get("resource").cloned(),
-                    Some("queryReference") => {
-                        reference = part
-                            .get("valueReference")
-                            .and_then(|r| r.get("reference"))
-                            .and_then(|v| v.as_str())
-                            .or_else(|| part.get("valueString").and_then(|v| v.as_str()))
-                            .map(|s| s.to_string());
-                    }
-                    Some("parameters") => bindings_resource = part.get("resource").cloned(),
-                    _ => {}
-                }
+
+        let output_name = subject_output_name(name.as_deref(), &subject.resource, index);
+        match subject.kind {
+            SubjectKind::ViewDefinition => work.views.push(NamedView {
+                name: output_name,
+                view: subject.resource,
+            }),
+            SubjectKind::SqlQuery | SubjectKind::SqlView => {
+                work.queries.push(
+                    prepare_named_sqlquery(
+                        state,
+                        tenant,
+                        Some(output_name),
+                        &subject.resource,
+                        bindings.as_ref(),
+                        &table_sources,
+                    )
+                    .await?,
+                );
             }
         }
-        let library_json = match (inline, reference) {
-            (Some(_), Some(_)) => {
-                return Err(RestError::BadRequest {
-                    message: "supply at most one of `queryReference` or `queryResource` per query"
-                        .to_string(),
-                });
-            }
-            (Some(v), None) => v,
-            (None, Some(r)) => {
-                resolve_resource_canonical_or_relative(state, tenant.context(), "Library", &r)
-                    .await?
-            }
-            (None, None) => {
-                return Err(RestError::BadRequest {
-                    message:
-                        "each `query` parameter must supply `queryResource` or `queryReference`"
-                            .to_string(),
-                });
-            }
-        };
-        out.push(
-            prepare_named_sqlquery(
-                state,
-                tenant,
-                name,
-                &library_json,
-                bindings_resource.as_ref(),
-                table_sources,
-            )
-            .await?,
-        );
+        index += 1;
     }
-    Ok(out)
+
+    Ok(work)
 }
 
+/// Resolves a subject's output name: the `name` part, else the subject's own
+/// `name` element, else a server-generated identifier. Output names are unique
+/// across the job, which [`submit_export_job`] enforces.
+fn subject_output_name(explicit: Option<&str>, resource: &Value, index: usize) -> String {
+    explicit
+        .map(|s| s.to_string())
+        .or_else(|| {
+            resource
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| format!("output-{index}"))
+}
 /// Parses and validates one SQLQuery Library and packages it as a
 /// [`NamedSqlQuery`]: validates the SQL is a single SELECT, enforces the
 /// depends-on cap, resolves every `depends-on` ViewDefinition (preferring
@@ -567,7 +381,7 @@ async fn prepare_named_sqlquery<S>(
     name_hint: Option<String>,
     library_json: &Value,
     supplied_params: Option<&Value>,
-    table_sources: &[SuppliedTableView],
+    table_sources: &[Value],
 ) -> Result<NamedSqlQuery, RestError>
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
@@ -590,16 +404,11 @@ where
 
     let mut tables: Vec<SqlTableSource> = Vec::with_capacity(library.depends_on.len());
     for dep in &library.depends_on {
-        let supplied = table_sources
+        let view = match table_sources
             .iter()
-            .find(|t| t.view.get("url").and_then(|u| u.as_str()) == Some(dep.url.as_str()))
-            .or_else(|| {
-                table_sources
-                    .iter()
-                    .find(|t| t.name.as_deref() == Some(dep.label.as_str()))
-            });
-        let view = match supplied {
-            Some(t) => t.view.clone(),
+            .find(|vd| vd.get("url").and_then(|u| u.as_str()) == Some(dep.url.as_str()))
+        {
+            Some(vd) => vd.clone(),
             None => {
                 resolve_resource_canonical_or_relative(
                     state,
@@ -657,77 +466,10 @@ fn check_prefer_async(headers: &HeaderMap) -> Result<(), Response> {
         axum::Json(json!({
             "resourceType": "OperationOutcome",
             "issue": [{"severity": "error", "code": "invariant",
-                "diagnostics": "bulk export requires the `Prefer: respond-async` header per the SQL-on-FHIR v2 spec"}]
+                "diagnostics": "$sql-export requires the `Prefer: respond-async` header per the FHIR Asynchronous Interaction Request Pattern"}]
         })),
     )
         .into_response())
-}
-
-/// Returns `Some(400 response)` if the caller supplied any input parameter
-/// (in the query string or the body) at instance level. Per the spec, every
-/// input parameter — `view`, `_format`, `header`, `patient`, `group`,
-/// `_since`, `clientTrackingId`, `source` — is scoped to "system, type"
-/// only. The instance-level URL `/ViewDefinition/{id}/$viewdefinition-export`
-/// identifies the view entirely from the URL path, so any body or query
-/// parameter is unsupported.
-fn reject_instance_level_params(
-    raw_query: Option<&str>,
-    body: Option<&axum::Json<Value>>,
-    op: &str,
-) -> Option<Response> {
-    let raw = raw_query.unwrap_or("");
-    if let Some((k, _)) = url::form_urlencoded::parse(raw.as_bytes()).next() {
-        return Some(
-            (
-                StatusCode::BAD_REQUEST,
-                axum::Json(json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{
-                        "severity": "error",
-                        "code": "not-supported",
-                        "diagnostics": format!(
-                            "parameter '{k}' is not supported at the instance-level \
-                             {op} endpoint; spec scopes all input \
-                             parameters to system and type level only"
-                        )
-                    }]
-                })),
-            )
-                .into_response(),
-        );
-    }
-
-    let body_params = body
-        .as_ref()
-        .and_then(|axum::Json(v)| v.get("parameter"))
-        .and_then(|p| p.as_array());
-    if let Some(arr) = body_params {
-        if let Some(first) = arr.first() {
-            let name = first
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("(unnamed)");
-            return Some(
-                (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({
-                        "resourceType": "OperationOutcome",
-                        "issue": [{
-                            "severity": "error",
-                            "code": "not-supported",
-                            "diagnostics": format!(
-                                "body parameter '{name}' is not supported at the \
-                                 instance-level {op} endpoint; spec \
-                                 scopes all input parameters to system and type level only"
-                            )
-                        }]
-                    })),
-                )
-                    .into_response(),
-            );
-        }
-    }
-    None
 }
 
 /// Returns `Some(400 response)` if the caller supplied the spec-defined
@@ -763,24 +505,11 @@ fn reject_unsupported_source(params: &ExportQueryParams, body: Option<&Value>) -
     )
 }
 
-/// 422 response for bodies that don't supply at least one valid view.
-fn missing_view_response() -> Response {
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        axum::Json(json!({
-            "resourceType": "OperationOutcome",
-            "issue": [{"severity": "error", "code": "invalid",
-                "diagnostics": "at least one ViewDefinition is required (use `view.viewResource` or `view.viewReference`)"}]
-        })),
-    )
-        .into_response()
-}
-
-/// Common submit logic: validate every view, dispatch to controller, return 202.
+/// Validates every subject in the job, then dispatches it and returns 202.
 async fn submit_export_job<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
-    views: Vec<NamedView>,
+    work: ExportWork,
     inputs: ExportInputs,
 ) -> Result<Response, RestError>
 where
@@ -799,23 +528,31 @@ where
                     "severity": "error",
                     "code": "not-supported",
                     "diagnostics": format!(
-                        "unsupported `_format` value '{}'; supported: {}",
+                        "unsupported `_format` value '{}'; supported: {}. `fhir` applies to \
+                         $sql-run only, since an export produces flat files",
                         inputs.format,
                         SUPPORTED_FORMATS.join(", ")
-                    )
+                    ),
+                    "expression": ["_format"]
                 }]
             })),
         )
             .into_response());
     }
 
-    // Spec implies one `output` per submitted view. The completion manifest
-    // groups files by view name, so two views with the same name would
-    // silently collapse into a single `output` entry. Detect collisions at
-    // submit time and reject.
+    // Spec: "a request in which two repetitions would produce the same output
+    // name" is rejected. Clients correlate manifest entries by name, and the
+    // manifest groups files by name, so a collision would silently collapse two
+    // subjects into one `output` entry. Views and queries share one namespace
+    // because they share one manifest.
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for nv in &views {
-        if !seen.insert(nv.name.as_str()) {
+    let names = work
+        .views
+        .iter()
+        .map(|v| v.name.as_str())
+        .chain(work.queries.iter().map(|q| q.name.as_str()));
+    for name in names {
+        if !seen.insert(name) {
             return Ok((
                 StatusCode::BAD_REQUEST,
                 axum::Json(json!({
@@ -824,11 +561,11 @@ where
                         "severity": "error",
                         "code": "invalid",
                         "diagnostics": format!(
-                            "duplicate view name '{}'; each submitted view must have a unique \
-                             name (set `view.part[name=name].valueString` or \
-                             `ViewDefinition.name` to disambiguate)",
-                            nv.name
-                        )
+                            "duplicate output name '{name}'; output names are unique across the \
+                             job (set `subject.part[name=name].valueString`, or the subject's own \
+                             `name` element, to disambiguate)"
+                        ),
+                        "expression": ["subject.name"]
                     }]
                 })),
             )
@@ -836,106 +573,29 @@ where
         }
     }
 
-    // Validate that each view has a `resource` field (basic check).
-    for nv in &views {
+    // A ViewDefinition without `resource` names nothing to project.
+    for nv in &work.views {
         if nv.view.get("resource").and_then(|v| v.as_str()).is_none() {
             return Ok((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 axum::Json(json!({
                     "resourceType": "OperationOutcome",
                     "issue": [{"severity": "error", "code": "invalid",
-                        "diagnostics": format!("ViewDefinition.resource is required (view '{}')", nv.name)}]
+                        "diagnostics": format!("ViewDefinition.resource is required (subject '{}')", nv.name)}]
                 })),
             )
                 .into_response());
         }
     }
 
-    // Spec SHOULD: if patient/group references don't resolve, return an
-    // OperationOutcome with details. We check relative `Patient/{id}` and
-    // `Group/{id}` references here; absolute external refs pass through.
+    // A `patient` or `group` that names a resource the server cannot find is
+    // rejected with 400, not 404: it scopes the data rather than being the
+    // thing the operation is about (operations-common.html#filter-resolution-errors).
     if let Some(resp) = validate_patient_group_refs(state, tenant, &inputs).await? {
         return Ok(resp);
     }
 
-    dispatch_export_job(state, tenant, ExportWork::Views(views), inputs).await
-}
-
-/// Common submit logic for `$sqlquery-export`: validate, dispatch to the
-/// controller, return 202. Mirrors [`submit_export_job`] with query-specific
-/// checks (the per-query SQL/Library/binding validation happened during
-/// extraction).
-async fn submit_sqlquery_export_job<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    queries: Vec<NamedSqlQuery>,
-    inputs: ExportInputs,
-) -> Result<Response, RestError>
-where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
-{
-    if !SUPPORTED_FORMATS.contains(&inputs.format.as_str()) {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({
-                "resourceType": "OperationOutcome",
-                "issue": [{
-                    "severity": "error",
-                    "code": "not-supported",
-                    "diagnostics": format!(
-                        "unsupported `_format` value '{}'; supported: {}",
-                        inputs.format,
-                        SUPPORTED_FORMATS.join(", ")
-                    )
-                }]
-            })),
-        )
-            .into_response());
-    }
-
-    // The completion manifest groups files by output name; duplicates would
-    // silently collapse into one `output` entry (same rule as views).
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for q in &queries {
-        if !seen.insert(q.name.as_str()) {
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                axum::Json(json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{
-                        "severity": "error",
-                        "code": "invalid",
-                        "diagnostics": format!(
-                            "duplicate query name '{}'; each submitted query must have a unique \
-                             name (set `query.part[name=name].valueString` or `Library.name` \
-                             to disambiguate)",
-                            q.name
-                        )
-                    }]
-                })),
-            )
-                .into_response());
-        }
-    }
-
-    if let Some(resp) = validate_patient_group_refs(state, tenant, &inputs).await? {
-        return Ok(resp);
-    }
-
-    // Execution caps mirror the synchronous `$sqlquery-run` configuration.
-    let limits = SqlExportLimits {
-        max_source_rows_per_vd: state.config().sof_sqlquery_max_source_rows_per_vd,
-        max_rows: state.config().sof_sqlquery_max_rows,
-        timeout_secs: state.config().sof_sqlquery_timeout_secs,
-    };
-
-    dispatch_export_job(
-        state,
-        tenant,
-        ExportWork::SqlQueries { queries, limits },
-        inputs,
-    )
-    .await
+    dispatch_export_job(state, tenant, work, inputs).await
 }
 
 /// Shared tail of every export kick-off: require the controller, build the
@@ -1471,7 +1131,7 @@ fn parse_export_query(raw: Option<&str>) -> Result<ExportQueryParams, Response> 
                         "severity": "error",
                         "code": "not-supported",
                         "diagnostics": format!(
-                            "unsupported query parameter '{k}' for $viewdefinition-export"
+                            "unsupported query parameter '{k}' for $sql-export"
                         )
                     }]
                 })),
@@ -1700,252 +1360,4 @@ fn split_refs(v: Option<&str>) -> Vec<String> {
             .collect(),
         None => Vec::new(),
     }
-}
-
-/// Extracts the list of [`NamedView`] inputs from a submit body.
-///
-/// Accepts:
-/// - A bare `ViewDefinition` resource — produces a single unnamed view.
-/// - A `Parameters` resource with a top-level `viewResource` parameter
-///   (back-compat single-view shape).
-/// - A `Parameters` resource with one or more `view` parameters, each carrying
-///   `part` entries `name`, `viewResource`, and/or `viewReference` per the
-///   SQL-on-FHIR v2 spec (`view` 1..*).
-///
-/// References are resolved through storage like `$viewdefinition-run` does.
-/// Only relative `ViewDefinition/{id}` references are currently supported.
-async fn extract_views_from_body<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    body: &Value,
-) -> Result<Vec<NamedView>, RestError>
-where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
-{
-    let rt = body
-        .get("resourceType")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if rt == "ViewDefinition" {
-        let name = body
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "output".to_string());
-        return Ok(vec![NamedView {
-            name,
-            view: body.clone(),
-        }]);
-    }
-
-    if rt != "Parameters" {
-        return Err(RestError::BadRequest {
-            message: format!("Expected Parameters or ViewDefinition, got '{rt}'"),
-        });
-    }
-
-    let entries = body
-        .get("parameter")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| RestError::BadRequest {
-            message: "Parameters.parameter must be an array".to_string(),
-        })?;
-
-    let mut out: Vec<NamedView> = Vec::new();
-
-    // Back-compat: a top-level `viewResource` is treated as a single view.
-    for p in entries {
-        if p.get("name").and_then(|n| n.as_str()) == Some("viewResource") {
-            if let Some(r) = p.get("resource") {
-                let name = r
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "output".to_string());
-                out.push(NamedView {
-                    name,
-                    view: r.clone(),
-                });
-            }
-        }
-    }
-
-    // Spec form: every `view` parameter contributes one view, defined by its `part` list.
-    for p in entries {
-        if p.get("name").and_then(|n| n.as_str()) != Some("view") {
-            continue;
-        }
-        let parts = p.get("part").and_then(|v| v.as_array());
-        let mut name: Option<String> = None;
-        let mut inline: Option<Value> = None;
-        let mut reference: Option<String> = None;
-
-        if let Some(arr) = parts {
-            for part in arr {
-                match part.get("name").and_then(|v| v.as_str()) {
-                    Some("name") => {
-                        name = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("viewResource") => {
-                        inline = part.get("resource").cloned();
-                    }
-                    Some("viewReference") => {
-                        reference = part
-                            .get("valueReference")
-                            .and_then(|r| r.get("reference"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let view = match (inline, reference) {
-            (Some(_), Some(_)) => {
-                // Spec: `view.viewReference` and `view.viewResource` are XOR
-                // — exactly one of them must be present.
-                return Err(RestError::BadRequest {
-                    message: "each `view` parameter must contain exactly one of \
-                              `viewResource` or `viewReference` (not both)"
-                        .to_string(),
-                });
-            }
-            (Some(r), None) => r,
-            (None, Some(reference)) => {
-                resolve_view_reference_export(state, tenant, &reference).await?
-            }
-            (None, None) => {
-                return Err(RestError::BadRequest {
-                    message:
-                        "each `view` parameter must contain a `viewResource` or `viewReference` part"
-                            .to_string(),
-                });
-            }
-        };
-
-        let resolved_name = name.unwrap_or_else(|| {
-            view.get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("output-{}", out.len()))
-        });
-        out.push(NamedView {
-            name: resolved_name,
-            view,
-        });
-    }
-
-    Ok(out)
-}
-
-/// Resolves a FHIR reference to a stored ViewDefinition for use in
-/// `$viewdefinition-export`. Accepts:
-///
-/// - Relative: `ViewDefinition/{id}` — `storage.read(...)`.
-/// - Canonical: `http(s)://…` optionally with `…|version` — server registry
-///   lookup via `SearchProvider::search` on `url` (+ `version`); newest
-///   match by `meta.lastUpdated` wins.
-///
-/// Absolute external URL *fetch* is not supported; callers must register
-/// the artifact on this server first. An absolute URL that matches a
-/// registered resource's canonical is resolved successfully — that's why
-/// `$sql-on-fhir-capabilities` advertises
-/// `supportsAbsoluteReference = true`.
-async fn resolve_view_reference_export<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    reference: &str,
-) -> Result<Value, RestError>
-where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
-{
-    let trimmed = reference.trim();
-    if let Some(rest) = trimmed.strip_prefix("ViewDefinition/") {
-        let id = rest.split('/').next().unwrap_or("").to_string();
-        if id.is_empty() {
-            return Err(RestError::BadRequest {
-                message: format!("viewReference '{reference}' has an empty id"),
-            });
-        }
-        let stored = state
-            .storage()
-            .read(tenant.context(), "ViewDefinition", &id)
-            .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("failed to read ViewDefinition: {e}"),
-            })?
-            .ok_or_else(|| RestError::NotFound {
-                resource_type: "ViewDefinition".to_string(),
-                id: id.clone(),
-            })?;
-        return Ok(stored.content().clone());
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return resolve_canonical_view_definition(state, tenant.context(), trimmed).await;
-    }
-    Err(RestError::BadRequest {
-        message: format!(
-            "viewReference '{reference}' uses an unsupported form; supported: \
-             relative `ViewDefinition/{{id}}` or canonical `http(s)://…[|version]`"
-        ),
-    })
-}
-
-/// Resolves a canonical ViewDefinition URL (optionally with `|version`) via
-/// `SearchProvider::search` against the local registry. Picks the newest
-/// match by `meta.lastUpdated` when multiple resources share the same URL.
-async fn resolve_canonical_view_definition<S>(
-    state: &AppState<S>,
-    tenant: &TenantContext,
-    url: &str,
-) -> Result<Value, RestError>
-where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
-{
-    let (canonical, version) = match url.split_once('|') {
-        Some((u, v)) => (u.to_string(), Some(v.to_string())),
-        None => (url.to_string(), None),
-    };
-    let mut query = SearchQuery::new("ViewDefinition");
-    query.parameters.push(SearchParameter {
-        name: "url".to_string(),
-        param_type: SearchParamType::Uri,
-        modifier: None,
-        values: vec![SearchValue::new(SearchPrefix::Eq, canonical)],
-        chain: Vec::new(),
-        components: Vec::new(),
-    });
-    if let Some(v) = version {
-        query.parameters.push(SearchParameter {
-            name: "version".to_string(),
-            param_type: SearchParamType::Token,
-            modifier: None,
-            values: vec![SearchValue::new(SearchPrefix::Eq, v)],
-            chain: Vec::new(),
-            components: Vec::new(),
-        });
-    }
-    let result =
-        state
-            .storage()
-            .search(tenant, &query)
-            .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("canonical lookup failed for ViewDefinition url={url}: {e}"),
-            })?;
-    let chosen = result
-        .resources
-        .items
-        .into_iter()
-        .max_by_key(|r| r.last_modified())
-        .ok_or_else(|| RestError::NotFound {
-            resource_type: "ViewDefinition".to_string(),
-            id: url.to_string(),
-        })?;
-    Ok(chosen.content().clone())
 }

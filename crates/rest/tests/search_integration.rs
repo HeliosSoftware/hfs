@@ -406,6 +406,139 @@ mod basic_search {
         ok.assert_status_ok();
     }
 
+    /// Returns the bundle's `self` link URL.
+    fn self_link(body: &Value) -> String {
+        body["link"]
+            .as_array()
+            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+            .and_then(|l| l["url"].as_str())
+            .expect("searchset must carry a self link")
+            .to_string()
+    }
+
+    /// Returns the `search.mode = outcome` entries of a searchset bundle.
+    fn outcome_entries(body: &Value) -> Vec<&Value> {
+        get_bundle_entries(body)
+            .into_iter()
+            .filter(|e| e["search"]["mode"] == "outcome")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_unknown_underscore_param_rejected_under_strict() {
+        // Regression for #524: `_`-prefixed names used to bypass the unknown
+        // parameter check entirely, so strict handling could never reject one.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for param in ["_typo=foo", "_whatever=foo", "_language=en"] {
+            let strict = server
+                .get(&format!("/Patient?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            assert_eq!(
+                strict.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{param} must be rejected under Prefer: handling=strict"
+            );
+        }
+
+        // Global parameters the server does honour are still accepted.
+        for param in ["_id=patient-1", "_lastUpdated=gt2000-01-01", "_tag=foo"] {
+            let ok = server
+                .get(&format!("/Patient?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            ok.assert_status_ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ignored_param_dropped_from_self_link_and_reported() {
+        // Under lenient handling an unsupported parameter may be ignored only if
+        // the server says so: it must not appear in the self link (which states
+        // what was applied) and is reported as an OperationOutcome entry.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let all: Value = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let total = get_bundle_entries(&all).len();
+        assert!(total > 0, "fixture should seed patients");
+
+        for query in ["_typo=foo", "nonsense-param=foo"] {
+            let response = server
+                .get(&format!("/Patient?{query}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+
+            let link = self_link(&body);
+            assert!(
+                !link.contains("typo") && !link.contains("nonsense-param"),
+                "self link must not echo the ignored parameter ({query}): {link}"
+            );
+
+            let outcomes = outcome_entries(&body);
+            assert_eq!(
+                outcomes.len(),
+                1,
+                "ignored parameter must be reported ({query})"
+            );
+            let issue = &outcomes[0]["resource"]["issue"][0];
+            assert_eq!(issue["severity"], "warning");
+            assert_eq!(issue["code"], "not-supported");
+            let text = issue["details"]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(query.split('=').next().unwrap()),
+                "outcome must name the ignored parameter: {text}"
+            );
+
+            // "Ignored" is literal: the filter is not applied, so the result set
+            // is the same as the unfiltered search (previously the parameter
+            // reached the backend and silently matched nothing).
+            let matches = get_bundle_entries(&body)
+                .into_iter()
+                .filter(|e| e["search"]["mode"] == "match")
+                .count();
+            assert_eq!(
+                matches, total,
+                "ignored parameter must not filter ({query})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_known_params_survive_lenient_handling() {
+        // The self link still carries every parameter that was applied, and no
+        // outcome entry is added when nothing was ignored.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let body: Value = server
+            .get("/Patient?name=Smith&_count=5")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+
+        let link = self_link(&body);
+        assert!(link.contains("name=Smith"), "self link: {link}");
+        assert!(link.contains("_count=5"), "self link: {link}");
+        assert!(outcome_entries(&body).is_empty());
+    }
+
     #[tokio::test]
     async fn test_date_prefix_uses_precision_boundaries() {
         let (server, backend) = create_test_server().await;
@@ -2575,5 +2708,187 @@ mod summary_count {
         response.assert_status_ok();
         let body: Value = response.json();
         assert!(body["total"].is_null(), "explicit _total=none wins: {body}");
+    }
+}
+
+// ============================================================================
+// Meta Parameter Tests (_tag / _profile / _security, #474)
+// ============================================================================
+
+mod meta_params {
+    use super::*;
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+
+    async fn seed_tagged_patient(backend: &SqliteBackend) {
+        let tenant = TenantContext::new(
+            TenantId::new("test-tenant"),
+            TenantPermissions::full_access(),
+        );
+        let tagged = json!({
+            "resourceType": "Patient",
+            "meta": {
+                "tag": [{"system": "http://example.org/tags", "code": "test-data"}],
+                "profile": ["http://example.org/StructureDefinition/custom-patient"]
+            },
+            "name": [{"family": "Tagged"}]
+        });
+        backend
+            .create(&tenant, "Patient", tagged, FhirVersion::R4)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tag_filters_over_http() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        seed_tagged_patient(&backend).await;
+
+        let response = server
+            .get("/Patient?_tag=http%3A%2F%2Fexample.org%2Ftags%7Ctest-data")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(
+            entries.len(),
+            1,
+            "_tag must filter instead of returning every patient"
+        );
+        assert_eq!(entries[0]["resource"]["name"][0]["family"], "Tagged");
+    }
+
+    #[tokio::test]
+    async fn test_profile_filters_over_http() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        seed_tagged_patient(&backend).await;
+
+        let response = server
+            .get(
+                "/Patient?_profile=http%3A%2F%2Fexample.org%2FStructureDefinition%2Fcustom-patient",
+            )
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resource"]["name"][0]["family"], "Tagged");
+    }
+}
+
+/// #456: date search must honor the value's precision at every boundary.
+/// Stored dates keep their source precision while bounds are full datetimes,
+/// and SQLite compares text — so a day never fell inside its own range, and a
+/// full-precision timestamp built the impossible range `>= X AND < X`.
+mod date_precision {
+    use super::*;
+
+    async fn seed(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        let patients = vec![
+            json!({"resourceType": "Patient", "id": "d-boundary", "birthDate": "1995-10-02"}),
+            json!({"resourceType": "Patient", "id": "d-new-year", "birthDate": "1996-01-01"}),
+            json!({"resourceType": "Patient", "id": "d-earlier", "birthDate": "1975-03-21"}),
+        ];
+        for p in patients {
+            backend
+                .create(&tenant, "Patient", p, FhirVersion::R4)
+                .await
+                .expect("seed patient");
+        }
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "d-obs",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "subject": {"reference": "Patient/d-boundary"},
+                    "effectiveDateTime": "2016-01-23T13:07:42-04:00"
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed observation");
+    }
+
+    async fn total(server: &TestServer, query: &str) -> u64 {
+        let response = server
+            .get(&format!("{query}&_total=accurate"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        response.json::<Value>()["total"].as_u64().expect("total")
+    }
+
+    #[tokio::test]
+    async fn day_precision_boundaries() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        // eq: the patient born that exact day is found.
+        assert_eq!(total(&server, "/Patient?birthdate=1995-10-02").await, 1);
+        // ge includes the named day itself.
+        assert_eq!(total(&server, "/Patient?birthdate=ge1995-10-02").await, 2);
+        // gt starts strictly after the day.
+        assert_eq!(total(&server, "/Patient?birthdate=gt1995-10-02").await, 1);
+        // le must NOT leak into the next day's midnight.
+        assert_eq!(total(&server, "/Patient?birthdate=le1995-12-31").await, 2);
+        // lt excludes the boundary day.
+        assert_eq!(total(&server, "/Patient?birthdate=lt1996-01-01").await, 2);
+        // A same-day sandwich pins exactly the one patient.
+        assert_eq!(
+            total(
+                &server,
+                "/Patient?birthdate=ge1995-10-02&birthdate=le1995-10-02"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn coarser_precisions_still_match() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        assert_eq!(total(&server, "/Patient?birthdate=1995-10").await, 1);
+        // The year range must not swallow 1996-01-01.
+        assert_eq!(total(&server, "/Patient?birthdate=1995").await, 1);
+    }
+
+    #[tokio::test]
+    async fn full_precision_timestamp_matches_itself() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        assert_eq!(
+            total(&server, "/Observation?date=2016-01-23T13:07:42-04:00").await,
+            1
+        );
+        // And the same instant expressed in UTC matches too: datetime()
+        // folds offsets before comparing.
+        assert_eq!(
+            total(&server, "/Observation?date=2016-01-23T17:07:42Z").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn chained_date_inherits_the_fix() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        assert_eq!(
+            total(&server, "/Observation?patient.birthdate=1995-10-02").await,
+            1
+        );
     }
 }

@@ -1,15 +1,16 @@
 //! Parse a SQLQuery Library (FHIR Library profile) into the parts the engine
 //! needs: the SQL string, parameter declarations, and depends-on ViewDefinitions.
 //!
-//! See <https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/StructureDefinition-SQLQuery.html>
+//! See <http://hl7.org/fhir/uv/sql-on-fhir/StructureDefinition-SQLQuery.html>
 
 use base64::Engine;
 use serde_json::Value;
 
 use super::SqlQueryError;
+use crate::canonical::{LEGACY_LIBRARY_TYPES_CODE_SYSTEM, LIBRARY_TYPES_CODE_SYSTEM};
 
 /// `Library.type.coding.system` value the SQLQuery profile fixes.
-pub const LIBRARY_TYPE_SYSTEM: &str = "https://sql-on-fhir.org/ig/CodeSystem/LibraryTypesCodes";
+pub const LIBRARY_TYPE_SYSTEM: &str = LIBRARY_TYPES_CODE_SYSTEM;
 /// `Library.type.coding.code` value the SQLQuery profile fixes.
 pub const LIBRARY_TYPE_CODE: &str = "sql-query";
 
@@ -94,10 +95,18 @@ fn validate_library_type(library_json: &Value) -> Result<(), SqlQueryError> {
                     .to_string(),
             )
         })?;
+    // The ballot reissued the `LibraryTypesCodes` canonical along with every
+    // other URL the guide publishes. Libraries authored against 2.0.0 or the
+    // pre-ballot build carry the old system, and both releases stay published,
+    // so accept either.
     let ok = codings.iter().any(|c| {
         let code = c.get("code").and_then(|v| v.as_str());
         let system = c.get("system").and_then(|v| v.as_str());
-        code == Some(LIBRARY_TYPE_CODE) && (system.is_none() || system == Some(LIBRARY_TYPE_SYSTEM))
+        code == Some(LIBRARY_TYPE_CODE)
+            && matches!(
+                system,
+                None | Some(LIBRARY_TYPES_CODE_SYSTEM) | Some(LEGACY_LIBRARY_TYPES_CODE_SYSTEM)
+            )
     });
     if !ok {
         return Err(SqlQueryError::MalformedLibrary(format!(
@@ -342,7 +351,7 @@ mod tests {
         lib["content"] = json!([{
             "contentType": "application/sql",
             "extension": [{
-                "url": "https://sql-on-fhir.org/ig/StructureDefinition/sql-text",
+                "url": "http://hl7.org/fhir/uv/sql-on-fhir/StructureDefinition/sql-text",
                 "valueString": "SELECT 2"
             }]
         }]);

@@ -153,3 +153,66 @@ async fn conditional_update_without_negotiation_stamps_the_configured_default() 
         .await;
     as_r4b.assert_status(StatusCode::OK);
 }
+
+/// Bundle entries are stamped with the request's negotiated version too — one
+/// bundle, one version (#350).
+///
+/// This assertion used to live in `helios-persistence`'s
+/// `BundleProvider::process_batch` unit tests. #501 deleted that method as
+/// unreachable, so the batch half of the guarantee is pinned here, against the
+/// loop that actually runs it.
+#[tokio::test]
+async fn batch_entries_stamp_the_configured_default() {
+    let server = create_test_server().await;
+
+    let response = server
+        .post("/")
+        .add_header(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/fhir+json"),
+        )
+        .json(&json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                {
+                    "request": { "method": "PUT", "url": "Patient/batch-fallback-1" },
+                    "resource": {"resourceType": "Patient", "id": "batch-fallback-1"}
+                },
+                {
+                    "request": { "method": "PUT", "url": "Patient/batch-fallback-2" },
+                    "resource": {"resourceType": "Patient", "id": "batch-fallback-2"}
+                }
+            ]
+        }))
+        .await;
+    response.assert_status(StatusCode::OK);
+
+    let body: Value = response.json();
+    for index in 0..2 {
+        let status = body["entry"][index]["response"]["status"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(status.starts_with("201"), "entry {index}: {status}");
+    }
+
+    for id in ["batch-fallback-1", "batch-fallback-2"] {
+        let as_r4b = server
+            .get(&format!("/Patient/{id}"))
+            .add_header(
+                ACCEPT,
+                HeaderValue::from_static("application/fhir+json; fhirVersion=4.3"),
+            )
+            .await;
+        as_r4b.assert_status(StatusCode::OK);
+
+        let as_r4 = server
+            .get(&format!("/Patient/{id}"))
+            .add_header(
+                ACCEPT,
+                HeaderValue::from_static("application/fhir+json; fhirVersion=4.0"),
+            )
+            .await;
+        as_r4.assert_status(StatusCode::NOT_ACCEPTABLE);
+    }
+}

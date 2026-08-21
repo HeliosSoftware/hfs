@@ -182,22 +182,6 @@ async fn mongodb_integration_transaction_bundle_topology_behavior() {
     }
 }
 
-#[tokio::test]
-async fn test_mongodb_bundle_provider_batch_not_supported() {
-    let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
-    let tenant = create_tenant("tenant-bundle-batch");
-
-    let result = backend
-        .process_batch(&tenant, vec![], FhirVersion::default())
-        .await;
-    assert!(matches!(
-        result,
-        Err(StorageError::Backend(
-            BackendError::UnsupportedCapability { .. }
-        ))
-    ));
-}
-
 async fn process_transaction_or_skip(
     backend: &MongoBackend,
     tenant: &TenantContext,
@@ -307,6 +291,30 @@ mod shared_mongo {
     pub(super) async fn connection_string() -> Option<String> {
         Some(shared().await?.connection_string.clone())
     }
+}
+
+/// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
+/// verbatim with the SQLite and PostgreSQL suites.
+///
+/// `#[path]`-included rather than placed in `tests/common/`, which no test
+/// target declares and cargo therefore never compiles (issue #306).
+#[path = "multitenancy/tenant_id_fidelity_suite.rs"]
+mod tenant_id_fidelity_suite;
+
+/// The backend-agnostic day-precision date-boundary suite (issue #519) — the
+/// #456 table that #463 pinned for SQLite only. Same `#[path]` arrangement.
+#[path = "search/date_boundary_suite.rs"]
+mod date_boundary_suite;
+
+/// #519: MongoDB's date handler was explicitly unverified. Needs the full
+/// registry so `birthdate` extracts into the search index at write time.
+#[tokio::test]
+async fn mongodb_day_precision_date_boundaries() {
+    let Some(backend) = create_backend_with_full_registry("date_boundary").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    date_boundary_suite::day_precision_boundaries(&backend, "date-boundary-519").await;
 }
 
 fn create_tenant(tenant_id: &str) -> TenantContext {
@@ -3617,4 +3625,653 @@ async fn mongodb_integration_purge_tenant_settings() {
     backend.purge_tenant_settings("a.b").await.unwrap();
     let dotted_doc = backend.get_settings(&dotted).await.unwrap().unwrap();
     assert_eq!(dotted_doc.document, json!({}));
+}
+
+// ============================================================================
+// Issue #447 — tenant-id fidelity
+// ============================================================================
+//
+// The #447 defect is S3's: it *derives* a key prefix from the tenant id, and
+// `trim_matches('/')` made that derivation many-to-one. MongoDB derives
+// nothing — documents carry a `tenant_id` field matched exactly, under the
+// default (case-sensitive) collation — so the scoping is the identity mapping
+// and the defect cannot occur here.
+//
+// That is a code reading, and a code reading is exactly what let the same
+// defect class sit undiscovered in the two backends that *do* derive (#384 on
+// Elasticsearch, #447 on S3). So it is checked against a real server, where
+// BSON matching and collation are the engine's behaviour rather than the Rust's.
+//
+// Each test gets its own database (`build_test_database_name`), so a fixed base
+// id is safe here.
+
+#[tokio::test]
+async fn mongodb_integration_distinct_tenant_ids_never_share_data() {
+    let Some(backend) = create_backend("tenant_fidelity").await else {
+        eprintln!(
+            "Skipping mongodb_integration_distinct_tenant_ids_never_share_data (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    tenant_id_fidelity_suite::distinct_tenant_ids_never_share_data(&backend, "acme").await;
+}
+
+#[tokio::test]
+async fn mongodb_integration_purging_one_tenant_leaves_the_look_alikes_intact() {
+    let Some(backend) = create_backend("tenant_fidelity_purge").await else {
+        eprintln!(
+            "Skipping mongodb_integration_purging_one_tenant_leaves_the_look_alikes_intact (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    tenant_id_fidelity_suite::purging_one_tenant_leaves_the_look_alikes_intact(&backend, "acme")
+        .await;
+}
+
+// ===========================================================================
+// Bulk Data Submit ($bulk-submit)
+//
+// MongoDB hosts the whole submit surface — the ingestion engine and the REST
+// worker's job store — so these cover both halves: ingest through the streaming
+// engine, and claim/heartbeat/fence/finish through the lease layer.
+// ===========================================================================
+
+mod bulk_submit {
+    use super::*;
+
+    use helios_persistence::core::{
+        BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
+        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, ManifestFetchParams, ManifestStatus,
+        NdjsonEntry, RemoteFile, RemoteManifest, StreamingBulkSubmitProvider, SubmissionId,
+        SubmissionStatus, SubmitClaimStrategy, SubmitFileRecord, SubmitInputFetcher,
+        SubmitWorkerStorage, WorkerId,
+    };
+    use helios_persistence::error::StorageResult;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    fn lease_duration() -> Duration {
+        Duration::from_secs(60)
+    }
+
+    /// Creates a submission with one fetchable manifest — the shape the REST
+    /// kickoff handler produces.
+    async fn seed(backend: &MongoBackend, tenant: &TenantContext) -> (SubmissionId, String) {
+        let id = SubmissionId::generate("data-provider");
+        backend.create_submission(tenant, &id, None).await.unwrap();
+        let manifest = backend
+            .add_manifest(
+                tenant,
+                &id,
+                Some("https://provider.example/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        (id, manifest.manifest_id)
+    }
+
+    /// Serves a fixed manifest and its NDJSON files from memory.
+    struct MockFetcher {
+        manifest: RemoteManifest,
+        files: HashMap<String, Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SubmitInputFetcher for MockFetcher {
+        async fn fetch_manifest(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> StorageResult<RemoteManifest> {
+            Ok(self.manifest.clone())
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            _headers: &[(String, String)],
+            _requires_access_token: bool,
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+            let data = self.files.get(url).cloned().unwrap_or_default();
+            Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+                data,
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_entries_creates_and_updates() {
+        let Some(backend) = create_backend("submit_process_entries").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let entries = vec![
+            NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "gender": "female"}),
+            ),
+            NdjsonEntry::new(2, "Patient", json!({"resourceType": "Patient"})),
+        ];
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.is_success()));
+        assert!(results[0].created && results[1].created);
+
+        // The resource really landed in the FHIR store, not just the job store.
+        let stored = backend
+            .read(&tenant, "Patient", "p1")
+            .await
+            .unwrap()
+            .expect("submitted Patient is readable");
+        assert_eq!(stored.content()["gender"], json!("female"));
+
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.success, 2);
+        assert_eq!(counts.total, 2);
+
+        // Re-submitting the same id is an update, and the change log records it
+        // so an abort can roll it back.
+        let update = vec![NdjsonEntry::new(
+            1,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p1", "gender": "male"}),
+        )];
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                update,
+                &BulkProcessingOptions::new()
+                    .with_file_url("https://provider.example/second.ndjson"),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].is_success() && !results[0].created);
+
+        let changes = backend.list_changes(&tenant, &id, 100, 0).await.unwrap();
+        assert!(
+            changes.iter().any(|c| c.change_type == ChangeType::Update),
+            "an update must be recorded for rollback, got {changes:?}"
+        );
+    }
+
+    /// Line numbers restart in every manifest output file, so the file is part
+    /// of an entry result's identity (#457). Without it the second file's line 1
+    /// overwrites the first file's.
+    #[tokio::test]
+    async fn test_entry_results_from_two_files_do_not_collide() {
+        let Some(backend) = create_backend("submit_file_discriminator").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        for (file, patient) in [("a.ndjson", "pa"), ("b.ndjson", "pb")] {
+            backend
+                .process_entries(
+                    &tenant,
+                    &id,
+                    &manifest_id,
+                    vec![NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": patient}),
+                    )],
+                    &BulkProcessingOptions::new().with_file_url(file),
+                )
+                .await
+                .unwrap();
+        }
+
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            counts.total, 2,
+            "both files' line 1 must survive as separate results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_heartbeat_and_finish() {
+        let Some(backend) = create_backend("submit_claim_lifecycle").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let worker = WorkerId::new("worker-1");
+        let lease = backend
+            .claim_next_manifest(&worker, lease_duration())
+            .await
+            .unwrap()
+            .expect("the seeded manifest is claimable");
+        assert_eq!(lease.manifest_id, manifest_id);
+        assert_eq!(lease.fencing_token, 1, "the first claim bumps 0 -> 1");
+
+        // A second worker cannot take a manifest that is still leased.
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+                .await
+                .unwrap()
+                .is_none(),
+            "a live lease must not be claimable by another worker"
+        );
+
+        backend.heartbeat(&lease).await.unwrap();
+        backend.finish_manifest(&lease).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+        assert!(
+            backend
+                .claim_next_manifest(&worker, lease_duration())
+                .await
+                .unwrap()
+                .is_none(),
+            "a completed manifest must leave the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fencing_blocks_a_zombie_worker() {
+        let Some(backend) = create_backend("submit_fencing").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let _ = seed(&backend, &tenant).await;
+
+        let stale = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .unwrap()
+            .unwrap();
+        // Release puts it back; the next claim bumps the token past the stale one.
+        // Disambiguated because `Backend::release` (connection pooling) shares
+        // the name with the lease release.
+        SubmitClaimStrategy::release(&backend, stale.clone())
+            .await
+            .unwrap();
+        let fresh = backend
+            .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fresh.fencing_token > stale.fencing_token);
+
+        for outcome in [
+            backend
+                .heartbeat(&stale)
+                .await
+                .err()
+                .map(|e| format!("{e:?}")),
+            backend
+                .update_manifest_progress(&stale, 1, 0, 1)
+                .await
+                .err()
+                .map(|e| format!("{e:?}")),
+            backend
+                .finish_manifest(&stale)
+                .await
+                .err()
+                .map(|e| format!("{e:?}")),
+        ] {
+            let message = outcome.expect("a zombie worker's fenced write must fail");
+            assert!(
+                message.contains("LeaseLost"),
+                "expected LeaseLost, got {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_poll_token_and_kickoff_metadata() {
+        let Some(backend) = create_backend("submit_poll_token").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, _manifest_id) = seed(&backend, &tenant).await;
+
+        backend
+            .set_submission_kickoff_meta(
+                &tenant,
+                &id,
+                Some("client-subject"),
+                "https://hfs.example/$bulk-submit",
+                true,
+            )
+            .await
+            .unwrap();
+
+        let token = backend.ensure_poll_token(&tenant, &id).await.unwrap();
+        assert_eq!(
+            backend.ensure_poll_token(&tenant, &id).await.unwrap(),
+            token,
+            "ensure_poll_token must be idempotent"
+        );
+
+        let target = backend
+            .resolve_poll_token(&token)
+            .await
+            .unwrap()
+            .expect("the token resolves to its submission");
+        assert_eq!(target.submission_id, id);
+        assert_eq!(target.tenant.tenant_id().as_str(), "submit-tenant");
+        assert_eq!(target.owner_subject.as_deref(), Some("client-subject"));
+
+        // A transaction time is minted once and then stable.
+        let first = backend.ensure_transaction_time(&tenant, &id).await.unwrap();
+        assert_eq!(
+            backend.ensure_transaction_time(&tenant, &id).await.unwrap(),
+            first
+        );
+
+        backend.clear_poll_token(&tenant, &id).await.unwrap();
+        assert!(
+            backend.resolve_poll_token(&token).await.unwrap().is_none(),
+            "a cleared token must stop resolving, so a deleted submission 404s"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_files_are_recorded_and_deletable() {
+        let Some(backend) = create_backend("submit_files").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, _manifest_id) = seed(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .unwrap()
+            .unwrap();
+        let record = SubmitFileRecord {
+            manifest_url: Some("https://provider.example/manifest.json".to_string()),
+            file_type: "output".to_string(),
+            resource_type: Some("Patient".to_string()),
+            part_index: 0,
+            file_path: "tenant/job/output/Patient-0.ndjson".to_string(),
+            line_count: 3,
+            byte_count: 120,
+            count_severity: None,
+        };
+        backend.record_submit_file(&lease, &record).await.unwrap();
+        // Re-recording the same artifact must not double it in the manifest.
+        backend.record_submit_file(&lease, &record).await.unwrap();
+
+        let rows = backend.list_submit_files(&tenant, &id).await.unwrap();
+        assert_eq!(rows.len(), 1, "record_submit_file must be idempotent");
+        assert_eq!(rows[0].line_count, 3);
+        assert_eq!(rows[0].fencing_token, lease.fencing_token);
+
+        backend
+            .delete_submission_artifacts(&tenant, &id)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .list_submit_files(&tenant, &id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_active_submission_count_and_expiry_scan() {
+        let Some(backend) = create_backend("submit_counts").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-counts");
+        let (id, _manifest_id) = seed(&backend, &tenant).await;
+
+        assert_eq!(
+            backend.count_active_submissions(&tenant).await.unwrap(),
+            1,
+            "an in-progress submission counts toward the per-tenant cap"
+        );
+        backend.complete_submission(&tenant, &id).await.unwrap();
+        assert_eq!(
+            backend.count_active_submissions(&tenant).await.unwrap(),
+            0,
+            "a completed submission must free its slot"
+        );
+
+        // A zero TTL makes every submission expired; a long one, none.
+        let expired = backend
+            .list_expired_submissions(chrono::Utc::now(), Duration::from_secs(0), 10)
+            .await
+            .unwrap();
+        assert!(expired.iter().any(|(_, sub)| sub == &id));
+        let fresh = backend
+            .list_expired_submissions(chrono::Utc::now(), Duration::from_secs(86_400), 10)
+            .await
+            .unwrap();
+        assert!(!fresh.iter().any(|(_, sub)| sub == &id));
+    }
+
+    #[tokio::test]
+    async fn test_aborted_submission_is_not_claimable() {
+        let Some(backend) = create_backend("submit_abort").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, _manifest_id) = seed(&backend, &tenant).await;
+
+        backend
+            .abort_submission(&tenant, &id, "provider cancelled")
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+                .await
+                .unwrap()
+                .is_none(),
+            "an aborted submission's manifests must not be picked up"
+        );
+
+        let summary = backend.get_submission(&tenant, &id).await.unwrap().unwrap();
+        assert_eq!(summary.status, SubmissionStatus::Aborted);
+    }
+
+    /// End-to-end through the shared worker: claim → fetch → ingest → artifacts.
+    #[tokio::test]
+    async fn test_worker_ingests_a_manifest_end_to_end() {
+        let Some(backend) = create_backend("submit_worker_e2e").await else {
+            return;
+        };
+        let backend = Arc::new(backend);
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        backend
+            .set_manifest_fetch_params(
+                &tenant,
+                &id,
+                &manifest_id,
+                ManifestFetchParams {
+                    import_directives: &[(
+                        IMPORT_MODE_PARAMETER_URL.to_string(),
+                        "replace".to_string(),
+                    )],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let ndjson = concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"w1\",\"gender\":\"female\"}\n",
+            "not-json\n"
+        );
+        let mut files = HashMap::new();
+        files.insert(
+            "https://provider.example/patient.ndjson".to_string(),
+            ndjson.as_bytes().to_vec(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: "https://provider.example/patient.ndjson".to_string(),
+                    count: Some(2),
+                }],
+                deleted: vec![],
+            },
+            files,
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(
+            helios_persistence::backends::local_fs::LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://localhost:8080",
+            ),
+        );
+        let worker_id = WorkerId::new("e2e-worker");
+        let worker = DefaultSubmitWorker::new(backend.clone(), fetcher, output, worker_id.clone());
+
+        let lease = backend
+            .claim_next_manifest(&worker_id, lease_duration())
+            .await
+            .unwrap()
+            .unwrap();
+        worker.run_job(lease).await.unwrap();
+
+        // Partial success: the good line ingested, the malformed one counted.
+        let stored = backend.read(&tenant, "Patient", "w1").await.unwrap();
+        assert!(stored.is_some(), "the valid NDJSON line must be ingested");
+        let manifests = backend.list_manifests(&tenant, &id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+        assert!(manifests[0].failed_entries >= 1);
+
+        let files = backend.list_submit_files(&tenant, &id).await.unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|f| f.file_type == "output" && f.resource_type.as_deref() == Some("Patient")),
+            "an output receipt must be recorded, got {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.file_type == "error"),
+            "the malformed line must surface in the error artifact, got {files:?}"
+        );
+    }
+
+    /// A status-only kickoff registers no fetchable manifest, so the worker has
+    /// nothing to claim — the same predicate the SQL job stores encode in their
+    /// claim query's `WHERE manifest_url IS NOT NULL`.
+    #[tokio::test]
+    async fn test_manifest_without_url_is_never_claimed() {
+        let Some(backend) = create_backend("submit_status_only").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let id = SubmissionId::generate("data-provider");
+        backend.create_submission(&tenant, &id, None).await.unwrap();
+        backend
+            .add_manifest(&tenant, &id, None, None)
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replaces_manifest_url_supersedes_and_dequeues() {
+        let Some(backend) = create_backend("submit_replaces").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let superseded = backend
+            .replace_manifest_by_url(&tenant, &id, "https://provider.example/manifest.json")
+            .await
+            .unwrap();
+        assert_eq!(superseded, vec![manifest_id]);
+
+        let manifests = backend.list_manifests(&tenant, &id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Replaced);
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+                .await
+                .unwrap()
+                .is_none(),
+            "a replaced manifest is no longer work"
+        );
+    }
+
+    /// The streaming engine is what the worker actually drives, so cover it
+    /// directly too: wrong-typed lines are counted, not ingested.
+    #[tokio::test]
+    async fn test_stream_rejects_lines_of_the_wrong_type() {
+        let Some(backend) = create_backend("submit_stream_types").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let ndjson = concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"ok\"}\n",
+            "{\"resourceType\":\"Observation\",\"id\":\"wrong\"}\n"
+        );
+        let reader = Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+            ndjson.as_bytes().to_vec(),
+        )));
+        let result = backend
+            .process_ndjson_stream(
+                &tenant,
+                &id,
+                &manifest_id,
+                "Patient",
+                reader,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.counts.success, 1);
+        assert_eq!(result.counts.validation_error, 1);
+        assert!(
+            backend
+                .read(&tenant, "Observation", "wrong")
+                .await
+                .unwrap()
+                .is_none(),
+            "a line of the wrong type must not be stored"
+        );
+    }
 }

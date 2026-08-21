@@ -63,6 +63,51 @@ async fn index_serves_the_full_landing_page() {
 }
 
 #[tokio::test]
+async fn legacy_expand_query_param_is_ignored_and_harmless() {
+    // `?expand=1` used to render the taller chart (#601); the affordance is
+    // gone, but old bookmarks/links carrying the param must still resolve
+    // cleanly, and the response must never echo it back into a live href.
+    let response = app()
+        .oneshot(Request::get("/ui?expand=1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains("expand=1"));
+}
+
+#[tokio::test]
+async fn dashboard_renders_job_cards_with_unavailable_state_when_no_provider() {
+    // No DashboardProvider is registered in this test router, so build_index_page
+    // falls back to sample_snapshot, whose export_jobs/import_jobs_active are
+    // both None — the dashboard must render the explicit "unavailable" state
+    // rather than any fabricated numbers.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Export jobs"));
+    assert!(html.contains("Import jobs"));
+    assert!(html.contains(r#"href="/ui/bulk-export""#));
+    assert!(html.contains(r#"href="/ui/bulk-import""#));
+    assert!(html.contains("unavailable"));
+    assert!(!html.contains(">13<"));
+    assert!(!html.contains("queued)"));
+
+    // The Uptime card follows the same honesty rule (#540): this test binary
+    // never calls helios_observability::uptime::init(), so the card renders
+    // the unavailable state, not the old hardcoded percentage. The
+    // initialized path lives in tests/dashboard_uptime_http.rs — a separate
+    // binary, because the tracker is process-global.
+    assert!(!html.contains("99.98"));
+    assert!(!html.contains("since process start"));
+}
+
+#[tokio::test]
 async fn page_wires_the_hover_rail_nav() {
     let response = app()
         .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
@@ -175,11 +220,26 @@ async fn search_parameters_page_serves_the_registry_view() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("<title>Search Parameters — Helios FHIR Server</title>"));
+    assert!(html.contains(r#"<h1 class="page-head__title">Search Parameters</h1>"#));
+    assert!(html.contains(
+        r#"<table class="data-table" data-row-navigation aria-label="Search Parameters">"#
+    ));
+    assert!(html.contains(r#"<script src="/ui/assets/search-parameters.js" defer></script>"#));
     // The Resource Filter rail and the facet rows are server-rendered.
     assert!(html.contains(r#"id="sp-rail-list""#));
     assert!(html.contains("base=Patient"));
     // Real registry data, not placeholders: Patient supports `name`.
     assert!(html.contains("http://hl7.org/fhir/SearchParameter/Patient-name"));
+    // Each result row keeps exactly one native link for keyboard and no-JS use.
+    let table_body = html
+        .split_once("<tbody>")
+        .and_then(|(_, rest)| rest.split_once("</tbody>"))
+        .map(|(body, _)| body)
+        .expect("SearchParameter table body");
+    let row_count = table_body.matches("<tr").count();
+    assert!(row_count > 0);
+    assert_eq!(table_body.matches(r#"class="row-link""#).count(), row_count);
     // This page, not Home, carries aria-current in the sidebar.
     assert!(html.contains(r#"href="/ui/search-parameters" aria-current="page""#));
 }
@@ -835,4 +895,99 @@ async fn editor_add_with_a_slice_name_appends_the_item() {
             .await;
 
     assert!(html.contains(r#"data-path="identifier.0""#));
+}
+
+/// #476: the Batch/Transaction workspace mounts and the nav links it.
+#[tokio::test]
+async fn batch_page_serves_the_workspace_shell() {
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    // The three client-driven stages are all in the shell.
+    assert!(html.contains(r#"id="batch-upload""#));
+    assert!(html.contains(r#"id="batch-preflight""#));
+    assert!(html.contains(r#"id="batch-response""#));
+    // The nav entry is a real link now, current on this page.
+    assert!(html.contains(r#"href="/ui/batch" aria-current="page""#));
+    // The semantics copy rides in as data for batch.js.
+    assert!(html.contains("data-msg-semantics-transaction"));
+    assert!(html.contains(r#"src="/ui/assets/batch.js""#));
+}
+
+/* #546: creating a resource with required elements must not dump duplicated,
+ * unanchored error lines. */
+
+#[tokio::test]
+async fn editor_orphan_issues_are_deduped_and_titled() {
+    // A brand-new Claim: several required elements, none present, no rows.
+    let html = edit("doc=%7B%22resourceType%22%3A%22Claim%22%7D&op=").await;
+
+    // Styled panel with a heading, not bare lines.
+    assert!(html.contains("editor__orphans-title"), "titled panel");
+    // The old "priority: priority is required" duplication is gone.
+    assert!(
+        !html.contains("priority: priority"),
+        "no duplicated element name"
+    );
+    assert!(html.contains("priority"), "the issue itself still shows");
+}
+
+/* #549: temporal primitives get format assistance. */
+
+#[tokio::test]
+async fn editor_temporal_primitives_carry_format_assistance() {
+    // A Patient with a birthDate (type `date`) present renders its row.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%222024-01-01%22%7D&op=",
+    )
+    .await;
+    assert!(
+        html.contains(r#"placeholder="2024-05-17""#),
+        "date placeholder"
+    );
+    assert!(
+        html.contains(r#"pattern="\d{4}(-\d{2}(-\d{2})?)?""#),
+        "date pattern"
+    );
+    // Non-temporal primitives stay bare.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22name%22%3A%5B%7B%22family%22%3A%22X%22%7D%5D%7D&op=",
+    )
+    .await;
+    assert!(!html.contains(r#"placeholder="14:30:00""#));
+}
+
+/* #547: the server marks the created node so the client can focus it, and
+ * an empty document opens the root add-picker by itself. */
+
+#[tokio::test]
+async fn editor_marks_the_created_node_for_focus() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=add&path=&name=birthDate").await;
+    assert!(
+        html.contains(r#"data-focus="birthDate""#),
+        "created path marked: {}",
+        &html[..400]
+    );
+}
+
+#[tokio::test]
+async fn editor_opens_the_root_picker_on_an_empty_document() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+    assert!(
+        html.contains(r#"<details class="editor-add" open>"#),
+        "root picker auto-opens"
+    );
+
+    // With content present it stays closed.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%222024-01-01%22%7D&op=",
+    )
+    .await;
+    assert!(!html.contains(r#"<details class="editor-add" open>"#));
 }

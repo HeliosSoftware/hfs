@@ -811,7 +811,11 @@ impl ResourceStorage for PostgresBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
-        crate::tenant::ensure_mutable_tenant(id)?;
+        // Backstop for the canonical tenant-id contract (issue #385). As with
+        // SQLite, PostgreSQL keys tenants by an exact-match, case-sensitive
+        // `tenant_id` column and has no derivation to protect — this keeps the
+        // precondition uniform across every implementation.
+        self.ensure_canonical_tenant_id(id)?;
         let client = self.get_client().await?;
         // Plain INSERT so a duplicate id surfaces as a constraint error; the
         // admin handler pre-checks existence and returns 409, so reaching here
@@ -2726,6 +2730,14 @@ impl PostgresBackend {
 
 #[async_trait]
 impl BundleProvider for PostgresBackend {
+    /// PostgreSQL provides real ACID transactions; `PostgresBackend` also
+    /// implements [`TransactionProvider`](crate::core::TransactionProvider),
+    /// and `process_transaction` runs inside one, so a failure unwinds
+    /// completely.
+    fn supports_atomic_transactions(&self) -> bool {
+        true
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
@@ -2810,26 +2822,6 @@ impl BundleProvider for PostgresBackend {
 
         Ok(BundleResult {
             bundle_type: BundleType::Transaction,
-            entries: results,
-        })
-    }
-
-    async fn process_batch(
-        &self,
-        tenant: &TenantContext,
-        entries: Vec<BundleEntry>,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleResult> {
-        let mut results = Vec::with_capacity(entries.len());
-
-        // Process each entry independently
-        for entry in &entries {
-            let result = self.process_batch_entry(tenant, entry, fhir_version).await;
-            results.push(result);
-        }
-
-        Ok(BundleResult {
-            bundle_type: BundleType::Batch,
             entries: results,
         })
     }
@@ -2948,147 +2940,6 @@ impl PostgresBackend {
                     }),
                 ))
             }
-        }
-    }
-
-    /// Process a single batch entry (independent, no transaction).
-    async fn process_batch_entry(
-        &self,
-        tenant: &TenantContext,
-        entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> BundleEntryResult {
-        match self
-            .process_batch_entry_inner(tenant, entry, fhir_version)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => BundleEntryResult::error(
-                500,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "error", "code": "exception", "diagnostics": e.to_string()}]
-                }),
-            ),
-        }
-    }
-
-    async fn process_batch_entry_inner(
-        &self,
-        tenant: &TenantContext,
-        entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleEntryResult> {
-        match entry.method {
-            BundleMethod::Get => {
-                let (resource_type, id) = self.parse_url(&entry.url)?;
-                match self.read(tenant, &resource_type, &id).await? {
-                    Some(resource) => Ok(BundleEntryResult::ok(resource)),
-                    None => Ok(BundleEntryResult::error(
-                        404,
-                        serde_json::json!({
-                            "resourceType": "OperationOutcome",
-                            "issue": [{"severity": "error", "code": "not-found"}]
-                        }),
-                    )),
-                }
-            }
-            BundleMethod::Post => {
-                let resource = entry.resource.clone().ok_or_else(|| {
-                    StorageError::Validation(crate::error::ValidationError::MissingRequiredField {
-                        field: "resource".to_string(),
-                    })
-                })?;
-
-                let resource_type = resource
-                    .get("resourceType")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| {
-                        StorageError::Validation(
-                            crate::error::ValidationError::MissingRequiredField {
-                                field: "resourceType".to_string(),
-                            },
-                        )
-                    })?;
-
-                let created = self
-                    .create(tenant, &resource_type, resource, fhir_version)
-                    .await?;
-                Ok(BundleEntryResult::created(created))
-            }
-            BundleMethod::Put => {
-                let resource = entry.resource.clone().ok_or_else(|| {
-                    StorageError::Validation(crate::error::ValidationError::MissingRequiredField {
-                        field: "resource".to_string(),
-                    })
-                })?;
-
-                let (resource_type, id) = self.parse_url(&entry.url)?;
-
-                // `ifMatch` was previously dropped on the floor in the BATCH
-                // path (the transaction path did check it), so optimistic
-                // locking silently disappeared for anyone who wrapped a PUT in a
-                // `type: batch` Bundle — a lost update reported as 200 OK.
-                // Only pay for the extra read when a precondition was supplied.
-                if entry.if_match.is_some() {
-                    // A deleted resource has no current representation, so
-                    // `Gone` is `None` here; real storage errors must not be
-                    // swallowed into a bogus precondition failure.
-                    let existing = match self.read(tenant, &resource_type, &id).await {
-                        Ok(v) => v,
-                        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-                        Err(e) => return Err(e),
-                    };
-                    if let Some(failure) = bundle_if_match_gate(
-                        entry.if_match.as_deref(),
-                        existing.as_ref().map(|r| r.version_id()),
-                    ) {
-                        return Ok(failure);
-                    }
-                }
-
-                let (stored, _created) = self
-                    .create_or_update(tenant, &resource_type, &id, resource, fhir_version)
-                    .await?;
-                Ok(BundleEntryResult::ok(stored))
-            }
-            BundleMethod::Delete => {
-                let (resource_type, id) = self.parse_url(&entry.url)?;
-
-                // As above: `ifMatch` on DELETE was ignored here entirely.
-                if entry.if_match.is_some() {
-                    // A deleted resource has no current representation, so
-                    // `Gone` is `None` here; real storage errors must not be
-                    // swallowed into a bogus precondition failure.
-                    let existing = match self.read(tenant, &resource_type, &id).await {
-                        Ok(v) => v,
-                        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-                        Err(e) => return Err(e),
-                    };
-                    if let Some(failure) = bundle_if_match_gate(
-                        entry.if_match.as_deref(),
-                        existing.as_ref().map(|r| r.version_id()),
-                    ) {
-                        return Ok(failure);
-                    }
-                }
-
-                match self.delete(tenant, &resource_type, &id).await {
-                    Ok(()) => Ok(BundleEntryResult::deleted()),
-                    Err(StorageError::Resource(ResourceError::NotFound { .. })) => {
-                        Ok(BundleEntryResult::deleted()) // Idempotent delete
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            BundleMethod::Patch => Ok(BundleEntryResult::error(
-                501,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "error", "code": "not-supported", "diagnostics": "PATCH not implemented"}]
-                }),
-            )),
         }
     }
 
@@ -3330,6 +3181,19 @@ impl ReindexTarget for PostgresBackend {
             .index_contained_resources(&client, tenant_id, resource_type, resource_id, content)
             .await?;
 
+        // Rebuild the full-text row as well. `run_reindex` deletes each
+        // resource's search entries first (`delete_search_entries` ->
+        // `delete_search_index`), and that drops the `resource_fts` row; without
+        // this call nothing put it back, so `$reindex` silently disabled
+        // `_text`/`_content` on every reindex, with or without `clear_existing`.
+        // Same defect as the SQLite side — this is not PostgreSQL-specific.
+        //
+        // Not counted in `count`, which reports `search_index` entries only.
+        // `index_fts_content` is DELETE-then-INSERT here, so it is idempotent
+        // regardless of what ran before it.
+        self.index_fts_content(&client, tenant_id, resource_type, resource_id, content)
+            .await?;
+
         Ok(count)
     }
 
@@ -3397,10 +3261,29 @@ impl SearchableContent {
 }
 
 /// Extracts searchable text content from a FHIR resource.
+///
+/// `full_content` backs `_content`, which FHIR defines as a search over *the
+/// entire content of the resource* — so it must be a superset of `_text`, the
+/// narrative-only search. `collect_strings` skips the `div` key deliberately, to
+/// keep raw XHTML markup (`div`, `p`, `xmlns`, attribute values) out of the
+/// index; that left the narrative missing from `_content` altogether, so a term
+/// that appeared only in `text.div` was findable through `_text` and invisible
+/// to `_content`. Appending the already-stripped narrative restores the
+/// superset relationship without indexing the markup, and matches SQLite, which
+/// has always had the narrative in `_content`. `data` stays excluded — base64
+/// attachment blobs are not text.
 fn extract_searchable_content(resource: &Value) -> SearchableContent {
+    let narrative = extract_narrative(resource);
+    let mut full_content = extract_all_strings(resource);
+    if !narrative.is_empty() {
+        if !full_content.is_empty() {
+            full_content.push(' ');
+        }
+        full_content.push_str(&narrative);
+    }
     SearchableContent {
-        narrative: extract_narrative(resource),
-        full_content: extract_all_strings(resource),
+        narrative,
+        full_content,
     }
 }
 
@@ -3462,5 +3345,87 @@ fn collect_strings(value: &Value, parts: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod fts_extraction_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn patient_with_narrative() -> Value {
+        json!({
+            "resourceType": "Patient",
+            "name": [{"family": "Purgetest"}],
+            "text": {
+                "status": "generated",
+                "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>Assessment: \
+                        Zebracrossingdiagnosis.</p></div>"
+            },
+            "photo": [{"contentType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUg=="}]
+        })
+    }
+
+    #[test]
+    fn content_includes_the_narrative() {
+        // Regression: `_content` is "the entire content of the resource", so a
+        // term that only appears in the narrative must be reachable through it.
+        // `collect_strings` skips the `div` key, which used to drop the
+        // narrative from `full_content` entirely — `_text` found the term,
+        // `_content` did not.
+        let content = extract_searchable_content(&patient_with_narrative());
+
+        assert!(
+            content.narrative.contains("Zebracrossingdiagnosis"),
+            "narrative: {}",
+            content.narrative
+        );
+        assert!(
+            content.full_content.contains("Zebracrossingdiagnosis"),
+            "_content must be a superset of _text: {}",
+            content.full_content
+        );
+        assert!(
+            content.full_content.contains("Purgetest"),
+            "the non-narrative fields must still be there: {}",
+            content.full_content
+        );
+    }
+
+    #[test]
+    fn content_excludes_markup_and_binary_payloads() {
+        // The narrative goes in stripped, not raw: tag and attribute noise would
+        // make every resource match `xmlns` or `div`. Base64 attachment data
+        // stays out for the same reason plus index size.
+        let content = extract_searchable_content(&patient_with_narrative());
+
+        assert!(
+            !content.full_content.contains("xmlns"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("<p>"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("iVBORw0KGgo"),
+            "{}",
+            content.full_content
+        );
+    }
+
+    #[test]
+    fn narrative_only_resource_is_not_empty() {
+        // `index_fts_content` returns early on `is_empty()`; a resource whose
+        // only text is its narrative must still be indexed.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Binary",
+            "text": {"div": "<div><p>Solitary</p></div>"}
+        }));
+
+        assert!(!content.is_empty());
+        assert!(content.full_content.contains("Solitary"));
     }
 }

@@ -284,16 +284,88 @@ pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     )
     .unwrap_or_default();
 
-    let expanded = quote! {
-        // --- Serialize Implementation ---
-        impl #impl_generics serde::Serialize for #name #ty_generics #where_clause {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                #serialize_impl
+    // `serialize` genuinely consumes the `S` type parameter, so unlike the
+    // struct constructor #509 hoisted, it cannot simply move into a non-generic
+    // nested `fn`. Instead `S` is *erased* at the impl boundary: the generic
+    // wrapper stays a handful of instructions and the body behind it is
+    // compiled exactly once, against `&mut dyn erased_serde::Serializer`.
+    //
+    // Without this the same body lands in a binary once per `(FHIR type,
+    // Serializer)` pair — measured at 8.4 copies across the ~3,700 FHIR types
+    // in `helios-rest --lib`, or 134.5 MB where one copy each is 24.8 MB.
+    //
+    // `Deserialize` is deliberately left monomorphized. The identical treatment
+    // saves a comparable ~110 MB, but `erased_serde`'s deserializer returns
+    // every value through a type-erased `Any`, which heap-allocates anything
+    // over 16 bytes — and the `Temp*` structs are kilobytes. That measured 2.7x
+    // slower on a 202 MB corpus of R4 spec examples, against 2.0x for
+    // `Serialize` on a path that starts out 4x faster. See #510.
+    //
+    // Generic FHIR types keep the old monomorphized shape: the erasure anchor
+    // has to be non-generic to be emitted once, and there are no generic
+    // `FhirSerde` types in the generated models anyway.
+    let serialize_impls = if generics.params.is_empty() {
+        quote! {
+            const _: () = {
+                // The serialized shape, written against a shim so the body can
+                // be reached through `erased_serde` without recursing back into
+                // `<#name as Serialize>::serialize`. Instantiated at exactly one
+                // `S` — erased-serde's internal serializer.
+                struct __FhirSerShim<'__a>(&'__a #name);
+
+                impl<'__a> serde::Serialize for __FhirSerShim<'__a> {
+                    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                    where
+                        S: serde::Serializer,
+                    {
+                        #[allow(unused_variables)]
+                        let __value = self.0;
+                        #serialize_impl
+                    }
+                }
+
+                // Non-generic (lifetimes do not monomorphize), so the unsizing
+                // coercion — and with it the vtable and everything it reaches —
+                // is emitted here, once, rather than in each crate that
+                // instantiates `serialize::<S>`.
+                #[inline(never)]
+                fn __fhir_erase_ser<'__a, '__b>(
+                    shim: &'__a __FhirSerShim<'__b>,
+                ) -> &'__a (dyn ::helios_serde_support::erased_serde::Serialize + '__a) {
+                    shim
+                }
+
+                impl serde::Serialize for #name {
+                    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                    where
+                        S: serde::Serializer,
+                    {
+                        ::helios_serde_support::erased_serde::serialize(
+                            __fhir_erase_ser(&__FhirSerShim(self)),
+                            serializer,
+                        )
+                    }
+                }
+            };
+        }
+    } else {
+        quote! {
+            impl #impl_generics serde::Serialize for #name #ty_generics #where_clause {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    #[allow(unused_variables)]
+                    let __value = self;
+                    #serialize_impl
+                }
             }
         }
+    };
+
+    let expanded = quote! {
+        // --- Serialize Implementation ---
+        #serialize_impls
 
         // --- Deserialize Implementation ---
         impl<'de> #impl_generics serde::Deserialize<'de> for #name #ty_generics #where_clause
@@ -760,7 +832,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                             match_arms.push(quote! {
                                 // Removed 'ref' from pattern
-                                Self::#variant_name(value) => {
+                                #name::#variant_name(value) => {
                                     // Check if the element has id or extension that needs to be serialized
                                     let has_extension = value.id.is_some() || value.extension.is_some();
                                     // Serialize the primitive value
@@ -784,7 +856,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             // Regular newtype variant
                             match_arms.push(quote! {
                                 // Removed 'ref' from pattern
-                                Self::#variant_name(value) => {
+                                #name::#variant_name(value) => {
                                     state.serialize_entry(#variant_key, value)?;
                                 }
                             });
@@ -793,7 +865,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     Fields::Unnamed(_) => {
                         // Tuple variant with multiple fields
                         match_arms.push(quote! {
-                            Self::#variant_name(ref value) => {
+                            #name::#variant_name(ref value) => {
                                 state.serialize_entry(#variant_key, value)?;
                             }
                         });
@@ -801,15 +873,15 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     Fields::Named(_fields) => {
                         // Struct variant
                         match_arms.push(quote! {
-                            Self::#variant_name { .. } => {
-                                state.serialize_entry(#variant_key, self)?;
+                            #name::#variant_name { .. } => {
+                                state.serialize_entry(#variant_key, __value)?;
                             }
                         });
                     }
                     Fields::Unit => {
                         // Unit variant
                         match_arms.push(quote! {
-                            Self::#variant_name => {
+                            #name::#variant_name => {
                                 state.serialize_entry(#variant_key, &())?;
                             }
                         });
@@ -828,8 +900,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                 // Create a serialization state
                 let mut state = serializer.serialize_map(Some(count))?;
 
-                // Match on self to determine which variant to serialize
-                match self {
+                // Match on the value to determine which variant to serialize.
+                // It is bound as `__value` rather than read off `self` so the
+                // same body can be emitted inside the erasure shim, which is a
+                // different type from the enum it serializes.
+                match __value {
                     #(#match_arms)*
                 }
 
@@ -867,7 +942,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let is_fhir_element = is_element || is_decimal_element;
 
                         // Use field_name_ident for accessing the struct field
-                        let field_access = quote! { self.#field_name_ident };
+                        let field_access = quote! { __value.#field_name_ident };
 
                         let extension_field_ident =
                             format_ident!("is_{}_extension", field_name_ident);
@@ -1677,7 +1752,14 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                 let variant_key = rename.unwrap_or_else(|| variant_name_str.clone());
                 variant_names.push(variant_key.clone()); // Keep track of expected keys
 
-                // Generate the specific deserialization logic for this variant
+                // Generate the specific deserialization logic for this variant.
+                //
+                // Every arm below delegates the actual work to a shared helper in
+                // `helios-serde-support` rather than expanding it inline. Choice enums carry
+                // one variant per permitted FHIR datatype (dozens each) and there are hundreds
+                // of such enums per FHIR version, so inlining the extension-reunification and
+                // error-formatting logic multiplies out into hundreds of megabytes of
+                // near-identical code in any binary that deserializes typed resources.
                 let deserialization_logic = match &variant.fields {
                     Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
                         // Newtype variant (e.g., String(String))
@@ -1687,100 +1769,28 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                         if is_element || is_decimal_element {
                             // --- Element/DecimalElement Variant Construction ---
-                            let underscore_variant_key_str = format!("_{}", variant_key); // For error messages
-
-                            // Determine the primitive type V or PreciseDecimal for the value field
-                            let primitive_type_for_element = if is_decimal_element {
-                                quote! { crate::PreciseDecimal }
-                            } else {
-                                // Extract V from Element<V, E> or the alias's underlying primitive
-                                // Need to re-determine the base type here
-                                let base_type = get_base_type(field_ty);
-                                if let Type::Path(type_path) = base_type {
-                                    if let Some(last_segment) = type_path.path.segments.last() {
-                                        if last_segment.ident == "Element" {
-                                            // Direct Element<V, E>
-                                            if let PathArguments::AngleBracketed(generics) =
-                                                &last_segment.arguments
-                                            {
-                                                if let Some(GenericArgument::Type(inner_v_type)) =
-                                                    generics.args.first()
-                                                {
-                                                    quote! { #inner_v_type }
-                                                } else {
-                                                    panic!("Element missing generic argument V");
-                                                }
-                                            } else {
-                                                panic!("Element missing angle bracketed arguments");
-                                            }
-                                        } else {
-                                            // Alias
-                                            let alias_name = last_segment.ident.to_string();
-                                            let primitive_type_str =
-                                                extract_inner_element_type(&alias_name);
-                                            let primitive_type_parsed: Type = syn::parse_str(
-                                                primitive_type_str,
-                                            )
-                                            .expect("Failed to parse primitive type string");
-                                            quote! { #primitive_type_parsed }
-                                        }
-                                    } else {
-                                        panic!("Could not get last segment of Element type path");
-                                    }
-                                } else {
-                                    panic!("Element type is not a Type::Path");
-                                }
-                            };
-
+                            // `V` and `E` are inferred from the assignments into `element`,
+                            // so the primitive type never has to be spelled out here.
                             quote! {
-                                // Check if parts exist *before* potentially moving them
-                                let has_value_part = value_part.is_some();
-                                let has_extension_part = extension_part.is_some();
-
-                                // Deserialize the extension part if present
-                                let mut ext_helper_opt: Option<IdAndExtensionHelper> = None;
-                                if let Some(ext_value) = extension_part { // Move happens here
-                                    ext_helper_opt = Some(serde::Deserialize::deserialize(ext_value)
-                                        .map_err(|e| serde::de::Error::custom(format!("Error deserializing extension {}: {}", #underscore_variant_key_str, e)))?);
-                                }
-
-                                // Deserialize the value part if present, consuming value_part
-                                let deserialized_value_opt = if let Some(prim_value) = value_part { // Move of value_part happens here
-                                    // Use #primitive_type_for_element determined outside
-                                    Some(<#primitive_type_for_element>::deserialize(prim_value)
-                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing primitive {}: {}", #variant_key, e)))?)
-                                } else {
-                                    None::<#primitive_type_for_element> // Explicit type needed for None
-                                };
-
-                                // Construct the element using deserialized parts
-                                let mut element: #field_ty = Default::default(); // Start with default
-
-                                // Assign deserialized value
-                                element.value = deserialized_value_opt; // Assign the Option<V> or Option<PreciseDecimal>
-
-                                // Merge the extension data if it exists
-                                if let Some(ext_helper) = ext_helper_opt {
-                                    if ext_helper.id.is_some() {
-                                        element.id = ext_helper.id;
-                                    }
-                                    if ext_helper.extension.is_some() {
-                                        element.extension = ext_helper.extension;
-                                    }
-                                }
-                                // Note: The check `if !has_value_part && has_extension_part { element.value = None; }`
-                                // is now redundant because element.value is already None if !has_value_part.
-
+                                let (__value, __id, __extension) =
+                                    ::helios_serde_support::deserialize_choice_element_parts::<_, _, A::Error>(
+                                        value_part, extension_part, #variant_key,
+                                    )?;
+                                let mut element: #field_ty = Default::default();
+                                element.value = __value;
+                                element.id = __id;
+                                element.extension = __extension;
                                 Ok(#name::#variant_name(element))
                             }
                             // --- End Element/DecimalElement Variant Construction ---
                         } else {
                             // --- Regular Newtype Variant Construction ---
                             quote! {
-                                let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                                let inner_value = serde::Deserialize::deserialize(value)
-                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing non-element variant {}: {}", #variant_key, e)))?;
-                                Ok(#name::#variant_name(inner_value)) // Removed .into()
+                                Ok(#name::#variant_name(
+                                    ::helios_serde_support::deserialize_choice_value::<_, A::Error>(
+                                        value_part, #variant_key, "non-element variant",
+                                    )?
+                                ))
                             }
                             // --- End Regular Newtype Variant Construction ---
                         }
@@ -1788,19 +1798,21 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                     Fields::Unnamed(_) => {
                         // Tuple variant
                         quote! {
-                            let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                            let inner_value = serde::Deserialize::deserialize(value)
-                                .map_err(|e| serde::de::Error::custom(format!("Error deserializing tuple variant {}: {}", #variant_key, e)))?;
-                            Ok(#name::#variant_name(inner_value)) // Use variant_name directly
+                            Ok(#name::#variant_name(
+                                ::helios_serde_support::deserialize_choice_value::<_, A::Error>(
+                                    value_part, #variant_key, "tuple variant",
+                                )?
+                            ))
                         }
                     }
                     Fields::Named(_) => {
                         // Struct variant
                         quote! {
-                            let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                            let inner_value = serde::Deserialize::deserialize(value)
-                                .map_err(|e| serde::de::Error::custom(format!("Error deserializing struct variant {}: {}", #variant_key, e)))?;
-                            Ok(#name::#variant_name(inner_value)) // Use variant_name directly
+                            Ok(#name::#variant_name(
+                                ::helios_serde_support::deserialize_choice_value::<_, A::Error>(
+                                    value_part, #variant_key, "struct variant",
+                                )?
+                            ))
                         }
                     }
                     Fields::Unit => {
@@ -1811,130 +1823,57 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                     }
                 }; // End match variant.fields
 
-                // Push the complete match arm
+                // Push the complete match arm, keyed on the variant's index in
+                // `VARIANT_KEYS` so the dispatch compiles to a jump table rather than
+                // a chain of string comparisons.
+                let variant_index = variant_matches.len();
                 variant_matches.push(quote! {
-                    #variant_key => { // Use the string key as the match pattern
+                    #variant_index => {
                         #deserialization_logic // Embed the generated logic block
                     }
                 });
             } // End loop over variants
 
-            // Define the helper type alias needed for enum deserialization
-            let id_extension_helper_def = quote! {
-                // Type alias for deserializing the id/extension part from _fieldName
-                type IdAndExtensionHelper = helios_serde_support::IdAndExtensionOwned<Extension>;
-            };
-
-            // Generate the enum deserialization implementation
+            // Generate the enum deserialization implementation.
+            //
+            // The key scan lives in `helios_serde_support::deserialize_choice_parts`, which is
+            // generic only over the `MapAccess` implementation — so it is emitted once per
+            // deserializer rather than once per enum. All that remains here is a jump table
+            // over the matched variant index.
             return quote! {
-                // Import necessary crates/modules at the top level of the impl block
-                use serde::{Deserialize, de::{self, Visitor, MapAccess}};
-                use serde_json; // Needed for Value
-                use std::collections::HashSet; // Needed for processed_keys
-                // NOTE: Removed `use syn;` as it's not needed at runtime
+                struct EnumVisitor;
 
-                // Define the helper struct at the top level of the impl block
-                #id_extension_helper_def
-
-                // Define a visitor for the enum (no longer needs variants reference)
-                struct EnumVisitor; // Removed lifetime and variants field
-
-                impl<'de> serde::de::Visitor<'de> for EnumVisitor { // Removed lifetime 'a
+                impl<'de> serde::de::Visitor<'de> for EnumVisitor {
                     type Value = #name;
 
                     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                         formatter.write_str(concat!("a ", #enum_name, " enum"))
                     }
 
-                    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
                     where
                         A: serde::de::MapAccess<'de>,
                     {
-                        let mut found_variant_key: Option<std::string::String> = None;
-                        let mut value_part: Option<serde_json::Value> = None;
-                        let mut extension_part: Option<serde_json::Value> = None;
-                        let mut processed_keys = std::collections::HashSet::new(); // Track processed keys
+                        const VARIANT_KEYS: &[&str] = &[#(#variant_names),*];
 
-                        // Iterate through map entries directly, deserializing key as Value
-                        while let Some((key_value, current_value)) = map.next_entry::<serde_json::Value, serde_json::Value>()? {
-                            // Ensure the key is a string
-                            let key_str = match key_value {
-                                serde_json::Value::String(s) => s,
-                                _ => return Err(serde::de::Error::invalid_type(serde::de::Unexpected::Other("non-string key"), &"a string key")),
-                            };
+                        let ::helios_serde_support::ChoiceParts {
+                            index,
+                            value: value_part,
+                            extension: extension_part,
+                        } = ::helios_serde_support::deserialize_choice_parts(map, VARIANT_KEYS)?;
 
-                            let mut key_matched = false;
-                            #( // Loop over variant_names (&'static str)
-                                let base_name = #variant_names; // e.g., "authorString"
-                                let underscore_name = format!("_{}", base_name); // e.g., "_authorString"
-
-                                if key_str.as_str() == base_name { // Compare &str == &'static str
-                                    if value_part.is_some() {
-                                        return Err(serde::de::Error::duplicate_field(base_name));
-                                    }
-                                    value_part = Some(current_value.clone()); // Store the value
-                                    // If we already found a key based on the underscore version, ensure it matches
-                                    if let Some(ref existing_key) = found_variant_key {
-                                        if existing_key != base_name {
-                                             // Use key_str.as_str() for formatting
-                                             return Err(serde::de::Error::custom(format!("Mismatched keys found: {} and {}", existing_key, key_str.as_str())));
-                                        }
-                                    } else {
-                                        found_variant_key = Some(base_name.to_string());
-                                    }
-                                    processed_keys.insert(key_str.clone()); // Clone the String key
-                                    key_matched = true;
-                                } else if key_str.as_str() == underscore_name.as_str() { // Compare &str == &str
-                                    if extension_part.is_some() {
-                                        // Use custom error message as duplicate_field requires 'static str
-                                        return Err(serde::de::Error::custom(format!("duplicate field '{}'", key_str)));
-                                    }
-                                    extension_part = Some(current_value.clone()); // Store the extension value
-                                    // If we already found a key based on the base version, ensure it matches
-                                     if let Some(ref existing_key) = found_variant_key {
-                                        if existing_key != base_name {
-                                             // Use key_str.as_str() for formatting
-                                             return Err(serde::de::Error::custom(format!("Mismatched keys found: {} and {}", existing_key, key_str.as_str())));
-                                        }
-                                    } else {
-                                        found_variant_key = Some(base_name.to_string()); // Store the BASE name
-                                    }
-                                    processed_keys.insert(key_str.clone());
-                                    key_matched = true;
-                                }
-                            )*
-                            // If the key didn't match any expected variant key (base or underscore), ignore it?
-                            // Or error? Let's ignore for now, assuming other fields might be present.
-                            // if !key_matched {
-                            //     // Handle unexpected fields if necessary
-                            // }
-                        }
-
-                        // Ensure a variant key was found
-                        let variant_key = match found_variant_key {
-                            Some(key) => key, // key is the base name (String)
-                            None => {
-                                // No matching key found at all
-                                return Err(serde::de::Error::custom(format!(
-                                    "Expected one of the variant keys {:?} (or their underscore-prefixed versions) but found none",
-                                    [#(#variant_names),*]
-                                )));
-                            }
-                        };
-
-                        // --- Construct the variant based on found_variant_key, value_part, extension_part ---
-                        match variant_key.as_str() {
+                        match index {
                             // Use the pre-generated match arms
                             #(#variant_matches)*
 
-                            // Fallback for unknown variant key (should not be reached if logic above is correct)
-                            _ => Err(serde::de::Error::unknown_variant(&variant_key, &[#(#variant_names),*])),
+                            // Unreachable: `deserialize_choice_parts` only ever returns an
+                            // index into VARIANT_KEYS, which the arms above cover exhaustively.
+                            _ => Err(serde::de::Error::custom("unknown choice variant index")),
                         }
                     }
                 }
 
-                // Use the visitor to deserialize the enum (no longer needs variants)
-                deserializer.deserialize_map(EnumVisitor) // Removed variants passing
+                deserializer.deserialize_map(EnumVisitor)
             };
         }
         Data::Struct(ref data) => {
@@ -2590,6 +2529,19 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
         type IdAndExtensionHelper = helios_serde_support::IdAndExtensionOwned<Extension>;
     };
 
+    // The reunification step — merging each `field` with its `_field` metadata sibling
+    // back into an `Element` — is by far the largest part of the generated deserializer,
+    // and it depends only on the temporary struct, never on `D`. Emitting it as a nested
+    // *non-generic* `fn` (items in a function body do not inherit the enclosing generics)
+    // means it is codegen'd once per FHIR type instead of once per `(type, Deserializer)`
+    // pair in every crate that deserializes it. `Deserializer` implementations are
+    // plentiful — serde_json's reader and `Value`, serde's `MapAccessDeserializer` /
+    // `ContentDeserializer` wrappers, the XML deserializer — so the same body was
+    // previously landing in a binary a dozen or more times over.
+    //
+    // `serde_json::Error` is used as the intermediate error type (it implements
+    // `serde::de::Error`, so the error text is unchanged) and is re-wrapped into
+    // `D::Error` via `custom` at the call site.
     quote! {
         #id_extension_helper_def
 
@@ -2605,13 +2557,18 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
             #(#temp_struct_json_attrs)*
         }
 
-        let temp_struct = #struct_name::deserialize(deserializer)?;
-
         #[cfg(feature = "xml")]
-        return Ok(#name { #(#constructor_xml_attrs)* });
+        fn __from_temp(temp_struct: #struct_name) -> Result<#name, serde_json::Error> {
+            Ok(#name { #(#constructor_xml_attrs)* })
+        }
 
         #[cfg(not(feature = "xml"))]
-        return Ok(#name { #(#constructor_json_attrs)* });
+        fn __from_temp(temp_struct: #struct_name) -> Result<#name, serde_json::Error> {
+            Ok(#name { #(#constructor_json_attrs)* })
+        }
+
+        let temp_struct = #struct_name::deserialize(deserializer)?;
+        __from_temp(temp_struct).map_err(serde::de::Error::custom)
     }
 }
 
@@ -3183,86 +3140,27 @@ fn generate_fhirpath_enum_impl(
                     let is_choice_type_enum = fhir_field_name != variant_name_str &&
                         extract_type_suffix_from_field_name(&fhir_field_name).is_some();
 
+                    // Both shapes stamp the key-derived FHIR type onto the inner result so
+                    // `.ofType()` keeps working; a choice-type enum additionally wraps it in a
+                    // single-key object named after the type-suffixed field. Both steps live in
+                    // `helios-fhirpath-support` rather than being inlined per variant — see
+                    // `with_choice_type_info` for why.
                     if is_choice_type_enum {
                         quote! {
-                            Self::#variant_name(value) => {
-                                // Get the base evaluation result from the inner value
-                                let mut result = value.to_evaluation_result();
-                                // Add FHIR type information to preserve type for .ofType() operations
-                                // For choice type enums, always use the type determined from the field name
-                                result = match result {
-                                    helios_fhirpath_support::EvaluationResult::String(s, _existing_type_info, m) => {
-                                        // Always use the determined type from the field name for choice types
-                                        let type_info = helios_fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type);
-                                        helios_fhirpath_support::EvaluationResult::String(s, Some(type_info), m)
-                                    },
-                                    helios_fhirpath_support::EvaluationResult::Integer(i, existing_type_info, m) => {
-                                        let type_info = existing_type_info.unwrap_or_else(|| helios_fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
-                                        helios_fhirpath_support::EvaluationResult::Integer(i, Some(type_info), m)
-                                    },
-                                    helios_fhirpath_support::EvaluationResult::Decimal(d, existing_type_info, m) => {
-                                        let type_info = existing_type_info.unwrap_or_else(|| helios_fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
-                                        helios_fhirpath_support::EvaluationResult::Decimal(d, Some(type_info), m)
-                                    },
-                                    helios_fhirpath_support::EvaluationResult::Boolean(b, existing_type_info, m) => {
-                                        let type_info = existing_type_info.unwrap_or_else(|| helios_fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
-                                        helios_fhirpath_support::EvaluationResult::Boolean(b, Some(type_info), m)
-                                    },
-                                    helios_fhirpath_support::EvaluationResult::Object { map, type_info: existing_type_info } => {
-                                        let type_info = existing_type_info.unwrap_or_else(|| helios_fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
-                                        helios_fhirpath_support::EvaluationResult::Object {
-                                            map,
-                                            type_info: Some(type_info),
-                                        }
-                                    },
-                                    _ => result, // For other types, return as-is
-                                };
-
-                                // Wrap the result in an object with the field name as the key
-                                let mut map = std::collections::HashMap::new();
-                                map.insert(#fhir_field_name.to_string(), result);
-                                helios_fhirpath_support::EvaluationResult::Object {
-                                    map,
-                                    type_info: None, // No type info for the wrapper object
-                                }
-                            }
+                            Self::#variant_name(value) => helios_fhirpath_support::wrap_choice_field(
+                                helios_fhirpath_support::with_choice_type_info(
+                                    value.to_evaluation_result(),
+                                    #fhir_type,
+                                ),
+                                #fhir_field_name,
+                            ),
                         }
                     } else {
                         quote! {
-                            Self::#variant_name(value) => {
-                                // Get the base evaluation result from the inner value
-                                let mut result = value.to_evaluation_result();
-                                // Add FHIR type information to preserve type for .ofType() operations
-                                // For choice type enums, always use the type determined from the field name
-                                result = match result {
-                                    helios_fhirpath_support::EvaluationResult::String(s, _existing_type_info, m) => {
-                                        // Always use the determined type from the field name for choice types
-                                        let type_info = helios_fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type);
-                                        helios_fhirpath_support::EvaluationResult::String(s, Some(type_info), m)
-                                    },
-                                    helios_fhirpath_support::EvaluationResult::Integer(i, existing_type_info, m) => {
-                                        let type_info = existing_type_info.unwrap_or_else(|| helios_fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
-                                        helios_fhirpath_support::EvaluationResult::Integer(i, Some(type_info), m)
-                                    },
-                                    helios_fhirpath_support::EvaluationResult::Decimal(d, existing_type_info, m) => {
-                                        let type_info = existing_type_info.unwrap_or_else(|| helios_fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
-                                        helios_fhirpath_support::EvaluationResult::Decimal(d, Some(type_info), m)
-                                    },
-                                    helios_fhirpath_support::EvaluationResult::Boolean(b, existing_type_info, m) => {
-                                        let type_info = existing_type_info.unwrap_or_else(|| helios_fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
-                                        helios_fhirpath_support::EvaluationResult::Boolean(b, Some(type_info), m)
-                                    },
-                                    helios_fhirpath_support::EvaluationResult::Object { map, type_info: existing_type_info } => {
-                                        let type_info = existing_type_info.unwrap_or_else(|| helios_fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
-                                        helios_fhirpath_support::EvaluationResult::Object {
-                                            map,
-                                            type_info: Some(type_info),
-                                        }
-                                    },
-                                    _ => result, // For other types, return as-is
-                                };
-                                result
-                            }
+                            Self::#variant_name(value) => helios_fhirpath_support::with_choice_type_info(
+                                value.to_evaluation_result(),
+                                #fhir_type,
+                            ),
                         }
                     }
                 }

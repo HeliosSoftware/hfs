@@ -1,0 +1,112 @@
+name: Cargo target dir GC
+description: >
+  Cap the size of the workspace `target/` directory on a self-hosted runner by
+  evicting least-recently-used build artifacts. Runs at the end of every job
+  that compiles Rust on a persistent runner.
+
+# Why this exists
+# ---------------
+# Nothing in cargo ever deletes a stale artifact. Every dependency bump,
+# toolchain update and feature-flag combination adds a new set of `.rlib`s,
+# `.rmeta`s and incremental fragments alongside the old ones, and the old ones
+# stay forever. On a GitHub-hosted runner that does not matter — the machine is
+# thrown away. On our self-hosted runners it compounds indefinitely, because the
+# jobs that feed `target/` check out with `clean: false` on purpose (a warm
+# target dir is what keeps `test-rust` inside its 120-minute budget). Growth is
+# the price of that cache; a ceiling is the only thing that bounds it.
+#
+# Why per-run and not a nightly cron: same reasoning as `docker-host-gc`. The
+# runner fills during the working day, and a nightly sweep cannot help a job
+# that dies out of disk at 16:03 — by the time it fires the damage is twelve
+# hours old and several runs have already gone red.
+#
+# It is a soft cap, not a hard ceiling. cargo-sweep evicts the artifacts cargo
+# manages under `deps/`, `build/`, `.fingerprint/` and `incremental/` — which is
+# precisely the part that compounds — but it does not remove the linked outputs
+# at `target/<profile>/<bin>`. Those are hardlinked to their `deps/` copy
+# (verified: link count 2), so sweeping the dep entry frees nothing while the
+# top-level name survives. That residue is a small constant per profile and is
+# overwritten by the next build; it does not accumulate. Expect the swept
+# directory to settle slightly above `maxsize`, not exactly at it.
+#
+# Scope: this caps `target/` only. `~/.cargo/registry` also grows without bound
+# (every `.crate` tarball and unpacked source ever resolved), but far more
+# slowly — it is measured in single-digit GB, not hundreds. If it ever becomes
+# the problem it needs a different tool; cargo-sweep does not touch it. The
+# `free-floor-gb` warning exists so that "something *else* on this box is
+# filling up" surfaces in a job log rather than as a mystery.
+#
+# Why two near-identical steps below
+# ----------------------------------
+# This originally skipped Windows on the grounds that "the Windows runner is not
+# the one running out of space". That stopped being true immediately: agent4 is
+# the sole Windows agent, `test-fhirpath` is pinned to it and checks out with
+# `clean: false`, and the unpinned `runs-on: [self-hosted]` jobs land there too
+# — so it accumulated a full all-features workspace target dir with nothing ever
+# evicting it, and filled the disk. Skipping it was the bug.
+#
+# The plain `shell: bash` alias resolves to WSL bash on that agent, which has no
+# distro installed and aborts before running a line, so the Windows step points
+# at Git Bash through its space-free 8.3 short path — the same workaround
+# ci.yml already uses for its bash-only steps. Both steps run the identical
+# `sweep.sh` with the identical arguments; the script lives in a file rather
+# than inline precisely so the two paths cannot drift.
+
+inputs:
+  maxsize:
+    description: >
+      Size ceiling for `target/`. cargo-sweep evicts oldest-first until the
+      directory is under this. ALWAYS pass an explicit unit: a bare number is
+      interpreted as MEGABYTES, so `100` means 100MB and would evict essentially
+      the entire warm cache on every run.
+
+      100GB suits every agent we have: the smallest disk in the fleet is the
+      1.5TB C: on the Windows agent, so the ceiling leaves an order of magnitude
+      of headroom while still bounding the thing that compounds. Check this
+      assumption before adding a runner with a smaller disk — a ceiling above
+      the volume size is a no-op, not a cap.
+    required: false
+    default: 100GB
+  free-floor-gb:
+    description: >
+      Emit a `::warning::` when the checkout's filesystem has less than this
+      many GB free *after* sweeping. Not a failure — it is the early signal that
+      something this action does not manage is filling the runner. `0` disables.
+
+      100 rather than something tighter because a single job here can consume
+      tens of GB in one go: an all-features workspace build, or `cargo llvm-cov`
+      laying down a whole second instrumented profile. A floor that only trips
+      at 20GB free would routinely fire for the first time on the run that
+      already failed.
+    required: false
+    default: "100"
+  cargo-sweep-version:
+    description: >
+      Pinned cargo-sweep version. >=0.7.0 is required for unit suffixes on
+      `--maxsize`; >=0.8.0 for Rust 1.85+ compatibility (our MSRV is 1.90).
+    required: false
+    default: 0.8.0
+
+runs:
+  using: composite
+  steps:
+    - name: Cap target dir size (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        MAXSIZE: ${{ inputs.maxsize }}
+        WANT: ${{ inputs.cargo-sweep-version }}
+        FREE_FLOOR_GB: ${{ inputs.free-floor-gb }}
+      # `${GITHUB_ACTION_PATH//\\//}` — the runner hands this out in native form,
+      # so on Windows it arrives with backslashes, which bash reads as escapes.
+      # Normalising in both steps keeps the two `run:` bodies byte-identical.
+      run: bash "${GITHUB_ACTION_PATH//\\//}/sweep.sh"
+
+    - name: Cap target dir size (Windows)
+      if: runner.os == 'Windows'
+      shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+      env:
+        MAXSIZE: ${{ inputs.maxsize }}
+        WANT: ${{ inputs.cargo-sweep-version }}
+        FREE_FLOOR_GB: ${{ inputs.free-floor-gb }}
+      run: bash "${GITHUB_ACTION_PATH//\\//}/sweep.sh"

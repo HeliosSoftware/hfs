@@ -8,7 +8,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::tenant::TenantId;
+use crate::tenant::{TenantId, TenantIdError};
 
 /// The primary error type for all storage operations.
 ///
@@ -166,6 +166,19 @@ pub enum TenantError {
     InvalidTenant {
         /// Tenant identifier that failed validation.
         tenant_id: TenantId,
+    },
+
+    /// A tenant id offered for provisioning is not canonical.
+    ///
+    /// Distinct from [`InvalidTenant`](Self::InvalidTenant) because it carries
+    /// the *reason*: this reaches an operator through the admin API, where "the
+    /// id is 71 bytes" is actionable and "invalid tenant" is not.
+    #[error("tenant id '{tenant_id}' is not valid: {reason}")]
+    NonCanonicalTenantId {
+        /// The rejected identifier, as supplied.
+        tenant_id: String,
+        /// Why [`TenantId::parse`](crate::tenant::TenantId::parse) rejected it.
+        reason: TenantIdError,
     },
 
     /// Tenant is suspended and cannot perform operations.
@@ -395,6 +408,23 @@ pub enum TransactionError {
     UnsupportedIsolationLevel {
         /// Isolation level requested but not supported.
         level: String,
+    },
+
+    /// The backend cannot provide the all-or-nothing semantics a FHIR
+    /// `transaction` bundle requires.
+    ///
+    /// Distinct from [`RolledBack`](Self::RolledBack): nothing was attempted,
+    /// so no partial state exists. Raised *before* the first write so the
+    /// refusal is total — the failure mode in #489 was the opposite, a
+    /// best-effort attempt that committed 466 of 473 entries and reported
+    /// failure. Callers should surface this as a client error suggesting a
+    /// `batch` bundle, which carries no atomicity requirement.
+    #[error(
+        "backend '{backend_name}' cannot guarantee transaction atomicity; use a batch bundle instead"
+    )]
+    AtomicityUnsupported {
+        /// Backend identifier (e.g., `s3`).
+        backend_name: String,
     },
 }
 

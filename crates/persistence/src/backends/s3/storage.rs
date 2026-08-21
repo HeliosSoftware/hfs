@@ -1057,7 +1057,13 @@ impl ResourceStorage for S3Backend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
-        crate::tenant::ensure_mutable_tenant(id)?;
+        // Backstop for the canonical tenant-id contract (issue #385). S3 is the
+        // backend with the most to lose here: `with_tenant_prefix` gives `/`
+        // structural meaning, so tenant `a/resources` would store under
+        // `a/resources/…` — inside the prefix tenant `a` lists and
+        // `purge_tenant_data("a")` deletes. `TenantId::parse` rejects the
+        // reserved segment, making that shape unconstructible.
+        self.ensure_canonical_tenant_id(id)?;
         let location = self
             .registry_location()
             .ok_or_else(|| self.tenant_registry_unsupported())?;

@@ -11,6 +11,13 @@
  * paint; with JS disabled the page stays light, which is the design default.
  */
 
+/* Cascade layers (#543): tokens < base < components < pages. A page-layer
+   rule outranks a component rule regardless of specificity, and shared
+   component definitions can never be accidentally beaten by an earlier
+   page block. Every rule below lives in exactly one layer. */
+@layer tokens, base, components, pages;
+
+@layer base {
 /* Vendored Figtree variable font (OFL) — no runtime CDN, per crate rules. */
 @font-face {
   font-family: "Figtree";
@@ -33,7 +40,9 @@
     U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
     U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
+}
 
+@layer tokens {
 :root {
   color-scheme: light;
   /* Page + panes */
@@ -55,6 +64,14 @@
   --outline: #e4e4e4;
   /* Chart */
   --grid-line: #dcdcdc;
+  /* Series palette (#555): six distinguishable strokes, legible on both
+     themes at 1.5px. Slot 1 is the brand accent. */
+  --series-1: #33b8ff;
+  --series-2: #7c6cff;
+  --series-3: #2fbf71;
+  --series-4: #f39c2d;
+  --series-5: #e35d8a;
+  --series-6: #8a93a6;
   --accent: #33b8ff;
   --accent-soft: rgb(51 184 255 / 15%);
   /* A darker cast of the accent for the one place the light celeste can't work:
@@ -92,7 +109,9 @@
   --grid-line: rgb(255 255 255 / 12%);
   --input-bg: #1a1a1a;
 }
+}
 
+@layer base {
 * {
   box-sizing: border-box;
 }
@@ -105,13 +124,12 @@ body {
   font-size: 15px;
   line-height: 1.2;
 }
-
-/* The fixed sidebar sits outside the grid flow, so the flow columns need
-   explicit placement — otherwise the pane auto-fills the rail column. */
-.pane {
-  grid-column: 2;
 }
 
+@layer components {
+/* The fixed sidebar sits outside the grid flow, so the flow columns need
+   explicit placement — otherwise the pane auto-fills the rail column. The
+   .pane rule itself lives with the top-bar section. */
 body.has-nav-panel .nav-panel {
   grid-column: 2;
 }
@@ -119,7 +137,9 @@ body.has-nav-panel .nav-panel {
 body.has-nav-panel .pane {
   grid-column: 3;
 }
+}
 
+@layer base {
 svg {
   display: block;
 }
@@ -129,7 +149,9 @@ svg {
 [hidden] {
   display: none !important;
 }
+}
 
+@layer components {
 /* ---------- Sidebar ---------- */
 
 .sidebar {
@@ -163,6 +185,18 @@ svg {
   align-items: center;
   gap: 12px;
   padding: 4px 0;
+  color: inherit;
+  text-decoration: none;
+}
+
+.brand:hover .brand__name,
+.brand:focus-visible .brand__name {
+  color: var(--accent-text);
+}
+
+.brand:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
 }
 
 .brand__logo {
@@ -475,6 +509,7 @@ button.menu__option {
 /* ---------- Top bar + content pane ---------- */
 
 .pane {
+  grid-column: 2;
   display: flex;
   flex-direction: column;
   background: var(--bg-content);
@@ -571,15 +606,6 @@ button.menu__option {
 .content {
   flex: 1;
   padding: 24px 32px 32px;
-  max-width: 1161px;
-}
-
-.page-title {
-  margin: 8px 0 24px;
-  font-size: 35px;
-  font-weight: 500;
-  letter-spacing: -0.7px;
-  color: var(--text);
 }
 
 /* ---------- Cards ---------- */
@@ -621,19 +647,36 @@ button.menu__option {
   color: var(--text);
 }
 
-.stat__unit {
-  font-size: 17px;
-  letter-spacing: -0.3px;
-  vertical-align: 12px;
-}
-
 .stat__sub {
   display: block;
   margin-top: 6px;
   font-size: 12px;
   color: var(--muted);
 }
+}
 
+@layer components {
+.stat--link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+
+.stat--link:hover {
+  border-color: var(--accent);
+}
+
+.stat--link:focus-visible {
+  outline: 2px solid var(--outline);
+  outline-offset: 2px;
+}
+
+.stat__value--unavailable {
+  color: var(--muted);
+}
+}
+
+@layer pages {
 /* ---------- Chart card ---------- */
 
 .chart-card {
@@ -650,7 +693,9 @@ button.menu__option {
   display: flex;
   gap: 8px;
 }
+}
 
+@layer components {
 .pill {
   display: flex;
   align-items: center;
@@ -665,12 +710,6 @@ button.menu__option {
   color: var(--muted);
 }
 
-.pill--square {
-  width: 42px;
-  padding: 0;
-  justify-content: center;
-}
-
 /* A pill rendered as a real <button> (e.g. the chart-expand affordance) keeps
    the pill look but sheds the native button chrome and inherits type. */
 button.pill {
@@ -679,7 +718,9 @@ button.pill {
   color: inherit;
   cursor: pointer;
 }
+}
 
+@layer pages {
 .chart {
   width: 100%;
   height: auto;
@@ -784,6 +825,207 @@ button.pill {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---------- Functional chart (#555): multi-series, picker, tooltip -------- */
+
+/* Legend focus (#602): the focused line carries the weight, the rest recede
+   but stay on the chart at their true values. */
+.chart .series--focused { stroke-width: 3; }
+.chart .series--receded { opacity: 0.25; }
+
+/* The invisible twin polyline inside each line's focus anchor: a 14px hit
+   corridor, since a 1.5px stroke is no click target. */
+.chart .series-hit {
+  stroke: transparent;
+  stroke-width: 14;
+  fill: none;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.chart-legend__item--focused {
+  font-weight: 600;
+  color: var(--text-strong);
+}
+.chart-legend__item--focused .chart-legend__dot {
+  outline: 2px solid var(--text-strong);
+  outline-offset: 1px;
+}
+
+/* Series palette: slot N styles both the polyline and its legend dot. */
+.chart .series--1 { stroke: var(--series-1); }
+.chart .series--2 { stroke: var(--series-2); }
+.chart .series--3 { stroke: var(--series-3); }
+.chart .series--4 { stroke: var(--series-4); }
+.chart .series--5 { stroke: var(--series-5); }
+.chart .series--6 { stroke: var(--series-6); }
+
+.chart-legend__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.chart-legend__dot--1 { background: var(--series-1); }
+.chart-legend__dot--2 { background: var(--series-2); }
+.chart-legend__dot--3 { background: var(--series-3); }
+.chart-legend__dot--4 { background: var(--series-4); }
+.chart-legend__dot--5 { background: var(--series-5); }
+.chart-legend__dot--6 { background: var(--series-6); }
+
+/* Type picker: the mockup's checkbox menu, as plain toggle links. */
+.chart-pick summary.pill {
+  cursor: pointer;
+  max-width: 320px;
+}
+
+.chart-pick .menu__panel {
+  min-width: 260px;
+}
+
+/* The option list scrolls on its own so the heading and the filter stay put
+   however many types the tenant stores. */
+.chart-pick__list {
+  max-height: min(340px, 50vh);
+  overflow-y: auto;
+}
+
+.chart-pick__option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+}
+
+.chart-pick__box {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: #ffffff;
+  border: 1.5px solid var(--surface-border);
+  border-radius: 4px;
+}
+
+.chart-pick__option--on .chart-pick__box {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+/* "View all resources" (#599) sits above the filter input, set off from the
+   scrolling option list below it by a divider. */
+.chart-pick__option--all {
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.chart-pick__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chart-pick__count {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-pick__none {
+  margin: 4px 8px 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Tooltip host: the wrapper is the positioning context for the readout and
+   the vertical guide the script moves along the buckets. */
+.chart-wrap {
+  position: relative;
+  /* The svg scales its viewBox (text included) with rendered width; cap it so
+     axis labels stay near their designed size on wide panes. */
+  max-width: 1440px;
+  margin: 0 auto;
+}
+
+.chart-tip {
+  position: absolute;
+  pointer-events: none;
+  min-width: 150px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 16%);
+  z-index: 5;
+  font-size: 12px;
+}
+
+.chart-tip__date {
+  margin-bottom: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.chart-tip__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 1px 0;
+}
+
+.chart-tip__name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.chart-tip__value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.chart-guide {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  background: var(--accent);
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.chart-empty {
+  padding: 56px 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* The tabular alternative to the plot — same numbers, as text. */
+.chart-table {
+  margin-top: 12px;
+}
+
+.chart-table > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+  width: fit-content;
+}
+
+.chart-table > summary:hover {
+  color: var(--text);
+}
+
+}
+@layer components {
 /* ---------- Tenant maintenance (/ui/tenants) ---------- */
 
 .stat-grid--2 {
@@ -791,9 +1033,14 @@ button.pill {
   max-width: 620px;
 }
 
-.notice {
-  padding: 20px 24px;
-  color: var(--muted);
+.stat-grid--5 {
+  grid-template-columns: repeat(5, 1fr);
+}
+
+@media (max-width: 1100px) {
+  .stat-grid--5 {
+    grid-template-columns: repeat(3, 1fr);
+  }
 }
 
 .table-card {
@@ -805,6 +1052,31 @@ button.pill {
   align-items: center;
   gap: 16px;
   margin-bottom: 16px;
+}
+
+/* Same scale as .card-head h3 — a toolbar is the in-card section header. */
+.toolbar__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.toolbar__count {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+/* A .toolbar__count inside a .btn (e.g. "Active Exports N") stays plain and
+   matches the label color; only the gap separates it from the text (#608). */
+.btn .toolbar__count {
+  margin-left: 8px;
+  color: inherit;
+  font-variant-numeric: tabular-nums;
 }
 
 .toolbar__search {
@@ -827,33 +1099,6 @@ button.pill {
   outline: none;
   font-size: 15px;
   color: var(--text);
-}
-
-/* Buttons */
-.button {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  height: 42px;
-  padding: 0 16px;
-  border: 1px solid var(--surface-border);
-  border-radius: 12px;
-  background: var(--surface);
-  color: var(--text);
-  font: inherit;
-  font-weight: 500;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.button--primary {
-  background: var(--accent);
-  border-color: transparent;
-  color: #002438;
-}
-
-.button--primary:hover {
-  background: var(--accent-strong, #1aa5f0);
 }
 
 /* Add-tenant disclosure */
@@ -926,6 +1171,69 @@ button.pill {
 
 .addbox__actions {
   margin-top: 4px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--outline);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+}
+
+/* In-table provisioning state for tenants being created in the background
+   (#581): the row polls in via the rows fragment until the job finishes. */
+.provisioning {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* Centered-popup variant of the addbox (the Bulk Import dialogs, #527): the
+   same no-JS <details> mechanics, presented as a modal. While open, the
+   summary itself stretches over the viewport as the backdrop, so clicking
+   outside the panel closes the dialog without any script. */
+.addbox--modal[open] > summary {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgb(10 14 20 / 45%);
+  border-radius: 0;
+  cursor: default;
+  /* The summary's label is a text node, which `> *` cannot hide. */
+  color: transparent;
+}
+
+.addbox--modal[open] > summary > * {
+  visibility: hidden;
+}
+
+.addbox--modal[open] > .addbox__panel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  right: auto;
+  z-index: 50;
+  width: min(460px, calc(100vw - 40px));
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  transform: translate(-50%, -50%);
+}
+
+.field__hint--error {
+  color: rgb(220 38 38);
 }
 
 .form-error {
@@ -935,40 +1243,6 @@ button.pill {
   background: rgb(220 38 38 / 10%);
   color: #dc2626;
   font-size: 14px;
-}
-
-/* Data table */
-.data-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.data-table th {
-  text-align: left;
-  padding: 10px 12px;
-  font-size: 12px;
-  font-weight: 500;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
-  color: var(--muted);
-  border-bottom: 1px solid var(--divider);
-}
-
-.data-table td {
-  padding: 14px 12px;
-  border-bottom: 1px solid var(--divider);
-  color: var(--text);
-  vertical-align: middle;
-}
-
-.data-table tbody tr:last-child td {
-  border-bottom: 0;
-}
-
-.data-table__empty td {
-  color: var(--muted);
-  text-align: center;
-  padding: 32px 12px;
 }
 
 .col-num {
@@ -986,7 +1260,9 @@ button.pill {
   align-items: center;
   gap: 12px;
 }
+}
 
+@layer pages {
 .tenant-id {
   display: flex;
   flex-direction: column;
@@ -1003,19 +1279,17 @@ button.pill {
   color: var(--muted);
 }
 
-.tag {
-  display: inline-block;
-  margin-left: 8px;
-  padding: 1px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 500;
-  vertical-align: middle;
 }
-
+@layer components {
 .tag--muted {
   background: var(--accent-soft);
   color: var(--muted);
+}
+
+/* Failed provisioning job row (#581), matching .btn--danger's tokens. */
+.tag--danger {
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .icon-button {
@@ -1047,7 +1321,9 @@ button.pill {
     grid-template-columns: repeat(2, 1fr);
   }
 }
+}
 
+@layer pages {
 /* ---------------------------------------------------------------------------
    History & Versions (#236, Figma "History & Versions").
 
@@ -1099,25 +1375,30 @@ button.pill {
 .history__id { width: 200px; }
 .history__slash { color: var(--muted); }
 
-/* Tabs (Instance / Type feed / System feed). */
+/* Tabs — one definition for both tab designs (history's underline feed
+   switcher and the compartment viewer's pill links); the blocks used to be
+   defined twice and render their cascade-merge, which this preserves. */
 .tabs {
   display: flex;
   gap: 4px;
   margin-bottom: 16px;
   border-bottom: 1px solid var(--surface-border);
+  padding: 8px;
 }
 
 .tab {
-  padding: 8px 14px;
+  padding: 8px 16px;
   font: inherit;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--muted);
   background: transparent;
   border: 0;
   border-bottom: 2px solid transparent;
   margin-bottom: -1px;
   cursor: pointer;
+  border-radius: 9px;
+  text-decoration: none;
 }
 
 .tab:hover { color: var(--text); }
@@ -1232,6 +1513,8 @@ button.pill {
   border-radius: 8px;
 }
 
+}
+@layer components {
 /* ---- Saved queries (#234) ---------------------------------------------- */
 
 .page-head {
@@ -1250,7 +1533,9 @@ button.pill {
   font-size: 13px;
   color: var(--muted);
 }
+}
 
+@layer pages {
 .query-form-card {
   padding: 20px;
   margin-bottom: 24px;
@@ -1296,7 +1581,9 @@ button.pill {
 .query-builder__name input:focus {
   border-color: var(--accent);
 }
+}
 
+@layer components {
 .btn {
   display: inline-flex;
   align-items: center;
@@ -1311,6 +1598,7 @@ button.pill {
   border-radius: 9px;
   box-shadow: var(--surface-shadow);
   cursor: pointer;
+  text-decoration: none;
 }
 
 .btn:hover {
@@ -1331,6 +1619,13 @@ button.pill {
   filter: brightness(1.08);
 }
 
+.btn:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+}
+
+@layer pages {
 .query-group {
   padding: 16px 20px;
   margin-bottom: 16px;
@@ -1485,13 +1780,17 @@ button.pill {
   color: inherit;
 }
 
+}
+@layer components {
 .menu__panel--right {
   left: auto;
   right: 0;
   width: 380px;
   max-width: 90vw;
 }
+}
 
+@layer pages {
 .recent-item {
   display: flex;
   align-items: center;
@@ -1636,17 +1935,15 @@ button.pill {
   }
 }
 
-/* ---- Registry viewers: shared filter layout (#237/#238) ----------------- */
-
-/* These pages want the full pane width; .content keeps its dashboard cap. */
-.content--wide {
-  max-width: none;
 }
+@layer components {
+/* ---- Registry viewers: shared filter layout (#237/#238) ----------------- */
 
 .notice {
   margin: 0 0 16px;
   padding: 10px 14px;
   font-size: 13px;
+  color: var(--muted);
   border-radius: 10px;
 }
 
@@ -1872,12 +2169,27 @@ button.pill {
 .data-table td {
   padding: 9px 14px;
   border-bottom: 1px solid var(--surface-border);
+  color: var(--text);
   vertical-align: top;
+}
+
+.data-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.data-table__empty td {
+  color: var(--muted);
+  text-align: center;
+  padding: 32px 12px;
 }
 
 .data-table tbody tr:hover td,
 .data-table tbody tr[aria-selected="true"] td {
   background: var(--accent-soft);
+}
+
+.data-table[data-row-navigation] tbody tr {
+  cursor: pointer;
 }
 
 .row-link {
@@ -1928,6 +2240,8 @@ button.pill {
 
 .tag {
   display: inline-flex;
+  margin-left: 8px;
+  vertical-align: middle;
   align-items: center;
   height: 20px;
   padding: 0 8px;
@@ -1973,6 +2287,55 @@ button.pill {
   color: var(--danger);
 }
 
+/* Subscription states (#580): the cards and the STATUS column share this
+   vocabulary — active delivers, idle has no listeners, error needs attention. */
+.tag--active {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.tag--idle,
+.tag--requested {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tag--error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* Bulk Export job states (#537) — the same status-pill vocabulary. */
+.tag--in-progress {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tag--complete {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.tag--failed {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.tag--cancelled {
+  background: var(--accent-soft);
+  color: var(--muted);
+}
+
+.subs-sort summary.btn {
+  list-style: none;
+}
+
+.subs-sort summary.btn::-webkit-details-marker {
+  display: none;
+}
+}
+
+@layer pages {
 /* Detail panel (right rail on the SearchParameter viewer) */
 
 .detail {
@@ -1984,6 +2347,33 @@ button.pill {
   max-height: calc(100vh - 110px);
   padding: 16px;
   overflow-y: auto;
+}
+
+/* Full-width form sections (bulk export): the flex/gap/padding of .detail
+   without its sticky sidebar behavior (#608). */
+.form-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+/* Vertical gap between the stacked .form-panel/table-card sections of the
+   bulk export form (#608). */
+.bulk-export-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* The Group ID field only applies to the Group scope; hide it otherwise.
+   Browsers without :has() keep it always visible — today's behavior. */
+.bulk-export-form .field--group-id {
+  display: none;
+}
+
+.bulk-export-form:has(input[name="scope"][value="group"]:checked) .field--group-id {
+  display: block;
 }
 
 .detail__title {
@@ -2225,26 +2615,8 @@ button.pill {
 .lint__item--warn .lint__sev { color: var(--warn); }
 .lint__item--info .lint__sev { color: var(--accent); }
 
-/* Compartment viewer: tabs, members, tester */
-
-.tabs {
-  display: flex;
-  gap: 4px;
-  padding: 8px;
-}
-
-.tab {
-  padding: 8px 16px;
-  border-radius: 9px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--muted);
-  text-decoration: none;
-}
-
-.tab:hover {
-  color: var(--text);
-}
+/* Compartment viewer: tabs, members, tester. The .tabs / .tab primitives are
+   defined once, with the history feed switcher. */
 
 .tab[aria-current="true"] {
   background: var(--accent-soft);
@@ -2670,12 +3042,10 @@ button.filter-rail__item {
   color: var(--muted);
 }
 
+/* The Ask button keeps the shared primary metrics (36px — design-system.spec
+   holds every page to one primary button); only its icon gap is local. */
 .nl-input .btn--primary {
-  display: inline-flex;
-  align-items: center;
   gap: 8px;
-  height: 44px;
-  padding: 0 20px;
   white-space: nowrap;
 }
 
@@ -2948,16 +3318,41 @@ button.filter-rail__item {
 .editor-json__act:hover { color: var(--text); }
 .editor-json__act--on { color: var(--accent); border-color: var(--accent); }
 
-.editor-tree { padding: 12px 14px; }
+/* Both panes are viewport-bound scroll containers, so a large document
+   scrolls inside its own column and the cross-highlight's reveal always has
+   a scrollbar to move — with page-level scrolling, the highlighted
+   counterpart could sit far off-screen (#573 follow-up). */
+.editor-tree {
+  padding: 12px 14px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
 
 /* ---- the foldable JSON view ---- */
 
 .json-view {
   padding: 10px 0;
   overflow-x: auto;
+  max-height: 70vh;
+  overflow-y: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* Form ↔ JSON cross-highlight (editor-sync.js): hovering or focusing a form
+   row lights the JSON lines that hold that node, and vice versa. */
+.json-line--hit {
+  background: var(--accent-soft);
+}
+
+.json-line[data-jpath] .json-line__code {
+  cursor: pointer;
+}
+
+.editor-row--hit {
+  background: var(--accent-soft);
+  border-radius: 8px;
 }
 
 .json-line {
@@ -3073,6 +3468,7 @@ button.filter-rail__item {
 .editor-row__head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   min-height: 28px;
 }
@@ -3091,7 +3487,9 @@ button.filter-rail__item {
 
 .editor-row__input {
   flex: 1;
-  min-width: 0;
+  /* Never squeezed below a usable width — the head wraps it to its own line
+     instead of eating the content. */
+  min-width: 180px;
   max-width: 420px;
   height: 28px;
   padding: 0 10px;
@@ -3316,6 +3714,50 @@ button.filter-rail__item {
   resize: vertical;
 }
 
+/* Raw-mode highlight (editor-sync.js): a mirror <pre> sits behind the
+   textarea with identical metrics; its text is invisible and only the <mark>
+   around the hovered node's range shows through the textarea, whose own
+   background goes transparent while the mirror is present. */
+.editor-json__raw {
+  position: relative;
+}
+
+.editor-json__raw--mirrored .editor__source {
+  position: relative;
+  z-index: 1;
+  background: transparent;
+}
+
+.editor__source-mirror {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  pointer-events: none;
+  padding: 12px;
+  box-sizing: border-box;
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  color: transparent;
+  background: var(--input-bg);
+  border: 1px solid transparent;
+  border-radius: 10px;
+}
+
+.editor__source-mirror mark {
+  color: transparent;
+  background: var(--accent-soft);
+  border-radius: 3px;
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
 .editor__source-hint {
   margin: 8px 2px 0;
   font-size: 12px;
@@ -3352,6 +3794,8 @@ button.filter-rail__item {
   }
 }
 
+}
+@layer components {
 /* ---------------------------------------------------------------------------
    Resources workspace (#282): the nav submenu, the Create-button page head, and
    the Edit Resource modal (shadowbox).
@@ -3369,7 +3813,9 @@ button.filter-rail__item {
   background: var(--accent-soft);
   color: var(--text-strong);
 }
+}
 
+@layer pages {
 /* ---- the Edit Resource modal (shadowbox) ---- */
 
 .modal {
@@ -3393,7 +3839,11 @@ button.filter-rail__item {
   display: flex;
   flex-direction: column;
   width: min(1200px, 100%);
-  max-height: 90vh;
+  /* A fixed height, not a ceiling (#607): the dialog occupies the same
+     rectangle whichever pane is showing, so switching Edit/History or a
+     status message appearing never moves the header. The taller pane
+     scrolls inside .modal__body. */
+  height: 90vh;
   background: var(--bg-content);
   border: 1px solid var(--surface-border);
   border-radius: 18px;
@@ -3483,6 +3933,7 @@ button.filter-rail__item {
 }
 
 .modal__body {
+  flex: 1;
   padding: 16px 18px;
   overflow-y: auto;
 }
@@ -3498,10 +3949,12 @@ button.filter-rail__item {
 }
 
 @media (max-width: 900px) {
-  .modal__box { max-height: 96vh; }
+  .modal__box { height: 96vh; }
   .modal__head { flex-wrap: wrap; }
 }
+}
 
+@layer components {
 /* ---------------------------------------------------------------------------
    Resources: the resource-type panel as part of the menu (#282, Brett's
    "Resources" frame). A secondary column flush against the sidebar — same
@@ -3607,7 +4060,9 @@ body.has-nav-panel {
   body.has-nav-panel .pane { grid-column: 2; }
   .nav-panel { display: none; }
 }
+}
 
+@layer pages {
 /* Saved / Recent group headings inside the Recent dropdown (#282). */
 .recent-group {
   margin: 8px 4px 4px;
@@ -3849,6 +4304,8 @@ body.has-nav-panel {
   white-space: nowrap;
 }
 
+}
+@layer components {
 /* Conformance CRUD (#237, #238): New in the page head, Edit/Delete in the
    detail panels. */
 .page-head__actions {
@@ -3870,15 +4327,20 @@ body.has-nav-panel {
   background: var(--danger-soft);
 }
 
+}
+@layer pages {
 /* mustSupport emphasis + human labels (#364). */
 .editor-row--must-support > .editor-row__head .editor-row__label {
   font-weight: 600;
 }
 
-.editor-row__name {
+/* The element's short description sits on its own line under the head, so it
+   can never squeeze the input out of the row. */
+.editor-row__desc {
+  margin: 2px 0 0;
   color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
+  line-height: 1.4;
 }
 
 .editor-row__ms,
@@ -3896,6 +4358,188 @@ body.has-nav-panel {
   flex-basis: 100%;
   color: var(--muted);
   font-size: 11px;
+}
+
+/* Batch / Transaction workspace (#476). */
+.batch-drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 44px 16px;
+  border: 1.5px dashed var(--divider);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+}
+
+.batch-drop strong {
+  color: var(--text);
+}
+
+.batch-drop--over,
+.batch-drop:hover {
+  border-color: var(--accent-strong);
+  color: var(--text);
+}
+
+.request-strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.request-strip__label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.batch-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.batch-tab {
+  padding: 8px 14px;
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.batch-tab[aria-selected="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border-color: transparent;
+}
+
+.batch-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.batch-row {
+  border-top: 1px solid var(--divider);
+}
+
+.batch-row__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.batch-row__head--static {
+  cursor: default;
+}
+
+.batch-row__num {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 12px;
+  flex: none;
+}
+
+.batch-chip {
+  padding: 2px 8px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  flex: none;
+}
+
+.batch-chip--post { color: var(--accent-text); border-color: var(--accent-strong); }
+.batch-chip--delete { color: var(--danger); border-color: var(--danger); }
+
+.batch-row__url {
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.batch-row__arrow {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.batch-row__body {
+  margin: 0 0 12px 34px;
+  padding: 12px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 12.5px;
+  overflow-x: auto;
+}
+
+.batch-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 14px;
+}
+
+.batch-footer__right {
+  display: flex;
+  gap: 8px;
+}
+
+.batch-badge {
+  margin-left: auto;
+  padding: 2px 10px;
+  border-radius: 6px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.batch-badge--ok { background: var(--accent-soft); color: var(--accent-text); }
+.batch-badge--error { background: var(--danger-soft); color: var(--danger); }
+
+.batch-summary {
+  margin: 4px 0 10px;
+  color: var(--muted);
+}
+
+.batch-error {
+  margin-top: 10px;
+  color: var(--danger);
+}
+
+.batch-json {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 12.5px;
+  overflow-x: auto;
 }
 
 /* Slice + binding chips (#365). */
@@ -3922,11 +4566,12 @@ body.has-nav-panel {
   font-weight: 500;
 }
 
-/* Live-vs-save legend (#366). */
+/* Live-vs-save legend (#366): stacked, inset from the card edge. */
 .editor-legend {
   display: flex;
-  gap: 14px;
-  margin: 4px 0 8px;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 14px 10px;
   color: var(--muted);
   font-size: 11px;
 }
@@ -3955,4 +4600,104 @@ body.has-nav-panel {
   border-radius: 5px;
   color: var(--muted);
   font-size: 9.5px;
+}
+
+/* The JSON-pane header (#548): fold controls hug the heading on the left,
+   Edit raw stays alone at the end. */
+.card-head__tools--start {
+  margin-right: auto;
+}
+
+}
+@layer components {
+/* Addbox close affordances (#545). */
+.addbox__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.menu__heading--row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.addbox__x {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.addbox__x:hover,
+.addbox__x:focus-visible {
+  color: var(--text-strong);
+  background: var(--accent-soft);
+}
+
+}
+
+@layer pages {
+/* The Recent/Saved dropdown scrolls instead of growing unbounded (#542):
+   the recents are capped at ten, but every saved query renders in the same
+   panel, and a long collection was pushing it off-screen. */
+.query-recent #recent-searches {
+  max-height: min(420px, 60vh);
+  overflow-y: auto;
+}
+
+/* Issues that have no field yet (#546): a bounded, styled panel instead of a
+   wall of bare red lines under the tree. */
+.editor__orphans {
+  margin-top: 14px;
+  padding: 12px 16px;
+  border-left: 3px solid #C0362C;
+  border-radius: 0 10px 10px 0;
+  background: rgb(192 54 44 / 8%);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.editor__orphans-title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.editor__orphans .editor__orphan {
+  margin: 2px 0;
+  font-size: 13px;
+}
+
+/* Temporal-primitive assistance (#549): the pattern attribute drives live
+   native validity — a malformed date shows before any server round trip. */
+.editor-row__input:invalid {
+  border-color: #C0362C;
+  box-shadow: 0 0 0 3px rgb(192 54 44 / 12%);
+}
+}
+
+@layer pages {
+/* Bulk Export (#537): the resource-type checkbox grid. Its job-status chips
+   are .tag variants — one status-pill vocabulary, not a second chip family. */
+.typegrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 6px 18px;
+  padding: 6px 0;
+}
+
+.typegrid__item {
+  font-size: 14px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
 }

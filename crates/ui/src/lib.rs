@@ -34,8 +34,12 @@
 //! The chart is sampled over a [`DashboardWindow`], selected per request with
 //! `?window=` (`1h`, `24h`, or the default `30d`) alongside the `?type=` series
 //! selector. Both selectors are plain links, so the dashboard stays navigable
-//! without JavaScript.
+//! without JavaScript. `?all=1` is the "View all resources" toggle (#599): the
+//! picker's option list widens from the tenant's stored types to every
+//! resource type of the active FHIR version, offering the untouched ones at 0.
 
+mod bulk_export;
+mod bulk_import;
 mod compartments;
 mod conformance;
 mod editor;
@@ -43,6 +47,7 @@ mod history;
 mod i18n;
 mod json_view;
 mod search_params;
+mod subscriptions;
 mod tenants;
 
 #[doc(hidden)]
@@ -61,7 +66,7 @@ use axum_embed::ServeEmbed;
 use axum_htmx::{AutoVaryLayer, HxRequest};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
-    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow,
+    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, TypeCount,
 };
 use helios_persistence::core::{ResourceStorage, SettingsStore};
 use i18n::{I18n, RequestLocale};
@@ -112,6 +117,8 @@ struct WebState {
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
     tenants: Option<Arc<dyn ResourceStorage>>,
+    /// Tenant provisioning jobs started from the tenants page (#581).
+    provisioning: tenants::ProvisioningRegistry,
     /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
     /// tenant's conformance resources from the tenant-maintenance page.
     data_dir: Option<PathBuf>,
@@ -187,6 +194,9 @@ where
 pub(crate) struct RequestTenant {
     pub(crate) id: String,
     pub(crate) display: Option<String>,
+    /// Whether this install has any tenant beyond the server default — the
+    /// sidebar tenant picker only renders when it does (#544).
+    pub(crate) multi: bool,
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestTenant
@@ -206,6 +216,7 @@ where
             .unwrap_or(RequestTenant {
                 id: "default".to_string(),
                 display: None,
+                multi: false,
             }))
     }
 }
@@ -223,6 +234,7 @@ async fn resolve_prefs(
     let mut tenant = RequestTenant {
         id: state.default_tenant.clone(),
         display: None,
+        multi: false,
     };
     let document = match &state.settings {
         Some(store) => {
@@ -250,9 +262,23 @@ async fn resolve_prefs(
             tenant = RequestTenant {
                 id: record.id,
                 display: record.display_name,
+                multi: false,
             };
         }
     }
+    // The picker is pointless on a single-tenant install: show it only when
+    // the effective tenant already differs from the default, or the registry
+    // knows a second tenant. One indexed registry read per page load, the
+    // same cost class as the settings read above.
+    tenant.multi = tenant.id != state.default_tenant
+        || match &state.tenants {
+            Some(registry) => registry
+                .list_tenants()
+                .await
+                .map(|records| records.iter().any(|r| r.id != state.default_tenant))
+                .unwrap_or(false),
+            None => false,
+        };
     request.extensions_mut().insert(RequestVersion(version));
     request.extensions_mut().insert(tenant);
     next.run(request).await
@@ -271,6 +297,11 @@ pub(crate) struct Status {
     /// (#344).
     tenant_id: String,
     tenant_display: Option<String>,
+    /// Whether the sidebar renders the tenant picker (#544).
+    show_tenant_picker: bool,
+    /// Whether the subscriptions engine is advertised — the sidebar entry and
+    /// the operator page only appear when it is (#580).
+    subscriptions_enabled: bool,
 }
 
 impl Status {
@@ -287,6 +318,16 @@ impl Status {
             .into_iter()
             .map(|v| v.as_str())
             .collect()
+    }
+
+    /// Whether the sidebar renders the tenant picker (#544).
+    pub(crate) fn show_tenant_picker(&self) -> bool {
+        self.show_tenant_picker
+    }
+
+    /// Whether the subscriptions engine is advertised (#580).
+    pub(crate) fn subscriptions_enabled(&self) -> bool {
+        self.subscriptions_enabled
     }
 
     /// The effective tenant id, for the `hfs-tenant` meta tag browser calls
@@ -321,20 +362,44 @@ impl Status {
 /// Dashboard headline metrics rendered by `pages/index.html` (design: Figma
 /// "Dashboard V1.1").
 ///
-/// `resource_types`, `stored_resources`, `fhir_version`, and `chart_total` are
-/// derived from the live [`DashboardSnapshot`] (default tenant). `export_jobs`,
-/// `export_jobs_queued`, and `uptime_percent` describe other subsystems (bulk
-/// export job state; availability history) that are not part of the
-/// resource-count read path and remain placeholder values until those read paths
-/// land.
+/// `resource_types`, `stored_resources`, `fhir_version`, `export_jobs`,
+/// `import_jobs`, and `chart_total` are derived from the live
+/// [`DashboardSnapshot`] (default tenant). `uptime` is the process uptime from
+/// `helios_observability::uptime` (#540); in a cluster it describes only the
+/// node that served this request.
 struct DashboardMetrics {
     fhir_version: String,
     resource_types: String,
     stored_resources: String,
-    export_jobs: String,
-    export_jobs_queued: u32,
-    uptime_percent: String,
+    /// Bulk-export jobs for the tenant; `None` renders the unavailable state.
+    export_jobs: Option<ExportJobCounts>,
+    /// Active bulk-submit (import) jobs for the tenant; `None` renders the
+    /// unavailable state.
+    import_jobs: Option<u64>,
+    /// Formatted process uptime; `None` renders the unavailable state (the
+    /// uptime tracker was never initialized).
+    uptime: Option<String>,
     chart_total: String,
+}
+
+/// Process uptime as a short human duration ("3d 4h", "5h 12m", "42m", "18s"),
+/// or `None` when the tracker was never initialized and no honest figure
+/// exists.
+fn format_uptime(seconds: f64) -> Option<String> {
+    if seconds <= 0.0 {
+        return None;
+    }
+    let s = seconds as u64;
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60);
+    Some(if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
+    })
 }
 
 /// A single axis gridline or tick, in the chart's `0 0 1060 300` viewBox. `pos`
@@ -347,33 +412,81 @@ struct AxisTick {
     label_y: i64,
 }
 
-/// Server-computed SVG geometry for the "resources over time" chart, for a single
-/// selected resource type's cumulative series.
-struct ChartView {
-    /// Whether a non-empty series was plotted (`false` → axes only).
-    has_data: bool,
-    /// The resource type currently charted (a real, server-controlled type name).
-    selected_type: String,
+/// One plotted series of the "resources over time" chart: SVG geometry plus
+/// the identity the legend and tooltip need (#555).
+struct ChartSeriesView {
+    resource_type: String,
+    /// 1-based palette slot (`--series-N` custom properties, 6 defined).
+    color: usize,
     /// `"x,y x,y …"` coordinate list for the `<polyline>`.
     polyline: String,
+    /// Class suffix under a legend focus (#602): `" series--focused"`,
+    /// `" series--receded"`, or empty when nothing is focused.
+    emphasis: &'static str,
+    /// The same focus/unfocus link the legend entry carries (#602): the line
+    /// itself is clickable, as a native SVG `<a>`. `None` while only one
+    /// series is plotted.
+    href: Option<String>,
+    /// Whether this series holds the focus — picks the link's label.
+    focused: bool,
+}
+
+/// One row of the chart's tabular alternative: a bucket label and the
+/// cumulative value of every plotted series at that bucket (#555, a11y).
+struct ChartTableRow {
+    label: String,
+    values: Vec<String>,
+}
+
+/// Server-computed SVG geometry for the "resources over time" chart.
+struct ChartView {
+    /// Whether any series was plotted (`false` → empty state). A plotted
+    /// series with a zero total — an "empty" type charted via #599 — still
+    /// counts: it renders as a real flat line, not the empty state.
+    has_data: bool,
+    series: Vec<ChartSeriesView>,
     /// Horizontal value gridlines, top (largest) to bottom (zero).
     y_ticks: Vec<AxisTick>,
     /// X-axis date labels at evenly spaced sample points.
     x_ticks: Vec<AxisTick>,
+    /// viewBox height (always [`CHART_HEIGHT`]).
+    height: i64,
+    /// Inert JSON the tooltip script reads (`#chart-data`): bucket labels and
+    /// per-series values with their SVG coordinates, so the script does no
+    /// chart math of its own.
+    tip_json: String,
+    /// Sampled rows (the labeled buckets) for the accessible table.
+    table: Vec<ChartTableRow>,
+    /// Comma-joined plotted type names, for the SVG's accessible name.
+    types_label: String,
+    /// Compact picker-pill label: the first type plus a `+N` overflow count.
+    pick_label: String,
 }
 
-/// One entry in the chart legend, which doubles as the per-type series selector:
-/// each is a link that re-renders the page with that type charted.
+/// One entry in the chart legend: a plotted series. While more than one is
+/// plotted the entry links to focusing that series — or, when it is already
+/// the focused one, back to the unfocused view (#602). Types leave the chart
+/// through the picker, never the legend.
 struct LegendEntry {
     resource_type: String,
     total: String,
+    color: usize,
+    href: Option<String>,
+    focused: bool,
+}
+
+/// One option in the chart's type picker: a link that toggles the type in or
+/// out of the charted set, rendered as a checkbox row (#555).
+struct PickerEntry {
+    resource_type: String,
+    total: String,
     href: String,
-    active: bool,
+    selected: bool,
 }
 
 /// One entry in the time-window selector (`1h` / `24h` / `30d`): a link that
 /// re-renders the page with the chart sampled over that window, keeping the
-/// currently charted resource type.
+/// charted set.
 struct WindowEntry {
     label: String,
     href: String,
@@ -387,7 +500,17 @@ struct IndexPage {
     metrics: DashboardMetrics,
     chart: ChartView,
     legend: Vec<LegendEntry>,
+    picker: Vec<PickerEntry>,
     windows: Vec<WindowEntry>,
+    /// Whether "View all resources" (#599) is on: the picker offers every
+    /// resource type of the active FHIR version, not just the tenant's
+    /// stored ones.
+    all_types: bool,
+    /// Link that flips the "View all resources" toggle.
+    all_types_href: String,
+    /// True when no provider answered and the placeholder snapshot is shown —
+    /// rendered with an explicit "sample data" notice, never silently (#555).
+    sample_data: bool,
     i18n: I18n,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
@@ -457,6 +580,15 @@ struct SearchParametersPage {
     i18n: I18n,
     active_page: &'static str,
     view: search_params::SpView,
+}
+
+/// Batch/Transaction workspace (#476): a static shell; batch.js does the rest.
+#[derive(Template)]
+#[template(path = "pages/batch.html")]
+struct BatchPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
 }
 
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
@@ -569,6 +701,8 @@ pub fn mount(
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url,
         outbound_auth,
+        fhir_version,
+        data_dir.clone(),
     ));
     mount_with_conformance_source(
         fhir_app,
@@ -621,6 +755,9 @@ pub fn mount_with_conformance_source(
         .route("/ui/queries/params", get(query_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/compartments", get(compartments_page))
+        // Batch/Transaction workspace (#476): upload → preflight → response.
+        .route("/ui/batch", get(batch_page))
+        .route("/ui/subscriptions", get(subscriptions::page))
         // Schema-driven resource editor (#264). One POST endpoint applies every
         // structural mutation and re-renders: the document rides with it.
         .route("/ui/editor", get(editor::page))
@@ -635,6 +772,74 @@ pub fn mount_with_conformance_source(
         // docs/history-diff-rendering.md); the browser posts the two versions
         // it fetched from `_history`.
         .route("/ui/history/diff", axum::routing::post(history_diff))
+        .route(
+            "/ui/bulk-export",
+            get(bulk_export::page).post(bulk_export::start),
+        )
+        .route("/ui/bulk-export/active", get(bulk_export::active))
+        .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
+        .route(
+            "/ui/bulk-export/active/{id}/cancel",
+            axum::routing::post(bulk_export::cancel),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/retry",
+            axum::routing::post(bulk_export::retry),
+        )
+        .route(
+            "/ui/bulk-import",
+            get(bulk_import::page).post(bulk_import::create),
+        )
+        .route(
+            "/ui/bulk-import/test-auth",
+            axum::routing::post(bulk_import::test_auth),
+        )
+        .route(
+            "/ui/bulk-import/empty-manifest.json",
+            get(bulk_import::empty_manifest),
+        )
+        .route("/ui/bulk-import/keys", get(bulk_import::keys))
+        .route(
+            "/ui/bulk-import/{id}/manifests/{mid}/replace",
+            axum::routing::post(bulk_import::replace_manifest),
+        )
+        .route(
+            "/ui/bulk-import/{id}/manifests/{mid}/abort",
+            axum::routing::post(bulk_import::abort_manifest),
+        )
+        .route("/ui/bulk-import/{id}", get(bulk_import::detail))
+        .route(
+            "/ui/bulk-import/{id}/status",
+            get(bulk_import::status_fragment),
+        )
+        .route(
+            "/ui/bulk-import/{id}/delete",
+            axum::routing::post(bulk_import::delete),
+        )
+        .route(
+            "/ui/bulk-import/{id}/abort",
+            axum::routing::post(bulk_import::abort),
+        )
+        .route(
+            "/ui/bulk-import/{id}/complete",
+            axum::routing::post(bulk_import::complete),
+        )
+        .route(
+            "/ui/bulk-import/{id}/submit-all",
+            axum::routing::post(bulk_import::submit_all),
+        )
+        .route(
+            "/ui/bulk-import/{id}/manifests",
+            axum::routing::post(bulk_import::add_manifest),
+        )
+        .route(
+            "/ui/bulk-import/{id}/manifests/{mid}/delete",
+            axum::routing::post(bulk_import::delete_manifest),
+        )
+        .route(
+            "/ui/bulk-import/{id}/manifests/{mid}/submit",
+            axum::routing::post(bulk_import::submit_manifest),
+        )
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
@@ -655,6 +860,7 @@ pub fn mount_with_conformance_source(
         compartments: Arc::new(compartments::CompartmentCatalog::new(source)),
         nl: Arc::new(nl),
         tenants,
+        provisioning: Default::default(),
         settings,
         data_dir,
         fhir_version,
@@ -861,11 +1067,15 @@ async fn revalidate_assets(request: axum::extract::Request, next: middleware::Ne
     response
 }
 
-/// Full landing page. `?type=<ResourceType>` selects which resource type's series
-/// the chart plots (defaults to the first charted type); the value is validated
-/// against the snapshot, so an unknown type harmlessly falls back to the default.
-/// `?window=<1h|24h|30d>` selects the time window the chart is sampled over,
-/// falling back to [`DashboardWindow::default`] for anything unrecognised.
+/// Full landing page. `?types=<A,B,…>` selects which resource types the chart
+/// plots (defaults to the tenant's largest stored types); unknown names are
+/// dropped by the provider, so the set is always real. The legacy `?type=`
+/// single selection still works. `?window=<1h|24h|30d>` selects the sampling
+/// window, falling back to [`DashboardWindow::default`] for anything
+/// unrecognised. `?all=1` is the "View all resources" toggle (#599): with it,
+/// the picker offers every resource type of the active FHIR version, not just
+/// the ones the tenant stores, and a type with no data can be charted as a
+/// flat zero line.
 async fn index(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -873,11 +1083,45 @@ async fn index(
     rt: RequestTenant,
     RawQuery(query): RawQuery,
 ) -> Response {
-    let selected = query_value(query.as_deref(), "type");
+    let types: Vec<String> = query_value(query.as_deref(), "types")
+        .or_else(|| query_value(query.as_deref(), "type"))
+        .map(|csv| {
+            csv.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let window = query_value(query.as_deref(), "window")
         .and_then(|slug| DashboardWindow::from_slug(&slug))
         .unwrap_or_default();
-    render(build_index_page(state.version, locale, selected, window, rv.0, &rt).await)
+    let all_types = query_value(query.as_deref(), "all").as_deref() == Some("1");
+    // The full type list is only fetched when offered — the common,
+    // flag-off case pays nothing extra for it.
+    let spec_types = if all_types {
+        state.compartments.resource_type_names(&rt.id, rv.0).await
+    } else {
+        Vec::new()
+    };
+    // `?focus=Type` marks one plotted series as the legend focus (#602);
+    // validation against the actually-plotted set happens in build_dashboard.
+    let focus = query_value(query.as_deref(), "focus")
+        .filter(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphanumeric()));
+    render(
+        build_index_page(
+            state.version,
+            locale,
+            types,
+            window,
+            all_types,
+            spec_types,
+            focus,
+            rv.0,
+            &rt,
+        )
+        .await,
+    )
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -887,10 +1131,7 @@ async fn search(
     rv: RequestVersion,
     rt: RequestTenant,
 ) -> Response {
-    let resource_types = state
-        .compartments
-        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(SearchPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -909,10 +1150,7 @@ async fn queries(
     rv: RequestVersion,
     rt: RequestTenant,
 ) -> Response {
-    let resource_types = state
-        .compartments
-        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(QueriesPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -934,10 +1172,7 @@ async fn resources(
     rt: RequestTenant,
     Query(query): Query<ResourcesQuery>,
 ) -> Response {
-    let resource_types = state
-        .compartments
-        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     render(ResourcesPage {
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -967,16 +1202,14 @@ struct ParamsCatalogQuery {
 
 /// Parameter datalist for the search builder: the active parameters that
 /// apply to the given resource type (including `Resource` /
-/// `DomainResource`-level ones), from the default-version snapshot.
+/// `DomainResource`-level ones), from the selected version's snapshot.
 async fn query_params_catalog(
     State(state): State<WebState>,
     rt: RequestTenant,
+    rv: RequestVersion,
     Query(raw): Query<ParamsCatalogQuery>,
 ) -> Response {
-    let snapshot = state
-        .sp_catalog
-        .snapshot(&rt.id, helios_fhir::FhirVersion::default())
-        .await;
+    let snapshot = state.sp_catalog.snapshot(&rt.id, rv.0).await;
     let resource_type = raw.resource_type.unwrap_or_default();
     let mut params: Vec<ParamOption> = snapshot
         .params
@@ -1058,6 +1291,22 @@ struct CompartmentsQuery {
     refresh: Option<String>,
 }
 
+/// Batch/Transaction workspace page (#476). The shell is server-rendered;
+/// batch.js drives upload → preflight → execute → response entirely against
+/// the ordinary FHIR root, so this crate never touches storage.
+async fn batch_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render(BatchPage {
+        status: current_status(state.version, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "batch",
+    })
+}
+
 /// Compartment viewer & tester page.
 async fn compartments_page(
     State(state): State<WebState>,
@@ -1118,8 +1367,11 @@ async fn status(
             build_index_page(
                 state.version,
                 locale,
-                None,
+                Vec::new(),
                 DashboardWindow::default(),
+                false,
+                Vec::new(),
+                None,
                 rv.0,
                 &rt,
             )
@@ -1198,78 +1450,201 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
 }
 
 /// Assembles the landing page from the live dashboard snapshot, or from
-/// placeholder data when no provider is registered.
+/// placeholder data when no provider is registered — in which case the page
+/// says so explicitly rather than presenting invented numbers as real (#555).
+#[allow(clippy::too_many_arguments)]
 async fn build_index_page(
     version: &'static str,
     locale: RequestLocale,
-    selected: Option<String>,
+    types: Vec<String>,
     window: DashboardWindow,
+    all_types: bool,
+    spec_types: Vec<String>,
+    focus: Option<String>,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
 ) -> IndexPage {
     let status = current_status(version, fhir_version, tenant);
     let i18n = I18n::new(locale);
-    let snapshot = helios_observability::dashboard::snapshot(window, &tenant.id)
-        .await
-        .unwrap_or_else(|| sample_snapshot(window));
-    let (metrics, chart, legend, windows) = build_dashboard(&snapshot, selected.as_deref());
+    let live =
+        helios_observability::dashboard::snapshot(window, &tenant.id, &types, all_types).await;
+    let sample_data = live.is_none();
+    let snapshot = live.unwrap_or_else(|| sample_snapshot(window));
+    let dash = build_dashboard(&snapshot, all_types, &spec_types, focus.as_deref());
     IndexPage {
         status,
-        metrics,
-        chart,
-        legend,
-        windows,
+        metrics: dash.metrics,
+        chart: dash.chart,
+        legend: dash.legend,
+        picker: dash.picker,
+        windows: dash.windows,
+        all_types: dash.all_types,
+        all_types_href: dash.all_types_href,
+        sample_data,
         i18n,
         active_page: "home",
     }
 }
 
+/// Everything `build_dashboard` hands the landing page.
+struct DashboardView {
+    metrics: DashboardMetrics,
+    chart: ChartView,
+    legend: Vec<LegendEntry>,
+    picker: Vec<PickerEntry>,
+    windows: Vec<WindowEntry>,
+    /// Whether "View all resources" is on (#599).
+    all_types: bool,
+    /// Link that flips the "View all resources" toggle, keeping the charted
+    /// set and window.
+    all_types_href: String,
+}
+
+/// A `/ui` link carrying the whole chart state: charted set, window, the
+/// "View all resources" toggle (#599), and the focused series (#602). Every
+/// selector emits these so changing one control keeps the others.
+fn dash_href(
+    types: &[String],
+    window: DashboardWindow,
+    all_types: bool,
+    focus: Option<&str>,
+) -> String {
+    let mut href = format!("/ui?types={}&window={}", types.join(","), window.as_str());
+    if all_types {
+        href.push_str("&all=1");
+    }
+    // Focus survives a link only while the focused type is still charted.
+    if let Some(f) = focus
+        && types.iter().any(|t| t == f)
+    {
+        href.push_str(&format!("&focus={f}"));
+    }
+    href
+}
+
 /// Projects a [`DashboardSnapshot`] into the headline metrics, chart geometry,
-/// and the two selectors (resource type, time window) the template renders.
+/// and the selectors (type picker, legend, time window, "View all resources")
+/// the template renders. The charted set is `snapshot.series` itself — the
+/// provider already resolved the request to real (or, with `all_types`,
+/// explicitly requested) types.
+///
+/// `all_types` is the "View all resources" toggle (#599). When set,
+/// `spec_types` — every resource type of the active FHIR version, from
+/// [`compartments::CompartmentCatalog::resource_type_names`] — is unioned into
+/// the picker's option list alongside the tenant's stored types, so a type
+/// with no data can still be picked (and, once picked, charts as a flat zero
+/// line via the provider's relaxed selection guard). `spec_types` is ignored
+/// when `all_types` is `false`. `focus` names the series a legend click has
+/// asked to focus (#602); it is validated against the plotted set below.
 fn build_dashboard(
     snapshot: &DashboardSnapshot,
-    selected: Option<&str>,
-) -> (
-    DashboardMetrics,
-    ChartView,
-    Vec<LegendEntry>,
-    Vec<WindowEntry>,
-) {
-    // Resolve the charted type: the requested one if it exists, else the first
-    // series. `selected_type` is therefore always a real, server-controlled type
-    // name (or empty when there are no series at all).
-    let selected_type = selected
-        .filter(|s| {
-            snapshot
-                .series
-                .iter()
-                .any(|series| series.resource_type.as_str() == *s)
-        })
-        .map(|s| s.to_string())
-        .or_else(|| snapshot.series.first().map(|s| s.resource_type.clone()))
-        .unwrap_or_default();
-
-    let selected_series = snapshot
+    all_types: bool,
+    spec_types: &[String],
+    focus: Option<&str>,
+) -> DashboardView {
+    let charted: Vec<String> = snapshot
         .series
         .iter()
-        .find(|s| s.resource_type == selected_type);
+        .map(|s| s.resource_type.clone())
+        .collect();
 
-    let chart = build_chart(&selected_type, selected_series, snapshot.window);
+    // Focus only means something for a plotted series (#602); anything else
+    // in the query renders the ordinary unfocused view.
+    let focus = focus.filter(|f| charted.iter().any(|c| c == f));
 
-    // Both selectors carry the other's current value, so switching type keeps the
-    // window and vice versa.
+    let mut chart = build_chart(&snapshot.series, snapshot.window, focus);
+
+    // The plotted lines carry the same focus links as their legend entries
+    // (#602): clicking a line focuses its series, clicking the focused one
+    // links back. Native SVG anchors, so the no-JS contract holds.
+    if chart.series.len() > 1 {
+        for s in &mut chart.series {
+            let target = if s.focused {
+                None
+            } else {
+                Some(s.resource_type.as_str())
+            };
+            s.href = Some(dash_href(&charted, snapshot.window, all_types, target));
+        }
+    }
+
+    // The picker's option list: the tenant's stored types (largest first,
+    // from the provider), plus — with `all_types` — every other type of the
+    // active FHIR version, at 0, alphabetically after (never duplicating a
+    // type the provider already listed).
+    let mut options: Vec<TypeCount> = snapshot.available.clone();
+    if all_types {
+        let stored: std::collections::HashSet<&str> =
+            options.iter().map(|t| t.resource_type.as_str()).collect();
+        let mut empties: Vec<TypeCount> = spec_types
+            .iter()
+            .filter(|name| !stored.contains(name.as_str()))
+            .map(|name| TypeCount {
+                resource_type: name.clone(),
+                total: 0,
+            })
+            .collect();
+        empties.sort_by(|a, b| a.resource_type.cmp(&b.resource_type));
+        options.extend(empties);
+    }
+
+    // Each option toggles membership.
+    let picker = options
+        .iter()
+        .map(|t| {
+            let selected = charted.contains(&t.resource_type);
+            let toggled: Vec<String> = if selected {
+                charted
+                    .iter()
+                    .filter(|c| **c != t.resource_type)
+                    .cloned()
+                    .collect()
+            } else {
+                // Selecting past the cap swaps the oldest series out
+                // (mirrors the provider's MAX_CHARTED_TYPES).
+                let mut set: Vec<String> = charted
+                    .iter()
+                    .skip(charted.len().saturating_sub(CHART_MAX_SERIES - 1))
+                    .cloned()
+                    .collect();
+                set.push(t.resource_type.clone());
+                set
+            };
+            PickerEntry {
+                resource_type: t.resource_type.clone(),
+                total: grouped(t.total),
+                // dash_href drops the focus itself if this toggle removes
+                // the focused type.
+                href: dash_href(&toggled, snapshot.window, all_types, focus),
+                selected,
+            }
+        })
+        .collect();
+
+    // The legend names each plotted series; while more than one is plotted,
+    // an entry links to focusing that series — or back out of the focus when
+    // it already holds it (#602). Removal lives in the picker.
     let legend = snapshot
         .series
         .iter()
-        .map(|s| LegendEntry {
-            resource_type: s.resource_type.clone(),
-            total: grouped(s.total),
-            href: format!(
-                "/ui?type={}&window={}",
-                s.resource_type,
-                snapshot.window.as_str()
-            ),
-            active: s.resource_type == selected_type,
+        .enumerate()
+        .map(|(i, s)| {
+            let focused = focus == Some(s.resource_type.as_str());
+            let href = (snapshot.series.len() > 1).then(|| {
+                let target = if focused {
+                    None
+                } else {
+                    Some(s.resource_type.as_str())
+                };
+                dash_href(&charted, snapshot.window, all_types, target)
+            });
+            LegendEntry {
+                resource_type: s.resource_type.clone(),
+                total: grouped(s.total),
+                color: i % SERIES_COLORS + 1,
+                href,
+                focused,
+            }
         })
         .collect();
 
@@ -1277,7 +1652,7 @@ fn build_dashboard(
         .into_iter()
         .map(|w| WindowEntry {
             label: w.as_str().to_string(),
-            href: format!("/ui?type={}&window={}", selected_type, w.as_str()),
+            href: dash_href(&charted, w, all_types, focus),
             active: w == snapshot.window,
         })
         .collect();
@@ -1286,53 +1661,94 @@ fn build_dashboard(
         fhir_version: snapshot.fhir_version.clone(),
         resource_types: snapshot.distinct_types.to_string(),
         stored_resources: compact_count(snapshot.total_resources),
-        // Not part of the resource-count read path — placeholder until the bulk
-        // export job-state and availability read paths are wired.
-        export_jobs: "13".to_string(),
-        export_jobs_queued: 1,
-        uptime_percent: "99.98".to_string(),
-        chart_total: selected_series
-            .map(|s| grouped(s.total))
-            .unwrap_or_else(|| "0".to_string()),
+        export_jobs: snapshot.export_jobs,
+        import_jobs: snapshot.import_jobs_active,
+        uptime: format_uptime(helios_observability::uptime::uptime_seconds()),
+        chart_total: {
+            let sum: u64 = snapshot.series.iter().map(|s| s.total).sum();
+            grouped(sum)
+        },
     };
 
-    (metrics, chart, legend, windows)
+    DashboardView {
+        metrics,
+        chart,
+        legend,
+        picker,
+        windows,
+        all_types,
+        all_types_href: dash_href(&charted, snapshot.window, !all_types, focus),
+    }
 }
 
-// Chart plot area within the `0 0 1060 300` viewBox: the value axis occupies the
-// left gutter (x < 40), the date axis the bottom (y > 278).
+// Chart plot area within the `0 0 1060 H` viewBox: the value axis occupies the
+// left gutter (x < 40), the date axis the bottom 22 units.
 const PLOT_LEFT: i64 = 40;
 const PLOT_RIGHT: i64 = 1060;
 const PLOT_TOP: i64 = 10;
-const PLOT_BOTTOM: i64 = 278;
+/// The chart's fixed viewBox height (#555, #601).
+const CHART_HEIGHT: i64 = 300;
+/// Palette slots defined as `--series-N` custom properties in app.css.
+const SERIES_COLORS: usize = 6;
+/// Most series plotted at once — mirrors the provider's `MAX_CHARTED_TYPES`
+/// (and the palette), so a picker link never asks for more than the server
+/// will chart. The default selection is smaller (the provider's three).
+const CHART_MAX_SERIES: usize = 6;
 
 /// Computes the SVG geometry for one resource type's cumulative series. `window`
 /// decides only the x-axis label format — a calendar date over daily buckets, a
-/// UTC clock time over intraday ones.
-fn build_chart(
-    selected_type: &str,
-    series: Option<&DashboardSeries>,
-    window: DashboardWindow,
-) -> ChartView {
-    let points = match series {
-        Some(s) if !s.points.is_empty() => &s.points,
-        _ => {
-            // No data: render an empty 0-based axis so the card still frames.
-            return ChartView {
-                has_data: false,
-                selected_type: selected_type.to_string(),
-                polyline: String::new(),
-                y_ticks: y_axis_ticks(0),
-                x_ticks: Vec::new(),
-            };
-        }
+/// UTC clock time over intraday ones. Under a legend `focus` (#602) the y axis
+/// re-fits the focused series so a small type is legible next to a large one;
+/// the other series stay plotted at their true values, receded, and the plot
+/// clip-path cuts them where they exceed the focused scale.
+fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&str>) -> ChartView {
+    let height = CHART_HEIGHT;
+    let plot_bottom = height - 22;
+    let plotted: Vec<&DashboardSeries> = all.iter().filter(|s| !s.points.is_empty()).collect();
+    // Something is charted as soon as a series is plotted, even an all-zero
+    // one (#599, "View all resources"): that renders as a real flat line at
+    // 0, not the "nothing to chart" empty state.
+    let has_data = !plotted.is_empty();
+    let types_label = plotted
+        .iter()
+        .map(|s| s.resource_type.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The pill stays one name wide however many series are plotted.
+    let pick_label = match plotted.len() {
+        0 => String::new(),
+        1 => plotted[0].resource_type.clone(),
+        n => format!("{} +{}", plotted[0].resource_type, n - 1),
     };
 
+    if plotted.is_empty() {
+        return ChartView {
+            has_data: false,
+            series: Vec::new(),
+            y_ticks: y_axis_ticks(0, height, plot_bottom),
+            x_ticks: Vec::new(),
+            height,
+            tip_json: "{}".to_string(),
+            table: Vec::new(),
+            types_label,
+            pick_label: String::new(),
+        };
+    }
+
     let width = PLOT_RIGHT - PLOT_LEFT;
-    let height = PLOT_BOTTOM - PLOT_TOP;
+    let plot_height = plot_bottom - PLOT_TOP;
+    // Every series shares the window, so bucket geometry comes from the first.
+    let points = &plotted[0].points;
     let n = points.len() as i64;
 
-    let peak = points.iter().map(|p| p.cumulative).max().unwrap_or(0);
+    // One y scale across every plotted series, so the curves are comparable —
+    // unless a series is focused, in which case the axis fits that series.
+    let peak = plotted
+        .iter()
+        .filter(|s| focus.is_none() || focus == Some(s.resource_type.as_str()))
+        .flat_map(|s| s.points.iter().map(|p| p.cumulative))
+        .max()
+        .unwrap_or(0);
     let axis_max = nice_ceil(peak).max(1);
 
     // Map sample index -> x, cumulative value -> y (SVG y grows downward).
@@ -1343,18 +1759,38 @@ fn build_chart(
             PLOT_LEFT + width * i / (n - 1)
         }
     };
-    let y_at = |value: u64| -> i64 { PLOT_BOTTOM - (height * value as i64) / axis_max as i64 };
+    let y_at = |value: u64| -> i64 { plot_bottom - (plot_height * value as i64) / axis_max as i64 };
 
-    let polyline = points
+    let series: Vec<ChartSeriesView> = plotted
         .iter()
         .enumerate()
-        .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
-        .collect::<Vec<_>>()
-        .join(" ");
+        .map(|(si, s)| ChartSeriesView {
+            resource_type: s.resource_type.clone(),
+            color: si % SERIES_COLORS + 1,
+            polyline: s
+                .points
+                .iter()
+                .enumerate()
+                .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
+                .collect::<Vec<_>>()
+                .join(" "),
+            emphasis: match focus {
+                None => "",
+                Some(f) if f == s.resource_type => " series--focused",
+                Some(_) => " series--receded",
+            },
+            // build_dashboard fills the focus link in; geometry stays the
+            // only concern here.
+            href: None,
+            focused: focus == Some(s.resource_type.as_str()),
+        })
+        .collect();
 
-    // Up to six evenly spaced date labels along the window.
+    // Up to six evenly spaced date labels along the window; the same sampled
+    // buckets become the rows of the accessible table.
     let label_count = (n as usize).min(6);
     let mut x_ticks = Vec::with_capacity(label_count);
+    let mut table = Vec::with_capacity(label_count);
     for j in 0..label_count as i64 {
         let idx = if label_count <= 1 {
             0
@@ -1362,31 +1798,69 @@ fn build_chart(
             (n - 1) * j / (label_count as i64 - 1)
         };
         if let Some(point) = points.get(idx as usize) {
+            let label = axis_time_label(point.bucket_start, window);
             x_ticks.push(AxisTick {
-                label: axis_time_label(point.bucket_start, window),
+                label: label.clone(),
                 pos: x_at(idx),
                 // Date labels sit on the fixed bottom row of the viewBox.
-                label_y: 298,
+                label_y: height - 2,
+            });
+            table.push(ChartTableRow {
+                label,
+                values: plotted
+                    .iter()
+                    .map(|s| {
+                        s.points
+                            .get(idx as usize)
+                            .map(|p| grouped(p.cumulative))
+                            .unwrap_or_default()
+                    })
+                    .collect(),
             });
         }
     }
 
+    // Everything the tooltip script needs, precomputed: it does no scaling of
+    // its own beyond mapping the pointer to the nearest bucket x.
+    let tip_json = serde_json::json!({
+        "labels": points
+            .iter()
+            .map(|p| axis_time_label(p.bucket_start, window))
+            .collect::<Vec<_>>(),
+        "xs": (0..n).map(&x_at).collect::<Vec<_>>(),
+        "series": plotted
+            .iter()
+            .enumerate()
+            .map(|(si, s)| serde_json::json!({
+                "type": s.resource_type,
+                "color": si % SERIES_COLORS + 1,
+                "values": s.points.iter().map(|p| p.cumulative).collect::<Vec<_>>(),
+                "ys": s.points.iter().map(|p| y_at(p.cumulative)).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string();
+
     ChartView {
-        has_data: true,
-        selected_type: selected_type.to_string(),
-        polyline,
-        y_ticks: y_axis_ticks(axis_max),
+        has_data,
+        series,
+        y_ticks: y_axis_ticks(axis_max, height, plot_bottom),
         x_ticks,
+        height,
+        tip_json,
+        table,
+        types_label,
+        pick_label,
     }
 }
 
 /// Five horizontal value gridlines from `axis_max` (top) down to `0` (bottom).
-fn y_axis_ticks(axis_max: u64) -> Vec<AxisTick> {
-    let height = PLOT_BOTTOM - PLOT_TOP;
+fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64) -> Vec<AxisTick> {
+    let plot_height = plot_bottom - PLOT_TOP;
     (0..=4i64)
         .map(|k| {
             let value = axis_max * (4 - k) as u64 / 4;
-            let pos = PLOT_TOP + height * k / 4;
+            let pos = PLOT_TOP + plot_height * k / 4;
             AxisTick {
                 label: compact_count(value),
                 pos,
@@ -1423,7 +1897,7 @@ fn compact_count(n: u64) -> String {
 }
 
 /// Thousands-separated integer for prominent totals: `1204 -> "1,204"`.
-fn grouped(n: u64) -> String {
+pub(crate) fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let bytes = digits.as_bytes();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -1454,7 +1928,7 @@ fn axis_time_label(bucket_start: DateTime<Utc>, window: DashboardWindow) -> Stri
 /// Both values we read this way (a FHIR resource type, a window slug) are
 /// alphanumeric, so no percent-decoding is needed; each is validated — against
 /// the snapshot's series, or `DashboardWindow::from_slug` — before use.
-fn query_value(query: Option<&str>, key: &str) -> Option<String> {
+pub(crate) fn query_value(query: Option<&str>, key: &str) -> Option<String> {
     let query = query?;
     query.split('&').find_map(|pair| {
         let (k, value) = pair.split_once('=')?;
@@ -1505,6 +1979,13 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         series("Condition", 2_700, 700),
     ];
     let total_resources = series.iter().map(|s| s.total).sum();
+    let available = series
+        .iter()
+        .map(|s| helios_observability::dashboard::TypeCount {
+            resource_type: s.resource_type.clone(),
+            total: s.total,
+        })
+        .collect();
 
     DashboardSnapshot {
         fhir_version: "R4".to_string(),
@@ -1512,6 +1993,9 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         distinct_types: 142,
         window,
         series,
+        available,
+        export_jobs: None,
+        import_jobs_active: None,
     }
 }
 
@@ -1538,6 +2022,8 @@ pub(crate) fn current_status(
         fhir_version,
         tenant_id: tenant.id.clone(),
         tenant_display: tenant.display.clone(),
+        show_tenant_picker: tenant.multi,
+        subscriptions_enabled: helios_observability::subscriptions::enabled(),
     }
 }
 
@@ -1569,8 +2055,12 @@ mod tests {
 
     /// Builds an `IndexPage` from the sample snapshot for template-rendering tests.
     fn sample_index_page(version: &'static str, checked_at: u64, i18n: I18n) -> IndexPage {
-        let (metrics, chart, legend, windows) =
-            build_dashboard(&sample_snapshot(DashboardWindow::default()), None);
+        let dash = build_dashboard(
+            &sample_snapshot(DashboardWindow::default()),
+            false,
+            &[],
+            None,
+        );
         IndexPage {
             status: Status {
                 version,
@@ -1578,14 +2068,107 @@ mod tests {
                 fhir_version: helios_fhir::FhirVersion::R4,
                 tenant_id: "default".to_string(),
                 tenant_display: None,
+                show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
-            metrics,
-            chart,
-            legend,
-            windows,
+            metrics: dash.metrics,
+            chart: dash.chart,
+            legend: dash.legend,
+            picker: dash.picker,
+            windows: dash.windows,
+            all_types: dash.all_types,
+            all_types_href: dash.all_types_href,
+            sample_data: true,
             i18n,
             active_page: "home",
         }
+    }
+
+    /// #602: a legend focus keeps every series plotted, re-fits the y axis to
+    /// the focused one, and flips the focused entry's link into the way back.
+    #[test]
+    fn legend_focus_rescales_recedes_and_links_back() {
+        let snapshot = sample_snapshot(DashboardWindow::default());
+        let unfocused = build_dashboard(&snapshot, false, &[], None);
+        // Patient is the smallest sample series, so focusing it must lower
+        // the axis ceiling relative to the shared (Observation-driven) scale.
+        let dash = build_dashboard(&snapshot, false, &[], Some("Patient"));
+
+        assert_eq!(dash.chart.series.len(), unfocused.chart.series.len());
+        for s in &dash.chart.series {
+            if s.resource_type == "Patient" {
+                assert_eq!(s.emphasis, " series--focused");
+            } else {
+                assert_eq!(s.emphasis, " series--receded");
+            }
+        }
+        let top = |d: &DashboardView| d.chart.y_ticks.first().map(|t| t.label.clone()).unwrap();
+        assert_ne!(top(&dash), top(&unfocused), "axis re-fits the focus");
+
+        let entry = |d: &DashboardView, t: &str| {
+            d.legend
+                .iter()
+                .find(|l| l.resource_type == t)
+                .expect("legend entry")
+                .href
+                .clone()
+                .expect("legend link")
+        };
+        // The focused entry links back out; the others move the focus.
+        assert!(!entry(&dash, "Patient").contains("focus="));
+        assert!(entry(&dash, "Observation").contains("focus=Observation"));
+        // Nothing was removed: every legend link keeps the full charted set.
+        assert!(entry(&dash, "Observation").contains("Patient"));
+
+        // The plotted lines carry the same links as their legend entries:
+        // the focused one links back out, the others move the focus.
+        let line = |d: &DashboardView, t: &str| {
+            d.chart
+                .series
+                .iter()
+                .find(|s| s.resource_type == t)
+                .expect("series")
+                .href
+                .clone()
+                .expect("line link")
+        };
+        assert!(!line(&dash, "Patient").contains("focus="));
+        assert!(line(&dash, "Observation").contains("focus=Observation"));
+
+        // A focus that names an uncharted type renders the ordinary view.
+        let bogus = build_dashboard(&snapshot, false, &[], Some("Nope"));
+        assert!(bogus.chart.series.iter().all(|s| s.emphasis.is_empty()));
+
+        // The focus link keeps "View all resources" on too (#599 + #602
+        // interaction): a focus click while `?all=1` is active must not drop
+        // the flag.
+        let with_all_types = build_dashboard(&snapshot, true, &[], Some("Patient"));
+        let all_types_entry = with_all_types
+            .legend
+            .iter()
+            .find(|l| l.resource_type == "Observation")
+            .expect("legend entry")
+            .href
+            .clone()
+            .expect("legend link");
+        assert!(all_types_entry.contains("focus=Observation"));
+        assert!(all_types_entry.contains("all=1"));
+    }
+
+    #[test]
+    fn format_uptime_picks_the_two_leading_units() {
+        assert_eq!(format_uptime(0.0), None);
+        assert_eq!(format_uptime(-5.0), None);
+        assert_eq!(format_uptime(18.4), Some("18s".to_string()));
+        assert_eq!(format_uptime(42.0 * 60.0 + 30.0), Some("42m".to_string()));
+        assert_eq!(
+            format_uptime(5.0 * 3_600.0 + 12.0 * 60.0),
+            Some("5h 12m".to_string())
+        );
+        assert_eq!(
+            format_uptime(3.0 * 86_400.0 + 4.0 * 3_600.0 + 59.0 * 60.0),
+            Some("3d 4h".to_string())
+        );
     }
 
     /// A point at a fixed instant, for geometry tests that don't care when.
@@ -1631,6 +2214,8 @@ mod tests {
                 fhir_version: helios_fhir::FhirVersion::R4,
                 tenant_id: "default".to_string(),
                 tenant_display: None,
+                show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             i18n: i18n("en"),
         }
@@ -1686,6 +2271,8 @@ mod tests {
                 fhir_version: helios_fhir::FhirVersion::R4,
                 tenant_id: "default".to_string(),
                 tenant_display: None,
+                show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -1704,6 +2291,9 @@ mod tests {
         assert!(html.contains(r#"data-intent="run""#));
         assert!(html.contains(r#"data-intent="save""#));
         assert!(html.contains(r#"id="recent-searches""#));
+        // The Recent panel closes from an explicit X as well as outside
+        // click / Esc (addbox.js covers details.menu too).
+        assert!(html.contains("data-addbox-close"));
         // Resource picker rail: the version's full type list, with count
         // slots the script hydrates via _summary=count.
         assert!(html.contains(r#"data-rail-type="Patient""#));
@@ -1725,6 +2315,8 @@ mod tests {
                 fhir_version: helios_fhir::FhirVersion::R4,
                 tenant_id: "default".to_string(),
                 tenant_display: None,
+                show_tenant_picker: true,
+                subscriptions_enabled: false,
             },
             i18n: i18n("es"),
             active_page: "queries",
@@ -1806,39 +2398,63 @@ mod tests {
 
     #[test]
     fn dashboard_projects_snapshot_counts_and_chart() {
-        let (metrics, chart, legend, _windows) = build_dashboard(
+        let dash = build_dashboard(
             &sample_snapshot(DashboardWindow::default()),
-            Some("Observation"),
+            false,
+            &[],
+            None,
         );
 
-        // Selected type drives the chart + headline total.
-        assert_eq!(chart.selected_type, "Observation");
-        assert!(chart.has_data);
-        assert!(!chart.polyline.is_empty());
-        assert_eq!(chart.y_ticks.len(), 5);
+        // Every series the snapshot carries is plotted, on one shared y scale.
+        assert!(dash.chart.has_data);
+        assert_eq!(dash.chart.series.len(), 4);
+        assert!(dash.chart.series.iter().all(|s| !s.polyline.is_empty()));
+        assert_eq!(dash.chart.y_ticks.len(), 5);
+        assert!(dash.chart.types_label.contains("Observation"));
 
-        // Legend lists every series, with the selected one marked active. Each
-        // href carries the current window, so switching type does not reset it.
-        assert_eq!(legend.len(), 4);
-        let observation = legend
+        // The legend names each plotted series; while several are plotted each
+        // entry is a focus link that keeps the whole charted set and the
+        // window (#602) — removal belongs to the picker.
+        assert_eq!(dash.legend.len(), 4);
+        let observation = dash
+            .legend
             .iter()
             .find(|e| e.resource_type == "Observation")
             .expect("Observation in legend");
-        assert!(observation.active);
-        assert_eq!(observation.href, "/ui?type=Observation&window=30d");
-        assert_eq!(legend.iter().filter(|e| e.active).count(), 1);
+        let href = observation
+            .href
+            .as_deref()
+            .expect("focusable while several are plotted");
+        assert!(href.contains("focus=Observation"));
+        assert!(href.contains("Patient"));
+        assert!(href.contains("window=30d"));
 
-        assert_eq!(metrics.resource_types, "142");
+        // The picker offers every stored type, ticking the plotted ones; a
+        // selected option's link drops exactly itself.
+        assert_eq!(dash.picker.len(), 4);
+        assert!(dash.picker.iter().all(|p| p.selected));
+        let patient = dash
+            .picker
+            .iter()
+            .find(|p| p.resource_type == "Patient")
+            .expect("Patient offered");
+        assert!(!patient.href.contains("types=Patient"));
+        assert!(patient.href.contains("Observation"));
+
+        assert_eq!(dash.metrics.resource_types, "142");
     }
 
     /// The window selector offers every window, marks the snapshot's own as
     /// active, and carries the charted type across a window switch.
     #[test]
     fn window_selector_marks_the_active_window_and_keeps_the_charted_type() {
-        let (_metrics, _chart, _legend, windows) = build_dashboard(
+        let windows = build_dashboard(
             &sample_snapshot(DashboardWindow::LastHour),
-            Some("Encounter"),
-        );
+            false,
+            &[],
+            None,
+        )
+        .windows;
 
         assert_eq!(windows.len(), DashboardWindow::ALL.len());
         assert_eq!(windows.iter().filter(|w| w.active).count(), 1);
@@ -1847,18 +2463,24 @@ mod tests {
         assert!(
             windows
                 .iter()
-                .all(|w| w.href.starts_with("/ui?type=Encounter&window=")),
-            "every window link keeps the charted type"
+                .all(|w| w.href.starts_with("/ui?types=") && w.href.contains("Patient")),
+            "every window link keeps the charted set"
         );
-        assert_eq!(active.href, "/ui?type=Encounter&window=1h");
+        assert!(active.href.contains("Patient"));
+        assert!(active.href.ends_with("window=1h"));
     }
 
     /// Intraday windows label the x-axis with clock times; the 30-day window
     /// keeps calendar dates. Same series, different axis vocabulary.
     #[test]
     fn axis_labels_follow_the_window_resolution() {
-        let (_m, hour_chart, _l, _w) =
-            build_dashboard(&sample_snapshot(DashboardWindow::LastHour), None);
+        let hour_chart = build_dashboard(
+            &sample_snapshot(DashboardWindow::LastHour),
+            false,
+            &[],
+            None,
+        )
+        .chart;
         assert!(
             hour_chart
                 .x_ticks
@@ -1872,8 +2494,13 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let (_m, month_chart, _l, _w) =
-            build_dashboard(&sample_snapshot(DashboardWindow::LastMonth), None);
+        let month_chart = build_dashboard(
+            &sample_snapshot(DashboardWindow::LastMonth),
+            false,
+            &[],
+            None,
+        )
+        .chart;
         assert!(
             month_chart.x_ticks.iter().all(|t| !t.label.contains(':')),
             "30d axis should read as a calendar date, got {:?}",
@@ -1892,7 +2519,7 @@ mod tests {
     fn every_window_renders_a_bounded_chart() {
         for window in DashboardWindow::ALL {
             let snapshot = sample_snapshot(window);
-            let (_m, chart, _l, _w) = build_dashboard(&snapshot, None);
+            let chart = build_dashboard(&snapshot, false, &[], None).chart;
             assert!(chart.has_data, "{}", window.as_str());
             assert_eq!(snapshot.series[0].points.len(), window.points());
             assert!(
@@ -1905,30 +2532,148 @@ mod tests {
     }
 
     #[test]
-    fn unknown_selected_type_falls_back_to_first_series() {
-        let (_metrics, chart, _legend, _windows) = build_dashboard(
-            &sample_snapshot(DashboardWindow::default()),
-            Some("<script>"),
-        );
-        assert_eq!(chart.selected_type, "Patient");
-    }
-
-    #[test]
-    fn empty_snapshot_renders_axes_without_a_series() {
+    fn empty_snapshot_renders_the_empty_state() {
         let empty = DashboardSnapshot {
             fhir_version: "R4".to_string(),
             total_resources: 0,
             distinct_types: 0,
             window: DashboardWindow::default(),
             series: Vec::new(),
+            available: Vec::new(),
+            export_jobs: None,
+            import_jobs_active: None,
         };
-        let (metrics, chart, legend, windows) = build_dashboard(&empty, None);
-        assert!(!chart.has_data);
-        assert!(chart.polyline.is_empty());
-        assert!(legend.is_empty());
-        assert_eq!(metrics.chart_total, "0");
+        let dash = build_dashboard(&empty, false, &[], None);
+        assert!(!dash.chart.has_data);
+        assert!(dash.chart.series.is_empty());
+        assert!(dash.legend.is_empty());
+        assert!(dash.picker.is_empty());
+        assert_eq!(dash.metrics.chart_total, "0");
         // The window selector still renders, so an empty server is not a dead end.
-        assert_eq!(windows.len(), DashboardWindow::ALL.len());
+        assert_eq!(dash.windows.len(), DashboardWindow::ALL.len());
+    }
+
+    /// `dash_href` only appends `&all=1` when the toggle is on — the common,
+    /// flag-off links must stay exactly as they were before #599.
+    #[test]
+    fn dash_href_carries_the_all_types_flag_only_when_on() {
+        let types = vec!["Patient".to_string()];
+        let off = dash_href(&types, DashboardWindow::LastDay, false, None);
+        let on = dash_href(&types, DashboardWindow::LastDay, true, None);
+        assert_eq!(off, "/ui?types=Patient&window=24h");
+        assert_eq!(on, "/ui?types=Patient&window=24h&all=1");
+    }
+
+    /// With "View all resources" (#599), the picker offers the tenant's stored
+    /// types (as today, largest first) plus every other type of the version at
+    /// 0, alphabetically after — never duplicating a type already stored, and
+    /// every option link carries `all=1` so the toggle survives a click.
+    #[test]
+    fn view_all_unions_spec_types_after_stored_ones_with_data_first() {
+        let snapshot = DashboardSnapshot {
+            fhir_version: "R4".to_string(),
+            total_resources: 5,
+            distinct_types: 1,
+            window: DashboardWindow::default(),
+            series: vec![DashboardSeries {
+                resource_type: "Patient".to_string(),
+                total: 5,
+                points: vec![point_at(1_752_451_200, 5, 5)],
+            }],
+            available: vec![helios_observability::dashboard::TypeCount {
+                resource_type: "Patient".to_string(),
+                total: 5,
+            }],
+            export_jobs: None,
+            import_jobs_active: None,
+        };
+        let spec_types = vec![
+            "Observation".to_string(),
+            "Aardvark".to_string(),
+            "Patient".to_string(), // already stored — must not be duplicated
+        ];
+
+        let dash = build_dashboard(&snapshot, true, &spec_types, None);
+
+        let names: Vec<&str> = dash
+            .picker
+            .iter()
+            .map(|p| p.resource_type.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Patient", "Aardvark", "Observation"],
+            "stored types first, then the rest of the version alphabetically"
+        );
+        let observation = dash
+            .picker
+            .iter()
+            .find(|p| p.resource_type == "Observation")
+            .expect("Observation offered even though unstored");
+        assert_eq!(observation.total, "0");
+        assert!(!observation.selected);
+        assert!(
+            observation.href.contains("all=1"),
+            "toggling an option keeps the flag on: {}",
+            observation.href
+        );
+
+        // Without the flag, the union never happens — today's behavior.
+        let off = build_dashboard(&snapshot, false, &spec_types, None);
+        assert_eq!(off.picker.len(), 1, "only the stored type is offered");
+        assert!(!off.picker[0].href.contains("all=1"));
+    }
+
+    /// The toggle link itself flips `all_types` while keeping the charted set
+    /// and window untouched.
+    #[test]
+    fn all_types_toggle_link_flips_the_flag_and_keeps_the_rest_of_the_state() {
+        let snapshot = DashboardSnapshot {
+            window: DashboardWindow::LastDay,
+            series: vec![DashboardSeries {
+                resource_type: "Patient".to_string(),
+                total: 5,
+                points: vec![point_at(1_752_451_200, 5, 5)],
+            }],
+            ..DashboardSnapshot::default()
+        };
+
+        let off = build_dashboard(&snapshot, false, &[], None);
+        assert!(!off.all_types);
+        assert!(off.all_types_href.contains("Patient"));
+        assert!(off.all_types_href.contains("window=24h"));
+        assert!(off.all_types_href.ends_with("all=1"));
+
+        let on = build_dashboard(&snapshot, true, &[], None);
+        assert!(on.all_types);
+        assert!(!on.all_types_href.contains("all=1"), "toggles back off");
+    }
+
+    /// A charted type with no data (#599: a "View all resources" selection) is
+    /// a real flat line at 0, not the chart's empty state.
+    #[test]
+    fn charting_a_zero_total_series_renders_a_flat_line_not_the_empty_state() {
+        let empty_type = DashboardSeries {
+            resource_type: "Observation".to_string(),
+            total: 0,
+            points: vec![
+                point_at(1_752_451_200, 0, 0),
+                point_at(1_752_454_800, 0, 0),
+                point_at(1_752_458_400, 0, 0),
+            ],
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&empty_type),
+            DashboardWindow::LastHour,
+            None,
+        );
+
+        assert!(chart.has_data, "a plotted series, even all-zero, has data");
+        assert_eq!(chart.series.len(), 1);
+        assert!(
+            !chart.series[0].polyline.is_empty(),
+            "the flat line is still drawn, not omitted"
+        );
     }
 
     #[test]
@@ -1995,12 +2740,17 @@ mod tests {
             total: 5,
             points: vec![point_at(1_752_503_400, 5, 5)],
         };
-        let chart = build_chart("Patient", Some(&series), DashboardWindow::default());
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::default(),
+            None,
+        );
 
         assert!(chart.has_data);
         // A lone point produces a single "x,y" pair pinned to the left axis.
-        assert!(!chart.polyline.contains(' '));
-        assert!(chart.polyline.starts_with("40,"));
+        let polyline = &chart.series[0].polyline;
+        assert!(!polyline.contains(' '));
+        assert!(polyline.starts_with("40,"));
         assert_eq!(chart.x_ticks.len(), 1);
     }
 
@@ -2017,11 +2767,15 @@ mod tests {
                 point_at(1_752_503_520, 0, 4),
             ],
         };
-        let chart = build_chart("Patient", Some(&series), DashboardWindow::LastHour);
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+        );
 
         assert!(chart.has_data);
         // Every plotted y sits inside the plot area (10..=278 in the viewBox).
-        for pair in chart.polyline.split(' ') {
+        for pair in chart.series[0].polyline.split(' ') {
             let y: i64 = pair
                 .split_once(',')
                 .expect("x,y pair")
@@ -2029,7 +2783,7 @@ mod tests {
                 .parse()
                 .expect("integer y");
             assert!(
-                (PLOT_TOP..=PLOT_BOTTOM).contains(&y),
+                (PLOT_TOP..=CHART_HEIGHT - 22).contains(&y),
                 "y {y} escaped the plot"
             );
         }

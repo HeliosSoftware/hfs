@@ -4,6 +4,7 @@
 //! `POST [base]` with a Bundle of type "batch" or "transaction"
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{
     Json,
@@ -11,13 +12,15 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use futures::stream::{self, StreamExt};
 use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
 use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, ResourceStorage,
+    bundle_if_match_gate,
 };
-use helios_persistence::error::{StorageError, TransactionError};
+use helios_persistence::error::{ResourceError, StorageError, TransactionError};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
@@ -57,7 +60,7 @@ pub async fn batch_handler<S>(
     request: Request,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + BundleProvider + Send + Sync,
+    S: ResourceStorage + BundleProvider + helios_persistence::core::SearchProvider + Send + Sync,
 {
     // Extract the Principal from request extensions (set by auth middleware).
     // If present, per-entry scope checks will be enforced.
@@ -131,6 +134,113 @@ where
     }
 }
 
+/// Hard ceiling on batch entry concurrency, independent of configuration.
+///
+/// Caps the damage a backend could do by returning an absurd
+/// [`ResourceStorage::bulk_write_concurrency`], and bounds a `ServerConfig`
+/// built programmatically without going through `validate()`.
+const MAX_BATCH_CONCURRENCY: usize = 64;
+
+/// Resolves how many entries of this bundle may execute at once.
+///
+/// The backend states its own tolerance via
+/// [`ResourceStorage::bulk_write_concurrency`] — SQLite keeps the default of 1
+/// (a single writer behind synchronous rusqlite, whose storage calls contain no
+/// await points, so they could not interleave regardless), PostgreSQL, MongoDB
+/// and Elasticsearch declare 8, S3 declares 32, and a composite delegates to
+/// its primary. `HFS_BATCH_MAX_CONCURRENCY` caps that answer; it never raises
+/// it, because only the backend knows what its pool absorbs.
+///
+/// The floor of 1 is load-bearing: `buffered(0)` never polls its inner futures,
+/// so a zero bound would hang the request until the timeout — precisely the
+/// symptom this bound exists to remove.
+fn batch_concurrency<S>(state: &AppState<S>, entries: &[Value]) -> usize
+where
+    S: ResourceStorage + Send + Sync,
+{
+    // A StructureDefinition written by entry i is folded into the tenant
+    // profile registry by `upsert_stored_profile` (the POST and PUT arms of
+    // `process_batch_entry`) before entry i+1's `check_write` resolves against
+    // it. That read-your-writes is the only cross-entry dependency on this
+    // path, and it is a server-side conformance side effect rather than a
+    // resource read, so FHIR's "entries are independent" does not sanction
+    // racing it. Fall back to today's exact semantics for exactly the bundles
+    // that rely on it.
+    //
+    // Keyed off `request.url` through the same `parse_request_url` the side
+    // effect itself keys off, so the scan and the write cannot disagree. Since
+    // #503 that parse strips the query, so `StructureDefinition?url=…` matches
+    // here where it did not before. Such an entry is refused as conditional
+    // before it writes, which makes the clamp conservative rather than
+    // load-bearing — but the scan and the write still agree, which is the
+    // invariant this is keyed for.
+    //
+    // NOTE: extend this scan in lockstep with any new cross-entry
+    // `state.validation()` mutation added to `process_batch_entry`.
+    let writes_conformance = entries.iter().any(|entry| {
+        entry
+            .get("request")
+            .and_then(|request| request.get("url"))
+            .and_then(Value::as_str)
+            .and_then(|url| parse_request_url(url).ok())
+            .is_some_and(|(resource_type, _)| resource_type == "StructureDefinition")
+    });
+    if writes_conformance {
+        return 1;
+    }
+
+    state
+        .storage()
+        .bulk_write_concurrency()
+        .min(state.config().batch_max_concurrency)
+        .clamp(1, MAX_BATCH_CONCURRENCY)
+}
+
+/// Records how far a batch got, and says so if the handler future is dropped.
+///
+/// On expiry the `TimeoutLayer` (`crate::lib`) drops the handler without
+/// propagating an error and manufactures an empty-bodied 408, so the
+/// batch-response Bundle naming the entries that committed is discarded before
+/// the client ever sees it. `Drop` still runs; this is the only place that can
+/// leave a trace of what landed.
+struct BatchProgress {
+    total: usize,
+    completed: AtomicUsize,
+    bundle_id: String,
+    finished: bool,
+}
+
+impl BatchProgress {
+    fn new(total: usize, bundle_id: String) -> Self {
+        Self {
+            total,
+            completed: AtomicUsize::new(0),
+            bundle_id,
+            finished: false,
+        }
+    }
+
+    fn record(&self) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for BatchProgress {
+    fn drop(&mut self) {
+        if !self.finished {
+            warn!(
+                completed = self.completed.load(Ordering::Relaxed),
+                total = self.total,
+                bundle_id = %self.bundle_id,
+                "Batch abandoned before completion (request timed out or client \
+                 disconnected). Entries already written are durable and were not \
+                 rolled back; where auditing is enabled, their events carry this \
+                 bundle-id."
+            );
+        }
+    }
+}
+
 /// Processes a batch Bundle.
 async fn process_batch<S>(
     state: &AppState<S>,
@@ -156,22 +266,79 @@ where
         .unwrap_or_default();
 
     let base_url = state.base_url();
-    let mut response_entries = Vec::with_capacity(entries.len());
+    let concurrency = batch_concurrency(state, &entries);
+    let mut progress = BatchProgress::new(entries.len(), correlation.bundle_id.clone());
 
-    for (index, entry) in entries.iter().enumerate() {
-        let result =
-            process_batch_entry(state, &tenant, fhir_version, entry, index, principal).await;
-        let correlation_details = EntryAuditCorrelation::from_bundle(&correlation, index);
-        emit_batch_entry_audit(
-            state,
-            entry,
-            &result,
-            principal,
-            None,
-            Some(&correlation_details),
-        );
-        response_entries.push(bundle_entry_result_to_json(&result, base_url, prefer));
-    }
+    // Re-borrow the owned locals. The per-entry closure is `FnMut`, so it can
+    // only capture things it may reproduce on every call — shared references
+    // are `Copy`, so they qualify while the values themselves would not.
+    //
+    // `buffered` polls its futures in place on this task and never spawns, so
+    // nothing here needs `'static` or an `Arc` clone, and dropping the handler
+    // drops every in-flight entry synchronously.
+    let entries_ref = &entries;
+    let tenant = &tenant;
+    let correlation = &correlation;
+    let progress_ref = &progress;
+
+    // Entries are independent per the FHIR spec ("the server may process the
+    // entries in any order"), so they run with bounded concurrency. The stream
+    // is driven over indices rather than over `entries.iter()` deliberately:
+    // a closure whose returned future borrows its *argument* needs a
+    // higher-ranked lifetime that inference cannot supply here, and the
+    // resulting error is reported against the route registration in
+    // `routing::fhir_routes` rather than against this function.
+    //
+    // `buffered` — NOT `buffer_unordered` — is backed by `FuturesOrdered` and
+    // yields in submission order, so response entry i answers request entry i
+    // by construction.
+    let results: Vec<(usize, Value)> = stream::iter(0..entries_ref.len())
+        .map(|index| async move {
+            let entry = &entries_ref[index];
+            let result =
+                process_batch_entry(state, tenant, fhir_version, entry, index, principal).await;
+
+            // Audit is emitted inside the entry future rather than after
+            // collection. `emit_batch_entry_audit` hands off to a detached
+            // task and carries position as an explicit `entry-index` detail,
+            // so completion-order emission costs nothing — and it means an
+            // entry whose write committed before a timeout still gets its
+            // event, which post-collection emission would drop for the whole
+            // bundle.
+            let correlation_details = EntryAuditCorrelation::from_bundle(correlation, index);
+            emit_batch_entry_audit(
+                state,
+                entry,
+                &result,
+                principal,
+                None,
+                Some(&correlation_details),
+            );
+
+            progress_ref.record();
+            (
+                index,
+                bundle_entry_result_to_json(&result, base_url, prefer),
+            )
+        })
+        .buffered(concurrency)
+        .collect()
+        .await;
+
+    // The positional contract is guaranteed by the combinator; assert it rather
+    // than trust it. Nothing in the response entry carries an index, so a
+    // regression here would be invisible to every existing test and to most
+    // clients.
+    debug_assert!(
+        results
+            .iter()
+            .enumerate()
+            .all(|(position, (index, _))| position == *index),
+        "batch response entries must remain positional"
+    );
+
+    let response_entries: Vec<Value> = results.into_iter().map(|(_, entry)| entry).collect();
+    progress.finished = true;
 
     let response_bundle = serde_json::json!({
         "resourceType": "Bundle",
@@ -181,7 +348,7 @@ where
 
     debug!(
         entries = response_entries.len(),
-        "Batch processing completed"
+        concurrency, "Batch processing completed"
     );
 
     Ok((StatusCode::OK, Json(response_bundle)).into_response())
@@ -204,7 +371,7 @@ async fn process_transaction<S>(
     principal: Option<&Principal>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + BundleProvider + Send + Sync,
+    S: ResourceStorage + BundleProvider + helios_persistence::core::SearchProvider + Send + Sync,
 {
     debug!(
         tenant = %tenant.tenant_id(),
@@ -225,6 +392,45 @@ where
     for (index, entry) in json_entries.iter().enumerate() {
         match parse_bundle_entry(entry) {
             Ok((bundle_entry, full_url)) => {
+                // Entry URLs reach the backends unparsed, and every backend's
+                // `parse_url` splits on `/` alone and takes the last two
+                // segments — sqlite, postgres and mongodb carry byte-equivalent
+                // copies. A query string therefore lands in storage as part of
+                // the resource type or the id: `PUT Patient?identifier=http://…`
+                // commits a row typed `Patient?identifier=http:`, and
+                // `PUT Patient/123?_format=json` commits one whose id is
+                // `123?_format=json`. `PUT Patient?name=peter` yields a single
+                // segment and fails the whole bundle with a message about the
+                // URL format instead. Decline here, before anything executes, so
+                // the bundle is declined intact (#503).
+                //
+                // GET is exempt — but not because this path resolves searches.
+                // It does not: a GET entry still reaches the backend's
+                // `parse_url`, and a query-bearing one still fails there. The
+                // exemption keeps this guard off the arm #478 is rewriting, so
+                // that work lands on an untouched dispatch path instead of
+                // merging against a refusal it is about to replace.
+                //
+                // `ifNoneExist` is left alone too — MongoDB resolves it inside
+                // the session, so refusing it here would remove a working,
+                // atomic feature. Resolving URL criteria within a transaction's
+                // atomic scope is #511.
+                if !matches!(bundle_entry.method, BundleMethod::Get)
+                    && bundle_entry.url.contains('?')
+                {
+                    return Err(RestError::NotSupported {
+                        feature: format!(
+                            "Transaction entry {} ({} {}) carries a query string. This \
+                             server cannot resolve one inside a transaction's atomic \
+                             scope, so no entries were applied. Submit it in a batch \
+                             Bundle, or address the instance directly.",
+                            index,
+                            bundle_method_to_http_method(&bundle_entry.method),
+                            bundle_entry.url
+                        ),
+                    });
+                }
+
                 // Enforce per-entry scope authorization for transactions.
                 // Transactions are atomic so any denied entry rejects the whole bundle.
                 if let Some(principal) = principal {
@@ -243,16 +449,38 @@ where
                         },
                     )?;
                 }
+                // Decline PATCH before anything executes, at the same 501 the
+                // batch arm returns and all three backends already return from
+                // inside the transaction. Today such a bundle executes its
+                // earlier entries, hits the backend's 501, rolls back, and
+                // surfaces as a generic "Transaction failed at entry N" — the
+                // status the client sees never mentions PATCH. Raised here, the
+                // bundle is declined intact and says why.
+                if matches!(bundle_entry.method, BundleMethod::Patch) {
+                    return Err(RestError::NotImplemented {
+                        feature: format!("PATCH in a Bundle entry (transaction entry {index})"),
+                    });
+                }
+
                 indexed_entries.push((index, bundle_entry, full_url));
             }
             Err(e) => {
-                // For transactions, any parse error fails the whole bundle
-                return Err(RestError::BadRequest {
-                    message: format!("Entry {}: {}", index, e),
-                });
+                // For transactions, any parse error fails the whole bundle.
+                // Rendered through the error itself rather than flattened to a
+                // 400: a HEAD entry is 405 here exactly as it is per-entry in a
+                // batch, which is the agreement #502 asks for.
+                return Err(e.into_rest_error(index));
             }
         }
     }
+
+    // Conditional references (`Type?query`) resolve against the server's
+    // content before anything executes, per the transaction processing rules:
+    // exactly one match rewrites the reference to `Type/id`; zero or several
+    // fail the bundle (#459). They used to be stored verbatim — unsearchable
+    // and unresolvable. References to entries created by this same bundle use
+    // `fullUrl`s, which the storage layer resolves during processing.
+    resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
 
     // Write-path validation: transactions are atomic, so any invalid write
     // entry rejects the whole bundle before anything executes.
@@ -378,6 +606,57 @@ where
     }
 }
 
+/// Evaluates a batch entry's `ifMatch` precondition against stored state.
+///
+/// Returns `Some` when the entry must not proceed — either the 412 the gate
+/// produced, or a storage error rendered as an entry result. Returns `None`
+/// when there was no precondition to check, or it was satisfied.
+///
+/// `ifMatch` is a list, satisfied when any listed tag matches (#311), and `*`
+/// requires a current representation — so a supplied `ifMatch` against an
+/// absent or deleted resource fails rather than silently creating.
+///
+/// **This is a read-then-write check, not an atomic compare-and-swap.** The
+/// backends reach an atomic re-check through `update_with_match`, which lives on
+/// [`VersionedStorage`] — a trait the FHIR router does not bound `S` with, so
+/// this path cannot call it. The window is the same one `handlers::update`
+/// already carries for single-resource updates, with one addition worth naming:
+/// entries within a bundle now run concurrently, so two entries carrying
+/// `ifMatch` for the same id can both pass this gate and both write.
+///
+/// [`VersionedStorage`]: helios_persistence::core::VersionedStorage
+async fn check_entry_if_match<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    resource_type: &str,
+    id: &str,
+    if_match: Option<&str>,
+) -> Option<BundleEntryResult>
+where
+    S: ResourceStorage + Send + Sync,
+{
+    // Entries that send no precondition pay nothing — not even the read.
+    if_match?;
+
+    let current = match state
+        .storage()
+        .read(tenant.context(), resource_type, id)
+        .await
+    {
+        Ok(current) => current,
+        // A deleted resource has no current representation, which is a failed
+        // precondition rather than a storage error — the same mapping
+        // `handlers::update` and the backends' own batch arms make.
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
+        Err(e) => {
+            let (status, message) = entry_error(e);
+            return Some(create_error_result(status, &message));
+        }
+    };
+
+    bundle_if_match_gate(if_match, current.as_ref().map(|r| r.version_id()))
+}
+
 /// Processes a single batch entry, returning a structured BundleEntryResult.
 async fn process_batch_entry<S>(
     state: &AppState<S>,
@@ -397,8 +676,18 @@ where
         }
     };
 
-    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    // Resolved through the shared seam, so this arm and the transaction arm
+    // accept exactly the same set of codes and refuse the rest with the same
+    // status (#502). It runs before the URL parse below, so an entry that is
+    // wrong in both ways now reports the method rather than the URL.
+    let method = match parse_entry_method(request) {
+        Ok(method) => method,
+        Err(refusal) => {
+            return create_error_result(refusal.status(), &refusal.message(index));
+        }
+    };
     let url = request.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let if_match = request.get("ifMatch").and_then(|v| v.as_str());
 
     // Parse the URL to extract resource type and ID
     let (resource_type, id) = match parse_request_url(url) {
@@ -410,13 +699,12 @@ where
 
     // Enforce per-entry scope authorization
     if let Some(principal) = principal {
-        let operation = match method {
-            "GET" => FhirOperation::Read,
-            "POST" => FhirOperation::Create,
-            "PUT" | "PATCH" => FhirOperation::Update,
-            "DELETE" => FhirOperation::Delete,
-            _ => FhirOperation::Read, // will be caught by unsupported method below
-        };
+        // The same enum-typed table the transaction arm uses. The raw-string
+        // copy this replaced ended in `_ => FhirOperation::Read`, which was only
+        // safe while an unsupported method was caught further down — with the
+        // catch-all gone, a method that slipped through would have been
+        // authorized as a read and then executed as whatever it was.
+        let operation = bundle_method_to_fhir_operation(&method);
         if SmartScopePolicy::check(principal, &resource_type, operation).is_err() {
             return create_error_result(
                 403,
@@ -428,8 +716,39 @@ where
         }
     }
 
+    // A query on a type-level URL is FHIR conditional criteria, and this path
+    // cannot resolve one — that needs a search, which is #511. Refuse it
+    // explicitly rather than dispatch something else: before #503 the criteria
+    // rode along in `resource_type`, so a conditional PUT reached
+    // `create_or_update` with an empty id and wrote a row no search can address.
+    //
+    // GET is exempt. A query there is a search rather than a condition, and
+    // executing it is #478's deliverable; leaving the arm untouched keeps this
+    // fix off that diff.
+    //
+    // Since #502 the predicate is enum-typed, matching its transaction twin. As
+    // a raw `method != "GET"` this was the third case-sensitive comparison in
+    // the file: a lowercase `get` on a search URL failed it and was refused as a
+    // conditional interaction. Such an entry is now refused at the seam and
+    // never reaches here. `{method}` below renders the canonical spelling rather
+    // than echoing raw client bytes.
+    if !matches!(method, BundleMethod::Get)
+        && let Some(criteria) = conditional_criteria(url, &id)
+    {
+        return create_error_result(
+            400,
+            &format!(
+                "Conditional interactions are not supported in Bundle entries \
+                 (entry {index}: {method} {url}). Criteria were not applied and \
+                 nothing was written. Address the instance directly, or perform \
+                 the conditional interaction against the resource endpoint. \
+                 Criteria: {criteria}"
+            ),
+        );
+    }
+
     match method {
-        "GET" => {
+        BundleMethod::Get => {
             // Read operation
             match state
                 .storage()
@@ -444,7 +763,7 @@ where
                 }
             }
         }
-        "POST" => {
+        BundleMethod::Post => {
             // Create operation
             let resource = match entry.get("resource") {
                 Some(r) => r.clone(),
@@ -483,7 +802,7 @@ where
                 }
             }
         }
-        "PUT" => {
+        BundleMethod::Put => {
             // Update operation
             let resource = match entry.get("resource") {
                 Some(r) => r.clone(),
@@ -491,6 +810,28 @@ where
                     return create_error_result(400, "PUT entry missing resource");
                 }
             };
+
+            // `PUT Patient` names no instance to update. Left to fall through it
+            // reaches `create_or_update` with an empty id, and that writes a row
+            // rather than rejecting: the backend inserts `"id": ""` into the
+            // resource before delegating to `create`, whose id fallback fires on
+            // an absent id, not an empty one. Every later such entry then reads
+            // that row back and overwrites it (#503).
+            if id.is_empty() {
+                return create_error_result(
+                    400,
+                    "PUT entry request.url must address an instance ('[type]/[id]')",
+                );
+            }
+
+            // Ahead of validation, because every backend evaluates `ifMatch`
+            // first: a stale precondition carrying an invalid body is a 412,
+            // not a 422.
+            if let Some(failure) =
+                check_entry_if_match(state, tenant, &resource_type, &id, if_match).await
+            {
+                return failure;
+            }
 
             // Write-path validation (per-entry outcome in batch semantics).
             if let Err(e) = state
@@ -535,7 +876,25 @@ where
                 }
             }
         }
-        "DELETE" => {
+        BundleMethod::Delete => {
+            // Mirror of the PUT guard above. FHIR defines no unconditional
+            // type-level delete, and an empty id would otherwise target the
+            // empty-id row a pre-#503 conditional PUT could have written.
+            if id.is_empty() {
+                return create_error_result(
+                    400,
+                    "DELETE entry request.url must address an instance ('[type]/[id]')",
+                );
+            }
+
+            // Honour `ifMatch` on DELETE: a client asking to delete only the
+            // version it reviewed must not destroy a concurrent amendment.
+            if let Some(failure) =
+                check_entry_if_match(state, tenant, &resource_type, &id, if_match).await
+            {
+                return failure;
+            }
+
             // Delete operation
             match state
                 .storage()
@@ -549,10 +908,24 @@ where
                 }
             }
         }
-        _ => {
-            warn!(method = method, "Unsupported batch method");
-            create_error_result(405, &format!("Unsupported method: {}", method))
-        }
+        // Declined rather than dispatched, matching the transaction arm and all
+        // three backends, which already return 501 for a bundle PATCH. A
+        // bundle entry carries no Content-Type, and `parse_patch_format`
+        // derives the patch format entirely from it, so there is nothing here
+        // to dispatch on; R4 designates FHIRPath Patch as the bundle format and
+        // `apply_patch` does not implement it. Tracked by #502's follow-up.
+        BundleMethod::Patch => create_error_result(
+            501,
+            &format!(
+                "Entry {index}: PATCH is not implemented in Bundle entries, so \
+                 nothing was applied. Send the patch to the instance endpoint \
+                 (PATCH [base]/[type]/[id])."
+            ),
+        ),
+        // No catch-all: the match is exhaustive over `BundleMethod`, so adding a
+        // variant is a compile error here rather than a silent 405. Codes
+        // outside the value set never reach this point — `parse_entry_method`
+        // refuses them at the top of this function.
     }
 }
 
@@ -757,16 +1130,160 @@ fn extract_outcome_description(outcome: Option<&Value>) -> Option<String> {
 }
 
 /// Parses a request URL to extract resource type and optional ID.
+///
+/// The query string is split off **before** the path is parsed. FHIR conditional
+/// criteria routinely contain `/` — the spec's own transaction example carries
+/// `Patient?identifier=http:/example.org/fhir/ids|456456` — so splitting the raw
+/// URL on `/` first folds the criteria into the resource type, and the caller
+/// then addresses storage with a type like `Patient?identifier=http:` (#503).
+///
+/// Empty segments are dropped rather than yielded, so a leading `/` and the
+/// `[type]/?[criteria]` form that `http.html` prints for conditional delete both
+/// reduce to the type alone instead of producing an empty id.
+///
+/// The query itself is deliberately not returned. Callers refuse conditional
+/// entries via [`conditional_criteria`]; resolving them is #511.
 fn parse_request_url(url: &str) -> Result<(String, String), String> {
-    let parts: Vec<&str> = url.trim_start_matches('/').split('/').collect();
+    let path = url.split_once('?').map_or(url, |(path, _)| path);
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
 
-    match parts.len() {
-        0 => Err("Empty URL".to_string()),
-        1 => Ok((parts[0].to_string(), String::new())),
-        2 => Ok((parts[0].to_string(), parts[1].to_string())),
-        _ => {
-            // Handle URLs like Patient/123/_history/1
-            Ok((parts[0].to_string(), parts[1].to_string()))
+    // Unlike the previous `Vec`-and-`match` shape, this arm is reachable: an
+    // absent or empty `request.url` used to parse as the resource type `""`,
+    // which the POST arm then created a row under.
+    let resource_type = segments
+        .next()
+        .ok_or_else(|| "Entry request.url is empty".to_string())?;
+
+    // `Patient/123/_history/1` addresses `Patient/123`; anything past the id
+    // qualifies that address rather than extending it.
+    Ok((
+        resource_type.to_string(),
+        segments.next().unwrap_or_default().to_string(),
+    ))
+}
+
+/// Returns the conditional criteria an entry URL carries, if any.
+///
+/// A query on a **type-level** URL (`Patient?identifier=x`) is FHIR conditional
+/// criteria. A query on an **instance** URL (`Patient/123?_format=json`) is a
+/// control parameter — the entry addresses a known resource either way — so it
+/// is not reported here.
+///
+/// A bare `Patient?` carries no criteria and is not conditional; treating it as
+/// one would match every resource of the type.
+fn conditional_criteria<'a>(url: &'a str, id: &str) -> Option<&'a str> {
+    if !id.is_empty() {
+        return None;
+    }
+    url.split_once('?')
+        .map(|(_, query)| query)
+        .filter(|query| !query.is_empty())
+}
+
+/// Why a bundle entry's `request.method` was refused.
+///
+/// The refusal carries its own status so the batch and transaction arms cannot
+/// disagree about it. Batch renders it as a per-entry response and transaction
+/// as the whole-bundle error, but the status is decided once, here — which is
+/// the divergence #502 is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryMethodRefusal {
+    /// `request.method` is absent, or is not a JSON string.
+    Missing,
+    /// Present, but not an `http-verb` code. Carries the raw spelling so the
+    /// message can show the client exactly what was sent.
+    NotCanonical(String),
+    /// `HEAD` — a legal `http-verb` code this server does not accept in a Bundle.
+    Head,
+}
+
+impl EntryMethodRefusal {
+    fn status(&self) -> u16 {
+        match self {
+            Self::Missing | Self::NotCanonical(_) => 400,
+            Self::Head => 405,
+        }
+    }
+
+    fn message(&self, index: usize) -> String {
+        match self {
+            Self::Missing => format!("Entry {index}: request.method is required"),
+            Self::NotCanonical(raw) => format!(
+                "Entry {index}: '{raw}' is not an http-verb code. \
+                 Bundle.entry.request.method is a code with a required binding to \
+                 http://hl7.org/fhir/ValueSet/http-verb, and FHIR codes are \
+                 case-sensitive — use GET, POST, PUT, PATCH or DELETE."
+            ),
+            Self::Head => format!(
+                "Entry {index}: HEAD is not supported in Bundle entries. Use GET, \
+                 or send HEAD to the instance endpoint directly."
+            ),
+        }
+    }
+
+    /// Renders the refusal for the transaction arm, where it fails the bundle.
+    fn into_rest_error(self, index: usize) -> RestError {
+        let message = self.message(index);
+        match self {
+            Self::Head => RestError::MethodNotAllowed {
+                method: "HEAD".to_string(),
+                resource_type: format!("a Bundle entry (entry {index})"),
+            },
+            Self::Missing | Self::NotCanonical(_) => RestError::BadRequest { message },
+        }
+    }
+}
+
+/// Parses a bundle entry's `request.method` into a [`BundleMethod`].
+///
+/// **This is the only `&str` -> `BundleMethod` table in this crate.** Both the
+/// batch and the transaction arm go through it, which is the point: they used
+/// to carry two independently-written matchers that disagreed, so the same
+/// Bundle succeeded as a `transaction` and failed as a `batch` (#502).
+///
+/// The match is deliberately **case-sensitive**. `Bundle.entry.request.method`
+/// is a `code` with a *required* binding to `http://hl7.org/fhir/ValueSet/http-verb`,
+/// whose concepts are `caseSensitive: true` and uppercase in every FHIR version
+/// this server supports. A lowercase `"post"` is therefore invalid instance
+/// data, not a valid entry a strict server wrongly rejects — so the previous
+/// `to_uppercase()` on the transaction path was the non-conformant matcher, and
+/// removing it is the fix rather than copying it across.
+fn parse_entry_method(request: &Value) -> Result<BundleMethod, EntryMethodRefusal> {
+    let Some(raw) = request.get("method").and_then(Value::as_str) else {
+        return Err(EntryMethodRefusal::Missing);
+    };
+
+    match raw {
+        "GET" => Ok(BundleMethod::Get),
+        "POST" => Ok(BundleMethod::Post),
+        "PUT" => Ok(BundleMethod::Put),
+        "PATCH" => Ok(BundleMethod::Patch),
+        "DELETE" => Ok(BundleMethod::Delete),
+        // A legal code, but one no bundle arm implements. HEAD *is* served on
+        // the instance-read route; it is Bundle entries it is refused in.
+        "HEAD" => Err(EntryMethodRefusal::Head),
+        _ => Err(EntryMethodRefusal::NotCanonical(raw.to_string())),
+    }
+}
+
+/// Why a bundle entry could not be parsed at all.
+///
+/// Split from a bare `String` so the method refusal keeps its status across the
+/// transaction boundary; flattening it there is what would re-create #502's
+/// divergence in a new place.
+#[derive(Debug)]
+enum EntryParseError {
+    Method(EntryMethodRefusal),
+    Malformed(String),
+}
+
+impl EntryParseError {
+    fn into_rest_error(self, index: usize) -> RestError {
+        match self {
+            Self::Method(refusal) => refusal.into_rest_error(index),
+            Self::Malformed(message) => RestError::BadRequest {
+                message: format!("Entry {}: {}", index, message),
+            },
         }
     }
 }
@@ -839,29 +1356,166 @@ fn status_text(code: &str) -> &'static str {
 /// Parses a bundle entry from JSON into a BundleEntry struct.
 ///
 /// Returns the BundleEntry and optionally the fullUrl for reference resolution.
-fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), String> {
+/// Resolves conditional references (`Type?query`) in the bundle's resources
+/// against the server's content, per the transaction processing rules:
+/// exactly one match rewrites the reference to `Type/id`, zero or several
+/// fail the bundle (#459). They used to pass through into storage verbatim,
+/// where nothing can search or resolve them.
+async fn resolve_conditional_references<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    indexed_entries: &mut [(usize, BundleEntry, Option<String>)],
+) -> RestResult<()>
+where
+    S: ResourceStorage + helios_persistence::core::SearchProvider + Send + Sync,
+{
+    use std::collections::HashMap;
+
+    // Collect every distinct conditional reference first: bundles repeat the
+    // same one heavily (every Synthea entry names its location), and each
+    // lookup is a search.
+    let mut conditionals: HashMap<String, Option<String>> = HashMap::new();
+    for (_, entry, _) in indexed_entries.iter() {
+        if let Some(resource) = &entry.resource {
+            collect_conditional_references(resource, &mut conditionals);
+        }
+    }
+    if conditionals.is_empty() {
+        return Ok(());
+    }
+
+    for (reference, resolved) in conditionals.iter_mut() {
+        let (resource_type, query_string) =
+            reference.split_once('?').expect("collected with a '?'");
+        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query_string.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let registry = state.storage().search_param_registry(tenant.context());
+        let mut query = {
+            let registry = registry.read();
+            crate::extractors::build_search_query_from_pairs(resource_type, &pairs, &registry)
+                .map_err(|e| RestError::BadRequest {
+                    message: format!(
+                        "Conditional reference '{reference}' is not a valid search: {e}"
+                    ),
+                })?
+        };
+        // Two is enough to prove the match is not unique.
+        query.count = Some(2);
+        let result = state
+            .storage()
+            .search(tenant.context(), &query)
+            .await
+            .map_err(RestError::from)?;
+        match result.resources.items.as_slice() {
+            [only] => {
+                *resolved = Some(format!("{}/{}", only.resource_type(), only.id()));
+            }
+            [] => {
+                return Err(RestError::BadRequest {
+                    message: format!(
+                        "Conditional reference '{reference}' matches no existing resource"
+                    ),
+                });
+            }
+            _ => {
+                return Err(RestError::BadRequest {
+                    message: format!(
+                        "Conditional reference '{reference}' matches more than one resource"
+                    ),
+                });
+            }
+        }
+    }
+
+    for (_, entry, _) in indexed_entries.iter_mut() {
+        if let Some(resource) = &mut entry.resource {
+            rewrite_conditional_references(resource, &conditionals);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a reference literal is a conditional reference (`Type?query`).
+fn is_conditional_reference(reference: &str) -> bool {
+    match reference.split_once('?') {
+        Some((head, query)) => {
+            !head.is_empty()
+                && !query.is_empty()
+                && head.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && head.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// Walks a resource collecting conditional `reference` literals.
+fn collect_conditional_references(
+    value: &Value,
+    out: &mut std::collections::HashMap<String, Option<String>>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get("reference")
+                && is_conditional_reference(reference)
+            {
+                out.entry(reference.clone()).or_insert(None);
+            }
+            for v in map.values() {
+                collect_conditional_references(v, out);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                collect_conditional_references(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrites collected conditional `reference` literals to their resolutions.
+fn rewrite_conditional_references(
+    value: &mut Value,
+    resolved: &std::collections::HashMap<String, Option<String>>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get("reference")
+                && let Some(Some(target)) = resolved.get(reference)
+            {
+                map.insert("reference".to_string(), Value::String(target.clone()));
+            }
+            for v in map.values_mut() {
+                rewrite_conditional_references(v, resolved);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                rewrite_conditional_references(item, resolved);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), EntryParseError> {
     let request = entry
         .get("request")
-        .ok_or_else(|| "Entry missing 'request'".to_string())?;
+        .ok_or_else(|| EntryParseError::Malformed("Entry missing 'request'".to_string()))?;
 
-    let method_str = request
-        .get("method")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Entry request missing 'method'".to_string())?;
-
-    let method = match method_str.to_uppercase().as_str() {
-        "GET" => BundleMethod::Get,
-        "POST" => BundleMethod::Post,
-        "PUT" => BundleMethod::Put,
-        "PATCH" => BundleMethod::Patch,
-        "DELETE" => BundleMethod::Delete,
-        _ => return Err(format!("Unsupported method: {}", method_str)),
-    };
+    // Was an independently-written `to_uppercase()` ladder — the second of the
+    // two matchers #502 is about. It no longer case-folds: `request.method` is a
+    // `code` with a required binding, and folding it was the only thing standing
+    // between invalid instance data and a real write. The refusal keeps its
+    // status across this boundary so the whole-bundle error the caller raises
+    // agrees with the per-entry result the batch arm would produce.
+    let method = parse_entry_method(request).map_err(EntryParseError::Method)?;
 
     let url = request
         .get("url")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "Entry request missing 'url'".to_string())?
+        .ok_or_else(|| EntryParseError::Malformed("Entry request missing 'url'".to_string()))?
         .to_string();
 
     let resource = entry.get("resource").cloned();
@@ -1082,6 +1736,27 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
             StatusCode::NOT_IMPLEMENTED,
             "not-supported",
             format!("Isolation level '{}' is not supported", level),
+        ),
+        // 501 + `not-supported`, matching the two sibling capability gaps
+        // above. This is a property of the configured storage backend, not of
+        // the request: the same bundle succeeds against a PostgreSQL or MongoDB
+        // deployment. The message names `batch` because that is the actionable
+        // alternative — it carries no atomicity requirement and every backend
+        // supports it (#489).
+        //
+        // Raised before any entry is written, so a client that retries finds
+        // the server in exactly the state it left it.
+        TransactionError::AtomicityUnsupported { backend_name } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "not-supported",
+            format!(
+                "The configured storage backend ('{}') cannot guarantee the all-or-nothing \
+                 semantics a transaction Bundle requires, so no entries were applied. Submit \
+                 the entries as a batch Bundle if partial success is acceptable, or use a \
+                 backend with transaction support. This server's CapabilityStatement lists \
+                 the interactions it supports.",
+                backend_name
+            ),
         ),
     }
 }
@@ -1478,6 +2153,717 @@ mod tests {
         assert_eq!(
             entry_indexes,
             HashSet::from_iter(["0".to_string(), "1".to_string()])
+        );
+    }
+
+    // ---- Batch entry concurrency (#501) ------------------------------------
+
+    /// A backend that makes entry execution observable.
+    ///
+    /// It declares a `bulk_write_concurrency` — which is what the batch loop
+    /// actually consults, so a mock that does not override it pins nothing —
+    /// records the high-water mark of simultaneous reads, and delays each read
+    /// so that a sequential loop and a concurrent one are distinguishable in
+    /// both wall clock and completion order.
+    struct DelayStorage {
+        concurrency: usize,
+        delay: std::time::Duration,
+        /// When set, entry `n` of `total` sleeps `(total - n) * delay`, so
+        /// entry 0 finishes *last* and completion order is the exact reverse of
+        /// request order. That is what distinguishes `buffered` from
+        /// `buffer_unordered`.
+        reverse_of: Option<usize>,
+        in_flight: AtomicUsize,
+        peak_in_flight: AtomicUsize,
+    }
+
+    impl DelayStorage {
+        fn new(concurrency: usize, delay_ms: u64) -> Self {
+            Self {
+                concurrency,
+                delay: std::time::Duration::from_millis(delay_ms),
+                reverse_of: None,
+                in_flight: AtomicUsize::new(0),
+                peak_in_flight: AtomicUsize::new(0),
+            }
+        }
+
+        fn reversing(concurrency: usize, delay_ms: u64, total: usize) -> Self {
+            Self {
+                reverse_of: Some(total),
+                ..Self::new(concurrency, delay_ms)
+            }
+        }
+
+        fn peak(&self) -> usize {
+            self.peak_in_flight.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl ResourceStorage for DelayStorage {
+        fn backend_name(&self) -> &'static str {
+            "delay"
+        }
+
+        fn bulk_write_concurrency(&self) -> usize {
+            self.concurrency
+        }
+
+        async fn read(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            let entered = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_in_flight.fetch_max(entered, Ordering::SeqCst);
+
+            let delay = match self.reverse_of {
+                Some(total) => {
+                    let n: usize = id.trim_start_matches('p').parse().unwrap_or(0);
+                    self.delay * (total.saturating_sub(n)) as u32
+                }
+                None => self.delay,
+            };
+            tokio::time::sleep(delay).await;
+
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+            Ok(Some(StoredResource::new(
+                resource_type,
+                id,
+                tenant.tenant_id().clone(),
+                serde_json::json!({ "resourceType": resource_type, "id": id }),
+                FhirVersion::default(),
+            )))
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!()
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            unimplemented!()
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            unimplemented!()
+        }
+    }
+
+    /// A batch Bundle of `count` GET entries, targeting `Patient/p0..p{count}`.
+    fn get_bundle(count: usize) -> Value {
+        let entries: Vec<Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "request": { "method": "GET", "url": format!("Patient/p{i}") }
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": entries,
+        })
+    }
+
+    async fn run_batch<S>(
+        state: &AppState<S>,
+        bundle: &Value,
+        principal: Option<&Principal>,
+    ) -> Value
+    where
+        S: ResourceStorage + Send + Sync,
+    {
+        let tenant = TenantExtractor::new("test-tenant", crate::tenant::TenantSource::Default);
+        let response = process_batch(
+            state,
+            tenant,
+            FhirVersion::default(),
+            &PreferHeader::default(),
+            bundle,
+            principal,
+        )
+        .await
+        .expect("batch should always produce a response");
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&bytes).expect("response body is JSON")
+    }
+
+    fn state_with(storage: DelayStorage) -> AppState<DelayStorage> {
+        AppState::new(Arc::new(storage), crate::config::ServerConfig::default())
+    }
+
+    /// Response entry *i* must answer request entry *i*, even when entry *i*
+    /// finishes last.
+    ///
+    /// The mock resolves entries in exact reverse order, so this fails under
+    /// `buffer_unordered` and passes under `buffered`. Nothing in a response
+    /// entry carries its index, so without this test a scramble is invisible.
+    #[tokio::test]
+    async fn batch_response_entries_stay_positional_under_concurrency() {
+        const ENTRIES: usize = 16;
+
+        let state = state_with(DelayStorage::reversing(ENTRIES, 10, ENTRIES));
+        let body = run_batch(&state, &get_bundle(ENTRIES), None).await;
+
+        let entries = body["entry"].as_array().expect("entry array");
+        assert_eq!(entries.len(), ENTRIES);
+
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry["resource"]["id"].as_str(),
+                Some(format!("p{i}").as_str()),
+                "response entry {i} answered a different request entry"
+            );
+        }
+
+        assert!(
+            state.storage().peak() > 1,
+            "the ordering guarantee is only meaningful if entries really overlapped"
+        );
+    }
+
+    /// Entries run concurrently, and never more concurrently than the backend
+    /// declared.
+    #[tokio::test]
+    async fn batch_entries_run_concurrently_up_to_the_bound() {
+        const ENTRIES: usize = 32;
+        const BOUND: usize = 8;
+        const DELAY_MS: u64 = 40;
+
+        let state = state_with(DelayStorage::new(BOUND, DELAY_MS));
+        let started = std::time::Instant::now();
+        let body = run_batch(&state, &get_bundle(ENTRIES), None).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            body["entry"].as_array().expect("entry array").len(),
+            ENTRIES
+        );
+
+        let peak = state.storage().peak();
+        assert!(peak > 1, "entries did not overlap at all (peak {peak})");
+        assert!(
+            peak <= BOUND,
+            "exceeded the bound the backend declared: peak {peak} > {BOUND}"
+        );
+
+        // Sequential would be ENTRIES * DELAY_MS; half of that is a wide margin
+        // that still cannot be met without real concurrency.
+        let sequential = std::time::Duration::from_millis(DELAY_MS * ENTRIES as u64);
+        assert!(
+            elapsed < sequential / 2,
+            "no speedup: {elapsed:?} against a sequential floor of {sequential:?}"
+        );
+    }
+
+    /// A single-writer backend keeps today's behaviour exactly. This is the
+    /// claim that lets SQLite stay untouched by this change.
+    #[tokio::test]
+    async fn sequential_backend_still_processes_entries_one_at_a_time() {
+        let state = state_with(DelayStorage::new(1, 1));
+        let body = run_batch(&state, &get_bundle(8), None).await;
+
+        assert_eq!(body["entry"].as_array().expect("entry array").len(), 8);
+        assert_eq!(
+            state.storage().peak(),
+            1,
+            "a backend declaring 1 must never have two entries in flight"
+        );
+    }
+
+    /// The configured ceiling lowers a backend's declared tolerance and never
+    /// raises it.
+    #[test]
+    fn batch_concurrency_caps_but_never_raises() {
+        // (backend declares, HFS_BATCH_MAX_CONCURRENCY, effective)
+        let cases = [
+            (32, 4, 4),                          // config lowers
+            (1, 32, 1),                          // config cannot raise a single-writer backend
+            (32, 32, 32),                        // both agree
+            (8, 16, 8),                          // the default ceiling leaves 8 alone
+            (32, 0, 1),     // a config that skipped validate() still cannot hang
+            (9999, 16, 16), // absurd backend, capped by config first
+            (9999, 9999, MAX_BATCH_CONCURRENCY), // then by the hard ceiling
+        ];
+
+        for (declared, configured, expected) in cases {
+            let config = crate::config::ServerConfig {
+                batch_max_concurrency: configured,
+                ..Default::default()
+            };
+            let state = AppState::new(Arc::new(DelayStorage::new(declared, 0)), config);
+
+            assert_eq!(
+                batch_concurrency(&state, &[]),
+                expected,
+                "backend {declared} with config {configured}"
+            );
+        }
+    }
+
+    /// A bundle that writes a StructureDefinition falls back to sequential.
+    ///
+    /// `upsert_stored_profile` folds the profile into the tenant registry, and
+    /// later entries' `check_write` resolve against it — a read-your-writes
+    /// dependency that concurrency would make load-dependent.
+    #[test]
+    fn batch_concurrency_is_one_when_a_structure_definition_is_written() {
+        let state = state_with(DelayStorage::new(32, 0));
+
+        let conformance = [serde_json::json!({
+            "request": { "method": "POST", "url": "StructureDefinition" },
+            "resource": { "resourceType": "StructureDefinition", "id": "sd-1" }
+        })];
+        assert_eq!(batch_concurrency(&state, &conformance), 1);
+
+        // Keyed off `request.url`, exactly like the side effect it protects —
+        // a body without `resourceType` must still be caught.
+        let url_only = [serde_json::json!({
+            "request": { "method": "PUT", "url": "StructureDefinition/sd-1" },
+            "resource": { "id": "sd-1" }
+        })];
+        assert_eq!(batch_concurrency(&state, &url_only), 1);
+
+        // Since #503 the parse strips the query, so a conditional conformance
+        // URL is caught here where it silently was not before. Such an entry is
+        // refused before it writes, which makes this clamp conservative — but
+        // the scan and the write must not disagree, which is what it is keyed
+        // for.
+        let conditional = [serde_json::json!({
+            "request": { "method": "PUT", "url": "StructureDefinition?url=http://example.org/sd" },
+            "resource": { "resourceType": "StructureDefinition" }
+        })];
+        assert_eq!(batch_concurrency(&state, &conditional), 1);
+
+        // A bundle with no conformance writes resolves normally. Compared
+        // against the empty bundle rather than a literal, so this test stays
+        // about the carve-out; the cap itself is pinned by
+        // `batch_concurrency_caps_but_never_raises`.
+        let data_only = [serde_json::json!({
+            "request": { "method": "GET", "url": "Patient/p0" }
+        })];
+        assert_eq!(
+            batch_concurrency(&state, &data_only),
+            batch_concurrency(&state, &[])
+        );
+        assert!(batch_concurrency(&state, &data_only) > 1);
+    }
+
+    /// The query is split off before the path, so conditional criteria never
+    /// ride along in the resource type (#503).
+    #[test]
+    fn parse_request_url_splits_the_query_off_before_the_path() {
+        // The shape from the issue: the `//` inside the criteria produced an
+        // empty path segment, and the criteria became the resource type.
+        assert_eq!(
+            parse_request_url("Patient?identifier=http://example.org|12345").unwrap(),
+            ("Patient".to_string(), String::new())
+        );
+        // The spec's own transaction example carries `/` inside its criteria.
+        assert_eq!(
+            parse_request_url("Patient?identifier=http:/example.org/fhir/ids|456456").unwrap(),
+            ("Patient".to_string(), String::new())
+        );
+        // `[type]/?[criteria]` is the form `http.html` prints for conditional
+        // delete; the empty segment must not become an id.
+        assert_eq!(
+            parse_request_url("Patient/?identifier=x").unwrap(),
+            ("Patient".to_string(), String::new())
+        );
+        // A query on an instance URL qualifies the request; it is not the id.
+        assert_eq!(
+            parse_request_url("Patient/p1?_format=json").unwrap(),
+            ("Patient".to_string(), "p1".to_string())
+        );
+    }
+
+    /// Shapes that already resolved keep resolving identically.
+    #[test]
+    fn parse_request_url_still_addresses_types_instances_and_history() {
+        for (url, expected_type, expected_id) in [
+            ("Patient", "Patient", ""),
+            ("Patient/p1", "Patient", "p1"),
+            ("/Patient/p1", "Patient", "p1"),
+            ("Patient/p1/_history/2", "Patient", "p1"),
+        ] {
+            assert_eq!(
+                parse_request_url(url).unwrap(),
+                (expected_type.to_string(), expected_id.to_string()),
+                "url: {url}"
+            );
+        }
+    }
+
+    /// The empty-URL arm used to be unreachable — `str::split` always yields at
+    /// least one element, so an absent `request.url` parsed as the resource type
+    /// `""` and the POST arm created a row under it.
+    #[test]
+    fn parse_request_url_rejects_a_url_with_no_resource_type() {
+        for url in ["", "/", "?identifier=x"] {
+            assert!(parse_request_url(url).is_err(), "url: {url}");
+        }
+    }
+
+    #[test]
+    fn conditional_criteria_only_fires_on_a_type_level_url() {
+        assert_eq!(
+            conditional_criteria("Patient?identifier=x", ""),
+            Some("identifier=x")
+        );
+        // An instance URL already addresses its target.
+        assert_eq!(conditional_criteria("Patient/p1?_format=json", "p1"), None);
+        // Nothing to condition on. A bare `Patient?` in particular must not be
+        // read as criteria — that would match every Patient.
+        assert_eq!(conditional_criteria("Patient", ""), None);
+        assert_eq!(conditional_criteria("Patient?", ""), None);
+    }
+
+    /// `request.method` is a `code` with a required binding to `http-verb`,
+    /// whose concepts are case-sensitive and uppercase. Only those five codes
+    /// dispatch; everything else is refused, and the refusal carries the status
+    /// both bundle arms will use (#502).
+    #[test]
+    fn parse_entry_method_accepts_only_the_canonical_http_verb_codes() {
+        for (raw, expected) in [
+            ("GET", BundleMethod::Get),
+            ("POST", BundleMethod::Post),
+            ("PUT", BundleMethod::Put),
+            ("PATCH", BundleMethod::Patch),
+            ("DELETE", BundleMethod::Delete),
+        ] {
+            let request = serde_json::json!({ "method": raw, "url": "Patient" });
+            assert_eq!(parse_entry_method(&request), Ok(expected), "raw: {raw}");
+        }
+
+        // A legal http-verb code this server does not accept inside a Bundle.
+        // HEAD *is* served on the instance-read route.
+        let head = serde_json::json!({ "method": "HEAD", "url": "Patient/p1" });
+        assert_eq!(parse_entry_method(&head), Err(EntryMethodRefusal::Head));
+        assert_eq!(EntryMethodRefusal::Head.status(), 405);
+
+        // Case-folded spellings are invalid instance data, not valid entries a
+        // strict server wrongly rejects — this is the premise #502 inverted.
+        for raw in ["post", "Post", "get", "Patch", "delete", "FOO", ""] {
+            let request = serde_json::json!({ "method": raw, "url": "Patient" });
+            assert_eq!(
+                parse_entry_method(&request),
+                Err(EntryMethodRefusal::NotCanonical(raw.to_string())),
+                "raw: {raw}"
+            );
+        }
+        assert_eq!(
+            EntryMethodRefusal::NotCanonical("post".to_string()).status(),
+            400
+        );
+
+        // Absent or non-string is distinguishable from a bogus code. It used to
+        // read as `""` via `unwrap_or("")`, yielding "Unsupported method: ".
+        for request in [
+            serde_json::json!({ "url": "Patient" }),
+            serde_json::json!({ "method": 42, "url": "Patient" }),
+            serde_json::json!({ "method": null, "url": "Patient" }),
+        ] {
+            assert_eq!(
+                parse_entry_method(&request),
+                Err(EntryMethodRefusal::Missing),
+                "request: {request}"
+            );
+        }
+        assert_eq!(EntryMethodRefusal::Missing.status(), 400);
+    }
+
+    /// The refusal keeps its status across the transaction boundary. Flattening
+    /// it to a bare 400 there would re-create #502's divergence in a new place:
+    /// HEAD would be 405 per-entry in a batch and 400 for the whole bundle.
+    #[test]
+    fn a_method_refusal_keeps_its_status_on_the_transaction_path() {
+        let head = EntryMethodRefusal::Head.into_rest_error(3);
+        assert!(
+            matches!(head, RestError::MethodNotAllowed { .. }),
+            "HEAD must stay 405, got {head:?}"
+        );
+
+        let lowercase = EntryMethodRefusal::NotCanonical("post".to_string()).into_rest_error(0);
+        assert!(matches!(lowercase, RestError::BadRequest { .. }));
+        assert!(matches!(
+            EntryMethodRefusal::Missing.into_rest_error(0),
+            RestError::BadRequest { .. }
+        ));
+    }
+
+    /// The transaction matcher no longer case-folds. `to_uppercase()` was the
+    /// only gate between an invalid `code` and a real write.
+    #[test]
+    fn the_transaction_matcher_no_longer_accepts_a_lowercase_method() {
+        let entry = serde_json::json!({
+            "request": { "method": "post", "url": "Patient" },
+            "resource": { "resourceType": "Patient" }
+        });
+        let err = parse_bundle_entry(&entry).expect_err("must be refused");
+        assert!(matches!(
+            err,
+            EntryParseError::Method(EntryMethodRefusal::NotCanonical(_))
+        ));
+
+        // The canonical spelling still parses.
+        let ok = serde_json::json!({
+            "request": { "method": "POST", "url": "Patient" },
+            "resource": { "resourceType": "Patient" }
+        });
+        assert_eq!(
+            parse_bundle_entry(&ok).unwrap().0.method,
+            BundleMethod::Post
+        );
+    }
+
+    /// Refused methods are answered per-entry and never dispatch.
+    ///
+    /// `DelayStorage`'s write methods are `unimplemented!()`, so a refusal moved
+    /// after dispatch panics rather than silently writing.
+    #[tokio::test]
+    async fn refused_methods_are_answered_per_entry_and_never_reach_storage() {
+        let state = state_with(DelayStorage::new(8, 0));
+
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                {
+                    "request": { "method": "PATCH", "url": "Patient/p1" },
+                    "resource": { "resourceType": "Patient" }
+                },
+                { "request": { "method": "HEAD", "url": "Patient/p1" } },
+                {
+                    "request": { "method": "post", "url": "Patient" },
+                    "resource": { "resourceType": "Patient" }
+                },
+                { "request": { "url": "Patient/p1" } },
+            ]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        let entries = response["entry"].as_array().unwrap();
+        let statuses: Vec<&str> = entries
+            .iter()
+            .map(|e| e["response"]["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                "501 Not Implemented",
+                "405 Method Not Allowed",
+                "400 Bad Request",
+                "400 Bad Request",
+            ]
+        );
+        assert_eq!(state.storage().peak(), 0, "no entry may reach storage");
+    }
+
+    /// A conditional write is refused per-entry and never reaches storage.
+    ///
+    /// `DelayStorage::create_or_update` and `::delete` are `unimplemented!()`,
+    /// so this panics rather than merely failing if a refusal is ever moved
+    /// after dispatch.
+    #[tokio::test]
+    async fn conditional_write_entries_are_refused_before_they_reach_storage() {
+        let state = state_with(DelayStorage::new(8, 0));
+
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                {
+                    "request": { "method": "PUT", "url": "Patient?identifier=http://example.org|1" },
+                    "resource": { "resourceType": "Patient" }
+                },
+                { "request": { "method": "DELETE", "url": "Patient?identifier=x" } },
+                {
+                    "request": { "method": "POST", "url": "Patient?identifier=x" },
+                    "resource": { "resourceType": "Patient" }
+                },
+            ]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        let entries = response["entry"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry["response"]["status"], "400 Bad Request",
+                "entry {index}: {entry}"
+            );
+        }
+        assert_eq!(state.storage().peak(), 0, "no entry may reach storage");
+    }
+
+    /// A type-level URL with no criteria names no instance. Left to fall
+    /// through, `PUT Patient` reached `create_or_update` with an empty id, and
+    /// the backend wrote a row rather than rejecting (#503).
+    #[tokio::test]
+    async fn type_level_writes_without_an_id_are_refused() {
+        let state = state_with(DelayStorage::new(8, 0));
+
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                {
+                    "request": { "method": "PUT", "url": "Patient" },
+                    "resource": { "resourceType": "Patient" }
+                },
+                { "request": { "method": "DELETE", "url": "Patient" } },
+            ]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        let entries = response["entry"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry["response"]["status"], "400 Bad Request",
+                "entry {index}: {entry}"
+            );
+        }
+        assert_eq!(state.storage().peak(), 0, "no entry may reach storage");
+    }
+
+    /// An instance-addressed entry carrying a control parameter still resolves:
+    /// the query is dropped, not treated as criteria.
+    #[tokio::test]
+    async fn an_instance_url_with_a_query_still_addresses_its_instance() {
+        let state = state_with(DelayStorage::new(8, 0));
+
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                { "request": { "method": "GET", "url": "Patient/p1?_format=json" } },
+            ]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        let entry = &response["entry"][0];
+        assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
+        assert_eq!(entry["resource"]["id"], "p1");
+    }
+
+    /// Scope enforcement stays per-entry when entries run concurrently: denied
+    /// entries become 403 response entries and permitted ones still succeed.
+    ///
+    /// `POST [base]` has no upstream authorization gate, so this inline check is
+    /// the only one — and there was no test asserting a batch scope denial
+    /// before this change made the loop concurrent.
+    #[tokio::test]
+    async fn batch_scope_denial_is_still_per_entry_under_concurrency() {
+        let state = state_with(DelayStorage::new(8, 1));
+
+        let entries: Vec<Value> = (0..8)
+            .map(|i| {
+                let resource_type = if i % 2 == 0 { "Patient" } else { "Observation" };
+                serde_json::json!({
+                    "request": { "method": "GET", "url": format!("{resource_type}/p{i}") }
+                })
+            })
+            .collect();
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": entries,
+        });
+
+        let principal = Principal {
+            subject: "client".to_string(),
+            issuer: "https://issuer.example".to_string(),
+            tenant_id: None,
+            scopes: helios_auth::ScopeSet::parse("system/Patient.rs"),
+            jti: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            custom_claims: serde_json::Map::new(),
+        };
+
+        let body = run_batch(&state, &bundle, Some(&principal)).await;
+        let entries = body["entry"].as_array().expect("entry array");
+        assert_eq!(entries.len(), 8);
+
+        for (i, entry) in entries.iter().enumerate() {
+            let status = entry["response"]["status"].as_str().unwrap_or_default();
+            if i % 2 == 0 {
+                assert!(status.starts_with("200"), "entry {i} (Patient): {status}");
+            } else {
+                assert!(
+                    status.starts_with("403"),
+                    "entry {i} (Observation) must be denied: {status}"
+                );
+            }
+        }
+    }
+
+    /// A backend that cannot honour transaction atomicity must produce a client
+    /// -actionable refusal, not a 500.
+    ///
+    /// 501 + `not-supported` matches the two sibling capability gaps
+    /// (`NestedNotSupported`, `UnsupportedIsolationLevel`) already mapped that
+    /// way, and the message has to name `batch` — that is the alternative the
+    /// caller can actually act on, and the fallback the Inferno loader uses for
+    /// S3 (#489).
+    #[test]
+    fn atomicity_unsupported_maps_to_501_not_supported() {
+        let (status, code, message) =
+            transaction_error_response_parts(&TransactionError::AtomicityUnsupported {
+                backend_name: "s3".to_string(),
+            });
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(code, "not-supported");
+        assert!(message.contains("s3"), "should name the backend: {message}");
+        assert!(
+            message.contains("batch"),
+            "should point at the workable alternative: {message}"
+        );
+        assert!(
+            message.contains("no entries were applied"),
+            "must state that nothing was written, so a retry is known-safe: {message}"
         );
     }
 }

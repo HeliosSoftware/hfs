@@ -536,13 +536,14 @@ async fn migrate_v5_to_v6(client: &deadpool_postgres::Client) -> StorageResult<(
                 submitter TEXT NOT NULL,
                 submission_id TEXT NOT NULL,
                 manifest_id TEXT NOT NULL,
+                file_url TEXT NOT NULL DEFAULT '',
                 line_number INTEGER NOT NULL,
                 resource_type TEXT NOT NULL,
                 resource_id TEXT,
                 created BOOLEAN,
                 outcome TEXT NOT NULL,
                 operation_outcome JSONB,
-                PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id, line_number),
+                PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id, file_url, line_number),
                 FOREIGN KEY (tenant_id, submitter, submission_id, manifest_id)
                     REFERENCES bulk_manifests(tenant_id, submitter, submission_id, manifest_id) ON DELETE CASCADE
             )",
@@ -550,6 +551,36 @@ async fn migrate_v5_to_v6(client: &deadpool_postgres::Client) -> StorageResult<(
         )
         .await
         .map_err(|e| pg_error(format!("Failed to create bulk_entry_results table: {}", e)))?;
+
+    // #457 migration for pre-existing tables: line numbers restart per output
+    // file, so the file belongs in the key — without it every file after the
+    // first collided on its first entry. Pre-migration rows keep ''.
+    client
+        .execute(
+            "ALTER TABLE bulk_entry_results ADD COLUMN IF NOT EXISTS file_url TEXT NOT NULL DEFAULT ''",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to add bulk_entry_results.file_url: {}", e)))?;
+    client
+        .execute(
+            "DO $$
+             BEGIN
+               IF NOT EXISTS (
+                 SELECT 1 FROM information_schema.key_column_usage
+                 WHERE table_name = 'bulk_entry_results'
+                   AND constraint_name = 'bulk_entry_results_pkey'
+                   AND column_name = 'file_url'
+               ) THEN
+                 ALTER TABLE bulk_entry_results DROP CONSTRAINT bulk_entry_results_pkey;
+                 ALTER TABLE bulk_entry_results ADD PRIMARY KEY
+                   (tenant_id, submitter, submission_id, manifest_id, file_url, line_number);
+               END IF;
+             END $$",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to rekey bulk_entry_results: {}", e)))?;
 
     client
         .execute(

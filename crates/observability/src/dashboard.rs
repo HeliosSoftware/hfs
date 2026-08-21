@@ -130,6 +130,26 @@ pub struct DashboardSeries {
     pub points: Vec<DashboardPoint>,
 }
 
+/// A resource type the tenant actually stores, with its current total —
+/// what the chart's type picker offers (#555).
+#[derive(Clone, Debug)]
+pub struct TypeCount {
+    pub resource_type: String,
+    pub total: u64,
+}
+
+/// Bulk-export jobs for one tenant, split by lifecycle stage.
+///
+/// Carried by [`DashboardSnapshot::export_jobs`]; both figures come from the
+/// same storage read so they are always consistent with each other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportJobCounts {
+    /// Jobs a worker has claimed and is executing (`in-progress`).
+    pub running: u64,
+    /// Jobs accepted and waiting for a worker slot (`accepted`).
+    pub queued: u64,
+}
+
 /// A snapshot of the figures the dashboard renders. Plain data — no storage or
 /// FHIR types — so this crate stays dependency-light.
 #[derive(Clone, Debug, Default)]
@@ -144,16 +164,44 @@ pub struct DashboardSnapshot {
     pub window: DashboardWindow,
     /// Per-type series for the charted resource types, in display order.
     pub series: Vec<DashboardSeries>,
+    /// Every type with at least one stored resource, largest first — the
+    /// picker's option list, so a tenant charts what it actually has (#555).
+    /// A provider may also report a zero-total type here when asked to (see
+    /// [`DashboardProvider::snapshot`]'s `include_empty`, #599); the UI's own
+    /// picker widens this further, unioning in the FHIR version's full type
+    /// list against a separate spec-derived source this crate does not know
+    /// about.
+    pub available: Vec<TypeCount>,
+    /// Bulk-export jobs for the tenant.
+    ///
+    /// `None` when the running storage backend has no bulk-export job store,
+    /// the subsystem is disabled, or the count could not be read — the UI
+    /// renders an explicit "unavailable" state instead of a fabricated zero.
+    pub export_jobs: Option<ExportJobCounts>,
+    /// Non-terminal bulk-submit (import) jobs for the tenant. `None` under the
+    /// same conditions as [`Self::export_jobs`].
+    pub import_jobs_active: Option<u64>,
 }
 
 /// Supplies [`DashboardSnapshot`]s on demand. Implemented in `helios-rest` over
 /// the live storage backend and registered via [`set_provider`] at startup.
 #[async_trait]
 pub trait DashboardProvider: Send + Sync {
-    /// Compute a fresh snapshot over `window`. Called per dashboard page load, so
-    /// implementations keep the query fan-out bounded (a handful of resource
-    /// types) and degrade gracefully — returning zeros — rather than erroring.
-    async fn snapshot(&self, window: DashboardWindow, tenant: &str) -> DashboardSnapshot;
+    /// Compute a fresh snapshot over `window`, charting `types` (an empty slice
+    /// asks for the provider's default selection — its top stored types).
+    /// `include_empty` is the "View all resources" toggle (#599): when `true`,
+    /// the implementation should also accept a requested type that is not
+    /// among its stored types, charting it as a flat zero series, rather than
+    /// silently dropping it. Called per dashboard page load, so implementations
+    /// keep the query fan-out bounded (implementations cap the charted set) and
+    /// degrade gracefully — returning zeros — rather than erroring.
+    async fn snapshot(
+        &self,
+        window: DashboardWindow,
+        tenant: &str,
+        types: &[String],
+        include_empty: bool,
+    ) -> DashboardSnapshot;
 }
 
 static PROVIDER: RwLock<Option<Arc<dyn DashboardProvider>>> = RwLock::new(None);
@@ -179,7 +227,8 @@ struct CacheEntry {
     computing: bool,
 }
 
-type SnapCache = Arc<RwLock<std::collections::HashMap<(DashboardWindow, String), CacheEntry>>>;
+type SnapCache =
+    Arc<RwLock<std::collections::HashMap<(DashboardWindow, String, String, bool), CacheEntry>>>;
 
 static CACHE: std::sync::LazyLock<SnapCache> = std::sync::LazyLock::new(SnapCache::default);
 
@@ -202,13 +251,20 @@ const COLD_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
 /// page loads O(1) even on backends where computing the snapshot walks storage
 /// (the S3 primary reads one object per resource — minutes once conformance
 /// seeding has populated the store, #326).
-pub async fn snapshot(window: DashboardWindow, tenant: &str) -> Option<DashboardSnapshot> {
+pub async fn snapshot(
+    window: DashboardWindow,
+    tenant: &str,
+    types: &[String],
+    include_empty: bool,
+) -> Option<DashboardSnapshot> {
     let provider = provider()?;
     snapshot_via(
         CACHE.clone(),
         provider,
         window,
         tenant,
+        types,
+        include_empty,
         CACHE_TTL,
         COLD_WAIT,
     )
@@ -217,15 +273,23 @@ pub async fn snapshot(window: DashboardWindow, tenant: &str) -> Option<Dashboard
 
 /// [`snapshot`] with the cache, provider, and timings injected, so the serve
 /// paths are testable against private caches and fast clocks.
+#[allow(clippy::too_many_arguments)]
 async fn snapshot_via(
     cache: SnapCache,
     provider: Arc<dyn DashboardProvider>,
     window: DashboardWindow,
     tenant: &str,
+    types: &[String],
+    include_empty: bool,
     ttl: std::time::Duration,
     cold_wait: std::time::Duration,
 ) -> Option<DashboardSnapshot> {
-    let key = (window, tenant.to_string());
+    // The charted set (and the "View all resources" toggle, #599) is part of
+    // the cache identity: two selections — or the same selection with the
+    // toggle flipped — are two different snapshots. Selections are short
+    // (providers cap them), so the joined key stays small and the cache stays
+    // bounded by user behavior.
+    let key = (window, tenant.to_string(), types.join(","), include_empty);
     // One pass under the lock: serve fresh hits, note staleness, and claim the
     // compute slot if nobody holds it.
     let (cached, spawn_compute) = {
@@ -250,8 +314,11 @@ async fn snapshot_via(
         let cache = cache.clone();
         let key = key.clone();
         let tenant = tenant.to_string();
+        let types = types.to_vec();
         tokio::spawn(async move {
-            let value = provider.snapshot(window, &tenant).await;
+            let value = provider
+                .snapshot(window, &tenant, &types, include_empty)
+                .await;
             if let Ok(mut guard) = cache.write()
                 && let Some(entry) = guard.get_mut(&key)
             {
@@ -304,7 +371,13 @@ mod tests {
 
     #[async_trait]
     impl DashboardProvider for Counting {
-        async fn snapshot(&self, window: DashboardWindow, _tenant: &str) -> DashboardSnapshot {
+        async fn snapshot(
+            &self,
+            window: DashboardWindow,
+            _tenant: &str,
+            _types: &[String],
+            _include_empty: bool,
+        ) -> DashboardSnapshot {
             let hit = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
@@ -329,6 +402,8 @@ mod tests {
             provider.clone(),
             DashboardWindow::LastHour,
             "default",
+            &[],
+            false,
             ttl,
             cold,
         )
@@ -341,6 +416,8 @@ mod tests {
             provider.clone(),
             DashboardWindow::LastHour,
             "default",
+            &[],
+            false,
             ttl,
             cold,
         )
@@ -366,6 +443,8 @@ mod tests {
             provider.clone(),
             DashboardWindow::LastDay,
             "default",
+            &[],
+            false,
             ttl,
             cold,
         )
@@ -378,6 +457,8 @@ mod tests {
             provider.clone(),
             DashboardWindow::LastDay,
             "default",
+            &[],
+            false,
             ttl,
             cold,
         )
@@ -397,6 +478,8 @@ mod tests {
             provider.clone(),
             DashboardWindow::LastDay,
             "default",
+            &[],
+            false,
             ttl,
             cold,
         )
@@ -421,6 +504,8 @@ mod tests {
             provider.clone(),
             DashboardWindow::LastMonth,
             "default",
+            &[],
+            false,
             ttl,
             cold,
         )
@@ -436,6 +521,8 @@ mod tests {
             provider.clone(),
             DashboardWindow::LastMonth,
             "default",
+            &[],
+            false,
             ttl,
             cold,
         )
@@ -455,7 +542,13 @@ mod tests {
 
     #[async_trait]
     impl DashboardProvider for Fixed {
-        async fn snapshot(&self, window: DashboardWindow, _tenant: &str) -> DashboardSnapshot {
+        async fn snapshot(
+            &self,
+            window: DashboardWindow,
+            _tenant: &str,
+            _types: &[String],
+            _include_empty: bool,
+        ) -> DashboardSnapshot {
             DashboardSnapshot {
                 fhir_version: "R4".to_string(),
                 total_resources: 42,
@@ -470,6 +563,9 @@ mod tests {
                         cumulative: 7,
                     }],
                 }],
+                available: Vec::new(),
+                export_jobs: None,
+                import_jobs_active: None,
             }
         }
     }
@@ -478,7 +574,7 @@ mod tests {
     async fn registered_provider_snapshot_round_trips() {
         set_provider(Arc::new(Fixed));
 
-        let snap = snapshot(DashboardWindow::LastHour, "default")
+        let snap = snapshot(DashboardWindow::LastHour, "default", &[], false)
             .await
             .expect("provider registered");
         assert_eq!(snap.total_resources, 42);
@@ -489,6 +585,48 @@ mod tests {
         assert_eq!(snap.series.len(), 1);
         assert_eq!(snap.series[0].resource_type, "Patient");
         assert_eq!(snap.series[0].points.last().unwrap().cumulative, 7);
+    }
+
+    /// The "View all resources" toggle (#599) is part of the cache identity:
+    /// the same window/tenant/types with `include_empty` flipped must not
+    /// reuse a value computed under the other setting.
+    #[tokio::test]
+    async fn include_empty_is_part_of_the_cache_key() {
+        let cache = SnapCache::default();
+        let provider = Counting::new(Duration::ZERO);
+        let ttl = Duration::from_secs(60);
+        let cold = Duration::from_millis(800);
+
+        let without = snapshot_via(
+            cache.clone(),
+            provider.clone(),
+            DashboardWindow::LastHour,
+            "default",
+            &[],
+            false,
+            ttl,
+            cold,
+        )
+        .await
+        .expect("cold load, flag off");
+        assert_eq!(without.total_resources, 1);
+
+        let with = snapshot_via(
+            cache,
+            provider.clone(),
+            DashboardWindow::LastHour,
+            "default",
+            &[],
+            true,
+            ttl,
+            cold,
+        )
+        .await
+        .expect("cold load, flag on — a separate cache entry");
+        assert_eq!(
+            with.total_resources, 2,
+            "not served from the flag-off entry"
+        );
     }
 
     /// Every window stays inside a legible point budget, and its span is exactly

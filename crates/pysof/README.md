@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Downloads](https://pepy.tech/badge/pysof)](https://pepy.tech/project/pysof)
 
-**High-performance FHIR data transformation for Python.** Transform FHIR resources into tabular formats (CSV, JSON, Parquet) using declarative ViewDefinitions from the [SQL on FHIR specification](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/).
+**High-performance FHIR data transformation for Python.** Transform FHIR resources into tabular formats (CSV, JSON, Parquet) using declarative ViewDefinitions from the [SQL on FHIR specification](http://hl7.org/fhir/uv/sql-on-fhir/).
 
 Built in Rust for speed, exposed to Python with a simple, Pythonic API. Part of the [Helios FHIR Server](https://github.com/HeliosSoftware/hfs) project.
 

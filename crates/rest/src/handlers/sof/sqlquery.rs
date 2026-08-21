@@ -1,9 +1,8 @@
-//! `$sqlquery-run` operation handler (SQL-on-FHIR v2).
+//! Executing a `$sql-run` whose subject is a SQLQuery or SQLView Library.
 //!
-//! Implements three routes per the spec:
-//! - `POST /$sqlquery-run` (system)
-//! - `POST /Library/$sqlquery-run` (type)
-//! - `POST /Library/{id}/$sqlquery-run` (instance — `{id}` binds the Library)
+//! `$sql-run` is invoked at the system level and names its subject by
+//! parameter, so this module has no routes of its own: [`super::run`] resolves
+//! the subject and dispatches here when it turns out to be a Library.
 //!
 //! Execution model: the SQLQuery Library declares one or more `relatedArtifact`
 //! ViewDefinitions (`type=depends-on`, with a `label`). For each, this handler
@@ -17,9 +16,8 @@
 //!
 //! The spec declares the operation's `return` parameter as `Binary` (1..1):
 //! a raw binary stream in the format's native media type, *not* a serialized
-//! `Binary` resource envelope (spec PR #365, commit `86c178b`; same shape as
-//! `$viewdefinition-run`). When `_format=fhir` is requested the response is a
-//! `Parameters` resource instead — the documented exception to the `Binary`
+//! `Binary` resource envelope. When `_format=fhir` is requested the response is
+//! a `Parameters` resource instead — the documented exception to the `Binary`
 //! return. By default, flat formats (csv/json/ndjson/parquet) are returned as
 //! raw payload bytes with the format's `Content-Type`. Callers that want the
 //! serialized `Binary` envelope (base64 `data`) can request it by setting
@@ -48,7 +46,6 @@
 //! ViewDefinition projection, or accept the `valueString` fallback.
 
 use axum::{
-    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -67,11 +64,12 @@ use std::time::Duration;
 use tracing::warn;
 
 use super::references::resolve_resource_canonical_or_relative;
+use super::view_sources::extract_table_source_views;
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
 
-/// Query-string parameters accepted by `$sqlquery-run`. The spec ships every
+/// Query-string parameters accepted by `$sql-run`. The spec ships every
 /// `in` parameter on the operation; we only honor the ones that make sense in
 /// a URL: `_format`, `header`, and `_limit`. Everything else (Library,
 /// parameters, source) is body-only.
@@ -90,47 +88,25 @@ pub struct SqlQueryRunQuery {
     pub limit: Option<u32>,
 }
 
-/// `POST /$sqlquery-run` and `POST /Library/$sqlquery-run`.
-pub async fn sqlquery_run_handler<S>(
-    State(state): State<AppState<S>>,
-    Query(query): Query<SqlQueryRunQuery>,
-    tenant: TenantExtractor,
-    headers: HeaderMap,
-    body: axum::extract::Json<Value>,
-) -> Result<Response, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    run_sqlquery(state, tenant, body.0, query, &headers, None).await
-}
-
-/// `POST /Library/{id}/$sqlquery-run`.
-pub async fn sqlquery_run_instance_handler<S>(
-    State(state): State<AppState<S>>,
-    Path(id): Path<String>,
-    Query(query): Query<SqlQueryRunQuery>,
-    tenant: TenantExtractor,
-    headers: HeaderMap,
-    body: axum::extract::Json<Value>,
-) -> Result<Response, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    run_sqlquery(state, tenant, body.0, query, &headers, Some(id)).await
-}
-
-async fn run_sqlquery<S>(
+/// Executes a `$sql-run` whose subject is a SQLQuery or SQLView Library.
+///
+/// The subject has already been named, fetched and classified by
+/// [`super::subject::resolve_subject`], so `library_json` arrives resolved. The
+/// dependency graph it declares in `relatedArtifact` is materialized here,
+/// then its SQL runs against the resulting tables.
+pub(super) async fn run_library_subject<S>(
     state: AppState<S>,
     tenant: TenantExtractor,
     body: Value,
     query: SqlQueryRunQuery,
     headers: &HeaderMap,
-    path_id: Option<String>,
+    library_json: Value,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
     let params = extract_sqlquery_params_from_json(&body);
+    let inline_views = extract_table_source_views(&body)?;
 
     // Spec Common Operation Behavior axis 2 (representation): the FHIR XML
     // envelope form is not supported → 406, never raw bytes under a FHIR
@@ -145,8 +121,7 @@ where
     }
 
     // _format precedence: body (Parameters) > query string > Accept header
-    // > `ndjson` default. SoF v2 PR #353 makes `_format` `0..1` defaulting
-    // to `ndjson`.
+    // > `ndjson` default. `_format` is `0..1`.
     let format = resolve_format(params.format.as_deref(), query.format.as_deref(), headers);
 
     // Spec: the `source` parameter is 0..1 and points at an external data
@@ -157,30 +132,12 @@ where
     if params.source.is_some() {
         return Err(RestError::BadRequest {
             message: "the 'source' parameter is not supported by this server; \
-                      the query will only run against the SQLQuery Library's \
+                      the query will only run against the Library's \
                       depends-on ViewDefinitions"
                 .to_string(),
         });
     }
 
-    // Mutual exclusion: queryResource and queryReference cannot both be supplied.
-    if params.query_reference.is_some() && params.query_resource.is_some() {
-        return Err(RestError::BadRequest {
-            message: "supply at most one of queryReference or queryResource".to_string(),
-        });
-    }
-
-    // Instance route binds the Library by path id; body queryReference / queryResource
-    // would conflict.
-    if path_id.is_some() && (params.query_reference.is_some() || params.query_resource.is_some()) {
-        return Err(RestError::BadRequest {
-            message: "the instance route binds Library by path id; \
-                      do not also supply queryReference or queryResource in the body"
-                .to_string(),
-        });
-    }
-
-    let library_json = resolve_library(&state, &tenant, &path_id, &params).await?;
     let library = parse_sqlquery_library(&library_json).map_err(sqlquery_err_to_rest)?;
 
     // Cap depends-on count.
@@ -202,7 +159,7 @@ where
     let runner = state
         .sof_runner()
         .ok_or_else(|| RestError::NotImplemented {
-            feature: "$sqlquery-run is not available: the configured storage backend does not \
+            feature: "$sql-run is not available: the configured storage backend does not \
                       provide a SOF runner"
                 .to_string(),
         })?
@@ -214,7 +171,13 @@ where
     let mut schemas_in_order: Vec<(String, TableSchema)> = Vec::new();
     for dep in &library.depends_on {
         let label = dep.label.clone();
-        let vd_json = resolve_canonical_view_definition(&state, tenant.context(), &dep.url).await?;
+        let vd_json = match inline_views
+            .iter()
+            .find(|vd| vd.get("url").and_then(|u| u.as_str()) == Some(dep.url.as_str()))
+        {
+            Some(vd) => vd.clone(),
+            None => resolve_canonical_view_definition(&state, tenant.context(), &dep.url).await?,
+        };
         let schema = TableSchema::from_view_definition(&vd_json);
         engine
             .create_table(&label, &schema)
@@ -308,7 +271,7 @@ where
 /// Resolves the output format. Precedence (SoF v2 PR #353): body `_format` >
 /// URL `_format` > Accept header > `ndjson` default. `_format` is `0..1`.
 ///
-/// Accept mapping mirrors `$viewdefinition-run`: `application/json` → `json`,
+/// Accept mapping: `application/json` → `json`,
 /// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
 /// `application/octet-stream`/`application/parquet` → `parquet`,
 /// `application/fhir+json` → `fhir`. `application/fhir+xml` is **not**
@@ -413,53 +376,7 @@ pub(crate) fn validate_select_only(sql: &str) -> Result<(), RestError> {
     }
 }
 
-async fn resolve_library<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    path_id: &Option<String>,
-    params: &helios_sof::SqlQueryRunParams,
-) -> Result<Value, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    // Instance route wins.
-    if let Some(id) = path_id {
-        let stored = state
-            .storage()
-            .read(tenant.context(), "Library", id)
-            .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("failed to read Library: {e}"),
-            })?
-            .ok_or_else(|| RestError::NotFound {
-                resource_type: "Library".to_string(),
-                id: id.clone(),
-            })?;
-        return Ok(stored.content().clone());
-    }
-    if let Some(library_json) = &params.query_resource {
-        return Ok(library_json.clone());
-    }
-    if let Some(reference) = &params.query_reference {
-        return resolve_library_reference(state, tenant.context(), reference).await;
-    }
-    Err(RestError::BadRequest {
-        message: "supply queryReference, queryResource, or use the instance route".to_string(),
-    })
-}
-
-async fn resolve_library_reference<S>(
-    state: &AppState<S>,
-    tenant: &TenantContext,
-    reference: &str,
-) -> Result<Value, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    resolve_resource_canonical_or_relative(state, tenant, "Library", reference).await
-}
-
-async fn resolve_canonical_view_definition<S>(
+pub(super) async fn resolve_canonical_view_definition<S>(
     state: &AppState<S>,
     tenant: &TenantContext,
     url: &str,
@@ -596,7 +513,7 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
             ),
         },
         SqlQueryError::Sqlite(err) => {
-            warn!(error = %err, "sqlite error during $sqlquery-run");
+            warn!(error = %err, "sqlite error during $sql-run");
             RestError::UnprocessableEntity {
                 message: format!("SQLite error: {err}"),
             }

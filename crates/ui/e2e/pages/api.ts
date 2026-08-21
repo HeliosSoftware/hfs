@@ -60,3 +60,30 @@ export async function seedTwoVersions(
   await updateResource(request, type, id, mutate(first));
   return id;
 }
+
+/**
+ * Wait until a created resource is *searchable*, not merely readable. On the
+ * SQLite/PostgreSQL/MongoDB backends search is read-your-write and the first
+ * probe returns immediately; on the Elasticsearch composites a write only
+ * becomes searchable after the index's refresh tick (~1s), so a spec that
+ * creates and then immediately searches — through the UI or the API — must
+ * wait here first or it races the refresh (nightly ui-tests-matrix, ES legs).
+ */
+export async function waitSearchable(
+  request: APIRequestContext,
+  type: string,
+  id: string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const res = await request.get(`/${type}?_id=${id}&_summary=count`, {
+      headers: { Accept: FHIR_JSON },
+    });
+    if (res.ok() && (((await res.json()).total as number) ?? 0) >= 1) return;
+    if (Date.now() > deadline) {
+      throw new Error(`${type}/${id} still not searchable after ${timeoutMs}ms`);
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}

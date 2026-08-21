@@ -12,16 +12,19 @@
   <script src="/ui/assets/theme.js"></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
+  <script src="/ui/assets/addbox.js" defer></script>
+  <script src="/ui/assets/dashboard.js" defer></script>
+  <script src="/ui/assets/editor-sync.js" defer></script>
 </head>
 <body class="{% block body_class %}{% endblock %}">
   <aside class="sidebar" id="sidebar">
-    <div class="brand">
+    <a class="brand" href="/ui" aria-label="{{ i18n.t("app-title") }} hfs v{{ status.version }} — {{ i18n.t("nav-home") }}">
       <img class="brand__logo" src="/ui/assets/logo.png" alt="">
       <div class="brand__text">
         <span class="brand__name">{{ i18n.t("app-title") }}</span>
         <span class="brand__version">hfs v{{ status.version }}</span>
       </div>
-    </div>
+    </a>
 
     <!--
       Tenant selector (#344). A <details> disclosure — works without
@@ -30,6 +33,7 @@
       lazily fetched from the registry by htmx when the menu first opens; with
       JavaScript disabled the panel offers the tenant-maintenance page instead.
     -->
+    {% if status.show_tenant_picker() %}
     <details class="menu">
       <summary class="selector">
         <span class="avatar">{{ status.tenant_initials() }}</span>
@@ -49,6 +53,7 @@
         </div>
       </div>
     </details>
+    {% endif %}
 
     <hr class="divider">
 
@@ -75,18 +80,18 @@
       </a>
 
       <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-batch-transaction") }}">
+      <a class="nav-item" href="/ui/batch"{% if active_page == "batch" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-batch-transaction") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-batch-transaction") }}</span>
-      </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-import") }}">
+      </a>
+      <a class="nav-item" href="/ui/bulk-import"{% if active_page == "bulk-import" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-import") }}">
         <span class="icon">{% include "icons/import.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-import") }}</span>
-      </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-export") }}">
+      </a>
+      <a class="nav-item" href="/ui/bulk-export"{% if active_page == "bulk-export" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-export") }}">
         <span class="icon">{% include "icons/export.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-export") }}</span>
-      </span>
+      </a>
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-sql-on-fhir") }}">
         <span class="icon">{% include "icons/grid.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-sql-on-fhir") }}</span>
@@ -115,10 +120,13 @@
         <span class="icon">{% include "icons/book.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
       </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-subscriptions") }}">
+      <!-- Visible only when the subscriptions engine is advertised (#580). -->
+      {% if status.subscriptions_enabled() %}
+      <a class="nav-item" href="/ui/subscriptions"{% if active_page == "subscriptions" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-subscriptions") }}">
         <span class="icon">{% include "icons/sync.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-subscriptions") }}</span>
-      </span>
+      </a>
+      {% endif %}
     </nav>
 
     <!--

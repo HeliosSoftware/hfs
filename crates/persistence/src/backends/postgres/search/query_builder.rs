@@ -527,6 +527,19 @@ impl PostgresQueryBuilder {
             "_lastUpdated" => {
                 return Self::build_last_updated_condition(&param.values, param_offset);
             }
+            // Full text over the generated narrative (`_text`) and over the whole
+            // serialized resource (`_content`), against the same `resource_fts`
+            // tsvector columns the write path populates.
+            "_text" => {
+                return Self::build_fts_condition(
+                    &param.values,
+                    "narrative_tsvector",
+                    param_offset,
+                );
+            }
+            "_content" => {
+                return Self::build_fts_condition(&param.values, "content_tsvector", param_offset);
+            }
             _ => {}
         }
 
@@ -556,6 +569,72 @@ impl PostgresQueryBuilder {
         if conditions.is_empty() {
             return None;
         }
+        let mut combined = conditions.remove(0);
+        for cond in conditions {
+            combined = combined.or(cond);
+        }
+        Some(combined)
+    }
+
+    /// Builds the `_text` / `_content` full-text condition against
+    /// `resource_fts`.
+    ///
+    /// Without this, `SearchParamType::Special` fell through to the `None` arm
+    /// below and the parameter contributed **no** condition. A search whose only
+    /// parameter was `_text` therefore produced an empty filter and returned
+    /// every resource of the type — a text query answered with the whole
+    /// compartment, not a narrower or empty result. SQLite has handled both
+    /// parameters (via FTS5 `MATCH`) all along; this is the PostgreSQL half.
+    ///
+    /// `plainto_tsquery('english', …)` matches `search_text`/`search_content` in
+    /// `search_impl.rs`, and it parameterises the user's term rather than
+    /// splicing it, so a term containing tsquery operators is data, not syntax.
+    ///
+    /// `tenant_id = $1` is not optional: the sub-select yields a bare
+    /// `resource_id` set that the outer query intersects with *this* tenant's
+    /// resources, so omitting it would let tenant B's Patient/123 select tenant
+    /// A's Patient/123 — a cross-tenant match oracle. `resource_type = $2`
+    /// likewise keeps an Observation's narrative from selecting a Patient of the
+    /// same id. Both are already bound as tenant and resource type by every
+    /// caller of `build_search_query` (`search`, `search_count`), the same
+    /// invariant `build_missing_condition` and `build_compartment_condition`
+    /// rely on.
+    fn build_fts_condition(
+        values: &[SearchValue],
+        column: &str,
+        offset: usize,
+    ) -> Option<SqlFragment> {
+        let mut conditions = Vec::new();
+        // Numbered off the running count of *accepted* values, not the loop
+        // index: a skipped value must not leave a gap, because the caller binds
+        // this fragment's params consecutively from `offset`.
+        let mut param_num = offset;
+        for value in values {
+            let term = value.value.trim();
+            if term.is_empty() {
+                continue;
+            }
+            param_num += 1;
+            conditions.push(SqlFragment::with_params(
+                format!(
+                    "id IN (SELECT resource_id FROM resource_fts \
+                     WHERE tenant_id = $1 AND resource_type = $2 \
+                     AND {} @@ plainto_tsquery('english', ${}))",
+                    column, param_num
+                ),
+                vec![SqlParam::text(term)],
+            ));
+        }
+        if conditions.is_empty() {
+            // Every value was blank. Returning `None` here would drop the
+            // parameter and hand back the entire resource type — the defect this
+            // function exists to fix — so fail closed instead. A term of nothing
+            // matches nothing, which is also what a stopword-only term already
+            // does through `plainto_tsquery`.
+            return Some(SqlFragment::new("FALSE".to_string()));
+        }
+        // Repeated values of one parameter are a logical OR, as elsewhere in
+        // this builder.
         let mut combined = conditions.remove(0);
         for cond in conditions {
             combined = combined.or(cond);
@@ -1420,6 +1499,34 @@ impl PostgresQueryBuilder {
         Some(combined)
     }
 
+    /// Builds the condition for a reference parameter.
+    ///
+    /// # Bare ids
+    ///
+    /// Per [FHIR R4 search on references](https://hl7.org/fhir/R4/search.html#reference),
+    /// `[parameter]=[id]` — a bare logical id — is the *primary* form, with
+    /// `[type]/[id]` an additional one. References are indexed as written
+    /// (`search/writer.rs` stores `Reference.reference` verbatim), so the
+    /// overwhelmingly common `Patient/<id>` literal is what sits in
+    /// `value_reference`; matching a bare id therefore needs a suffix match, not
+    /// just equality. Comparing only the raw value made `Observation?patient=<id>`
+    /// — the single most common search shape in FHIR — return an empty Bundle
+    /// (#490), while `patient=Patient/<id>` worked.
+    ///
+    /// A `:Type` modifier resolves the ambiguity up front: `subject:Patient=<id>`
+    /// is normalized to `Patient/<id>` and matched as a type-prefixed reference,
+    /// mirroring the SQLite handler.
+    ///
+    /// Matching stays version-agnostic throughout: the search value is stripped of
+    /// any `/_history/<vid>`, and a stored versioned reference still matches.
+    ///
+    /// # LIKE escaping
+    ///
+    /// The plain path binds fully-formed patterns built with [`like_escape`] and
+    /// `ESCAPE '\'` rather than concatenating the raw value into a pattern in SQL.
+    /// The suffix match makes this load-bearing: an unescaped `%` would turn
+    /// `patient=%` into `LIKE '%/%'` and match every reference. (The `:contains`,
+    /// `:below` and `:above` paths keep their existing unescaped behavior.)
     fn build_reference_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         if matches!(param.modifier.as_ref(), Some(SearchModifier::Identifier)) {
             return Self::build_reference_identifier_condition(param, offset);
@@ -1436,44 +1543,86 @@ impl PostgresQueryBuilder {
         let is_code_text = matches!(modifier, Some(SearchModifier::CodeText));
         let is_below = matches!(modifier, Some(SearchModifier::Below));
         let is_above = matches!(modifier, Some(SearchModifier::Above));
+        let type_modifier = match modifier {
+            Some(SearchModifier::Type(type_name)) => Some(type_name.as_str()),
+            _ => None,
+        };
 
-        for (i, value) in param.values.iter().enumerate() {
-            let param_num = offset + i + 1;
+        // The plain path binds a variable number of parameters per value (two for
+        // a type-prefixed reference, three for a bare id), so `param_num` runs as
+        // a counter rather than `offset + i`. `build_search_query` advances the
+        // next parameter's offset by `params.len()`, so this stays consistent.
+        let mut param_num = offset;
+        for value in &param.values {
             let predicate = if is_text {
+                param_num += 1;
+                params.push(SqlParam::text(&value.value));
                 format!("value_reference_display ILIKE '%' || ${} || '%'", param_num)
             } else if is_code_text {
+                param_num += 1;
+                params.push(SqlParam::text(&value.value));
                 format!("value_reference_display ILIKE ${} || '%'", param_num)
             } else if is_contains {
+                param_num += 1;
+                params.push(SqlParam::text(&value.value));
                 format!("value_reference ILIKE '%' || ${} || '%'", param_num)
             } else if is_below {
                 // URL/path-prefix hierarchy (canonical |version not handled).
+                param_num += 1;
+                params.push(SqlParam::text(&value.value));
                 format!(
                     "(value_reference = ${0} OR value_reference LIKE ${0} || '/%')",
                     param_num
                 )
             } else if is_above {
+                param_num += 1;
+                params.push(SqlParam::text(&value.value));
                 format!(
                     "(${0} = value_reference OR ${0} LIKE value_reference || '/%')",
                     param_num
                 )
             } else {
-                // Plain reference match, version-agnostic: the bound value is
-                // the version-stripped base; match it exactly or carrying any
-                // `_history` version.
-                format!(
-                    "(value_reference = ${0} OR value_reference LIKE ${0} || '/_history/%')",
-                    param_num
-                )
-            };
-            // For the plain match the bound value is version-stripped; modifiers
-            // keep the literal value.
-            let bound = if is_text || is_code_text || is_contains || is_below || is_above {
-                value.value.clone()
-            } else {
-                strip_reference_version(&value.value).to_string()
+                // Plain reference match. Normalize `:Type` + bare id to `Type/id`,
+                // then match version-agnostically off the version-stripped base.
+                let stripped = strip_reference_version(&value.value);
+                let base = match type_modifier {
+                    Some(type_name) if !stripped.contains('/') => {
+                        format!("{}/{}", type_name, stripped)
+                    }
+                    _ => stripped.to_string(),
+                };
+                let escaped = like_escape(&base);
+
+                // `\_history` — the escape keeps the underscore literal.
+                if base.contains('/') {
+                    // `Type/id` or an absolute URL: match the base reference, or
+                    // the same reference carrying any `_history` version.
+                    let exact = param_num + 1;
+                    let versioned = param_num + 2;
+                    param_num += 2;
+                    params.push(SqlParam::text(&base));
+                    params.push(SqlParam::text(&format!("{}/\\_history/%", escaped)));
+                    format!(
+                        "(value_reference = ${exact} OR value_reference LIKE ${versioned} ESCAPE '\\')"
+                    )
+                } else {
+                    // Bare logical id: also match any reference ending in `/id`,
+                    // with or without a trailing `_history` version.
+                    let exact = param_num + 1;
+                    let suffix = param_num + 2;
+                    let versioned = param_num + 3;
+                    param_num += 3;
+                    params.push(SqlParam::text(&base));
+                    params.push(SqlParam::text(&format!("%/{}", escaped)));
+                    params.push(SqlParam::text(&format!("%/{}/\\_history/%", escaped)));
+                    format!(
+                        "(value_reference = ${exact} \
+                          OR value_reference LIKE ${suffix} ESCAPE '\\' \
+                          OR value_reference LIKE ${versioned} ESCAPE '\\')"
+                    )
+                }
             };
             conditions.push(predicate);
-            params.push(SqlParam::text(&bound));
         }
 
         if conditions.is_empty() {
@@ -1623,6 +1772,105 @@ mod tests {
         assert!(frag.sql.contains("value_quantity_value < $5"));
         // token (system+code) = 2 params, quantity (no unit) = 1 param.
         assert_eq!(frag.params.len(), 3);
+    }
+
+    fn special_param(name: &str, values: Vec<SearchValue>) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Special,
+            modifier: None,
+            values,
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    #[test]
+    fn text_search_filters_instead_of_returning_everything() {
+        // Regression: `SearchParamType::Special` fell through to `None`, so a
+        // `_text`-only query built no filter at all and `search` answered a
+        // full-text query with every resource of the type.
+        let query = SearchQuery::new("Patient").with_parameter(special_param(
+            "_text",
+            vec![SearchValue::eq("Zebracrossingdiagnosis")],
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("_text must produce a condition, not an empty filter");
+
+        assert!(
+            frag.sql.contains("FROM resource_fts"),
+            "must resolve through the full-text table: {}",
+            frag.sql
+        );
+        assert!(
+            frag.sql
+                .contains("narrative_tsvector @@ plainto_tsquery('english', $3)"),
+            "_text matches the narrative column: {}",
+            frag.sql
+        );
+        // Tenant and type scoping keep the sub-select from selecting another
+        // tenant's — or another resource type's — row of the same id.
+        assert!(frag.sql.contains("tenant_id = $1"), "{}", frag.sql);
+        assert!(frag.sql.contains("resource_type = $2"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn content_search_uses_the_content_column() {
+        let query = SearchQuery::new("Patient").with_parameter(special_param(
+            "_content",
+            vec![SearchValue::eq("Quokkaflavoured")],
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("_content must produce a condition");
+
+        assert!(
+            frag.sql
+                .contains("content_tsvector @@ plainto_tsquery('english', $3)"),
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn text_or_list_placeholders_are_gap_free() {
+        // Two terms OR together, and a blank one must not consume a placeholder
+        // number it never binds — the caller binds this fragment's params
+        // consecutively.
+        let query = SearchQuery::new("Patient").with_parameter(special_param(
+            "_text",
+            vec![
+                SearchValue::eq("   "),
+                SearchValue::eq("fracture"),
+                SearchValue::eq("sprain"),
+            ],
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("_text OR-list should produce a condition");
+
+        assert_eq!(frag.params.len(), 2, "the blank term binds nothing");
+        assert!(frag.sql.contains("$3"), "{}", frag.sql);
+        assert!(frag.sql.contains("$4"), "{}", frag.sql);
+        assert!(
+            !frag.sql.contains("$5"),
+            "placeholder numbering must be gap-free: {}",
+            frag.sql
+        );
+        assert!(frag.sql.contains(" OR "), "{}", frag.sql);
+    }
+
+    #[test]
+    fn blank_text_term_fails_closed() {
+        // Dropping the parameter would return the whole resource type, which is
+        // the exact failure mode being fixed.
+        let query = SearchQuery::new("Patient")
+            .with_parameter(special_param("_text", vec![SearchValue::eq("")]));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("a blank _text must still constrain the query");
+
+        assert_eq!(frag.sql, "FALSE");
+        assert!(frag.params.is_empty());
     }
 
     #[test]
@@ -1873,7 +2121,132 @@ mod tests {
             "reference OR-list must be one sublink: {}",
             frag.sql
         );
-        assert_eq!(frag.params.len(), 2);
+        // Two params per type-prefixed value: the exact base and the
+        // `/_history/%` pattern (the pattern is built in Rust so the value can be
+        // LIKE-escaped, rather than concatenated onto the raw bind in SQL).
+        assert_eq!(frag.params.len(), 4);
+    }
+
+    /// A bare logical id is the primary form of a reference search
+    /// (`Observation?patient=<id>`), and must match a stored `Patient/<id>`.
+    /// Postgres previously compared the raw value only, so a bare id matched
+    /// nothing while `patient=Patient/<id>` worked — #490.
+    #[test]
+    fn reference_bare_id_matches_type_prefixed_reference() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "patient-1")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("bare-id reference");
+
+        let params: Vec<&str> = frag
+            .params
+            .iter()
+            .map(|p| match p {
+                SqlParam::Text(t) => t.as_str(),
+                other => panic!("expected text params, got {:?}", other),
+            })
+            .collect();
+        assert_eq!(
+            params,
+            vec!["patient-1", "%/patient-1", "%/patient-1/\\_history/%"],
+            "a bare id must match exactly, as a `/id` suffix, and versioned: {}",
+            frag.sql
+        );
+        assert_eq!(
+            frag.sql.matches("id IN (SELECT").count(),
+            1,
+            "still a single sublink: {}",
+            frag.sql
+        );
+    }
+
+    /// `subject:Patient=<id>` resolves the bare id to `Patient/<id>` and matches
+    /// it as a type-prefixed reference, mirroring the SQLite handler.
+    #[test]
+    fn reference_type_modifier_normalizes_bare_id() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: Some(SearchModifier::Type("Patient".to_string())),
+            values: vec![SearchValue::new(SearchPrefix::Eq, "patient-1")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect(":Type reference");
+
+        let params: Vec<&str> = frag
+            .params
+            .iter()
+            .map(|p| match p {
+                SqlParam::Text(t) => t.as_str(),
+                other => panic!("expected text params, got {:?}", other),
+            })
+            .collect();
+        assert_eq!(
+            params,
+            vec!["Patient/patient-1", "Patient/patient-1/\\_history/%"],
+            "the type modifier pins the reference, so no `/id` suffix match: {}",
+            frag.sql
+        );
+    }
+
+    /// A versioned search value is stripped before the bare-id suffix match, so
+    /// `subject=patient-1/_history/2` still matches a stored `Patient/patient-1`.
+    #[test]
+    fn reference_bare_id_is_version_stripped() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "patient-1/_history/2")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("versioned bare-id reference");
+
+        match &frag.params[0] {
+            SqlParam::Text(t) => assert_eq!(t, "patient-1"),
+            other => panic!("expected a text param, got {:?}", other),
+        }
+        assert_eq!(frag.params.len(), 3, "version-stripped back to a bare id");
+    }
+
+    /// The suffix match makes LIKE escaping load-bearing: unescaped, `patient=%`
+    /// would become `LIKE '%/%'` and match every stored reference.
+    #[test]
+    fn reference_bare_id_escapes_like_metacharacters() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "%")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("wildcard reference");
+
+        match &frag.params[1] {
+            SqlParam::Text(t) => assert_eq!(
+                t, "%/\\%",
+                "only the leading wildcard is live; the value's own '%' is escaped"
+            ),
+            other => panic!("expected a text param, got {:?}", other),
+        }
+        assert!(
+            frag.sql.contains("ESCAPE '\\'"),
+            "the pattern must carry its escape clause: {}",
+            frag.sql
+        );
     }
 
     #[test]

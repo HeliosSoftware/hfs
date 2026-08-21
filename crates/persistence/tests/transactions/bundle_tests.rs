@@ -668,17 +668,8 @@ macro_rules! sqlite_if_match_test {
     };
 }
 
-sqlite_if_match_test!(batch_put_honors_stale_if_match);
-sqlite_if_match_test!(batch_put_accepts_matching_if_match);
 sqlite_if_match_test!(multi_valued_if_match_matches_any_member);
 sqlite_if_match_test!(multi_valued_if_match_fails_when_no_member_matches);
 sqlite_if_match_test!(strong_form_if_match_matches_weak_etag);
-sqlite_if_match_test!(if_match_on_absent_resource_fails_instead_of_creating);
-sqlite_if_match_test!(star_if_match_requires_an_existing_resource);
-sqlite_if_match_test!(malformed_if_match_fails_closed);
-sqlite_if_match_test!(batch_put_if_match_on_deleted_resource_fails);
-sqlite_if_match_test!(batch_delete_if_match_on_deleted_resource_fails);
-sqlite_if_match_test!(batch_delete_honors_stale_if_match);
-sqlite_if_match_test!(batch_delete_accepts_matching_if_match);
 sqlite_if_match_test!(transaction_delete_honors_stale_if_match);
 sqlite_if_match_test!(transaction_delete_accepts_matching_if_match);

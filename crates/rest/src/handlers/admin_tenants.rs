@@ -28,6 +28,7 @@ use axum::{
 };
 use helios_audit::{AuditAction, AuditEventBuilder};
 use helios_persistence::core::ResourceStorage;
+use helios_persistence::tenant::{SYSTEM_TENANT, TenantId};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::debug;
@@ -35,7 +36,9 @@ use tracing::debug;
 use crate::error::{RestError, RestResult};
 use crate::state::AppState;
 
-use helios_persistence::tenant::{MAX_TENANT_ID_LEN, SYSTEM_TENANT, TenantId, TenantIdError};
+// The tenant-id length cap and reserved-name list that used to live here are
+// now `helios_persistence::tenant::{MAX_TENANT_ID_LEN, RESERVED_TENANT_SEGMENTS}`,
+// applied by `TenantId::parse` — see `validate_tenant_id` below (issue #385).
 
 /// Request body for `POST /admin/tenants`.
 #[derive(Debug, Deserialize)]
@@ -84,37 +87,31 @@ async fn seed_new_tenant<S: ResourceStorage>(
     .await;
 }
 
-/// Validates a tenant id: non-empty, within length, a conservative identifier
-/// charset, and never a reserved internal id.
+/// Validates a tenant id against the canonical definition.
 ///
-/// Delegates to [`TenantId::parse`], the single reservation authority shared
-/// with the request-time tenant extractor, the web UI's tenant page, and the
-/// storage-layer lifecycle guard. Previously this function kept its own copy of
-/// the rules, which is how the reservation came to be enforced here but not on
-/// the doors an untrusted caller actually knocks on (issue #317).
+/// This used to be a third, independent charset — wider than the two the REST
+/// routing surfaces enforced (it permitted `.` and `/`) and with a different
+/// length cap. Provisioning a tenant it accepted but routing did not produced a
+/// registered tenant nobody could address. Validation now lives in one place
+/// ([`TenantId::parse`], issue #385) and this handler only translates the
+/// rejection into a `400`.
 ///
-/// The wording of each rejection is preserved so the API's error messages do not
-/// change.
+/// Two rules the old local version had are now *stronger*, not merely moved:
+///
+/// - The reserved-name check compares each `/`-separated **segment**, not the
+///   whole id. `acme/resources` used to pass, and on S3 its objects land inside
+///   the `acme/resources/` prefix that tenant `acme` lists and
+///   `purge_tenant_data("acme")` deletes.
+/// - The length cap is 64, not 128. An id in 65..=128 bytes was already
+///   unroutable through both header and URL routing (each capped at 64), so it
+///   was reachable only through the JWT claim — the ingress that validated
+///   nothing.
 fn validate_tenant_id(id: &str) -> RestResult<()> {
-    TenantId::parse(id).map(|_| ()).map_err(|e| {
-        let message = match e {
-            TenantIdError::Empty => "tenant id must not be empty".to_string(),
-            TenantIdError::TooLong { .. } => {
-                format!("tenant id exceeds {MAX_TENANT_ID_LEN} characters")
-            }
-            TenantIdError::Reserved { id } if id == SYSTEM_TENANT => {
-                "'__system__' is reserved for internal shared resources".to_string()
-            }
-            TenantIdError::Reserved { id } => format!("'{id}' is reserved for internal use"),
-            TenantIdError::InvalidChar { .. } => {
-                "tenant id may contain only letters, digits, '-', '_', '.', and '/'".to_string()
-            }
-            // `TenantIdError` is `#[non_exhaustive]`; a variant added later falls
-            // back to its own `Display` rather than failing to compile here.
-            other => other.to_string(),
-        };
-        RestError::BadRequest { message }
-    })
+    TenantId::parse(id)
+        .map(|_| ())
+        .map_err(|e| RestError::BadRequest {
+            message: e.to_string(),
+        })
 }
 
 /// `GET /admin/tenants`
@@ -125,6 +122,16 @@ fn validate_tenant_id(id: &str) -> RestResult<()> {
 /// from stored data (`registered: false`, `created_at: null`) so nothing with
 /// data is hidden. Each row carries the current non-deleted `resources` count.
 /// The internal system tenant is never listed.
+///
+/// Each row also carries `canonical` — whether the id satisfies
+/// [`TenantId::parse`]. It is `true` for everything this API can create, so the
+/// field only ever matters for ids that predate the canonical validator (issue
+/// #385): those were stored under a wider (or absent) charset and are no longer
+/// reachable through any ingress. This is how an operator finds them. Rows with
+/// `canonical: false` and a non-zero `resources` count are the ones needing
+/// attention — the data is still there, but requests naming that tenant are now
+/// rejected. `DELETE /admin/tenants/{id}` still accepts them, deliberately, so
+/// they can be cleaned up.
 pub async fn list_tenants_handler<S>(State(state): State<AppState<S>>) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
@@ -140,6 +147,11 @@ where
         .into_iter()
         .collect();
 
+    // `new` (unchecked) then `is_canonical`, not `parse().is_ok()`, to say
+    // plainly what this is: reporting on a value that is already stored, never
+    // admitting one.
+    let is_canonical = |id: &str| helios_persistence::tenant::TenantId::new(id).is_canonical();
+
     let mut seen = std::collections::HashSet::new();
     let mut tenants = Vec::new();
     for rec in &registered {
@@ -149,6 +161,7 @@ where
             "display_name": rec.display_name,
             "created_at": rec.created_at,
             "registered": true,
+            "canonical": is_canonical(&rec.id),
             "resources": counts.get(&rec.id).copied().unwrap_or(0),
         }));
     }
@@ -165,12 +178,20 @@ where
             "display_name": null,
             "created_at": null,
             "registered": false,
+            "canonical": is_canonical(id),
             "resources": n,
         }));
     }
 
+    let non_canonical = tenants
+        .iter()
+        .filter(|t| t["canonical"] == json!(false))
+        .count();
     let body = json!({
         "tenant_count": tenants.len(),
+        // Surfaced at the top level so an operator does not have to scan the
+        // rows to learn whether the upgrade stranded anything.
+        "non_canonical_count": non_canonical,
         "tenants": tenants,
     });
     Ok((StatusCode::OK, Json(body)).into_response())

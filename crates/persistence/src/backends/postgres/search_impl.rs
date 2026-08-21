@@ -633,7 +633,17 @@ impl ChainedSearchProvider for PostgresBackend {
         let parsed = builder
             .parse_chain(chain)
             .map_err(|e| internal_error(format!("Failed to parse chain: {}", e)))?;
-        let parsed_value = crate::types::SearchValue::parse(value);
+        // Strip the comparator prefix only when the terminal parameter's type
+        // admits one: dates/numbers/quantities compare, but a string value
+        // like `family=Levine` must never be misread as le + "vine" (#258).
+        let candidate = crate::types::SearchValue::parse(value);
+        let parsed_value = if candidate.prefix != crate::types::SearchPrefix::Eq
+            && candidate.prefix.is_valid_for(parsed.terminal_type)
+        {
+            candidate
+        } else {
+            crate::types::SearchValue::eq(value)
+        };
         let fragment = builder.build_forward_chain_sql(&parsed, &parsed_value)?;
 
         let sql = format!(

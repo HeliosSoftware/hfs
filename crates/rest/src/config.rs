@@ -872,6 +872,21 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_REQUEST_TIMEOUT", default_value = "30")]
     pub request_timeout: u64,
 
+    /// Ceiling on how many entries of one `batch` Bundle execute concurrently.
+    ///
+    /// The effective bound is the storage backend's own
+    /// [`bulk_write_concurrency`] capped by this value: it can lower what a
+    /// backend declared it tolerates, never raise it. Raising a backend's
+    /// tolerance is a backend setting (connection pool size, for instance).
+    ///
+    /// This exists to keep a large batch inside `request_timeout`: entries run
+    /// sequentially at a bound of 1, so wall clock is the sum of every entry's
+    /// storage round trips.
+    ///
+    /// [`bulk_write_concurrency`]: helios_persistence::core::ResourceStorage::bulk_write_concurrency
+    #[arg(long, env = "HFS_BATCH_MAX_CONCURRENCY", default_value = "16")]
+    pub batch_max_concurrency: usize,
+
     /// Enable CORS.
     #[arg(long, env = "HFS_ENABLE_CORS", default_value = "true")]
     pub enable_cors: bool,
@@ -986,7 +1001,7 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
     pub elasticsearch_password: Option<String>,
 
-    /// Enable SQL-on-FHIR operations ($viewdefinition-run, $viewdefinition-export).
+    /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
@@ -1067,7 +1082,7 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_MAX_CONCURRENCY", default_value = "4")]
     pub export_max_concurrency: usize,
 
-    /// Target rows per output shard for `$viewdefinition-export`.
+    /// Target rows per output shard for `$sql-export`.
     /// Large result sets are split into multiple files of this size.
     #[arg(long, env = "HFS_EXPORT_SHARD_ROWS", default_value = "500000")]
     pub export_shard_rows: usize,
@@ -1089,11 +1104,11 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_CLEANUP_INTERVAL", default_value = "300")]
     pub export_cleanup_interval_secs: u64,
 
-    /// Maximum rows returned by `$sqlquery-run`.
+    /// Maximum rows returned by `$sql-run`.
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_ROWS", default_value = "100000")]
     pub sof_sqlquery_max_rows: usize,
 
-    /// Maximum rows materialized per depends-on ViewDefinition by `$sqlquery-run`.
+    /// Maximum rows materialized per depends-on ViewDefinition by `$sql-run`.
     #[arg(
         long,
         env = "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
@@ -1105,7 +1120,7 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_VDS", default_value = "16")]
     pub sof_sqlquery_max_vds: usize,
 
-    /// Hard timeout (seconds) for `$sqlquery-run` queries.
+    /// Hard timeout (seconds) for `$sql-run` queries.
     #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
     pub sof_sqlquery_timeout_secs: u64,
 
@@ -1154,6 +1169,7 @@ impl Default for ServerConfig {
             log_level: "info".to_string(),
             max_body_size: 10 * 1024 * 1024, // 10MB
             request_timeout: 30,
+            batch_max_concurrency: 16,
             enable_cors: true,
             cors_origins: "*".to_string(),
             cors_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS".to_string(),
@@ -1253,6 +1269,10 @@ impl ServerConfig {
             errors.push("Request timeout cannot be 0".to_string());
         }
 
+        if self.batch_max_concurrency == 0 {
+            errors.push("Batch max concurrency cannot be 0".to_string());
+        }
+
         if self.default_page_size == 0 {
             errors.push("Default page size cannot be 0".to_string());
         }
@@ -1313,6 +1333,7 @@ impl ServerConfig {
             log_level: "debug".to_string(),
             max_body_size: 10 * 1024 * 1024,
             request_timeout: 5, // Shorter timeout for tests
+            batch_max_concurrency: 16,
             enable_cors: false,
             cors_origins: "*".to_string(),
             cors_methods: "*".to_string(),
@@ -1721,6 +1742,24 @@ mod tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.contains("timeout")));
+    }
+
+    // ── validate() – batch_max_concurrency == 0 ──────────────────
+
+    /// A zero bound would make `buffered(0)` poll nothing, hanging every batch
+    /// request until the timeout — the exact symptom the bound exists to
+    /// remove. The batch handler clamps defensively as well, but the operator
+    /// should be told at startup rather than by a stalled request.
+    #[test]
+    fn test_validate_batch_concurrency_zero() {
+        let config = ServerConfig {
+            batch_max_concurrency: 0,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("Batch max concurrency")));
     }
 
     // ── validate() – default_page_size == 0 ──────────────────────
