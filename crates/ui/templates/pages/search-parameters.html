@@ -2,20 +2,23 @@
 
 {% block title %}{{ i18n.t("sp-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
+{% block body_class %}app-shell{% endblock %}
+{% block content_class %} content--app{% endblock %}
+
 {% block content %}
-<section class="page-head">
-  <h1 class="page-head__title">{{ i18n.t("sp-heading") }}</h1>
-  <p class="page-head__lede">{{ i18n.t("sp-lede") }}</p>
-  <div class="page-head__actions">
-    <a class="btn btn--primary" href="/ui/editor?type=SearchParameter">{{ i18n.t("sp-new") }}</a>
+<section class="page-head page-head--row">
+  <div>
+    <h1 class="page-head__title">{{ i18n.t("sp-heading") }}</h1>
+    <p class="page-head__lede">{{ i18n.t("sp-lede") }}</p>
+    {% if view.versions.len() > 1 %}
+    <nav class="version-switch" aria-label="{{ i18n.t("sp-version-label") }}">
+      {% for v in view.versions %}
+      <a href="{{ v.href }}"{% if v.current %} aria-current="true"{% endif %}>{{ v.label }}</a>
+      {% endfor %}
+    </nav>
+    {% endif %}
   </div>
-  {% if view.versions.len() > 1 %}
-  <nav class="version-switch" aria-label="{{ i18n.t("sp-version-label") }}">
-    {% for v in view.versions %}
-    <a href="{{ v.href }}"{% if v.current %} aria-current="true"{% endif %}>{{ v.label }}</a>
-    {% endfor %}
-  </nav>
-  {% endif %}
+  <a class="btn btn--primary" href="/ui/editor?type=SearchParameter">{{ i18n.t("sp-new") }}</a>
 </section>
 
 {% if !view.spec_loaded %}
@@ -24,13 +27,27 @@
 
 <div class="filter-layout" hx-boost="true">
   <!--
-    Resource Filter rail — the primitive the Resources screen will share:
-    a search box over resource types, an "All types" row, a Recently-used
-    group (populated client-side; see resource-filter.js), and a live count
-    next to every type. The registry is already keyed base → code → param,
-    so the rail is a direct view of the outer map.
+    Resource Filter rail: a search box over resource types, an "All types"
+    row, a Recently-used group (populated client-side; see
+    resource-filter.js), and a live count next to every type. The registry is
+    already keyed base → code → param, so the rail is a direct view of the
+    outer map.
+
+    Same flat rail as Resources/Search/Saved Queries (#603 follow-up): the
+    "RESOURCE TYPES" heading, rounded filter input, and item rows share the
+    `.nav-panel`/`.filter-rail` classes those pages use, no bordered card.
+    This page keeps its own item loop rather than the shared
+    `partials/type_rail.html` macro (#541): its counts are always-known
+    parameter counts (`usize`), not the dashboard snapshot's optional
+    per-type totals the macro's `count: Option` branch expects, and the
+    "All types" row has no `data-type` equivalent. `#sp-rail-recent` and the
+    divider/heading before `#sp-rail-list` stay outside that id on purpose:
+    the htmx search only swaps `#sp-rail-list`, and swapping the recent
+    group with the server's (always-empty) render of it would blow away
+    what resource-filter.js populated from localStorage.
   -->
-  <aside class="card filter-rail" aria-label="{{ i18n.t("sp-rail-label") }}">
+  <aside class="filter-rail" aria-label="{{ i18n.t("sp-rail-label") }}">
+    <div class="filter-rail__heading">{{ i18n.t("sp-rail-types") }}</div>
     <form class="filter-rail__search" method="get" action="/ui/search-parameters" role="search">
       {% for field in view.hidden_fields %}
       <input type="hidden" name="{{ field.0 }}" value="{{ field.1 }}">
@@ -44,9 +61,10 @@
              hx-target="#sp-rail-list" hx-select="#sp-rail-list" hx-swap="outerHTML">
     </form>
     <div class="filter-rail__group" id="sp-rail-recent" data-recent-key="hfs-recent-types" hidden>
-      <div class="filter-rail__heading">{{ i18n.t("sp-rail-recent") }}</div>
+      <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("sp-rail-recent") }}</div>
     </div>
-    <div class="filter-rail__heading">{{ i18n.t("sp-rail-types") }}</div>
+    <div class="filter-rail__divider" aria-hidden="true"></div>
+    <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
     <div class="filter-rail__list" id="sp-rail-list">
       <a class="filter-rail__item" href="{{ view.rail_all.href }}"{% if view.rail_all.current %} aria-current="true"{% endif %}>
         <span>{{ i18n.t("sp-rail-all") }}</span>

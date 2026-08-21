@@ -64,7 +64,9 @@ test("a stored parameter can be created, offers Edit, and deletes", async ({
 
   // refresh=1 drops the server's cached snapshot so the new parameter shows.
   await searchParameters.goto(`?refresh=1&sel=${encodeURIComponent(url)}`);
-  await expect(page.locator(".page-head__actions a.btn--primary")).toHaveAttribute(
+  // The primary action sits in the page-head row next to the title (the
+  // Resources pattern), not in a standalone actions block under the lede.
+  await expect(page.locator(".page-head--row > a.btn--primary")).toHaveAttribute(
     "href",
     "/ui/editor?type=SearchParameter",
   );

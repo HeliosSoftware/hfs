@@ -501,13 +501,14 @@ editor-versions-none = Sin versiones anteriores.
 
 resources-heading = Recursos
 resources-lede = Explora, busca, crea y edita recursos FHIR. Busca en lenguaje natural o arma la consulta a mano, y abre cualquier resultado para editarlo.
-resources-create = Crear nuevo
+resources-create-typed = Crear { $type }
 resources-save-blocked = Corrige los problemas de validación antes de guardar.
 resources-save-invalid = El JSON no es válido — corrígelo antes de guardar.
 resources-edit-title = Editar recurso
 resources-tab-edit = Editar
 resources-tab-history = Historial
 resources-types-heading = Tipos de recurso
+rail-all-types-heading = Todos los tipos
 
 queries-saved-group = Guardadas
 

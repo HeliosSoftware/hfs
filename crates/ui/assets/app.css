@@ -84,6 +84,10 @@
   --accent-text: #0a5f96;
   /* Menu panel input */
   --input-bg: #f5f5f5;
+  /* Pill scrollbars: thin bar, fully-rounded track and thumb. */
+  --scroll-track: #ececec;
+  --scroll-thumb: #bdbdbd;
+  --scroll-thumb-hover: #a0a0a0;
 
   font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
@@ -108,6 +112,9 @@
   --outline: #353535;
   --grid-line: rgb(255 255 255 / 12%);
   --input-bg: #1a1a1a;
+  --scroll-track: rgb(255 255 255 / 7%);
+  --scroll-thumb: rgb(255 255 255 / 25%);
+  --scroll-thumb-hover: rgb(255 255 255 / 38%);
 }
 }
 
@@ -126,19 +133,6 @@ body {
 }
 }
 
-@layer components {
-/* The fixed sidebar sits outside the grid flow, so the flow columns need
-   explicit placement — otherwise the pane auto-fills the rail column. The
-   .pane rule itself lives with the top-bar section. */
-body.has-nav-panel .nav-panel {
-  grid-column: 2;
-}
-
-body.has-nav-panel .pane {
-  grid-column: 3;
-}
-}
-
 @layer base {
 svg {
   display: block;
@@ -148,6 +142,36 @@ svg {
    attribute on script-toggled regions. */
 [hidden] {
   display: none !important;
+}
+
+/* Minimal pill scrollbars everywhere: an 8px bar whose track and thumb are
+   fully-rounded pills. The standard properties are Firefox-only on purpose:
+   Chromium also understands scrollbar-width, and when it is set it IGNORES
+   the ::-webkit-scrollbar styling below — so they must never apply there. */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+  }
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--scroll-track);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
 }
 }
 
@@ -607,6 +631,11 @@ button.menu__option {
   flex: 1;
   padding: 24px 32px 32px;
 }
+
+/* App-shell rules live at the end of the file in @layer pages: they override
+   per-page layout rules (.queries-layout, .filter-rail) that live in that
+   later layer, where a rule here in components would lose regardless of
+   specificity. */
 
 /* ---------- Cards ---------- */
 
@@ -1953,6 +1982,9 @@ button.pill {
   border: 1px solid var(--warn);
 }
 
+/* 280px matches .nav-panel and .queries-layout's rail column (#603 follow-up):
+   one rail width across Resources, Search, Saved Queries, and Search
+   Parameters. */
 .filter-layout {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr) 360px;
@@ -2029,11 +2061,45 @@ button.pill {
   color: var(--muted);
 }
 
+/* Sub-group labels inside the list ("Recently used", "All types") read as
+   section labels, not a fainter echo of the panel's own heading (#603
+   follow-up: they camouflaged against the items below them). */
+.filter-rail__heading--group {
+  color: var(--text);
+  font-weight: 700;
+}
+
+/* Between the Recently used group and the general list. Hidden by default —
+   shown only when it directly follows a *populated* (non-`hidden`) recent
+   group, so there is nothing to divide from before resource-filter.js has
+   anything to render (or with JavaScript off, where the group stays
+   `hidden` forever). */
+.filter-rail__divider {
+  display: none;
+  height: 1px;
+  margin: 8px 4px;
+  background: var(--divider);
+}
+
+.filter-rail__group:not([hidden]) + .filter-rail__divider {
+  display: block;
+}
+
 .filter-rail__list {
   display: flex;
   flex-direction: column;
   gap: 2px;
   overflow-y: auto;
+  /* Breathing room between the counts and the scrollbar pill. */
+  padding-right: 6px;
+}
+
+/* The list scrolls; its children keep their natural size. Without this the
+   flex algorithm crushes shrinkable rows before overflowing — the empty
+   1px divider collapses to 0 height the moment the list becomes a
+   height-bound scroll region. */
+.filter-rail__list > * {
+  flex: none;
 }
 
 .filter-rail__group {
@@ -2049,12 +2115,24 @@ button.pill {
   align-items: center;
   gap: 8px;
   width: 100%;
+  min-width: 0;
   padding: 7px 10px;
   border-radius: 9px;
   font-size: 13px;
   font-weight: 500;
   color: var(--text);
   text-decoration: none;
+}
+
+/* Long resource type names (e.g. "MedicinalProductContraindication", 32
+   chars) truncate with an ellipsis instead of colliding with the count or
+   forcing horizontal scroll on the rail; the full name stays available via
+   `title` (#604). */
+.filter-rail__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .filter-rail__item:hover {
@@ -2068,6 +2146,7 @@ button.pill {
 }
 
 .filter-rail__item .count {
+  flex: none;
   margin-left: auto;
   font-size: 11px;
   color: var(--muted);
@@ -2929,7 +3008,10 @@ button.pill {
 
 .queries-layout {
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr);
+  /* Same rail width as .nav-panel and .filter-layout (#603 follow-up): one
+     rail width across Resources, Search, Saved Queries, and Search
+     Parameters. */
+  grid-template-columns: 280px minmax(0, 1fr);
   gap: 20px;
   align-items: start;
 }
@@ -2938,15 +3020,7 @@ button.pill {
   min-width: 0;
 }
 
-/* The picker rail reuses .filter-rail with <button> items. */
-button.filter-rail__item {
-  border: 0;
-  background-color: transparent;
-  font: inherit;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-}
+/* The picker rail reuses .filter-rail with real `<a>` items (#541). */
 
 @media (max-width: 1100px) {
   .queries-layout {
@@ -3961,105 +4035,23 @@ button.filter-rail__item {
    surface, no card — with the search + results in the content column.
    --------------------------------------------------------------------------- */
 
-/* Three columns when a nav panel is present: sidebar, the panel, content. */
-body.has-nav-panel {
-  grid-template-columns: 76px 232px 1fr;
-}
-
-.nav-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-height: 100vh;
-  padding: 20px 16px;
-  border-right: 1px solid var(--divider);
-  box-shadow: 1px 0 0 var(--divider-glint);
-  overflow-y: auto;
-}
-
-.nav-panel__head {
-  padding: 4px 6px;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
-.nav-panel__search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 36px;
-  padding: 0 12px;
-  color: var(--muted);
-  background: var(--input-bg);
-  border: 1px solid var(--surface-border);
-  border-radius: 10px;
-}
-
-.nav-panel__search input {
-  width: 100%;
-  /* WCAG 2.2 target-size floor - font fallback must not shrink it below it. */
-  min-height: 24px;
-  border: 0;
-  background: none;
-  font: inherit;
-  font-size: 13px;
-  color: var(--text);
-  outline: none;
-}
-
-.nav-panel__list {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin-top: 4px;
-}
-
-.nav-panel__item {
-  /* WCAG 2.2 target-size floor - font fallback must not shrink rows below it. */
-  min-height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  width: 100%;
-  padding: 9px 12px;
-  font: inherit;
-  font-size: 14px;
-  text-align: left;
-  color: var(--text);
-  background: transparent;
-  border: 0;
-  border-radius: 10px;
-  cursor: pointer;
-}
-
-.nav-panel__item:hover { background: var(--input-bg); }
-
-.nav-panel__item--on {
-  background: var(--accent-soft);
-  color: var(--accent-text);
-  font-weight: 600;
-}
-
-.nav-panel__item .count {
-  font-size: 12px;
-  color: var(--muted);
-}
-.nav-panel__item--on .count { color: var(--accent-text); }
-
-/* The Create-new primary button (blue + plus), top-right of the page head. */
+/* The Create-new primary button (blue + plus), top-right of the page head.
+   The label names the selected type ("Create new Patient") and can grow long
+   (#605) — the button caps its width and truncates the label rather than
+   pushing the header row wider than the page. */
 .resources-create {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 320px;
 }
 
-@media (max-width: 1100px) {
-  body.has-nav-panel { grid-template-columns: 76px 1fr; }
-  body.has-nav-panel .pane { grid-column: 2; }
-  .nav-panel { display: none; }
+.resources-create__label {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+
 }
 
 @layer pages {
@@ -4699,5 +4691,87 @@ body.has-nav-panel {
   display: flex;
   gap: 8px;
   align-items: center;
+}
+}
+
+@layer pages {
+/* ---------------------------------------------------------------------------
+   App-shell pages (#541): the screen itself never scrolls - the page head
+   stays put while each region below it (type rail, main panel, detail)
+   scrolls on its own. Declared last, in the pages layer, so it wins over the
+   per-page layout rules above. Reverted under 1100px, where the columns stack
+   and the page scrolls normally.
+   --------------------------------------------------------------------------- */
+
+body.app-shell {
+  height: 100dvh;
+  overflow: hidden;
+}
+
+body.app-shell .pane {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.content--app {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  max-width: none;
+}
+
+.content--app .filter-layout,
+.content--app .queries-layout {
+  flex: 1;
+  min-height: 0;
+  align-items: stretch;
+}
+
+.content--app .filter-rail {
+  position: static;
+  max-height: none;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.content--app .filter-rail__list {
+  /* min-height: 0 lets the flex item shrink below its content, so the list
+     itself scrolls instead of being clipped by the rail's hidden overflow. */
+  flex: 1;
+  min-height: 0;
+}
+
+.content--app .filter-center,
+.content--app .queries-main {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.content--app .detail {
+  position: static;
+  max-height: none;
+  min-height: 0;
+}
+
+@media (max-width: 1100px) {
+  body.app-shell {
+    height: auto;
+    overflow: visible;
+  }
+
+  body.app-shell .pane {
+    overflow: visible;
+  }
+
+  .content--app {
+    display: block;
+    overflow: visible;
+  }
+
+  .content--app .filter-center,
+  .content--app .queries-main {
+    overflow: visible;
+  }
 }
 }

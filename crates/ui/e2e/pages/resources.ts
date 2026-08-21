@@ -3,12 +3,17 @@
 // hosts the shared Editor component and the in-modal history diff.
 import type { Page, Locator } from "@playwright/test";
 import { Editor } from "./editor";
+import { SearchBuilder, SearchResults } from "./search-builder";
 
 export class ResourcesPage {
   readonly modal: ResourceModal;
+  readonly builder: SearchBuilder;
+  readonly results: SearchResults;
 
   constructor(readonly page: Page) {
     this.modal = new ResourceModal(page);
+    this.builder = new SearchBuilder(page);
+    this.results = new SearchResults(page);
   }
 
   async goto(type?: string): Promise<void> {
@@ -22,28 +27,54 @@ export class ResourcesPage {
   get createButton(): Locator {
     return this.page.locator("#resource-create");
   }
+  /** The type-naming text inside Create ("Create new Patient"), #605. */
+  get createLabel(): Locator {
+    return this.page.locator("#resource-create .resources-create__label");
+  }
 
+  // Direct-child combinator: `#type-rail-recent` (the "Recently used" group,
+  // #603) nests inside `#type-rail-list` too, and its clones carry the same
+  // `data-type`. `>` keeps this scoped to the full, unfiltered list.
   railItem(type: string): Locator {
-    return this.page.locator(`[data-rail-type='${type}']`);
+    return this.page.locator(`#type-rail-list > [data-type='${type}']`);
   }
   count(type: string): Locator {
-    return this.page.locator(`[data-count-for='${type}']`);
+    return this.page.locator(`#type-rail-list > [data-type='${type}'] .count`);
   }
 
   /** Every resource type the rail offers, in DOM order. */
   async railTypes(): Promise<string[]> {
-    return this.page.$$eval("[data-rail-type]", (els) =>
-      els.map((e) => (e as HTMLElement).dataset.railType!).filter(Boolean),
+    return this.page.$$eval("#type-rail-list > a.filter-rail__item[data-type]", (els) =>
+      els.map((e) => (e as HTMLElement).dataset.type!).filter(Boolean),
     );
   }
 
   /** Rail items currently visible (not filtered out). */
   async visibleRailTypes(): Promise<string[]> {
-    return this.page.$$eval("[data-rail-type]", (els) =>
+    return this.page.$$eval("#type-rail-list > a.filter-rail__item[data-type]", (els) =>
       els
         .filter((e) => (e as HTMLElement).offsetParent !== null)
-        .map((e) => (e as HTMLElement).dataset.railType!),
+        .map((e) => (e as HTMLElement).dataset.type!),
     );
+  }
+
+  /** The "Recently used" group (#603): hidden until at least one entry. */
+  get recentGroup(): Locator {
+    return this.page.locator("#type-rail-recent");
+  }
+  recentItem(type: string): Locator {
+    return this.page.locator(`#type-rail-recent [data-type='${type}']`);
+  }
+  /** Separates Recently used from the general list (#603 follow-up): only
+   * visible once the recent group actually has entries. */
+  get recentDivider(): Locator {
+    return this.page.locator("#type-rail-list > .filter-rail__divider");
+  }
+  /** The general list's own section heading (#603 follow-up). */
+  get generalHeading(): Locator {
+    return this.page.locator("#type-rail-list > .filter-rail__heading--group", {
+      hasText: "All types",
+    });
   }
 
   async pickType(type: string): Promise<void> {

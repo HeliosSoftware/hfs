@@ -71,6 +71,17 @@ test("the 'coming soon' nav entries are inert, not links", async ({ page }) => {
   expect(await soon.evaluateAll((els) => els.every((e) => e.tagName !== "A"))).toBe(true);
 });
 
+test("the Resources type rail navigates via plain links with no JavaScript", async ({
+  page,
+}) => {
+  await page.goto("/ui/resources");
+  const item = page.locator("#type-rail-list a.filter-rail__item[data-type='Observation']");
+  await expect(item).toBeVisible();
+  await item.click();
+  await expect(page).toHaveURL(/\/ui\/resources\?type=Observation/);
+  await expect(item).toHaveAttribute("aria-current", "true");
+});
+
 test("a hard navigation returns the full page, not an htmx fragment", async ({ page, chrome }) => {
   // /ui/status is fragment-or-full depending on HX-Request; a plain load (no JS,
   // no htmx header) must get the whole document.

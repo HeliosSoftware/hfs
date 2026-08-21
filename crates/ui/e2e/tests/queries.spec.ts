@@ -397,6 +397,18 @@ test.describe("query builder", () => {
     await expect.poll(async () => queries.builder.paramOptions.count()).toBeGreaterThan(0);
   });
 
+  // Picking a type updates the URL (and back navigates) without a full
+  // reload — the click handler is an enhancement over the rail's real
+  // <a href> (#541).
+  test("picking a rail type updates the URL and back navigates", async ({ queries, page }) => {
+    await queries.railItem("Observation").click();
+    await expect(page).toHaveURL(/\/ui\/queries\?type=Observation/);
+    await expect(queries.railItem("Observation")).toHaveAttribute("aria-current", "true");
+
+    await page.goBack();
+    await expect(page).toHaveURL(/\/ui\/queries$/);
+  });
+
   test("a run is recorded under the Recent disclosure", async ({ queries, request }) => {
     await createResource(request, "Patient", { name: [{ family: "Recent" }] });
     await queries.goto();
