@@ -41,4 +41,11 @@
     {% endif %}
   </div>
 </section>
+{#-
+  Paste/file toggle + FileReader sink. Loaded once from the page (not from
+  the form partial) so htmx re-renders of #hts-import-status don't re-execute
+  the script. `defer` waits for parse; the script binds by id/name so it is
+  safe even if included at end of body.
+-#}
+<script src="/ui/hts/assets/import.js" defer></script>
 {% endblock %}

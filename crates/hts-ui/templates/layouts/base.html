@@ -26,36 +26,64 @@
     <nav class="nav">
       <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-work") }}</div>
       <a class="nav-item" href="/ui/hts"{% if chrome.active_page == "dashboard" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-dashboard") }}">
+        <span class="icon">{% include "icons/home.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-dashboard") }}</span>
       </a>
       <a class="nav-item" href="/ui/hts/code-systems"{% if chrome.active_page == "code-systems" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-code-systems") }}">
+        <span class="icon">{% include "icons/book.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-code-systems") }}</span>
       </a>
       <a class="nav-item nav-item--soon" href="/ui/hts/value-sets"{% if chrome.active_page == "value-sets" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-value-sets") }}">
+        <span class="icon">{% include "icons/bookmark.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-value-sets") }}</span>
       </a>
       <a class="nav-item nav-item--soon" href="/ui/hts/concept-maps"{% if chrome.active_page == "concept-maps" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-concept-maps") }}">
+        <span class="icon">{% include "icons/sync.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-concept-maps") }}</span>
       </a>
 
       <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-tools") }}</div>
       <a class="nav-item nav-item--soon" href="/ui/hts/operations"{% if chrome.active_page == "operations" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-operations") }}">
+        <span class="icon">{% include "icons/sliders.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-operations") }}</span>
       </a>
       <a class="nav-item nav-item--soon" href="/ui/hts/import"{% if chrome.active_page == "import" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-import") }}">
+        <span class="icon">{% include "icons/import.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-import") }}</span>
       </a>
 
       <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-server") }}</div>
       <a class="nav-item nav-item--soon" href="/ui/hts/diagnostics"{% if chrome.active_page == "diagnostics" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-diagnostics") }}">
+        <span class="icon">{% include "icons/shield.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-diagnostics") }}</span>
       </a>
     </nav>
 
+    {#-
+      FHIR version selector — visual parity with HFS base.html sidebar__foot.
+      Degenerate: only R4 is available today and it renders as `aria-current`.
+      No `<form action=…>` because HTS does not support switching the version
+      at runtime; the disclosure is display-only to match HFS chrome exactly.
+    -#}
     <div class="sidebar__foot">
-      <span class="fhir-badge" title="{{ chrome.i18n.t("hts-fhir-version-heading") }}">
-        {{ chrome.i18n.t_arg("hts-fhir-version", "version", chrome.fhir_version.to_string()) }}
-      </span>
+      <details class="menu menu--up">
+        <summary class="selector selector--outline">
+          <span class="icon">{% include "icons/hierarchy.svg" %}</span>
+          <span class="selector__label">{{ chrome.i18n.t_arg("hts-fhir-version", "version", chrome.fhir_version.to_string()) }}</span>
+          <span class="selector__chevrons">
+            <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
+            <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+          </span>
+        </summary>
+        <div class="menu__panel">
+          <div class="menu__heading">{{ chrome.i18n.t("hts-fhir-version-heading") }}</div>
+          <div class="menu__option" aria-current="true">
+            <span class="avatar">{% include "icons/hierarchy.svg" %}</span>
+            {{ chrome.fhir_version }}
+            <span class="check">{% include "icons/check.svg" %}</span>
+          </div>
+        </div>
+      </details>
     </div>
   </aside>
 

@@ -30,6 +30,7 @@
   {% endif %}
 
   {% if let Some(summary) = self.summary() %}
+    <a class="backlink" href="/ui/hts/concept-maps">‹ {{ chrome.i18n.t("hts-cm-browser-title") }}</a>
     <header class="page-header hts-cm-detail__header">
       <p class="page-header__eyebrow">{{ chrome.i18n.t("hts-cm-detail-eyebrow") }}</p>
       <h1 id="hts-cm-detail-heading" class="page-header__title">

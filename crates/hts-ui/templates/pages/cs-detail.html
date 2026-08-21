@@ -28,6 +28,7 @@
   {% endif %}
 
   {% if let Some(summary) = self.summary() %}
+    <a class="backlink" href="/ui/hts/code-systems">‹ {{ chrome.i18n.t("hts-cs-browser-title") }}</a>
     <header class="page-header hts-cs-detail__header">
       <p class="page-header__eyebrow">{{ chrome.i18n.t("hts-cs-detail-eyebrow") }}</p>
       <h1 id="hts-cs-detail-heading" class="page-header__title">
