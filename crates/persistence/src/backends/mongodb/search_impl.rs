@@ -63,6 +63,50 @@ fn implied_period_end(raw: &str, start: DateTime<Utc>) -> Option<DateTime<Utc>> 
     }
 }
 
+/// The date filter document for one search value (#519). A free function so
+/// the period semantics are unit-testable without a live MongoDB.
+///
+/// A partial date names a *period*, not an instant (mirroring the SQLite
+/// mapping #463 pinned): `1995` is the whole year, `1995-10` the whole month,
+/// `1995-10-02` the whole day. `eq` used to compare the exact start instant,
+/// so month/year queries matched nothing.
+fn build_date_filter_doc(value: &SearchValue, field: &str) -> StorageResult<Document> {
+    let parsed = parse_date_for_query(&value.value).ok_or_else(|| {
+        StorageError::Search(SearchError::QueryParseError {
+            message: format!("Invalid date value '{}'", value.value),
+        })
+    })?;
+
+    let end = implied_period_end(&value.value, parsed).map(chrono_to_bson);
+    let start = chrono_to_bson(parsed);
+
+    let filter = match (value.prefix, end) {
+        (SearchPrefix::Ap, _) => {
+            let lower = chrono_to_bson(parsed - chrono::Duration::hours(12));
+            let upper = chrono_to_bson(parsed + chrono::Duration::hours(12));
+            doc! { field: { "$gte": lower, "$lte": upper } }
+        }
+        (SearchPrefix::Eq, Some(end)) => doc! { field: { "$gte": start, "$lt": end } },
+        (SearchPrefix::Eq, None) => doc! { field: { "$eq": start } },
+        (SearchPrefix::Ne, Some(end)) => doc! {
+            "$or": [
+                { field: { "$lt": start } },
+                { field: { "$gte": end } },
+            ]
+        },
+        (SearchPrefix::Ne, None) => doc! { field: { "$ne": start } },
+        // gt / sa: strictly after the whole period.
+        (SearchPrefix::Gt | SearchPrefix::Sa, Some(end)) => doc! { field: { "$gte": end } },
+        (SearchPrefix::Gt | SearchPrefix::Sa, None) => doc! { field: { "$gt": start } },
+        // lt / eb: strictly before the whole period.
+        (SearchPrefix::Lt | SearchPrefix::Eb, _) => doc! { field: { "$lt": start } },
+        (SearchPrefix::Ge, _) => doc! { field: { "$gte": start } },
+        (SearchPrefix::Le, Some(end)) => doc! { field: { "$lt": end } },
+        (SearchPrefix::Le, None) => doc! { field: { "$lte": start } },
+    };
+    Ok(filter)
+}
+
 fn parse_date_for_query(value: &str) -> Option<DateTime<Utc>> {
     let normalized = if value.contains('T') {
         if value.contains('Z') || value.contains('+') || value.matches('-').count() > 2 {
@@ -1035,44 +1079,7 @@ impl MongoBackend {
     }
 
     fn build_date_filter(&self, value: &SearchValue, field: &str) -> StorageResult<Document> {
-        let parsed = parse_date_for_query(&value.value).ok_or_else(|| {
-            StorageError::Search(SearchError::QueryParseError {
-                message: format!("Invalid date value '{}'", value.value),
-            })
-        })?;
-
-        // A partial date names a *period*, not an instant (#519, mirroring the
-        // SQLite semantics #463 pinned): `1995` is the whole year, `1995-10`
-        // the whole month, `1995-10-02` the whole day. `eq` used to compare
-        // the exact start instant, so month/year queries matched nothing.
-        let end = implied_period_end(&value.value, parsed).map(chrono_to_bson);
-        let start = chrono_to_bson(parsed);
-
-        let filter = match (value.prefix, end) {
-            (SearchPrefix::Ap, _) => {
-                let lower = chrono_to_bson(parsed - chrono::Duration::hours(12));
-                let upper = chrono_to_bson(parsed + chrono::Duration::hours(12));
-                doc! { field: { "$gte": lower, "$lte": upper } }
-            }
-            (SearchPrefix::Eq, Some(end)) => doc! { field: { "$gte": start, "$lt": end } },
-            (SearchPrefix::Eq, None) => doc! { field: { "$eq": start } },
-            (SearchPrefix::Ne, Some(end)) => doc! {
-                "$or": [
-                    { field: { "$lt": start } },
-                    { field: { "$gte": end } },
-                ]
-            },
-            (SearchPrefix::Ne, None) => doc! { field: { "$ne": start } },
-            // gt / sa: strictly after the whole period.
-            (SearchPrefix::Gt | SearchPrefix::Sa, Some(end)) => doc! { field: { "$gte": end } },
-            (SearchPrefix::Gt | SearchPrefix::Sa, None) => doc! { field: { "$gt": start } },
-            // lt / eb: strictly before the whole period.
-            (SearchPrefix::Lt | SearchPrefix::Eb, _) => doc! { field: { "$lt": start } },
-            (SearchPrefix::Ge, _) => doc! { field: { "$gte": start } },
-            (SearchPrefix::Le, Some(end)) => doc! { field: { "$lt": end } },
-            (SearchPrefix::Le, None) => doc! { field: { "$lte": start } },
-        };
-        Ok(filter)
+        build_date_filter_doc(value, field)
     }
 
     /// Builds a MongoDB filter for a quantity parameter.
@@ -1675,5 +1682,107 @@ impl RevincludeProvider for MongoBackend {
         }
 
         Ok(included)
+    }
+}
+
+#[cfg(test)]
+mod date_filter_tests {
+    use super::*;
+
+    fn filter(raw: &str) -> Document {
+        build_date_filter_doc(&SearchValue::parse(raw), "value_date").expect("valid date")
+    }
+
+    fn bounds(d: &Document) -> &Document {
+        d.get_document("value_date").expect("field doc")
+    }
+
+    /// #519: every prefix arm over the period a partial date names, pinned
+    /// without a live MongoDB. `1995-10` spans [1995-10-01, 1995-11-01).
+    #[test]
+    fn partial_dates_compare_as_periods() {
+        let oct = chrono_to_bson(parse_date_for_query("1995-10").unwrap());
+        let nov = chrono_to_bson(parse_date_for_query("1995-11").unwrap());
+
+        let eq = filter("1995-10");
+        assert_eq!(bounds(&eq).get_datetime("$gte").unwrap(), &oct);
+        assert_eq!(bounds(&eq).get_datetime("$lt").unwrap(), &nov);
+
+        // ne: outside the period, either side.
+        let ne = filter("ne1995-10");
+        let arms = ne.get_array("$or").expect("$or");
+        assert_eq!(arms.len(), 2);
+
+        // gt/sa start at the period's end; le runs to it.
+        assert_eq!(
+            bounds(&filter("gt1995-10")).get_datetime("$gte").unwrap(),
+            &nov
+        );
+        assert_eq!(
+            bounds(&filter("sa1995-10")).get_datetime("$gte").unwrap(),
+            &nov
+        );
+        assert_eq!(
+            bounds(&filter("le1995-10")).get_datetime("$lt").unwrap(),
+            &nov
+        );
+
+        // lt/eb and ge compare against the start.
+        assert_eq!(
+            bounds(&filter("lt1995-10")).get_datetime("$lt").unwrap(),
+            &oct
+        );
+        assert_eq!(
+            bounds(&filter("eb1995-10")).get_datetime("$lt").unwrap(),
+            &oct
+        );
+        assert_eq!(
+            bounds(&filter("ge1995-10")).get_datetime("$gte").unwrap(),
+            &oct
+        );
+    }
+
+    /// Year and day precisions derive their own period ends; a full timestamp
+    /// is an instant and keeps exact comparison.
+    #[test]
+    fn precision_decides_the_period_end() {
+        let y1996 = chrono_to_bson(parse_date_for_query("1996").unwrap());
+        assert_eq!(bounds(&filter("1995")).get_datetime("$lt").unwrap(), &y1996);
+
+        let oct3 = chrono_to_bson(parse_date_for_query("1995-10-03").unwrap());
+        assert_eq!(
+            bounds(&filter("1995-10-02")).get_datetime("$lt").unwrap(),
+            &oct3
+        );
+
+        let instant = filter("eq1995-10-02T08:30:00Z");
+        assert!(bounds(&instant).get_datetime("$eq").is_ok(), "{instant}");
+
+        let ne_instant = filter("ne1995-10-02T08:30:00Z");
+        assert!(bounds(&ne_instant).get_datetime("$ne").is_ok());
+        assert!(
+            bounds(&filter("gt1995-10-02T08:30:00Z"))
+                .get_datetime("$gt")
+                .is_ok()
+        );
+        assert!(
+            bounds(&filter("le1995-10-02T08:30:00Z"))
+                .get_datetime("$lte")
+                .is_ok()
+        );
+    }
+
+    /// ap: ±12h around the start, unchanged semantics.
+    #[test]
+    fn ap_keeps_the_twelve_hour_window() {
+        let ap = filter("ap1995-10-02");
+        assert!(bounds(&ap).get_datetime("$gte").is_ok());
+        assert!(bounds(&ap).get_datetime("$lte").is_ok());
+    }
+
+    /// Garbage stays an error, not a silent full scan.
+    #[test]
+    fn invalid_dates_error() {
+        assert!(build_date_filter_doc(&SearchValue::parse("not-a-date"), "value_date").is_err());
     }
 }
