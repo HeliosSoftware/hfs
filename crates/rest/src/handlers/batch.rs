@@ -1934,6 +1934,37 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
+    /// #478: the read-or-search split on a bundle GET url. Instance addresses
+    /// stay reads; type-level urls (with or without a query) are searches.
+    #[test]
+    fn parse_search_entry_url_splits_reads_from_searches() {
+        let (rt, pairs) = parse_search_entry_url("Patient?name=x&gender=female").expect("search");
+        assert_eq!(rt, "Patient");
+        assert_eq!(pairs.len(), 2);
+
+        // Bare type: an unfiltered type search, leading slash tolerated.
+        let (rt, pairs) = parse_search_entry_url("/Patient").expect("bare type search");
+        assert_eq!(rt, "Patient");
+        assert!(pairs.is_empty());
+
+        // Instance reads and deeper paths are not searches.
+        assert!(parse_search_entry_url("Patient/123").is_none());
+        assert!(parse_search_entry_url("Patient/123/_history/1").is_none());
+        assert!(parse_search_entry_url("").is_none());
+    }
+
+    /// #478: the searchset entry result embeds the bundle at 200 with no
+    /// location/etag baggage.
+    #[test]
+    fn searchset_result_embeds_the_bundle() {
+        let result = searchset_result(serde_json::json!({
+            "resourceType": "Bundle", "type": "searchset"
+        }));
+        assert_eq!(result.status, 200);
+        assert!(result.location.is_none());
+        assert_eq!(result.resource.unwrap()["type"], "searchset");
+    }
+
     use async_trait::async_trait;
     use helios_audit::AuditSink;
     use helios_fhir::FhirVersion;
