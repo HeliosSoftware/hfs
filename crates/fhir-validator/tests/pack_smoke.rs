@@ -248,3 +248,79 @@ fn r4_pack_validates_known_good_and_bad_resources() {
         serde_json::to_string_pretty(&outcome.errors).unwrap()
     );
 }
+
+/// U+00A0 in a `string` or a `code` must survive validation against the real
+/// packs, on every enabled version (issue #425).
+///
+/// The unit tests in `engine::primitives` pin the compiled patterns; this pins
+/// the path the server actually takes — pack regex, `validate_primitive`, byte
+/// match — so the fix cannot regress through a change to how the value reaches
+/// the matcher rather than to the pattern itself.
+#[test]
+fn non_breaking_space_is_valid_in_string_and_code() {
+    let versions = [
+        FhirVersion::R4,
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B,
+        #[cfg(feature = "R5")]
+        FhirVersion::R5,
+        #[cfg(feature = "R6")]
+        FhirVersion::R6,
+    ];
+    let opts = ValidationOptions::default();
+    for version in versions {
+        let validator = Validator::new(core_registry(version));
+
+        // The case from the issue: a CodeSystem whose title ends in a
+        // non-breaking space. `name`/`title`/`display` are `string`;
+        // `status`/`content`/`concept.code` are `code`.
+        let good = json!({
+            "resourceType": "CodeSystem",
+            "status": "active",
+            "content": "complete",
+            "name": "AcquiredBrainInjuryABIProgram",
+            "title": "Acquired Brain Injury (ABI) Program\u{a0}",
+            "concept": [{ "code": "abi\u{a0}program", "display": "ABI\u{a0}Program" }]
+        });
+        let errors = validator.validate_sync(&good, &opts).errors;
+        assert_eq!(
+            errors,
+            vec![],
+            "{version:?}: U+00A0 in string/code must validate clean, got: {}",
+            serde_json::to_string_pretty(&errors).unwrap()
+        );
+
+        // The widening is confined to the shorthand classes: `id` is built
+        // from an explicit ASCII class and must still reject U+00A0. Checked
+        // through `Meta.versionId`, which is genuinely typed `id` — note that
+        // `Resource.id` is not: the spec declares it as a FHIRPath System.String
+        // and the pack carries it as `string`, so no `id` regex applies there.
+        let bad_id = json!({
+            "resourceType": "CodeSystem",
+            "meta": { "versionId": "abi\u{a0}" },
+            "status": "active",
+            "content": "complete"
+        });
+        let errors = validator.validate_sync(&bad_id, &opts).errors;
+        assert!(
+            errors.iter().any(|e| e.path == "CodeSystem.meta.versionId"),
+            "{version:?}: U+00A0 in an id must still be rejected, got: {}",
+            serde_json::to_string_pretty(&errors).unwrap()
+        );
+
+        // A real leading space in a `code` is still an error, as FHIR's "no
+        // leading or trailing whitespace" requires.
+        let bad_code = json!({
+            "resourceType": "CodeSystem",
+            "status": "active",
+            "content": "complete",
+            "concept": [{ "code": " leading" }]
+        });
+        let errors = validator.validate_sync(&bad_code, &opts).errors;
+        assert!(
+            errors.iter().any(|e| e.path == "CodeSystem.concept.0.code"),
+            "{version:?}: leading space in a code must still be rejected, got: {}",
+            serde_json::to_string_pretty(&errors).unwrap()
+        );
+    }
+}
