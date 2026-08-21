@@ -60,18 +60,19 @@ struct Route {
 const ROUTES: &[Route] = &[
     Route {
         path: "/ui/hts",
-        // Slice A: the dashboard renders live cards. The page `<h1>` is the
+        // Slice A: the Home page renders live cards. The page `<h1>` is the
         // most stable marker (an inaccessible upstream still renders the
-        // shell). The Fluent stub for `hts-dashboard-title` in en is
-        // exactly "Dashboard".
-        expect: ">Dashboard<",
+        // shell). The Fluent stub for `hts-nav-home` in en is exactly
+        // "Home" — the same key backs both the sidebar label and the h1,
+        // mirroring HFS's `nav-home` collapse.
+        expect: ">Home<",
     },
     Route {
         // Slice A refresh fragment endpoint. Not a "page", but registered
         // and worth guarding: an accidental removal of the polling target
-        // would blank the dashboard on JS clients without any test noticing.
-        path: "/ui/hts/dashboard/cards",
-        expect: "hts-dashboard-cards",
+        // would blank the Home cards on JS clients without any test noticing.
+        path: "/ui/hts/home/cards",
+        expect: "hts-home-cards",
     },
     // Slice B: CodeSystem browser + rows fragment. The workbench tab
     // routes deliberately live in `tests/code_systems.rs` instead of

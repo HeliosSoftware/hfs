@@ -607,7 +607,7 @@ hts-app-title = { -hts-app-name }
 hts-nav-section-work = Terminology
 hts-nav-section-tools = Tools
 hts-nav-section-server = Server
-hts-nav-dashboard = Dashboard
+hts-nav-home = Home
 hts-nav-code-systems = Code Systems
 hts-nav-value-sets = Value Sets
 hts-nav-concept-maps = Concept Maps
@@ -618,34 +618,35 @@ hts-nav-diagnostics = Diagnostics
 hts-fhir-version-heading = FHIR version
 hts-fhir-version = FHIR { $version }
 
-hts-dashboard-title = Dashboard
-hts-dashboard-subtitle = Terminology server health, catalog inventory, and quick actions.
+hts-home-title = Home
+hts-home-subtitle = Terminology server health, catalog inventory, and quick actions.
 
 ## Dashboard rows (row headings are visually hidden — they're for screen readers).
 
-hts-dashboard-row-status = Server status
-hts-dashboard-row-inventory = Loaded inventory
-hts-dashboard-row-metrics = Traffic metrics
-hts-dashboard-quick-links = Quick links
+hts-home-row-status = Server status
+hts-home-row-inventory = Loaded inventory
+hts-home-row-metrics = Traffic metrics
+hts-home-quick-links = Quick links
 
 ## Dashboard tiles.
 
-hts-dashboard-tile-status = Status
-hts-dashboard-tile-backend = Backend
-hts-dashboard-tile-uptime = Uptime
-hts-dashboard-tile-fhir-version = FHIR version
-hts-dashboard-tile-loaded-systems = Loaded systems
-hts-dashboard-tile-loaded-systems-hint = From TerminologyCapabilities.codeSystem[]
-hts-dashboard-tile-bundled-data = Bundled data
-hts-dashboard-tile-bundled-data-value = { $mib } MiB
-hts-dashboard-tile-bundled-data-hint = From HTS_BOOTSTRAP_DIR footprint
-hts-dashboard-tile-requests = Requests
-hts-dashboard-tile-avg-latency = Avg latency
-hts-dashboard-tile-metrics-hint = From /metrics — Wave 2
+hts-home-tile-status = Status
+hts-home-tile-backend = Backend
+hts-home-tile-uptime = Uptime
+hts-home-tile-fhir-version = FHIR version
+hts-home-tile-loaded-systems = Loaded systems
+hts-home-tile-loaded-systems-hint = From TerminologyCapabilities.codeSystem[]
+hts-home-tile-bundled-data = Bundled data
+hts-home-tile-bundled-data-value = { $mib } MiB
+hts-home-tile-bundled-data-hint = From HTS_BOOTSTRAP_DIR footprint
+hts-home-tile-requests = Requests
+hts-home-tile-avg-latency = Avg latency
+hts-home-tile-avg-latency-value = { $ms } ms
+hts-home-tile-metrics-hint = Since server start
 
 ## /health `status` values, keyed for translation.
 
-hts-dashboard-status-ok = OK
+hts-home-status-ok = OK
 
 ## Degraded banner (design doc §7 header contract).
 

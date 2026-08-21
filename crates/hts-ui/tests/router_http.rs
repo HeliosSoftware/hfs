@@ -44,7 +44,7 @@ async fn body_text(response: axum::response::Response) -> String {
 }
 
 #[tokio::test]
-async fn dashboard_serves_full_page_at_ui_hts() {
+async fn home_serves_full_page_at_ui_hts() {
     let response = app()
         .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())
         .await
@@ -61,14 +61,14 @@ async fn dashboard_serves_full_page_at_ui_hts() {
     // stray key text would signal either a missing Fluent entry or a
     // template that renders the key literally.
     for key in [
-        "hts-nav-dashboard",
+        "hts-nav-home",
         "hts-nav-code-systems",
         "hts-nav-value-sets",
         "hts-nav-concept-maps",
         "hts-nav-operations",
         "hts-nav-import",
         "hts-nav-diagnostics",
-        "hts-dashboard-title",
+        "hts-home-title",
         "hts-dialect-prefix",
         "hts-degraded-title",
     ] {
@@ -86,7 +86,7 @@ async fn dashboard_serves_full_page_at_ui_hts() {
 }
 
 #[tokio::test]
-async fn dashboard_trailing_slash_redirects_to_canonical() {
+async fn home_trailing_slash_redirects_to_canonical() {
     // `/ui/hts/` (trailing slash) must 308-redirect to the canonical
     // `/ui/hts`. Axum matches paths exactly, so without an explicit route
     // the trailing-slash variant would 404 — which is exactly what
@@ -114,7 +114,7 @@ async fn dashboard_trailing_slash_redirects_to_canonical() {
 }
 
 #[tokio::test]
-async fn dashboard_advertises_vary_hx_request_for_htmx_caching() {
+async fn home_advertises_vary_hx_request_for_htmx_caching() {
     // `AutoVaryLayer` (axum-htmx) appends `Vary: HX-Request` only when the
     // request carried the `HX-Request` header — that's what makes it safe
     // for shared caches: a hard navigation and an htmx swap of the same URL
@@ -168,7 +168,7 @@ async fn assets_serve_the_embedded_bundle_under_ui_hts_assets() {
 }
 
 #[tokio::test]
-async fn dashboard_localizes_via_accept_language_when_no_query_or_cookie() {
+async fn home_localizes_via_accept_language_when_no_query_or_cookie() {
     // Spanish request: the sidebar heading must be translated. If the Fluent
     // catalog is not wired the key would leak; if the locale negotiator is not
     // installed the English string would leak — both are actionable failures.
@@ -188,9 +188,10 @@ async fn dashboard_localizes_via_accept_language_when_no_query_or_cookie() {
         html.contains("<html lang=\"es\">"),
         "the html lang attribute must reflect the negotiated locale",
     );
-    // The Spanish stub for hts-nav-dashboard.
+    // The Spanish stub for hts-nav-home is "Inicio" — the collapsed key
+    // that backs both the sidebar label and the h1 (HFS `nav-home` parity).
     assert!(
-        html.contains("Panel"),
-        "Spanish translation of hts-nav-dashboard must appear in the sidebar",
+        html.contains("Inicio"),
+        "Spanish translation of hts-nav-home must appear in the sidebar",
     );
 }

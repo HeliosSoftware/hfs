@@ -117,7 +117,7 @@ test.describe("HTS Import page shell (§7.7)", () => {
     const navLinks = page
       .locator("nav")
       .getByRole("link")
-      .filter({ hasText: /Dashboard|Code|Value|Concept|Operations|Import|Diagnostics/ });
+      .filter({ hasText: /Home|Code|Value|Concept|Operations|Import|Diagnostics/ });
     const names = await navLinks.allTextContents();
     const operationsIdx = names.findIndex((n) => /Operations/i.test(n));
     const importIdx = names.findIndex((n) => /Import/i.test(n));

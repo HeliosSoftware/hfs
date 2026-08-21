@@ -603,7 +603,7 @@ hts-app-title = { -hts-app-name }
 hts-nav-section-work = Terminología
 hts-nav-section-tools = Herramientas
 hts-nav-section-server = Servidor
-hts-nav-dashboard = Panel
+hts-nav-home = Inicio
 hts-nav-code-systems = Sistemas de códigos
 hts-nav-value-sets = Conjuntos de valores
 hts-nav-concept-maps = Mapas de conceptos
@@ -614,34 +614,35 @@ hts-nav-diagnostics = Diagnóstico
 hts-fhir-version-heading = Versión FHIR
 hts-fhir-version = FHIR { $version }
 
-hts-dashboard-title = Panel
-hts-dashboard-subtitle = Estado del servidor de terminología, inventario del catálogo y acciones rápidas.
+hts-home-title = Inicio
+hts-home-subtitle = Estado del servidor de terminología, inventario del catálogo y acciones rápidas.
 
 ## Filas del panel (encabezados ocultos visualmente para lectores de pantalla).
 
-hts-dashboard-row-status = Estado del servidor
-hts-dashboard-row-inventory = Inventario cargado
-hts-dashboard-row-metrics = Métricas de tráfico
-hts-dashboard-quick-links = Accesos rápidos
+hts-home-row-status = Estado del servidor
+hts-home-row-inventory = Inventario cargado
+hts-home-row-metrics = Métricas de tráfico
+hts-home-quick-links = Accesos rápidos
 
 ## Tarjetas del panel.
 
-hts-dashboard-tile-status = Estado
-hts-dashboard-tile-backend = Backend
-hts-dashboard-tile-uptime = Tiempo activo
-hts-dashboard-tile-fhir-version = Versión FHIR
-hts-dashboard-tile-loaded-systems = Sistemas cargados
-hts-dashboard-tile-loaded-systems-hint = De TerminologyCapabilities.codeSystem[]
-hts-dashboard-tile-bundled-data = Datos empaquetados
-hts-dashboard-tile-bundled-data-value = { $mib } MiB
-hts-dashboard-tile-bundled-data-hint = Del contenido de HTS_BOOTSTRAP_DIR
-hts-dashboard-tile-requests = Solicitudes
-hts-dashboard-tile-avg-latency = Latencia promedio
-hts-dashboard-tile-metrics-hint = De /metrics — Wave 2
+hts-home-tile-status = Estado
+hts-home-tile-backend = Backend
+hts-home-tile-uptime = Tiempo activo
+hts-home-tile-fhir-version = Versión FHIR
+hts-home-tile-loaded-systems = Sistemas cargados
+hts-home-tile-loaded-systems-hint = De TerminologyCapabilities.codeSystem[]
+hts-home-tile-bundled-data = Datos empaquetados
+hts-home-tile-bundled-data-value = { $mib } MiB
+hts-home-tile-bundled-data-hint = Del contenido de HTS_BOOTSTRAP_DIR
+hts-home-tile-requests = Solicitudes
+hts-home-tile-avg-latency = Latencia promedio
+hts-home-tile-avg-latency-value = { $ms } ms
+hts-home-tile-metrics-hint = Desde el arranque del servidor
 
 ## Valores del campo `status` de /health, con clave para traducción.
 
-hts-dashboard-status-ok = OK
+hts-home-status-ok = OK
 
 ## Banner degradado (contrato del design doc §7).
 

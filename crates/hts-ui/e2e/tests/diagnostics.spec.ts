@@ -78,7 +78,7 @@ test.describe("HTS Diagnostics page shell (§7.9)", () => {
       .locator("nav")
       .getByRole("link")
       .filter({
-        hasText: /Dashboard|Code|Value|Concept|Operations|Import|Diagnostics/,
+        hasText: /Home|Code|Value|Concept|Operations|Import|Diagnostics/,
       });
     const names = await navLinks.allTextContents();
     const importIdx = names.findIndex((n) => /Import/i.test(n));

@@ -7,27 +7,68 @@
 // script is the e2e harness that populates it via the well-known
 // `POST /import` endpoint (see crates/hts/README.md §"Import a FHIR Bundle").
 //
-// The fixture roster is derived from the specs' inline documentation:
-//   - code-systems.spec.ts §7.2/§7.3:  ex-cs-1 (A subsumes B, "Alpha"
-//     designation, property), plus ex-cs-2..ex-cs-31 fillers so the default
-//     browser page yields a Load-more.
-//   - value-sets.spec.ts §7.4:         ex-vs-1 (flat, 60 concepts so pager
-//     fires), ex-vs-tree (hierarchical), plus supporting CodeSystems.
-//   - concept-maps.spec.ts §7.5:       ex-cm-1 (source A -> target T1,
-//     equivalent), ex-cm-no-match (structurally valid, no mappings).
+// Every resource carries the metadata that the browser row + detail templates
+// render — `title`, `publisher`, `jurisdiction`, plus `purpose`/`copyright`
+// on ValueSets and ConceptMaps — so the demo never shows em-dash placeholders
+// where a plausible value would fit. See design §7.10 states matrix.
 
 const PORT = process.env.HTS_E2E_PORT || "8090";
 const IMPORT_URL = `http://127.0.0.1:${PORT}/import`;
 const READY_URL = `http://127.0.0.1:${PORT}/ui/hts`;
 
+// Small pools of plausible-but-obviously-synthetic values used to enrich the
+// seed. Rotating across a handful makes browser filters (publisher facet,
+// jurisdiction column) show varied rows without inventing fake medical data.
+const PUBLISHERS = [
+  "Helios Terminology Services",
+  "Acme Health Informatics",
+  "Example Terminology Consortium",
+];
+
+const JURISDICTIONS = [
+  {
+    coding: [{ system: "urn:iso:std:iso:3166", code: "001", display: "World" }],
+  },
+  {
+    coding: [{ system: "urn:iso:std:iso:3166", code: "US", display: "United States of America" }],
+  },
+  {
+    coding: [{ system: "urn:iso:std:iso:3166", code: "GB", display: "United Kingdom of Great Britain and Northern Ireland" }],
+  },
+  {
+    coding: [{ system: "urn:iso:std:iso:3166", code: "DE", display: "Germany" }],
+  },
+];
+
+// Shared copyright — synthetic, obviously non-clinical.
+const COPYRIGHT_LINE =
+  "\u00A9 2026 Helios Terminology Services. Sample data for demonstration purposes only.";
+
+function pickPublisher(n) {
+  return PUBLISHERS[n % PUBLISHERS.length];
+}
+
+function pickJurisdiction(n) {
+  return [JURISDICTIONS[n % JURISDICTIONS.length]];
+}
+
 function fillerCodeSystem(n) {
+  // Rotate status across fillers so the Status filter has variety without
+  // making the primary demo resources anything other than `active`.
+  let status = "active";
+  if (n % 7 === 0) status = "draft";
+  else if (n % 11 === 0) status = "retired";
   return {
     resourceType: "CodeSystem",
     id: `ex-cs-${n}`,
     url: `http://example.org/cs/filler-${n}`,
     version: "1.0.0",
     name: `FillerCS${n}`,
-    status: "active",
+    title: `Filler Code System ${n}`,
+    status,
+    experimental: true,
+    publisher: pickPublisher(n),
+    jurisdiction: pickJurisdiction(n),
     content: "not-present",
   };
 }
@@ -44,8 +85,15 @@ function buildSeedBundle() {
       url: "http://example.org/cs",
       version: "1.0.0",
       name: "ExampleCodeSystem",
+      title: "Example Anatomy Code System",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[0],
+      jurisdiction: [JURISDICTIONS[0]],
+      description:
+        "A minimal two-concept demonstration CodeSystem used by the HTS workbench canary tests.",
       content: "complete",
+      count: 2,
       hierarchyMeaning: "is-a",
       property: [
         { code: "status", uri: "http://hl7.org/fhir/concept-properties#status", type: "code" },
@@ -54,15 +102,9 @@ function buildSeedBundle() {
         {
           code: "A",
           display: "Alpha",
-          designation: [
-            { language: "en", value: "The Alpha" },
-          ],
-          property: [
-            { code: "status", valueCode: "active" },
-          ],
-          concept: [
-            { code: "B", display: "Beta" },
-          ],
+          designation: [{ language: "en", value: "The Alpha" }],
+          property: [{ code: "status", valueCode: "active" }],
+          concept: [{ code: "B", display: "Beta" }],
         },
       ],
     },
@@ -82,8 +124,13 @@ function buildSeedBundle() {
       url: "http://example.org/cs/source",
       version: "1.0.0",
       name: "ExampleSourceCS",
+      title: "Example Source Terms",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[1],
+      jurisdiction: [JURISDICTIONS[1]],
       content: "complete",
+      count: 1,
       concept: [{ code: "A", display: "Alpha (source)" }],
     },
   });
@@ -94,8 +141,13 @@ function buildSeedBundle() {
       url: "http://example.org/cs/target",
       version: "1.0.0",
       name: "ExampleTargetCS",
+      title: "Example Target Terms",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[2],
+      jurisdiction: [JURISDICTIONS[2]],
       content: "complete",
+      count: 1,
       concept: [{ code: "T1", display: "Target One" }],
     },
   });
@@ -113,8 +165,13 @@ function buildSeedBundle() {
       url: "http://example.org/cs/limbs",
       version: "1.0.0",
       name: "ExampleLimbsCS",
+      title: "Example Limbs Anatomy",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[0],
+      jurisdiction: [JURISDICTIONS[0]],
       content: "complete",
+      count: 60,
       concept: limbConcepts,
     },
   });
@@ -127,7 +184,15 @@ function buildSeedBundle() {
       url: "http://example.org/vs/limbs",
       version: "1.0.0",
       name: "ExampleLimbsVS",
+      title: "Example Limbs Value Set",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[0],
+      jurisdiction: [JURISDICTIONS[0]],
+      purpose:
+        "Enumerates the ExampleLimbsCS anatomy vocabulary so the workbench $expand pager has a meaningful page ceiling.",
+      copyright: COPYRIGHT_LINE,
+      immutable: false,
       compose: {
         include: [{ system: "http://example.org/cs/limbs" }],
       },
@@ -143,7 +208,15 @@ function buildSeedBundle() {
       url: "http://example.org/vs/tree",
       version: "1.0.0",
       name: "ExampleTreeVS",
+      title: "Example Alpha/Beta Tree",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[1],
+      jurisdiction: [JURISDICTIONS[1]],
+      purpose:
+        "Demonstrates hierarchical expansion for the workbench tree-mode toggle by re-exposing the ex-cs-1 A > B tree.",
+      copyright: COPYRIGHT_LINE,
+      immutable: false,
       compose: {
         include: [{ system: "http://example.org/cs" }],
       },
@@ -162,7 +235,15 @@ function buildSeedBundle() {
       url: "http://example.org/vs/too-costly",
       version: "1.0.0",
       name: "ExampleTooCostlyVS",
+      title: "Example Too-Costly Expansion",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[2],
+      jurisdiction: [JURISDICTIONS[3]],
+      purpose:
+        "Exercises the workbench too-costly banner: a 60-concept expansion under a 5-item ceiling.",
+      copyright: COPYRIGHT_LINE,
+      immutable: false,
       compose: {
         include: [{ system: "http://example.org/cs/limbs" }],
       },
@@ -176,7 +257,15 @@ function buildSeedBundle() {
       id: "ex-vs-source",
       url: "http://example.org/vs/source",
       version: "1.0.0",
+      name: "ExampleSourceVS",
+      title: "Example Source Terms Value Set",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[1],
+      jurisdiction: [JURISDICTIONS[1]],
+      purpose: "Reference envelope for the ConceptMap source scope.",
+      copyright: COPYRIGHT_LINE,
+      immutable: false,
       compose: { include: [{ system: "http://example.org/cs/source" }] },
     },
   });
@@ -186,7 +275,15 @@ function buildSeedBundle() {
       id: "ex-vs-target",
       url: "http://example.org/vs/target",
       version: "1.0.0",
+      name: "ExampleTargetVS",
+      title: "Example Target Terms Value Set",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[2],
+      jurisdiction: [JURISDICTIONS[2]],
+      purpose: "Reference envelope for the ConceptMap target scope.",
+      copyright: COPYRIGHT_LINE,
+      immutable: false,
       compose: { include: [{ system: "http://example.org/cs/target" }] },
     },
   });
@@ -200,7 +297,14 @@ function buildSeedBundle() {
       url: "http://example.org/cm/example",
       version: "1.0.0",
       name: "ExampleCM",
+      title: "Example Source-to-Target Mapping",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[0],
+      jurisdiction: [JURISDICTIONS[0]],
+      purpose:
+        "Illustrates a single equivalent mapping (Alpha -> Target One) for the workbench forward-translate demo.",
+      copyright: COPYRIGHT_LINE,
       sourceUri: "http://example.org/vs/source",
       targetUri: "http://example.org/vs/target",
       group: [
@@ -230,7 +334,14 @@ function buildSeedBundle() {
       url: "http://example.org/cm/no-match",
       version: "1.0.0",
       name: "ExampleCMNoMatch",
+      title: "Example Empty Mapping (No-Match Demo)",
       status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[1],
+      jurisdiction: [JURISDICTIONS[3]],
+      purpose:
+        "Demonstrates the well-formed no-match branch: valid mapping envelope with zero elements.",
+      copyright: COPYRIGHT_LINE,
       sourceUri: "http://example.org/vs/source",
       targetUri: "http://example.org/vs/target",
       group: [

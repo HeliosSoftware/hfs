@@ -37,10 +37,11 @@
 
 mod code_systems;
 mod concept_maps;
-mod dashboard;
 mod diagnostics;
+mod home;
 mod i18n;
 mod import;
+mod metrics_parse;
 mod operations;
 mod upstream;
 mod value_sets;
@@ -117,7 +118,7 @@ pub struct HtsUiState {
 /// `/ui/hts`, `/ui/hts/assets/*`, etc.
 pub fn router(state: Arc<HtsUiState>) -> Router {
     Router::new()
-        .merge(dashboard::routes())
+        .merge(home::routes())
         .merge(code_systems::routes())
         .merge(value_sets::routes())
         .merge(concept_maps::routes())

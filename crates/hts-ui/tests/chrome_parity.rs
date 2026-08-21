@@ -139,7 +139,7 @@ async fn sidebar_nav_items_render_inline_svg_icons() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
 
-    // Seven nav items in the HTS sidebar (dashboard, code-systems,
+    // Seven nav items in the HTS sidebar (home, code-systems,
     // value-sets, concept-maps, operations, import, diagnostics). Each
     // opens with an <a class="nav-item" …> and must carry its own
     // <span class="icon">. Counting the class marker across the page is

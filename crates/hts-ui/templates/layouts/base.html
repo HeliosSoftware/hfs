@@ -25,9 +25,9 @@
 
     <nav class="nav">
       <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-work") }}</div>
-      <a class="nav-item" href="/ui/hts"{% if chrome.active_page == "dashboard" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-dashboard") }}">
+      <a class="nav-item" href="/ui/hts"{% if chrome.active_page == "home" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-home") }}">
         <span class="icon">{% include "icons/home.svg" %}</span>
-        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-dashboard") }}</span>
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-home") }}</span>
       </a>
       <a class="nav-item" href="/ui/hts/code-systems"{% if chrome.active_page == "code-systems" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-code-systems") }}">
         <span class="icon">{% include "icons/book.svg" %}</span>

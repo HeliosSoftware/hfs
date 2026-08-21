@@ -201,7 +201,7 @@ impl I18n {
     }
 
     /// Look up a message with one named placeable, e.g.
-    /// `t_arg("hts-dashboard-uptime", "duration", "3d")`.
+    /// `t_arg("hts-home-uptime", "duration", "3d")`.
     pub fn t_arg(&self, key: &str, name: &str, value: impl Into<FluentValue<'static>>) -> String {
         let args: HashMap<Cow<'static, str>, FluentValue<'static>> =
             HashMap::from([(Cow::Owned(name.to_owned()), value.into())]);
@@ -313,7 +313,7 @@ mod tests {
                 "language-es",
                 "language-de",
                 "home-lede",
-                "hts-dashboard-title",
+                "hts-nav-home",
             ] {
                 let rendered = i18n.t(key);
                 for pair in &mojibake_pairs {

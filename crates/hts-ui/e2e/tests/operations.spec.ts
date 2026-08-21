@@ -255,13 +255,13 @@ test.describe("HTS Operations workbench a11y + nav (§7.6, §7.10)", () => {
     page,
   }) => {
     await page.goto("/ui/hts");
-    // The nav order (dashboard, code systems, value sets, concept
+    // The nav order (home, code systems, value sets, concept
     // maps, operations) is asserted end-to-end so a future addition
     // slots in cleanly.
     const navLinks = page
       .locator("nav")
       .getByRole("link")
-      .filter({ hasText: /Dashboard|Code|Value|Concept|Operations/ });
+      .filter({ hasText: /Home|Code|Value|Concept|Operations/ });
     const names = await navLinks.allTextContents();
     const operationsIdx = names.findIndex((n) => /Operations/i.test(n));
     const conceptMapsIdx = names.findIndex((n) => /Concept/i.test(n));
