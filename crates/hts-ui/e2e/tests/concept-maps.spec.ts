@@ -32,15 +32,30 @@ test.describe("HTS ConceptMap browser (§7.5)", () => {
   test("renders the browser heading and status pill at /ui/hts/concept-maps", async ({
     page,
   }) => {
-    const response = await page.goto("/ui/hts/concept-maps");
+    // `_count=100` (== MAX_COUNT) so the seed row lands on the first page
+    // regardless of how much bootstrap terminology HTS added to the ledger
+    // (Slice B invariant #1 clamps at 100 without a hard 400). Scoping to
+    // the seed row via the linkified `Name` cell is what makes this test
+    // pagination-independent: whichever page the bootstrap noise pushes
+    // `ex-cm-1` onto, `_count=100` keeps it visible, and the row link is
+    // the only stable selector that survives the CM browser filter's
+    // known "does not narrow" backend bug (see Source system test below).
+    const response = await page.goto("/ui/hts/concept-maps?_count=100");
     expect(response?.status(), "browser route must respond 200").toBe(200);
     await expect(
       page.getByRole("heading", { name: "ConceptMaps", exact: true, level: 1 }),
     ).toBeVisible();
-    // The seed CM is active, so the browser table's first row shows an
-    // "active" pill translated by the Fluent catalog.
+    // The seed CM is active, so its row shows an "active" pill translated
+    // by the Fluent catalog. Scope to the seed row via its detail-page
+    // link so bootstrap-driven pagination noise cannot mask the check.
+    const seedRow = page
+      .getByRole("row")
+      .filter({
+        has: page.locator("a[href='/ui/hts/concept-maps/ex-cm-1']"),
+      });
+    await expect(seedRow).toHaveCount(1);
     await expect(
-      page.getByRole("cell").filter({ hasText: "active" }).first(),
+      seedRow.getByRole("cell").filter({ hasText: "active" }),
     ).toBeVisible();
   });
 
@@ -56,10 +71,59 @@ test.describe("HTS ConceptMap browser (§7.5)", () => {
       page.getByText("No ConceptMaps match these filters."),
     ).toBeVisible({ timeout: 3_000 });
     // Reset returns us to the full listing (empty-anchor href navigation).
+    // The critical guarantee is that the empty state clears — we do NOT
+    // assert on any specific row's URL because (a) bootstrap terminology
+    // may push the seed CM off the default first page and (b) the CM
+    // browser's server-side title / URL filters currently do not narrow
+    // the row set (pinned by the Source system filter test below). Assert
+    // the empty-state banner is gone and at least one data row is in the
+    // tbody so the "swap-back" path is exercised end to end.
     await page.getByRole("link", { name: "Reset", exact: true }).click();
     await expect(
-      page.getByRole("cell", { name: "http://example.org/cm/example" }),
-    ).toBeVisible();
+      page.getByText("No ConceptMaps match these filters."),
+    ).toHaveCount(0);
+    await expect(page.locator("#hts-cm-rows tbody > tr").first()).toBeVisible();
+  });
+
+  test("Source system filter routes to the `source` FHIR param without narrowing the table", async ({
+    page,
+  }) => {
+    // Pins §3.5 demo step 2: the rail advertises a Source system filter
+    // that maps to the FHIR `source-uri` canonical search parameter. HTS
+    // currently drops the param (backend bug tracked in helios-hts), but
+    // the rail must still (a) send it on the wire so a future backend
+    // fix light-switches the filter on, (b) echo the typed value back so
+    // the operator can see what they asked for, and (c) leave the row
+    // set untouched (no accidental client-side narrowing).
+    await page.goto("/ui/hts/concept-maps");
+    // Scope to the rail input by id: the Mapping cell in every browser
+    // row also carries `<span aria-label="Source system">S:</span>`, so
+    // an accessible-name locator would match 1 + N elements. `#filter-
+    // source` is the rail's stable anchor (cm-browser.html).
+    const railSource = page.locator("#filter-source");
+    const rowsUrl = /\/ui\/hts\/concept-maps\/rows\b/;
+    const requestPromise = page.waitForRequest(rowsUrl, { timeout: 3_000 });
+    await railSource.fill("http://example.org/cs/source");
+    const request = await requestPromise;
+    // (a) `source=` is on the wire, URL-encoded exactly as the backend
+    // would expect if it wired the param through.
+    expect(request.url()).toContain(
+      "source=http%3A%2F%2Fexample.org%2Fcs%2Fsource",
+    );
+    // (b) After htmx swaps the rows partial, the rail input keeps its
+    // typed value (the rail form is outside the swap target).
+    await expect(railSource).toHaveValue("http://example.org/cs/source");
+    // (c) The table does NOT narrow to empty. HTS ignores the param
+    // today, so whichever rows the first page contained pre-filter are
+    // still there — the empty-state marker must not appear. This is
+    // pagination-independent (works whether the seed CM lands on the
+    // first page or not, since the bootstrap ledger adds N > 25 CMs).
+    // If the backend ever starts honoring `source-uri`, this expectation
+    // will flip (only maps whose sourceUri matches would survive) and
+    // this test needs updating alongside the demo doc.
+    await expect(
+      page.getByText("No ConceptMaps match these filters."),
+    ).toHaveCount(0);
   });
 });
 
@@ -78,9 +142,15 @@ test.describe("HTS ConceptMap detail + $translate workbench (§7.5)", () => {
       page.getByRole("tab", { name: "Translate", exact: true }),
     ).toHaveAttribute("aria-selected", "true");
     // Facts block above the tab strip renders the seed CM's canonical
-    // URL and target.
+    // URL (Identity section) and target URI (Mapping section). The
+    // canonical URL is intentionally echoed again inside the translate
+    // input's "ConceptMap (fixed)" pinned-map header so the operator sees
+    // which map the workbench is scoped to; scope this assertion to the
+    // Identity section via its aria-labelledby heading so the two legit
+    // occurrences do not collide under strict mode. The target URI only
+    // renders inside the Mapping section, so the bare locator is unique.
     await expect(
-      page.getByText("http://example.org/cm/example"),
+      page.getByLabel("Identity").getByText("http://example.org/cm/example"),
     ).toBeVisible();
     await expect(
       page.getByText("http://example.org/vs/target"),
@@ -164,6 +234,63 @@ test.describe("HTS ConceptMap detail + $translate workbench (§7.5)", () => {
     await expect(page.locator(".hts-outcome--error")).toBeVisible({
       timeout: 3_000,
     });
+  });
+
+  test("direction toggle emits exactly one `direction=` param on the wire (CM:139 pin)", async ({
+    page,
+  }) => {
+    // Pins §3.5's Reverse red flag and the diagnosis captured in
+    // hts-cm-translate-input.html lines 60-72: without `hx-params="none"`
+    // on the direction radios, htmx serialises the radio's own form
+    // value onto the GET URL, colliding with the literal ?direction=…
+    // already in `hx-get` and yielding `direction=reverse&direction=reverse`.
+    // axum then rejects with HTTP 400, htmx swaps nothing, and the
+    // reverse fieldset never lands. Assert the wire directly.
+    await page.goto("/ui/hts/concept-maps/ex-cm-1/translate");
+    const translateGet = (dir: "forward" | "reverse") =>
+      page.waitForRequest(
+        (req) =>
+          req.method() === "GET" &&
+          /\/ui\/hts\/concept-maps\/ex-cm-1\/translate\b/.test(req.url()) &&
+          req.url().includes(`direction=${dir}`),
+        { timeout: 3_000 },
+      );
+
+    // Reverse: exactly one direction=reverse, and the partial lands.
+    const reversePromise = translateGet("reverse");
+    await page.getByLabel("Reverse", { exact: true }).check();
+    const reverseReq = await reversePromise;
+    const reverseMatches =
+      reverseReq.url().match(/(?:^|[?&])direction=/g) || [];
+    expect(
+      reverseMatches.length,
+      `expected 1 direction= in ${reverseReq.url()}`,
+    ).toBe(1);
+    expect(reverseReq.url()).toContain("direction=reverse");
+    expect(reverseReq.url()).not.toContain(
+      "direction=reverse&direction=reverse",
+    );
+    await expect(
+      page.getByLabel("Target code", { exact: true }),
+    ).toBeVisible({ timeout: 3_000 });
+
+    // Forward round-trip: symmetric guarantee.
+    const forwardPromise = translateGet("forward");
+    await page.getByLabel("Forward", { exact: true }).check();
+    const forwardReq = await forwardPromise;
+    const forwardMatches =
+      forwardReq.url().match(/(?:^|[?&])direction=/g) || [];
+    expect(
+      forwardMatches.length,
+      `expected 1 direction= in ${forwardReq.url()}`,
+    ).toBe(1);
+    expect(forwardReq.url()).toContain("direction=forward");
+    expect(forwardReq.url()).not.toContain(
+      "direction=forward&direction=forward",
+    );
+    await expect(
+      page.getByLabel("Code", { exact: true }),
+    ).toBeVisible({ timeout: 3_000 });
   });
 
   test("reverse translate with targetCode + targetSystem renders a match", async ({

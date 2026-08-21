@@ -70,6 +70,23 @@
     FormData collection for these two triggers so the URL is emitted
     verbatim. See edson/docs/hts-ui-cm139-diagnosis.md for the wire
     trace and htmx-source references.
+
+    `hx-select="#hts-workbench-input"` is equally critical: the GET
+    handler (`translate_input` in crates/hts-ui/src/concept_maps.rs)
+    always renders the full `DetailPageTemplate` (extends
+    `layouts/base.html`) so the nojs hard-nav fallback keeps working.
+    Without `hx-select`, htmx would swap the entire response body into
+    the form's outerHTML slot, nesting a second
+    `#hts-cm-detail-region` / `#hts-cm-workbench` / `#hts-workbench-input`
+    / `#hts-workbench-result` under the workbench and leaving the
+    original `#hts-workbench-result` sibling untouched. Subsequent
+    Playwright `page.locator("#hts-workbench-result")` calls trip
+    strict-mode with two matches; htmx also picks the first-in-DOM
+    (nested) result region on the next POST swap, so the operator's
+    match table ends up hidden below a stale empty-state block. The
+    tabs in `cs-detail.html` / `cm-detail.html` use the same
+    `hx-select` pattern to extract just the region from the full-page
+    response.
   -#}
   <fieldset>
     <legend>{{ chrome.i18n.t("hts-cm-translate-direction-legend") }}</legend>
@@ -78,6 +95,7 @@
              {% if direction == TranslateDirection::Forward %} checked{% endif %}
              hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=forward"
              hx-target="#hts-workbench-input"
+             hx-select="#hts-workbench-input"
              hx-swap="outerHTML"
              hx-trigger="click"
              hx-params="none">
@@ -88,6 +106,7 @@
              {% if direction == TranslateDirection::Reverse %} checked{% endif %}
              hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=reverse"
              hx-target="#hts-workbench-input"
+             hx-select="#hts-workbench-input"
              hx-swap="outerHTML"
              hx-trigger="click"
              hx-params="none">
