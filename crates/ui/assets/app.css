@@ -1048,10 +1048,12 @@ a.pill {
   color: var(--muted);
 }
 
-/* Space the count out from the link label when a .toolbar__count sits
-   inside a .btn (e.g. "Active Exports N") (#608). */
+/* A .toolbar__count inside a .btn (e.g. "Active Exports N") stays plain and
+   matches the label color; only the gap separates it from the text (#608). */
 .btn .toolbar__count {
   margin-left: 8px;
+  color: inherit;
+  font-variant-numeric: tabular-nums;
 }
 
 .toolbar__search {
@@ -1573,6 +1575,7 @@ a.pill {
   border-radius: 9px;
   box-shadow: var(--surface-shadow);
   cursor: pointer;
+  text-decoration: none;
 }
 
 .btn:hover {
