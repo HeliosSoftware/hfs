@@ -223,6 +223,36 @@ function buildSeedBundle() {
     },
   });
 
+  // -- ex-vs-batch-mixed: target ValueSet for the operations workbench
+  //    $batch-validate-code demo (edson/docs/hts-demo.md §3.6). Composes
+  //    both example CodeSystems so a single batch job exercises
+  //    cross-system validation in one submission (rows sourced from
+  //    ex-cs-1 AND ex-cs-source resolve against the same envelope).
+  entries.push({
+    resource: {
+      resourceType: "ValueSet",
+      id: "ex-vs-batch-mixed",
+      url: "http://example.org/vs/batch-mixed",
+      version: "1.0.0",
+      name: "ExampleBatchMixedVS",
+      title: "Example Mixed-System Batch Envelope",
+      status: "active",
+      experimental: true,
+      publisher: PUBLISHERS[0],
+      jurisdiction: [JURISDICTIONS[0]],
+      purpose:
+        "Target ValueSet for the $batch-validate-code demo (§3.6): composes both example CodeSystems (ex-cs-1 + ex-cs-source) so a single batch exercises cross-CS validation.",
+      copyright: COPYRIGHT_LINE,
+      immutable: false,
+      compose: {
+        include: [
+          { system: "http://example.org/cs" },
+          { system: "http://example.org/cs/source" },
+        ],
+      },
+    },
+  });
+
   // -- ex-vs-too-costly: reuses ex-cs-limbs (60 concepts). Combined with
   //    HTS_MAX_EXPANSION_SIZE=5 in boot.mjs, its default `$expand` blows
   //    past the ceiling and HTS answers 422 with a `too-costly`

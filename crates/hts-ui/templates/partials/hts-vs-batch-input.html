@@ -2,9 +2,11 @@
   Batch $validate-code input (design doc §7.6 F1=D). UI-fabricated
   aggregation: seeds a batch on the server, then the seed response
   swaps in the skeleton table and progress region for client-side
-  polling. Slice E1 ships the input surface; the seed handler is a
-  stub (§7.6.1 F1=D E1/E2 split) so submissions render a not-implemented
-  outcome.
+  polling. Slice E2 ships the seed handler in full:
+  `run_batch_validate_seed` (`crates/hts-ui/src/operations.rs`) stages
+  a process-global job store and hands out per-row polling targets on
+  the htmx path; the nojs fallback fans out synchronously and returns
+  a pre-rendered completed table (§7.6.1 F1=D, F10 in the design doc).
 
   The seed form and the row form share the same URL (§7.6 F1=D). The
   nojs fallback is the same POST - the server fans out inline, waits
@@ -13,6 +15,13 @@
   Layout: `.field`/`.field__input` primitives; each row triple
   (code / system / display) uses `.builder-grid` with three columns
   via inline style since the shared HFS grid ships 2-col only.
+
+  Note: the `target` input is HTML5 `required`, so the browser blocks
+  submission with a "Please fill out this field" tooltip when empty.
+  The E2E seed provides `http://example.org/vs/batch-mixed`
+  (`ex-vs-batch-mixed`) as the demo target-of-choice — it composes
+  both example CodeSystems so a single batch exercises cross-CS
+  validation. See `edson/docs/hts-demo.md` §3.6.
 -#}
 <form id="hts-workbench-input"
       class="hts-op-workbench__input"

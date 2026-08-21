@@ -35,7 +35,13 @@
     var isFile = mode === "file";
     if (textareaField) textareaField.hidden = isFile;
     if (fileField) fileField.hidden = !isFile;
-    textarea.disabled = isFile;
+    // Do NOT set `textarea.disabled` here: HTML5 skips disabled inputs on
+    // form submission, so the FileReader-populated value would never reach
+    // the server and the pre-flight would 400 with "Paste a JSON Bundle
+    // before submitting". The parent `.field` `hidden` toggle above is
+    // enough to keep the textarea out of the user's way visually while
+    // still letting its value ride along in the urlencoded body.
+    textarea.readOnly = isFile;
   }
 
   radios.forEach(function (radio) {

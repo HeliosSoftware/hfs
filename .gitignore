@@ -18,8 +18,9 @@ off
 
 # Test artifacts
 /test-artifacts
-test-*.log
-compile.log
+
+# Runtime + build logs (hts-*.log, hts-run.log, test-*.log, compile.log, …)
+*.log
 
 # Python bytecode (e.g. audit test helpers under crates/hfs/tests/audit)
 __pycache__/
