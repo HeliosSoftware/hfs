@@ -153,7 +153,8 @@ chart-empty = Nada que graficar todavía: los recursos almacenados aparecerán a
 chart-sample-note = Datos de muestra: esta build no tiene registrado un proveedor de métricas en vivo.
 chart-table-toggle = Ver como tabla
 chart-table-when = Momento
-chart-remove-series = Quitar del gráfico
+chart-focus-series = Enfocar esta serie
+chart-unfocus-series = Mostrar todas las series
 
 ## Pie de página
 

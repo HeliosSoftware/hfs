@@ -9,6 +9,12 @@ import { createResource } from "../pages/api";
 // ordinary FHIR API; the snapshot cache is outlasted by
 // DashboardPage.waitForSeries.
 
+// Backends whose primary store has no count read path (S3 — the composite
+// delegates counts to the primary) cannot feed the chart; the matrix sets
+// this flag for them and the chart specs stand down. The job-cards spec
+// still runs — the cards read job state, not counts.
+const noChartData = process.env.HFS_E2E_NO_CHART_DATA === "1";
+
 test.beforeEach(async ({ request }) => {
   await createResource(request, "Patient", { name: [{ family: "Chart" }] });
   await createResource(request, "Observation", {
@@ -22,6 +28,7 @@ test.beforeEach(async ({ request }) => {
 });
 
 test("the dashboard renders its stat cards and a charted series", async ({ dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await expect(dashboard.statCards).toHaveCount(5);
   await dashboard.waitForSeries();
@@ -48,6 +55,7 @@ test("export and import job cards show real counts and link to their pages", asy
 });
 
 test("the time-window selector re-renders over the chosen window", async ({ page, dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   await dashboard.windowOption(/24h/i).first().click();
@@ -56,6 +64,7 @@ test("the time-window selector re-renders over the chosen window", async ({ page
 });
 
 test("the picker toggles types on, capped at the palette", async ({ page, dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   await dashboard.openPicker();
@@ -74,14 +83,49 @@ test("the picker toggles types on, capped at the palette", async ({ page, dashbo
   }
   expect(await dashboard.seriesLines.count()).toBeGreaterThan(1);
   expect(await dashboard.seriesLines.count()).toBeLessThanOrEqual(6);
+});
 
-  // The legend removes: clicking an entry drops that series.
+test("legend click focuses a series; clicking it again restores the shared view", async ({
+  page,
+  dashboard,
+}) => {
+  test.skip(process.env.HFS_E2E_NO_CHART_DATA === "1", "no count read path on this backend");
+  await dashboard.goto();
+  await dashboard.waitForSeries();
   const before = await dashboard.seriesLines.count();
-  if (before > 1) {
-    await dashboard.legendItems.first().click();
-    await expect(page).toHaveURL(/types=/);
-    expect(await dashboard.seriesLines.count()).toBe(before - 1);
-  }
+  test.skip(before < 2, "focus needs at least two series");
+
+  // Focus: nothing is removed, the URL carries the focus, the focused line
+  // and legend entry are marked, the rest recede (#602).
+  await dashboard.legendItems.first().click();
+  await expect(page).toHaveURL(/focus=/);
+  expect(await dashboard.seriesLines.count()).toBe(before);
+  await expect(page.locator(".series--focused")).toHaveCount(1);
+  await expect(page.locator(".series--receded")).toHaveCount(before - 1);
+  await expect(page.locator(".chart-legend__item--focused")).toHaveCount(1);
+
+  // The way back is the same entry.
+  await page.locator(".chart-legend__item--focused").click();
+  await expect(page).not.toHaveURL(/focus=/);
+  await expect(page.locator(".series--focused")).toHaveCount(0);
+  expect(await dashboard.seriesLines.count()).toBe(before);
+
+  // The line itself is the same link: clicking a plotted series focuses it
+  // (native SVG anchor, via the widened hit corridor). Playwright's default
+  // click aims at the bounding-box centre — empty air for a polyline with
+  // pointer-events: stroke — so aim at an actual vertex, mapped from
+  // viewBox units to screen pixels.
+  const hit = page.locator(".series-hit").first();
+  const vertex = (await hit.getAttribute("points"))!.split(" ")[2].split(",").map(Number);
+  const svg = page.locator("svg.chart");
+  const viewBox = (await svg.getAttribute("viewBox"))!.split(" ").map(Number);
+  const svgBox = (await svg.boundingBox())!;
+  await page.mouse.click(
+    svgBox.x + (vertex[0] / viewBox[2]) * svgBox.width,
+    svgBox.y + (vertex[1] / viewBox[3]) * svgBox.height,
+  );
+  await expect(page).toHaveURL(/focus=/);
+  await expect(page.locator(".series--focused")).toHaveCount(1);
 });
 
 test("\"View all resources\" offers empty types, charts a flat line at 0, and keeps state across window/type changes", async ({
@@ -143,6 +187,7 @@ test("\"View all resources\" offers empty types, charts a flat line at 0, and ke
 });
 
 test("the picker filter narrows the offered types", async ({ dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   await dashboard.openPicker();
@@ -155,6 +200,7 @@ test("the picker filter narrows the offered types", async ({ dashboard }) => {
 });
 
 test("hovering the chart shows the tooltip readout", async ({ dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   const box = await dashboard.chart.boundingBox();
@@ -167,6 +213,7 @@ test("hovering the chart shows the tooltip readout", async ({ dashboard }) => {
 });
 
 test("the chart has no expand/collapse toggle", async ({ dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   await expect(dashboard.page.locator('[href*="expand=1"]')).toHaveCount(0);
@@ -175,6 +222,7 @@ test("the chart has no expand/collapse toggle", async ({ dashboard }) => {
 });
 
 test("the chart's numbers are readable as a table", async ({ dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
   await dashboard.dataTableToggle.click();

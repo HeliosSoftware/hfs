@@ -30,6 +30,10 @@ function bundleFile(type: "batch" | "transaction"): string {
 }
 
 test("a transaction bundle uploads, previews, executes, and reports", async ({ page }) => {
+  // S3 has no multi-object atomicity and refuses transaction Bundles by
+  // design (#489); the UI surfaces the rejection in #batch-execute-error.
+  // The matrix sets this flag for that leg. Batch Bundles stay covered below.
+  test.skip(process.env.HFS_E2E_NO_TRANSACTIONS === "1", "transactions refused on this backend");
   await page.goto("/ui/batch", { waitUntil: "networkidle" });
 
   await page.locator("#batch-file").setInputFiles(bundleFile("transaction"));
