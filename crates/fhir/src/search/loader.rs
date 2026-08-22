@@ -724,10 +724,15 @@ mod tests {
         let loader = SearchParameterLoader::new(FhirVersion::default());
         let params = loader.load_embedded().unwrap();
 
-        assert!(!params.is_empty());
-        assert!(
-            params.len() <= 10,
-            "Minimal fallback should have ~10 params"
+        // Exact, not `<=`: an upper bound alone passes when fallbacks are
+        // *lost*, which is the direction that breaks indexing. The six
+        // `Resource`-level parameters below plus `url`/`version` for each of
+        // `ViewDefinition` and `Library`.
+        assert_eq!(
+            params.len(),
+            10,
+            "Minimal fallback set changed; update this count and the names below: {:?}",
+            params.iter().map(|p| &p.code).collect::<Vec<_>>()
         );
 
         // The whole `Resource`-level meta set, asserted by name. `_source` was
@@ -742,10 +747,17 @@ mod tests {
             "_security",
             "_source",
         ] {
-            let def = params
-                .iter()
-                .find(|p| p.code == code)
-                .unwrap_or_else(|| panic!("Should have {code} parameter"));
+            // Exactly one definition per code, not merely at least one: a
+            // feature-gated duplicate would shadow-conflict at registration and
+            // `.find()` would happily accept it.
+            let matches: Vec<_> = params.iter().filter(|p| p.code == code).collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "Should have exactly one {code} fallback, got {}",
+                matches.len()
+            );
+            let def = matches[0];
             assert!(
                 !def.expression.starts_with("Resource."),
                 "{code} fallback expression must be resource-relative, got {:?}",

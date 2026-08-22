@@ -2521,18 +2521,7 @@ impl PostgresBackend {
         for (name, value) in params {
             let param_type = self
                 .lookup_param_type(&registry, resource_type, name)
-                .unwrap_or({
-                    match name.as_str() {
-                        "_id" => SearchParamType::Token,
-                        "_lastUpdated" => SearchParamType::Date,
-                        "_tag" | "_profile" | "_security" => SearchParamType::Token,
-                        "identifier" => SearchParamType::Token,
-                        "patient" | "subject" | "encounter" | "performer" | "author"
-                        | "requester" | "recorder" | "asserter" | "practitioner"
-                        | "organization" | "location" | "device" => SearchParamType::Reference,
-                        _ => SearchParamType::String,
-                    }
-                });
+                .unwrap_or_else(|| crate::search::fallback_param_type(name));
 
             search_params.push(SearchParameter {
                 name: name.clone(),

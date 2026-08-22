@@ -382,16 +382,24 @@ impl QueryBuilder {
         param: &SearchParameter,
         param_offset: usize,
     ) -> Option<SqlFragment> {
-        // Handle special parameters. `_tag`/`_profile`/`_security`/`_source`
-        // are NOT special on the query side: the extractor indexes them from
-        // meta like any typed parameter (rows in search_index under their own
-        // param_name), so they take the regular token/uri path below. Routing
+        // Handle special parameters. `_tag`/`_profile`/`_security`/`_source`/
+        // `_language` are NOT special on the query side: the extractor indexes
+        // them from `meta` (and, for `_language`, from `Resource.language`)
+        // like any typed parameter — rows in search_index under their own
+        // param_name — so they take the regular token/uri path below. Routing
         // them into the special handler silently dropped the condition and
-        // returned the unfiltered result set (#474).
+        // returned the unfiltered result set (#474). `_language` is indexed
+        // only on R5/R6, where the spec first defines it; on R4/R4B it is not
+        // a registered parameter and never reaches here.
+        //
+        // Anything added to this list must have a working regular path, and
+        // anything left off it must have an arm in
+        // `build_special_parameter_condition` — the `_ => None` fallback there
+        // drops the filter rather than narrowing it.
         if param.name.starts_with('_')
             && !matches!(
                 param.name.as_str(),
-                "_tag" | "_profile" | "_security" | "_source"
+                "_tag" | "_profile" | "_security" | "_source" | "_language"
             )
         {
             return self.build_special_parameter_condition(param, param_offset);
@@ -969,6 +977,71 @@ mod tests {
 
         assert_eq!(frag.sql, "0");
         assert!(frag.params.is_empty());
+    }
+
+    /// Every indexed `_`-prefixed parameter must produce a real condition.
+    ///
+    /// `build_special_parameter_condition`'s `_ => None` arm *drops* the
+    /// parameter rather than narrowing it, so a search whose only filter is a
+    /// missing arm answers with every resource of the type — the #474 failure
+    /// mode. `_language` (R5/R6) is indexed by the extractor exactly like the
+    /// `meta` set and so belongs on the regular token path with them; before
+    /// this it fell through to the `None` arm.
+    #[test]
+    fn indexed_meta_parameters_are_not_dropped() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+
+        for (name, param_type, value) in [
+            ("_language", SearchParamType::Token, "en-US"),
+            ("_source", SearchParamType::Uri, "http://example.org/src"),
+            ("_tag", SearchParamType::Token, "http://sys|t1"),
+            ("_profile", SearchParamType::Uri, "http://example.org/sd"),
+            ("_security", SearchParamType::Token, "http://sys|R"),
+        ] {
+            let param = SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: None,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            };
+
+            let fragment = builder
+                .build_parameter_condition(&param, 2)
+                .unwrap_or_else(|| {
+                    panic!("{name} produced no condition — the filter would be dropped")
+                });
+            assert!(
+                fragment.sql.contains(&format!("param_name = '{name}'")),
+                "{name} should read its own search_index rows, got: {}",
+                fragment.sql
+            );
+        }
+    }
+
+    /// `_in` never reaches the index — nothing writes rows for it, and the
+    /// SQLite special-parameter path has no arm for it, so a query naming it
+    /// would silently return the whole type. `helios-rest` rejects it before
+    /// the backend is asked; this pins the backend half of that contract so a
+    /// future "just let it through" change has to confront the drop. Update it
+    /// when membership resolution lands (#638).
+    #[test]
+    fn membership_parameter_has_no_backend_condition() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let param = SearchParameter {
+            name: "_in".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("List/42")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        assert!(
+            builder.build_parameter_condition(&param, 2).is_none(),
+            "_in must not be answered by the index; it is rejected at the REST layer"
+        );
     }
 
     #[test]

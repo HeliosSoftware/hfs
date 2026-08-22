@@ -2919,23 +2919,11 @@ impl SqliteBackend {
         let mut search_params = Vec::with_capacity(params.len());
 
         for (name, value) in params {
-            // Look up the parameter definition to get its type
+            // Look up the parameter definition to get its type, falling back to
+            // the shared registry-miss guess when it is not registered.
             let param_type = self
                 .lookup_param_type(&registry, resource_type, name)
-                .unwrap_or({
-                    // Fallback for common parameters when not in registry
-                    match name.as_str() {
-                        "_id" => SearchParamType::Token,
-                        "_lastUpdated" => SearchParamType::Date,
-                        "_tag" | "_profile" | "_security" => SearchParamType::Token,
-                        "identifier" => SearchParamType::Token,
-                        // Common reference parameters across many resource types
-                        "patient" | "subject" | "encounter" | "performer" | "author"
-                        | "requester" | "recorder" | "asserter" | "practitioner"
-                        | "organization" | "location" | "device" => SearchParamType::Reference,
-                        _ => SearchParamType::String, // Default fallback
-                    }
-                });
+                .unwrap_or_else(|| crate::search::fallback_param_type(name));
 
             search_params.push(SearchParameter {
                 name: name.clone(),

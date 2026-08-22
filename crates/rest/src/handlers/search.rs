@@ -187,7 +187,16 @@ where
     // (named queries) is not implemented by any backend. (`_list` is implemented
     // via list resolution; `_score` as an output/`_sort` concept; `_contained` /
     // `_containedType` are parsed below and gated per backend capability.)
-    const UNSUPPORTED_PARAMS: [&str; 1] = ["_query"];
+    //
+    // `_in` (R5/R6) asks whether a resource is a member of a referenced List or
+    // Group; resolving that is not implemented (#638). It cannot be left to fall
+    // through, because it *is* a registered parameter of type `reference` on
+    // those versions — so `Prefer: handling=lenient` would not drop it, and the
+    // backends would answer it with whatever their reference path makes of the
+    // spec's placeholder `Resource.id` expression: an identity test on
+    // PostgreSQL, an unfiltered result set on SQLite. Use `_list` for List
+    // membership.
+    const UNSUPPORTED_PARAMS: [&str; 2] = ["_query", "_in"];
     if let Some((key, _)) = pairs
         .iter()
         .find(|(k, _)| UNSUPPORTED_PARAMS.contains(&k.as_str()))

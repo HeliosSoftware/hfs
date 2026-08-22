@@ -568,14 +568,13 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
                 .as_ref()
                 .and_then(|schema| schema.type_.clone())
                 .unwrap_or_default();
-            let contexts = [
-                resource_type,
-                dotted.as_str(),
-                type_context.as_str(),
-                "Element",
-                "Resource",
-                "DomainResource",
-            ];
+            // The abstract bases come from the shared list so this stays one
+            // statement of that set rather than a third hand-copy of it.
+            let contexts: Vec<&str> = [resource_type, dotted.as_str(), type_context.as_str()]
+                .into_iter()
+                .chain(["Element"])
+                .chain(helios_fhir::search::ABSTRACT_BASE_TYPES)
+                .collect();
             registry
                 .extensions_applicable(&contexts)
                 .into_iter()

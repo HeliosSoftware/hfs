@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::{ResourceStorage, SearchProvider};
-use helios_persistence::search::seed_spec_search_parameters;
+use helios_persistence::search::{SearchParameterLoader, seed_spec_search_parameters};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use serde_json::json;
 
@@ -181,13 +181,17 @@ async fn seeding_with_missing_spec_bundle_seeds_only_fallbacks() {
         seed_spec_search_parameters(&backend, FhirVersion::R4, empty_dir.path(), "default")
             .await
             .expect("seed fallbacks");
-    // Only the handful of embedded fallbacks are seeded — no spec set. The
-    // upper bound tracks `get_minimal_fallback_parameters`: five meta-level
-    // params plus `_source` (added with #523), plus ViewDefinition/Library
-    // url+version.
-    assert!(
-        outcome.created > 0 && outcome.created <= 10,
-        "expected only embedded fallbacks, got {outcome:?}"
+    // Only the embedded fallbacks are seeded — no spec set. Derived from
+    // `load_embedded()` rather than written as a bound, so the assertion fails
+    // when a fallback is *lost* as loudly as when the spec set leaks in; an
+    // upper bound only catches the second.
+    let expected = SearchParameterLoader::new(FhirVersion::R4)
+        .load_embedded()
+        .expect("embedded fallbacks")
+        .len();
+    assert_eq!(
+        outcome.created, expected,
+        "expected exactly the {expected} embedded fallbacks, got {outcome:?}"
     );
     assert_eq!(outcome.failed, 0);
 }

@@ -208,16 +208,7 @@ impl CompositeStorage {
     }
 
     fn infer_conditional_param_type(name: &str) -> SearchParamType {
-        match name {
-            "_id" => SearchParamType::Token,
-            "_lastUpdated" => SearchParamType::Date,
-            "_tag" | "_profile" | "_security" | "identifier" => SearchParamType::Token,
-            "patient" | "subject" | "encounter" | "performer" | "author" | "requester"
-            | "recorder" | "asserter" | "practitioner" | "organization" | "location" | "device" => {
-                SearchParamType::Reference
-            }
-            _ => SearchParamType::String,
-        }
+        crate::search::fallback_param_type(name)
     }
 
     async fn find_conditional_matches(

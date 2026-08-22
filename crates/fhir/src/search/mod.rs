@@ -21,7 +21,7 @@ pub mod types;
 pub use errors::{LoaderError, RegistryError};
 pub use loader::SearchParameterLoader;
 pub use registry::{
-    CompositeComponentDef, SearchParameterDefinition, SearchParameterRegistry,
+    ABSTRACT_BASE_TYPES, CompositeComponentDef, SearchParameterDefinition, SearchParameterRegistry,
     SearchParameterSource, SearchParameterStatus, resolve_param_targets, resolve_param_type,
 };
 pub use types::SearchParamType;

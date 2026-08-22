@@ -134,6 +134,16 @@ the background and is polled via `/$reindex-status/[job_id]`.
   deployment, poll the node you kicked off against.
 - The `s3` backend standalone has no search index of any kind, so `$reindex`
   there returns `501`. Every other backend and composite supports it.
+- The same applies after a **server upgrade that adds a parameter to the
+  built-in set**, not just after an operator edits one. Resources written
+  before the upgrade were extracted under the old definitions and have no index
+  rows for the new parameter, so it matches nothing on that older data until a
+  `$reindex` runs. Two current cases: `_source` (`meta.source`), which no
+  version of the server indexed before [#523], and `_language`
+  (`Resource.language`) on R5/R6. Neither returns an error on stale data — it
+  simply under-matches, which is the failure mode a reindex exists to clear.
+
+[#523]: https://github.com/HeliosSoftware/hfs/issues/523
 
 Both operations emit BALP `AuditEvent`s — purge on completion or failure,
 reindex at start and at its terminal state (complete / cancel / fail, outcome
