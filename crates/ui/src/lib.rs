@@ -2393,6 +2393,30 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_groups_compartments_under_server_and_labels_tools() {
+        for (locale, tools_label) in [("en", "Tools"), ("es", "Herramientas"), ("de", "Werkzeuge")]
+        {
+            let html = sample_index_page("1.2.3", 42, i18n(locale))
+                .render()
+                .expect("index renders");
+
+            assert!(html.contains(tools_label));
+        }
+
+        let html = sample_index_page("1.2.3", 42, i18n("en"))
+            .render()
+            .expect("index renders");
+        let server = html.find(">Server</div>").expect("Server section");
+        let compartments = html
+            .find(r#"href="/ui/compartments"#)
+            .expect("Compartments link");
+        let tools = html.find(">Tools</div>").expect("Tools section");
+
+        assert!(server < compartments && compartments < tools);
+        assert!(!html.contains("Admin / Ops"));
+    }
+
+    #[test]
     fn status_partial_is_fragment_not_full_page() {
         let html = StatusPartial {
             status: Status {
@@ -2489,8 +2513,14 @@ mod tests {
         assert!(html.contains("data-addbox-close"));
         // Resource picker rail (#541): a real link per type, server-marked
         // current; no count without a dashboard provider.
-        assert!(html.contains(r#"data-type="Patient" href="/ui/queries?type=Patient""#));
-        assert!(html.contains(r#"data-type="Observation" href="/ui/queries?type=Observation""#));
+        assert!(html.contains(
+            r#"data-type="Patient" data-full-name="Patient"
+   href="/ui/queries?type=Patient""#
+        ));
+        assert!(html.contains(
+            r#"data-type="Observation" data-full-name="Observation"
+   href="/ui/queries?type=Observation""#
+        ));
         assert!(!html.contains(r#"class="count""#));
         // Saved Queries has no nav entry any more (#282 folded search / editor
         // / history / saved-queries into Resources); the route still renders.

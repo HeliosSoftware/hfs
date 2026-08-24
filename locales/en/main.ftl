@@ -89,7 +89,7 @@ error-generic = Something went wrong. Please try again.
 nav-section-work = Work
 nav-section-batch-data = Batch & Data
 nav-section-server = Server
-nav-section-conditional = Conditional
+nav-section-tools = Tools
 
 nav-home = Home
 nav-search = Search
@@ -102,7 +102,6 @@ nav-export = Export
 nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capability & Conformance
 nav-search-parameters = Search Parameters
-nav-admin-ops = Admin / Ops
 nav-subscriptions = Subscriptions
 nav-tenants = Tenants
 

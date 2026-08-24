@@ -148,5 +148,20 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
             encounter.contains(">0<"),
             "{path}: a type with no stored resources still renders 0: {encounter}"
         );
+        let long_name = "MedicinalProductUndesirableEffect";
+        let long_item = rail_item(&html, long_name);
+        assert!(
+            long_item.contains(&format!(r#"data-full-name="{long_name}""#)),
+            "{path}: the full name feeds the shared hover/focus tooltip: {long_item}"
+        );
+        assert!(
+            long_item.contains(&format!(r#"title="{long_name}""#)),
+            "{path}: the no-JS tooltip fallback remains available: {long_item}"
+        );
+        assert!(
+            long_item.contains(&format!(r#">{long_name}</span>"#))
+                && long_item.contains(r#"<span class="count">0</span>"#),
+            "{path}: the accessible name and count remain separate: {long_item}"
+        );
     }
 }
