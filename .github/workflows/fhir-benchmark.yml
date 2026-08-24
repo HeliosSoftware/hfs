@@ -517,7 +517,13 @@ jobs:
           HFS_DATA_DIR="$GITHUB_WORKSPACE/data" \
             ./hfs > "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>&1 &
 
-          echo "HFS_PID=$!" >> "$GITHUB_ENV"
+          # Keep the pid in a LOCAL variable as well as $GITHUB_ENV: values
+          # written to $GITHUB_ENV only become visible to *subsequent* steps, so
+          # the readiness loop below — which runs in this same step — would
+          # otherwise see an empty $HFS_PID and `kill -0 ""` would fail on the
+          # first iteration.
+          HFS_PID=$!
+          echo "HFS_PID=$HFS_PID" >> "$GITHUB_ENV"
 
           # Cold start is dominated by conformance seeding — 1,377 SearchParameters
           # written one at a time, measured at 27s (postgres) / 38s (sqlite) on an
