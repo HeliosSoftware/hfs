@@ -144,7 +144,7 @@ async fn the_export_page_offers_scopes_types_and_filters() {
     assert!(html.contains("Everything"));
     assert!(html.contains(r#"name="types" value="Patient""#));
     assert!(html.contains("Narrow it down"));
-    assert!(html.contains("Start export"));
+    assert!(html.contains("Start Export"));
 }
 
 #[tokio::test]
