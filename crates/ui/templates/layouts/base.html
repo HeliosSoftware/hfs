@@ -139,10 +139,10 @@
 
     <!--
       FHIR version selector (#343). A <details> disclosure like the tenant
-      selector, so it works without JavaScript. The label is the server's
-      default version; each option re-loads the current page with `?version=` —
-      the pages with a version dimension (SearchParameters, Compartments)
-      switch, the rest ignore it.
+      selector, so it works without JavaScript. The label is the effective
+      version for this request — the user's stored choice when one is set,
+      else the server default (#553); each option POSTs /ui/version to
+      persist a new choice and reloads the current page.
     -->
     <div class="sidebar__foot">
       <details class="menu menu--up">

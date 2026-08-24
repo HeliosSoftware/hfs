@@ -343,7 +343,10 @@ impl TerminologyNavigation {
 }
 
 impl Status {
-    /// The default FHIR version's display label (`"R4"`, `"R5"`, â€¦).
+    /// Display label (`"R4"`, `"R5"`, â€¦) of the request's effective FHIR
+    /// version â€” the user's stored choice when one is set, else the server
+    /// default. Rendered by the sidebar selector and the dashboard's
+    /// "Resource types" card (#553).
     pub(crate) fn fhir_version_label(&self) -> &'static str {
         self.fhir_version.as_str()
     }
@@ -415,13 +418,14 @@ impl Status {
 /// Dashboard headline metrics rendered by `pages/index.html` (design: Figma
 /// "Dashboard V1.1").
 ///
-/// `resource_types`, `stored_resources`, `fhir_version`, `export_jobs`,
-/// `import_jobs`, and `chart_total` are derived from the live
-/// [`DashboardSnapshot`] (default tenant). `uptime` is the process uptime from
-/// `helios_observability::uptime` (#540); in a cluster it describes only the
-/// node that served this request.
+/// `resource_types`, `stored_resources`, `export_jobs`, `import_jobs`, and
+/// `chart_total` are derived from the live [`DashboardSnapshot`], scoped to
+/// the request's effective tenant (#344). The card's version label is NOT
+/// here: it renders from [`Status`], the same per-request source as the
+/// sidebar selector, so the two can never disagree (#553). `uptime` is the
+/// process uptime from `helios_observability::uptime` (#540); in a cluster it
+/// describes only the node that served this request.
 struct DashboardMetrics {
-    fhir_version: String,
     resource_types: String,
     stored_resources: String,
     /// Bulk-export jobs for the tenant; `None` renders the unavailable state.
@@ -1843,7 +1847,6 @@ fn build_dashboard(
         .collect();
 
     let metrics = DashboardMetrics {
-        fhir_version: snapshot.fhir_version.clone(),
         resource_types: snapshot.distinct_types.to_string(),
         stored_resources: compact_count(snapshot.total_resources),
         export_jobs: snapshot.export_jobs,
