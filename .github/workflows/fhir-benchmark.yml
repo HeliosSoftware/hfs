@@ -519,19 +519,51 @@ jobs:
 
           echo "HFS_PID=$!" >> "$GITHUB_ENV"
 
+          # Cold start is dominated by conformance seeding — 1,377 SearchParameters
+          # written one at a time, measured at 27s (postgres) / 38s (sqlite) on an
+          # empty database. The old 120s gate left barely 3x headroom on a shared
+          # runner, and when the sqlite leg of run 32740257894 blew through it the
+          # step reported 120s of silence and nothing else. 300s plus a progress
+          # line every 10s so a slow start is distinguishable from a hung one.
           echo "Waiting for HFS to become ready..."
-          for i in $(seq 1 60); do
+          READY_TIMEOUT=300
+          START_TS=$SECONDS
+          READY=0
+          while [ $((SECONDS - START_TS)) -lt "$READY_TIMEOUT" ]; do
             if curl -sf "http://localhost:${{ matrix.port }}/metadata" -o /dev/null 2>/dev/null; then
-              echo "HFS ready after $((i * 2))s"
+              echo "HFS ready after $((SECONDS - START_TS))s"
+              READY=1
               break
             fi
-            if [ "$i" -eq 60 ]; then
-              echo "ERROR: HFS did not start within 120s"
-              cat "/tmp/hfs-bench-${{ matrix.backend }}.log"
-              exit 1
+            if ! kill -0 "$HFS_PID" 2>/dev/null; then
+              echo "ERROR: HFS process $HFS_PID exited after $((SECONDS - START_TS))s"
+              break
+            fi
+            ELAPSED=$((SECONDS - START_TS))
+            if [ $((ELAPSED % 10)) -lt 2 ] && [ "$ELAPSED" -gt 0 ]; then
+              echo "  ... still waiting (${ELAPSED}s) — last log line: $(tail -n 1 "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>/dev/null || echo '(no log yet)')"
             fi
             sleep 2
           done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "ERROR: HFS did not become ready within ${READY_TIMEOUT}s"
+            echo "── server log ──"
+            cat "/tmp/hfs-bench-${{ matrix.backend }}.log" || true
+            echo "── process state ──"
+            ps -o pid,stat,etime,rss,args -p "$HFS_PID" 2>/dev/null || echo "process $HFS_PID is gone"
+            echo "── open files / sockets (may need lsof) ──"
+            ls -l "/proc/$HFS_PID/fd" 2>/dev/null | tail -n 20 || true
+            echo "── kernel stack ──"
+            cat "/proc/$HFS_PID/stack" 2>/dev/null || echo "(stack unavailable)"
+            echo "── wait channel ──"
+            cat "/proc/$HFS_PID/wchan" 2>/dev/null && echo || true
+            if [ "${{ matrix.backend }}" = "sqlite" ]; then
+              echo "── sqlite database state ──"
+              ls -la "$HFS_DATABASE_URL"* 2>/dev/null || echo "(no database files)"
+            fi
+            exit 1
+          fi
 
       # Guard against the silent search-parameter degrade (see HFS_DATA_DIR note):
       # if the spec bundle didn't load, HFS logs a "minimal fallback" warning and
