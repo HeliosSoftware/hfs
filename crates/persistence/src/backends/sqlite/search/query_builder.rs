@@ -1096,6 +1096,21 @@ mod tests {
     }
 
     #[test]
+    fn missing_parameter_without_values_is_ignored() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let param = SearchParameter {
+            name: "birthdate".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![],
+            chain: vec![],
+            components: vec![],
+        };
+
+        assert!(builder.build_parameter_condition(&param, 2).is_none());
+    }
+
+    #[test]
     fn test_order_by_default() {
         let builder = QueryBuilder::new("tenant1", "Patient");
         let query = SearchQuery::new("Patient");
