@@ -85,7 +85,7 @@ error-generic = Algo salió mal. Vuelva a intentarlo.
 nav-section-work = Trabajo
 nav-section-batch-data = Lotes y datos
 nav-section-server = Servidor
-nav-section-conditional = Condicional
+nav-section-tools = Herramientas
 
 nav-home = Inicio
 nav-search = Buscar
@@ -98,7 +98,6 @@ nav-export = Exportar
 nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capacidad y conformidad
 nav-search-parameters = Parámetros de búsqueda
-nav-admin-ops = Administración / Operaciones
 nav-subscriptions = Suscripciones
 nav-tenants = Tenants
 
