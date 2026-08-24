@@ -7,6 +7,8 @@
 use std::path::PathBuf;
 
 #[cfg(feature = "sqlite")]
+use helios_fhir::FhirVersion;
+#[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 
 /// Builds an in-memory SQLite backend that has the spec `SearchParameter` set
@@ -21,6 +23,12 @@ use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 /// correctly-configured builder.
 #[cfg(feature = "sqlite")]
 pub fn make_sqlite_backend() -> SqliteBackend {
+    make_sqlite_backend_for(FhirVersion::default_enabled())
+}
+
+/// Builds the same test backend with an explicit FHIR search-parameter set.
+#[cfg(feature = "sqlite")]
+pub fn make_sqlite_backend_for(fhir_version: FhirVersion) -> SqliteBackend {
     // CARGO_MANIFEST_DIR for these tests is crates/persistence.
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -29,6 +37,7 @@ pub fn make_sqlite_backend() -> SqliteBackend {
         .unwrap_or_else(|| PathBuf::from("data"));
 
     let config = SqliteBackendConfig {
+        fhir_version,
         data_dir: Some(data_dir),
         ..Default::default()
     };

@@ -664,8 +664,10 @@ impl PostgresQueryBuilder {
 
     /// Builds an `id IN/NOT IN` condition for the `:missing` modifier.
     ///
-    /// `param:missing=true` matches resources with **no** `search_index` entry
-    /// for the parameter; `:missing=false` matches resources that **have** one.
+    /// `param:missing=true` matches resources with **no top-level** `search_index`
+    /// entry for the parameter; `:missing=false` matches resources that **have**
+    /// one. Index rows extracted from contained resources do not establish
+    /// presence on their container.
     /// Uses only the always-present `$1`/`$2` (tenant, resource type) bind
     /// params, so it adds no parameters to the surrounding query.
     fn build_missing_condition(param: &SearchParameter) -> SqlFragment {
@@ -674,10 +676,14 @@ impl PostgresQueryBuilder {
             .first()
             .map(|v| v.value == "true")
             .unwrap_or(false);
-        let inner = format!(
-            "SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}'",
-            param.name
-        );
+        let inner = match param.name.as_str() {
+            "_id" => "SELECT id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id IS NOT NULL".to_string(),
+            "_lastUpdated" => "SELECT id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND last_updated IS NOT NULL".to_string(),
+            _ => format!(
+                "SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND is_contained = FALSE AND param_name = '{}'",
+                param.name
+            ),
+        };
         let sql = if is_missing {
             format!("id NOT IN ({})", inner)
         } else {
@@ -2271,5 +2277,49 @@ mod tests {
         assert!(frag.sql.contains("value_identifier_type_system = $4"));
         assert!(frag.sql.contains("value_identifier_type_code = $5"));
         assert_eq!(frag.params.len(), 3);
+    }
+
+    #[test]
+    fn missing_ignores_index_rows_from_contained_resources() {
+        let param = SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("false")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Patient").with_parameter(param);
+        let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect(":missing must produce a condition");
+
+        assert!(
+            fragment.sql.contains("is_contained = FALSE"),
+            "contained-resource index rows must not establish presence: {}",
+            fragment.sql
+        );
+    }
+
+    #[test]
+    fn missing_metadata_uses_authoritative_resource_columns() {
+        for (name, param_type, column) in [
+            ("_id", SearchParamType::Token, "id"),
+            ("_lastUpdated", SearchParamType::Date, "last_updated"),
+        ] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: Some(SearchModifier::Missing),
+                values: vec![SearchValue::eq("false")],
+                chain: vec![],
+                components: vec![],
+            });
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
+                .expect(":missing must produce a condition");
+
+            assert!(fragment.sql.contains("FROM resources"));
+            assert!(fragment.sql.contains(&format!("{column} IS NOT NULL")));
+            assert!(!fragment.sql.contains("FROM search_index"));
+        }
     }
 }

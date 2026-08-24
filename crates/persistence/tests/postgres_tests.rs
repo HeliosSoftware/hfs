@@ -2367,8 +2367,10 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_integration_search_missing_modifier() {
         use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
         use helios_persistence::types::{
-            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+            ContainedMode, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
         };
 
         let backend = create_backend().await;
@@ -2392,6 +2394,23 @@ mod postgres_integration {
             )
             .await
             .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "container-no-gender",
+                    "contained": [{
+                        "resourceType": "Patient",
+                        "id": "contained-with-gender",
+                        "gender": "female"
+                    }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
 
         let missing = |present: &str| {
             SearchQuery::new("Patient").with_parameter(SearchParameter {
@@ -2405,13 +2424,18 @@ mod postgres_integration {
         };
 
         let result = backend.search(&tenant, &missing("true")).await.unwrap();
-        let ids: Vec<String> = result
+        let mut ids: Vec<String> = result
             .resources
             .items
             .iter()
             .map(|r| r.id().to_string())
             .collect();
-        assert_eq!(ids, vec!["no-gender"], "gender:missing=true → no-gender");
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["container-no-gender", "no-gender"],
+            "gender:missing=true must ignore gender indexed only from contained resources"
+        );
 
         let result = backend.search(&tenant, &missing("false")).await.unwrap();
         let ids: Vec<String> = result
@@ -2425,6 +2449,45 @@ mod postgres_integration {
             vec!["with-gender"],
             "gender:missing=false → with-gender"
         );
+
+        for (name, param_type) in [
+            ("_id", SearchParamType::Token),
+            ("_lastUpdated", SearchParamType::Date),
+        ] {
+            let query = |is_missing| {
+                SearchQuery::new("Patient").with_parameter(SearchParameter {
+                    name: name.to_string(),
+                    param_type,
+                    modifier: Some(SearchModifier::Missing),
+                    values: vec![SearchValue::boolean(is_missing)],
+                    chain: vec![],
+                    components: vec![],
+                })
+            };
+
+            let missing = backend.search(&tenant, &query(true)).await.unwrap();
+            assert!(missing.resources.items.is_empty(), "{name}:missing=true");
+
+            let present = backend.search(&tenant, &query(false)).await.unwrap();
+            let mut ids: Vec<&str> = present.resources.items.iter().map(|r| r.id()).collect();
+            ids.sort();
+            assert_eq!(
+                ids,
+                vec!["container-no-gender", "no-gender", "with-gender"],
+                "{name}:missing=false"
+            );
+        }
+
+        let mut contained_missing = missing("true");
+        contained_missing.contained = ContainedMode::On;
+        let error = backend
+            .search(&tenant, &contained_missing)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Search(SearchError::QueryParseError { .. })
+        ));
     }
 
     #[tokio::test]

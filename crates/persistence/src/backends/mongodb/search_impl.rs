@@ -677,7 +677,8 @@ impl MongoBackend {
         for param in &query.parameters {
             if matches!(
                 param.modifier,
-                Some(SearchModifier::Above)
+                Some(SearchModifier::Missing)
+                    | Some(SearchModifier::Above)
                     | Some(SearchModifier::Below)
                     | Some(SearchModifier::In)
                     | Some(SearchModifier::NotIn)
@@ -1784,5 +1785,33 @@ mod date_filter_tests {
     #[test]
     fn invalid_dates_error() {
         assert!(build_date_filter_doc(&SearchValue::parse("not-a-date"), "value_date").is_err());
+    }
+}
+
+#[cfg(test)]
+mod query_support_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+
+    #[test]
+    fn missing_is_rejected_before_type_specific_value_parsing() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "birthdate".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("true")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let error = backend.validate_query_support(&query).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Search(SearchError::UnsupportedModifier {
+                ref modifier,
+                ..
+            }) if modifier == "missing"
+        ));
     }
 }

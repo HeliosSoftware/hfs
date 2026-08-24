@@ -185,6 +185,13 @@ impl<'a> EsQueryBuilder<'a> {
 
     /// Builds a clause for a single search parameter.
     fn build_parameter_clause(&self, param: &SearchParameter) -> Option<Value> {
+        // Presence is independent of the parameter's ordinary value syntax.
+        // Resolve it before `_id` and `_lastUpdated`, which would otherwise
+        // interpret the boolean literal as an ID or date value.
+        if param.modifier == Some(SearchModifier::Missing) {
+            return modifier_handlers::build_missing_clause(param);
+        }
+
         // Handle special parameters
         match param.name.as_str() {
             "_id" => return self.build_id_clause(param),
@@ -192,11 +199,6 @@ impl<'a> EsQueryBuilder<'a> {
             "_text" => return fts::build_text_clause(param),
             "_content" => return fts::build_content_clause(param),
             _ => {}
-        }
-
-        // Handle :missing modifier
-        if param.modifier == Some(SearchModifier::Missing) {
-            return modifier_handlers::build_missing_clause(param);
         }
 
         // Dispatch based on parameter type
@@ -424,6 +426,29 @@ mod tests {
         let es_query = builder.build(&query);
         let body_str = serde_json::to_string(&es_query.body).unwrap();
         assert!(body_str.contains("resource_id"));
+    }
+
+    #[test]
+    fn missing_precedes_id_and_last_updated_dispatch() {
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+
+        for (name, param_type, field) in [
+            ("_id", SearchParamType::Token, "resource_id"),
+            ("_lastUpdated", SearchParamType::Date, "last_updated"),
+        ] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: Some(SearchModifier::Missing),
+                values: vec![SearchValue::eq("false")],
+                chain: vec![],
+                components: vec![],
+            });
+            let es_query = builder.build(&query);
+            let clause = &es_query.body["query"]["bool"]["must"][0];
+
+            assert_eq!(clause["exists"]["field"], field);
+        }
     }
 
     fn not_param(values: Vec<SearchValue>) -> SearchQuery {

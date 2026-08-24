@@ -341,6 +341,37 @@ fn parse_search_parameter(
     // Check for chained parameters (e.g., "patient.name" or "subject:Patient.name")
     let (base_name, chain) = parse_chain(param_name);
 
+    // FHIR defines :missing as a single, case-sensitive boolean literal.
+    // Validate it before splitting comma-separated OR values so malformed
+    // inputs cannot silently become `missing=false` in a storage backend.
+    if matches!(modifier, Some(SearchModifier::Missing)) && !matches!(value, "true" | "false") {
+        return Err(RestError::InvalidParameter {
+            param: name.to_string(),
+            message: "the :missing modifier requires exactly 'true' or 'false'".to_string(),
+        });
+    }
+
+    // Full-text and other computed `_` parameters have no ordinary presence
+    // row in the search index. Treating them as index-backed would make
+    // `:missing=true` match every resource.
+    let registered = registry.get_param(resource_type, base_name).is_some()
+        || registry.get_param("Resource", base_name).is_some();
+    let has_presence_index = matches!(base_name, "_id" | "_lastUpdated")
+        || registered
+            && matches!(
+                base_name,
+                "_tag" | "_profile" | "_security" | "_source" | "_language"
+            );
+    if matches!(modifier, Some(SearchModifier::Missing))
+        && base_name.starts_with('_')
+        && !has_presence_index
+    {
+        return Err(RestError::InvalidParameter {
+            param: name.to_string(),
+            message: format!(":missing is not supported for parameter '{base_name}'"),
+        });
+    }
+
     // Parse the value(s) - multiple values separated by comma are ORed.
     // Prefix extraction (gt/lt/ge/le/sa/eb/ap/eq/ne) is only meaningful for
     // date/number/quantity types per FHIR. For tokens/strings/references/uris,
@@ -422,16 +453,6 @@ fn parse_search_parameter(
                     .collect();
             }
         }
-    }
-
-    // Handle :missing modifier specially
-    if param
-        .modifier
-        .as_ref()
-        .is_some_and(|m| *m == SearchModifier::Missing)
-    {
-        // The value should be "true" or "false"
-        param.values = vec![SearchValue::eq(value)];
     }
 
     Ok(param)
@@ -935,6 +956,94 @@ mod tests {
         assert_eq!(query.parameters.len(), 1);
         assert_eq!(query.parameters[0].name, "name");
         assert_eq!(query.parameters[0].modifier, Some(SearchModifier::Exact));
+    }
+
+    #[test]
+    fn test_missing_modifier_accepts_exact_boolean_literals() {
+        let registry = test_registry();
+
+        for value in ["true", "false"] {
+            let param =
+                parse_search_parameter("Patient", "birthdate:missing", value, &registry).unwrap();
+            assert_eq!(param.modifier, Some(SearchModifier::Missing));
+            assert_eq!(param.values.len(), 1);
+            assert_eq!(param.values[0].value, value);
+        }
+    }
+
+    #[test]
+    fn test_missing_modifier_rejects_non_boolean_literals() {
+        let registry = test_registry();
+
+        for value in ["", "TRUE", "False", "invalid", "true,false"] {
+            let error = parse_search_parameter("Patient", "birthdate:missing", value, &registry)
+                .unwrap_err();
+            assert!(
+                matches!(error, RestError::InvalidParameter { .. }),
+                "unexpected error for {value:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_modifier_rejects_composite_parameters() {
+        let mut registry = test_registry();
+        registry
+            .register(
+                SearchParameterDefinition::new(
+                    "http://hl7.org/fhir/SearchParameter/Observation-code-value-quantity",
+                    "code-value-quantity",
+                    SearchParamType::Composite,
+                    "ignored",
+                )
+                .with_base(vec!["Observation"]),
+            )
+            .unwrap();
+
+        let error = parse_search_parameter(
+            "Observation",
+            "code-value-quantity:missing",
+            "true",
+            &registry,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, RestError::InvalidParameter { .. }));
+    }
+
+    #[test]
+    fn test_missing_modifier_rejects_non_indexed_special_parameters() {
+        let registry = test_registry();
+
+        for name in ["_text:missing", "_content:missing"] {
+            let error = parse_search_parameter("Patient", name, "true", &registry).unwrap_err();
+            assert!(
+                matches!(error, RestError::InvalidParameter { .. }),
+                "unexpected error for {name}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_language_missing_requires_a_registered_search_parameter() {
+        let mut registry = test_registry();
+        assert!(parse_search_parameter("Patient", "_language:missing", "true", &registry).is_err());
+
+        registry
+            .register(
+                SearchParameterDefinition::new(
+                    "http://hl7.org/fhir/SearchParameter/Resource-language",
+                    "_language",
+                    SearchParamType::Token,
+                    "Resource.language",
+                )
+                .with_base(vec!["Resource"]),
+            )
+            .unwrap();
+
+        let param =
+            parse_search_parameter("Patient", "_language:missing", "true", &registry).unwrap();
+        assert_eq!(param.modifier, Some(SearchModifier::Missing));
     }
 
     #[test]

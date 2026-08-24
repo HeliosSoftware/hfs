@@ -18,7 +18,7 @@ use crate::core::{
     ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
     RevincludeProvider, SearchProvider, SearchResult,
 };
-use crate::error::{BackendError, QueryErrorExt, StorageError, StorageResult};
+use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
     CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo,
@@ -34,6 +34,20 @@ fn internal_error(message: String) -> StorageError {
         message,
         source: None,
     })
+}
+
+fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
+    if query.contained != crate::types::ContainedMode::Off
+        && query
+            .parameters
+            .iter()
+            .any(|param| matches!(param.modifier, Some(crate::types::SearchModifier::Missing)))
+    {
+        return Err(StorageError::Search(SearchError::QueryParseError {
+            message: "SQLite does not support :missing with _contained=true or both".to_string(),
+        }));
+    }
+    Ok(())
 }
 
 /// Binds the cursor's boundary sort value as `?3`, typed per the sort key kind.
@@ -76,6 +90,8 @@ impl SearchProvider for SqliteBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        reject_contained_missing(query)?;
+
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
         if query.contained != crate::types::ContainedMode::Off {
@@ -342,6 +358,8 @@ impl SearchProvider for SqliteBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        reject_contained_missing(query)?;
+
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;

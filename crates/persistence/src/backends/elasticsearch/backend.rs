@@ -637,8 +637,7 @@ impl ElasticsearchBackend {
             SearchParamType::Number => vec!["missing"],
             SearchParamType::Quantity => vec!["missing"],
             SearchParamType::Uri => vec!["contains", "below", "above", "missing"],
-            SearchParamType::Composite => vec!["missing"],
-            SearchParamType::Special => vec![],
+            SearchParamType::Composite | SearchParamType::Special => vec![],
         }
     }
 }
@@ -647,6 +646,15 @@ impl ElasticsearchBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn missing_is_not_advertised_for_composite_or_special_parameters() {
+        assert!(ElasticsearchBackend::modifiers_for_type(SearchParamType::Composite).is_empty());
+        assert!(ElasticsearchBackend::modifiers_for_type(SearchParamType::Special).is_empty());
+        assert!(
+            ElasticsearchBackend::modifiers_for_type(SearchParamType::String).contains(&"missing")
+        );
+    }
 
     #[test]
     fn test_config_defaults() {
