@@ -274,22 +274,185 @@ test.describe("query builder", () => {
     expect(opts).not.toContain(":in");
   });
 
-  test("the MODIFY panel explains chips and clicking one applies it", async ({
-    queries,
-  }) => {
+  test("the MODIFY panel explains its chips", async ({ queries }) => {
     await queries.builder.setUrl("Patient?name=ann");
     const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
     await row.locator("[data-toggle-mods]").click();
     const panel = row.locator(".builder-row__modpanel");
     await expect(panel).toBeVisible();
     const chip = panel.locator("[data-mod-chip=contains]");
     await expect(chip).toContainText(":contains");
     await expect(chip).toContainText("anywhere");
-
-    await chip.click();
-    await expect(row.locator(".builder-row__modifier")).toHaveValue("contains");
-    await expect(queries.builder.url).toHaveValue("GET /Patient?name:contains=ann");
   });
+
+  const modifierLayoutScenarios = [
+    {
+      name: "desktop string with two OR values in Spanish",
+      width: 1280,
+      lang: "es",
+      query: "Patient?name=ann,anne",
+      modType: "string",
+      requiredChip: "contains",
+      interaction: {
+        chip: "contains",
+        url: "GET /Patient?name:contains=ann,anne",
+      },
+    },
+    {
+      name: "token just above the responsive breakpoint in German",
+      width: 901,
+      lang: "de",
+      query: "Patient?gender=male",
+      modType: "token",
+      requiredChip: "of-type",
+    },
+    {
+      name: "unknown parameter at a narrow width in English",
+      width: 760,
+      lang: "en",
+      query: "Patient?custom-param=value",
+      requiredChip: "above",
+      wraps: true,
+    },
+  ];
+
+  for (const scenario of modifierLayoutScenarios) {
+    test(`the MODIFY panel preserves layout for ${scenario.name}`, async ({
+      page,
+      queries,
+    }) => {
+      await page.setViewportSize({ width: scenario.width, height: 900 });
+      await page.goto(`/ui/queries?lang=${scenario.lang}`, { waitUntil: "networkidle" });
+      await expect(page.locator("html")).toHaveAttribute("lang", scenario.lang);
+      await queries.builder.setUrl(scenario.query);
+
+      const row = queries.builder.conditionRows.first();
+      if ("modType" in scenario) {
+        await expect(row).toHaveAttribute("data-mod-type", scenario.modType);
+      }
+
+      const primaryControls = row.locator(
+        ".builder-row__key, .builder-row__modifier, .builder-row__values, " +
+          ".builder-row__or, .builder-row__adv, [data-remove-row]",
+      );
+      const primaryBounds = () =>
+        primaryControls.evaluateAll((elements) => {
+          const rowRect = elements[0].closest(".builder-row")!.getBoundingClientRect();
+          return elements.map((element) => {
+            const rect = element.getBoundingClientRect();
+            return [
+              rect.x - rowRect.x,
+              rect.y - rowRect.y,
+              rect.width,
+              rect.height,
+            ].map(Math.round);
+          });
+        });
+
+      const before = await primaryBounds();
+      const toggle = row.locator("[data-toggle-mods]");
+      await toggle.click();
+      const panel = row.locator(".builder-row__modpanel");
+      await expect(panel).toBeVisible();
+      await expect(panel.locator(`[data-mod-chip='${scenario.requiredChip}']`)).toBeVisible();
+
+      expect(await primaryBounds()).toEqual(before);
+      const geometry = await row.evaluate((element) => {
+        const rowRect = element.getBoundingClientRect();
+        const relativeBox = (node: Element, parentRect = rowRect) => {
+          const rect = node.getBoundingClientRect();
+          return {
+            x: rect.x - parentRect.x,
+            y: rect.y - parentRect.y,
+            width: rect.width,
+            height: rect.height,
+          };
+        };
+        const panel = element.querySelector(".builder-row__modpanel")!;
+        const panelBox = relativeBox(panel);
+        const panelClientRect = panel.getBoundingClientRect();
+        const visibleLeaves = Array.from(
+          element.querySelectorAll(
+            ".builder-row__key, .builder-row__modifier, .builder-row__value, " +
+              ".builder-row__remove--or, .builder-row__or, .builder-row__adv, [data-remove-row]",
+          ),
+        ).filter((leaf) => {
+          const style = getComputedStyle(leaf);
+          return style.display !== "none" && style.visibility !== "hidden";
+        });
+        const leafBoxes = visibleLeaves.map((leaf) => relativeBox(leaf));
+        const chips = Array.from(panel.querySelectorAll(".builder-row__modchip")).map((chip) =>
+          relativeBox(chip, panelClientRect),
+        );
+        const overlaps = (
+          first: ReturnType<typeof relativeBox>,
+          second: ReturnType<typeof relativeBox>,
+        ) =>
+          first.x < second.x + second.width - 1 &&
+          first.x + first.width > second.x + 1 &&
+          first.y < second.y + second.height - 1 &&
+          first.y + first.height > second.y + 1;
+        const pairwiseClear = (boxes: ReturnType<typeof relativeBox>[]) =>
+          boxes.every((box, index) => boxes.slice(index + 1).every((other) => !overlaps(box, other)));
+        const within = (box: ReturnType<typeof relativeBox>, width: number, height: number) =>
+          box.x >= -1 &&
+          box.y >= -1 &&
+          box.x + box.width <= width + 1 &&
+          box.y + box.height <= height + 1;
+        const valueWidths = Array.from(element.querySelectorAll(".builder-row__value")).map(
+          (value) => value.getBoundingClientRect().width,
+        );
+        return {
+          panelBelowControls:
+            panelBox.y >= Math.max(...leafBoxes.map((box) => box.y + box.height)) - 1,
+          panelFullWidth:
+            Math.abs(panelBox.x) <= 1 && Math.abs(panelBox.width - rowRect.width) <= 1,
+          noOverflow:
+            element.scrollWidth <= element.clientWidth + 1 &&
+            panel.scrollWidth <= panel.clientWidth + 1,
+          controlsDoNotOverlap: pairwiseClear(leafBoxes),
+          chipsDoNotOverlap: pairwiseClear(chips),
+          controlsContained: leafBoxes.every((box) =>
+            within(box, rowRect.width, rowRect.height),
+          ),
+          panelContained: within(panelBox, rowRect.width, rowRect.height),
+          chipsContained: chips.every((box) =>
+            within(box, panelClientRect.width, panelClientRect.height),
+          ),
+          minimumValueWidth: Math.min(...valueWidths),
+          chipsWrap: chips.some((chip) => chip.y >= chips[0].y + chips[0].height - 1),
+        };
+      });
+
+      expect(geometry).toMatchObject({
+        panelBelowControls: true,
+        panelFullWidth: true,
+        noOverflow: true,
+        controlsDoNotOverlap: true,
+        chipsDoNotOverlap: true,
+        controlsContained: true,
+        panelContained: true,
+        chipsContained: true,
+      });
+      expect(geometry.minimumValueWidth).toBeGreaterThan(120);
+      if ("wraps" in scenario) expect(geometry.chipsWrap).toBe(true);
+
+      if ("interaction" in scenario) {
+        const chip = panel.locator(`[data-mod-chip='${scenario.interaction.chip}']`);
+        await chip.click();
+        await expect(chip).toHaveAttribute("aria-pressed", "true");
+        await expect(row.locator(".builder-row__modifier")).toHaveValue(
+          scenario.interaction.chip,
+        );
+        await expect(queries.builder.url).toHaveValue(scenario.interaction.url);
+      }
+
+      await toggle.click();
+      await expect(panel).toBeHidden();
+      expect(await primaryBounds()).toEqual(before);
+    });
+  }
 
   /* ---- results sort + typed columns (#416) ---------------------------- */
 
