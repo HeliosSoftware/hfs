@@ -9,8 +9,25 @@
 -- confidently wrong answers: it ranked the covering-index variant LAST when in CI
 -- it is the only one that removes the I/O. Measure where the I/O is real.
 --
--- Read `Buffers: shared read=` as the primary metric, not Execution Time —
--- it is immune to cache state and to runner noise.
+-- HOW TO READ THIS FILE — the metric is TOTAL BUFFERS TOUCHED (hit + read),
+-- not `read=` alone and not Execution Time.
+--
+-- `read=` is NOT immune to cache state, and treating it as such is how run
+-- 32740257894's capture was misread: the token lever appeared to be a 5x win
+-- (375ms -> 76ms, read=13099 -> read=97) when the two plans were byte-identical,
+-- same index, same node counts. All that changed was that the second run found
+-- the pages already in shared buffers. `hit + read` barely moved, and `hit+read`
+-- is what actually tracks the work done.
+--
+-- Because every variant below runs sequentially against the same database and
+-- warms the cache for the next one, a lever can only be believed when at least
+-- one of these is true:
+--   1. the PLAN CHANGED — a different index or node type appears; or
+--   2. total buffers touched (hit + read) dropped materially; or
+--   3. the paired RE-BASELINE control below (same lever dropped, re-measured
+--      warm) is still slower than the lever.
+-- A time drop with an unchanged plan and unchanged hit+read is cache warming.
+-- Report it as such.
 
 \pset pager off
 \timing on
@@ -265,5 +282,52 @@ WHERE tenant_id = 'default' AND resource_type = 'Encounter' AND is_deleted = FAL
                 AND param_name = 'date' AND value_date >= '2010-01-01'))
 ORDER BY last_updated DESC, id ASC LIMIT 21;
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- RE-BASELINE CONTROLS. K/M measured the baseline COLD; O/Q measured the lever
+-- with those same pages already in shared buffers, so the pair cannot separate
+-- "the index helped" from "the cache was warm". Dropping the lever and
+-- re-measuring the identical baseline query — now warm — gives the honest
+-- comparison: R vs O and S vs Q. If R ≈ O (or S ≈ Q) the lever did nothing and
+-- the apparent win was cache warming.
+-- ─────────────────────────────────────────────────────────────────────────────
 DROP INDEX IF EXISTS tmp_search_token_code_cover;
 DROP INDEX IF EXISTS tmp_search_date_cover;
+
+\echo ''
+\echo '######## R. TOKEN Observation?code=8302-2 — BASELINE RE-RUN, WARM (control for O) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                AND param_name = 'code' AND (value_token_code = '8302-2')))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## S. DATE Encounter?date=gt2010-01-01 — BASELINE RE-RUN, WARM (control for Q) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Encounter' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+                AND param_name = 'date' AND value_date >= '2010-01-01'))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+-- The composite covering index (section A-E) gets the same treatment: E measured
+-- it warm against A's cold baseline. T re-measures the shipped query with the
+-- covering index gone.
+DROP INDEX IF EXISTS tmp_composite_cover;
+
+\echo ''
+\echo '######## T. COMPOSITE code-value-quantity — SHIPPED RE-RUN, WARM (control for D) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                AND param_name = 'code-value-quantity'
+                AND ((value_token_code = '8867-4') OR (value_quantity_value > 100))
+              GROUP BY resource_id, composite_group
+              HAVING MAX(CASE WHEN value_token_code = '8867-4' THEN 1 ELSE 0 END) = 1
+                 AND MAX(CASE WHEN value_quantity_value > 100 THEN 1 ELSE 0 END) = 1))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
