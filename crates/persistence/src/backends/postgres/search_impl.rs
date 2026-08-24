@@ -17,7 +17,7 @@ use crate::core::{
     ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
     RevincludeProvider, SearchProvider, SearchResult, TextSearchProvider,
 };
-use crate::error::{BackendError, QueryErrorExt, StorageError, StorageResult};
+use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
     CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo, Pagination,
@@ -36,6 +36,21 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
+    if query.contained != crate::types::ContainedMode::Off
+        && query
+            .parameters
+            .iter()
+            .any(|param| matches!(param.modifier, Some(crate::types::SearchModifier::Missing)))
+    {
+        return Err(StorageError::Search(SearchError::QueryParseError {
+            message: "PostgreSQL does not support :missing with _contained=true or both"
+                .to_string(),
+        }));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SearchProvider for PostgresBackend {
     async fn search(
@@ -43,6 +58,8 @@ impl SearchProvider for PostgresBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        reject_contained_missing(query)?;
+
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
         if query.contained != crate::types::ContainedMode::Off {
@@ -286,6 +303,8 @@ impl SearchProvider for PostgresBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        reject_contained_missing(query)?;
+
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;

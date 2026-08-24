@@ -958,8 +958,7 @@ impl PostgresBackend {
             SearchParamType::Number => vec!["missing"],
             SearchParamType::Quantity => vec!["missing"],
             SearchParamType::Uri => vec!["contains", "below", "above", "missing"],
-            SearchParamType::Composite => vec!["missing"],
-            SearchParamType::Special => vec![],
+            SearchParamType::Composite | SearchParamType::Special => vec![],
         }
     }
 }
@@ -967,6 +966,13 @@ impl PostgresBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_is_not_advertised_for_composite_or_special_parameters() {
+        assert!(PostgresBackend::modifiers_for_type(SearchParamType::Composite).is_empty());
+        assert!(PostgresBackend::modifiers_for_type(SearchParamType::Special).is_empty());
+        assert!(PostgresBackend::modifiers_for_type(SearchParamType::String).contains(&"missing"));
+    }
 
     // ── config builders (#355) ────────────────────────────────
 
