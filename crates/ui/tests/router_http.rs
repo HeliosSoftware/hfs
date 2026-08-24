@@ -750,6 +750,11 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     // The edit modal shell, with its Edit / History tabs.
     assert!(html.contains(r#"id="resource-modal""#));
     assert!(html.contains(r#"data-modal-tab="history""#));
+    // The rail unions the compartment enumeration with the generated Resource
+    // enum (#648): HFS-served types the spec's compartments never mention —
+    // ViewDefinition — are reachable, and the spec set is still there.
+    assert!(html.contains(r#"data-rail-type="ViewDefinition""#));
+    assert!(html.contains(r#"data-rail-type="EffectEvidenceSynthesis""#));
     // The nav carries a flat Resources entry, marked current on this page
     // (matching Brett's flat sidebar — the type picker is the page's own rail).
     assert!(html.contains(r#"href="/ui/resources" aria-current="page""#));
