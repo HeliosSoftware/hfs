@@ -157,12 +157,12 @@ impl ResourceStorage for PostgresBackend {
         self.index_resource(&client, tenant_id, resource_type, &id, &resource)
             .await?;
 
-        // An *active* SearchParameter write changes a tenant's overlay: reload
-        // the stored cache and drop the per-tenant registries so they rebuild.
-        // Draft copies (the seeded spec set) never overlay, so skip them and
-        // avoid an O(n²) reload storm during bulk seeding.
+        // An overlay-affecting SearchParameter write: reload the stored cache
+        // and drop the per-tenant registries so they rebuild. Seeded spec
+        // copies never affect the overlay (see `create_affects_overlay`),
+        // which keeps bulk seeding from triggering an O(n²) reload storm.
         if resource_type == "SearchParameter"
-            && crate::search::search_parameter_create_affects_overlay(&resource)
+            && self.tenant_registries().create_affects_overlay(&resource)
         {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");

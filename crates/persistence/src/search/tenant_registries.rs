@@ -34,16 +34,6 @@ use crate::search::{SearchParameterDefinition, SearchParameterRegistry};
 /// no store, e.g. S3).
 pub type StoredParamLoader = Arc<dyn Fn(&str) -> Vec<SearchParameterDefinition> + Send + Sync>;
 
-/// Whether creating this `SearchParameter` resource can change a tenant's
-/// overlay. Only `status: active` params are registered into per-tenant
-/// registries, so a create of any other status (notably the `draft` spec copies
-/// seeded into every tenant) need not invalidate the cache — which keeps bulk
-/// seeding from triggering an O(n²) rebuild storm. Update/delete are rare and
-/// invalidate unconditionally.
-pub fn search_parameter_create_affects_overlay(resource: &serde_json::Value) -> bool {
-    resource.get("status").and_then(|s| s.as_str()) == Some("active")
-}
-
 /// A shared base registry plus lazily-built, cached per-tenant registries.
 ///
 /// Backends hold `Arc<TenantSearchRegistries>` in place of the former single
@@ -104,6 +94,26 @@ impl TenantSearchRegistries {
             .write()
             .insert(tenant_id.to_string(), arc.clone());
         arc
+    }
+
+    /// Whether creating this `SearchParameter` resource can change a tenant's
+    /// overlay. Only `status: active` params are registered into per-tenant
+    /// registries, so a create of any other status need not invalidate the
+    /// cache. Neither can an active param whose canonical `url` is already
+    /// registered in the shared base: the overlay rebuild ignores duplicate
+    /// URLs, so registering it is a no-op. That second check is what keeps
+    /// spec seeding from triggering an O(n²) rebuild storm — every seeded copy
+    /// is in the base by construction, and R6's bundle ships them as `active`
+    /// (R4's are all `draft`), so the status check alone does not cover it
+    /// (#667). Update/delete are rare and invalidate unconditionally.
+    pub fn create_affects_overlay(&self, resource: &serde_json::Value) -> bool {
+        if resource.get("status").and_then(|s| s.as_str()) != Some("active") {
+            return false;
+        }
+        match resource.get("url").and_then(|u| u.as_str()) {
+            Some(url) => self.base.read().get_by_url(url).is_none(),
+            None => true,
+        }
     }
 
     /// Drops a tenant's cached registry so the next access rebuilds it from
@@ -207,6 +217,42 @@ mod tests {
                 .get_param("Patient", "name")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn create_affects_overlay_requires_active_status_and_a_url_new_to_the_base() {
+        let regs = registries_with(HashMap::new());
+        let param = |status: &str, url: &str| {
+            serde_json::json!({
+                "resourceType": "SearchParameter",
+                "status": status,
+                "url": url,
+                "code": "name",
+                "base": ["Patient"],
+            })
+        };
+
+        // The R4 spec-bundle shape: seeded copies are draft.
+        assert!(!regs.create_affects_overlay(&param(
+            "draft",
+            "http://acme.health/fhir/SearchParameter/patient-nickname"
+        )));
+        // The R6 spec-bundle shape (#667): seeded copies are active, but their
+        // canonical URL is already registered in the base.
+        assert!(!regs.create_affects_overlay(&param(
+            "active",
+            "http://hl7.org/fhir/SearchParameter/Patient-name"
+        )));
+        // A user-POSTed active param with a new URL changes the overlay.
+        assert!(regs.create_affects_overlay(&param(
+            "active",
+            "http://acme.health/fhir/SearchParameter/patient-nickname"
+        )));
+        // No URL at all: invalidate rather than guess.
+        assert!(regs.create_affects_overlay(&serde_json::json!({
+            "resourceType": "SearchParameter",
+            "status": "active",
+        })));
     }
 
     #[test]
