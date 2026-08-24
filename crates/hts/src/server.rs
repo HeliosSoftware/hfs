@@ -28,6 +28,7 @@ use crate::operations::batch_validate::vs_batch_validate_handler;
 use axum::extract::DefaultBodyLimit;
 use axum::{
     Router,
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use std::time::Duration;
@@ -64,6 +65,18 @@ use crate::operations::validate_code::{
 };
 use crate::state::AppState;
 use crate::traits::TerminologyBackend;
+
+/// Redirects the bare root URL to the HTS UI home (`/ui/hts`).
+///
+/// Mounted by [`create_app`] only when `config.ui_enabled` is true, so a UI-off
+/// deployment keeps axum's default 405 on `GET /` instead of pointing operators
+/// at a 404. Returns a 308 (permanent) mirroring the trailing-slash
+/// canonicalization pattern in `helios-hts-ui`'s `home.rs`; the sibling
+/// `POST /` FHIR batch route on the same path is unaffected because axum merges
+/// compatible method routers per path.
+async fn root_redirect() -> Response {
+    Redirect::permanent("/ui/hts").into_response()
+}
 
 /// Build the Axum application router with all middleware and routes.
 ///
@@ -239,8 +252,21 @@ where
     // Merge the optional UI router before wrapping the whole app in the
     // observability / cors / timeout / trace layers so the UI benefits from
     // the same shared middleware stack (metrics + trace spans).
+    //
+    // `GET /` -> 308 `/ui/hts`: reviewer-requested landing so browsers hitting
+    // the bare root URL end up on the HTS UI home instead of seeing axum's
+    // "405 Method Not Allowed" for the POST-only FHIR batch endpoint.
+    // Registered inside the `ui_enabled` branch so a UI-off deployment keeps
+    // the current 405 behavior (redirecting to `/ui/hts` when that route is
+    // not mounted would send operators to a 404). `Redirect::permanent`
+    // (308) is the idiomatic choice mirrored from `hts-ui/src/home.rs`
+    // trailing-slash canonicalization; the existing `POST /` batch handler
+    // is unaffected because axum's `Router::route` merges compatible method
+    // routers on the same path.
     let router = if let Some(ui) = hts_ui {
-        router.nest("/ui", ui)
+        router
+            .route("/", get(root_redirect))
+            .nest("/ui", ui)
     } else {
         router
     };

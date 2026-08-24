@@ -79,4 +79,23 @@ test.describe("HTS home (Phase 2 Slice A)", () => {
     const cookies = await page.context().cookies();
     expect(cookies.find((c) => c.name === "hts_lang")?.value).toBe("es");
   });
+
+  test("naked `/` redirects to `/ui/hts` home page", async ({ page }) => {
+    // Reviewer contract: the bare root URL sends operators to the HTS UI
+    // home so they never see the FHIR batch POST-only landing (bare `/`
+    // would otherwise 405 on GET). The redirect lives in
+    // `crates/hts/src/server.rs::create_app` inside the `ui_enabled`
+    // branch, gated so a UI-off deployment keeps its 405 instead of
+    // landing on a 404 at `/ui/hts`. Playwright follows the 308
+    // transparently, so the assertion is: final URL under `/ui/hts` and
+    // the Home heading rendered. Mirrors the redirect-follows pattern
+    // used by the CS/VS/CM detail landing tests. The E2E fixture sets
+    // `HTS_UI_ENABLED=true` in boot.mjs so this route is registered.
+    const response = await page.goto("/");
+    expect(response?.status(), "root should land at 200 after the 308").toBe(200);
+    expect(page.url()).toContain("/ui/hts");
+    await expect(
+      page.getByRole("heading", { name: "Home", exact: true }),
+    ).toBeVisible();
+  });
 });
