@@ -12,6 +12,11 @@ export class DashboardPage {
   get statCards(): Locator {
     return this.page.locator(".card.stat");
   }
+  /** The "Resource types" card; its `.stat__sub` names the effective FHIR
+   * version ("used for R4", #553). */
+  get resourceTypesCard(): Locator {
+    return this.page.locator(".card.stat", { hasText: "Resource types" });
+  }
   get exportJobsCard(): Locator {
     return this.page.locator("a.card.stat", { hasText: "Export jobs" });
   }
