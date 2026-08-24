@@ -1285,6 +1285,9 @@
   function plainValue(part) {
     var raw = part.value || "";
     var mod = part.modifier || "";
+    if (mod === "missing" && (raw === "true" || raw === "false")) {
+      return { verb: PLAIN.missing[raw], value: "", showValue: false };
+    }
     var alternatives = raw.split(",").filter(Boolean).map(function (v) {
       var p = PREFIX_RE.exec(v);
       return p ? v.slice(2) : v;
@@ -1297,7 +1300,13 @@
         return "\u201C" + v + "\u201D";
       })
       .join(" " + PLAIN.or + " ");
-    return { verb: verb, value: joined };
+    return { verb: verb, value: joined, showValue: joined !== "" };
+  }
+
+  function renderPlainClause(withValue, withoutValue, args, plain) {
+    args.verb = plain.verb;
+    if (plain.showValue) args.value = plain.value;
+    return tpl(plain.showValue ? withValue : withoutValue, args);
   }
 
   function updatePlain() {
@@ -1318,13 +1327,20 @@
           .concat([part.key])
           .join(PLAIN.arrow + " ");
         var cv = plainValue(part);
-        clauses.push(tpl(PLAIN.clause, { path: path, verb: cv.verb, value: cv.value }));
+        clauses.push(
+          renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: path }, cv),
+        );
         return;
       }
       if (part.kind === "has") {
         var hv = plainValue(part);
         clauses.push(
-          tpl(PLAIN.has, { type: part.hasType, param: part.key, verb: hv.verb, value: hv.value }),
+          renderPlainClause(
+            PLAIN.has,
+            PLAIN.hasNoValue,
+            { type: part.hasType, param: part.key },
+            hv,
+          ),
         );
         return;
       }
@@ -1356,7 +1372,9 @@
       }
       if (CONTROL_KEYS.indexOf(part.key) >= 0 || !part.key) return;
       var v = plainValue(part);
-      clauses.push(tpl(PLAIN.clause, { path: part.key, verb: v.verb, value: v.value }));
+      clauses.push(
+        renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: part.key }, v),
+      );
     });
 
     var sentence = tpl(PLAIN.find, { type: parsed.type });
