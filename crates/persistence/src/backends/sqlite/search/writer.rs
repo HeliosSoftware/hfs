@@ -325,6 +325,7 @@ mod tests {
             param_type: SearchParamType::String,
             value: IndexValue::String("Smith".to_string()),
             composite_group: None,
+            composite_slot: None,
         };
 
         let params =
@@ -349,6 +350,7 @@ mod tests {
                 identifier_type_code: None,
             },
             composite_group: None,
+            composite_slot: None,
         };
 
         let params =
@@ -373,6 +375,7 @@ mod tests {
                 identifier_type_code: None,
             },
             composite_group: None,
+            composite_slot: None,
         };
 
         let params =
@@ -398,6 +401,7 @@ mod tests {
                 identifier_type_code: Some("MR".to_string()),
             },
             composite_group: None,
+            composite_slot: None,
         };
 
         let params =
@@ -423,6 +427,7 @@ mod tests {
                 precision: DatePrecision::Day,
             },
             composite_group: None,
+            composite_slot: None,
         };
 
         let params =
@@ -444,6 +449,7 @@ mod tests {
                 code: Some("mg".to_string()),
             },
             composite_group: None,
+            composite_slot: None,
         };
 
         let params =

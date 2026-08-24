@@ -368,7 +368,10 @@ impl PostgresQueryBuilder {
                     | SearchParamType::Number
                     | SearchParamType::Quantity
                     | SearchParamType::Date => {
-                        Self::build_composite_component(value, param.param_type, offset)
+                        // Not a composite: this reuses the component predicate
+                        // builder for an ordinary single-valued parameter, which
+                        // always lives in slot 1.
+                        Self::build_composite_component(value, param.param_type, offset, 1)
                     }
                     SearchParamType::Reference => Some((
                         format!("value_reference = ${}", offset + 1),
@@ -942,6 +945,24 @@ impl PostgresQueryBuilder {
         let mut all_params: Vec<SqlParam> = Vec::new();
         let mut current = offset;
 
+        // Slot each component within its column family, in the parameter's own
+        // component order — the identical rule the extractor uses when it writes
+        // the denormalized row (`ExtractedValue::composite_slot`). Both sides
+        // derive it from the same registry ordering, so no mapping is stored.
+        let component_slots: Vec<u8> = {
+            let mut seen: std::collections::HashMap<SearchParamType, u8> =
+                std::collections::HashMap::new();
+            param
+                .components
+                .iter()
+                .map(|c| {
+                    let slot = seen.entry(c.param_type).or_insert(0);
+                    *slot += 1;
+                    *slot
+                })
+                .collect()
+        };
+
         for value in &param.values {
             let parts: Vec<&str> = value.value.split('$').collect();
             if parts.len() != param.components.len() {
@@ -960,9 +981,13 @@ impl PostgresQueryBuilder {
             let mut next = current;
             let mut ok = true;
 
-            for (part, component) in parts.iter().zip(param.components.iter()) {
+            for ((part, component), slot) in parts
+                .iter()
+                .zip(param.components.iter())
+                .zip(component_slots.iter())
+            {
                 let cv = Self::parse_component_value(part);
-                match Self::build_composite_component(&cv, component.param_type, next) {
+                match Self::build_composite_component(&cv, component.param_type, next, *slot) {
                     Some((sql, params)) => {
                         next += params.len();
                         staged_params.extend(params);
@@ -1037,27 +1062,28 @@ impl PostgresQueryBuilder {
             // composite group with every component's value column populated, so a
             // single index answers "code = X AND value > Y within one group" directly.
             // Tracked separately — it needs a writer change, a migration and a backfill.
-            let havings = predicates
-                .iter()
-                .map(|p| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", p))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            // Parenthesize each component before OR-ing: a token component emits
-            // `sys = $n AND code = $m`, and while SQL's AND-before-OR precedence
-            // happens to group that correctly, relying on it is a trap for the next
-            // component type someone adds.
-            let prefilter = predicates
+            // With the denormalized layout every component of one composite
+            // instance lives in a single row, so "code = X AND value > Y within
+            // the same group" is a plain conjunction — no prefilter, no
+            // GROUP BY, no HAVING. The covering index
+            // `idx_search_composite_flat` answers it directly and the LIMIT can
+            // stop early, which is what removes the ~110k-row / ~108k-heap-block
+            // scan the grouped form performed to return 21 rows.
+            //
+            // Parenthesize each component: a token component emits
+            // `sys = $n AND code = $m`, and relying on AND-before-OR precedence
+            // is a trap for the next component type someone adds.
+            let conjunction = predicates
                 .iter()
                 .map(|p| format!("({})", p))
                 .collect::<Vec<_>>()
-                .join(" OR ");
+                .join(" AND ");
 
             value_conditions.push(format!(
                 "id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' \
-                 AND ({}) \
-                 GROUP BY resource_id, composite_group HAVING {})",
-                param.name, prefilter, havings
+                 AND composite_group IS NOT NULL AND {})",
+                param.name, conjunction
             ));
         }
 
@@ -1097,6 +1123,21 @@ impl PostgresQueryBuilder {
         }
     }
 
+    /// The column a composite component's value lives in, for a given slot.
+    ///
+    /// Slot 1 is the ordinary value column. Slot 2 is the `_2` variant, used
+    /// when a composite has two components of the same type (24 of the 46 R4
+    /// composites do — see `ExtractedValue::composite_slot`). The writer
+    /// assigns slots from the same registry component order, so both sides
+    /// agree without storing a mapping.
+    fn composite_col(base: &str, slot: u8) -> String {
+        if slot >= 2 {
+            format!("{base}_{slot}")
+        } else {
+            base.to_string()
+        }
+    }
+
     /// Builds a single composite component as a bare column predicate (no
     /// `id IN (...)` wrapper — the caller scopes it to the composite row).
     /// Returns `None` if the value cannot be parsed for the component type.
@@ -1104,24 +1145,28 @@ impl PostgresQueryBuilder {
         value: &SearchValue,
         param_type: SearchParamType,
         offset: usize,
+        slot: u8,
     ) -> Option<(String, Vec<SqlParam>)> {
+        let token_code = Self::composite_col("value_token_code", slot);
+        let token_system = Self::composite_col("value_token_system", slot);
+        let number = Self::composite_col("value_number", slot);
         match param_type {
             SearchParamType::Token => {
                 if let Some((system, code)) = value.value.split_once('|') {
                     if system.is_empty() {
                         Some((
-                            format!("value_token_code = ${}", offset + 1),
+                            format!("{token_code} = ${}", offset + 1),
                             vec![SqlParam::text(code)],
                         ))
                     } else if code.is_empty() {
                         Some((
-                            format!("value_token_system = ${}", offset + 1),
+                            format!("{token_system} = ${}", offset + 1),
                             vec![SqlParam::text(system)],
                         ))
                     } else {
                         Some((
                             format!(
-                                "value_token_system = ${} AND value_token_code = ${}",
+                                "{token_system} = ${} AND {token_code} = ${}",
                                 offset + 1,
                                 offset + 2
                             ),
@@ -1130,7 +1175,7 @@ impl PostgresQueryBuilder {
                     }
                 } else {
                     Some((
-                        format!("value_token_code = ${}", offset + 1),
+                        format!("{token_code} = ${}", offset + 1),
                         vec![SqlParam::text(&value.value)],
                     ))
                 }
@@ -1143,7 +1188,7 @@ impl PostgresQueryBuilder {
                 let num = value.value.parse::<f64>().ok()?;
                 let op = Self::prefix_to_operator(&value.prefix);
                 Some((
-                    format!("value_number {} ${}", op, offset + 1),
+                    format!("{} {} ${}", number, op, offset + 1),
                     vec![SqlParam::Float(num)],
                 ))
             }
@@ -1952,10 +1997,23 @@ mod tests {
     }
 
     #[test]
-    fn composite_prefilters_but_keeps_group_semantics() {
-        // The WHERE gains an OR-prefilter so the subquery stops reading every
-        // composite row for the parameter, but the GROUP BY / HAVING must survive
-        // intact — it is what forces both components into the SAME composite_group.
+    fn composite_confines_components_to_one_group() {
+        // The invariant under test is unchanged from the grouped form: a
+        // resource may only match when BOTH components are satisfied within the
+        // SAME composite instance — a blood-pressure panel's systolic value must
+        // never pair with its diastolic code.
+        //
+        // What changed is how that is enforced. The old form read one row per
+        // component and used GROUP BY resource_id, composite_group + HAVING
+        // MAX(CASE …) to require both within a group. The denormalized layout
+        // (#279) stores one row per (resource, composite_group) carrying every
+        // component's value, so a plain conjunction over ONE row enforces the
+        // same thing by construction — components cannot come from different
+        // groups because they cannot come from different rows.
+        //
+        // So this asserts the new mechanism, and deliberately asserts the
+        // absence of the old one: if GROUP BY reappears here alongside the flat
+        // predicate, the two layouts have been mixed and the result is wrong.
         let param = SearchParameter {
             name: "combo-code-value-quantity".to_string(),
             param_type: SearchParamType::Composite,
@@ -1980,22 +2038,28 @@ mod tests {
         let frag =
             PostgresQueryBuilder::build_search_query(&query, 2).expect("composite condition");
 
+        // One row per composite instance: the predicate is scoped to composite
+        // rows and every component is ANDed within that single row.
         assert!(
+            frag.sql.contains("composite_group IS NOT NULL"),
+            "the subquery must be confined to composite rows: {}",
             frag.sql
-                .contains("GROUP BY resource_id, composite_group HAVING"),
-            "composite_group grouping must be preserved — without it, components \
-             match across different composite groups: {}",
+        );
+        assert!(
+            frag.sql.contains(") AND (value_quantity_value"),
+            "components must be ANDed within one row, not OR-prefiltered: {}",
+            frag.sql
+        );
+        // The old aggregate form must be gone — mixing the two layouts would
+        // aggregate over already-denormalized rows and match across groups.
+        assert!(
+            !frag.sql.contains("GROUP BY resource_id, composite_group"),
+            "the denormalized layout must not re-aggregate: {}",
             frag.sql
         );
         assert!(
-            frag.sql.contains("MAX(CASE WHEN"),
-            "per-component HAVING must be preserved: {}",
-            frag.sql
-        );
-        // The prefilter: components OR'd inside the WHERE.
-        assert!(
-            frag.sql.contains(") OR (value_quantity_value"),
-            "expected an OR-prefilter over the components in the WHERE clause: {}",
+            !frag.sql.contains("MAX(CASE WHEN"),
+            "the denormalized layout must not use the HAVING form: {}",
             frag.sql
         );
     }

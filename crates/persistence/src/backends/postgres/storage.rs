@@ -1039,18 +1039,14 @@ impl PostgresBackend {
             .extract(resource, resource_type)
         {
             Ok(values) => {
-                let mut count = 0;
-                for value in values {
-                    PostgresSearchIndexWriter::write_entry(
-                        client,
-                        tenant_id,
-                        resource_type,
-                        resource_id,
-                        &value,
-                    )
-                    .await?;
-                    count += 1;
-                }
+                let count = PostgresSearchIndexWriter::write_values(
+                    client,
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    values,
+                )
+                .await?;
                 tracing::debug!(
                     "Dynamically indexed {} values for {}/{}",
                     count,
@@ -3151,18 +3147,14 @@ impl ReindexTarget for PostgresBackend {
             .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
-        let mut count = 0;
-        for value in values {
-            PostgresSearchIndexWriter::write_entry(
-                &client,
-                tenant_id,
-                resource_type,
-                resource_id,
-                &value,
-            )
-            .await?;
-            count += 1;
-        }
+        let mut count = PostgresSearchIndexWriter::write_values(
+            &client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            values,
+        )
+        .await?;
 
         // Re-index contained resources too, so `$reindex` rebuilds `_contained`
         // search entries.

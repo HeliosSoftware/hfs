@@ -37,6 +37,84 @@ fn parse_index_date(value: &str) -> Option<DateTime<Utc>> {
 pub struct PostgresSearchIndexWriter;
 
 impl PostgresSearchIndexWriter {
+    /// Writes every extracted value for one resource.
+    ///
+    /// Non-composite values keep one row each. Composite values are folded into
+    /// the denormalized one-row-per-instance layout (issue #279) before insert,
+    /// so a composite search is a plain conjunction over a single row instead of
+    /// a grouped aggregate over one row per component.
+    ///
+    /// Returns the number of rows written.
+    pub async fn write_values(
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        values: Vec<ExtractedValue>,
+    ) -> StorageResult<usize> {
+        let (plain, composites) = super::composite_rows::fold_composites(values);
+
+        let mut written = 0;
+        for value in &plain {
+            Self::write_entry(client, tenant_id, resource_type, resource_id, value).await?;
+            written += 1;
+        }
+        for row in &composites {
+            Self::write_composite_row(client, tenant_id, resource_type, resource_id, row).await?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Inserts one denormalized composite row.
+    async fn write_composite_row(
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        row: &super::composite_rows::CompositeRow,
+    ) -> StorageResult<()> {
+        let date = row.value_date.as_deref().and_then(parse_index_date);
+        client
+            .execute(
+                "INSERT INTO search_index (
+                    tenant_id, resource_type, resource_id, param_name, param_url,
+                    composite_group,
+                    value_token_system, value_token_code,
+                    value_token_system_2, value_token_code_2,
+                    value_string, value_date,
+                    value_number, value_number_2,
+                    value_quantity_value, value_quantity_unit, value_quantity_system,
+                    value_reference, value_uri
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                          $15, $16, $17, $18, $19)",
+                &[
+                    &tenant_id,
+                    &resource_type,
+                    &resource_id,
+                    &row.param_name.as_str(),
+                    &row.param_url.as_str(),
+                    &row.composite_group,
+                    &row.value_token_system,
+                    &row.value_token_code,
+                    &row.value_token_system_2,
+                    &row.value_token_code_2,
+                    &row.value_string,
+                    &date,
+                    &row.value_number,
+                    &row.value_number_2,
+                    &row.value_quantity_value,
+                    &row.value_quantity_unit,
+                    &row.value_quantity_system,
+                    &row.value_reference,
+                    &row.value_uri,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to write composite index row: {}", e)))?;
+        Ok(())
+    }
+
     /// Writes a single search index entry to PostgreSQL.
     ///
     /// Accepts any type that can be dereferenced to a `tokio_postgres::Client`,

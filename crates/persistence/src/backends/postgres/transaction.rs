@@ -122,17 +122,16 @@ impl PostgresTransaction {
             .extract(resource, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
-        // Write each extracted value to the index
-        for value in values {
-            PostgresSearchIndexWriter::write_entry(
-                client,
-                tenant_id,
-                resource_type,
-                resource_id,
-                &value,
-            )
-            .await?;
-        }
+        // Write the extracted values, folding composites into the denormalized
+        // one-row-per-instance layout (#279).
+        PostgresSearchIndexWriter::write_values(
+            client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            values,
+        )
+        .await?;
 
         tracing::debug!(
             "Indexed resource {}/{} within transaction",

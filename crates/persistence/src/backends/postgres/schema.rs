@@ -158,6 +158,16 @@ async fn create_schema_v1(client: &deadpool_postgres::Client) -> StorageResult<(
                 value_identifier_type_system TEXT,
                 value_identifier_type_code TEXT,
                 value_reference_display TEXT,
+                -- Slot-2 columns for the denormalized composite layout (#279).
+                -- A composite instance is stored as ONE row carrying every
+                -- component's value; 24 of the 46 R4 composites pair two
+                -- components of the same type (almost all token+token, e.g.
+                -- Observation.code-value-concept), which would otherwise
+                -- collide. Slot 2 holds the second component of that type.
+                -- Max observed per family is 2, so one extra slot suffices.
+                value_token_system_2 TEXT,
+                value_token_code_2 TEXT,
+                value_number_2 DOUBLE PRECISION,
                 CONSTRAINT fk_search_resource FOREIGN KEY (tenant_id, resource_type, resource_id)
                     REFERENCES resources(tenant_id, resource_type, id) ON DELETE CASCADE
             )",
@@ -193,6 +203,19 @@ async fn create_indexes(client: &deadpool_postgres::Client) -> StorageResult<()>
         "CREATE INDEX IF NOT EXISTS idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference)",
         "CREATE INDEX IF NOT EXISTS idx_search_uri ON search_index(tenant_id, resource_type, param_name, value_uri)",
         "CREATE INDEX IF NOT EXISTS idx_search_composite ON search_index(tenant_id, resource_type, resource_id, param_name, composite_group)",
+        // The denormalized composite layout (#279) answers "code = X AND value > Y"
+        // from one row, so these two partial covering indexes serve the whole
+        // composite surface: 19 of the 46 R4 composites are token+quantity (all
+        // three benchmark shapes) and 20 are token+token. Both are restricted to
+        // composite rows, which is a small slice of search_index.
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_token_quantity ON search_index
+         (tenant_id, resource_type, param_name, value_token_code, value_quantity_value)
+         INCLUDE (resource_id)
+         WHERE composite_group IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_token_token ON search_index
+         (tenant_id, resource_type, param_name, value_token_code, value_token_code_2)
+         INCLUDE (resource_id)
+         WHERE composite_group IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_search_resource ON search_index(tenant_id, resource_type, resource_id)",
         "CREATE INDEX IF NOT EXISTS idx_search_token_display ON search_index(tenant_id, resource_type, param_name, value_token_display)",
         "CREATE INDEX IF NOT EXISTS idx_search_identifier_type ON search_index(tenant_id, resource_type, param_name, value_identifier_type_system, value_identifier_type_code)",

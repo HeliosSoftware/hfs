@@ -39,6 +39,21 @@ pub struct ExtractedValue {
     /// Composite group ID (for composite parameters).
     /// Values with the same group ID are part of the same composite match.
     pub composite_group: Option<u32>,
+
+    /// Which slot of its column family this composite component occupies.
+    ///
+    /// A composite's components are stored in the value columns of their own
+    /// type — `code-value-quantity` puts `code` in the token columns and
+    /// `value-quantity` in the quantity columns. 24 of the 46 R4 composites
+    /// have two components of the *same* type (almost all `token`+`token`,
+    /// e.g. `Observation.code-value-concept`), which would otherwise collide
+    /// in one row. The slot disambiguates them: 1 for the first component of
+    /// a given type in the parameter's component list, 2 for the second.
+    ///
+    /// `None` for non-composite values. Backends that keep one row per
+    /// component ignore it; the Postgres writer uses it to fold a group's
+    /// components into a single row (issue #279).
+    pub composite_slot: Option<u8>,
 }
 
 impl ExtractedValue {
@@ -55,12 +70,19 @@ impl ExtractedValue {
             param_type,
             value,
             composite_group: None,
+            composite_slot: None,
         }
     }
 
     /// Sets the composite group ID.
     pub fn with_composite_group(mut self, group: u32) -> Self {
         self.composite_group = Some(group);
+        self
+    }
+
+    /// Sets the composite component's slot within its column family.
+    pub fn with_composite_slot(mut self, slot: u8) -> Self {
+        self.composite_slot = Some(slot);
         self
     }
 }
@@ -303,13 +325,39 @@ impl SearchParameterExtractor {
                 .collect()
         };
 
+        // Slot each component within its own column family: 1 for the first
+        // component of a given type, 2 for the second. 24 of the 46 R4
+        // composites pair two components of the same type, so without this a
+        // denormalized row could not tell `code` from `value-concept`. The
+        // Postgres query builder derives the same slots from the same registry
+        // component order, so the two sides agree without storing a mapping.
+        let component_slots: Vec<u8> = {
+            let mut seen: std::collections::HashMap<SearchParamType, u8> =
+                std::collections::HashMap::new();
+            component_types
+                .iter()
+                .map(|t| match t {
+                    Some(t) => {
+                        let slot = seen.entry(*t).or_insert(0);
+                        *slot += 1;
+                        *slot
+                    }
+                    None => 1,
+                })
+                .collect()
+        };
+
         // Each base instance becomes a composite group.
         let base_nodes = self.evaluate_fhirpath(resource, &base_expr)?;
 
         let mut results = Vec::new();
         for (group_idx, node) in base_nodes.iter().enumerate() {
             let group = group_idx as u32;
-            for (component, sub_type) in components.iter().zip(component_types.iter()) {
+            for ((component, sub_type), slot) in components
+                .iter()
+                .zip(component_types.iter())
+                .zip(component_slots.iter())
+            {
                 let sub_type = match sub_type {
                     Some(t) => *t,
                     None => continue, // unknown component definition — skip
@@ -324,7 +372,8 @@ impl SearchParameterExtractor {
                     for idx_value in converted {
                         results.push(
                             ExtractedValue::new(&param.code, &param.url, sub_type, idx_value)
-                                .with_composite_group(group),
+                                .with_composite_group(group)
+                                .with_composite_slot(*slot),
                         );
                     }
                 }
