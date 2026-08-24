@@ -206,6 +206,92 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
     assert_eq!(body_text(response).await, "fhir handled");
 }
 
+/// #653: the CapabilityStatement page renders the live /metadata answer —
+/// summary, the batch/transaction distinction, linkified local operation
+/// definitions, the filterable per-resource table, and the raw fold. Without
+/// a fetchable statement it degrades to the warning, never fabricates.
+#[tokio::test]
+async fn capability_statement_page_renders_summary_and_degrades() {
+    // The default test source seeds no metadata: the degraded warning shows.
+    let response = app()
+        .oneshot(
+            Request::get("/ui/capability-statement")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("notice--warn"));
+
+    // With a seeded statement the page renders the real content.
+    let source = helios_ui::StaticConformanceSource::from_data_dir(std::path::Path::new(
+        "../../data",
+    ))
+    .with_metadata(serde_json::json!({
+        "resourceType": "CapabilityStatement",
+        "status": "active", "kind": "instance", "date": "2026-08-24",
+        "fhirVersion": "4.0.1",
+        "format": ["application/fhir+json"],
+        "implementation": {"description": "Helios FHIR Server", "url": "http://t/"},
+        "rest": [{
+            "interaction": [{"code": "batch"}, {"code": "transaction"}],
+            "operation": [{"name": "export", "definition": "http://t/OperationDefinition/export"}],
+            "resource": [
+                {"type": "Patient", "interaction": [{"code": "read"}],
+                 "searchParam": [{"name": "name"}]},
+                {"type": "Observation", "interaction": [{"code": "read"}]}
+            ]
+        }]
+    }));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/capability-statement")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("4.0.1"));
+    assert!(html.contains(">batch<"));
+    assert!(html.contains(">transaction<"));
+    // The transaction-is-conditional note renders alongside the chips.
+    assert!(html.contains("atomic transactions"));
+    // Local operation definitions are clickable, at their local path.
+    assert!(html.contains(r#"href="/OperationDefinition/export""#));
+    assert!(html.contains("$export"));
+    // Both resource rows, then the server-side filter narrows to one.
+    assert!(html.contains(">Patient<") && html.contains(">Observation<"));
+    let response = app
+        .oneshot(
+            Request::get("/ui/capability-statement?filter=obs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains(">Patient<") && html.contains(">Observation<"));
+    // The raw statement rides in the fold.
+    assert!(html.contains("CapabilityStatement"));
+}
+
 #[tokio::test]
 async fn search_parameters_page_serves_the_registry_view() {
     let response = app()

@@ -40,6 +40,7 @@
 
 mod bulk_export;
 mod bulk_import;
+mod capability;
 mod compartments;
 mod conformance;
 mod editor;
@@ -113,6 +114,9 @@ struct WebState {
     /// Lazily-fetched CompartmentDefinitions per FHIR version (#237), read from
     /// the server's own `/CompartmentDefinition` endpoint.
     compartments: Arc<compartments::CompartmentCatalog>,
+    /// The raw conformance source, for reads that are not catalog-shaped —
+    /// the live CapabilityStatement fetch (`/metadata`, #653).
+    conformance: Arc<dyn ConformanceSource>,
     /// Read/write path for the tenant-maintenance page. `None` when the host did
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
@@ -838,6 +842,8 @@ pub fn mount_with_conformance_source(
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/terminology", get(terminology_page))
         .route("/ui/compartments", get(compartments_page))
+        // Read-only live CapabilityStatement (#653).
+        .route("/ui/capability-statement", get(capability_page))
         // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
         .route("/ui/batch", get(batch_page))
         .route("/ui/subscriptions", get(subscriptions::page))
@@ -940,7 +946,8 @@ pub fn mount_with_conformance_source(
     let state = WebState {
         version: hfs_version,
         sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
-        compartments: Arc::new(compartments::CompartmentCatalog::new(source)),
+        compartments: Arc::new(compartments::CompartmentCatalog::new(source.clone())),
+        conformance: source,
         nl: Arc::new(nl),
         tenants,
         provisioning: Default::default(),
@@ -1489,6 +1496,63 @@ async fn batch_page(
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "batch",
+    })
+}
+
+/// The read-only CapabilityStatement page (#653): the live `/metadata`
+/// answer for the sidebar's tenant and FHIR version, summarized and filterable,
+/// with the raw statement one fold away.
+#[derive(Template)]
+#[template(path = "pages/capability-statement.html")]
+struct CapabilityPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// `None` when the self-fetch failed — the page degrades to a warning.
+    view: Option<capability::CapabilityView>,
+    /// Pretty-printed raw statement for the foldable block.
+    raw: String,
+    /// The server-side resource-type filter, echoed back into the form.
+    filter: String,
+}
+
+#[derive(Deserialize, Default)]
+struct CapabilityQuery {
+    filter: Option<String>,
+}
+
+async fn capability_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<CapabilityQuery>,
+) -> Response {
+    let filter = query.filter.unwrap_or_default();
+    let fetched = state.conformance.metadata(rv.0, &rt.id).await;
+    let (view, raw) = match fetched {
+        Ok(statement) => {
+            let mut view = capability::build_view(&statement);
+            if !filter.is_empty() {
+                let needle = filter.to_lowercase();
+                view.resources
+                    .retain(|r| r.resource_type.to_lowercase().contains(&needle));
+            }
+            let raw = serde_json::to_string_pretty(&statement).unwrap_or_default();
+            (Some(view), raw)
+        }
+        Err(error) => {
+            tracing::warn!("CapabilityStatement self-fetch failed: {error}");
+            (None, String::new())
+        }
+    };
+    render(CapabilityPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "capability-statement",
+        view,
+        raw,
+        filter,
     })
 }
 

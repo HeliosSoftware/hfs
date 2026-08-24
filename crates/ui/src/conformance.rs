@@ -36,6 +36,14 @@ pub trait ConformanceSource: Send + Sync {
         version: FhirVersion,
         tenant: &str,
     ) -> Result<Vec<Value>, String>;
+
+    /// The server's live CapabilityStatement for `version` and `tenant`
+    /// (`GET /metadata`, #653), or an `Err` message when the fetch fails —
+    /// the page degrades, it never fabricates capabilities.
+    async fn metadata(&self, version: FhirVersion, tenant: &str) -> Result<Value, String> {
+        let _ = (version, tenant);
+        Err("metadata is not available from this source".to_string())
+    }
 }
 
 /// Reads conformance resources from the server's own FHIR API over HTTP.
@@ -115,6 +123,41 @@ impl HttpConformanceSource {
 
 #[async_trait]
 impl ConformanceSource for HttpConformanceSource {
+    /// `GET /metadata` on the loopback base (#653). `/metadata` composes the
+    /// statement fresh from live server state and selects the described
+    /// version from the Accept header's `fhirVersion` parameter, so the
+    /// sidebar's selection rides the request — no spec-bundle fallback here,
+    /// the endpoint itself is version-aware.
+    async fn metadata(&self, version: FhirVersion, tenant: &str) -> Result<Value, String> {
+        let url = format!("{}/metadata", self.base_url);
+        let mut request = self.client.get(&url).header(
+            "Accept",
+            format!(
+                "application/fhir+json; fhirVersion={}",
+                version.as_mime_param()
+            ),
+        );
+        if !tenant.is_empty() {
+            request = request.header("X-Tenant-ID", tenant);
+        }
+        let request = self
+            .outbound_auth
+            .authorize(request, &self.base_url)
+            .await
+            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("{url} returned {}", response.status()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("parsing the CapabilityStatement failed: {e}"))
+    }
+
     async fn fetch(
         &self,
         resource_type: &str,
@@ -220,6 +263,7 @@ fn extract_bundle_resources(bundle: &Value) -> Vec<Value> {
 #[doc(hidden)]
 pub struct StaticConformanceSource {
     map: HashMap<(String, FhirVersion), Vec<Value>>,
+    metadata: Option<Value>,
 }
 
 impl StaticConformanceSource {
@@ -227,7 +271,14 @@ impl StaticConformanceSource {
     pub fn empty() -> Self {
         Self {
             map: HashMap::new(),
+            metadata: None,
         }
+    }
+
+    /// Seeds the CapabilityStatement `metadata()` answers with (#653).
+    pub fn with_metadata(mut self, statement: Value) -> Self {
+        self.metadata = Some(statement);
+        self
     }
 
     /// Seeds one `(resource_type, version)` slot.
@@ -277,6 +328,12 @@ impl ConformanceSource for StaticConformanceSource {
             .get(&(resource_type.to_string(), version))
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn metadata(&self, _version: FhirVersion, _tenant: &str) -> Result<Value, String> {
+        self.metadata
+            .clone()
+            .ok_or_else(|| "no metadata seeded".to_string())
     }
 }
 
