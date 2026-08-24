@@ -251,6 +251,14 @@ async fn search_parameters_page_serves_the_registry_view() {
     // "All types" now renders twice: the new section heading, and the
     // existing "clear filter" row it sits above.
     assert_eq!(html.matches(">All types<").count(), 2);
+    let long_name = "MedicinalProductUndesirableEffect";
+    assert!(html.contains(&format!(
+        r#"data-type="{long_name}" data-full-name="{long_name}""#
+    )));
+    assert!(html.contains(&format!(r#"title="{long_name}""#)));
+    assert!(html.contains(&format!(
+        r#"<span class="filter-rail__label">{long_name}</span>"#
+    )));
 }
 
 #[tokio::test]
@@ -765,7 +773,8 @@ async fn resources_deep_links_focus_the_selected_type() {
     // pattern shared with Search Parameters), not a full-height menu panel.
     assert!(html.contains(r#"data-selected-type="Observation""#));
     assert!(html.contains(
-        r#"data-type="Observation" href="/ui/resources?type=Observation" title="Observation" aria-current="true""#
+        r#"data-type="Observation" data-full-name="Observation"
+   href="/ui/resources?type=Observation" title="Observation" aria-current="true""#
     ));
     assert!(html.contains(r#"class="filter-rail" id="resources""#));
     // Create and the builder prefill both follow the deep-linked type.
