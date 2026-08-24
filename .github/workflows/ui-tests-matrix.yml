@@ -2,14 +2,17 @@ name: UI Tests (backend matrix)
 
 # The heavy ring of the UI test pyramid: the same Playwright + axe-core browser
 # suite that ui-tests.yml runs against SQLite, but replayed against every
-# supported storage backend — because a rendering, search, or history bug can
+# search-capable storage mode — because a rendering, search, or history bug can
 # surface on Postgres or Mongo and stay invisible on SQLite. Modeled on the
 # Inferno backend matrix (inferno-subscription.yml): hfs is built once with all
 # backends, runs on the runner host against containerized stores, and the
 # browser (in the Playwright container) drives it over the runner's IP.
 #
 # Manual + nightly only — it needs the remote Docker host and cloud secrets and
-# takes minutes; ui-tests.yml stays the fast per-PR gate.
+# takes minutes; ui-tests.yml stays the fast per-PR gate. This R4 backend axis
+# is deliberately orthogonal to ui-tests.yml's R4/R4B/R5/R6 SQLite contract:
+# the escaped-value codec and REST alternative boundary execute before storage
+# dispatch, so crossing both axes would repeat the same contract 28 times.
 
 on:
   workflow_dispatch:
@@ -86,13 +89,22 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
+        backend:
+          - sqlite
+          - sqlite-elasticsearch
+          - postgres
+          - postgres-elasticsearch
+          - mongodb
+          - mongodb-elasticsearch
+          - s3-elasticsearch
         include:
           - { backend: sqlite, hfs_port: 19080 }
           - { backend: sqlite-elasticsearch, hfs_port: 19081 }
           - { backend: postgres, hfs_port: 19082 }
-          - { backend: mongodb, hfs_port: 19083 }
-          - { backend: s3-elasticsearch, hfs_port: 19084 }
+          - { backend: postgres-elasticsearch, hfs_port: 19083 }
+          - { backend: mongodb, hfs_port: 19084 }
+          - { backend: mongodb-elasticsearch, hfs_port: 19085 }
+          - { backend: s3-elasticsearch, hfs_port: 19086 }
     env:
       HFS_PORT: ${{ matrix.hfs_port }}
       RESULTS_DIR: ui-matrix-results/${{ matrix.backend }}
@@ -124,7 +136,7 @@ jobs:
           echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
 
       - name: Start Elasticsearch
-        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        if: contains(matrix.backend, 'elasticsearch')
         run: |
           # Every container this workflow starts carries hfs-ci=true and the
           # run id. Container names here are run-id-scoped, so a leak can never
@@ -163,9 +175,9 @@ jobs:
           exit 1
 
       - name: Start PostgreSQL
-        if: matrix.backend == 'postgres'
+        if: matrix.backend == 'postgres' || matrix.backend == 'postgres-elasticsearch'
         run: |
-          PG_CONTAINER="pg-ui-matrix-${{ github.run_id }}-${{ github.run_attempt }}"
+          PG_CONTAINER="pg-ui-matrix-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             --label hfs-ci=true \
@@ -197,9 +209,9 @@ jobs:
           exit 1
 
       - name: Start MongoDB replica set
-        if: matrix.backend == 'mongodb'
+        if: matrix.backend == 'mongodb' || matrix.backend == 'mongodb-elasticsearch'
         run: |
-          MONGO_CONTAINER="mongo-ui-matrix-${{ github.run_id }}-${{ github.run_attempt }}"
+          MONGO_CONTAINER="mongo-ui-matrix-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MONGO_CONTAINER" -p 0:27017 \
             --label hfs-ci=true \
@@ -318,11 +330,13 @@ jobs:
           # the default asynchronous sync races the specs (nightly reds since
           # the SearchParameter CRUD spec landed). Synchronous puts the write
           # in ES before the API responds; the specs' waitSearchable covers
-          # the index-refresh window that remains. Only on the sqlite leg:
-          # against real S3 the extra per-write latency tipped the seed-heavy
-          # dashboard specs over their budgets (run 62), so that leg stays
-          # asynchronous and leans on the polls alone.
-          if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
+          # the index-refresh window that remains. Only the S3 composite stays
+          # asynchronous: against real S3 the extra per-write latency tipped
+          # the seed-heavy dashboard specs over their budgets (run 62), so
+          # that leg stays asynchronous and leans on the polls alone.
+          if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ] || \
+             [ "${{ matrix.backend }}" = "postgres-elasticsearch" ] || \
+             [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
             export HFS_COMPOSITE_SYNC_MODE=synchronous
           fi
 
@@ -330,6 +344,15 @@ jobs:
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres-elasticsearch" ]; then
+            HFS_STORAGE_BACKEND=postgres-elasticsearch \
+            HFS_PG_HOST="$DOCKER_HOST_IP" \
+            HFS_PG_PORT="$PG_PORT" \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres" ]; then
             HFS_STORAGE_BACKEND=postgres \
             HFS_PG_HOST="$DOCKER_HOST_IP" \
@@ -342,6 +365,12 @@ jobs:
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_ui_matrix_${{ github.run_id }}_${{ github.run_attempt }}" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
+            HFS_STORAGE_BACKEND=mongodb-elasticsearch \
+            HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_ui_matrix_${{ github.run_id }}_${{ github.run_attempt }}" \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=s3-elasticsearch \
@@ -428,6 +457,7 @@ jobs:
             --label github.run_id=${{ github.run_id }} \
             --label github.workflow=ui-tests-matrix \
             --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+          docker cp crates/ui/assets "$PW_CONTAINER":/work/assets
           docker cp crates/ui/e2e "$PW_CONTAINER":/work/e2e
           # The ES composites index asynchronously: specs that assert an
           # immediate post-write search relax to a bounded poll under this
@@ -447,7 +477,7 @@ jobs:
             -e HFS_E2E_EVENTUAL_SEARCH="$EVENTUAL" \
             -e HFS_E2E_NO_CHART_DATA="$NO_CHART" \
             -e HFS_E2E_NO_TRANSACTIONS="$NO_TX" -w /work/e2e "$PW_CONTAINER" \
-            bash -c "npm ci && npx playwright test"
+            bash -c "npm ci && npm run test:unit && npx playwright test"
 
       - name: Copy Playwright report out
         if: always()

@@ -2477,7 +2477,12 @@ mod tests {
 
         assert!(html.contains(r#"id="saved-query-form""#));
         assert!(html.contains(r#"id="saved-queries""#));
+        assert!(html.contains("/ui/assets/fhir-search-value.js"));
         assert!(html.contains("/ui/assets/saved-queries.js"));
+        assert!(
+            html.find("/ui/assets/fhir-search-value.js") < html.find("/ui/assets/saved-queries.js"),
+            "the FHIR search-value codec must load before its consumer"
+        );
         // Search Builder: the featured GET URL input, both submit intents,
         // and the Recent dropdown shell the script hydrates.
         assert!(html.contains(r#"name="url""#));
@@ -2550,6 +2555,14 @@ mod tests {
         // parameter suggestions come from the server-rendered datalist.
         assert!(source.contains("application/fhir+json"));
         assert!(source.contains("/ui/queries/params"));
+    }
+
+    #[test]
+    fn fhir_search_value_codec_is_embedded() {
+        let file = Assets::get("fhir-search-value.js").expect("FHIR search-value codec embedded");
+        let source = std::str::from_utf8(&file.data).expect("FHIR search-value codec is UTF-8");
+        assert!(source.contains("parseAlternatives"));
+        assert!(source.contains("serializeAlternative"));
     }
 
     /// The builder's datalist fragment is fed by the SearchParameter
