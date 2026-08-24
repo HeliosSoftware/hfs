@@ -444,7 +444,14 @@ jobs:
 
           if [ "$PG_SHARED_BUFFERS" = "auto" ]; then
             if [ "$DOCKER_HOST_MEM_GB" -ge 8 ]; then
-              PG_SHARED_BUFFERS="$(( DOCKER_HOST_MEM_GB / 4 ))GB"
+              AUTO_SB=$(( DOCKER_HOST_MEM_GB / 4 ))
+              # Cap at the published benchmark's 10G. The Docker host is SHARED
+              # with every other testcontainers job in the repo, and this
+              # workflow has taken it down before (run 30550776427). There is no
+              # reason to grab more than the configuration we are trying to
+              # match, however large the host happens to be.
+              [ "$AUTO_SB" -gt 10 ] && AUTO_SB=10
+              PG_SHARED_BUFFERS="${AUTO_SB}GB"
             else
               # Too small to carve up meaningfully — keep the old conservative value.
               PG_SHARED_BUFFERS="2GB"
@@ -452,7 +459,12 @@ jobs:
           fi
           if [ "$PG_EFFECTIVE_CACHE" = "auto" ]; then
             if [ "$DOCKER_HOST_MEM_GB" -ge 8 ]; then
-              PG_EFFECTIVE_CACHE="$(( DOCKER_HOST_MEM_GB * 3 / 4 ))GB"
+              # effective_cache_size is a planner HINT — it allocates nothing —
+              # so it can track the host without the shared-host concern above,
+              # but capping at the published 25G keeps us comparable.
+              AUTO_EC=$(( DOCKER_HOST_MEM_GB * 3 / 4 ))
+              [ "$AUTO_EC" -gt 25 ] && AUTO_EC=25
+              PG_EFFECTIVE_CACHE="${AUTO_EC}GB"
             else
               PG_EFFECTIVE_CACHE="6GB"
             fi
