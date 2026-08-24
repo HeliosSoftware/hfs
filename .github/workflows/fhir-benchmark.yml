@@ -79,6 +79,18 @@ on:
         description: "HFS_LOG_LEVEL (use 'debug' to log search query params when diagnosing 500s)"
         required: false
         default: "info"
+      pg_shared_buffers:
+        description: "Postgres shared_buffers ('auto' = 25% of the Docker host's RAM, or e.g. 10GB)"
+        required: false
+        default: "auto"
+      pg_effective_cache_size:
+        description: "Postgres effective_cache_size ('auto' = 75% of the Docker host's RAM, or e.g. 25GB)"
+        required: false
+        default: "auto"
+      pg_work_mem:
+        description: "Postgres work_mem (e.g. 10MB, 64MB)"
+        required: false
+        default: "10MB"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -408,12 +420,61 @@ jobs:
           docker volume create --label hfs-bench=1 \
             --label "hfs-bench-run=${{ github.run_id }}" "$PG_VOLUME" >/dev/null
 
-          # Tuning approximates the benchmark's infra/postgres/postgres.conf.
-          # shared_buffers/effective_cache_size are scaled DOWN from the
-          # published values (10G/25G) to fit a typical self-hosted runner;
-          # bump them (and the runner) to match the benchmark host for numbers
-          # that are directly comparable to the public report. `--shm-size`
-          # must exceed shared_buffers.
+          # ── Memory sizing ────────────────────────────────────────────────
+          # Postgres runs on the REMOTE Docker host, not the runner, so it is
+          # that host's RAM that bounds shared_buffers — read it from the daemon
+          # rather than guessing. The published benchmark uses 10G/25G against a
+          # 30G database container (infra/postgres in the upstream repo); a
+          # hardcoded 2GB here was the single largest known confound in the
+          # 2026-08-24 comparison, on a workload we have already shown is random
+          # heap I/O over a 29 GB search_index.
+          #
+          # 'auto' applies the standard 25% / 75% split of host RAM, so the
+          # config scales with whatever host the run lands on instead of being
+          # silently wrong. Override either value to sweep them.
+          DOCKER_HOST_MEM_BYTES=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
+          DOCKER_HOST_MEM_GB=$(( DOCKER_HOST_MEM_BYTES / 1024 / 1024 / 1024 ))
+          echo "Docker host RAM: ${DOCKER_HOST_MEM_GB}G (${DOCKER_HOST_MEM_BYTES} bytes)"
+          echo "Docker host CPUs: $(docker info --format '{{.NCPU}}' 2>/dev/null || echo '?')"
+          echo "Runner CPUs: $(nproc 2>/dev/null || echo '?'), runner RAM: $(free -g 2>/dev/null | awk '/^Mem:/{print $2"G"}' || echo '?')"
+
+          PG_SHARED_BUFFERS="${{ inputs.pg_shared_buffers || 'auto' }}"
+          PG_EFFECTIVE_CACHE="${{ inputs.pg_effective_cache_size || 'auto' }}"
+          PG_WORK_MEM="${{ inputs.pg_work_mem || '10MB' }}"
+
+          if [ "$PG_SHARED_BUFFERS" = "auto" ]; then
+            if [ "$DOCKER_HOST_MEM_GB" -ge 8 ]; then
+              PG_SHARED_BUFFERS="$(( DOCKER_HOST_MEM_GB / 4 ))GB"
+            else
+              # Too small to carve up meaningfully — keep the old conservative value.
+              PG_SHARED_BUFFERS="2GB"
+            fi
+          fi
+          if [ "$PG_EFFECTIVE_CACHE" = "auto" ]; then
+            if [ "$DOCKER_HOST_MEM_GB" -ge 8 ]; then
+              PG_EFFECTIVE_CACHE="$(( DOCKER_HOST_MEM_GB * 3 / 4 ))GB"
+            else
+              PG_EFFECTIVE_CACHE="6GB"
+            fi
+          fi
+          # --shm-size must exceed shared_buffers. Only GB-suffixed values can be
+          # turned into a number here; anything else (e.g. "512MB") falls back to
+          # a safe 4g rather than failing the arithmetic and killing the run.
+          case "$PG_SHARED_BUFFERS" in
+            *GB) SHM_GB=$(( ${PG_SHARED_BUFFERS%GB} + 2 )) ;;
+            *)   SHM_GB=4 ;;
+          esac
+          echo "Postgres tuning: shared_buffers=$PG_SHARED_BUFFERS effective_cache_size=$PG_EFFECTIVE_CACHE work_mem=$PG_WORK_MEM shm=${SHM_GB}g"
+          {
+            echo "### Postgres tuning (${{ matrix.backend }})"
+            echo ""
+            echo "| setting | value |"
+            echo "|---|---|"
+            echo "| Docker host RAM | ${DOCKER_HOST_MEM_GB}G |"
+            echo "| shared_buffers | \`$PG_SHARED_BUFFERS\` |"
+            echo "| effective_cache_size | \`$PG_EFFECTIVE_CACHE\` |"
+            echo "| work_mem | \`$PG_WORK_MEM\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
           #
           # The data directory is a **named volume**, not the container's
           # writable layer. Importing the Synthea corpus writes several GB, and
@@ -430,7 +491,7 @@ jobs:
             --name "$PG_CONTAINER" \
             --label hfs-bench=1 \
             --label "hfs-bench-run=${{ github.run_id }}" \
-            --shm-size=4g \
+            --shm-size=${SHM_GB}g \
             -v "$PG_VOLUME:/var/lib/postgresql" \
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_USER=postgres \
@@ -438,9 +499,9 @@ jobs:
             -p 0:5432 \
             postgres:18 \
             -c max_connections=1000 \
-            -c shared_buffers=2GB \
-            -c effective_cache_size=6GB \
-            -c work_mem=10MB \
+            -c shared_buffers=$PG_SHARED_BUFFERS \
+            -c effective_cache_size=$PG_EFFECTIVE_CACHE \
+            -c work_mem=$PG_WORK_MEM \
             -c maintenance_work_mem=256MB \
             -c max_wal_size=1GB \
             -c random_page_cost=1.1 \
