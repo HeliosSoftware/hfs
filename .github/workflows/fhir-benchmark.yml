@@ -376,7 +376,18 @@ jobs:
           echo "HFS_STORAGE_BACKEND=${{ matrix.backend }}" >> "$GITHUB_ENV"
           if [ "${{ matrix.backend }}" = "sqlite" ]; then
             DB_PATH="$GITHUB_WORKSPACE/fhir-bench.db"
-            rm -f "$DB_PATH"
+            # Remove the WAL sidecars too, not just the database file. The
+            # runner workspace is reused across runs, and a benchmark killed
+            # mid-import (as in run 30550776427) leaves `-wal`/`-shm` behind.
+            # Deleting only the database and then opening a fresh empty one
+            # next to a stale WAL makes SQLite replay that WAL into it, which
+            # both resurrects the previous run's data and stalls startup long
+            # enough to blow the 120s readiness gate.
+            if ls "$DB_PATH"* >/dev/null 2>&1; then
+              echo "Leftover SQLite state from a previous run:"
+              ls -la "$DB_PATH"*
+            fi
+            rm -f "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" "$DB_PATH-journal"
             echo "HFS_DATABASE_URL=$DB_PATH" >> "$GITHUB_ENV"
             echo "SQLite DB: $DB_PATH"
           else
