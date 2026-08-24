@@ -1,6 +1,7 @@
 {% macro rail_items(entries) %}
 {% for e in entries %}
-<a class="filter-rail__item" data-type="{{ e.name }}" href="{{ e.href }}" title="{{ e.name }}"{% if e.current %} aria-current="true"{% endif %}>
+<a class="filter-rail__item" data-type="{{ e.name }}" data-full-name="{{ e.name }}"
+   href="{{ e.href }}" title="{{ e.name }}"{% if e.current %} aria-current="true"{% endif %}>
   <span class="filter-rail__label">{{ e.name }}</span>
   {% if let Some(c) = e.count %}<span class="count">{{ c }}</span>{% endif %}
 </a>

@@ -2126,8 +2126,9 @@ button.pill {
 
 /* Long resource type names (e.g. "MedicinalProductContraindication", 32
    chars) truncate with an ellipsis instead of colliding with the count or
-   forcing horizontal scroll on the rail; the full name stays available via
-   `title` (#604). */
+   forcing horizontal scroll on the rail. `title` is the no-JS fallback;
+   resource-filter.js replaces it with a visible hover/keyboard tooltip when
+   the label is actually truncated (#604, #634). */
 .filter-rail__label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2151,6 +2152,30 @@ button.pill {
   font-size: 11px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* Appended to <body> and positioned from the focused/hovered rail item so the
+   full label is not clipped by the rail's scrolling overflow. One shared
+   tooltip serves both the main list and cloneNode()-based Recent items. */
+.filter-rail__tooltip {
+  position: fixed;
+  z-index: 1000;
+  max-width: min(320px, calc(100vw - 16px));
+  padding: 6px 9px;
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--surface-shadow);
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+.filter-rail__tooltip[hidden] {
+  display: none;
 }
 
 .filter-rail__note {
