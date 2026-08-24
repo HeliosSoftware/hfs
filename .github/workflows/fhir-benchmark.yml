@@ -80,13 +80,13 @@ on:
         required: false
         default: "info"
       pg_shared_buffers:
-        description: "Postgres shared_buffers ('auto' = 25% of the Docker host's RAM, or e.g. 10GB)"
+        description: "Postgres shared_buffers ('auto' = 25% of Docker host RAM capped at 10GB, or e.g. 4GB)"
         required: false
-        default: "auto"
+        default: "2GB"
       pg_effective_cache_size:
-        description: "Postgres effective_cache_size ('auto' = 75% of the Docker host's RAM, or e.g. 25GB)"
+        description: "Postgres effective_cache_size ('auto' = 75% of Docker host RAM capped at 25GB, or e.g. 8GB)"
         required: false
-        default: "auto"
+        default: "6GB"
       pg_work_mem:
         description: "Postgres work_mem (e.g. 10MB, 64MB)"
         required: false
@@ -442,8 +442,12 @@ jobs:
           echo "Docker host CPUs: $(docker info --format '{{.NCPU}}' 2>/dev/null || echo '?')"
           echo "Runner CPUs: $(nproc 2>/dev/null || echo '?'), runner RAM: $(free -g 2>/dev/null | awk '/^Mem:/{print $2"G"}' || echo '?')"
 
-          PG_SHARED_BUFFERS="${{ inputs.pg_shared_buffers || 'auto' }}"
-          PG_EFFECTIVE_CACHE="${{ inputs.pg_effective_cache_size || 'auto' }}"
+          # Defaults are the CONCRETE values every prior run measured under, not
+          # 'auto' — a default that silently changes with the host would make two
+          # runs incomparable without either of them saying so. 'auto' is opt-in,
+          # for when we deliberately want the config to track the host.
+          PG_SHARED_BUFFERS="${{ inputs.pg_shared_buffers || '2GB' }}"
+          PG_EFFECTIVE_CACHE="${{ inputs.pg_effective_cache_size || '6GB' }}"
           PG_WORK_MEM="${{ inputs.pg_work_mem || '10MB' }}"
 
           if [ "$PG_SHARED_BUFFERS" = "auto" ]; then
