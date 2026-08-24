@@ -49,7 +49,26 @@ SELECT pg_size_pretty(pg_total_relation_size('search_index')) AS search_index_to
 -- ─────────────────────────────────────────────────────────────────────────────
 
 \echo ''
-\echo '######## A. SHIPPED: OR-prefilter + IN  (baseline: 975ms / 111881 reads) ########'
+\echo '######## A0. SHIPPED SINCE #279: denormalized flat conjunction ########'
+-- This is what the query builder emits today. One row per composite instance
+-- carries every component's value, so the match is a plain conjunction that
+-- idx_search_composite_token_quantity can answer without the grouped
+-- aggregate's scattered heap reads. Compare its `hit + read` against section A
+-- below, which is the form this replaced.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                AND param_name = 'code-value-quantity'
+                AND composite_group IS NOT NULL
+                AND (value_token_code = '8867-4') AND (value_quantity_value > 100)))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## A. LEGACY (pre-#279 grouped form) — kept as the comparison baseline ########'
+-- NO LONGER SHIPS. Retained so each run measures the old and new forms against
+-- the same data on the same host; do not read this as current behaviour.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT id, version_id, data, last_updated, fhir_version FROM resources
 WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = FALSE
@@ -319,7 +338,7 @@ ORDER BY last_updated DESC, id ASC LIMIT 21;
 DROP INDEX IF EXISTS tmp_composite_cover;
 
 \echo ''
-\echo '######## T. COMPOSITE code-value-quantity — SHIPPED RE-RUN, WARM (control for D) ########'
+\echo '######## T. COMPOSITE code-value-quantity — LEGACY GROUPED RE-RUN, WARM (control for D) ########'
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT id, version_id, data, last_updated, fhir_version FROM resources
 WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = FALSE
