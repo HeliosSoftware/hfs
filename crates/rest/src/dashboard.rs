@@ -7,9 +7,9 @@
 //! and registers it in [`crate::build_app`]; the UI reads the resulting snapshot
 //! through the storage-agnostic `helios-observability` registry.
 //!
-//! The single-tenant scope matches the operator dashboard: figures reflect the
-//! server's **default tenant** only, and are never exported to the public
-//! Prometheus `/metrics` endpoint (per the design in
+//! Figures are scoped per snapshot call to the requesting tenant (#344; the
+//! server's default tenant is only the empty-id fallback), and are never
+//! exported to the public Prometheus `/metrics` endpoint (per the design in
 //! [`helios_observability::metrics`]). The same [`resource_count_series`] helper
 //! also backs the authenticated `/console/metrics/resource-counts` JSON handler,
 //! so the cumulative-bucketing semantics live in exactly one place.
