@@ -2897,10 +2897,8 @@ button.pill {
   align-self: flex-start;
 }
 
-/* Chaining rows (#394): forward chains and _has carry extra controls, so
- * they wrap; the shared input skin comes from the selectors above. */
-.builder-row--chain,
-.builder-row--has {
+/* Condition rows can grow a full-width modifier panel. */
+#builder-conditions > .builder-row {
   flex-wrap: wrap;
 }
 
@@ -4136,6 +4134,8 @@ button.pill {
 
 .builder-row__modpanel {
   flex-basis: 100%;
+  min-width: 0;
+  max-width: 100%;
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
