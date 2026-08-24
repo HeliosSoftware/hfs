@@ -49,6 +49,26 @@ async fn body_text(response: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+fn assert_recent_types_are_pinned_above_the_list(html: &str) {
+    let recent = html
+        .find(r#"id="type-rail-recent""#)
+        .expect("Recently used group");
+    let divider = html
+        .find(r#"class="filter-rail__divider""#)
+        .expect("recent-types divider");
+    let all_types = html.find(">All types<").expect("All types heading");
+    let list = html
+        .find(r#"id="type-rail-list""#)
+        .expect("scrollable type list");
+
+    assert!(recent < divider, "Recently used must precede its divider");
+    assert!(divider < all_types, "the divider must precede All types");
+    assert!(
+        all_types < list,
+        "Recently used and All types must stay outside the scrollable list"
+    );
+}
+
 #[tokio::test]
 async fn index_serves_the_full_landing_page() {
     let response = app()
@@ -474,6 +494,20 @@ async fn nl_search_configured_renders_the_translator_over_an_editable_query() {
     // there is no separate Search nav entry (#282).
 }
 
+#[tokio::test]
+async fn search_and_queries_pin_recent_types_above_the_scrollable_list() {
+    for path in ["/ui/search", "/ui/queries"] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_text(response).await;
+        assert_recent_types_are_pinned_above_the_list(&html);
+    }
+}
+
 /* The resource editor (#264). The endpoint takes the whole in-flight document
  * plus one mutation and hands back the re-rendered body — so these drive it the
  * way the browser does. */
@@ -745,8 +779,7 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     // A divider and an "All types" heading separate the Recently used group
     // from the general list (#603 follow-up), between the recent group and
     // the rail items.
-    assert!(html.contains(r#"class="filter-rail__divider""#));
-    assert!(html.contains(">All types<"));
+    assert_recent_types_are_pinned_above_the_list(&html);
     // The edit modal shell, with its Edit / History tabs.
     assert!(html.contains(r#"id="resource-modal""#));
     assert!(html.contains(r#"data-modal-tab="history""#));

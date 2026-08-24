@@ -24,6 +24,9 @@ export class ResourcesPage {
   get railFilter(): Locator {
     return this.page.locator("#type-rail-filter");
   }
+  get typeList(): Locator {
+    return this.page.locator("#type-rail-list");
+  }
   get createButton(): Locator {
     return this.page.locator("#resource-create");
   }
@@ -32,9 +35,8 @@ export class ResourcesPage {
     return this.page.locator("#resource-create .resources-create__label");
   }
 
-  // Direct-child combinator: `#type-rail-recent` (the "Recently used" group,
-  // #603) nests inside `#type-rail-list` too, and its clones carry the same
-  // `data-type`. `>` keeps this scoped to the full, unfiltered list.
+  // Direct-child combinator keeps this scoped to the full, unfiltered list;
+  // recently-used clones live in the sibling group above the scroller.
   railItem(type: string): Locator {
     return this.page.locator(`#type-rail-list > [data-type='${type}']`);
   }
@@ -68,13 +70,14 @@ export class ResourcesPage {
   /** Separates Recently used from the general list (#603 follow-up): only
    * visible once the recent group actually has entries. */
   get recentDivider(): Locator {
-    return this.page.locator("#type-rail-list > .filter-rail__divider");
+    return this.page.locator("#type-rail-recent + .filter-rail__divider");
   }
   /** The general list's own section heading (#603 follow-up). */
   get generalHeading(): Locator {
-    return this.page.locator("#type-rail-list > .filter-rail__heading--group", {
-      hasText: "All types",
-    });
+    return this.page.locator(
+      "#type-rail-recent + .filter-rail__divider + .filter-rail__heading--group",
+      { hasText: "All types" },
+    );
   }
 
   async pickType(type: string): Promise<void> {

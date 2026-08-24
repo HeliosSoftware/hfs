@@ -131,13 +131,17 @@ test("every resource type is reachable — Create targets each one", async ({ re
 
 // "Recently used" group (#603): a per-browser convenience, populated by
 // resource-filter.js from explicit rail picks and re-rendered on load.
-test("the recently-used group tracks picks, most-recent-first, with counts matching the full list", async ({
+test("the recently-used group caps at five, keeps MRU order, deduplicates, and preserves counts", async ({
   resources,
 }) => {
   await resources.goto("Patient");
-  await resources.pickType("Encounter");
-  await resources.pickType("Observation");
-  await resources.pickType("Encounter"); // re-selection: moves to front, no duplicate
+  await resources.pickType("Account");
+  await resources.pickType("ActivityDefinition");
+  await resources.pickType("AdverseEvent");
+  await resources.pickType("AllergyIntolerance");
+  await resources.pickType("Appointment");
+  await resources.pickType("AppointmentResponse");
+  await resources.pickType("AllergyIntolerance"); // re-selection: moves to front, no duplicate
 
   // The group is client-rendered from localStorage on load, so it only
   // reflects the picks above once the page (re)loads.
@@ -150,13 +154,87 @@ test("the recently-used group tracks picks, most-recent-first, with counts match
 
   const types = await resources.recentGroup
     .locator("a.filter-rail__item[data-type]")
-    .evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.type));
-  expect(types).toEqual(["Encounter", "Observation"]);
+    .evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.type!));
+  expect(types).toEqual([
+    "AllergyIntolerance",
+    "AppointmentResponse",
+    "Appointment",
+    "AdverseEvent",
+    "ActivityDefinition",
+  ]);
 
   for (const type of types) {
     const listCount = await resources.count(type).textContent();
     const recentCount = await resources.recentItem(type).locator(".count").textContent();
     expect(recentCount).toBe(listCount);
+  }
+});
+
+test("the type rails keep recents and the All types heading fixed while type items scroll", async ({
+  resources,
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 700 });
+  await resources.goto("Account");
+  for (const type of [
+    "ActivityDefinition",
+    "AdverseEvent",
+    "AllergyIntolerance",
+    "Appointment",
+    "Observation",
+  ]) {
+    await resources.pickType(type);
+  }
+
+  for (const [name, path] of [
+    ["Resources", "/ui/resources?type=Account"],
+    ["Search", "/ui/search?type=Account"],
+    ["Saved queries", "/ui/queries?type=Account"],
+  ] as const) {
+    await test.step(name, async () => {
+      await page.goto(path, { waitUntil: "networkidle" });
+
+      const recent = resources.recentGroup;
+      const divider = resources.recentDivider;
+      const allTypes = resources.generalHeading;
+      const pinned = recent.or(divider).or(allTypes);
+      const list = resources.typeList;
+      const firstType = list.locator("a.filter-rail__item[data-type]").first();
+
+      await expect(recent).toBeVisible();
+      await expect(divider).toBeVisible();
+      await expect(allTypes).toBeVisible();
+
+      const pinnedTopsBefore = await pinned
+        .evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().top));
+      const firstTypeTopBefore = await firstType.evaluate(
+        (element) => element.getBoundingClientRect().top,
+      );
+      const before = await list.evaluate((element) => ({
+        scrollTop: element.scrollTop,
+        maxScrollTop: element.scrollHeight - element.clientHeight,
+      }));
+      expect(before.maxScrollTop).toBeGreaterThan(0);
+
+      await list.evaluate((element) => {
+        element.scrollTop = element.scrollHeight;
+      });
+      await expect.poll(() => list.evaluate((element) => element.scrollTop)).toBeGreaterThan(
+        before.scrollTop,
+      );
+
+      const pinnedTopsAfter = await pinned
+        .evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().top));
+      const firstTypeTopAfter = await firstType.evaluate(
+        (element) => element.getBoundingClientRect().top,
+      );
+
+      expect(pinnedTopsAfter).toHaveLength(pinnedTopsBefore.length);
+      pinnedTopsAfter.forEach((top, index) => {
+        expect(Math.abs(top - pinnedTopsBefore[index])).toBeLessThanOrEqual(1);
+      });
+      expect(firstTypeTopAfter).toBeLessThan(firstTypeTopBefore);
+    });
   }
 });
 
@@ -205,7 +283,6 @@ test("a created resource can be deleted from its modal", async ({ resources, pag
 
   // Open it in the modal by searching for it and clicking the result row.
   await resources.goto("Patient");
-  await resources.modal; // ensure page loaded
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
   await page.locator(`#query-results-body a.url`).first().click();

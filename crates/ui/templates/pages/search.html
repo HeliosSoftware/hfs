@@ -27,13 +27,13 @@
              placeholder="{{ i18n.t("queries-rail-filter") }}"
              aria-label="{{ i18n.t("queries-rail-filter") }}">
     </div>
+    <div class="filter-rail__group" id="type-rail-recent"
+         data-recent-key="hfs-recent-types" data-rail-list="type-rail-list" hidden>
+      <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("sp-rail-recent") }}</div>
+    </div>
+    <div class="filter-rail__divider" aria-hidden="true"></div>
+    <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
     <div class="filter-rail__list" id="type-rail-list">
-      <div class="filter-rail__group" id="type-rail-recent"
-           data-recent-key="hfs-recent-types" data-rail-list="type-rail-list" hidden>
-        <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("sp-rail-recent") }}</div>
-      </div>
-      <div class="filter-rail__divider" aria-hidden="true"></div>
-      <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
       {% call rail::rail_items(rail_entries) %}{% endcall %}
     </div>
   </aside>
