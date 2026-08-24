@@ -91,6 +91,10 @@ on:
         description: "Postgres work_mem (e.g. 10MB, 64MB)"
         required: false
         default: "10MB"
+      hfs_pg_max_connections:
+        description: "HFS Postgres pool size (crud drives 300 VUs; 32 leaves most of each request queued)"
+        required: false
+        default: "32"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -575,7 +579,13 @@ jobs:
           # comparators (Aidbox/HAPI/Medplum) impose no such cap and import.js
           # allows 900s client-side, so match that here for a fair comparison.
           # HFS_PG_MAX_CONNECTIONS: set explicitly so the pool size is a recorded
-          # input rather than an inferred default. The search suite runs 30 VUs; a
+          # input rather than an inferred default, and now a sweepable one — 32
+          # was chosen for the SEARCH suite's 30 VUs, but crud drives 300. In run
+          # 32767978962 crud managed 261 RPS at p50 996ms; 261 RPS across 32
+          # connections is ~122ms of service time per request, so ~870ms of each
+          # request was spent waiting for a connection rather than doing work.
+          # Postgres itself is started with max_connections=1000, so the pool is
+          # the binding constraint, not the server. The search suite runs 30 VUs; a
           # pool smaller than that puts every request behind a connection queue and
           # the measurement stops being about query cost at all (issue #224 — the
           # pool was pinned at 10 and, on the HFS_DATABASE_URL path, no environment
@@ -586,7 +596,7 @@ jobs:
           HFS_LOG_LEVEL="${{ inputs.log_level || 'info' }}" \
           HFS_MAX_BODY_SIZE="209715200" \
           HFS_REQUEST_TIMEOUT="900" \
-          HFS_PG_MAX_CONNECTIONS="32" \
+          HFS_PG_MAX_CONNECTIONS="${{ inputs.hfs_pg_max_connections || '32' }}" \
           HFS_DATA_DIR="$GITHUB_WORKSPACE/data" \
             ./hfs > "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>&1 &
 
