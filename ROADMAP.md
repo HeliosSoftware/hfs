@@ -43,6 +43,7 @@ These capabilities are available today in the current release.
 
 **Standards**
 
+- [FHIR Validation engine](crates/fhir-validator/) — FHIR Schema based structural and profile validation with a StructureDefinition→schema converter, embedded core packages (R4–R6), FHIRPath invariant evaluation, and terminology binding checks. Exposed as `$validate` on the REST API, as opt-in write-path validation (`HFS_VALIDATION_MODE=log|enforce`), and as the `validator-cli` tool
 - [Bulk Data API — `$export`](crates/rest/README.md) — System / patient / group export with pre-signed S3 downloads
 - [Bulk Data API — `$bulk-submit`](crates/rest/README.md) — Bulk ingestion
 
@@ -64,7 +65,6 @@ Work that is currently underway or planned for the near term.
 
 | Area | Item | Status |
 |------|------|--------|
-| **Standards** | FHIR Validation engine | 🟡 In progress |
 | **Developer Experience** | Administrative UI — web-based management console for server configuration and monitoring | 🟡 In progress |
 | **Terminology** | [Administrative UI for HTS](crates/hts/README.md) — web-based management console for the terminology server: CodeSystem / ValueSet / ConceptMap browsing, terminology import and bootstrap sync monitoring, and operation testing | 🟡 In progress |
 | **Deployment** | Cluster support — multi-instance deployment behind a load balancer, with cluster-safe state | 🟡 In progress |
@@ -220,7 +220,7 @@ Devitt's book defines nine key questions organizations must answer before choosi
 
 | Gap | Book Reference | Current Status |
 |-----|---------------|----------------|
-| **No profile validation on write** | Ch. 1 Fig 1.1 shows "FHIR validation + Profile validation" as a core server responsibility on create. Ch. 6 warns that without it, data quality degrades in FHIR-native systems. | 🔵 Design |
+| **Profile validation on write** | Ch. 1 Fig 1.1 shows "FHIR validation + Profile validation" as a core server responsibility on create. Ch. 6 warns that without it, data quality degrades in FHIR-native systems. | ✅ Shipped — `helios-fhir-validator` validates structure, `meta.profile` claims, FHIRPath invariants, and required bindings. Write-path enforcement is opt-in (`HFS_VALIDATION_MODE`, default `off`); `$validate` is always available. |
 
 #### Significant
 
@@ -250,7 +250,7 @@ Devitt's book defines nine key questions organizations must answer before choosi
 
 Using Devitt's framework (Chapters 4–7), HFS is currently best suited for:
 
-- **FHIR-native Variant A** (single source of truth, greenfield) — strong fit once profile validation ships
+- **FHIR-native Variant A** (single source of truth, greenfield) — strong fit, with profile validation available on the write path
 - **Hybrid Variant A** (sync-only, read-only FHIR server) — requires Subscriptions or Bulk Data REST endpoints for the sync pipeline
 - **Analytics / AI secondary use** — strong SQL-on-FHIR and Parquet support today
 
