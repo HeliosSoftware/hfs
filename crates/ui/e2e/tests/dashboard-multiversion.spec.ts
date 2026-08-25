@@ -47,7 +47,13 @@ test("switching version changes the dashboard's full type set (membership and co
   // The Resources rail already exposes the complete per-version type list
   // (`resource_type_names()`), independent of the dashboard code path —
   // reading it for R4 and R5 gives ground truth to check the dashboard
-  // picker against, not a value baked into the test.
+  // picker against, not a value baked into the test. Pin R4 explicitly
+  // first: the effective version otherwise starts at the server's seed
+  // (HFS_DEFAULT_FHIR_VERSION — R6 in CI's dedicated job), and an R6 set
+  // masquerading as "R4 ground truth" makes the final R4 assertion demand
+  // an R6-only type of the R4 picker (#553; surfaced when the moving R6
+  // spec build gained DeviceAlert).
+  await chrome.selectVersion("R4");
   await resources.goto();
   const r4Types = new Set(await resources.railTypes());
 
@@ -80,6 +86,32 @@ test("switching version changes the dashboard's full type set (membership and co
   await dashboard.openPicker();
   await expect(dashboard.pickerOption(onlyInR4[0])).toBeVisible();
   await expect(dashboard.pickerOption(onlyInR5[0])).toHaveCount(0);
+});
+
+test("the Resource types card names the selected version, not the boot-time default", async ({
+  dashboard,
+  chrome,
+}) => {
+  // #553: the card's sub-line used to render DashboardSnapshot.fhir_version,
+  // which the provider pins to the boot-time default — so after a sidebar
+  // switch the card and the selector two labels away disagreed. It now
+  // renders the same per-request Status source as the sidebar.
+  const options = await chrome.versionOptions();
+  const before = await chrome.currentVersion();
+  const requested = options.find((v) => v !== before);
+  if (!requested) test.skip(true, "no second compiled version to request instead of the seed");
+
+  await dashboard.goto();
+  await expect(dashboard.resourceTypesCard.locator(".stat__sub")).toHaveText(`used for ${before}`);
+
+  await chrome.selectVersion(requested!);
+  await dashboard.goto();
+  await expect(dashboard.resourceTypesCard.locator(".stat__sub")).toHaveText(
+    `used for ${requested}`,
+  );
+
+  // Restore, so later specs meet the server on the version we found it with.
+  await chrome.selectVersion(before);
 });
 
 test("the picker follows the requested version, not the server's boot-time default", async ({

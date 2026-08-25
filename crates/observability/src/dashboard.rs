@@ -13,11 +13,11 @@
 //!
 //! ## Scope and trust
 //!
-//! The registered provider reports counts for a **single tenant** (the server's
-//! default tenant) and is consumed only by the operator dashboard. Per-tenant
-//! counts are deliberately never exported to the public Prometheus `/metrics`
-//! endpoint (see [`crate::metrics`]); this snapshot is a separate, operator-facing
-//! surface.
+//! Each snapshot reports counts for the single tenant passed to [`snapshot`]
+//! (#344) and is consumed only by the operator dashboard. Per-tenant counts
+//! are deliberately never exported to the public Prometheus `/metrics`
+//! endpoint (see [`crate::metrics`]); this snapshot is a separate,
+//! operator-facing surface.
 //!
 //! ## Time resolution
 //!
@@ -154,7 +154,9 @@ pub struct ExportJobCounts {
 /// FHIR types — so this crate stays dependency-light.
 #[derive(Clone, Debug, Default)]
 pub struct DashboardSnapshot {
-    /// Default FHIR version the server serves (e.g. `"R4"`).
+    /// Default FHIR version the server serves (e.g. `"R4"`), fixed when the
+    /// provider is constructed. The UI's dashboard card does not render this:
+    /// it shows the request's effective version instead (#553).
     pub fhir_version: String,
     /// Total non-deleted resources across all types for the default tenant.
     pub total_resources: u64,

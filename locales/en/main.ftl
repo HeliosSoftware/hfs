@@ -148,7 +148,7 @@ fhir-version = FHIR { $version }
 fhir-version-heading = FHIR Version
 
 card-resource-types = Resource Types
-card-resource-types-sub = enabled for { $version }
+card-resource-types-sub = used for { $version }
 card-stored-resources = Stored Resources
 card-stored-resources-sub = across active tenant
 card-export-jobs = Export Jobs
