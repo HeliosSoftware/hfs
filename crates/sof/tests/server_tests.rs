@@ -32,7 +32,9 @@ async fn test_capability_statement() {
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "CapabilityStatement");
     assert_eq!(json["kind"], "instance");
-    assert_eq!(json["fhirVersion"], "4.0.1");
+    // The advertised version tracks the newest enabled FHIR feature (R4 by
+    // default, R6 under --all-features), so assert against the same source.
+    assert_eq!(json["fhirVersion"], helios_sof::get_fhir_version_string());
 
     // Verify ViewDefinition resource is supported
     // `$sql-run` is a system-level operation, so it is declared in
