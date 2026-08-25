@@ -199,7 +199,16 @@ jobs:
   benchmark:
     name: Benchmark (${{ matrix.backend }})
     needs: [setup, build]
-    runs-on: [self-hosted, Linux]
+    # Pinned to ONE machine. HFS and k6 run natively on the runner (only Postgres
+    # is on the remote Docker host), so a run that lands on a different agent is
+    # measuring different hardware and cannot be compared with the previous one.
+    # Runs 32790578934 and 32861672614 both landed on github-agent6; 32867744843
+    # drew github-agent2 and would have been read against them regardless.
+    # `setup` and `build` stay unpinned — they only produce artifacts.
+    runs-on:
+      - self-hosted
+      - Linux
+      - ${{ inputs.runner || 'github-agent6' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
