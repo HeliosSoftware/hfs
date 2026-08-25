@@ -44,6 +44,35 @@ pub trait ConformanceSource: Send + Sync {
         let _ = (version, tenant);
         Err("metadata is not available from this source".to_string())
     }
+
+    /// Runs `$sql-run` with `view_definition` as the inline subject and
+    /// returns the output rows (`_format=json`), or an `Err` message the page
+    /// shows in place of the results table (#649).
+    async fn sql_run(
+        &self,
+        view_definition: &Value,
+        limit: usize,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Vec<Value>, String> {
+        let _ = (view_definition, limit, version, tenant);
+        Err("$sql-run is not available from this source".to_string())
+    }
+
+    /// Creates (`id: None`) or updates one resource through the server's own
+    /// FHIR API and returns the stored resource. Backs the ViewDefinition
+    /// editor's plain-form save, which must work without JavaScript (#649).
+    async fn save_resource(
+        &self,
+        resource_type: &str,
+        id: Option<&str>,
+        resource: Value,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Value, String> {
+        let _ = (resource_type, id, resource, version, tenant);
+        Err("saving is not available from this source".to_string())
+    }
 }
 
 /// Reads conformance resources from the server's own FHIR API over HTTP.
@@ -219,6 +248,124 @@ impl ConformanceSource for HttpConformanceSource {
         }
         Ok(resources)
     }
+
+    /// `POST /$sql-run` on the loopback base with the ViewDefinition as the
+    /// inline subject (the handler's raw-resource shorthand for a Parameters
+    /// body). Storage holds the seeded default version only, so any other
+    /// version degrades with a message rather than running against the wrong
+    /// data.
+    async fn sql_run(
+        &self,
+        view_definition: &Value,
+        limit: usize,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Vec<Value>, String> {
+        if version != self.default_version {
+            return Err(format!(
+                "$sql-run reads stored data, which holds the server default (FHIR {}); switch the sidebar back to run this view",
+                self.default_version.as_str(),
+            ));
+        }
+        let url = format!("{}/$sql-run?_format=json&_limit={limit}", self.base_url);
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(view_definition);
+        if !tenant.is_empty() {
+            request = request.header("X-Tenant-ID", tenant);
+        }
+        let request = self
+            .outbound_auth
+            .authorize(request, &self.base_url)
+            .await
+            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            // $sql-run explains its 4xx in an OperationOutcome; surface its
+            // diagnostics so an invalid view reads as more than a status code.
+            let detail = response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|o| outcome_diagnostics(&o))
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default();
+            return Err(format!("$sql-run returned {status}{detail}"));
+        }
+        response
+            .json::<Vec<Value>>()
+            .await
+            .map_err(|e| format!("parsing $sql-run rows failed: {e}"))
+    }
+
+    async fn save_resource(
+        &self,
+        resource_type: &str,
+        id: Option<&str>,
+        resource: Value,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Value, String> {
+        let url = match id {
+            Some(id) => format!("{}/{resource_type}/{id}", self.base_url),
+            None => format!("{}/{resource_type}", self.base_url),
+        };
+        let accept = format!(
+            "application/fhir+json; fhirVersion={}",
+            version.as_mime_param()
+        );
+        let mut request = match id {
+            Some(_) => self.client.put(&url),
+            None => self.client.post(&url),
+        }
+        .header("Content-Type", accept.clone())
+        .header("Accept", accept)
+        .json(&resource);
+        if !tenant.is_empty() {
+            request = request.header("X-Tenant-ID", tenant);
+        }
+        let request = self
+            .outbound_auth
+            .authorize(request, &self.base_url)
+            .await
+            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let detail = response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|o| outcome_diagnostics(&o))
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default();
+            return Err(format!("saving to {url} returned {status}{detail}"));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("parsing the saved resource failed: {e}"))
+    }
+}
+
+/// The first issue diagnostics of an OperationOutcome, if that is what this is.
+fn outcome_diagnostics(outcome: &Value) -> Option<String> {
+    outcome
+        .get("issue")?
+        .as_array()?
+        .iter()
+        .find_map(|i| i.get("diagnostics").and_then(Value::as_str))
+        .map(String::from)
 }
 
 /// The `next` page URL of a searchset Bundle, if any.
@@ -264,6 +411,7 @@ fn extract_bundle_resources(bundle: &Value) -> Vec<Value> {
 pub struct StaticConformanceSource {
     map: HashMap<(String, FhirVersion), Vec<Value>>,
     metadata: Option<Value>,
+    sql_rows: Option<Result<Vec<Value>, String>>,
 }
 
 impl StaticConformanceSource {
@@ -272,12 +420,19 @@ impl StaticConformanceSource {
         Self {
             map: HashMap::new(),
             metadata: None,
+            sql_rows: None,
         }
     }
 
     /// Seeds the CapabilityStatement `metadata()` answers with (#653).
     pub fn with_metadata(mut self, statement: Value) -> Self {
         self.metadata = Some(statement);
+        self
+    }
+
+    /// Seeds what `sql_run()` answers (#649): `Ok` rows or the `Err` message.
+    pub fn with_sql_run(mut self, outcome: Result<Vec<Value>, String>) -> Self {
+        self.sql_rows = Some(outcome);
         self
     }
 
@@ -334,6 +489,37 @@ impl ConformanceSource for StaticConformanceSource {
         self.metadata
             .clone()
             .ok_or_else(|| "no metadata seeded".to_string())
+    }
+
+    async fn sql_run(
+        &self,
+        _view_definition: &Value,
+        limit: usize,
+        _version: FhirVersion,
+        _tenant: &str,
+    ) -> Result<Vec<Value>, String> {
+        match &self.sql_rows {
+            Some(Ok(rows)) => Ok(rows.iter().take(limit).cloned().collect()),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("no $sql-run outcome seeded".to_string()),
+        }
+    }
+
+    /// Echoes the resource back with an id, so the save handler's redirect
+    /// (and a test's assertion on it) has something stable to point at.
+    async fn save_resource(
+        &self,
+        _resource_type: &str,
+        id: Option<&str>,
+        mut resource: Value,
+        _version: FhirVersion,
+        _tenant: &str,
+    ) -> Result<Value, String> {
+        let id = id.unwrap_or("static-created").to_string();
+        if let Some(map) = resource.as_object_mut() {
+            map.insert("id".to_string(), Value::String(id));
+        }
+        Ok(resource)
     }
 }
 

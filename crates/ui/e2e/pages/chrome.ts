@@ -18,11 +18,6 @@ export class AppChrome {
     return this.page.locator(`a.nav-item[href='${href}']`);
   }
 
-  /** A disabled "coming soon" nav entry by its visible label. */
-  soonItem(label: string): Locator {
-    return this.page.locator("span.nav-item--soon", { hasText: label });
-  }
-
   themeButton(theme: Theme): Locator {
     return this.page.locator(`[data-set-theme='${theme}']`);
   }

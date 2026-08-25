@@ -1795,6 +1795,43 @@ mod sof_export_tests {
     }
 
     // =========================================================================
+    // 23b. The renamed `view` parameter gets a didactic 400 instead of the
+    //      generic "unsupported body parameter" message. The old shape is
+    //      still rejected outright — there is no compatibility window.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_renamed_view_param_gets_didactic_message() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "view", "part": [
+                    {"name": "viewResource", "resource": patient_view()}
+                ]}
+            ]
+        });
+        let resp = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let outcome: Value = resp.json();
+        assert_eq!(
+            outcome["issue"][0]["code"].as_str(),
+            Some("not-supported"),
+            "{outcome}"
+        );
+        let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diagnostics.contains("renamed to `context`"),
+            "expected the didactic rename message, got: {diagnostics}"
+        );
+    }
+
+    // =========================================================================
     // 24. Body-form input parameters take effect: a `Parameters` body
     //     supplying `_format=csv` and `clientTrackingId=body-tid` must drive
     //     the completion manifest's `_format` and `clientTrackingId` even

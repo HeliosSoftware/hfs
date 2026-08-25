@@ -84,6 +84,7 @@ error-generic = Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.
 
 nav-section-work = Arbeit
 nav-section-batch-data = Batch & Daten
+nav-section-sql-on-fhir = SQL on FHIR
 nav-section-server = Server
 nav-section-tools = Werkzeuge
 
@@ -95,7 +96,11 @@ nav-compartments = Compartments
 nav-batch-transaction = Batch / Transaktion
 nav-import = Importieren
 nav-export = Exportieren
-nav-sql-on-fhir = SQL-on-FHIR
+nav-sql-view-definitions = View-Definitionen
+nav-sql-queries = SQL-Abfragen
+nav-sql-views = SQL-Views
+nav-sql-export = SQL-Export
+nav-sql-files = Dateien
 nav-capability-conformance = Capability & Konformität
 nav-search-parameters = Suchparameter
 nav-subscriptions = Abonnements
@@ -553,7 +558,6 @@ bulk-import-new = Neue Submission
 bulk-import-create-title = Bulk Submission anlegen
 bulk-import-field-name = Name der Submission
 bulk-import-field-recipient = Basis-URL des Empfängers
-bulk-import-field-recipient-hint = Die Basis-URL des Servers, an den die Daten übermittelt werden.
 bulk-import-auth = Authentifizierung
 bulk-import-auth-hint = Wie gegenüber dem Empfängerserver authentifiziert wird.
 bulk-import-auth-none = Keine
@@ -582,6 +586,7 @@ bulk-import-status-not-started = Nicht gestartet
 bulk-import-status-in-progress = In Bearbeitung
 bulk-import-status-stopped = Angehalten
 bulk-import-status-completed = Abgeschlossen
+bulk-import-status-failed = Fehlgeschlagen
 bulk-import-detail-recipient = Datenempfänger
 bulk-import-detail-id = Submission-ID
 bulk-import-detail-submitter = Einreicher
@@ -598,7 +603,7 @@ bulk-import-field-manifest-url = Manifest-URL
 bulk-import-field-manifest-url-hint = URL eines Bulk-Export-Manifests mit einem vorkoordinierten FHIR-Datensatz.
 bulk-import-field-fhir-base = FHIR-Basis-URL
 bulk-import-field-fhir-base-hint = Basis-URL, die der Empfänger beim Auflösen relativer Referenzen verwendet. Leer lassen, um die Basis-URL des Manifests zu verwenden.
-bulk-import-field-output-format = Ausgabeformat
+bulk-import-field-output-format = Format
 bulk-import-field-output-format-hint = Das Format der Bulk-Data-Dateien im Manifest.
 bulk-import-field-headers = Header für Dateiabrufe
 bulk-import-field-headers-hint = HTTP-Header, die der Empfänger beim Abruf einer Datendatei verwenden soll, je Zeile "Name: Wert".
@@ -733,3 +738,50 @@ cap-col-revincludes = Revincludes
 cap-resources-empty = Kein Ressourcentyp entspricht dem Filter.
 cap-raw-toggle = Rohes CapabilityStatement (JSON)
 cap-unavailable = Das CapabilityStatement konnte nicht vom Server geladen werden — der Selbstaufruf benötigt bei aktivierter Authentifizierung eventuell ein Ausgangs-Token.
+
+## Stubs der SQL-on-FHIR-Sektion (#649)
+
+sql-stub-heading = Demnächst
+sql-stub-planned = Geplant
+sql-stub-api = Bedienende API
+
+sql-vd-title = View-Definitionen
+sql-vd-lede = Erstelle und verwalte die ViewDefinitions, mit denen SQL on FHIR Ressourcen abflacht.
+
+sql-queries-title = SQL-Abfragen
+sql-queries-lede = Führe SQL-on-FHIR-Abfragen gegen diesen Server aus.
+sql-queries-body = Eine Abfrage verfassen, ausführen und die Ergebniszeilen direkt inspizieren.
+
+sql-views-title = SQL-Views
+sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
+sql-views-body = SQLView-Bibliotheken und die darin definierten Views, aufgelöst mit ihren Abhängigkeiten.
+
+sql-export-title = SQL-Export
+sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
+sql-export-body = Einen Export starten, den Fortschritt verfolgen und nicht mehr benötigte Aufträge abbrechen.
+
+sql-files-title = Dateien
+sql-files-lede = Manifeste und Ausgabedateien der SQL-Exporte.
+sql-files-body = Das Manifest jedes Auftrags einsehen und seine Ausgabedateien herunterladen.
+
+## View-Definitionen-Arbeitsbereich (#649)
+
+vd-new = Neu erstellen
+vd-new-title = Neue View-Definition
+vd-rail-label = View-Definitionen
+vd-rail-heading = View-Definitionen
+vd-filter = Views filtern
+vd-none = Noch keine View-Definitionen.
+vd-empty-lede = Lege mit „Neu erstellen" die erste ViewDefinition an.
+vd-degraded = Die Liste der View-Definitionen konnte nicht geladen werden.
+vd-saved = Gespeichert.
+vd-run = Ausführen
+vd-run-failed = Die Ausführung der View ist fehlgeschlagen.
+vd-save = Speichern
+vd-duplicate = Duplizieren
+vd-delete = Löschen
+vd-delete-confirm = View-Definition „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
+vd-delete-failed = Die View-Definition konnte nicht gelöscht werden.
+vd-json-heading = Definition (JSON)
+vd-results-heading = Ergebnisse
+vd-results-empty = Die View hat keine Zeilen erzeugt.

@@ -682,6 +682,7 @@ async fn serve(
             outbound_auth,
             config.default_fhir_version,
             config.terminology_server.clone(),
+            config.base_url.clone(),
             config.max_body_size,
         )
     };

@@ -22,7 +22,7 @@ pub mod sink;
 
 pub use controller::{
     CompletedFile, ExportError, ExportJobController, ExportTask, ExportWork, JobStatus,
-    NamedSqlQuery, SqlExportLimits, SqlTableSource,
+    NamedSqlQuery, SqlExportLimits,
 };
 pub use in_memory::{CleanupConfig, InMemoryController};
 pub use planner::DEFAULT_SHARD_ROWS;

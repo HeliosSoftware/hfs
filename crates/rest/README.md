@@ -372,6 +372,15 @@ enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`. Aligns with the manifest's advertised 24h `Expires`. |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
 
+`$sql-run` and `$sql-export` both accept a repeating `context` parameter
+carrying ViewDefinitions or SQLView Libraries inline, matched to the
+subject's dependency graph by canonical URL at any depth. Resolution is
+**server-first**: for each dependency, storage is checked before `context`,
+so `context` only applies to URLs the server cannot resolve on its own — a
+`context` entry that duplicates an artifact the server already has is
+silently ignored (there is no channel to attach a warning to a streamed
+`$sql-run`/`$sql-export` response).
+
 Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
 job's already-written partial shards immediately; the reaper above reclaims
 *completed* jobs once they age past `HFS_EXPORT_OUTPUT_TTL`.

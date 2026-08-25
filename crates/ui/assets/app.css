@@ -1186,11 +1186,24 @@ button.pill {
   width: 100%;
   height: 40px;
   padding: 0 12px;
+  box-sizing: border-box;
   border: 1px solid var(--surface-border);
   border-radius: 10px;
   background: var(--input-bg, var(--surface));
   color: var(--text);
+  /* Form controls do not inherit the page font by default — a bare textarea
+     falls back to the UA's monospace (#685). */
+  font: inherit;
   font-size: 15px;
+}
+
+/* Multi-line variant (#685): sized by its rows= within the panel, never able
+   to widen the dialog. */
+textarea.field__input {
+  height: auto;
+  min-height: 64px;
+  padding: 8px 12px;
+  resize: vertical;
 }
 
 .field__input:focus {
@@ -1641,6 +1654,18 @@ button.pill {
 .btn:hover {
   background: var(--accent-soft);
   border-color: var(--accent);
+}
+
+/* The app's own focus indicator (#682): keyboard focus gets the accent ring,
+   and a mouse click never leaves the UA's default ring behind — buttons and
+   the <summary class="btn"> dialog toggles alike. */
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn:focus:not(:focus-visible) {
+  outline: none;
 }
 
 .btn--primary {
