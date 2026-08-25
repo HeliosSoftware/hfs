@@ -711,6 +711,7 @@ cap-title = Capability Statement
 cap-lede = Was dieser Server aktuell leistet, für den gewählten Tenant und die FHIR-Version — live aus /metadata zusammengesetzt.
 cap-summary-heading = Server-Übersicht
 cap-summary-description = Beschreibung
+cap-summary-url = Basis-URL
 cap-summary-fhir-version = FHIR-Version
 cap-summary-status = Status
 cap-summary-kind = Art
