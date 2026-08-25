@@ -273,6 +273,72 @@ impl PostgresSearchIndexWriter {
         Ok(rows.len())
     }
 
+    /// Builds one multi-row `INSERT` and its bind parameters.
+    ///
+    /// Split out so the correspondence between [`ROW_COLUMNS`] and the push
+    /// order below is assertable without a database: a column added to one and
+    /// not the other shifts every later value into the wrong column, which
+    /// Postgres accepts silently wherever the types happen to line up.
+    fn build_insert(
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        last_updated: DateTime<Utc>,
+        chunk: &[IndexRow],
+    ) -> (
+        String,
+        Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    ) {
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            Vec::with_capacity(chunk.len() * ROW_COLUMNS.len());
+        let mut tuples: Vec<String> = Vec::with_capacity(chunk.len());
+
+        for row in chunk {
+            let base = params.len();
+            let placeholders: Vec<String> = (1..=ROW_COLUMNS.len())
+                .map(|i| format!("${}", base + i))
+                .collect();
+            tuples.push(format!("({})", placeholders.join(", ")));
+
+            // Push order must match ROW_COLUMNS exactly.
+            params.push(Box::new(tenant_id.to_string()));
+            params.push(Box::new(resource_type.to_string()));
+            params.push(Box::new(resource_id.to_string()));
+            params.push(Box::new(last_updated));
+            params.push(Box::new(row.param_name.clone()));
+            params.push(Box::new(row.param_url.clone()));
+            params.push(Box::new(row.composite_group));
+            params.push(Box::new(row.value_string.clone()));
+            params.push(Box::new(row.value_string_folded.clone()));
+            params.push(Box::new(row.value_token_system.clone()));
+            params.push(Box::new(row.value_token_code.clone()));
+            params.push(Box::new(row.value_token_display.clone()));
+            params.push(Box::new(row.value_token_system_2.clone()));
+            params.push(Box::new(row.value_token_code_2.clone()));
+            params.push(Box::new(row.value_date));
+            params.push(Box::new(row.value_date_precision.clone()));
+            params.push(Box::new(row.value_number));
+            params.push(Box::new(row.value_number_2));
+            params.push(Box::new(row.value_quantity_value));
+            params.push(Box::new(row.value_quantity_unit.clone()));
+            params.push(Box::new(row.value_quantity_system.clone()));
+            params.push(Box::new(row.value_quantity_canonical_value));
+            params.push(Box::new(row.value_quantity_canonical_unit.clone()));
+            params.push(Box::new(row.value_reference.clone()));
+            params.push(Box::new(row.value_reference_display.clone()));
+            params.push(Box::new(row.value_identifier_type_system.clone()));
+            params.push(Box::new(row.value_identifier_type_code.clone()));
+            params.push(Box::new(row.value_uri.clone()));
+        }
+
+        let sql = format!(
+            "INSERT INTO search_index ({}) VALUES {}",
+            ROW_COLUMNS.join(", "),
+            tuples.join(", ")
+        );
+        (sql, params)
+    }
+
     /// Sends flattened rows as multi-row `INSERT`s of at most [`BATCH_ROWS`].
     ///
     /// One statement per 128 rows instead of one per row. Postgres commonly runs
@@ -288,53 +354,8 @@ impl PostgresSearchIndexWriter {
         rows: &[IndexRow],
     ) -> StorageResult<()> {
         for chunk in rows.chunks(BATCH_ROWS) {
-            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-                Vec::with_capacity(chunk.len() * ROW_COLUMNS.len());
-            let mut tuples: Vec<String> = Vec::with_capacity(chunk.len());
-
-            for row in chunk {
-                let base = params.len();
-                let placeholders: Vec<String> = (1..=ROW_COLUMNS.len())
-                    .map(|i| format!("${}", base + i))
-                    .collect();
-                tuples.push(format!("({})", placeholders.join(", ")));
-
-                // Push order must match ROW_COLUMNS exactly.
-                params.push(Box::new(tenant_id.to_string()));
-                params.push(Box::new(resource_type.to_string()));
-                params.push(Box::new(resource_id.to_string()));
-                params.push(Box::new(last_updated));
-                params.push(Box::new(row.param_name.clone()));
-                params.push(Box::new(row.param_url.clone()));
-                params.push(Box::new(row.composite_group));
-                params.push(Box::new(row.value_string.clone()));
-                params.push(Box::new(row.value_string_folded.clone()));
-                params.push(Box::new(row.value_token_system.clone()));
-                params.push(Box::new(row.value_token_code.clone()));
-                params.push(Box::new(row.value_token_display.clone()));
-                params.push(Box::new(row.value_token_system_2.clone()));
-                params.push(Box::new(row.value_token_code_2.clone()));
-                params.push(Box::new(row.value_date));
-                params.push(Box::new(row.value_date_precision.clone()));
-                params.push(Box::new(row.value_number));
-                params.push(Box::new(row.value_number_2));
-                params.push(Box::new(row.value_quantity_value));
-                params.push(Box::new(row.value_quantity_unit.clone()));
-                params.push(Box::new(row.value_quantity_system.clone()));
-                params.push(Box::new(row.value_quantity_canonical_value));
-                params.push(Box::new(row.value_quantity_canonical_unit.clone()));
-                params.push(Box::new(row.value_reference.clone()));
-                params.push(Box::new(row.value_reference_display.clone()));
-                params.push(Box::new(row.value_identifier_type_system.clone()));
-                params.push(Box::new(row.value_identifier_type_code.clone()));
-                params.push(Box::new(row.value_uri.clone()));
-            }
-
-            let sql = format!(
-                "INSERT INTO search_index ({}) VALUES {}",
-                ROW_COLUMNS.join(", "),
-                tuples.join(", ")
-            );
+            let (sql, params) =
+                Self::build_insert(tenant_id, resource_type, resource_id, last_updated, chunk);
             let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
                 .iter()
                 .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
@@ -654,5 +675,107 @@ mod tests {
                 "{value:?} must not resolve to a timestamp"
             );
         }
+    }
+
+    use crate::search::extractor::ExtractedValue;
+    use crate::types::DatePrecision;
+
+    fn extracted(value: IndexValue) -> ExtractedValue {
+        ExtractedValue {
+            param_name: "p".to_string(),
+            param_url: "http://example.org/p".to_string(),
+            param_type: crate::types::SearchParamType::String,
+            value,
+            composite_group: None,
+            composite_slot: None,
+        }
+    }
+
+    fn row_of(value: IndexValue) -> IndexRow {
+        IndexRow::from_extracted(&extracted(value), "Observation", "abc")
+            .expect("value should map to a row")
+    }
+
+    /// The push order in `build_insert` and `ROW_COLUMNS` are maintained by
+    /// hand. If they drift, every value after the divergence lands in the wrong
+    /// column — and Postgres accepts that silently wherever the types line up,
+    /// so the index is corrupted rather than the write rejected.
+    #[test]
+    fn bind_count_matches_the_column_list() {
+        let now = Utc::now();
+        for rows in [1usize, 3, BATCH_ROWS] {
+            let chunk: Vec<IndexRow> = (0..rows)
+                .map(|_| row_of(IndexValue::String("x".to_string())))
+                .collect();
+            let (sql, params) =
+                PostgresSearchIndexWriter::build_insert("t", "Observation", "abc", now, &chunk);
+            assert_eq!(
+                params.len(),
+                rows * ROW_COLUMNS.len(),
+                "bind count must equal columns x rows"
+            );
+            assert_eq!(
+                sql.matches('$').count(),
+                rows * ROW_COLUMNS.len(),
+                "every bind needs a placeholder"
+            );
+            // Placeholders must run 1..=n with no gap or repeat.
+            assert!(sql.contains(&format!("${}", rows * ROW_COLUMNS.len())));
+            assert!(!sql.contains(&format!("${}", rows * ROW_COLUMNS.len() + 1)));
+        }
+    }
+
+    #[test]
+    fn each_value_kind_lands_in_its_own_columns() {
+        let string = row_of(IndexValue::String("Smith".to_string()));
+        assert_eq!(string.value_string.as_deref(), Some("Smith"));
+        assert!(
+            string.value_string_folded.is_some(),
+            "string is folded on write"
+        );
+        assert!(string.value_token_code.is_none());
+
+        let token = row_of(IndexValue::Token {
+            system: Some("http://loinc.org".to_string()),
+            code: "8302-2".to_string(),
+            display: Some("Body height".to_string()),
+            identifier_type_system: Some("http://ts".to_string()),
+            identifier_type_code: Some("MR".to_string()),
+        });
+        assert_eq!(
+            token.value_token_system.as_deref(),
+            Some("http://loinc.org")
+        );
+        assert_eq!(token.value_token_code.as_deref(), Some("8302-2"));
+        assert_eq!(token.value_token_display.as_deref(), Some("Body height"));
+        assert_eq!(token.value_identifier_type_code.as_deref(), Some("MR"));
+        assert!(token.value_string.is_none());
+
+        let reference = row_of(IndexValue::Reference {
+            reference: "Patient/1".to_string(),
+            resource_type: Some("Patient".to_string()),
+            resource_id: Some("1".to_string()),
+            display: Some("Jane".to_string()),
+        });
+        assert_eq!(reference.value_reference.as_deref(), Some("Patient/1"));
+        assert_eq!(reference.value_reference_display.as_deref(), Some("Jane"));
+
+        let uri = row_of(IndexValue::Uri("http://x".to_string()));
+        assert_eq!(uri.value_uri.as_deref(), Some("http://x"));
+
+        let number = row_of(IndexValue::Number(4.0));
+        assert_eq!(number.value_number, Some(4.0));
+        assert!(number.value_quantity_value.is_none());
+    }
+
+    /// An unparseable date skips its row rather than being stored at ingestion
+    /// time, which would make `date=gt<any past date>` match it (#494).
+    #[test]
+    fn an_unparseable_date_yields_no_row() {
+        let bad = IndexValue::Date {
+            value: "not-a-date".to_string(),
+            precision: DatePrecision::Day,
+        };
+        assert!(IndexRow::from_extracted(&extracted(bad), "Observation", "abc").is_none());
     }
 }
