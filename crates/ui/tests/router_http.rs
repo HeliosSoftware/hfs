@@ -900,10 +900,17 @@ async fn resources_deep_links_focus_the_selected_type() {
     // list is a flat rail in the content under the fixed page head (app-shell
     // pattern shared with Search Parameters), not a full-height menu panel.
     assert!(html.contains(r#"data-selected-type="Observation""#));
-    assert!(html.contains(
-        r#"data-type="Observation" data-full-name="Observation"
-   href="/ui/resources?type=Observation" title="Observation" aria-current="true""#
-    ));
+    // Debug-printed on failure so a byte-level mismatch (a stray CR, an
+    // attribute drift) is visible in CI output instead of a blind false.
+    let anchor = r#"data-type="Observation" data-full-name="Observation""#;
+    let expected = r#"data-type="Observation" data-full-name="Observation"
+   href="/ui/resources?type=Observation" title="Observation" aria-current="true""#;
+    assert!(
+        html.contains(expected),
+        "rail entry mismatch; rendered around the anchor: {:?}",
+        html.find(anchor)
+            .map(|i| &html[i..html.len().min(i + 220)]),
+    );
     assert!(html.contains(r#"class="filter-rail" id="resources""#));
     // Create and the builder prefill both follow the deep-linked type.
     assert!(html.contains("Create new Observation"));
