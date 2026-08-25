@@ -48,6 +48,9 @@ pub struct PostgresTransaction {
     search_extractor: Arc<SearchParameterExtractor>,
     /// When true, search indexing is offloaded to a secondary backend.
     search_offloaded: bool,
+    /// The `search_index` layout, so writes in this transaction take the same
+    /// composite shape the read path will look for.
+    index_layout: super::schema::IndexLayout,
     /// The FHIR version writes in this transaction are stamped with.
     fhir_version: FhirVersion,
 }
@@ -69,6 +72,7 @@ impl PostgresTransaction {
         search_extractor: Arc<SearchParameterExtractor>,
         search_offloaded: bool,
         fhir_version: FhirVersion,
+        index_layout: super::schema::IndexLayout,
     ) -> StorageResult<Self> {
         // Start the transaction
         client.execute("BEGIN", &[]).await.map_err(|e| {
@@ -84,6 +88,7 @@ impl PostgresTransaction {
             search_extractor,
             search_offloaded,
             fhir_version,
+            index_layout,
         })
     }
 
@@ -133,6 +138,7 @@ impl PostgresTransaction {
             resource_type,
             resource_id,
             last_updated,
+            self.index_layout,
             values,
         )
         .await?;
@@ -595,6 +601,7 @@ impl TransactionProvider for PostgresBackend {
             std::sync::Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
             self.is_search_offloaded(),
             options.fhir_version.unwrap_or(self.config().fhir_version),
+            self.index_layout(),
         )
         .await
     }

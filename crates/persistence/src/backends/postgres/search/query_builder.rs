@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::backends::postgres::schema::IndexLayout;
 use crate::search::fold_text;
 use crate::types::{
     CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
@@ -263,11 +264,28 @@ impl PostgresQueryBuilder {
     /// Returns a SQL fragment that selects DISTINCT resource_ids from search_index
     /// matching the given search parameters.
     pub fn build_search_query(query: &SearchQuery, param_offset: usize) -> Option<SqlFragment> {
+        Self::build_search_query_for(query, param_offset, IndexLayout::Denormalized)
+    }
+
+    /// As [`Self::build_search_query`], but emitting the form that matches the
+    /// database's actual `search_index` layout.
+    ///
+    /// Only composite search differs. Under [`IndexLayout::Denormalized`] every
+    /// component of one composite instance shares a row, so the match is a plain
+    /// conjunction. A database that predates v17 still stores one row per
+    /// component, where that conjunction matches nothing at all — the search
+    /// silently returns an empty bundle rather than failing.
+    pub fn build_search_query_for(
+        query: &SearchQuery,
+        param_offset: usize,
+        layout: IndexLayout,
+    ) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
         let mut current_offset = param_offset;
 
         for param in &query.parameters {
-            if let Some(condition) = Self::build_parameter_condition(param, current_offset) {
+            if let Some(condition) = Self::build_parameter_condition(param, current_offset, layout)
+            {
                 current_offset += condition.params.len();
                 conditions.push(condition);
             }
@@ -472,8 +490,11 @@ impl PostgresQueryBuilder {
         let inner = sql
             .strip_prefix(Self::INDEX_MEMBERSHIP_PREFIX)?
             .strip_suffix(')')?;
-        // Defensive: nothing that still mentions the table can be a lone test.
-        if inner.contains("FROM search_index") {
+        // Defensive: nothing that still mentions the table can be a lone test,
+        // and the legacy composite form is an aggregate rather than a row
+        // predicate — splicing it into a `SELECT DISTINCT ... ORDER BY` would be
+        // nonsense. (Layouts are mutually exclusive, so this is belt and braces.)
+        if inner.contains("FROM search_index") || inner.contains("GROUP BY") {
             return None;
         }
         Some(inner)
@@ -533,6 +554,7 @@ impl PostgresQueryBuilder {
     fn build_parameter_condition(
         param: &SearchParameter,
         param_offset: usize,
+        layout: IndexLayout,
     ) -> Option<SqlFragment> {
         if param.values.is_empty() {
             return None;
@@ -575,7 +597,10 @@ impl PostgresQueryBuilder {
             SearchParamType::Quantity => Self::build_quantity_condition(param, param_offset),
             SearchParamType::Reference => Self::build_reference_condition(param, param_offset),
             SearchParamType::Uri => Self::build_uri_condition(param, param_offset),
-            SearchParamType::Composite => Self::build_composite_condition(param, param_offset),
+            SearchParamType::Composite => match layout {
+                IndexLayout::Denormalized => Self::build_composite_condition(param, param_offset),
+                IndexLayout::Legacy => Self::build_composite_condition_legacy(param, param_offset),
+            },
             SearchParamType::Special => None,
         }
     }
@@ -1104,6 +1129,107 @@ impl PostgresQueryBuilder {
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' \
                  AND composite_group IS NOT NULL AND {})",
                 param.name, conjunction
+            ));
+        }
+
+        if value_conditions.is_empty() {
+            return None;
+        }
+        Some(SqlFragment::with_params(
+            value_conditions.join(" OR "),
+            all_params,
+        ))
+    }
+
+    /// Composite search against a pre-v17 `search_index`, where each component of
+    /// a composite instance is its own row.
+    ///
+    /// A resource matches only when every component is satisfied by some row
+    /// *within the same* `composite_group` — that grouping is what stops a blood
+    /// pressure panel's systolic value from pairing with its diastolic code, so
+    /// the GROUP BY / HAVING structure is load-bearing.
+    ///
+    /// The WHERE prefilter is result-preserving: a row satisfying no component
+    /// contributes 0 to every `MAX(CASE ...)` in the HAVING, so it can never turn
+    /// a 0 into a 1, and a group the prefilter empties could not have satisfied
+    /// the HAVING anyway. Without it the subquery aggregates the resource type's
+    /// entire composite slice on every request (#224's timeout).
+    ///
+    /// This is the pre-#279 form, restored verbatim in behaviour. It is slow —
+    /// that slowness is exactly why the denormalized layout exists — but it is
+    /// correct against rows the denormalized conjunction cannot match at all.
+    /// Components read the base value columns (slot 1): the `_2` columns only
+    /// exist to pack two same-type components into one denormalized row.
+    fn build_composite_condition_legacy(
+        param: &SearchParameter,
+        offset: usize,
+    ) -> Option<SqlFragment> {
+        if param.components.is_empty() {
+            return None;
+        }
+
+        let mut value_conditions = Vec::new();
+        let mut all_params: Vec<SqlParam> = Vec::new();
+        let mut current = offset;
+
+        for value in &param.values {
+            let parts: Vec<&str> = value.value.split('$').collect();
+            if parts.len() != param.components.len() {
+                value_conditions.push("1 = 0".to_string());
+                continue;
+            }
+
+            // Stage this value's params and commit them only once every component
+            // has parsed, so a component that fails midway cannot leave its
+            // predecessors bound with no placeholder in the final statement.
+            let mut staged_params: Vec<SqlParam> = Vec::new();
+            let mut predicates: Vec<String> = Vec::new();
+            let mut next = current;
+            let mut ok = true;
+
+            for (part, component) in parts.iter().zip(param.components.iter()) {
+                let cv = Self::parse_component_value(part);
+                match Self::build_composite_component(&cv, component.param_type, next, 1) {
+                    Some((sql, params)) => {
+                        next += params.len();
+                        staged_params.extend(params);
+                        predicates.push(sql);
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if !ok || predicates.is_empty() {
+                value_conditions.push("1 = 0".to_string());
+                continue;
+            }
+
+            current = next;
+            all_params.extend(staged_params);
+
+            let havings = predicates
+                .iter()
+                .map(|p| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", p))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            // Parenthesize each component before OR-ing: a token component emits
+            // `sys = $n AND code = $m`, and relying on AND-before-OR precedence is
+            // a trap for the next component type someone adds.
+            let prefilter = predicates
+                .iter()
+                .map(|p| format!("({})", p))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+
+            value_conditions.push(format!(
+                "id IN (SELECT resource_id FROM search_index \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' \
+                 AND ({}) \
+                 GROUP BY resource_id, composite_group HAVING {})",
+                param.name, prefilter, havings
             ));
         }
 
@@ -1882,6 +2008,96 @@ mod tests {
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
 
         assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
+
+    #[test]
+    fn legacy_layout_keeps_the_grouped_composite_form() {
+        // A database that predates v17 stores one row per composite component.
+        // The denormalized conjunction matches none of them, and would return an
+        // empty bundle rather than an error — so the layout must select the form.
+        let param = SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "http://loinc.org|8480-6$lt60",
+            )],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value".to_string(),
+                },
+            ],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+
+        let legacy = PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy)
+            .expect("legacy composite condition");
+        assert!(
+            legacy
+                .sql
+                .contains("GROUP BY resource_id, composite_group HAVING"),
+            "grouping is what confines components to one composite instance: {}",
+            legacy.sql
+        );
+        assert!(
+            legacy.sql.contains("MAX(CASE WHEN"),
+            "per-component HAVING must survive: {}",
+            legacy.sql
+        );
+        // Components read the base columns; the `_2` columns exist only to pack
+        // two same-type components into one denormalized row.
+        assert!(!legacy.sql.contains("value_token_code_2"), "{}", legacy.sql);
+
+        let flat =
+            PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Denormalized)
+                .expect("denormalized composite condition");
+        assert!(!flat.sql.contains("GROUP BY"), "{}", flat.sql);
+        assert!(
+            flat.sql.contains("composite_group IS NOT NULL"),
+            "{}",
+            flat.sql
+        );
+
+        // Both forms must bind the same values, or the two layouts would disagree
+        // about what was searched for.
+        assert_eq!(legacy.params.len(), flat.params.len());
+    }
+
+    #[test]
+    fn the_legacy_composite_form_is_never_taken_as_a_fast_path() {
+        // It is an aggregate, not a row predicate; splicing it into a
+        // `SELECT DISTINCT ... ORDER BY` would be nonsense.
+        let param = SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "http://loinc.org|8480-6$lt60",
+            )],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value".to_string(),
+                },
+            ],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let legacy = PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy)
+            .expect("condition");
+        assert!(PostgresQueryBuilder::single_index_predicate(&legacy.sql).is_none());
     }
 
     #[test]

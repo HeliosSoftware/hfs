@@ -1089,6 +1089,7 @@ impl PostgresBackend {
                     resource_type,
                     resource_id,
                     last_updated,
+                    self.index_layout(),
                     values,
                 )
                 .await?;
@@ -3198,6 +3199,7 @@ impl ReindexTarget for PostgresBackend {
             resource_type,
             resource_id,
             resource.last_modified(),
+            self.index_layout(),
             values,
         )
         .await?;

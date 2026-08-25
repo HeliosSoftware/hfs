@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::backends::postgres::schema::IndexLayout;
 use crate::error::{BackendError, StorageResult};
 use crate::search::{converters::IndexValue, extractor::ExtractedValue};
 
@@ -247,9 +248,10 @@ impl PostgresSearchIndexWriter {
         resource_type: &str,
         resource_id: &str,
         last_updated: DateTime<Utc>,
+        layout: IndexLayout,
         values: Vec<ExtractedValue>,
     ) -> StorageResult<usize> {
-        let (plain, composites) = super::composite_rows::fold_composites(values);
+        let (plain, composites) = Self::split_for_layout(values, layout);
 
         let mut rows: Vec<IndexRow> = Vec::with_capacity(plain.len() + composites.len());
         for value in &plain {
@@ -271,6 +273,26 @@ impl PostgresSearchIndexWriter {
         )
         .await?;
         Ok(rows.len())
+    }
+
+    /// Splits extracted values into the row shapes the database's layout expects.
+    ///
+    /// A pre-v17 database is read with the grouped composite form, which only
+    /// understands one row per component. Folding anyway would leave the table
+    /// holding both shapes at once, matching neither reliably — and silently,
+    /// since a composite miss returns an empty bundle rather than an error. So
+    /// the write side follows the same marker the read side does.
+    fn split_for_layout(
+        values: Vec<ExtractedValue>,
+        layout: IndexLayout,
+    ) -> (
+        Vec<ExtractedValue>,
+        Vec<super::composite_rows::CompositeRow>,
+    ) {
+        match layout {
+            IndexLayout::Denormalized => super::composite_rows::fold_composites(values),
+            IndexLayout::Legacy => (values, Vec::new()),
+        }
     }
 
     /// Builds one multi-row `INSERT` and its bind parameters.
@@ -694,6 +716,39 @@ mod tests {
     fn row_of(value: IndexValue) -> IndexRow {
         IndexRow::from_extracted(&extracted(value), "Observation", "abc")
             .expect("value should map to a row")
+    }
+
+    /// A pre-v17 database is read with the grouped composite form, which only
+    /// understands one row per component. If the write path folded anyway, the
+    /// table would hold both shapes and the read form would match neither
+    /// reliably — silently, since a composite miss returns an empty bundle.
+    #[test]
+    fn the_layout_decides_the_composite_row_shape() {
+        let component = |code: &str, slot: u8| ExtractedValue {
+            param_name: "code-value-quantity".to_string(),
+            param_url: "http://example.org/cvq".to_string(),
+            param_type: crate::types::SearchParamType::Composite,
+            value: IndexValue::Token {
+                system: Some("http://loinc.org".to_string()),
+                code: code.to_string(),
+                display: None,
+                identifier_type_system: None,
+                identifier_type_code: None,
+            },
+            composite_group: Some(1),
+            composite_slot: Some(slot),
+        };
+        let values = vec![component("8480-6", 1), component("8462-4", 2)];
+
+        let (plain, folded) =
+            PostgresSearchIndexWriter::split_for_layout(values.clone(), IndexLayout::Denormalized);
+        assert_eq!(folded.len(), 1, "the pair folds into one row");
+        assert!(plain.is_empty(), "nothing is left unfolded");
+
+        let (plain, folded) =
+            PostgresSearchIndexWriter::split_for_layout(values, IndexLayout::Legacy);
+        assert_eq!(plain.len(), 2, "one row per component");
+        assert!(folded.is_empty(), "nothing is folded on a legacy layout");
     }
 
     /// The push order in `build_insert` and `ROW_COLUMNS` are maintained by
