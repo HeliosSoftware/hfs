@@ -30,7 +30,7 @@
 (function () {
   "use strict";
 
-  var MAX_RECENT = 3;
+  var MAX_RECENT = 5;
   var DEFAULT_LIST_ID = "sp-rail-list";
   var DEFAULT_ITEM_SELECTOR = "a.filter-rail__item";
   var DEFAULT_ATTR = "data-type";
@@ -246,15 +246,13 @@
    `aria-current` item (the deep-linked type, or the default Patient the page
    scripts mark on load) sits near the middle of the list instead of below
    the fold. Runs on window load, after the deferred page scripts have marked
-   the selection. When a recent-group clone also carries the mark, the last
-   match is the main-list occurrence, which is the one worth revealing. */
+   the selection. Recent clones live outside the scrolling list. */
 (function () {
   "use strict";
   window.addEventListener("load", function () {
     document.querySelectorAll(".filter-rail__list").forEach(function (list) {
-      var marked = list.querySelectorAll('[aria-current="true"]');
-      if (!marked.length) return;
-      var current = marked[marked.length - 1];
+      var current = list.querySelector('[aria-current="true"]');
+      if (!current) return;
       var offset =
         current.getBoundingClientRect().top - list.getBoundingClientRect().top;
       var target = list.scrollTop + offset - (list.clientHeight - current.offsetHeight) / 2;

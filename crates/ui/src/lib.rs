@@ -2521,14 +2521,16 @@ mod tests {
         assert!(html.contains("data-addbox-close"));
         // Resource picker rail (#541): a real link per type, server-marked
         // current; no count without a dashboard provider.
-        assert!(html.contains(
-            r#"data-type="Patient" data-full-name="Patient"
-   href="/ui/queries?type=Patient""#
-        ));
-        assert!(html.contains(
-            r#"data-type="Observation" data-full-name="Observation"
-   href="/ui/queries?type=Observation""#
-        ));
+        for resource_type in ["Patient", "Observation"] {
+            let attributes =
+                format!(r#"data-type="{resource_type}" data-full-name="{resource_type}""#);
+            let href = format!(r#"href="/ui/queries?type={resource_type}""#);
+            assert!(
+                html.contains(&attributes),
+                "{resource_type} rail attributes"
+            );
+            assert!(html.contains(&href), "{resource_type} rail link");
+        }
         assert!(!html.contains(r#"class="count""#));
         // Saved Queries has no nav entry any more (#282 folded search / editor
         // / history / saved-queries into Resources); the route still renders.
