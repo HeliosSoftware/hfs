@@ -311,14 +311,21 @@ time dropping from tens of milliseconds to microseconds.
 
 ### Performance Benchmarks
 
-| Mode | Dataset | Time | Memory | Notes |
-|------|---------|------|--------|-------|
-| **Batch** | 10k Patients | ~2.7s | 1.6 GB | All resources in memory |
-| **Streaming** | 10k Patients | ~0.9s | 45 MB | 35x less memory, 2.9x faster |
-| **Batch** | 93k Encounters | ~4s | 3.9 GB | All resources in memory |
-| **Streaming** | 93k Encounters | ~2.8s | 25 MB | 155x less memory, 1.4x faster |
+Measured with `scripts/bench_threading.py` (a 7-column Patient ViewDefinition;
+Windows 11, 12 logical CPUs, Python 3.11, release build with mimalloc):
 
-Streaming mode (`ChunkedProcessor`, `process_ndjson_to_file`) is recommended for large NDJSON files.
+| Path | Dataset | Throughput |
+|------|---------|-----------|
+| **Batch** (dict input) | 2,000-patient bundle | ~28k patients/sec |
+| **Batch** (JSON `str` input) | 2,000-patient bundle | ~31k patients/sec |
+| **Streaming** (`process_ndjson_to_file`) | 5,000-patient NDJSON | ~31k patients/sec |
+
+Numbers vary with hardware and ViewDefinition complexity — re-run
+`scripts/bench_threading.py` on your target machine.
+
+Streaming mode (`ChunkedProcessor`, `process_ndjson_to_file`) keeps memory
+bounded by `chunk_size` regardless of input size, so it is recommended for
+large NDJSON files; batch mode holds the whole bundle and result in memory.
 
 ### Controlling Thread Count (RAYON_NUM_THREADS)
 
