@@ -10,6 +10,17 @@
 
   function close(box) {
     box.removeAttribute("open");
+    /* Every close this script performs is a dismissal, so the dialog starts
+       blank next time (#682). The failure path never comes through here — an
+       errored submit re-renders inside the still-open panel — and success
+       paths (e.g. tenants.js) reset on their own before closing. */
+    box.querySelectorAll("form").forEach(function (form) {
+      form.reset();
+    });
+    /* Keep focus in a sensible place after Esc / the × removes the panel the
+       focus was in. An outside click keeps its own target's focus. */
+    var summary = box.querySelector("summary");
+    if (summary && box.contains(document.activeElement)) summary.focus();
   }
 
   document.addEventListener("keydown", function (event) {
