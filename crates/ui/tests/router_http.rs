@@ -1352,6 +1352,7 @@ async fn sql_export_and_files_follow_a_job_through_the_manifest() {
         std::sync::Arc::new(source),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     // The form offers both stored subjects.
@@ -1456,6 +1457,7 @@ async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
         std::sync::Arc::new(source),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     // The Queries page lists only the sql-query Library and decodes its SQL.
@@ -1547,6 +1549,7 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
         std::sync::Arc::new(source),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     let response = app
@@ -1619,6 +1622,7 @@ async fn view_definitions_save_roundtrips_and_rejects_bad_json() {
         std::sync::Arc::new(source),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     let body = "id=&action=save&json=%7B%22resourceType%22%3A%22ViewDefinition%22%2C%22name%22%3A%22x%22%7D";
