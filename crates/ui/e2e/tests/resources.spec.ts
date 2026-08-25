@@ -10,7 +10,11 @@ test("the type rail lists the full resource-type set", async ({ resources }) => 
   const types = await resources.railTypes();
   // The R4 Patient compartment enumerates the whole resource set (145 types).
   expect(types.length).toBeGreaterThan(140);
-  expect(types).toEqual(expect.arrayContaining(["Patient", "Observation", "Encounter", "Bundle"]));
+  // ViewDefinition rides the generated-enum union (#648), not the spec's
+  // compartment enumeration.
+  expect(types).toEqual(
+    expect.arrayContaining(["Patient", "Observation", "Encounter", "Bundle", "ViewDefinition"]),
+  );
 });
 
 test("the rail filter narrows the visible types", async ({ resources }) => {

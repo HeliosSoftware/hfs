@@ -1,0 +1,9 @@
+# Content that is embedded into the binary byte-verbatim (Askama templates,
+# fluent locales, rust-embed text assets) must check out with LF everywhere:
+# rendered output is compared against LF string literals in tests, and a CRLF
+# Windows checkout fails every multi-line assertion of rendered HTML (#671).
+# Binary assets (fonts, images) carry no attribute and stay untouched.
+crates/ui/templates/** text eol=lf
+crates/ui/assets/**/*.js text eol=lf
+crates/ui/assets/**/*.css text eol=lf
+locales/** text eol=lf
