@@ -5,6 +5,7 @@
   "description": "Browser-level (Playwright + axe-core) conformance tests for crates/ui (helios-ui). Self-contained: nothing here touches the cargo workspace.",
   "scripts": {
     "test": "playwright test",
+    "test:unit": "node --test unit/*.test.cjs",
     "test:ui": "playwright test --ui",
     "report": "playwright show-report",
     "install-browsers": "playwright install --with-deps chromium"

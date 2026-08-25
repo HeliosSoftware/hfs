@@ -147,7 +147,7 @@ test("the recently-used group caps at five, keeps MRU order, deduplicates, and p
   // reflects the picks above once the page (re)loads.
   await resources.goto("Patient");
   await expect(resources.recentGroup).toBeVisible();
-  // The divider and "All types" heading (#603 follow-up) give the general
+  // The divider and "All Types" heading (#603 follow-up) give the general
   // list its own clearly separated section once Recently used has entries.
   await expect(resources.recentDivider).toBeVisible();
   await expect(resources.generalHeading).toBeVisible();
@@ -170,7 +170,7 @@ test("the recently-used group caps at five, keeps MRU order, deduplicates, and p
   }
 });
 
-test("the type rails keep recents and the All types heading fixed while type items scroll", async ({
+test("the type rails keep recents and the All Types heading fixed while type items scroll", async ({
   resources,
   page,
 }) => {

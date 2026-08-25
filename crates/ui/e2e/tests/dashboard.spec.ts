@@ -132,6 +132,7 @@ test("\"View all resources\" offers empty types, charts a flat line at 0, and ke
   page,
   dashboard,
 }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
 

@@ -94,7 +94,7 @@ async fn the_list_page_renders_and_offers_creation() {
     let (status, html) = get(&settings, "/ui/bulk-import").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Bulk Import"));
-    assert!(html.contains("New submission"));
+    assert!(html.contains("New Submission"));
     assert!(html.contains("No submissions yet"));
 }
 

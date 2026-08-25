@@ -56,16 +56,16 @@ fn assert_recent_types_are_pinned_above_the_list(html: &str) {
     let divider = html
         .find(r#"class="filter-rail__divider""#)
         .expect("recent-types divider");
-    let all_types = html.find(">All types<").expect("All types heading");
+    let all_types = html.find(">All Types<").expect("All Types heading");
     let list = html
         .find(r#"id="type-rail-list""#)
         .expect("scrollable type list");
 
     assert!(recent < divider, "Recently used must precede its divider");
-    assert!(divider < all_types, "the divider must precede All types");
+    assert!(divider < all_types, "the divider must precede All Types");
     assert!(
         all_types < list,
-        "Recently used and All types must stay outside the scrollable list"
+        "Recently used and All Types must stay outside the scrollable list"
     );
 }
 
@@ -110,8 +110,8 @@ async fn dashboard_renders_job_cards_with_unavailable_state_when_no_provider() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    assert!(html.contains("Export jobs"));
-    assert!(html.contains("Import jobs"));
+    assert!(html.contains("Export Jobs"));
+    assert!(html.contains("Import Jobs"));
     assert!(html.contains(r#"href="/ui/bulk-export""#));
     assert!(html.contains(r#"href="/ui/bulk-import""#));
     assert!(html.contains("unavailable"));
@@ -193,7 +193,11 @@ async fn status_is_a_fragment_for_htmx_and_varies_on_the_header() {
 
 #[tokio::test]
 async fn embedded_assets_are_served() {
-    for asset in ["/ui/assets/htmx.min.js", "/ui/assets/app.css"] {
+    for asset in [
+        "/ui/assets/htmx.min.js",
+        "/ui/assets/app.css",
+        "/ui/assets/fhir-search-value.js",
+    ] {
         let response = app()
             .oneshot(Request::get(asset).body(Body::empty()).unwrap())
             .await
@@ -263,14 +267,14 @@ async fn search_parameters_page_serves_the_registry_view() {
     // This page, not Home, carries aria-current in the sidebar.
     assert!(html.contains(r#"href="/ui/search-parameters" aria-current="page""#));
     // The rail matches the flat Resources look (#603 follow-up): no bordered
-    // card wrapper, and a divider + "All types" heading separate the
+    // card wrapper, and a divider + "All Types" heading separate the
     // Recently used group from the general list.
     assert!(!html.contains(r#"class="card filter-rail""#));
     assert!(html.contains(r#"class="filter-rail""#));
     assert!(html.contains(r#"class="filter-rail__divider""#));
-    // "All types" now renders twice: the new section heading, and the
+    // "All Types" now renders twice: the new section heading, and the
     // existing "clear filter" row it sits above.
-    assert_eq!(html.matches(">All types<").count(), 2);
+    assert_eq!(html.matches(">All Types<").count(), 2);
     let long_name = "MedicinalProductUndesirableEffect";
     assert!(html.contains(&format!(
         r#"data-type="{long_name}" data-full-name="{long_name}""#
@@ -776,7 +780,7 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     let recent_tag_end = html[recent_start..].find('>').unwrap() + recent_start;
     assert!(html[recent_start..recent_tag_end].contains("hidden"));
     assert!(html.contains(r#"src="/ui/assets/resource-filter.js" defer"#));
-    // A divider and an "All types" heading separate the Recently used group
+    // A divider and an "All Types" heading separate the Recently used group
     // from the general list (#603 follow-up), between the recent group and
     // the rail items.
     assert_recent_types_are_pinned_above_the_list(&html);

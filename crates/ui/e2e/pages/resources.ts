@@ -76,7 +76,7 @@ export class ResourcesPage {
   get generalHeading(): Locator {
     return this.page.locator(
       "#type-rail-recent + .filter-rail__divider + .filter-rail__heading--group",
-      { hasText: "All types" },
+      { hasText: "All Types" },
     );
   }
 

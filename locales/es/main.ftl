@@ -334,6 +334,7 @@ queries-recent = Recientes
 queries-recent-heading = Búsquedas recientes
 queries-recent-empty = Aún no hay búsquedas recientes — ejecuta una para registrarla aquí.
 queries-invalid-url = Escribe una búsqueda como GET /Patient?name=smith — el tipo de recurso sale de la ruta.
+queries-invalid-fhir-escape = Esta consulta contiene un escape FHIR no válido. Corrige el valor escapado antes de editarlo visualmente.
 
 queries-conditions = Condiciones
 queries-add-condition = Añadir condición
