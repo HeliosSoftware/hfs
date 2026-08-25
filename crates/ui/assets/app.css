@@ -1992,6 +1992,14 @@ button.pill {
   align-items: start;
 }
 
+/* Stacked section cards keep the page's vertical rhythm. Pages that lay
+   cards out in a flex/grid column get their spacing from the gap; this
+   covers the block-flow stacks (SQL Export, Files, Capability Statement),
+   where .card alone sat flush against the previous one. */
+.content > .card + .card {
+  margin-top: 20px;
+}
+
 .filter-layout--two {
   grid-template-columns: 280px minmax(0, 1fr);
 }
