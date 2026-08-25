@@ -9,6 +9,7 @@ export const ROUTES = [
   "/ui",
   "/ui/resources",
   "/ui/batch",
+  "/ui/capability-statement",
   "/ui/compartments",
   "/ui/search-parameters",
   "/ui/terminology",
