@@ -47,7 +47,12 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
 
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    String::from_utf8(bytes.to_vec()).unwrap()
+    // Normalized to LF: what line endings the response carries depends on how
+    // the build checkout materialized the templates (#671), which is exactly
+    // what these assertions must not depend on.
+    String::from_utf8(bytes.to_vec())
+        .unwrap()
+        .replace("\r\n", "\n")
 }
 
 fn assert_recent_types_are_pinned_above_the_list(html: &str) {
@@ -907,8 +912,9 @@ async fn resources_deep_links_focus_the_selected_type() {
     // Debug-printed on failure so a byte-level mismatch (a stray CR, an
     // attribute drift) is visible in CI output instead of a blind false.
     let anchor = r#"data-type="Observation" data-full-name="Observation""#;
-    let expected = r#"data-type="Observation" data-full-name="Observation"
-   href="/ui/resources?type=Observation" title="Observation" aria-current="true""#;
+    // Explicit \n, not a raw literal spanning source lines: the literal must
+    // not inherit whatever endings this file was checked out with.
+    let expected = "data-type=\"Observation\" data-full-name=\"Observation\"\n   href=\"/ui/resources?type=Observation\" title=\"Observation\" aria-current=\"true\"";
     assert!(
         html.contains(expected),
         "rail entry mismatch; rendered around the anchor: {:?}",
