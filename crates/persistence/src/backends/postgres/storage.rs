@@ -32,15 +32,23 @@ use super::search::writer::PostgresSearchIndexWriter;
 
 /// Whether a resource being indexed can already have `search_index` rows.
 ///
-/// `search_index` is declared `FOREIGN KEY (tenant_id, resource_type, resource_id)
-/// REFERENCES resources ... ON DELETE CASCADE`, so an index row cannot outlive
-/// its resource. A create path that has already established no `resources` row
-/// exists has therefore also established there is nothing to clear, and the
-/// clearing `DELETE` is a guaranteed no-op — one round trip per created
-/// resource, on the path a bulk import takes for every resource it writes.
+/// `Fresh` asserts that nothing is indexed under this id, so the clearing
+/// `DELETE` can be skipped — one round trip on paths a bulk import takes for
+/// every resource it writes. Two situations establish it:
+///
+/// - A create that has already inserted the `resources` row. `search_index` is
+///   declared `FOREIGN KEY (tenant_id, resource_type, resource_id) REFERENCES
+///   resources ... ON DELETE CASCADE`, so an index row cannot outlive its
+///   resource; no prior row means nothing to clear.
+/// - A caller that has just run [`PostgresBackend::delete_search_index`], which
+///   clears `search_index` and `resource_fts` together.
+///
+/// Claiming `Fresh` wrongly leaves stale index rows behind — a resource that
+/// still matches searches for values it no longer has — so it is an explicit
+/// enum rather than a bool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexWrite {
-    /// The resource is new; nothing can be indexed under its id yet.
+    /// Nothing is indexed under this id.
     Fresh,
     /// The resource may already be indexed; clear it first.
     Replace,
@@ -391,7 +399,10 @@ impl ResourceStorage for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
-        // Re-index the resource (delete old entries, add new)
+        // Re-index the resource. `delete_search_index` clears `search_index` AND
+        // `resource_fts`, so it stays — but it leaves nothing for the indexing
+        // write to clear, and `Replace` would have issued a second identical
+        // DELETE against the same rows.
         self.delete_search_index(&client, tenant_id, resource_type, id)
             .await?;
         self.index_resource(
@@ -400,7 +411,7 @@ impl ResourceStorage for PostgresBackend {
             resource_type,
             id,
             now,
-            IndexWrite::Replace,
+            IndexWrite::Fresh,
             &resource,
         )
         .await?;
@@ -1009,7 +1020,9 @@ impl PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to insert restore history: {}", e)))?;
 
         // The delete dropped the search index entries; rebuild them for the
-        // resource that is live again.
+        // resource that is live again. As in `update`, the preceding
+        // `delete_search_index` is what clears both tables, so the indexing write
+        // has nothing left to clear.
         self.delete_search_index(&client, tenant_id, resource_type, id)
             .await?;
         self.index_resource(
@@ -1018,7 +1031,7 @@ impl PostgresBackend {
             resource_type,
             id,
             now,
-            IndexWrite::Replace,
+            IndexWrite::Fresh,
             &resource,
         )
         .await?;
