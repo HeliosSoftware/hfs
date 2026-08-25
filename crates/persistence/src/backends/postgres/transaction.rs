@@ -100,6 +100,7 @@ impl PostgresTransaction {
         resource_type: &str,
         resource_id: &str,
         last_updated: DateTime<Utc>,
+        mode: super::storage::IndexWrite,
         resource: &Value,
     ) -> StorageResult<()> {
         if self.search_offloaded {
@@ -108,14 +109,15 @@ impl PostgresTransaction {
 
         let client = self.client()?;
 
-        // Delete existing index entries
-        client
-            .execute(
-                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
+        if mode == super::storage::IndexWrite::Replace {
+            client
+                .execute(
+                    "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                    &[&tenant_id, &resource_type, &resource_id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
+        }
 
         // Extract values using the registry-driven extractor
         let values = self
@@ -223,8 +225,15 @@ impl Transaction for PostgresTransaction {
             .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Index the resource for search
-        self.index_resource(tenant_id, resource_type, &id, now, &data)
-            .await?;
+        self.index_resource(
+            tenant_id,
+            resource_type,
+            &id,
+            now,
+            super::storage::IndexWrite::Fresh,
+            &data,
+        )
+        .await?;
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -391,8 +400,15 @@ impl Transaction for PostgresTransaction {
             .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Re-index the resource for search
-        self.index_resource(tenant_id, resource_type, id, now, &data)
-            .await?;
+        self.index_resource(
+            tenant_id,
+            resource_type,
+            id,
+            now,
+            super::storage::IndexWrite::Replace,
+            &data,
+        )
+        .await?;
 
         Ok(StoredResource::from_storage(
             resource_type,

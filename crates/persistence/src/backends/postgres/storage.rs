@@ -30,6 +30,22 @@ use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 use super::PostgresBackend;
 use super::search::writer::PostgresSearchIndexWriter;
 
+/// Whether a resource being indexed can already have `search_index` rows.
+///
+/// `search_index` is declared `FOREIGN KEY (tenant_id, resource_type, resource_id)
+/// REFERENCES resources ... ON DELETE CASCADE`, so an index row cannot outlive
+/// its resource. A create path that has already established no `resources` row
+/// exists has therefore also established there is nothing to clear, and the
+/// clearing `DELETE` is a guaranteed no-op — one round trip per created
+/// resource, on the path a bulk import takes for every resource it writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexWrite {
+    /// The resource is new; nothing can be indexed under its id yet.
+    Fresh,
+    /// The resource may already be indexed; clear it first.
+    Replace,
+}
+
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "postgres".to_string(),
@@ -60,6 +76,7 @@ fn extract_part_value(part: &Value) -> Option<Value> {
 }
 
 #[async_trait]
+
 impl ResourceStorage for PostgresBackend {
     fn backend_name(&self) -> &'static str {
         "postgres"
@@ -154,8 +171,16 @@ impl ResourceStorage for PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Index the resource for search
-        self.index_resource(&client, tenant_id, resource_type, &id, now, &resource)
-            .await?;
+        self.index_resource(
+            &client,
+            tenant_id,
+            resource_type,
+            &id,
+            now,
+            IndexWrite::Fresh,
+            &resource,
+        )
+        .await?;
 
         // An *active* SearchParameter write changes a tenant's overlay: reload
         // the stored cache and drop the per-tenant registries so they rebuild.
@@ -371,8 +396,16 @@ impl ResourceStorage for PostgresBackend {
         // Re-index the resource (delete old entries, add new)
         self.delete_search_index(&client, tenant_id, resource_type, id)
             .await?;
-        self.index_resource(&client, tenant_id, resource_type, id, now, &resource)
-            .await?;
+        self.index_resource(
+            &client,
+            tenant_id,
+            resource_type,
+            id,
+            now,
+            IndexWrite::Replace,
+            &resource,
+        )
+        .await?;
 
         // A SearchParameter write invalidates the tenant overlays.
         if resource_type == "SearchParameter" {
@@ -981,8 +1014,16 @@ impl PostgresBackend {
         // resource that is live again.
         self.delete_search_index(&client, tenant_id, resource_type, id)
             .await?;
-        self.index_resource(&client, tenant_id, resource_type, id, now, &resource)
-            .await?;
+        self.index_resource(
+            &client,
+            tenant_id,
+            resource_type,
+            id,
+            now,
+            IndexWrite::Replace,
+            &resource,
+        )
+        .await?;
 
         // A restored SearchParameter re-enters the tenant overlays.
         if resource_type == "SearchParameter" {
@@ -1018,6 +1059,7 @@ impl PostgresBackend {
         resource_type: &str,
         resource_id: &str,
         last_updated: DateTime<Utc>,
+        mode: IndexWrite,
         resource: &Value,
     ) -> StorageResult<()> {
         // When search is offloaded to a secondary backend, skip local indexing
@@ -1025,14 +1067,15 @@ impl PostgresBackend {
             return Ok(());
         }
 
-        // Delete existing index entries
-        client
-            .execute(
-                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
+        if mode == IndexWrite::Replace {
+            client
+                .execute(
+                    "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                    &[&tenant_id, &resource_type, &resource_id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
+        }
 
         // Extract values using the registry-driven extractor
         match self
