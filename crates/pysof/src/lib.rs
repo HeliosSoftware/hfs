@@ -14,6 +14,12 @@ use helios_sof::{
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+
+// The SQL-on-FHIR transform is allocation-heavy (large generated FHIR structs);
+// benchmarks show mimalloc roughly doubles throughput over the system allocator,
+// most dramatically on Windows. See scripts/bench_threading.py.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
