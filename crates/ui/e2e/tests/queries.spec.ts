@@ -362,17 +362,139 @@ test.describe("query builder", () => {
     await expect(queries.builder.url).toHaveValue("GET /Patient?family=a,,b");
   });
 
-  test("comparator OR values keep a prefix per alternative", async ({ queries }) => {
-    await queries.builder.setUrl("Patient?birthdate=ge1980-01-01,le1990-12-31");
+  test("modifier values that resemble comparators remain literal", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?name:exact=ge1980,le1990");
     const row = queries.builder.conditionRows.first();
-    await expect(row.locator(".builder-row__value")).toHaveCount(2);
+    const comparators = row.locator(".builder-row__comparator");
+    const values = row.locator(".builder-row__value");
+
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("exact");
+    await expect(comparators.nth(0)).toHaveValue("");
+    await expect(comparators.nth(1)).toHaveValue("");
+    await expect(values.nth(0)).toHaveValue("ge1980");
+    await expect(values.nth(1)).toHaveValue("le1990");
     await expect(queries.page.locator("#query-plain-text")).toContainText(
-      "birthdate is on or after “1980-01-01” or is on or before “1990-12-31”",
+      "name is exactly “ge1980” or “le1990”",
     );
-    // The second alternative keeps its own comparator on round-trip.
-    await row.locator(".builder-row__value").nth(0).fill("ge1985-01-01");
+
+    await values.nth(0).fill("ge1981");
     await expect(queries.builder.url).toHaveValue(
-      "GET /Patient?birthdate=ge1985-01-01,le1990-12-31",
+      "GET /Patient?name:exact=ge1981,le1990",
+    );
+  });
+
+  const mixedComparatorOrders = [
+    {
+      name: "le then ge",
+      query: "Patient?birthdate=le1979-12-31,ge1980-01-02",
+      comparators: ["le", "ge"],
+      values: ["1979-12-31", "1980-01-02"],
+      narration:
+        "birthdate is on or before “1979-12-31” or birthdate is on or after “1980-01-02”",
+    },
+    {
+      name: "ge then le",
+      query: "Patient?birthdate=ge1980-01-02,le1979-12-31",
+      comparators: ["ge", "le"],
+      values: ["1980-01-02", "1979-12-31"],
+      narration:
+        "birthdate is on or after “1980-01-02” or birthdate is on or before “1979-12-31”",
+    },
+  ];
+
+  for (const scenario of mixedComparatorOrders) {
+    test(`mixed date comparators hydrate independently: ${scenario.name}`, async ({ queries }) => {
+      await queries.builder.setUrl(scenario.query);
+      const row = queries.builder.conditionRows.first();
+      const alternatives = row.locator(".builder-row__orvalue");
+      const comparators = row.locator(".builder-row__comparator");
+      const values = row.locator(".builder-row__value");
+
+      await expect(alternatives).toHaveCount(2);
+      await expect(comparators).toHaveCount(2);
+      await expect(comparators.nth(0)).toHaveValue(scenario.comparators[0]);
+      await expect(comparators.nth(1)).toHaveValue(scenario.comparators[1]);
+      await expect(comparators.nth(0)).toBeVisible();
+      await expect(comparators.nth(1)).toBeVisible();
+      await expect(values.nth(0)).toHaveValue(scenario.values[0]);
+      await expect(values.nth(1)).toHaveValue(scenario.values[1]);
+      await values.nth(0).fill(scenario.values[0]);
+      await expect(queries.builder.url).toHaveValue(`GET /${scenario.query}`);
+      await expect(queries.page.locator("#query-plain-text")).toContainText(
+        scenario.narration,
+      );
+    });
+  }
+
+  test("editing one date comparator leaves its sibling unchanged", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?birthdate=le1979-12-31,ge1980-01-02");
+    const row = queries.builder.conditionRows.first();
+    const comparators = row.locator(".builder-row__comparator");
+    const values = row.locator(".builder-row__value");
+
+    await comparators.nth(1).selectOption("gt");
+    await expect(comparators.nth(0)).toHaveValue("le");
+    await expect(comparators.nth(1)).toHaveValue("gt");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?birthdate=le1979-12-31,gt1980-01-02",
+    );
+    await expect(queries.page.locator("#query-plain-text")).toContainText(
+      "birthdate is on or before “1979-12-31” or birthdate is after “1980-01-02”",
+    );
+
+    await values.nth(0).fill("1978-12-31");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?birthdate=le1978-12-31,gt1980-01-02",
+    );
+    await expect(comparators.nth(1)).toHaveValue("gt");
+  });
+
+  test("adding and removing date alternatives keeps comparators with their values", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?birthdate=le1979-12-31");
+    const row = queries.builder.conditionRows.first();
+
+    await row.locator("[data-add-or]").click();
+    const alternatives = row.locator(".builder-row__orvalue");
+    await expect(alternatives).toHaveCount(2);
+    await expect(alternatives.nth(1).locator(".builder-row__comparator")).toHaveValue("");
+    await alternatives.nth(1).locator(".builder-row__comparator").selectOption("ge");
+    await alternatives.nth(1).locator(".builder-row__value").fill("1980-01-02");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?birthdate=le1979-12-31,ge1980-01-02",
+    );
+
+    await alternatives.nth(0).locator("[data-remove-or]").click();
+    await expect(alternatives).toHaveCount(1);
+    await expect(alternatives.first().locator(".builder-row__comparator")).toHaveValue("ge");
+    await expect(alternatives.first().locator(".builder-row__value")).toHaveValue(
+      "1980-01-02",
+    );
+    await expect(queries.builder.url).toHaveValue("GET /Patient?birthdate=ge1980-01-02");
+  });
+
+  test("date comparators stay available in forward and reverse chains", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?link:Patient.birthdate=1980-01-02");
+    const chain = queries.builder.chainRows.first();
+    const chainComparator = chain.locator(".builder-row__comparator");
+    await expect(chain).toHaveAttribute("data-mod-type", "date");
+    await expect(chainComparator).toBeVisible();
+    await chainComparator.selectOption("ge");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?link:Patient.birthdate=ge1980-01-02",
+    );
+
+    await queries.builder.setUrl("Patient?_has:Observation:patient:date=2020-01-01");
+    const reverseChain = queries.builder.hasRows.first();
+    const reverseComparator = reverseChain.locator(".builder-row__comparator");
+    await expect(reverseChain).toHaveAttribute("data-mod-type", "date");
+    await expect(reverseComparator).toBeVisible();
+    await reverseComparator.selectOption("le");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_has:Observation:patient:date=le2020-01-01",
     );
   });
 
@@ -402,6 +524,21 @@ test.describe("query builder", () => {
     await expect(chip).toContainText("anywhere");
   });
 
+  test("choosing a comparator clears the active modifier chip", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?birthdate=1980-01-02");
+    const row = queries.builder.conditionRows.first();
+    await row.locator("[data-toggle-mods]").click();
+    const missingChip = row.locator("[data-mod-chip=missing]");
+
+    await missingChip.click();
+    await expect(missingChip).toHaveAttribute("aria-pressed", "true");
+    await row.locator(".builder-row__comparator").selectOption("ge");
+
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(missingChip).toHaveAttribute("aria-pressed", "false");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?birthdate=ge1980-01-02");
+  });
+
   const modifierLayoutScenarios = [
     {
       name: "desktop string with two OR values in Spanish",
@@ -422,6 +559,14 @@ test.describe("query builder", () => {
       query: "Patient?gender=male",
       modType: "token",
       requiredChip: "of-type",
+    },
+    {
+      name: "date alternatives with independent comparators",
+      width: 901,
+      lang: "en",
+      query: "Patient?birthdate=le1979-12-31,ge1980-01-02",
+      modType: "date",
+      requiredChip: "missing",
     },
     {
       name: "unknown parameter at a narrow width in English",
@@ -490,7 +635,8 @@ test.describe("query builder", () => {
         const panelClientRect = panel.getBoundingClientRect();
         const visibleLeaves = Array.from(
           element.querySelectorAll(
-            ".builder-row__key, .builder-row__modifier, .builder-row__value, " +
+            ".builder-row__key, .builder-row__modifier, .builder-row__comparator, " +
+              ".builder-row__value, " +
               ".builder-row__remove--or, .builder-row__or, .builder-row__adv, [data-remove-row]",
           ),
         ).filter((leaf) => {

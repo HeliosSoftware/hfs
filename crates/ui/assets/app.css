@@ -2863,6 +2863,7 @@ button.pill {
 
 .builder-row__key,
 .builder-row__modifier,
+.builder-row__comparator,
 .builder-row__value {
   height: 32px;
   padding: 0 10px;
@@ -2886,6 +2887,12 @@ button.pill {
   color: var(--muted);
 }
 
+.builder-row__comparator {
+  flex-shrink: 0;
+  width: 72px;
+  color: var(--muted);
+}
+
 .builder-row__value {
   flex: 1;
   min-width: 0;
@@ -2895,6 +2902,7 @@ button.pill {
 
 .builder-row__key:focus,
 .builder-row__modifier:focus,
+.builder-row__comparator:focus,
 .builder-row__value:focus {
   border-color: var(--accent);
 }
@@ -4101,7 +4109,7 @@ button.pill {
   flex-direction: column;
   gap: 6px;
   flex: 1;
-  min-width: 0;
+  min-width: 230px;
 }
 
 .builder-row__orvalue {
