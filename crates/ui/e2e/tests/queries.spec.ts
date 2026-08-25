@@ -15,7 +15,7 @@ test.describe("query builder", () => {
     if (await queries.builder.form.isHidden().catch(() => true)) {
       test.skip(true, "no per-user settings store on this backend; the builder is hidden");
     }
-  });
+  });afa comparator on a newly added OR alternative waits for source classificationa
 
   test("running a query shows the results table with a total", async ({ queries, request }) => {
     await createResource(request, "Patient", { name: [{ family: "QueryA" }] });
