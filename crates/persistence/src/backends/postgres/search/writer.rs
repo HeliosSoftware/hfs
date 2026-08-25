@@ -33,6 +33,201 @@ fn parse_index_date(value: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
+/// One `search_index` row, flattened to every column the non-contained write
+/// paths can set.
+///
+/// The per-value `write_entry` path issues one `INSERT` per extracted value,
+/// which costs a network round trip per row. A Synthea import writes ~113 index
+/// rows per resource, so a 1,000-bundle import spends most of its wall clock in
+/// round trips rather than in Postgres. Flattening every value to a common row
+/// shape lets `write_values` send them as multi-row `INSERT`s instead.
+///
+/// Columns not listed here (`is_contained`, `contained_type`,
+/// `contained_local_id`) are left to their table defaults, exactly as the
+/// per-value inserts left them.
+#[derive(Default)]
+struct IndexRow {
+    param_name: String,
+    param_url: String,
+    composite_group: Option<i32>,
+    value_string: Option<String>,
+    value_string_folded: Option<String>,
+    value_token_system: Option<String>,
+    value_token_code: Option<String>,
+    value_token_display: Option<String>,
+    value_token_system_2: Option<String>,
+    value_token_code_2: Option<String>,
+    value_date: Option<DateTime<Utc>>,
+    value_date_precision: Option<String>,
+    value_number: Option<f64>,
+    value_number_2: Option<f64>,
+    value_quantity_value: Option<f64>,
+    value_quantity_unit: Option<String>,
+    value_quantity_system: Option<String>,
+    value_quantity_canonical_value: Option<f64>,
+    value_quantity_canonical_unit: Option<String>,
+    value_reference: Option<String>,
+    value_reference_display: Option<String>,
+    value_identifier_type_system: Option<String>,
+    value_identifier_type_code: Option<String>,
+    value_uri: Option<String>,
+}
+
+/// Column list for the batched insert, in bind order. `COLUMNS.len() + 3`
+/// (tenant/type/resource id are bound once per row too) must stay under
+/// Postgres' 65535-parameter ceiling for `BATCH_ROWS` rows — see `BATCH_ROWS`.
+const ROW_COLUMNS: &[&str] = &[
+    "tenant_id",
+    "resource_type",
+    "resource_id",
+    "param_name",
+    "param_url",
+    "composite_group",
+    "value_string",
+    "value_string_folded",
+    "value_token_system",
+    "value_token_code",
+    "value_token_display",
+    "value_token_system_2",
+    "value_token_code_2",
+    "value_date",
+    "value_date_precision",
+    "value_number",
+    "value_number_2",
+    "value_quantity_value",
+    "value_quantity_unit",
+    "value_quantity_system",
+    "value_quantity_canonical_value",
+    "value_quantity_canonical_unit",
+    "value_reference",
+    "value_reference_display",
+    "value_identifier_type_system",
+    "value_identifier_type_code",
+    "value_uri",
+];
+
+/// Rows per `INSERT`. 27 columns x 128 rows = 3,456 bind parameters, well under
+/// Postgres' 65535 ceiling, and roughly one statement per imported resource.
+const BATCH_ROWS: usize = 128;
+
+impl IndexRow {
+    /// Flattens one extracted value into a row.
+    ///
+    /// Returns `None` for an unparseable date, which is the one case the
+    /// per-value path also skipped rather than inserted (#494).
+    fn from_extracted(
+        extracted: &ExtractedValue,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Option<Self> {
+        let mut row = IndexRow {
+            param_name: extracted.param_name.to_string(),
+            param_url: extracted.param_url.to_string(),
+            composite_group: extracted.composite_group.map(|g| g as i32),
+            ..Default::default()
+        };
+
+        match &extracted.value {
+            IndexValue::String(s) => {
+                row.value_string = Some(s.clone());
+                row.value_string_folded = Some(crate::search::fold_text(s));
+            }
+            IndexValue::Token {
+                system,
+                code,
+                display,
+                identifier_type_system,
+                identifier_type_code,
+            } => {
+                row.value_token_system = system.clone();
+                row.value_token_code = Some(code.clone());
+                row.value_token_display = display.clone();
+                row.value_identifier_type_system = identifier_type_system.clone();
+                row.value_identifier_type_code = identifier_type_code.clone();
+            }
+            IndexValue::Date { value, precision } => {
+                let Some(timestamp) = parse_index_date(value) else {
+                    tracing::warn!(
+                        param_name = %extracted.param_name,
+                        resource_type = %resource_type,
+                        resource_id = %resource_id,
+                        value = %value,
+                        "skipping date search index entry: unparseable date value"
+                    );
+                    return None;
+                };
+                row.value_date = Some(timestamp);
+                row.value_date_precision = Some(precision.to_string());
+            }
+            IndexValue::Number(n) => {
+                row.value_number = Some(*n);
+            }
+            IndexValue::Quantity {
+                value,
+                unit,
+                system,
+                code,
+            } => {
+                // Canonicalize using the UCUM code (else the unit display) so
+                // quantity search can match equivalent units (g <-> mg).
+                let (canonical_value, canonical_unit) = code
+                    .as_deref()
+                    .or(unit.as_deref())
+                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
+                    .map(|(v, u)| (Some(v), Some(u)))
+                    .unwrap_or((None, None));
+                row.value_quantity_value = Some(*value);
+                row.value_quantity_unit = unit.clone();
+                row.value_quantity_system = system.clone();
+                row.value_quantity_canonical_value = canonical_value;
+                row.value_quantity_canonical_unit = canonical_unit;
+            }
+            IndexValue::Reference {
+                reference,
+                resource_type: _,
+                resource_id: _,
+                display,
+            } => {
+                row.value_reference = Some(reference.clone());
+                row.value_reference_display = display.clone();
+            }
+            IndexValue::Uri(uri) => {
+                row.value_uri = Some(uri.clone());
+            }
+        }
+
+        Some(row)
+    }
+
+    /// Flattens one denormalized composite row (#279).
+    ///
+    /// Deliberately does not populate `value_string_folded`, `value_token_display`,
+    /// the identifier-type columns or the canonical quantity columns: the
+    /// composite insert never set them either, and a composite search reads none
+    /// of them.
+    fn from_composite(row: &super::composite_rows::CompositeRow) -> Self {
+        IndexRow {
+            param_name: row.param_name.clone(),
+            param_url: row.param_url.clone(),
+            composite_group: Some(row.composite_group),
+            value_token_system: row.value_token_system.clone(),
+            value_token_code: row.value_token_code.clone(),
+            value_token_system_2: row.value_token_system_2.clone(),
+            value_token_code_2: row.value_token_code_2.clone(),
+            value_string: row.value_string.clone(),
+            value_date: row.value_date.as_deref().and_then(parse_index_date),
+            value_number: row.value_number,
+            value_number_2: row.value_number_2,
+            value_quantity_value: row.value_quantity_value,
+            value_quantity_unit: row.value_quantity_unit.clone(),
+            value_quantity_system: row.value_quantity_system.clone(),
+            value_reference: row.value_reference.clone(),
+            value_uri: row.value_uri.clone(),
+            ..Default::default()
+        }
+    }
+}
+
 /// PostgreSQL implementation of SearchIndexWriter.
 pub struct PostgresSearchIndexWriter;
 
@@ -54,71 +249,100 @@ impl PostgresSearchIndexWriter {
     ) -> StorageResult<usize> {
         let (plain, composites) = super::composite_rows::fold_composites(values);
 
-        let mut written = 0;
+        let mut rows: Vec<IndexRow> = Vec::with_capacity(plain.len() + composites.len());
         for value in &plain {
-            Self::write_entry(client, tenant_id, resource_type, resource_id, value).await?;
-            written += 1;
+            if let Some(row) = IndexRow::from_extracted(value, resource_type, resource_id) {
+                rows.push(row);
+            }
         }
         for row in &composites {
-            Self::write_composite_row(client, tenant_id, resource_type, resource_id, row).await?;
-            written += 1;
+            rows.push(IndexRow::from_composite(row));
         }
-        Ok(written)
+
+        Self::insert_rows(client, tenant_id, resource_type, resource_id, &rows).await?;
+        Ok(rows.len())
     }
 
-    /// Inserts one denormalized composite row.
-    async fn write_composite_row(
+    /// Sends flattened rows as multi-row `INSERT`s of at most [`BATCH_ROWS`].
+    ///
+    /// One statement per 128 rows instead of one per row. Postgres commonly runs
+    /// on a different host from the server, so the per-row form paid a network
+    /// round trip for every extracted value; this is what made bulk import
+    /// round-trip-bound rather than disk-bound.
+    async fn insert_rows(
         client: &deadpool_postgres::Client,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        row: &super::composite_rows::CompositeRow,
+        rows: &[IndexRow],
     ) -> StorageResult<()> {
-        let date = row.value_date.as_deref().and_then(parse_index_date);
-        client
-            .execute(
-                "INSERT INTO search_index (
-                    tenant_id, resource_type, resource_id, param_name, param_url,
-                    composite_group,
-                    value_token_system, value_token_code,
-                    value_token_system_2, value_token_code_2,
-                    value_string, value_date,
-                    value_number, value_number_2,
-                    value_quantity_value, value_quantity_unit, value_quantity_system,
-                    value_reference, value_uri
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                          $15, $16, $17, $18, $19)",
-                &[
-                    &tenant_id,
-                    &resource_type,
-                    &resource_id,
-                    &row.param_name.as_str(),
-                    &row.param_url.as_str(),
-                    &row.composite_group,
-                    &row.value_token_system,
-                    &row.value_token_code,
-                    &row.value_token_system_2,
-                    &row.value_token_code_2,
-                    &row.value_string,
-                    &date,
-                    &row.value_number,
-                    &row.value_number_2,
-                    &row.value_quantity_value,
-                    &row.value_quantity_unit,
-                    &row.value_quantity_system,
-                    &row.value_reference,
-                    &row.value_uri,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to write composite index row: {}", e)))?;
+        for chunk in rows.chunks(BATCH_ROWS) {
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+                Vec::with_capacity(chunk.len() * ROW_COLUMNS.len());
+            let mut tuples: Vec<String> = Vec::with_capacity(chunk.len());
+
+            for row in chunk {
+                let base = params.len();
+                let placeholders: Vec<String> = (1..=ROW_COLUMNS.len())
+                    .map(|i| format!("${}", base + i))
+                    .collect();
+                tuples.push(format!("({})", placeholders.join(", ")));
+
+                // Push order must match ROW_COLUMNS exactly.
+                params.push(Box::new(tenant_id.to_string()));
+                params.push(Box::new(resource_type.to_string()));
+                params.push(Box::new(resource_id.to_string()));
+                params.push(Box::new(row.param_name.clone()));
+                params.push(Box::new(row.param_url.clone()));
+                params.push(Box::new(row.composite_group));
+                params.push(Box::new(row.value_string.clone()));
+                params.push(Box::new(row.value_string_folded.clone()));
+                params.push(Box::new(row.value_token_system.clone()));
+                params.push(Box::new(row.value_token_code.clone()));
+                params.push(Box::new(row.value_token_display.clone()));
+                params.push(Box::new(row.value_token_system_2.clone()));
+                params.push(Box::new(row.value_token_code_2.clone()));
+                params.push(Box::new(row.value_date));
+                params.push(Box::new(row.value_date_precision.clone()));
+                params.push(Box::new(row.value_number));
+                params.push(Box::new(row.value_number_2));
+                params.push(Box::new(row.value_quantity_value));
+                params.push(Box::new(row.value_quantity_unit.clone()));
+                params.push(Box::new(row.value_quantity_system.clone()));
+                params.push(Box::new(row.value_quantity_canonical_value));
+                params.push(Box::new(row.value_quantity_canonical_unit.clone()));
+                params.push(Box::new(row.value_reference.clone()));
+                params.push(Box::new(row.value_reference_display.clone()));
+                params.push(Box::new(row.value_identifier_type_system.clone()));
+                params.push(Box::new(row.value_identifier_type_code.clone()));
+                params.push(Box::new(row.value_uri.clone()));
+            }
+
+            let sql = format!(
+                "INSERT INTO search_index ({}) VALUES {}",
+                ROW_COLUMNS.join(", "),
+                tuples.join(", ")
+            );
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                .iter()
+                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+
+            client
+                .execute(sql.as_str(), &param_refs)
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to insert search index rows: {}", e))
+                })?;
+        }
+
         Ok(())
     }
 
     /// Writes a single search index entry to PostgreSQL.
     ///
-    /// Accepts any type that can be dereferenced to a `tokio_postgres::Client`,
-    /// including `deadpool_postgres::Client` and `&deadpool_postgres::Client`.
+    /// Shares [`IndexRow`] with the batched path so both agree on which column
+    /// each `IndexValue` variant populates.
     pub async fn write_entry(
         client: &deadpool_postgres::Client,
         tenant_id: &str,
@@ -126,219 +350,10 @@ impl PostgresSearchIndexWriter {
         resource_id: &str,
         extracted: &ExtractedValue,
     ) -> StorageResult<()> {
-        match &extracted.value {
-            IndexValue::String(s) => {
-                let folded = crate::search::fold_text(s);
-                client
-                    .execute(
-                        "INSERT INTO search_index (
-                            tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_string, composite_group, value_string_folded
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                        &[
-                            &tenant_id,
-                            &resource_type,
-                            &resource_id,
-                            &extracted.param_name.as_str(),
-                            &extracted.param_url.as_str(),
-                            &Some(s.as_str()),
-                            &extracted.composite_group.map(|g| g as i32),
-                            &folded.as_str(),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!("Failed to insert string search index entry: {}", e))
-                    })?;
-            }
-            IndexValue::Token {
-                system,
-                code,
-                display,
-                identifier_type_system,
-                identifier_type_code,
-            } => {
-                client
-                    .execute(
-                        "INSERT INTO search_index (
-                            tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_token_system, value_token_code, value_token_display,
-                            composite_group, value_identifier_type_system, value_identifier_type_code
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                        &[
-                            &tenant_id,
-                            &resource_type,
-                            &resource_id,
-                            &extracted.param_name.as_str(),
-                            &extracted.param_url.as_str(),
-                            &system.as_deref(),
-                            &code.as_str(),
-                            &display.as_deref(),
-                            &extracted.composite_group.map(|g| g as i32),
-                            &identifier_type_system.as_deref(),
-                            &identifier_type_code.as_deref(),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!("Failed to insert token search index entry: {}", e))
-                    })?;
-            }
-            IndexValue::Date { value, precision } => {
-                let precision_str = precision.to_string();
-                let Some(timestamp) = parse_index_date(value) else {
-                    tracing::warn!(
-                        param_name = %extracted.param_name,
-                        resource_type = %resource_type,
-                        resource_id = %resource_id,
-                        value = %value,
-                        "skipping date search index entry: unparseable date value"
-                    );
-                    return Ok(());
-                };
-                client
-                    .execute(
-                        "INSERT INTO search_index (
-                            tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_date, value_date_precision, composite_group
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                        &[
-                            &tenant_id,
-                            &resource_type,
-                            &resource_id,
-                            &extracted.param_name.as_str(),
-                            &extracted.param_url.as_str(),
-                            &timestamp,
-                            &precision_str.as_str(),
-                            &extracted.composite_group.map(|g| g as i32),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!("Failed to insert date search index entry: {}", e))
-                    })?;
-            }
-            IndexValue::Number(n) => {
-                client
-                    .execute(
-                        "INSERT INTO search_index (
-                            tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_number, composite_group
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                        &[
-                            &tenant_id,
-                            &resource_type,
-                            &resource_id,
-                            &extracted.param_name.as_str(),
-                            &extracted.param_url.as_str(),
-                            n,
-                            &extracted.composite_group.map(|g| g as i32),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!("Failed to insert number search index entry: {}", e))
-                    })?;
-            }
-            IndexValue::Quantity {
-                value,
-                unit,
-                system,
-                code,
-            } => {
-                // Canonicalize using the UCUM code (else the unit display) so
-                // quantity search can match equivalent units (g ⇄ mg).
-                let (canonical_value, canonical_unit) = code
-                    .as_deref()
-                    .or(unit.as_deref())
-                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
-                    .map(|(v, u)| (Some(v), Some(u)))
-                    .unwrap_or((None, None));
-                client
-                    .execute(
-                        "INSERT INTO search_index (
-                            tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_quantity_value, value_quantity_unit, value_quantity_system, composite_group,
-                            value_quantity_canonical_value, value_quantity_canonical_unit
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                        &[
-                            &tenant_id,
-                            &resource_type,
-                            &resource_id,
-                            &extracted.param_name.as_str(),
-                            &extracted.param_url.as_str(),
-                            value,
-                            &unit.as_deref(),
-                            &system.as_deref(),
-                            &extracted.composite_group.map(|g| g as i32),
-                            &canonical_value,
-                            &canonical_unit.as_deref(),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!(
-                            "Failed to insert quantity search index entry: {}",
-                            e
-                        ))
-                    })?;
-            }
-            IndexValue::Reference {
-                reference,
-                resource_type: _,
-                resource_id: _,
-                display,
-            } => {
-                client
-                    .execute(
-                        "INSERT INTO search_index (
-                            tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_reference, composite_group, value_reference_display
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                        &[
-                            &tenant_id,
-                            &resource_type,
-                            &resource_id,
-                            &extracted.param_name.as_str(),
-                            &extracted.param_url.as_str(),
-                            &reference.as_str(),
-                            &extracted.composite_group.map(|g| g as i32),
-                            &display.as_deref(),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!(
-                            "Failed to insert reference search index entry: {}",
-                            e
-                        ))
-                    })?;
-            }
-            IndexValue::Uri(uri) => {
-                client
-                    .execute(
-                        "INSERT INTO search_index (
-                            tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_uri, composite_group
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                        &[
-                            &tenant_id,
-                            &resource_type,
-                            &resource_id,
-                            &extracted.param_name.as_str(),
-                            &extracted.param_url.as_str(),
-                            &uri.as_str(),
-                            &extracted.composite_group.map(|g| g as i32),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!("Failed to insert URI search index entry: {}", e))
-                    })?;
-            }
-        }
-
-        Ok(())
+        let Some(row) = IndexRow::from_extracted(extracted, resource_type, resource_id) else {
+            return Ok(());
+        };
+        Self::insert_rows(client, tenant_id, resource_type, resource_id, &[row]).await
     }
 
     /// Writes a single contained `ExtractedValue` for `_contained` search. The
