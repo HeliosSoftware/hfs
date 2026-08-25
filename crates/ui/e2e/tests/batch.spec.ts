@@ -56,6 +56,9 @@ test("a transaction bundle uploads, previews, executes, and reports", async ({ p
   await expect(page.locator("#batch-json")).toBeVisible();
   await page.locator("#batch-tab-actions").click();
 
+  // The execute error slot lives inside the footer, next to its button (#676).
+  await expect(page.locator(".batch-footer #batch-execute-error")).toHaveCount(1);
+
   // Execute: outcomes per entry plus the aggregate summary.
   await page.locator("#batch-execute").click();
   await expect(page.locator("#batch-response")).toBeVisible();
