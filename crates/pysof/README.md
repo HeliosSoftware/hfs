@@ -17,7 +17,8 @@ Built in Rust for speed, exposed to Python with a simple, Pythonic API. Part of 
 - 📦 **Streaming Support**: Memory-efficient chunked processing for large NDJSON files
 - 🌐 **Multi-Version FHIR**: Supports R4, R4B, R5, and R6 (based on build features)
 - 🎯 **Type-Safe**: Leverages Rust's type safety with a Pythonic interface
-- ⚡ **GIL-Free**: Python GIL released during processing for true parallelism
+- ⚡ **GIL-Friendly**: the GIL is released during parsing and processing, so other Python threads stay responsive
+- 📨 **Flexible Input**: ViewDefinitions and Bundles as Python dicts or pre-serialized JSON (`str`/`bytes`)
 
 ## 🎯 Why pysof?
 
@@ -285,7 +286,28 @@ pysof automatically processes FHIR resources in parallel using rayon:
 - **5-7x speedup** on typical batch workloads with multi-core CPUs
 - **Streaming benefits**: `ChunkedProcessor` and `process_ndjson_to_file` also use parallel processing
 - **Zero configuration** - parallelization is always enabled
-- **Python GIL released** during processing for true parallel execution
+- **Python GIL released** during parsing and processing, so other Python threads stay responsive
+
+Because each call already fans out across all cores via rayon's shared thread
+pool, running pysof from multiple Python threads does **not** multiply
+throughput — one call can saturate the machine. Use Python threads for
+concurrency (overlapping I/O, serving requests), not to speed up transforms.
+
+### Pass Pre-Serialized JSON for Maximum Speed
+
+If your data is already JSON text (from a file, an HTTP body, a database), pass
+the `str` or `bytes` directly instead of `json.loads`-ing it first:
+
+```python
+view_json: str = load_view_definition_text()
+bundle_json: bytes = fetch_bundle_bytes()
+
+result = pysof.run_view_definition(view_json, bundle_json, "csv")
+```
+
+This skips the Python-dict conversion entirely and parses the JSON with the
+GIL released — measured 20-27% faster per call on large bundles, with GIL hold
+time dropping from tens of milliseconds to microseconds.
 
 ### Performance Benchmarks
 

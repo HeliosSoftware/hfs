@@ -26,19 +26,6 @@ import time
 
 import pysof
 
-# Until the local NDJSON API is exported from the package (see pysof issue
-# backlog), fall back to the raw extension module.
-try:
-    from pysof import _pysof
-
-    process_ndjson_to_file = getattr(pysof, "process_ndjson_to_file", None) or (
-        lambda view, inp, out, fmt, **kw: _pysof.py_process_ndjson_to_file(
-            view, inp, out, fmt, **kw
-        )
-    )
-except ImportError:  # pragma: no cover
-    process_ndjson_to_file = pysof.process_ndjson_to_file
-
 LABEL = sys.argv[1] if len(sys.argv) > 1 else "current"
 
 VIEW = {
@@ -196,7 +183,7 @@ def main():
         n = getattr(counter, "n", 0)
         counter.n = n + 1
         out = os.path.join(tmpdir, f"out_{ident}_{n}.csv")
-        process_ndjson_to_file(VIEW, ndjson_path, out, "csv", chunk_size=1000)
+        pysof.process_ndjson_to_file(VIEW, ndjson_path, out, "csv", chunk_size=1000)
 
     bench_scenario("ndjson file->file, 5000 patients", file_job)
 

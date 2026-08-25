@@ -2,6 +2,9 @@
 
 from typing import Any
 
+# ViewDefinitions and Bundles: a Python dict, or pre-serialized JSON (str | bytes)
+JsonResource = dict[str, Any] | str | bytes
+
 # Module attributes
 __version__: str
 
@@ -42,14 +45,14 @@ class RemoteResolveConfig:
 
 # Core functions
 def py_run_view_definition(
-    view: dict[str, Any],
-    bundle: dict[str, Any],
+    view: JsonResource,
+    bundle: JsonResource,
     format: str,
     fhir_version: str,
 ) -> bytes: ...
 def py_run_view_definition_with_options(
-    view: dict[str, Any],
-    bundle: dict[str, Any],
+    view: JsonResource,
+    bundle: JsonResource,
     format: str,
     *,
     since: str | None = None,
@@ -58,18 +61,18 @@ def py_run_view_definition_with_options(
     fhir_version: str = "R4",
 ) -> bytes: ...
 def py_validate_view_definition(
-    view: dict[str, Any],
+    view: JsonResource,
     fhir_version: str,
 ) -> bool: ...
 def py_validate_bundle(
-    bundle: dict[str, Any],
+    bundle: JsonResource,
     fhir_version: str,
 ) -> bool: ...
 def py_parse_content_type(mime_type: str) -> str: ...
 def py_get_supported_fhir_versions() -> list[str]: ...
 def py_run_view_definition_with_options_remote(
-    view: dict[str, Any],
-    bundle: dict[str, Any],
+    view: JsonResource,
+    bundle: JsonResource,
     format: str,
     remote_config: RemoteResolveConfig,
     *,
@@ -79,7 +82,7 @@ def py_run_view_definition_with_options_remote(
     fhir_version: str = "R4",
 ) -> bytes: ...
 def py_process_ndjson_to_file(
-    view: dict[str, Any],
+    view: JsonResource,
     input_path: str,
     output_path: str,
     format: str,
@@ -92,7 +95,7 @@ def py_process_ndjson_to_file(
 class ChunkedProcessor:
     def __init__(
         self,
-        view_definition: dict[str, Any],
+        view_definition: JsonResource,
         input_path: str,
         *,
         chunk_size: int = 1000,
@@ -105,7 +108,7 @@ class ChunkedProcessor:
     def columns(self) -> list[str] | None: ...
 
 def py_process_ndjson_to_file_remote(
-    view: dict[str, Any],
+    view: JsonResource,
     input_path: str,
     output_path: str,
     format: str,
