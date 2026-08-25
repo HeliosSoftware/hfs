@@ -268,12 +268,19 @@ impl ConformanceSource for HttpConformanceSource {
             ));
         }
         let url = format!("{}/$sql-run?_format=json&_limit={limit}", self.base_url);
+        // The Parameters envelope, not the raw-resource shorthand: the
+        // shorthand is ViewDefinition-only, while `subjectResource` carries
+        // Library subjects (SQL Queries / SQL Views) just the same.
+        let body = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{ "name": "subjectResource", "resource": view_definition }],
+        });
         let mut request = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .json(view_definition);
+            .json(&body);
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
@@ -358,14 +365,15 @@ impl ConformanceSource for HttpConformanceSource {
     }
 }
 
-/// The first issue diagnostics of an OperationOutcome, if that is what this is.
+/// The first issue explanation of an OperationOutcome, if that is what this
+/// is — `diagnostics` when present, else the issue's `details.text`.
 fn outcome_diagnostics(outcome: &Value) -> Option<String> {
-    outcome
-        .get("issue")?
-        .as_array()?
-        .iter()
-        .find_map(|i| i.get("diagnostics").and_then(Value::as_str))
-        .map(String::from)
+    outcome.get("issue")?.as_array()?.iter().find_map(|i| {
+        i.get("diagnostics")
+            .and_then(Value::as_str)
+            .or_else(|| i.get("details").and_then(|d| d.get("text")).and_then(Value::as_str))
+            .map(String::from)
+    })
 }
 
 /// The `next` page URL of a searchset Bundle, if any.

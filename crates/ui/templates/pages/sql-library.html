@@ -1,0 +1,139 @@
+{% extends "layouts/base.html" %}
+
+{#
+  SQL Queries / SQL Views workspace (#649): the same shape as the View
+  Definitions page over Library resources of the route's kind. The SQL pane
+  edits the decoded application/sql attachment; the JSON pane edits the rest
+  of the Library. Save/Duplicate are one plain form; Run is a plain link;
+  Delete rides conformance-crud.js. Everything works without JavaScript.
+#}
+
+{% block title %}{{ i18n.t(title_key) }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block body_class %}app-shell{% endblock %}
+{% block content_class %} content--app{% endblock %}
+
+{% block content %}
+<section class="page-head page-head--row">
+  <div>
+    <h1 class="page-head__title">{{ i18n.t(title_key) }}</h1>
+    <p class="page-head__lede">{{ i18n.t(lede_key) }}</p>
+  </div>
+  <a class="btn btn--primary" href="{{ base_href }}?lib=new">{{ i18n.t("vd-new") }}</a>
+</section>
+
+{% if let Some(message) = degraded %}
+<p class="notice notice--warn">{{ i18n.t("lib-degraded") }} {{ message }}</p>
+{% endif %}
+{% if saved %}
+<p class="notice">{{ i18n.t("vd-saved") }}</p>
+{% endif %}
+
+<div class="filter-layout">
+  <aside class="filter-rail" aria-label="{{ i18n.t(title_key) }}">
+    <div class="filter-rail__heading">{{ i18n.t(title_key) }}</div>
+    <form class="filter-rail__search" method="get" action="{{ base_href }}" role="search">
+      {% if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
+      <input type="hidden" name="lib" value="{{ sel.id }}">
+      {% endif %}{% endif %}
+      <span class="icon">{% include "icons/search.svg" %}</span>
+      <input type="search" name="filter" value="{{ filter }}"
+             placeholder="{{ i18n.t("lib-filter") }}" aria-label="{{ i18n.t("lib-filter") }}">
+    </form>
+    <div class="filter-rail__list" id="lib-rail-list">
+      {% for item in rail %}
+      <a class="filter-rail__item" data-type="{{ item.id }}" data-full-name="{{ item.name }}"
+         href="{{ base_href }}?lib={{ item.id }}" title="{{ item.name }}"
+         {%- if let Some(sel) = selected %}{% if sel.id == item.id %} aria-current="true"{% endif %}{% endif %}>
+        <span class="filter-rail__label">{{ item.name }}</span>
+        <span class="count">{{ item.status }}</span>
+      </a>
+      {% endfor %}
+      {% if rail.is_empty() %}
+      <p class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("lib-none") }}</p>
+      {% endif %}
+    </div>
+  </aside>
+
+  <div>
+    {% if let Some(sel) = selected %}
+    <section class="page-head page-head--row">
+      <div>
+        <h1 class="page-head__title">{% if is_new %}{{ i18n.t(new_title_key) }}{% else %}{{ sel.name }}{% endif %}</h1>
+      </div>
+      <div>
+        {% if !is_new %}
+        <a class="btn" href="{{ base_href }}?lib={{ sel.id }}&run=1">{{ i18n.t("vd-run") }}</a>
+        <button type="button" class="btn btn--danger" data-crud-delete
+                data-type="Library" data-id="{{ sel.id }}"
+                data-confirm="{{ i18n.t_arg("lib-delete-confirm", "name", sel.name.to_string()) }}"
+                data-failed="{{ i18n.t("lib-delete-failed") }}"
+                data-redirect="{{ base_href }}">{{ i18n.t("vd-delete") }}</button>
+        {% endif %}
+      </div>
+    </section>
+
+    {% if let Some(error) = save_error %}
+    <p class="notice notice--warn">{{ error }}</p>
+    {% endif %}
+
+    <section class="card">
+      <div class="card-head">
+        <h3>{{ i18n.t("lib-sql-heading") }}</h3>
+      </div>
+      <form method="post" action="{{ base_href }}">
+        <input type="hidden" name="id" value="{{ sel.id }}">
+        <textarea class="field__input" name="sql" rows="6" spellcheck="false"
+                  aria-label="{{ i18n.t("lib-sql-heading") }}">{{ sel.sql }}</textarea>
+        <div class="card-head">
+          <h3>{{ i18n.t("vd-json-heading") }}</h3>
+        </div>
+        <textarea class="field__input" name="json" rows="14" spellcheck="false"
+                  aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
+        <div class="card-head">
+          <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
+          {% if !is_new %}
+          <button type="submit" class="btn" name="action" value="duplicate">{{ i18n.t("vd-duplicate") }}</button>
+          {% endif %}
+        </div>
+      </form>
+    </section>
+
+    {% if let Some(error) = run_error %}
+    <p class="notice notice--warn">{{ i18n.t("vd-run-failed") }} {{ error }}</p>
+    {% endif %}
+    {% if let Some(table) = results %}
+    <section class="card table-card">
+      <div class="card-head">
+        <h3>{{ i18n.t("vd-results-heading") }}</h3>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>{% for c in table.columns %}<th>{{ c }}</th>{% endfor %}</tr>
+          </thead>
+          <tbody>
+            {% for row in table.rows %}
+            <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+            {% endfor %}
+            {% if table.rows.is_empty() %}
+            <tr class="data-table__empty"><td colspan="{{ table.columns.len() }}">{{ i18n.t("vd-results-empty") }}</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {% endif %}
+    {% else %}
+    <section class="card">
+      <div class="card-head">
+        <h3>{{ i18n.t("lib-none") }}</h3>
+      </div>
+      <p class="page-head__lede">{{ i18n.t("lib-empty-lede") }}</p>
+    </section>
+    {% endif %}
+  </div>
+</div>
+
+<script src="/ui/assets/conformance-crud.js" defer></script>
+{% endblock %}

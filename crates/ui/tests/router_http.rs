@@ -1291,16 +1291,109 @@ async fn sql_on_fhir_section_navigates_to_real_stub_pages() {
             html.contains(&format!(r#"href="{href}" aria-current="page""#)),
             "{href} does not mark its nav entry current"
         );
-        // A stub states which server operation already serves the data; View
-        // Definitions is the live workspace and asserts its own content in
-        // `view_definitions_workspace_lists_edits_and_previews`.
-        if href != "/ui/sql/view-definitions" {
+        // A stub states which server operation already serves the data; the
+        // live workspaces (View Definitions, SQL Queries, SQL Views) assert
+        // their own content in their dedicated tests.
+        if href == "/ui/sql/export" || href == "/ui/sql/files" {
             assert!(
                 html.contains("sql-run") || html.contains("/export/"),
                 "{href}"
             );
         }
     }
+}
+
+/// #649: the SQL Queries and SQL Views workspaces list Libraries of their own
+/// kind only, decode the SQL attachment into its editor pane, and save via a
+/// plain form that re-embeds the SQL and redirects to the stored library.
+#[tokio::test]
+async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]},
+            "content": [{"contentType": "application/sql", "data": "U0VMRUNUIDE="}]}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "draft",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+    );
+
+    // The Queries page lists only the sql-query Library and decodes its SQL.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("patient_counts"));
+    assert!(!html.contains("flat_patients"));
+    assert!(html.contains("SELECT 1"));
+    assert!(html.contains(r#"name="sql""#));
+    assert!(html.contains(r#"data-type="Library""#));
+
+    // The Views page holds the other kind.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/views").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("flat_patients"));
+    assert!(!html.contains("patient_counts"));
+
+    // Save re-embeds the SQL pane and redirects to the stored library.
+    let body = "id=&action=save&sql=SELECT%202&json=%7B%22resourceType%22%3A%22Library%22%2C%22name%22%3A%22x%22%7D";
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/queries?lib=static-created&saved=1"
+    );
+
+    // Bad JSON re-renders with both panes preserved.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/views")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("id=&action=save&sql=SELECT%203&json=%7Bnope"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(html.contains("{nope"));
+    assert!(html.contains("SELECT 3"));
 }
 
 /// #649: the View Definitions workspace lists stored views in the rail

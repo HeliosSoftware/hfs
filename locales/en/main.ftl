@@ -752,11 +752,9 @@ sql-vd-lede = Author and manage the ViewDefinitions that SQL on FHIR runs flatte
 
 sql-queries-title = SQL Queries
 sql-queries-lede = Run SQL on FHIR queries against this server.
-sql-queries-body = Compose a query, run it, and inspect the resulting rows inline.
 
 sql-views-title = SQL Views
 sql-views-lede = Reusable SQL views layered over ViewDefinitions.
-sql-views-body = SQLView libraries and the views they define, resolved with their dependencies.
 
 sql-export-title = SQL Export
 sql-export-lede = Long-running SQL on FHIR export jobs.
@@ -787,3 +785,15 @@ vd-delete-failed = Deleting the view definition failed.
 vd-json-heading = Definition (JSON)
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
+
+## SQL Queries / SQL Views workspaces (#649)
+
+sql-queries-new-title = New SQL Query
+sql-views-new-title = New SQL View
+lib-filter = Filter libraries
+lib-none = No libraries yet.
+lib-empty-lede = Create your first library with Create New.
+lib-degraded = The library list could not be loaded.
+lib-sql-heading = SQL
+lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
+lib-delete-failed = Deleting the library failed.

@@ -749,11 +749,9 @@ sql-vd-lede = Erstelle und verwalte die ViewDefinitions, mit denen SQL on FHIR R
 
 sql-queries-title = SQL-Abfragen
 sql-queries-lede = Führe SQL-on-FHIR-Abfragen gegen diesen Server aus.
-sql-queries-body = Eine Abfrage verfassen, ausführen und die Ergebniszeilen direkt inspizieren.
 
 sql-views-title = SQL-Views
 sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
-sql-views-body = SQLView-Bibliotheken und die darin definierten Views, aufgelöst mit ihren Abhängigkeiten.
 
 sql-export-title = SQL-Export
 sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
@@ -784,3 +782,15 @@ vd-delete-failed = Die View-Definition konnte nicht gelöscht werden.
 vd-json-heading = Definition (JSON)
 vd-results-heading = Ergebnisse
 vd-results-empty = Die View hat keine Zeilen erzeugt.
+
+## SQL-Abfragen- / SQL-Views-Arbeitsbereiche (#649)
+
+sql-queries-new-title = Neue SQL-Abfrage
+sql-views-new-title = Neue SQL-View
+lib-filter = Bibliotheken filtern
+lib-none = Noch keine Bibliotheken.
+lib-empty-lede = Lege mit „Neu erstellen" die erste Bibliothek an.
+lib-degraded = Die Bibliotheksliste konnte nicht geladen werden.
+lib-sql-heading = SQL
+lib-delete-confirm = „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
+lib-delete-failed = Die Bibliothek konnte nicht gelöscht werden.
