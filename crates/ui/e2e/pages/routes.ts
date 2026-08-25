@@ -22,6 +22,11 @@ export const ROUTES = [
   "/ui/bulk-export",
   "/ui/bulk-export/active",
   "/ui/subscriptions",
+  "/ui/sql/view-definitions",
+  "/ui/sql/queries",
+  "/ui/sql/views",
+  "/ui/sql/export",
+  "/ui/sql/files",
 ];
 
 // The bulk-import detail page only exists with a submission behind it. Seed
@@ -29,7 +34,7 @@ export const ROUTES = [
 // append it to ROUTES so the detail layout is guarded too.
 export async function seedBulkImportDetail(request: APIRequestContext): Promise<string> {
   const res = await request.post("/ui/bulk-import", {
-    form: { name: "e2e-guard", recipient_base_url: "http://127.0.0.1:9/fhir" },
+    form: { name: "e2e-guard" },
     maxRedirects: 0,
   });
   const location = res.headers()["location"];

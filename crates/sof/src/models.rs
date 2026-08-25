@@ -3,8 +3,8 @@
 //! This module contains data structures for handling HTTP requests and responses,
 //! including parameter parsing and content type negotiation.
 
+use crate::{ContentType, SofParameters};
 use chrono::{DateTime, Utc};
-use helios_sof::{ContentType, SofParameters};
 use serde::Deserialize;
 use tracing::debug;
 
@@ -94,7 +94,7 @@ pub struct ValidatedRunParams {
     pub source: Option<String>,
 
     /// Parquet-specific options
-    pub parquet_options: Option<helios_sof::ParquetOptions>,
+    pub parquet_options: Option<crate::ParquetOptions>,
 }
 
 /// Parameters for ViewDefinition/$viewdefinition-run operation - now using proper FHIR Parameters
@@ -213,7 +213,7 @@ pub fn validate_query_params(
             "snappy".to_string() // Default
         };
 
-        Some(helios_sof::ParquetOptions {
+        Some(crate::ParquetOptions {
             row_group_size_mb,
             page_size_kb,
             compression,
@@ -251,7 +251,7 @@ pub fn parse_content_type(
     accept_header: Option<&str>,
     format_param: Option<&str>,
     header_param: Option<bool>,
-) -> Result<ContentType, helios_sof::SofError> {
+) -> Result<ContentType, crate::SofError> {
     let apply_csv_header = |s: &str| -> String {
         if s == "text/csv" {
             match header_param {
@@ -278,7 +278,7 @@ pub fn parse_content_type(
 ///
 /// `patient` and `group` are `Vec<String>` to match the SoF v2 spec
 /// (`patient` is `0..1`, `group` is `0..*`) and the shared permissive
-/// extractor in [`helios_sof::params`]. The strict path used to keep
+/// extractor in [`crate::params`]. The strict path used to keep
 /// only `Option<String>` here, which silently dropped earlier entries
 /// when callers supplied multiple `group` references.
 #[derive(Debug, Default)]
@@ -695,7 +695,7 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
 // `apply_json_filtering` / `apply_csv_filtering` /
 // `apply_pagination_to_records` / `apply_pagination_to_lines` helpers
 // re-parsed and re-truncated serialized output bytes even though
-// `helios_sof::run_view_definition_with_options` already applies
+// `crate::run_view_definition_with_options` already applies
 // `_limit` at the structured-row level (via
 // `apply_pagination_to_result`) before serialization. The serialized-
 // byte pass was inefficient (re-parsed/re-serialized JSON every time),
@@ -824,7 +824,7 @@ mod tests {
     // `apply_csv_filtering` / `apply_json_filtering` helpers. End-to-end
     // `_limit` behavior is exercised by `test_run_view_definition_limit`
     // (and equivalents) via the HTTP layer + the structured-row pass
-    // inside `helios_sof::run_view_definition_with_options`.
+    // inside `crate::run_view_definition_with_options`.
 
     #[test]
     fn test_extract_viewreference_parameter() {

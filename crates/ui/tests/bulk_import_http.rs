@@ -21,7 +21,23 @@ fn settings_store() -> Arc<dyn SettingsStore> {
     Arc::new(backend)
 }
 
-fn app(settings: &Arc<dyn SettingsStore>) -> Router {
+/// One test's world: the settings store and the recipient base the router is
+/// mounted with — the recipient is fixed server-side now (#689), so tests
+/// that need the kickoff to reach their mock recipient mount with its URL.
+struct Ctx {
+    settings: Arc<dyn SettingsStore>,
+    recipient: String,
+}
+
+fn ctx(recipient: &str) -> Ctx {
+    Ctx {
+        settings: settings_store(),
+        recipient: recipient.to_string(),
+    }
+}
+
+fn app(ctx: &Ctx) -> Router {
+    let settings = &ctx.settings;
     helios_ui::mount_with_conformance_source(
         Router::new(),
         "9.9.9",
@@ -33,6 +49,7 @@ fn app(settings: &Arc<dyn SettingsStore>) -> Router {
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
         None,
+        ctx.recipient.clone(),
     )
 }
 
@@ -41,8 +58,8 @@ async fn body_text(response: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
-async fn get(settings: &Arc<dyn SettingsStore>, uri: &str) -> (StatusCode, String) {
-    let res = app(settings)
+async fn get(ctx: &Ctx, uri: &str) -> (StatusCode, String) {
+    let res = app(ctx)
         .oneshot(Request::get(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -51,12 +68,8 @@ async fn get(settings: &Arc<dyn SettingsStore>, uri: &str) -> (StatusCode, Strin
 }
 
 /// POSTs a form and returns `(status, Location header, body)`.
-async fn post_form(
-    settings: &Arc<dyn SettingsStore>,
-    uri: &str,
-    form: &str,
-) -> (StatusCode, String, String) {
-    let res = app(settings)
+async fn post_form(ctx: &Ctx, uri: &str, form: &str) -> (StatusCode, String, String) {
+    let res = app(ctx)
         .oneshot(
             Request::post(uri)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -76,13 +89,8 @@ async fn post_form(
 }
 
 /// Creates a submission and returns its detail path (`/ui/bulk-import/{id}`).
-async fn create_submission(settings: &Arc<dyn SettingsStore>) -> String {
-    let (status, location, _) = post_form(
-        settings,
-        "/ui/bulk-import",
-        "name=BrettTest&recipient_base_url=http%3A%2F%2Flocalhost%3A9%2F&auth=none",
-    )
-    .await;
+async fn create_submission(ctx: &Ctx) -> String {
+    let (status, location, _) = post_form(ctx, "/ui/bulk-import", "name=BrettTest&auth=none").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(location.starts_with("/ui/bulk-import/"), "{location}");
     location
@@ -90,8 +98,8 @@ async fn create_submission(settings: &Arc<dyn SettingsStore>) -> String {
 
 #[tokio::test]
 async fn the_list_page_renders_and_offers_creation() {
-    let settings = settings_store();
-    let (status, html) = get(&settings, "/ui/bulk-import").await;
+    let ctx = ctx("http://localhost:9/");
+    let (status, html) = get(&ctx, "/ui/bulk-import").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Bulk Import"));
     assert!(html.contains("New Submission"));
@@ -100,10 +108,10 @@ async fn the_list_page_renders_and_offers_creation() {
 
 #[tokio::test]
 async fn creating_a_submission_lands_on_its_detail_page() {
-    let settings = settings_store();
-    let detail_path = create_submission(&settings).await;
+    let ctx = ctx("http://localhost:9/");
+    let detail_path = create_submission(&ctx).await;
 
-    let (status, html) = get(&settings, &detail_path).await;
+    let (status, html) = get(&ctx, &detail_path).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("BrettTest"));
     assert!(html.contains("Not Started"));
@@ -114,17 +122,17 @@ async fn creating_a_submission_lands_on_its_detail_page() {
     assert!(html.contains("Add Manifest"));
 
     // And the list now shows it.
-    let (_, list) = get(&settings, "/ui/bulk-import").await;
+    let (_, list) = get(&ctx, "/ui/bulk-import").await;
     assert!(list.contains("BrettTest"));
 }
 
 #[tokio::test]
 async fn manifests_can_be_added_and_removed() {
-    let settings = settings_store();
-    let detail_path = create_submission(&settings).await;
+    let ctx = ctx("http://localhost:9/");
+    let detail_path = create_submission(&ctx).await;
 
     let (status, location, _) = post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests"),
         "manifest_url=http%3A%2F%2F10.2.1.890%2Fmanifest.local",
     )
@@ -132,7 +140,7 @@ async fn manifests_can_be_added_and_removed() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location, detail_path);
 
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("http://10.2.1.890/manifest.local"));
     assert!(html.contains("Submit All"));
 
@@ -145,28 +153,24 @@ async fn manifests_can_be_added_and_removed() {
         .expect("manifest id in form action")
         .to_string();
 
-    let (status, _, _) = post_form(
-        &settings,
-        &format!("{detail_path}/manifests/{mid}/delete"),
-        "",
-    )
-    .await;
+    let (status, _, _) =
+        post_form(&ctx, &format!("{detail_path}/manifests/{mid}/delete"), "").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("No manifests yet"));
 }
 
 #[tokio::test]
 async fn deleting_a_submission_returns_to_the_list() {
-    let settings = settings_store();
-    let detail_path = create_submission(&settings).await;
+    let ctx = ctx("http://localhost:9/");
+    let detail_path = create_submission(&ctx).await;
 
-    let (status, location, _) = post_form(&settings, &format!("{detail_path}/delete"), "").await;
+    let (status, location, _) = post_form(&ctx, &format!("{detail_path}/delete"), "").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location, "/ui/bulk-import");
 
     // The detail page for a deleted submission redirects back to the list.
-    let res = app(&settings)
+    let res = app(&ctx)
         .oneshot(Request::get(&detail_path).body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -204,26 +208,18 @@ async fn mock_recipient(
 
 #[tokio::test]
 async fn submitting_a_manifest_posts_the_kickoff_and_logs_the_outcome() {
-    let settings = settings_store();
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        &format!(
-            "name=Alice&recipient_base_url={}&auth=none",
-            urlencode(&recipient_url)
-        ),
-    )
-    .await;
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Alice&auth=none").await;
     post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests"),
         "manifest_url=http%3A%2F%2Fexample.org%2Fexports%2Fmanifest.json&output_format=application%2Ffhir%2Bndjson",
     )
     .await;
 
-    let (status, _, _) = post_form(&settings, &format!("{detail_path}/submit-all"), "").await;
+    let (status, _, _) = post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 
     // The recipient saw a spec-shaped kick-off.
@@ -257,7 +253,7 @@ async fn submitting_a_manifest_posts_the_kickoff_and_logs_the_outcome() {
     );
 
     // The log recorded the attempt and the submission moved to In Progress.
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Submitting manifest"));
     assert!(html.contains("accepted by the recipient (200)"));
     assert!(html.contains("In Progress"));
@@ -265,30 +261,25 @@ async fn submitting_a_manifest_posts_the_kickoff_and_logs_the_outcome() {
 
 #[tokio::test]
 async fn a_rejected_kickoff_is_logged_as_a_failure() {
-    let settings = settings_store();
     let (recipient_url, _) = mock_recipient(StatusCode::NOT_FOUND).await;
+    let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        &format!(
-            "name=Alice&recipient_base_url={}&auth=none",
-            urlencode(&recipient_url)
-        ),
-    )
-    .await;
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Alice&auth=none").await;
     post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests"),
         "manifest_url=http%3A%2F%2Ftest.com",
     )
     .await;
-    post_form(&settings, &format!("{detail_path}/submit-all"), "").await;
+    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
 
-    let (_, html) = get(&settings, &detail_path).await;
-    assert!(html.contains("Bulk Submit request failed!"));
-    assert!(html.contains("404"));
-    assert!(html.contains("Not Started"), "status unchanged on failure");
+    let (_, html) = get(&ctx, &detail_path).await;
+    // The log names the request that failed — the kick-off POST, with the
+    // manifest as context — and the submission reads Failed (#686).
+    assert!(html.contains("$bulk-submit → 404"));
+    assert!(html.contains("(manifest http://test.com)"));
+    assert!(html.contains("Failed"), "status shows the failure");
+    assert!(!html.contains("Not Started"));
 }
 
 fn urlencode(s: &str) -> String {
@@ -297,30 +288,22 @@ fn urlencode(s: &str) -> String {
 
 #[tokio::test]
 async fn a_single_manifest_can_be_submitted_from_its_row() {
-    let settings = settings_store();
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        &format!(
-            "name=Solo&recipient_base_url={}&auth=none",
-            urlencode(&recipient_url)
-        ),
-    )
-    .await;
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Solo&auth=none").await;
     for url in [
         "http%3A%2F%2Fone.example%2Fm.json",
         "http%3A%2F%2Ftwo.example%2Fm.json",
     ] {
         post_form(
-            &settings,
+            &ctx,
             &format!("{detail_path}/manifests"),
             &format!("manifest_url={url}"),
         )
         .await;
     }
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     let marker = format!("{detail_path}/manifests/");
     let mid = html
         .split(&marker)
@@ -329,12 +312,8 @@ async fn a_single_manifest_can_be_submitted_from_its_row() {
         .expect("manifest id")
         .to_string();
 
-    let (status, _, _) = post_form(
-        &settings,
-        &format!("{detail_path}/manifests/{mid}/submit"),
-        "",
-    )
-    .await;
+    let (status, _, _) =
+        post_form(&ctx, &format!("{detail_path}/manifests/{mid}/submit"), "").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 
     // Only the one manifest went out.
@@ -343,26 +322,18 @@ async fn a_single_manifest_can_be_submitted_from_its_row() {
 
 #[tokio::test]
 async fn abort_and_complete_send_status_only_kickoffs() {
-    let settings = settings_store();
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        &format!(
-            "name=Lifecycle&recipient_base_url={}&auth=none",
-            urlencode(&recipient_url)
-        ),
-    )
-    .await;
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Lifecycle&auth=none").await;
 
-    post_form(&settings, &format!("{detail_path}/abort"), "").await;
-    let (_, html) = get(&settings, &detail_path).await;
+    post_form(&ctx, &format!("{detail_path}/abort"), "").await;
+    let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Stopped"));
     assert!(html.contains("Recipient acknowledged (200)"));
 
-    post_form(&settings, &format!("{detail_path}/complete"), "").await;
-    let (_, html) = get(&settings, &detail_path).await;
+    post_form(&ctx, &format!("{detail_path}/complete"), "").await;
+    let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Completed"));
 
     // Status-only kick-offs carry no manifestUrl.
@@ -392,57 +363,36 @@ async fn abort_and_complete_send_status_only_kickoffs() {
 
 #[tokio::test]
 async fn a_rejected_status_change_keeps_the_status_and_logs_it() {
-    let settings = settings_store();
     let (recipient_url, _) = mock_recipient(StatusCode::CONFLICT).await;
+    let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        &format!(
-            "name=Reject&recipient_base_url={}&auth=none",
-            urlencode(&recipient_url)
-        ),
-    )
-    .await;
-    post_form(&settings, &format!("{detail_path}/abort"), "").await;
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Reject&auth=none").await;
+    post_form(&ctx, &format!("{detail_path}/abort"), "").await;
 
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Recipient rejected the status change: 409"));
     assert!(html.contains("Not Started"));
 }
 
 #[tokio::test]
 async fn an_unreachable_recipient_fails_the_status_change() {
-    let settings = settings_store();
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        "name=Gone&recipient_base_url=http%3A%2F%2F127.0.0.1%3A9%2F&auth=none",
-    )
-    .await;
-    post_form(&settings, &format!("{detail_path}/abort"), "").await;
+    let ctx = ctx("http://localhost:9/");
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Gone&auth=none").await;
+    post_form(&ctx, &format!("{detail_path}/abort"), "").await;
 
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Status change failed:"));
     assert!(html.contains("Not Started"));
 }
 
 #[tokio::test]
 async fn manifest_options_ride_the_kickoff() {
-    let settings = settings_store();
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        &format!(
-            "name=Options&recipient_base_url={}&auth=none",
-            urlencode(&recipient_url)
-        ),
-    )
-    .await;
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Options&auth=none").await;
     post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests"),
         "manifest_url=http%3A%2F%2Fone.example%2Fm.json\
          &fhir_base_url=http%3A%2F%2Fbase.example%2Ffhir\
@@ -450,7 +400,7 @@ async fn manifest_options_ride_the_kickoff() {
          &file_request_headers=Authorization%3A%20Bearer%20abc%0AX-Trace%3A%201",
     )
     .await;
-    post_form(&settings, &format!("{detail_path}/submit-all"), "").await;
+    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
 
     let bodies = received.lock().unwrap().clone();
     assert_eq!(bodies.len(), 1);
@@ -504,6 +454,7 @@ async fn the_page_degrades_without_a_settings_store() {
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
     let res = app
         .clone()
@@ -519,7 +470,7 @@ async fn the_page_degrades_without_a_settings_store() {
         .oneshot(
             Request::post("/ui/bulk-import")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("name=X&recipient_base_url=http%3A%2F%2Fx"))
+                .body(Body::from("name=X"))
                 .unwrap(),
         )
         .await
@@ -554,13 +505,13 @@ async fn mock_token_endpoint(status: StatusCode, body: &'static str) -> String {
 /// and nothing else in this binary reads the variable.
 #[tokio::test]
 async fn backend_services_auth_mints_and_attaches_tokens() {
-    let settings = settings_store();
+    let ctx = ctx("http://localhost:9/");
     let token_url = mock_token_endpoint(StatusCode::OK, r#"{"access_token":"tok-123"}"#).await;
 
     // Phase 1 — no key configured: the gap is reported, not swallowed.
     unsafe { std::env::remove_var("HFS_BULK_SUBMIT_PRIVATE_KEY") };
     let (status, _, html) = post_form(
-        &settings,
+        &ctx,
         "/ui/bulk-import/test-auth",
         &format!("client_id=alice&token_url={}", urlencode(&token_url)),
     )
@@ -572,7 +523,7 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
 
     // Phase 2 — missing client id fails before any signing.
     let (_, _, html) = post_form(
-        &settings,
+        &ctx,
         "/ui/bulk-import/test-auth",
         &format!("client_id=&token_url={}", urlencode(&token_url)),
     )
@@ -581,7 +532,7 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
 
     // Phase 3 — a working endpoint: the mint succeeds.
     let (_, _, html) = post_form(
-        &settings,
+        &ctx,
         "/ui/bulk-import/test-auth",
         &format!("client_id=alice&token_url={}", urlencode(&token_url)),
     )
@@ -592,7 +543,7 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
     let denied =
         mock_token_endpoint(StatusCode::BAD_REQUEST, r#"{"error":"invalid_client"}"#).await;
     let (_, _, html) = post_form(
-        &settings,
+        &ctx,
         "/ui/bulk-import/test-auth",
         &format!("client_id=alice&token_url={}", urlencode(&denied)),
     )
@@ -602,7 +553,7 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
     // Phase 5 — a token response without access_token is an error.
     let empty = mock_token_endpoint(StatusCode::OK, r#"{"scope":"none"}"#).await;
     let (_, _, html) = post_form(
-        &settings,
+        &ctx,
         "/ui/bulk-import/test-auth",
         &format!("client_id=alice&token_url={}", urlencode(&empty)),
     )
@@ -612,37 +563,42 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
     // Phase 6 — a backend-services submission attaches the Bearer token to
     // the kick-off it POSTs at the recipient.
     let (recipient_url, seen_auth) = mock_recipient_capturing_auth().await;
+    // Same settings (the registered signing key lives there), phase-local
+    // recipient: the kick-off must reach this phase's capturing mock.
+    let ctx = Ctx {
+        settings: Arc::clone(&ctx.settings),
+        recipient: recipient_url.clone(),
+    };
     let (_, detail_path, _) = post_form(
-        &settings,
+        &ctx,
         "/ui/bulk-import",
         &format!(
-            "name=Authy&recipient_base_url={}&auth=backend-services&client_id=alice&token_url={}",
-            urlencode(&recipient_url),
+            "name=Authy&auth=backend-services&client_id=alice&token_url={}",
             urlencode(&token_url)
         ),
     )
     .await;
     post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests"),
         "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
     )
     .await;
-    post_form(&settings, &format!("{detail_path}/submit-all"), "").await;
+    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
 
     assert_eq!(
         seen_auth.lock().unwrap().as_deref(),
         Some("Bearer tok-123"),
         "the kick-off carried the minted token"
     );
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("accepted by the recipient (200)"));
 
     // Phase 7 — the RS384 signing path works with an RSA key.
     unsafe { std::env::set_var("HFS_BULK_SUBMIT_PRIVATE_KEY", TEST_RSA_KEY) };
     unsafe { std::env::set_var("HFS_BULK_SUBMIT_SIGNING_ALG", "RS384") };
     let (_, _, html) = post_form(
-        &settings,
+        &ctx,
         "/ui/bulk-import/test-auth",
         &format!("client_id=alice&token_url={}", urlencode(&token_url)),
     )
@@ -712,7 +668,7 @@ async fn mock_recipient_capturing_auth() -> (String, Arc<std::sync::Mutex<Option
 
 #[tokio::test]
 async fn unknown_ids_redirect_instead_of_crashing() {
-    let settings = settings_store();
+    let ctx = ctx("http://localhost:9/");
     let ghost = "/ui/bulk-import/00000000-0000-4000-8000-000000000000";
 
     for uri in [
@@ -722,26 +678,18 @@ async fn unknown_ids_redirect_instead_of_crashing() {
         format!("{ghost}/submit-all"),
         format!("{ghost}/abort"),
     ] {
-        let (status, _, _) = post_form(&settings, &uri, "manifest_url=http%3A%2F%2Fx").await;
+        let (status, _, _) = post_form(&ctx, &uri, "manifest_url=http%3A%2F%2Fx").await;
         assert_eq!(status, StatusCode::SEE_OTHER, "{uri}");
     }
 }
 
 #[tokio::test]
 async fn a_missing_manifest_id_submits_nothing() {
-    let settings = settings_store();
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        &format!(
-            "name=Ghost&recipient_base_url={}&auth=none",
-            urlencode(&recipient_url)
-        ),
-    )
-    .await;
+    let ctx = ctx(&recipient_url);
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Ghost&auth=none").await;
     post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests/no-such-manifest/submit"),
         "",
     )
@@ -751,24 +699,20 @@ async fn a_missing_manifest_id_submits_nothing() {
 
 #[tokio::test]
 async fn an_unreachable_recipient_fails_the_manifest_submit() {
-    let settings = settings_store();
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        "name=Down&recipient_base_url=http%3A%2F%2F127.0.0.1%3A9%2F&auth=none",
-    )
-    .await;
+    let ctx = ctx("http://localhost:9/");
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Down&auth=none").await;
     post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests"),
         "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
     )
     .await;
-    post_form(&settings, &format!("{detail_path}/submit-all"), "").await;
+    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
 
-    let (_, html) = get(&settings, &detail_path).await;
-    assert!(html.contains("Bulk Submit request failed!"));
-    assert!(html.contains("Failed to submit manifest"));
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains("Bulk Submit request failed:"));
+    assert!(html.contains("$bulk-submit"), "the failed target is named");
+    assert!(html.contains("Failed"), "status shows the failure");
 }
 
 /// A recipient implementing the full status flow: kick-off returns a
@@ -845,27 +789,24 @@ use axum::response::IntoResponse;
 
 #[tokio::test]
 async fn status_polling_tracks_progress_and_lands_the_result() {
-    let settings = settings_store();
     let (recipient_url, kickoffs) = mock_recipient_with_status().await;
+    let ctx = ctx(&recipient_url);
 
     let (_, detail_path, _) = post_form(
-        &settings,
+        &ctx,
         "/ui/bulk-import",
-        &format!(
-            "name=Polling&recipient_base_url={}&auth=none&submitter_system=http%3A%2F%2Fexample.org%2Fsubmitters&submitter_value=acme&submission_id=pinned-42",
-            urlencode(&recipient_url)
-        ),
+        "name=Polling&auth=none&submitter_system=http%3A%2F%2Fexample.org%2Fsubmitters&submitter_value=acme&submission_id=pinned-42",
     )
     .await;
     assert!(detail_path.ends_with("/pinned-42"), "{detail_path}");
 
     post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests"),
         "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
     )
     .await;
-    post_form(&settings, &format!("{detail_path}/submit-all"), "").await;
+    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
 
     // The submit kick-off carried the pinned id and the custom submitter,
     // and the status kick-off went out with the same identity.
@@ -883,18 +824,18 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
 
     // First status fetch: one poll happens -> 202 progress recorded, and the
     // fragment keeps polling.
-    let (status, html) = get(&settings, &format!("{detail_path}/status")).await;
+    let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("processing 0% complete"), "{html}");
     assert!(html.contains("every 5s"), "keeps polling: {html}");
 
     // Second fetch: the mock flips to 200 -> result summary, polling stops.
-    let (_, html) = get(&settings, &format!("{detail_path}/status")).await;
+    let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert!(!html.contains("every 5s"), "polling stopped: {html}");
     assert!(html.contains("Output files"), "{html}");
 
     // The log recorded the whole journey and the detail shows the summary.
-    let (_, detail) = get(&settings, &detail_path).await;
+    let (_, detail) = get(&ctx, &detail_path).await;
     assert!(detail.contains("Bulk status kick-off request"));
     assert!(detail.contains("got 200 OK"));
 }
@@ -904,8 +845,8 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
 /// working through it.
 #[tokio::test]
 async fn the_keys_endpoint_redirects_to_the_well_known_jwks() {
-    let settings = settings_store();
-    let res = app(&settings)
+    let ctx = ctx("http://localhost:9/");
+    let res = app(&ctx)
         .oneshot(
             Request::get("/ui/bulk-import/keys")
                 .body(Body::empty())
@@ -924,8 +865,8 @@ async fn the_keys_endpoint_redirects_to_the_well_known_jwks() {
 
 #[tokio::test]
 async fn the_empty_manifest_is_served() {
-    let settings = settings_store();
-    let (status, body) = get(&settings, "/ui/bulk-import/empty-manifest.json").await;
+    let ctx = ctx("http://localhost:9/");
+    let (status, body) = get(&ctx, "/ui/bulk-import/empty-manifest.json").await;
     assert_eq!(status, StatusCode::OK);
     let m: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(m["output"].as_array().unwrap().len(), 0);
@@ -934,24 +875,16 @@ async fn the_empty_manifest_is_served() {
 
 #[tokio::test]
 async fn replacing_a_manifest_sends_replaces_manifest_url() {
-    let settings = settings_store();
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        &format!(
-            "name=R&recipient_base_url={}&auth=none",
-            urlencode(&recipient_url)
-        ),
-    )
-    .await;
+    let ctx = ctx(&recipient_url);
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=R&auth=none").await;
     post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests"),
         "manifest_url=http%3A%2F%2Fold.example%2Fm.json",
     )
     .await;
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     let marker = format!("{detail_path}/manifests/");
     let mid = html
         .split(&marker)
@@ -961,7 +894,7 @@ async fn replacing_a_manifest_sends_replaces_manifest_url() {
         .to_string();
 
     post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests/{mid}/replace"),
         "manifest_url=http%3A%2F%2Fnew.example%2Fm.json",
     )
@@ -986,31 +919,23 @@ async fn replacing_a_manifest_sends_replaces_manifest_url() {
         "http://old.example/m.json"
     );
 
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("http://new.example/m.json"));
     assert!(html.contains("Replacement accepted (200)"));
 }
 
 #[tokio::test]
 async fn aborting_one_manifest_replaces_it_with_the_empty_manifest() {
-    let settings = settings_store();
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
-    let (_, detail_path, _) = post_form(
-        &settings,
-        "/ui/bulk-import",
-        &format!(
-            "name=A&recipient_base_url={}&auth=none",
-            urlencode(&recipient_url)
-        ),
-    )
-    .await;
+    let ctx = ctx(&recipient_url);
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=A&auth=none").await;
     post_form(
-        &settings,
+        &ctx,
         &format!("{detail_path}/manifests"),
         "manifest_url=http%3A%2F%2Fold.example%2Fm.json",
     )
     .await;
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     let marker = format!("{detail_path}/manifests/");
     let mid = html
         .split(&marker)
@@ -1019,12 +944,7 @@ async fn aborting_one_manifest_replaces_it_with_the_empty_manifest() {
         .unwrap()
         .to_string();
 
-    post_form(
-        &settings,
-        &format!("{detail_path}/manifests/{mid}/abort"),
-        "",
-    )
-    .await;
+    post_form(&ctx, &format!("{detail_path}/manifests/{mid}/abort"), "").await;
 
     let bodies = received.lock().unwrap().clone();
     assert_eq!(bodies.len(), 1);
@@ -1047,6 +967,41 @@ async fn aborting_one_manifest_replaces_it_with_the_empty_manifest() {
         "http://old.example/m.json"
     );
 
-    let (_, html) = get(&settings, &detail_path).await;
+    let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Abort accepted (200)"));
+}
+
+/// #686's repro: a recipient that is a plain static file server answers 501
+/// with an HTML error page. The log explains instead of pasting markup.
+#[tokio::test]
+async fn a_non_fhir_recipient_error_is_summarized_not_pasted() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let recipient = Router::new().fallback(|| async {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<!DOCTYPE HTML><html><body><h1>Error response</h1><p>Error code: 501</p></body></html>",
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, recipient).await.unwrap() });
+    let ctx = ctx(&format!("http://{addr}"));
+
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Static&auth=none").await;
+    post_form(
+        &ctx,
+        &format!("{detail_path}/manifests"),
+        "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
+    )
+    .await;
+    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
+
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains("$bulk-submit → 501"));
+    assert!(
+        html.contains("not a FHIR resource"),
+        "explains the mismatch"
+    );
+    assert!(!html.contains("Error code: 501"), "markup is not pasted");
+    assert!(html.contains("Failed"));
 }

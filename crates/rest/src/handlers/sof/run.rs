@@ -71,7 +71,9 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::sqlquery::{SqlQueryRunQuery, run_library_subject};
-use super::subject::{SubjectKind, SubjectRef, resolve_subject};
+use super::subject::{
+    RENAMED_VIEW_PARAM_MESSAGE, RENAMED_VIEW_PARAM_NAME, SubjectKind, SubjectRef, resolve_subject,
+};
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
@@ -149,6 +151,23 @@ where
     S: SearchProvider + Send + Sync + 'static,
 {
     let body_value = body.map(|j| j.0);
+
+    // The extractors below are deliberately permissive and silently ignore
+    // any parameter name they don't recognise — that's the existing,
+    // intentional behavior for `$sql-run`'s unknown parameters, and this
+    // handler does not introduce general strict validation. `view` is the
+    // one exception: it is the pre-ballot spelling of `context`, so a
+    // request naming it gets the same didactic 400 that `$sql-export`
+    // gives, instead of silently falling through to a generic
+    // "requires a subject" error.
+    if let Some(b) = body_value.as_ref() {
+        if body_names_parameter(b, RENAMED_VIEW_PARAM_NAME) {
+            return Err(RestError::BadRequest {
+                message: RENAMED_VIEW_PARAM_MESSAGE.to_string(),
+            });
+        }
+    }
+
     let body_params = body_value
         .as_ref()
         .map(extract_run_params_from_json)
@@ -177,8 +196,9 @@ where
         .unwrap_or(false);
     if has_parameters && !subject.kind.accepts_parameters() {
         return Err(RestError::BadRequest {
-            message: "the 'parameters' parameter requires a SQLQuery or SQLView subject; \
-                      a ViewDefinition declares no parameters"
+            message: "the 'parameters' parameter requires a SQLQuery subject; a ViewDefinition \
+                      declares no parameters, and the SQLView profile constrains \
+                      Library.parameter to 0..0"
                 .to_string(),
         });
     }

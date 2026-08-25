@@ -3,14 +3,7 @@
 //! This module implements the HTTP request handlers for all server endpoints,
 //! including the CapabilityStatement and ViewDefinition/$viewdefinition-run operations.
 
-use axum::{
-    Json,
-    extract::Query,
-    http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
-};
-use chrono::{DateTime, Utc};
-use helios_sof::{
+use crate::{
     ContentType, RunOptions, SofBundle, SofError, SofViewDefinition,
     create_bundle_from_resources_for_version as sof_create_bundle_from_resources_for_version,
     data_source::{DataSource, UniversalDataSource},
@@ -22,6 +15,13 @@ use helios_sof::{
     process_view_definition, run_view_definition_with_options,
     run_view_definition_with_options_remote,
 };
+use axum::{
+    Json,
+    extract::Query,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use chrono::{DateTime, Utc};
 use tracing::{debug, info};
 
 use super::{
@@ -185,7 +185,7 @@ pub async fn sql_run_handler(
     }
 
     // Group filtering is wired through the compartment-aware filter (see
-    // helios_sof::compartment::resolve_group_members_to_patient_refs): each
+    // crate::compartment::resolve_group_members_to_patient_refs): each
     // supplied `Group/{id}` is resolved against Group resources in the
     // inline bundle, and its `member.entity` Patient references join the
     // effective patient-compartment set. Absent `patient` / `group`
@@ -277,12 +277,12 @@ pub async fn sql_run_handler(
     let patient_filter: Vec<String> = if !extracted_params.patient.is_empty() {
         extracted_params.patient
     } else {
-        helios_sof::split_csv_refs(validated_params.patient.as_deref())
+        crate::split_csv_refs(validated_params.patient.as_deref())
     };
     let group_filter: Vec<String> = if !extracted_params.group.is_empty() {
         extracted_params.group
     } else {
-        helios_sof::split_csv_refs(validated_params.group.as_deref())
+        crate::split_csv_refs(validated_params.group.as_deref())
     };
     let source_param = extracted_params.source.or(validated_params.source.clone());
 
@@ -312,14 +312,16 @@ pub async fn sql_run_handler(
         || extracted_params.compression.is_some()
     {
         // Create or update Parquet options from body parameters
-        let mut parquet_opts = validated_params.parquet_options.clone().unwrap_or_else(|| {
-            helios_sof::ParquetOptions {
-                row_group_size_mb: 256,
-                page_size_kb: 1024,
-                compression: "snappy".to_string(),
-                max_file_size_mb: None,
-            }
-        });
+        let mut parquet_opts =
+            validated_params
+                .parquet_options
+                .clone()
+                .unwrap_or_else(|| crate::ParquetOptions {
+                    row_group_size_mb: 256,
+                    page_size_kb: 1024,
+                    compression: "snappy".to_string(),
+                    max_file_size_mb: None,
+                });
 
         if let Some(max_size) = extracted_params.max_file_size {
             parquet_opts.max_file_size_mb = Some(max_size);
@@ -552,7 +554,7 @@ pub async fn sql_run_handler(
         // CSV-fragile (line-splits assumed no embedded newlines).
         // Remote `resolve()` (trusted-server prefetch) is configured via
         // SOF_RESOLVE_* env vars; when inactive this is a no-op fast path.
-        let remote_config = helios_sof::RemoteResolveConfig::from_env();
+        let remote_config = crate::RemoteResolveConfig::from_env();
         let filtered_output = if remote_config.is_active() {
             run_view_definition_with_options_remote(
                 view_definition,
@@ -706,7 +708,7 @@ fn create_sql_run_operation_definition() -> serde_json::Value {
         "status": "active",
         "kind": "operation",
         "code": "sql-run",
-        "base": helios_sof::canonical::SQL_RUN_OPERATION_DEFINITION,
+        "base": crate::canonical::SQL_RUN_OPERATION_DEFINITION,
         "system": true,
         "type": false,
         "instance": false,
@@ -1135,7 +1137,7 @@ mod tests {
         assert_eq!(body["code"], "sql-run");
         assert_eq!(
             body["base"],
-            helios_sof::canonical::SQL_RUN_OPERATION_DEFINITION,
+            crate::canonical::SQL_RUN_OPERATION_DEFINITION,
             "base must name the guide's definition so a client knows what this subsets"
         );
         // System level only.
