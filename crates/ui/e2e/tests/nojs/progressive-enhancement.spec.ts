@@ -63,12 +63,11 @@ for (const { href, url } of NAV) {
   });
 }
 
-test("the 'coming soon' nav entries are inert, not links", async ({ page }) => {
+test("no nav entry is a dead 'coming soon' placeholder", async ({ page }) => {
+  // The last placeholder became the SQL on FHIR section (#649). Every entry
+  // in the menu now navigates; a reintroduced inert span would regress that.
   await page.goto("/ui");
-  const soon = page.locator("span.nav-item--soon");
-  await expect(soon.first()).toBeVisible();
-  // None of them is an anchor — they cannot navigate.
-  expect(await soon.evaluateAll((els) => els.every((e) => e.tagName !== "A"))).toBe(true);
+  await expect(page.locator(".nav-item--soon")).toHaveCount(0);
 });
 
 test("the Resources type rail navigates via plain links with no JavaScript", async ({
