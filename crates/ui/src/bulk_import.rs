@@ -210,6 +210,9 @@ struct BulkImportPage {
     available: bool,
     rows: Vec<SubmissionRow>,
     error: Option<String>,
+    /// Where every new submission goes (`HFS_BASE_URL`, #689) — shown in the
+    /// dialog so the fixed recipient is visible, not invisible.
+    recipient: String,
 }
 
 #[derive(Template)]
@@ -284,14 +287,13 @@ pub async fn page(
         available,
         rows,
         error: None,
+        recipient: state.public_base_url.trim_end_matches('/').to_string(),
     })
 }
 
 #[derive(Deserialize)]
 pub struct CreateForm {
     pub name: String,
-    #[serde(default)]
-    pub recipient_base_url: String,
     #[serde(default)]
     pub auth: String,
     #[serde(default)]
@@ -322,11 +324,10 @@ pub async fn create(
     };
     let submission = Submission {
         name: form.name.trim().to_string(),
-        recipient_base_url: form
-            .recipient_base_url
-            .trim()
-            .trim_end_matches('/')
-            .to_string(),
+        // The recipient is always this server's HFS_BASE_URL (#689) — typing
+        // it per submission is how a submission ended up pointed at something
+        // that is not a Bulk Data Submit endpoint (#686).
+        recipient_base_url: state.public_base_url.trim_end_matches('/').to_string(),
         auth: if form.auth == "backend-services" {
             form.auth
         } else {
