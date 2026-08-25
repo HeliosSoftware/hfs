@@ -322,40 +322,11 @@ impl ResourceStorage for PostgresBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let id = current.id();
 
-        // Check that the resource still exists with the expected version
-        let row = client
-            .query_opt(
-                "SELECT version_id FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
-
-        let actual_version = match row {
-            Some(row) => row.get::<_, String>(0),
-            None => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-        };
-
-        // Check version match
-        if actual_version != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version,
-                },
-            ));
-        }
-
-        // Calculate new version
-        let new_version: u64 = actual_version.parse().unwrap_or(0) + 1;
+        // The expected version is `current`'s, and the UPDATE below only matches a
+        // row that still carries it — so the new version follows from what the
+        // caller already read, with no round trip to ask what is stored.
+        let expected_version = current.version_id().to_string();
+        let new_version: u64 = expected_version.parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
         // Ensure the resource has correct type and id
@@ -370,13 +341,25 @@ impl ResourceStorage for PostgresBackend {
 
         let now = Utc::now();
         let fhir_version_str = current.fhir_version().as_mime_param();
-        let is_deleted = false;
 
-        // Update the resource
-        client
+        // Version check, update and history row in one statement. The check used
+        // to be a separate `SELECT` — a round trip on every update, and a
+        // check-then-act besides: a concurrent writer could bump the version in
+        // between and this update would overwrite it while reporting success.
+        // Folding the expected version into the `WHERE` makes the two atomic.
+        //
+        // Zero rows means the update matched nothing; which of the two reasons it
+        // was costs a query, but only on the path that is already failing.
+        let updated = client
             .execute(
-                "UPDATE resources SET version_id = $1, data = $2, last_updated = $3
-                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
+                "WITH upd AS (
+                     UPDATE resources SET version_id = $1, data = $2, last_updated = $3
+                     WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                       AND is_deleted = FALSE AND version_id = $7
+                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd",
                 &[
                     &new_version_str,
                     &resource,
@@ -384,20 +367,38 @@ impl ResourceStorage for PostgresBackend {
                     &tenant_id,
                     &resource_type,
                     &id,
+                    &expected_version,
+                    &fhir_version_str,
                 ],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
 
-        // Insert into history (preserve the original FHIR version)
-        client
-            .execute(
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &new_version_str, &resource, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        if updated == 0 {
+            let actual = client
+                .query_opt(
+                    "SELECT version_id FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
+                    &[&tenant_id, &resource_type, &id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+
+            return match actual {
+                Some(row) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version,
+                        actual_version: row.get::<_, String>(0),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
+        }
 
         // Re-index the resource. `delete_search_index` clears `search_index` AND
         // `resource_fts`, so it stays — but it leaves nothing for the indexing
