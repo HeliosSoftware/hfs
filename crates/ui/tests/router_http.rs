@@ -908,8 +908,7 @@ async fn resources_deep_links_focus_the_selected_type() {
     assert!(
         html.contains(expected),
         "rail entry mismatch; rendered around the anchor: {:?}",
-        html.find(anchor)
-            .map(|i| &html[i..html.len().min(i + 220)]),
+        html.find(anchor).map(|i| &html[i..html.len().min(i + 220)]),
     );
     assert!(html.contains(r#"class="filter-rail" id="resources""#));
     // Create and the builder prefill both follow the deep-linked type.
