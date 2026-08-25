@@ -65,10 +65,10 @@ test("a transaction bundle uploads, previews, executes, and reports", async ({ p
   await expect(page.locator("#batch-summary")).toContainText(/created/i);
   await expect(page.locator("#batch-overall")).toHaveClass(/--ok/);
 
-  // Back to the preflight keeps the parsed bundle.
-  await page.locator("#batch-back").click();
-  await expect(page.locator("#batch-preflight")).toBeVisible();
-  await expect(page.locator("#batch-rows .batch-row")).toHaveCount(2);
+  // Done is the one way out (#675): back to a clean upload stage.
+  await page.locator("#batch-done").click();
+  await expect(page.locator("#batch-upload")).toBeVisible();
+  await expect(page.locator("#batch-preflight")).toBeHidden();
 });
 
 test("a batch bundle gets the independent-entries copy", async ({ page }) => {

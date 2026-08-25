@@ -4423,16 +4423,37 @@ button.pill {
 }
 
 .request-strip__label {
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+/* The request line uses the app's mono stack at an explicit size — with no
+   rule it fell back to the UA's default monospace, visibly larger than the
+   surrounding text (#674). */
+.request-strip code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
 }
 
 .batch-tabs {
   display: flex;
   gap: 6px;
   margin-bottom: 8px;
+}
+
+/* Card content sits inset from the card border (#674): the tab row, entry
+   list, and JSON pane pick up the card's horizontal padding instead of
+   running edge-to-edge. */
+.card > .batch-tabs {
+  margin: 12px 14px 8px;
+}
+
+.card > .batch-rows,
+.card > .batch-json {
+  margin: 0 14px 12px;
 }
 
 .batch-tab {
@@ -4528,12 +4549,16 @@ button.pill {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
   margin-top: 14px;
 }
 
-.batch-footer__right {
-  display: flex;
-  gap: 8px;
+.batch-footer--top {
+  margin: 0 0 12px;
+}
+
+.batch-footer--end {
+  justify-content: flex-end;
 }
 
 .batch-badge {
