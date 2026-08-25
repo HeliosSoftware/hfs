@@ -82,6 +82,10 @@
      opposite move per theme — darker on the light tint, lighter on the dark —
      so it is theme-specific (see the dark block). */
   --accent-text: #0a5f96;
+  /* Destructive text clears 7:1 on the light card surface; the soft hover
+     fill keeps 5.8:1 contrast with the same foreground. */
+  --danger: #a61b12;
+  --danger-soft: #f0dfde;
   /* Menu panel input */
   --input-bg: #f5f5f5;
   /* Pill scrollbars: thin bar, fully-rounded track and thumb. */
@@ -107,6 +111,9 @@
   --muted: #a0a0a0;
   /* Selected-item accent text on the dark tint: lighter, to clear 4.5:1. */
   --accent-text: #7cc9ff;
+  /* Theme-specific destructive pair: 7.6:1 on the card and 5.6:1 on soft. */
+  --danger: #ff9a90;
+  --danger-soft: #453534;
   --divider: #000000;
   --divider-glint: rgb(255 255 255 / 12%);
   --outline: #353535;
@@ -1562,6 +1569,22 @@ button.pill {
   font-size: 13px;
   color: var(--muted);
 }
+
+.back-link,
+.back-link:visited {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+
+.back-link:hover {
+  text-decoration: underline;
+}
+
+.back-link:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
 }
 
 @layer pages {
@@ -2281,13 +2304,15 @@ button.pill {
   border-bottom: 0;
 }
 
-.data-table__empty td {
+.data-table__empty td,
+.empty-state {
+  margin: 0;
   color: var(--muted);
   text-align: center;
   padding: 32px 12px;
 }
 
-.data-table tbody tr:hover td,
+.data-table tbody tr:not(.data-table__empty):hover td,
 .data-table tbody tr[aria-selected="true"] td {
   background: var(--accent-soft);
 }
@@ -2440,6 +2465,16 @@ button.pill {
 }
 
 @layer pages {
+/* Bulk Import detail: consistent rhythm between its non-empty cards. */
+.bulk-import-section {
+  margin-bottom: 16px;
+}
+
+/* Status cards have no actions or content after their sole grid. */
+#bulk-status.bulk-import-section > .kv-grid:only-child {
+  margin-bottom: 0;
+}
+
 /* Detail panel (right rail on the SearchParameter viewer) */
 
 .detail {
