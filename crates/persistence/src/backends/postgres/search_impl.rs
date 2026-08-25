@@ -106,6 +106,27 @@ impl SearchProvider for PostgresBackend {
         } else {
             None
         };
+        // v17 fast path: resolve the page from `search_index` alone.
+        //
+        // The sort key lives on every index row (see `migrate_v16_to_v17`), so a
+        // single-parameter search can take its top-n before touching `resources`
+        // and then fetch only the rows it returns. The general form below has to
+        // join every match first — 42,927 whole resources for a 21-row page on
+        // the benchmark dataset — because the planner cannot estimate a range
+        // predicate whose selectivity is conditional on `param_name`.
+        let fast_index_pred: Option<String> = if cursor.is_none()
+            && query.offset.is_none()
+            && query.sort.is_empty()
+            && self.index_layout() == super::schema::IndexLayout::Denormalized
+        {
+            search_filter
+                .as_ref()
+                .and_then(|f| PostgresQueryBuilder::single_index_predicate(&f.sql))
+                .map(str::to_string)
+        } else {
+            None
+        };
+
         let filter_clause = search_filter
             .as_ref()
             .map(|f| format!(" AND ({})", f.sql))
@@ -129,7 +150,26 @@ impl SearchProvider for PostgresBackend {
         };
 
         // Build query based on pagination mode.
-        let (sql, has_previous) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
+        let (sql, has_previous) = if let Some(pred) = &fast_index_pred {
+            // `keyset` is always `Some` here: the fast path requires the default
+            // sort, which yields the `last_updated` keyset.
+            let sql = format!(
+                "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+                        r.last_updated AS sort_key \
+                 FROM ( \
+                   SELECT DISTINCT resource_id, last_updated FROM search_index \
+                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred} \
+                   ORDER BY last_updated DESC, resource_id ASC LIMIT {lim} \
+                 ) c \
+                 JOIN resources r \
+                   ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = c.resource_id \
+                 WHERE r.is_deleted = FALSE \
+                 ORDER BY c.last_updated DESC, c.resource_id ASC",
+                pred = pred,
+                lim = count + 1,
+            );
+            (sql, false)
+        } else if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
             let e = &k.expr;
             let asc = k.direction == crate::types::SortDirection::Ascending;
             match cursor.direction() {

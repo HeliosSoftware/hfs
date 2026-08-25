@@ -459,6 +459,26 @@ impl PostgresQueryBuilder {
         format!("ORDER BY {}", clauses.join(", "))
     }
 
+    /// The membership wrapper every single-parameter condition is built with.
+    ///
+    /// `SqlFragment::and` parenthesizes both sides, so a conjunction never
+    /// matches this prefix — only a lone membership test does.
+    const INDEX_MEMBERSHIP_PREFIX: &'static str = "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND ";
+
+    /// Returns the bare `search_index` predicate when `sql` is exactly one
+    /// membership test, so the caller can resolve the page against
+    /// `search_index` directly instead of through a subquery on `resources`.
+    pub fn single_index_predicate(sql: &str) -> Option<&str> {
+        let inner = sql
+            .strip_prefix(Self::INDEX_MEMBERSHIP_PREFIX)?
+            .strip_suffix(')')?;
+        // Defensive: nothing that still mentions the table can be a lone test.
+        if inner.contains("FROM search_index") {
+            return None;
+        }
+        Some(inner)
+    }
+
     /// Returns the keyset sort key for cursor pagination, or `None` when the
     /// query has multiple sort fields (those are returned as a single page
     /// rather than paged with a possibly-inconsistent keyset).
@@ -1789,6 +1809,80 @@ impl PostgresQueryBuilder {
 mod tests {
     use super::*;
     use crate::types::{CompositeSearchComponent, SearchModifier, SearchQuery};
+
+    fn date_param(name: &str, prefix: SearchPrefix, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(prefix, value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    #[test]
+    fn single_membership_test_is_extractable() {
+        let query = SearchQuery::new("Encounter").with_parameter(date_param(
+            "date",
+            SearchPrefix::Gt,
+            "2010-01-01",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(pred, "param_name = 'date' AND value_date >= $3");
+        // The extracted predicate must stand alone against `search_index`.
+        assert!(!pred.contains("resources"));
+        assert!(!pred.contains("SELECT"));
+    }
+
+    #[test]
+    fn conjunction_is_not_extractable() {
+        // Two parameters AND together, so no single index predicate resolves the
+        // page — taking either one alone would over-match.
+        let query = SearchQuery::new("Encounter")
+            .with_parameter(date_param("date", SearchPrefix::Gt, "2010-01-01"))
+            .with_parameter(date_param("date", SearchPrefix::Lt, "2020-01-01"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
+
+    #[test]
+    fn repeated_values_of_one_param_are_not_extractable() {
+        // `date=gt..&date=lt..` on one parameter also ANDs at resource level: two
+        // index rows may satisfy it jointly, which a single-row predicate cannot
+        // express.
+        let param = SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Gt, "2010-01-01"),
+                SearchValue::new(SearchPrefix::Lt, "2020-01-01"),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
+
+    #[test]
+    fn missing_modifier_is_not_extractable() {
+        // `:missing=true` is an absence test, so the rows it selects are exactly
+        // the ones `search_index` does not hold.
+        let mut param = date_param("date", SearchPrefix::Eq, "true");
+        param.modifier = Some(SearchModifier::Missing);
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
 
     #[test]
     fn composite_token_quantity_sql() {

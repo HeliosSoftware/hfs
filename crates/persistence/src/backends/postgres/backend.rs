@@ -35,6 +35,10 @@ pub struct PostgresBackend {
     registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
     stored_by_tenant: StoredByTenant,
+    /// `search_index` layout, read from the marker once the schema is initialized.
+    /// Unset until then, which reads as [`IndexLayout::Legacy`] — the form that
+    /// is correct against either layout.
+    index_layout: Arc<std::sync::OnceLock<super::schema::IndexLayout>>,
 }
 
 impl Debug for PostgresBackend {
@@ -333,6 +337,7 @@ impl PostgresBackend {
             config,
             registries,
             stored_by_tenant,
+            index_layout: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -612,10 +617,21 @@ impl PostgresBackend {
     pub async fn init_schema(&self) -> StorageResult<()> {
         let client = self.get_client().await?;
         super::schema::initialize_schema(&client).await?;
+        let _ = self
+            .index_layout
+            .set(super::schema::read_index_layout(&client).await);
         // Populate the per-tenant stored-param cache so the registries can build
         // each tenant's overlay lazily.
         self.reload_stored_cache().await?;
         Ok(())
+    }
+
+    /// The `search_index` layout this database is in.
+    pub(crate) fn index_layout(&self) -> super::schema::IndexLayout {
+        self.index_layout
+            .get()
+            .copied()
+            .unwrap_or(super::schema::IndexLayout::Legacy)
     }
 
     /// Reloads every tenant's stored active SearchParameters into the sync

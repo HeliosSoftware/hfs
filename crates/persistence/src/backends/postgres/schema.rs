@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 16;
+pub const SCHEMA_VERSION: i32 = 17;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -337,6 +337,7 @@ async fn migrate_schema(
             13 => migrate_v13_to_v14(client).await?,
             14 => migrate_v14_to_v15(client).await?,
             15 => migrate_v15_to_v16(client).await?,
+            16 => migrate_v16_to_v17(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -881,6 +882,154 @@ async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v12->v13 failed: {}", e)))?;
+    Ok(())
+}
+
+/// The layout of `search_index`, recorded once at the v16 -> v17 migration.
+///
+/// v17 denormalizes the pagination sort key (`last_updated`) onto every index
+/// row so that `ORDER BY last_updated DESC LIMIT n` can be answered from
+/// `search_index` alone. Only the write path can populate it — the value belongs
+/// to the resource, and a resource has many index rows — so an existing table
+/// cannot be backfilled by SQL and its rows keep `last_updated IS NULL`.
+///
+/// The marker records which case a database is in, so the read path can use the
+/// denormalized key only where every row actually has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexLayout {
+    /// Every `search_index` row carries `last_updated`.
+    Denormalized,
+    /// Rows predate v17 and have no sort key; read paths must use the v16 form.
+    Legacy,
+}
+
+/// Reads the recorded layout. Databases that never ran the v17 migration, and
+/// any database whose marker is unreadable, are treated as [`IndexLayout::Legacy`]
+/// — the conservative direction, since it selects the query form that works
+/// against both layouts.
+pub async fn read_index_layout(client: &deadpool_postgres::Client) -> IndexLayout {
+    match client
+        .query_opt("SELECT layout FROM search_index_layout LIMIT 1", &[])
+        .await
+    {
+        Ok(Some(row)) if row.get::<_, String>(0) == "denormalized" => IndexLayout::Denormalized,
+        Ok(_) => IndexLayout::Legacy,
+        Err(e) => {
+            tracing::warn!(
+                "Could not read search_index layout marker, assuming legacy: {}",
+                e
+            );
+            IndexLayout::Legacy
+        }
+    }
+}
+
+/// v16 -> v17: denormalize the pagination sort key onto `search_index`.
+///
+/// Every search ends `ORDER BY last_updated DESC, id ASC LIMIT n`, and that key
+/// lived only on `resources`. For a filter that matches many rows the planner
+/// therefore had to join every match before it could sort: measured on the
+/// benchmark dataset, `Encounter?date=gt2010-01-01` joined 42,927 whole
+/// resources (214,635 buffers, ~1.7 GB) to return 21 — 3,517 ms, of which the
+/// index scan was 228 ms.
+///
+/// Extended statistics fixed the equivalent problem for token search in v15, but
+/// they cannot fix this one: `value_date` selectivity is conditional on
+/// `param_name`, and a range predicate is not expressible as an MCV entry. So
+/// this removes the planner from the critical path instead of trying to inform
+/// it — with the sort key on the index row, the top-n is resolved before
+/// `resources` is touched at all.
+///
+/// Only the write path can populate the column, so an existing table is left
+/// alone and marked `legacy`: it keeps the v16 query form and behaves exactly as
+/// before. A fresh database is marked `denormalized`. (Promoting a populated
+/// database, by re-extracting under `$reindex` and flipping the marker, is not
+/// implemented here.)
+async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS search_index_layout (layout TEXT NOT NULL)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+
+    // A fresh database runs every migration in sequence against an empty table,
+    // so emptiness here is exactly "no row predates the column".
+    let populated = client
+        .query_one("SELECT EXISTS (SELECT 1 FROM search_index LIMIT 1)", &[])
+        .await
+        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?
+        .get::<_, bool>(0);
+
+    let layout = if populated { "legacy" } else { "denormalized" };
+
+    client
+        .execute("DELETE FROM search_index_layout", &[])
+        .await
+        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+    client
+        .execute(
+            "INSERT INTO search_index_layout (layout) VALUES ($1)",
+            &[&layout],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+
+    if populated {
+        tracing::info!(
+            "search_index predates v17; keeping the v16 search form. Existing \
+             deployments are unaffected and see no change in behaviour."
+        );
+        return Ok(());
+    }
+
+    // Carry the sort key in the index payload so the top-n is index-only. These
+    // rebuild instantly here — the table is empty by definition of this branch.
+    let index_stmts = [
+        "DROP INDEX IF EXISTS idx_search_date",
+        "CREATE INDEX IF NOT EXISTS idx_search_date
+         ON search_index (tenant_id, resource_type, param_name, value_date)
+         INCLUDE (resource_id, last_updated)
+         WHERE value_date IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_token_code",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_code
+         ON search_index (tenant_id, resource_type, param_name, value_token_code, value_token_system)
+         INCLUDE (resource_id, last_updated)
+         WHERE value_token_code IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_quantity",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity
+         ON search_index (tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit)
+         INCLUDE (resource_id, last_updated)",
+        // The denormalized composite indexes (#279) carry the key too, so a
+        // composite page is resolved the same way.
+        "DROP INDEX IF EXISTS idx_search_composite_token_quantity",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_token_quantity ON search_index
+         (tenant_id, resource_type, param_name, value_token_code, value_quantity_value)
+         INCLUDE (resource_id, last_updated)
+         WHERE composite_group IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_composite_token_token",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_token_token ON search_index
+         (tenant_id, resource_type, param_name, value_token_code, value_token_code_2)
+         INCLUDE (resource_id, last_updated)
+         WHERE composite_group IS NOT NULL",
+    ];
+
+    for sql in index_stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+    }
+
     Ok(())
 }
 

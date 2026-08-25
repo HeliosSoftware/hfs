@@ -154,7 +154,7 @@ impl ResourceStorage for PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Index the resource for search
-        self.index_resource(&client, tenant_id, resource_type, &id, &resource)
+        self.index_resource(&client, tenant_id, resource_type, &id, now, &resource)
             .await?;
 
         // An *active* SearchParameter write changes a tenant's overlay: reload
@@ -371,7 +371,7 @@ impl ResourceStorage for PostgresBackend {
         // Re-index the resource (delete old entries, add new)
         self.delete_search_index(&client, tenant_id, resource_type, id)
             .await?;
-        self.index_resource(&client, tenant_id, resource_type, id, &resource)
+        self.index_resource(&client, tenant_id, resource_type, id, now, &resource)
             .await?;
 
         // A SearchParameter write invalidates the tenant overlays.
@@ -981,7 +981,7 @@ impl PostgresBackend {
         // resource that is live again.
         self.delete_search_index(&client, tenant_id, resource_type, id)
             .await?;
-        self.index_resource(&client, tenant_id, resource_type, id, &resource)
+        self.index_resource(&client, tenant_id, resource_type, id, now, &resource)
             .await?;
 
         // A restored SearchParameter re-enters the tenant overlays.
@@ -1017,6 +1017,7 @@ impl PostgresBackend {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        last_updated: DateTime<Utc>,
         resource: &Value,
     ) -> StorageResult<()> {
         // When search is offloaded to a secondary backend, skip local indexing
@@ -1044,6 +1045,7 @@ impl PostgresBackend {
                     tenant_id,
                     resource_type,
                     resource_id,
+                    last_updated,
                     values,
                 )
                 .await?;
@@ -3152,6 +3154,7 @@ impl ReindexTarget for PostgresBackend {
             tenant_id,
             resource_type,
             resource_id,
+            resource.last_modified(),
             values,
         )
         .await?;

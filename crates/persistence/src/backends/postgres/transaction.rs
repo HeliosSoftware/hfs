@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use deadpool_postgres::Client;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
@@ -99,6 +99,7 @@ impl PostgresTransaction {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        last_updated: DateTime<Utc>,
         resource: &Value,
     ) -> StorageResult<()> {
         if self.search_offloaded {
@@ -129,6 +130,7 @@ impl PostgresTransaction {
             tenant_id,
             resource_type,
             resource_id,
+            last_updated,
             values,
         )
         .await?;
@@ -221,7 +223,7 @@ impl Transaction for PostgresTransaction {
             .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Index the resource for search
-        self.index_resource(tenant_id, resource_type, &id, &data)
+        self.index_resource(tenant_id, resource_type, &id, now, &data)
             .await?;
 
         Ok(StoredResource::from_storage(
@@ -389,7 +391,7 @@ impl Transaction for PostgresTransaction {
             .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Re-index the resource for search
-        self.index_resource(tenant_id, resource_type, id, &data)
+        self.index_resource(tenant_id, resource_type, id, now, &data)
             .await?;
 
         Ok(StoredResource::from_storage(

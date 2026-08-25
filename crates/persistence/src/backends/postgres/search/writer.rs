@@ -80,6 +80,7 @@ const ROW_COLUMNS: &[&str] = &[
     "tenant_id",
     "resource_type",
     "resource_id",
+    "last_updated",
     "param_name",
     "param_url",
     "composite_group",
@@ -106,7 +107,7 @@ const ROW_COLUMNS: &[&str] = &[
     "value_uri",
 ];
 
-/// Rows per `INSERT`. 27 columns x 128 rows = 3,456 bind parameters, well under
+/// Rows per `INSERT`. 28 columns x 128 rows = 3,584 bind parameters, well under
 /// Postgres' 65535 ceiling, and roughly one statement per imported resource.
 const BATCH_ROWS: usize = 128;
 
@@ -245,6 +246,7 @@ impl PostgresSearchIndexWriter {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        last_updated: DateTime<Utc>,
         values: Vec<ExtractedValue>,
     ) -> StorageResult<usize> {
         let (plain, composites) = super::composite_rows::fold_composites(values);
@@ -259,7 +261,15 @@ impl PostgresSearchIndexWriter {
             rows.push(IndexRow::from_composite(row));
         }
 
-        Self::insert_rows(client, tenant_id, resource_type, resource_id, &rows).await?;
+        Self::insert_rows(
+            client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            last_updated,
+            &rows,
+        )
+        .await?;
         Ok(rows.len())
     }
 
@@ -274,6 +284,7 @@ impl PostgresSearchIndexWriter {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        last_updated: DateTime<Utc>,
         rows: &[IndexRow],
     ) -> StorageResult<()> {
         for chunk in rows.chunks(BATCH_ROWS) {
@@ -292,6 +303,7 @@ impl PostgresSearchIndexWriter {
                 params.push(Box::new(tenant_id.to_string()));
                 params.push(Box::new(resource_type.to_string()));
                 params.push(Box::new(resource_id.to_string()));
+                params.push(Box::new(last_updated));
                 params.push(Box::new(row.param_name.clone()));
                 params.push(Box::new(row.param_url.clone()));
                 params.push(Box::new(row.composite_group));
@@ -348,12 +360,21 @@ impl PostgresSearchIndexWriter {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        last_updated: DateTime<Utc>,
         extracted: &ExtractedValue,
     ) -> StorageResult<()> {
         let Some(row) = IndexRow::from_extracted(extracted, resource_type, resource_id) else {
             return Ok(());
         };
-        Self::insert_rows(client, tenant_id, resource_type, resource_id, &[row]).await
+        Self::insert_rows(
+            client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            last_updated,
+            &[row],
+        )
+        .await
     }
 
     /// Writes a single contained `ExtractedValue` for `_contained` search. The
