@@ -22,7 +22,7 @@ nav-terminology = Terminology
 nav-terminology-new-window = Terminology (opens in a new tab)
 nav-resources = Resources
 nav-settings = Settings
-nav-signout = Sign out
+nav-signout = Sign Out
 
 ## Language switcher
 
@@ -41,7 +41,7 @@ status-last-checked = Last checked: { $timestamp }
 
 ## Dashboard / health
 
-dashboard-heading = Server dashboard
+dashboard-heading = Server Dashboard
 health-status-ok = All systems operational
 health-status-degraded = Some systems are degraded
 health-uptime = Uptime: { $duration }
@@ -55,15 +55,15 @@ resource-count = { $count ->
 
 ## Terminology browsing
 
-terminology-heading = Terminology server
+terminology-heading = Terminology Server
 terminology-lede = Connect HFS to a FHIR terminology server.
-terminology-configured-heading = Terminology server configured
+terminology-configured-heading = Terminology Server Configured
 terminology-configured-body = HFS_TERMINOLOGY_SERVER points to a valid server URL.
-terminology-configured-open = Open terminology server
+terminology-configured-open = Open Terminology Server
 terminology-invalid-heading = HFS_TERMINOLOGY_SERVER is invalid
 terminology-invalid-body = Use an absolute HTTP or HTTPS URL with a host. Paths and a trailing slash are allowed. Do not include credentials, a query string, or a fragment.
 terminology-invalid-note = Update the environment variable, then restart HFS.
-terminology-setup-heading = Connect a terminology server
+terminology-setup-heading = Connect a Terminology Server
 terminology-setup-body = Set HFS_TERMINOLOGY_SERVER to the base URL of the FHIR terminology server that HFS should use.
 terminology-setup-note = Set the variable in the environment that starts HFS, then restart the server.
 terminology-search-label = Search CodeSystems and ValueSets
@@ -117,20 +117,20 @@ tenants-stat-total-sub = { $count ->
 tenants-stat-resources = Resources stored
 tenants-stat-resources-sub = across all tenants
 tenants-search-placeholder = Search by name or tenant id…
-tenants-add = Add tenant
-tenants-add-title = Add a tenant
+tenants-add = Add Tenant
+tenants-add-title = Add a Tenant
 tenants-field-id = Tenant id
 tenants-field-id-hint = Used in the API (X-Tenant-ID header, URL prefix, JWT claim).
 tenants-field-name = Display name (optional)
 tenants-field-name-hint = A human-friendly label; not used for routing.
-tenants-add-submit = Provision tenant
+tenants-add-submit = Provision Tenant
 tenants-col-tenant = Tenant
 tenants-col-resources = Resources
 tenants-col-created = Created
 tenants-col-actions = Actions
 tenants-empty = No tenants match.
 tenants-unregistered = unregistered
-tenants-delete = Delete tenant
+tenants-delete = Delete Tenant
 tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept unless purged via the API.
 tenants-row-provisioning = Provisioning… this may take a moment.
 tenants-row-failed = Provisioning failed
@@ -145,28 +145,28 @@ theme-light = Light theme
 theme-dark = Dark theme
 
 fhir-version = FHIR { $version }
-fhir-version-heading = FHIR version
+fhir-version-heading = FHIR Version
 
-card-resource-types = Resource types
+card-resource-types = Resource Types
 card-resource-types-sub = enabled for { $version }
-card-stored-resources = Stored resources
+card-stored-resources = Stored Resources
 card-stored-resources-sub = across active tenant
-card-export-jobs = Export jobs
+card-export-jobs = Export Jobs
 card-export-jobs-sub = running ({ $queued } queued)
-card-import-jobs = Import jobs
+card-import-jobs = Import Jobs
 card-import-jobs-sub = active
 card-jobs-unavailable = unavailable
 card-uptime = Uptime
 card-uptime-sub = since process start
 
-chart-title = FHIR resources over time
+chart-title = FHIR Resources over Time
 chart-window = Chart time window
-chart-pick-heading = Charted resource types
+chart-pick-heading = Charted Resource Types
 chart-pick-all = View all resource types
 chart-pick-filter = Filter types
 chart-empty = Nothing to chart yet — stored resources appear here as they are created.
 chart-sample-note = Sample data: no live metrics provider is registered on this build.
-chart-table-toggle = View as table
+chart-table-toggle = View as Table
 chart-table-when = Time
 chart-focus-series = Focus this series
 chart-unfocus-series = Show all series
@@ -185,8 +185,8 @@ history-id-placeholder = resource id
 history-load = Load
 history-tabs-label = History scope
 history-tab-instance = Instance
-history-tab-type = Type feed
-history-tab-system = System feed
+history-tab-type = Type Feed
+history-tab-system = System Feed
 history-versions-label = Versions
 history-pick-instance = Pick an instance
 history-current = current
@@ -210,9 +210,9 @@ history-parse-error = Those versions could not be read as JSON.
 
 nav-saved-queries = Saved Queries
 
-queries-heading = Saved queries
+queries-heading = Saved Queries
 queries-lede = Keep FHIR search queries per resource type, sorted by when you last ran them. Saved to your user settings, so they roam across devices.
-queries-add-heading = Save a query
+queries-add-heading = Save a Query
 queries-type-label = Resource type
 queries-type-placeholder = e.g. Patient
 queries-name-label = Name
@@ -238,7 +238,7 @@ sp-rail-label = Resource filter
 sp-rail-search = Filter types
 sp-rail-recent = Recently used
 sp-rail-types = Resource types
-sp-rail-all = All types
+sp-rail-all = All Types
 sp-facet-type = Type
 sp-facet-type-label = Filter by parameter type
 sp-facet-source = Source
@@ -277,11 +277,11 @@ sp-note-shadowed = Shadowed by { $url } on (base, code): a higher-precedence sou
 sp-note-empty-expression = Empty expression: the extractor indexes zero rows, so every search on this parameter silently returns empty.
 sp-note-no-target = Reference parameter with no target types: chained search cannot resolve the referenced type.
 sp-note-choice-type = Choice-type expression: the extractor rewrites ofType(T) / as T to the concrete element (for example valueQuantity) before evaluating against raw stored JSON.
-sp-new = New search parameter
+sp-new = New Search Parameter
 sp-edit = Edit
 sp-delete = Delete
 sp-delete-confirm = Delete this stored search parameter? Searches that use it stop matching once the registry refreshes.
-cmp-new = New compartment definition
+cmp-new = New Compartment Definition
 cmp-edit = Edit
 cmp-delete = Delete
 cmp-delete-confirm = Delete this compartment definition? Its compartment routes stop resolving.
@@ -314,7 +314,7 @@ cmp-yes = yes
 cmp-no = no
 cmp-readonly-note = Read-only: these values come from the spec definitions compiled into the server.
 cmp-filter-members = Members
-cmp-filter-all = All types
+cmp-filter-all = All Types
 cmp-filter-excluded = Excluded
 cmp-member = member
 cmp-excluded = excluded
@@ -330,12 +330,12 @@ cmp-result-notmember = ✕ { $type } is not a member of this compartment
 cmp-result-notmember-note = The server returns 404 with an OperationOutcome for types that are not compartment members.
 cmp-result-fanout = Fans out to { $count } member types
 cmp-result-fanout-note = Excluded types are skipped, not failed — the fan-out drops non-member types rather than erroring.
-queries-builder-heading = Search builder
+queries-builder-heading = Search Builder
 queries-url-label = FHIR search URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
 queries-builder-hint = Edit the GET URL directly or through the rows below — they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
 queries-recent = Recent
-queries-recent-heading = Recent searches
+queries-recent-heading = Recent Searches
 queries-recent-empty = No recent searches yet — Run one to record it here.
 queries-invalid-url = Enter a search like GET /Patient?name=smith — the resource type comes from the path.
 queries-invalid-fhir-escape = This query contains an invalid FHIR escape. Correct the escaped value before editing it visually.
@@ -382,7 +382,7 @@ plain-verb-eq = is
 plain-verb-sa = starts after
 plain-verb-eb = ends before
 plain-verb-ap = is approximately
-queries-related-heading = Include related data
+queries-related-heading = Include Related Data
 queries-related-sub = Adds connected resources to the results.
 queries-related-add-include = Include a resource that points to
 queries-related-add-revinclude = Include resources that point here
@@ -417,12 +417,12 @@ queries-results = Results
 queries-results-total = { $count } results
 queries-results-included = { $count } included
 queries-results-empty = No results.
-queries-open-tab = Open in new tab
+queries-open-tab = Open in New Tab
 queries-col-updated = Updated
 queries-prev = Previous
 queries-next = Next
 
-queries-rail-heading = Resource types
+queries-rail-heading = Resource Types
 queries-rail-filter = Filter types
 
 ## Search — natural language & visual builder (#255)
@@ -430,7 +430,7 @@ queries-rail-filter = Filter types
 search-heading = Search
 search-lede = Describe what you're looking for, or build the query by hand. Either way you get a FHIR search query you can read, correct, and run.
 search-query-tag = QUERY
-search-copy = Copy the query
+search-copy = Copy the Query
 
 search-mode-label = How to write the query
 search-mode-nl = Natural language
@@ -455,22 +455,22 @@ search-setup-docs = Read the how-to
 
 ## Resource editor (#264)
 
-editor-heading = Resource editor
+editor-heading = Resource Editor
 editor-lede = Edit a resource against its schema: add any element the schema allows, at any depth — including extensions, on any node that accepts one.
-editor-title = Edit resource
+editor-title = Edit Resource
 editor-view-label = How to edit
 editor-view-form = Guided form
 editor-view-json = JSON
-editor-save = Save changes
+editor-save = Save Changes
 editor-delete = Delete
-editor-remove = Remove this node
+editor-remove = Remove This Node
 editor-saved = Saved.
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
 editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
 
-editor-add = Add element
+editor-add = Add Element
 editor-must-support-badge = MS
 editor-binding-hint = Bound to a value set — codes come from it; strength shown
 editor-legend-live = Checked as you type: structure, cardinality, required bindings
@@ -511,15 +511,15 @@ resources-lede = Browse, search, create, and edit FHIR resources. Search in natu
 resources-create-typed = Create new { $type }
 resources-save-blocked = Fix the validation issues before saving.
 resources-save-invalid = The JSON is not valid — fix it before saving.
-resources-edit-title = Edit resource
+resources-edit-title = Edit Resource
 resources-tab-edit = Edit
 resources-tab-history = History
-resources-types-heading = Resource types
-rail-all-types-heading = All types
+resources-types-heading = Resource Types
+rail-all-types-heading = All Types
 
 queries-saved-group = Saved
 
-nav-collapse = Collapse menu
+nav-collapse = Collapse Menu
 
 batch-heading = Batch / Transaction
 batch-lede = Upload a FHIR Bundle, review the actions it will run, execute it against this server, and read the outcome of every entry.
@@ -539,19 +539,19 @@ batch-no-body = (no body — this entry only addresses a resource)
 batch-cancel = Cancel
 batch-upload-another = Upload another
 batch-execute = Execute
-batch-response-heading = Per-action outcomes
+batch-response-heading = Per-Action Outcomes
 batch-sum-created = created
 batch-sum-updated = updated
 batch-sum-other = read/other
 batch-sum-failed = failed
 batch-request-failed = The request failed
-batch-back = Back to bundle
+batch-back = Back to Bundle
 batch-execute-again = Execute again
 
 ## Bulk Import workspace (#527)
 
 bulk-import-title = Bulk Import
-bulk-import-new = New submission
+bulk-import-new = New Submission
 bulk-import-create-title = Create Bulk Submission
 bulk-import-field-name = Submission name
 bulk-import-field-recipient = Recipient base URL
@@ -569,7 +569,7 @@ bulk-import-field-token-url-hint = Authorization server's token endpoint URL.
 bulk-import-jwks-hint = Register this server's public key with the recipient using the JWKS URL:
 bulk-import-test-auth = Test authentication
 bulk-import-test-auth-ok = Authentication succeeded.
-bulk-import-create-submit = Create submission
+bulk-import-create-submit = Create Submission
 bulk-import-unavailable = The storage backend does not host the settings store, so submissions cannot be saved.
 bulk-import-submissions = Submissions
 bulk-import-records = records
@@ -668,7 +668,7 @@ subs-state-off = off
 bulk-export-title = Bulk Export
 bulk-export-active-title = Active Exports
 bulk-export-active-link = Active exports
-bulk-export-new = New export
+bulk-export-new = New Export
 bulk-export-unavailable = The storage backend does not host the settings store, so export jobs cannot be tracked.
 bulk-export-scope = What are you exporting?
 bulk-export-scope-system = Everything
@@ -694,7 +694,7 @@ bulk-export-since-month = Last 4 weeks
 bulk-export-since-custom = Custom
 bulk-export-field-since-custom = Custom instant
 bulk-export-field-since-custom-hint = Used when Since is Custom. RFC 3339, e.g. 2026-08-01T00:00:00Z.
-bulk-export-start = Start export
+bulk-export-start = Start Export
 bulk-export-running = running
 bulk-export-none = No exports yet. Start one from the Bulk Export page.
 bulk-export-status-in-progress = In progress
