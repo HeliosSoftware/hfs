@@ -105,6 +105,7 @@ fn app() -> Router {
         )),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     )
 }
 

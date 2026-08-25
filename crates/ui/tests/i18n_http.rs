@@ -26,6 +26,7 @@ fn app() -> Router {
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     )
 }
 

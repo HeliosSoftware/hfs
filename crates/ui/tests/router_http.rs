@@ -41,6 +41,7 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
         )),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     )
 }
 
@@ -221,6 +222,7 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     )
     .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
     .await
@@ -280,6 +282,7 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         std::sync::Arc::new(source),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     let response = app
@@ -408,6 +411,7 @@ async fn compartments_degrade_to_a_warning_when_the_fetch_is_empty() {
         helios_fhir::FhirVersion::R4,
         // No terminology server: this test is about the conformance fetch.
         None,
+        "http://localhost:8080".to_string(),
     )
     .oneshot(
         Request::get("/ui/compartments")
@@ -945,6 +949,7 @@ fn app_with_terminology(terminology: Option<String>) -> Router {
         )),
         helios_fhir::FhirVersion::R4,
         terminology,
+        "http://localhost:8080".to_string(),
     )
 }
 
@@ -1250,4 +1255,196 @@ async fn editor_opens_the_root_picker_on_an_empty_document() {
     )
     .await;
     assert!(!html.contains(r#"<details class="editor-add" open>"#));
+}
+
+/// #649: SQL on FHIR is a top-level nav section whose five children are real
+/// routes — the dead `nav-item--soon` placeholder is gone — and each stub
+/// page answers 200 and marks its own nav entry current.
+#[tokio::test]
+async fn sql_on_fhir_section_navigates_to_real_stub_pages() {
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">SQL on FHIR</div>"));
+    for href in [
+        "/ui/sql/view-definitions",
+        "/ui/sql/queries",
+        "/ui/sql/views",
+        "/ui/sql/export",
+        "/ui/sql/files",
+    ] {
+        assert!(
+            html.contains(&format!(r#"href="{href}""#)),
+            "{href} missing from the nav"
+        );
+    }
+    // No entry in the menu is a dead placeholder any more.
+    assert!(!html.contains("nav-item--soon"));
+
+    for href in [
+        "/ui/sql/view-definitions",
+        "/ui/sql/queries",
+        "/ui/sql/views",
+        "/ui/sql/export",
+        "/ui/sql/files",
+    ] {
+        let response = app()
+            .oneshot(Request::get(href).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{href}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(&format!(r#"href="{href}" aria-current="page""#)),
+            "{href} does not mark its nav entry current"
+        );
+        // A stub states which server operation already serves the data; View
+        // Definitions is the live workspace and asserts its own content in
+        // `view_definitions_workspace_lists_edits_and_previews`.
+        if href != "/ui/sql/view-definitions" {
+            assert!(
+                html.contains("sql-run") || html.contains("/export/"),
+                "{href}"
+            );
+        }
+    }
+}
+
+/// #649: the View Definitions workspace lists stored views in the rail
+/// (name-sorted, first selected), edits the selection as JSON, offers the
+/// starter document under Create New, and previews rows through $sql-run in
+/// the view's declared column order.
+#[tokio::test]
+async fn view_definitions_workspace_lists_edits_and_previews() {
+    let vds = vec![
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd2", "name": "blood_pressure",
+            "resource": "Observation",
+            "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]}),
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+            "resource": "Patient",
+            "select": [{"column": [{"name": "id", "path": "getResourceKey()"},
+                                    {"name": "family", "path": "name.family.first()"}]}]}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vds)
+        .with_sql_run(Ok(vec![serde_json::json!({"family": "Doe", "id": "p1"})]));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // Both rail entries, and the name-sorted first one selected by default.
+    assert!(html.contains(r#"href="/ui/sql/view-definitions?vd=vd1""#));
+    assert!(html.contains(r#"href="/ui/sql/view-definitions?vd=vd2""#));
+    assert!(html.contains("active_patients"));
+    assert!(html.contains(r#"name="json""#));
+    // Delete goes through the shared conformance CRUD script.
+    assert!(html.contains(r#"data-crud-delete"#));
+    assert!(html.contains("/ui/assets/conformance-crud.js"));
+
+    // ?run=1 previews through $sql-run: declared column order, row rendered.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1&run=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("<th>id</th><th>family</th>"));
+    assert!(html.contains("<td>p1</td><td>Doe</td>"));
+
+    // Create New offers the starter document in the editor.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("new_view"));
+    assert!(html.contains("getResourceKey()"));
+}
+
+/// #649: Save is a plain form post — a valid document redirects to the stored
+/// view, a broken one re-renders with the submitted text preserved so nothing
+/// typed is lost.
+#[tokio::test]
+async fn view_definitions_save_roundtrips_and_rejects_bad_json() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+    );
+
+    let body = "id=&action=save&json=%7B%22resourceType%22%3A%22ViewDefinition%22%2C%22name%22%3A%22x%22%7D";
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/view-definitions?vd=static-created&saved=1"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("id=&action=save&json=%7Bnope"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(html.contains("{nope"));
 }

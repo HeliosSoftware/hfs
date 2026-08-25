@@ -84,6 +84,7 @@ error-generic = Algo salió mal. Vuelva a intentarlo.
 
 nav-section-work = Trabajo
 nav-section-batch-data = Lotes y datos
+nav-section-sql-on-fhir = SQL on FHIR
 nav-section-server = Servidor
 nav-section-tools = Herramientas
 
@@ -95,7 +96,11 @@ nav-compartments = Compartimentos
 nav-batch-transaction = Lote / Transacción
 nav-import = Importar
 nav-export = Exportar
-nav-sql-on-fhir = SQL-on-FHIR
+nav-sql-view-definitions = Definiciones de vistas
+nav-sql-queries = Consultas SQL
+nav-sql-views = Vistas SQL
+nav-sql-export = Exportación SQL
+nav-sql-files = Archivos
 nav-capability-conformance = Capacidad y conformidad
 nav-search-parameters = Parámetros de búsqueda
 nav-subscriptions = Suscripciones
@@ -552,7 +557,6 @@ bulk-import-new = Nueva submission
 bulk-import-create-title = Crear Bulk Submission
 bulk-import-field-name = Nombre de la submission
 bulk-import-field-recipient = URL base del receptor
-bulk-import-field-recipient-hint = La URL base del servidor donde se enviarán los datos.
 bulk-import-auth = Autenticación
 bulk-import-auth-hint = Cómo autenticarse ante el servidor receptor.
 bulk-import-auth-none = Ninguna
@@ -597,7 +601,7 @@ bulk-import-field-manifest-url = URL del manifest
 bulk-import-field-manifest-url-hint = URL de un Bulk Export Manifest con un conjunto de datos FHIR precoordinado.
 bulk-import-field-fhir-base = URL base FHIR
 bulk-import-field-fhir-base-hint = URL base que usará el receptor al resolver referencias relativas. Déjela vacía para usar la URL base del manifest.
-bulk-import-field-output-format = Formato de salida
+bulk-import-field-output-format = Formato
 bulk-import-field-output-format-hint = El formato de los archivos Bulk Data del manifest.
 bulk-import-field-headers = Cabeceras de petición de archivos
 bulk-import-field-headers-hint = Cabeceras HTTP que el receptor debe usar al pedir un archivo de datos, una "Nombre: valor" por línea.
@@ -736,3 +740,50 @@ cap-col-revincludes = Revincludes
 cap-resources-empty = Ningún tipo de recurso coincide con el filtro.
 cap-raw-toggle = CapabilityStatement en bruto (JSON)
 cap-unavailable = No se pudo obtener la CapabilityStatement del servidor — la autollamada puede necesitar un token saliente cuando la autenticación está activada.
+
+## Stubs de la sección SQL on FHIR (#649)
+
+sql-stub-heading = Próximamente
+sql-stub-planned = Previsto
+sql-stub-api = API que lo sirve
+
+sql-vd-title = Definiciones de vistas
+sql-vd-lede = Crea y gestiona las ViewDefinitions con las que SQL on FHIR aplana recursos.
+
+sql-queries-title = Consultas SQL
+sql-queries-lede = Ejecuta consultas SQL on FHIR contra este servidor.
+sql-queries-body = Redacta una consulta, ejecútala e inspecciona las filas resultantes en línea.
+
+sql-views-title = Vistas SQL
+sql-views-lede = Vistas SQL reutilizables construidas sobre ViewDefinitions.
+sql-views-body = Bibliotecas SQLView y las vistas que definen, resueltas con sus dependencias.
+
+sql-export-title = Exportación SQL
+sql-export-lede = Trabajos de exportación SQL on FHIR de larga duración.
+sql-export-body = Inicia una exportación, sigue su progreso y cancela los trabajos que ya no necesites.
+
+sql-files-title = Archivos
+sql-files-lede = Manifiestos y archivos de salida producidos por las exportaciones SQL.
+sql-files-body = Consulta el manifiesto de cada trabajo y descarga sus archivos de salida.
+
+## Espacio de definiciones de vistas (#649)
+
+vd-new = Crear nueva
+vd-new-title = Nueva definición de vista
+vd-rail-label = Definiciones de vistas
+vd-rail-heading = Definiciones de vistas
+vd-filter = Filtrar vistas
+vd-none = Aún no hay definiciones de vistas.
+vd-empty-lede = Crea tu primera ViewDefinition con «Crear nueva».
+vd-degraded = No se pudo cargar la lista de definiciones de vistas.
+vd-saved = Guardado.
+vd-run = Ejecutar
+vd-run-failed = La ejecución de la vista falló.
+vd-save = Guardar
+vd-duplicate = Duplicar
+vd-delete = Eliminar
+vd-delete-confirm = ¿Eliminar la definición de vista «{ $name }»? Esta acción no se puede deshacer.
+vd-delete-failed = No se pudo eliminar la definición de vista.
+vd-json-heading = Definición (JSON)
+vd-results-heading = Resultados
+vd-results-empty = La vista no produjo filas.
