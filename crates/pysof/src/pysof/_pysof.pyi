@@ -78,6 +78,32 @@ def py_run_view_definition_with_options_remote(
     page: int | None = None,
     fhir_version: str = "R4",
 ) -> bytes: ...
+def py_process_ndjson_to_file(
+    view: dict[str, Any],
+    input_path: str,
+    output_path: str,
+    format: str,
+    *,
+    chunk_size: int = 1000,
+    skip_invalid: bool = False,
+    fhir_version: str = "R4",
+) -> dict[str, Any]: ...
+
+class ChunkedProcessor:
+    def __init__(
+        self,
+        view_definition: dict[str, Any],
+        input_path: str,
+        *,
+        chunk_size: int = 1000,
+        skip_invalid: bool = False,
+        fhir_version: str = "R4",
+    ) -> None: ...
+    def __iter__(self) -> ChunkedProcessor: ...
+    def __next__(self) -> dict[str, Any]: ...
+    @property
+    def columns(self) -> list[str] | None: ...
+
 def py_process_ndjson_to_file_remote(
     view: dict[str, Any],
     input_path: str,

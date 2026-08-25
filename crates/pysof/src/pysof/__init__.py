@@ -7,6 +7,8 @@ Public API:
     run_view_definition: Transform FHIR data using ViewDefinition
     run_view_definition_with_options: Transform with filtering/pagination
     run_view_definition_remote: Transform with remote resolve() (trusted servers)
+    process_ndjson_to_file: Stream an NDJSON file to an output file
+    ChunkedProcessor: Iterate an NDJSON file as chunks of transformed rows
     process_ndjson_to_file_remote: Stream NDJSON with remote resolve()
     RemoteResolveConfig: Configuration for remote resolve()
     validate_view_definition: Pre-validate ViewDefinition structure
@@ -35,6 +37,8 @@ from typing import Any, cast
 try:
     # Import the Rust extension module
     from pysof._pysof import (
+        # NDJSON streaming iterator class
+        ChunkedProcessor,
         CsvError,
         FhirPathError,
         InvalidSourceContentError,
@@ -54,6 +58,7 @@ try:
         __version__,
         py_get_supported_fhir_versions,
         py_parse_content_type,
+        py_process_ndjson_to_file,
         py_process_ndjson_to_file_remote,
         py_run_view_definition,
         py_run_view_definition_with_options,
@@ -273,6 +278,44 @@ try:
             fhir_version=fhir_version,
         )
 
+    def process_ndjson_to_file(
+        view: dict[str, Any],
+        input_path: str,
+        output_path: str,
+        format: str,
+        *,
+        chunk_size: int = 1000,
+        skip_invalid: bool = False,
+        fhir_version: str = "R4",
+    ) -> dict[str, Any]:
+        """Stream an NDJSON file through a ViewDefinition into an output file.
+
+        The most memory-efficient way to process large NDJSON exports: resources
+        are read, transformed, and written chunk by chunk, so memory use is
+        bounded by ``chunk_size`` rather than file size.
+
+        Args:
+            view: ViewDefinition resource as a Python dictionary
+            input_path: Path to the input NDJSON file
+            output_path: Path to write the output file
+            format: Output format ("csv", "csv_with_header", "ndjson", "json")
+            chunk_size: Number of resources per chunk. Defaults to 1000.
+            skip_invalid: Skip invalid JSON lines. Defaults to False.
+            fhir_version: FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
+
+        Returns:
+            Processing statistics as a dictionary
+        """
+        return py_process_ndjson_to_file(
+            view,
+            input_path,
+            output_path,
+            format,
+            chunk_size=chunk_size,
+            skip_invalid=skip_invalid,
+            fhir_version=fhir_version,
+        )
+
 except ImportError as e:
     # Fallback for when the Rust extension is not available
     import warnings
@@ -421,6 +464,24 @@ except ImportError as e:
     ) -> dict[str, Any]:
         raise NotImplementedError("Rust extension module not available")
 
+    def process_ndjson_to_file(
+        view: dict[str, Any],
+        input_path: str,
+        output_path: str,
+        format: str,
+        *,
+        chunk_size: int = 1000,
+        skip_invalid: bool = False,
+        fhir_version: str = "R4",
+    ) -> dict[str, Any]:
+        raise NotImplementedError("Rust extension module not available")
+
+    class ChunkedProcessor:  # type: ignore[no-redef]
+        """NDJSON streaming iterator (placeholder)."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise NotImplementedError("Rust extension module not available")
+
     # Set fallback version when Rust extension is not available
     __version__ = "0.0.0-dev"
 
@@ -430,6 +491,8 @@ __all__: list[str] = [
     "run_view_definition",
     "run_view_definition_with_options",
     "run_view_definition_remote",
+    "process_ndjson_to_file",
+    "ChunkedProcessor",
     "process_ndjson_to_file_remote",
     "RemoteResolveConfig",
     "validate_view_definition",
