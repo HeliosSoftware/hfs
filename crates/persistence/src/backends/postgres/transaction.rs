@@ -179,22 +179,6 @@ impl Transaction for PostgresTransaction {
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        // Check if resource already exists
-        let exists = client
-            .query_opt(
-                "SELECT 1 FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to check existence: {}", e)))?;
-
-        if exists.is_some() {
-            return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        }
-
         // Build the resource with id and resourceType
         let mut data = resource.clone();
         if let Some(obj) = data.as_object_mut() {
@@ -210,25 +194,36 @@ impl Transaction for PostgresTransaction {
         let fhir_version_str = self.fhir_version.as_mime_param();
         let is_deleted = false;
 
-        // Insert the resource
-        client
+        // Resource row, history row and the existence check in one statement —
+        // see the matching comment on `PostgresBackend::create`. This is the path
+        // a transaction-bundle import takes for every resource it writes, so the
+        // round trips saved here are the ones that dominate a bulk import.
+        //
+        // Inside a transaction this is also strictly safer than the previous
+        // form: a losing race used to raise a primary-key violation, which aborts
+        // the whole transaction and takes every other entry in the bundle with
+        // it. `ON CONFLICT DO NOTHING` reports it as a value instead.
+        let inserted = client
             .execute(
-                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                "WITH ins AS (
+                     INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (tenant_id, resource_type, id) DO NOTHING
+                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version FROM ins",
                 &[&tenant_id, &resource_type, &id, &version_id, &data, &now, &is_deleted, &fhir_version_str],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
 
-        // Insert into history
-        client
-            .execute(
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &version_id, &data, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        if inserted == 0 {
+            return Err(StorageError::Resource(ResourceError::AlreadyExists {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
 
         // Index the resource for search
         self.index_resource(

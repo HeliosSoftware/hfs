@@ -119,22 +119,6 @@ impl ResourceStorage for PostgresBackend {
             .map(String::from)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        // Check if resource already exists
-        let exists = client
-            .query_opt(
-                "SELECT 1 FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to check existence: {}", e)))?;
-
-        if exists.is_some() {
-            return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                resource_type: resource_type.to_string(),
-                id: id.clone(),
-            }));
-        }
-
         // Ensure the resource has correct type and id
         let mut resource = resource;
         if let Some(obj) = resource.as_object_mut() {
@@ -150,25 +134,39 @@ impl ResourceStorage for PostgresBackend {
         let fhir_version_str = fhir_version.as_mime_param();
         let is_deleted = false;
 
-        // Insert the resource
-        client
+        // Resource row, history row and the existence check in one statement.
+        //
+        // The check used to be its own `SELECT` — a round trip per create, on the
+        // path a bulk import takes for every resource — and it was racy besides:
+        // two concurrent creates of the same id could both pass it and one would
+        // then fail on the primary key with an internal error instead of
+        // `AlreadyExists`. `ON CONFLICT DO NOTHING` decides it atomically.
+        //
+        // On conflict the CTE yields no row, so the history insert selects
+        // nothing and the statement reports zero rows affected — one signal for
+        // both writes. A soft-deleted resource still occupies its primary key, so
+        // it conflicts too, exactly as the old check treated it.
+        let inserted = client
             .execute(
-                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                "WITH ins AS (
+                     INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (tenant_id, resource_type, id) DO NOTHING
+                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version FROM ins",
                 &[&tenant_id, &resource_type, &id, &version_id, &resource, &now, &is_deleted, &fhir_version_str],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
 
-        // Insert into history
-        client
-            .execute(
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &version_id, &resource, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        if inserted == 0 {
+            return Err(StorageError::Resource(ResourceError::AlreadyExists {
+                resource_type: resource_type.to_string(),
+                id: id.clone(),
+            }));
+        }
 
         // Index the resource for search
         self.index_resource(
