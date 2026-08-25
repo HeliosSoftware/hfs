@@ -1994,9 +1994,11 @@ button.pill {
 
 /* Stacked section cards keep the page's vertical rhythm. Pages that lay
    cards out in a flex/grid column get their spacing from the gap; this
-   covers the block-flow stacks (SQL Export, Files, Capability Statement),
-   where .card alone sat flush against the previous one. */
-.content > .card + .card {
+   covers the block-flow stacks (SQL Export, Files, Capability Statement,
+   the Bulk Import detail), where .card alone sat flush against the previous
+   one. The general sibling, not the adjacent one: htmx wrapper divs sit
+   between cards on the Bulk Import detail. */
+.content > .card ~ .card {
   margin-top: 20px;
 }
 
