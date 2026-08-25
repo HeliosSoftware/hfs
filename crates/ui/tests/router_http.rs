@@ -103,6 +103,22 @@ fn app_with_body_limit(max_body_size: usize) -> Router {
     )
 }
 
+fn production_app() -> Router {
+    helios_ui::mount(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        "http://127.0.0.1:9".to_string(),
+        Arc::new(helios_auth::NoOpOutboundAuthProvider),
+        helios_fhir::FhirVersion::R4,
+        None,
+    )
+}
+
 fn app_with_unavailable_settings() -> Router {
     helios_ui::mount_with_conformance_source(
         Router::new(),
@@ -843,6 +859,35 @@ async fn json_view_endpoint_rejects_invalid_or_oversized_json() {
             Request::post("/ui/json-view/render")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"long":"01234567890123456789"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn production_mount_applies_the_default_json_view_body_limit() {
+    let app = production_app();
+
+    let normal = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"resourceType":"Patient"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(normal.status(), StatusCode::OK);
+
+    let over_default_limit = format!(r#"{{"value":"{}"}}"#, "x".repeat(10 * 1024 * 1024));
+    let oversized = app
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(over_default_limit))
                 .unwrap(),
         )
         .await

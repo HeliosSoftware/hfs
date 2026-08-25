@@ -545,4 +545,20 @@ mod tests {
         assert!(out.iter().all(|line| line.path.is_empty()));
         assert!(out.iter().any(|line| line.foldable));
     }
+
+    #[test]
+    fn construction_guard_rejects_a_line_at_capacity() {
+        let mut ctx = Ctx {
+            lines: Vec::new(),
+            counter: 0,
+            include_paths: false,
+            max_lines: Some(0),
+        };
+
+        assert_eq!(
+            ctx.push(Line::new(0, &[], String::new())),
+            Err(RenderLimitExceeded)
+        );
+        assert!(ctx.lines.is_empty());
+    }
 }
