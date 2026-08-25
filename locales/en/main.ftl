@@ -743,9 +743,6 @@ cap-unavailable = The CapabilityStatement could not be fetched from the server �
 
 ## SQL on FHIR section stubs (#649)
 
-sql-stub-heading = Coming Soon
-sql-stub-planned = Planned
-sql-stub-api = Serving API
 
 sql-vd-title = View Definitions
 sql-vd-lede = Author and manage the ViewDefinitions that SQL on FHIR runs flatten resources with.
@@ -758,11 +755,9 @@ sql-views-lede = Reusable SQL views layered over ViewDefinitions.
 
 sql-export-title = SQL Export
 sql-export-lede = Long-running SQL on FHIR export jobs.
-sql-export-body = Start an export, follow its progress, and cancel jobs that are no longer needed.
 
 sql-files-title = Files
 sql-files-lede = Manifests and output files produced by SQL exports.
-sql-files-body = Browse each job's manifest and download its output files.
 
 ## View Definitions workspace (#649)
 
@@ -797,3 +792,30 @@ lib-degraded = The library list could not be loaded.
 lib-sql-heading = SQL
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Deleting the library failed.
+
+## SQL Export and Files pages (#649)
+
+export-start-failed = Starting the export failed.
+export-started = Export started.
+export-cancelled = Cancellation requested.
+export-job-heading = Export Job
+export-job-id = Job id
+export-job-state = State
+export-state-running = Running
+export-state-done = Finished
+export-state-unknown = This job is unknown — it may have been cancelled or reclaimed.
+export-refresh = Refresh
+export-cancel = Cancel Job
+export-view-files = View Files
+export-new-heading = New Export
+export-no-subjects = Nothing to export yet — create a ViewDefinition first.
+export-format = Output format
+export-start = Start Export
+files-job-heading = Export Job
+files-load = Load Manifest
+files-error = Loading the manifest failed.
+files-outputs-heading = Outputs
+files-col-output = Output
+files-col-downloads = Downloads
+files-shard = File { $n }
+files-empty = The job produced no output files.

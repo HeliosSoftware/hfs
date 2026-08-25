@@ -48,13 +48,14 @@ mod history;
 mod i18n;
 mod json_view;
 mod search_params;
+mod sql_export;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
 mod tenants;
 
 #[doc(hidden)]
-pub use conformance::{ConformanceSource, StaticConformanceSource};
+pub use conformance::{ConformanceSource, SqlExportStatus, StaticConformanceSource};
 
 use askama::Template;
 use axum::{
@@ -863,7 +864,14 @@ pub fn mount_with_conformance_source(
             get(sql_queries_page).post(sql_queries_save),
         )
         .route("/ui/sql/views", get(sql_views_page).post(sql_views_save))
-        .route("/ui/sql/export", get(sql_export_page))
+        .route(
+            "/ui/sql/export",
+            get(sql_export_page).post(sql_export_start),
+        )
+        .route(
+            "/ui/sql/export/cancel",
+            axum::routing::post(sql_export_cancel),
+        )
         .route("/ui/sql/files", get(sql_files_page))
         .route("/ui/subscriptions", get(subscriptions::page))
         // Schema-driven resource editor (#264). One POST endpoint applies every
@@ -1518,51 +1526,6 @@ async fn batch_page(
     })
 }
 
-/// Shared stub behind the SQL on FHIR nav children (#649): every menu entry
-/// navigates somewhere real from day one; each page states what it will host
-/// and which already-routed server operation serves that data. The pages are
-/// replaced one by one, starting with the ViewDefinition Editor.
-#[derive(Template)]
-#[template(path = "pages/sql-stub.html")]
-struct SqlStubPage {
-    status: Status,
-    i18n: I18n,
-    active_page: &'static str,
-    title_key: &'static str,
-    lede_key: &'static str,
-    body_key: &'static str,
-    /// The server route(s) the finished page will drive, shown verbatim.
-    api: &'static str,
-}
-
-/// (active_page, title, lede, body, api) for one SQL on FHIR stub.
-type SqlStubSpec = (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-);
-
-fn render_sql_stub(
-    state: &WebState,
-    locale: RequestLocale,
-    rv: RequestVersion,
-    rt: &RequestTenant,
-    spec: SqlStubSpec,
-) -> Response {
-    let (active_page, title_key, lede_key, body_key, api) = spec;
-    render(SqlStubPage {
-        status: current_status(state, rv.0, rt),
-        i18n: I18n::new(locale),
-        active_page,
-        title_key,
-        lede_key,
-        body_key,
-        api,
-    })
-}
-
 /// The View Definitions workspace (#649, Figma `420-2`): a filter rail of the
 /// tenant's stored ViewDefinitions, the selected one as editable JSON, and a
 /// `$sql-run` preview of its output. Save and Duplicate are plain form posts
@@ -2130,25 +2093,202 @@ async fn sql_views_save(
     sql_library_save(state, locale, rv, rt, form, &SQL_VIEW_KIND).await
 }
 
+/// One checkbox row of the export form: a runnable subject the store holds.
+struct ExportSubject {
+    /// `ViewDefinition/{id}` or `Library/{id}` — the `subjectReference`.
+    reference: String,
+    name: String,
+    /// "ViewDefinition", "SQL Query", or "SQL View", for the row's tag.
+    kind: &'static str,
+}
+
+/// The SQL Export page (#649): pick stored subjects, submit a `$sql-export`
+/// job, and follow it — running (with progress), finished (a link to Files),
+/// or unknown. Submission and cancel are plain forms; refresh is a plain
+/// link. Job state lives on the server per the async pattern; the page holds
+/// no state of its own beyond the `?job=` id in the URL.
+#[derive(Template)]
+#[template(path = "pages/sql-export.html")]
+struct SqlExportPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    subjects: Vec<ExportSubject>,
+    degraded: Option<String>,
+    job: Option<String>,
+    job_status: Option<SqlExportStatus>,
+    started: bool,
+    cancelled: bool,
+    start_error: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct SqlExportQuery {
+    job: Option<String>,
+    started: Option<String>,
+    cancelled: Option<String>,
+}
+
+/// The stored subjects `$sql-export` can run: every ViewDefinition, and every
+/// Library carrying a SQL on FHIR kind.
+async fn export_subjects(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+) -> (Vec<ExportSubject>, Option<String>) {
+    let mut subjects = Vec::new();
+    let mut degraded = None;
+    match state
+        .conformance
+        .fetch("ViewDefinition", version, tenant)
+        .await
+    {
+        Ok(vds) => {
+            for e in sql_views::summarize(&vds) {
+                subjects.push(ExportSubject {
+                    reference: format!("ViewDefinition/{}", e.id),
+                    name: e.name,
+                    kind: "ViewDefinition",
+                });
+            }
+        }
+        Err(error) => degraded = Some(error),
+    }
+    match state.conformance.fetch("Library", version, tenant).await {
+        Ok(libs) => {
+            for (code, kind) in [("sql-query", "SQL Query"), ("sql-view", "SQL View")] {
+                for e in sql_libraries::summarize(&libs, code) {
+                    subjects.push(ExportSubject {
+                        reference: format!("Library/{}", e.id),
+                        name: e.name,
+                        kind,
+                    });
+                }
+            }
+        }
+        Err(error) => degraded = degraded.or(Some(error)),
+    }
+    (subjects, degraded)
+}
+
 async fn sql_export_page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<SqlExportQuery>,
 ) -> Response {
-    render_sql_stub(
-        &state,
-        locale,
-        rv,
-        &rt,
-        (
-            "sql-export",
-            "sql-export-title",
-            "sql-export-lede",
-            "sql-export-body",
-            "POST /$sql-export · GET /export/{job_id}/status",
-        ),
-    )
+    let (subjects, degraded) = export_subjects(&state, rv.0, &rt.id).await;
+    let job_status = match &query.job {
+        Some(job) => Some(state.conformance.sql_export_status(job, &rt.id).await),
+        None => None,
+    };
+    render(SqlExportPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "sql-export",
+        subjects,
+        degraded,
+        job: query.job,
+        job_status,
+        started: query.started.as_deref() == Some("1"),
+        cancelled: query.cancelled.as_deref() == Some("1"),
+        start_error: None,
+    })
+}
+
+/// Starts an export over the checked subjects. The form repeats `subject=`
+/// per checkbox, which `Form`-into-a-struct cannot express, so the raw body
+/// is parsed by hand.
+async fn sql_export_start(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let mut format = "ndjson".to_string();
+    let mut refs: Vec<String> = Vec::new();
+    for (k, v) in form_urlencoded::parse(&body) {
+        match k.as_ref() {
+            "subject" => refs.push(v.into_owned()),
+            "format" => format = v.into_owned(),
+            _ => {}
+        }
+    }
+    let error_page = |start_error: String| async {
+        let (subjects, degraded) = export_subjects(&state, rv.0, &rt.id).await;
+        render(SqlExportPage {
+            status: current_status(&state, rv.0, &rt),
+            i18n: I18n::new(locale),
+            active_page: "sql-export",
+            subjects,
+            degraded,
+            job: None,
+            job_status: None,
+            started: false,
+            cancelled: false,
+            start_error: Some(start_error),
+        })
+    };
+    if refs.is_empty() {
+        return error_page("select at least one subject".to_string()).await;
+    }
+    // The output name is the reference's id segment — unique within the job
+    // and recognizable in the manifest.
+    let subjects: Vec<(String, String)> = refs
+        .into_iter()
+        .map(|r| (r.rsplit('/').next().unwrap_or(&r).to_string(), r))
+        .collect();
+    match state
+        .conformance
+        .sql_export_start(&subjects, &format, &rt.id)
+        .await
+    {
+        Ok(job) => axum::response::Redirect::to(&format!("/ui/sql/export?job={job}&started=1"))
+            .into_response(),
+        Err(error) => error_page(error).await,
+    }
+}
+
+#[derive(Deserialize)]
+struct SqlExportCancelForm {
+    job: String,
+}
+
+async fn sql_export_cancel(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlExportCancelForm>,
+) -> Response {
+    let ok = state
+        .conformance
+        .sql_export_cancel(&form.job, &rt.id)
+        .await
+        .is_ok();
+    let suffix = if ok { "&cancelled=1" } else { "" };
+    axum::response::Redirect::to(&format!("/ui/sql/export?job={}{suffix}", form.job))
+        .into_response()
+}
+
+/// The Files page (#649): a finished job's completion manifest — one row per
+/// output with its shard download links, served straight off the FHIR API's
+/// result endpoint.
+#[derive(Template)]
+#[template(path = "pages/sql-files.html")]
+struct SqlFilesPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    job: String,
+    outputs: Option<Vec<sql_export::ManifestOutput>>,
+    format: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct SqlFilesQuery {
+    job: Option<String>,
 }
 
 async fn sql_files_page(
@@ -2156,20 +2296,30 @@ async fn sql_files_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<SqlFilesQuery>,
 ) -> Response {
-    render_sql_stub(
-        &state,
-        locale,
-        rv,
-        &rt,
-        (
-            "sql-files",
-            "sql-files-title",
-            "sql-files-lede",
-            "sql-files-body",
-            "GET /export/{job_id}/result · GET /export/{job_id}/{filename}",
-        ),
-    )
+    let job = query.job.unwrap_or_default();
+    let (outputs, format, error) = if job.is_empty() {
+        (None, None, None)
+    } else {
+        match state.conformance.sql_export_manifest(&job, &rt.id).await {
+            Ok(manifest) => (
+                Some(sql_export::manifest_outputs(&manifest)),
+                sql_export::manifest_value(&manifest, "_format"),
+                None,
+            ),
+            Err(error) => (None, None, Some(error)),
+        }
+    };
+    render(SqlFilesPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "sql-files",
+        job,
+        outputs,
+        format,
+        error,
+    })
 }
 
 /// The read-only CapabilityStatement page (#653): the live `/metadata`

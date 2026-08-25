@@ -740,9 +740,6 @@ cap-unavailable = No se pudo obtener la CapabilityStatement del servidor — la 
 
 ## Stubs de la sección SQL on FHIR (#649)
 
-sql-stub-heading = Próximamente
-sql-stub-planned = Previsto
-sql-stub-api = API que lo sirve
 
 sql-vd-title = Definiciones de vistas
 sql-vd-lede = Crea y gestiona las ViewDefinitions con las que SQL on FHIR aplana recursos.
@@ -755,11 +752,9 @@ sql-views-lede = Vistas SQL reutilizables construidas sobre ViewDefinitions.
 
 sql-export-title = Exportación SQL
 sql-export-lede = Trabajos de exportación SQL on FHIR de larga duración.
-sql-export-body = Inicia una exportación, sigue su progreso y cancela los trabajos que ya no necesites.
 
 sql-files-title = Archivos
 sql-files-lede = Manifiestos y archivos de salida producidos por las exportaciones SQL.
-sql-files-body = Consulta el manifiesto de cada trabajo y descarga sus archivos de salida.
 
 ## Espacio de definiciones de vistas (#649)
 
@@ -794,3 +789,30 @@ lib-degraded = No se pudo cargar la lista de bibliotecas.
 lib-sql-heading = SQL
 lib-delete-confirm = ¿Eliminar «{ $name }»? Esta acción no se puede deshacer.
 lib-delete-failed = No se pudo eliminar la biblioteca.
+
+## Páginas de exportación SQL y archivos (#649)
+
+export-start-failed = No se pudo iniciar la exportación.
+export-started = Exportación iniciada.
+export-cancelled = Cancelación solicitada.
+export-job-heading = Trabajo de exportación
+export-job-id = Id del trabajo
+export-job-state = Estado
+export-state-running = En ejecución
+export-state-done = Terminado
+export-state-unknown = Trabajo desconocido: puede haberse cancelado o purgado.
+export-refresh = Actualizar
+export-cancel = Cancelar trabajo
+export-view-files = Ver archivos
+export-new-heading = Nueva exportación
+export-no-subjects = Nada que exportar todavía: crea primero una ViewDefinition.
+export-format = Formato de salida
+export-start = Iniciar exportación
+files-job-heading = Trabajo de exportación
+files-load = Cargar manifiesto
+files-error = No se pudo cargar el manifiesto.
+files-outputs-heading = Salidas
+files-col-output = Salida
+files-col-downloads = Descargas
+files-shard = Archivo { $n }
+files-empty = El trabajo no produjo archivos de salida.

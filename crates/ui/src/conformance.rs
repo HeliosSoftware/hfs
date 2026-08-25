@@ -73,6 +73,47 @@ pub trait ConformanceSource: Send + Sync {
         let _ = (resource_type, id, resource, version, tenant);
         Err("saving is not available from this source".to_string())
     }
+
+    /// Submits a `$sql-export` job over `(output name, reference)` subjects
+    /// and returns the job id from its `Content-Location` (#649).
+    async fn sql_export_start(
+        &self,
+        subjects: &[(String, String)],
+        format: &str,
+        tenant: &str,
+    ) -> Result<String, String> {
+        let _ = (subjects, format, tenant);
+        Err("$sql-export is not available from this source".to_string())
+    }
+
+    /// Polls a job's status URL (#649).
+    async fn sql_export_status(&self, job_id: &str, tenant: &str) -> SqlExportStatus {
+        let _ = (job_id, tenant);
+        SqlExportStatus::Unknown
+    }
+
+    /// Cancels a job; `Ok` when the server accepted the cancellation (#649).
+    async fn sql_export_cancel(&self, job_id: &str, tenant: &str) -> Result<(), String> {
+        let _ = (job_id, tenant);
+        Err("$sql-export is not available from this source".to_string())
+    }
+
+    /// The completion manifest `Parameters` of a finished job (#649).
+    async fn sql_export_manifest(&self, job_id: &str, tenant: &str) -> Result<Value, String> {
+        let _ = (job_id, tenant);
+        Err("$sql-export is not available from this source".to_string())
+    }
+}
+
+/// What a `$sql-export` status poll answered (#649).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlExportStatus {
+    /// `202` — still running, with the `X-Progress` header when sent.
+    Running(Option<String>),
+    /// `303` — finished (the manifest tells success from failure).
+    Done,
+    /// `404` — unknown, cancelled, or reclaimed.
+    Unknown,
 }
 
 /// Reads conformance resources from the server's own FHIR API over HTTP.
@@ -99,12 +140,36 @@ impl HttpConformanceSource {
         data_dir: Option<PathBuf>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // Redirects stay manual: the async export pattern's status poll
+            // answers `303 See Other` when a job finishes, and following it
+            // would make "done" indistinguishable from "running" (#649). No
+            // other self-call relies on HTTP redirects.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client builds"),
             base_url: base_url.trim_end_matches('/').to_string(),
             outbound_auth,
             default_version,
             data_dir,
         }
+    }
+
+    /// A request with the tenant header and outbound auth applied.
+    async fn authorized(
+        &self,
+        request: reqwest::RequestBuilder,
+        tenant: &str,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let request = if tenant.is_empty() {
+            request
+        } else {
+            request.header("X-Tenant-ID", tenant)
+        };
+        self.outbound_auth
+            .authorize(request, &self.base_url)
+            .await
+            .map_err(|e| format!("outbound auth failed: {e}"))
     }
 
     /// Loads `resource_type` for a non-default `version` from the shipped
@@ -363,6 +428,146 @@ impl ConformanceSource for HttpConformanceSource {
             .await
             .map_err(|e| format!("parsing the saved resource failed: {e}"))
     }
+
+    async fn sql_export_start(
+        &self,
+        subjects: &[(String, String)],
+        format: &str,
+        tenant: &str,
+    ) -> Result<String, String> {
+        self.export_start(subjects, format, tenant).await
+    }
+
+    async fn sql_export_status(&self, job_id: &str, tenant: &str) -> SqlExportStatus {
+        self.export_status(job_id, tenant).await
+    }
+
+    async fn sql_export_cancel(&self, job_id: &str, tenant: &str) -> Result<(), String> {
+        self.export_cancel(job_id, tenant).await
+    }
+
+    async fn sql_export_manifest(&self, job_id: &str, tenant: &str) -> Result<Value, String> {
+        self.export_manifest(job_id, tenant).await
+    }
+}
+
+impl HttpConformanceSource {
+    async fn export_start(
+        &self,
+        subjects: &[(String, String)],
+        format: &str,
+        tenant: &str,
+    ) -> Result<String, String> {
+        let mut params: Vec<Value> = vec![serde_json::json!({
+            "name": "_format", "valueCode": format,
+        })];
+        for (name, reference) in subjects {
+            params.push(serde_json::json!({
+                "name": "subject",
+                "part": [
+                    { "name": "name", "valueString": name },
+                    { "name": "subjectReference", "valueReference": { "reference": reference } },
+                ],
+            }));
+        }
+        let url = format!("{}/$sql-export", self.base_url);
+        let request = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Prefer", "respond-async")
+            .json(&serde_json::json!({ "resourceType": "Parameters", "parameter": params }));
+        let response = self
+            .authorized(request, tenant)
+            .await?
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        let status = response.status();
+        if status != reqwest::StatusCode::ACCEPTED {
+            let detail = response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|o| outcome_diagnostics(&o))
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default();
+            return Err(format!("$sql-export returned {status}{detail}"));
+        }
+        // `Content-Location: …/export/{job-id}/status` — the id is the
+        // second-to-last path segment.
+        response
+            .headers()
+            .get("content-location")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|loc| {
+                let mut segments = loc.trim_end_matches('/').rsplit('/');
+                (segments.next() == Some("status"))
+                    .then(|| segments.next())
+                    .flatten()
+                    .map(String::from)
+            })
+            .ok_or_else(|| "the 202 carried no job id in Content-Location".to_string())
+    }
+
+    async fn export_status(&self, job_id: &str, tenant: &str) -> SqlExportStatus {
+        let url = format!("{}/export/{job_id}/status", self.base_url);
+        let request = match self.authorized(self.client.get(&url), tenant).await {
+            Ok(r) => r,
+            Err(_) => return SqlExportStatus::Unknown,
+        };
+        match request.send().await {
+            Ok(response) => match response.status().as_u16() {
+                202 => SqlExportStatus::Running(
+                    response
+                        .headers()
+                        .get("x-progress")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from),
+                ),
+                303 => SqlExportStatus::Done,
+                _ => SqlExportStatus::Unknown,
+            },
+            Err(_) => SqlExportStatus::Unknown,
+        }
+    }
+
+    async fn export_cancel(&self, job_id: &str, tenant: &str) -> Result<(), String> {
+        let url = format!("{}/export/{job_id}/status", self.base_url);
+        let response = self
+            .authorized(self.client.delete(&url), tenant)
+            .await?
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("cancelling returned {}", response.status()))
+        }
+    }
+
+    async fn export_manifest(&self, job_id: &str, tenant: &str) -> Result<Value, String> {
+        let url = format!("{}/export/{job_id}/result", self.base_url);
+        let response = self
+            .authorized(self.client.get(&url), tenant)
+            .await?
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|e| format!("parsing the manifest failed: {e}"))?;
+        if !status.is_success() {
+            let detail = outcome_diagnostics(&body)
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default();
+            return Err(format!("the result endpoint returned {status}{detail}"));
+        }
+        Ok(body)
+    }
 }
 
 /// The first issue explanation of an OperationOutcome, if that is what this
@@ -371,7 +576,11 @@ fn outcome_diagnostics(outcome: &Value) -> Option<String> {
     outcome.get("issue")?.as_array()?.iter().find_map(|i| {
         i.get("diagnostics")
             .and_then(Value::as_str)
-            .or_else(|| i.get("details").and_then(|d| d.get("text")).and_then(Value::as_str))
+            .or_else(|| {
+                i.get("details")
+                    .and_then(|d| d.get("text"))
+                    .and_then(Value::as_str)
+            })
             .map(String::from)
     })
 }
@@ -420,6 +629,8 @@ pub struct StaticConformanceSource {
     map: HashMap<(String, FhirVersion), Vec<Value>>,
     metadata: Option<Value>,
     sql_rows: Option<Result<Vec<Value>, String>>,
+    export_status: SqlExportStatus,
+    export_manifest: Option<Result<Value, String>>,
 }
 
 impl StaticConformanceSource {
@@ -429,7 +640,21 @@ impl StaticConformanceSource {
             map: HashMap::new(),
             metadata: None,
             sql_rows: None,
+            export_status: SqlExportStatus::Unknown,
+            export_manifest: None,
         }
+    }
+
+    /// Seeds what `sql_export_status()` answers (#649).
+    pub fn with_export_status(mut self, status: SqlExportStatus) -> Self {
+        self.export_status = status;
+        self
+    }
+
+    /// Seeds what `sql_export_manifest()` answers (#649).
+    pub fn with_export_manifest(mut self, outcome: Result<Value, String>) -> Self {
+        self.export_manifest = Some(outcome);
+        self
     }
 
     /// Seeds the CapabilityStatement `metadata()` answers with (#653).
@@ -511,6 +736,29 @@ impl ConformanceSource for StaticConformanceSource {
             Some(Err(e)) => Err(e.clone()),
             None => Err("no $sql-run outcome seeded".to_string()),
         }
+    }
+
+    async fn sql_export_start(
+        &self,
+        _subjects: &[(String, String)],
+        _format: &str,
+        _tenant: &str,
+    ) -> Result<String, String> {
+        Ok("static-job".to_string())
+    }
+
+    async fn sql_export_status(&self, _job_id: &str, _tenant: &str) -> SqlExportStatus {
+        self.export_status.clone()
+    }
+
+    async fn sql_export_cancel(&self, _job_id: &str, _tenant: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn sql_export_manifest(&self, _job_id: &str, _tenant: &str) -> Result<Value, String> {
+        self.export_manifest
+            .clone()
+            .unwrap_or_else(|| Err("no manifest seeded".to_string()))
     }
 
     /// Echoes the resource back with an id, so the save handler's redirect

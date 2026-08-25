@@ -1291,16 +1291,128 @@ async fn sql_on_fhir_section_navigates_to_real_stub_pages() {
             html.contains(&format!(r#"href="{href}" aria-current="page""#)),
             "{href} does not mark its nav entry current"
         );
-        // A stub states which server operation already serves the data; the
-        // live workspaces (View Definitions, SQL Queries, SQL Views) assert
-        // their own content in their dedicated tests.
-        if href == "/ui/sql/export" || href == "/ui/sql/files" {
-            assert!(
-                html.contains("sql-run") || html.contains("/export/"),
-                "{href}"
-            );
-        }
     }
+}
+
+/// #649: SQL Export offers the stored subjects, follows a job by ?job= —
+/// running with a cancel form, finished with a link to Files — and Files
+/// tables a finished job's manifest as download links.
+#[tokio::test]
+async fn sql_export_and_files_follow_a_job_through_the_manifest() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "exportId", "valueString": "job-9"},
+            {"name": "_format", "valueCode": "csv"},
+            {"name": "output", "part": [
+                {"name": "name", "valueString": "patients"},
+                {"name": "location", "valueUri": "http://s/export/job-9/patients-0.csv"},
+            ]},
+        ]
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![
+                serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1",
+                "name": "patients", "resource": "Patient"}),
+            ],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![
+                serde_json::json!({"resourceType": "Library", "id": "q1", "name": "counts",
+                "status": "active",
+                "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+            ],
+        )
+        .with_export_status(helios_ui::SqlExportStatus::Running(Some("2/3".to_string())))
+        .with_export_manifest(Ok(manifest));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+    );
+
+    // The form offers both stored subjects.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/export").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="ViewDefinition/vd1""#));
+    assert!(html.contains(r#"value="Library/q1""#));
+
+    // Starting redirects to the job the gateway handed back.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/export")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("subject=ViewDefinition%2Fvd1&format=csv"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/export?job=static-job&started=1"
+    );
+    // No subject selected: the page explains instead of submitting.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/export")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("format=csv"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("at least one subject"));
+
+    // A running job shows its progress and the cancel form.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/export?job=job-9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("2/3"));
+    assert!(html.contains("/ui/sql/export/cancel"));
+
+    // Files tables the manifest with its download links.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/files?job=job-9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("patients"));
+    assert!(html.contains(r#"href="http://s/export/job-9/patients-0.csv""#));
+    assert!(html.contains(">csv<"));
 }
 
 /// #649: the SQL Queries and SQL Views workspaces list Libraries of their own
