@@ -580,6 +580,7 @@ bulk-import-status-not-started = Nicht gestartet
 bulk-import-status-in-progress = In Bearbeitung
 bulk-import-status-stopped = Angehalten
 bulk-import-status-completed = Abgeschlossen
+bulk-import-status-failed = Fehlgeschlagen
 bulk-import-detail-recipient = Datenempfänger
 bulk-import-detail-id = Submission-ID
 bulk-import-detail-submitter = Einreicher

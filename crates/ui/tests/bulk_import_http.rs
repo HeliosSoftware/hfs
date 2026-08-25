@@ -274,9 +274,12 @@ async fn a_rejected_kickoff_is_logged_as_a_failure() {
     post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
 
     let (_, html) = get(&ctx, &detail_path).await;
-    assert!(html.contains("Bulk Submit request failed!"));
-    assert!(html.contains("404"));
-    assert!(html.contains("Not Started"), "status unchanged on failure");
+    // The log names the request that failed — the kick-off POST, with the
+    // manifest as context — and the submission reads Failed (#686).
+    assert!(html.contains("$bulk-submit → 404"));
+    assert!(html.contains("(manifest http://test.com)"));
+    assert!(html.contains("Failed"), "status shows the failure");
+    assert!(!html.contains("Not Started"));
 }
 
 fn urlencode(s: &str) -> String {
@@ -707,8 +710,9 @@ async fn an_unreachable_recipient_fails_the_manifest_submit() {
     post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
 
     let (_, html) = get(&ctx, &detail_path).await;
-    assert!(html.contains("Bulk Submit request failed!"));
-    assert!(html.contains("Failed to submit manifest"));
+    assert!(html.contains("Bulk Submit request failed:"));
+    assert!(html.contains("$bulk-submit"), "the failed target is named");
+    assert!(html.contains("Failed"), "status shows the failure");
 }
 
 /// A recipient implementing the full status flow: kick-off returns a
@@ -965,4 +969,39 @@ async fn aborting_one_manifest_replaces_it_with_the_empty_manifest() {
 
     let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Abort accepted (200)"));
+}
+
+/// #686's repro: a recipient that is a plain static file server answers 501
+/// with an HTML error page. The log explains instead of pasting markup.
+#[tokio::test]
+async fn a_non_fhir_recipient_error_is_summarized_not_pasted() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let recipient = Router::new().fallback(|| async {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<!DOCTYPE HTML><html><body><h1>Error response</h1><p>Error code: 501</p></body></html>",
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, recipient).await.unwrap() });
+    let ctx = ctx(&format!("http://{addr}"));
+
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Static&auth=none").await;
+    post_form(
+        &ctx,
+        &format!("{detail_path}/manifests"),
+        "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
+    )
+    .await;
+    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
+
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains("$bulk-submit → 501"));
+    assert!(
+        html.contains("not a FHIR resource"),
+        "explains the mismatch"
+    );
+    assert!(!html.contains("Error code: 501"), "markup is not pasted");
+    assert!(html.contains("Failed"));
 }

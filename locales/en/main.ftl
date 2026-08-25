@@ -583,6 +583,7 @@ bulk-import-status-not-started = Not Started
 bulk-import-status-in-progress = In Progress
 bulk-import-status-stopped = Stopped
 bulk-import-status-completed = Completed
+bulk-import-status-failed = Failed
 bulk-import-detail-recipient = Data Recipient
 bulk-import-detail-id = Submission ID
 bulk-import-detail-submitter = Submitter
