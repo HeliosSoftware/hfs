@@ -165,6 +165,15 @@
   /* Comparator prefixes live on the value (ge2020-01-01), not the key. */
   var PREFIXES = ["eq", "ne", "gt", "ge", "lt", "le", "sa", "eb", "ap"];
   var PREFIX_RE = /^(eq|ne|gt|ge|lt|le|sa|eb|ap)(?=[\d])/;
+
+  function parsePrefixedValue(raw) {
+    var match = PREFIX_RE.exec(raw || "");
+    return {
+      comparator: match ? match[1] : "",
+      value: match ? raw.slice(2) : raw,
+    };
+  }
+
   var catalogType = null;
 
   /* Per-type parameter metadata from the catalog fragment's data attributes:
@@ -344,17 +353,40 @@
     });
   }
 
-  /* Modifier select + value input + remove button, shared by every row kind. */
   /* One value input inside a row's OR stack (#414). The per-value remove
-   * only renders when the stack has siblings. */
-  function orValueInput(host, value, wire, escapeError) {
+   * only renders when the stack has siblings. Comparator prefixes belong to
+   * each value, so every alternative owns its own select (#630). */
+  function orValueInput(host, value, wire, escapeError, allowComparator) {
+    allowComparator = allowComparator !== false;
+    var parsed = allowComparator
+      ? parsePrefixedValue(value)
+      : { comparator: "", value: value };
+    var parsedWire =
+      wire === undefined
+        ? null
+        : allowComparator
+          ? parsePrefixedValue(wire)
+          : { comparator: "", value: wire };
     var wrap = document.createElement("span");
     wrap.className = "builder-row__orvalue";
+    var comparator = document.createElement("select");
+    comparator.className = "builder-row__comparator";
+    comparator.setAttribute("aria-label", sections.dataset.msgMatchIs);
+    option(comparator, "", sections.dataset.msgMatchIs, !parsed.comparator);
+    PREFIXES.forEach(function (prefix) {
+      option(comparator, prefix, prefix, parsed.comparator === prefix);
+    });
+    comparator.hidden = !parsed.comparator;
+    wrap.appendChild(comparator);
     var input = document.createElement("input");
     input.className = "builder-row__value";
-    input.value = value;
+    input.value = parsed.value;
     if (wire !== undefined) {
-      input.dataset.fhirWire = wire;
+      /* The comparator is represented by the sibling select. Keeping it in
+       * the preserved wire value would duplicate it when only that select is
+       * edited (for example, `gege1980-01-01`). */
+      input.dataset.fhirWire =
+        parsedWire.comparator === parsed.comparator ? parsedWire.value : wire;
       input.dataset.fhirDirty = "false";
     } else {
       input.dataset.fhirDirty = "true";
@@ -404,22 +436,36 @@
     if (!modifier) return;
     var selected = modifier.value;
     var mods = applicableMods(paramType);
-    var prefixes = applicablePrefixes(paramType);
     modifier.textContent = "";
     option(modifier, "", sections.dataset.msgMatchIs, !selected);
     mods.forEach(function (m) {
       option(modifier, m, ":" + m, selected === m);
     });
-    prefixes.forEach(function (p) {
-      option(modifier, p, p, selected === p);
-    });
     /* A modifier from a pasted URL stays selectable even when the type
      * would not offer it. */
-    if (selected && mods.indexOf(selected) < 0 && prefixes.indexOf(selected) < 0) {
+    if (selected && mods.indexOf(selected) < 0) {
       option(modifier, selected, ":" + selected, true);
     }
     var panel = row.querySelector(".builder-row__modpanel");
     if (panel) fillModPanel(panel, row, mods);
+  }
+
+  /* Re-gates the per-value comparator selects without discarding an explicit
+   * prefix from a pasted URL whose parameter type is unknown or unexpected. */
+  function refreshComparatorControls(row, paramType) {
+    var prefixes = applicablePrefixes(paramType);
+    row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+      var selected = comparator.value;
+      comparator.textContent = "";
+      option(comparator, "", sections.dataset.msgMatchIs, !selected);
+      prefixes.forEach(function (prefix) {
+        option(comparator, prefix, prefix, selected === prefix);
+      });
+      if (selected && prefixes.indexOf(selected) < 0) {
+        option(comparator, selected, selected, true);
+      }
+      comparator.hidden = prefixes.length === 0 && !selected;
+    });
   }
 
   /* Best-effort param type for a row's modifier target, from the cached
@@ -433,12 +479,10 @@
       return (((PARAM_META[t] || {})[leaf] || {}).type) || "";
     }
     if (row.classList.contains("builder-row--chain")) {
-      var chainLeaf = leafEl.value.trim();
-      for (var cached in PARAM_META) {
-        var m = PARAM_META[cached][chainLeaf];
-        if (m) return m.type;
-      }
-      return "";
+      /* refillLeaf resolves this against the chain's actual target types.
+       * Do not guess from unrelated resource registries that happen to use
+       * the same search-parameter code. */
+      return row.dataset.modType || "";
     }
     var key = row.querySelector(".builder-row__key");
     if (!key) return "";
@@ -446,11 +490,13 @@
   }
 
   /* Re-gates a row's modifier controls when its param type changed. */
-  function regateModifiers(row) {
-    var t = rowParamType(row);
-    if (row.dataset.modType === t) return;
-    row.dataset.modType = t;
-    refreshModifierControls(row, t);
+  function regateModifiers(row, resolvedType) {
+    var t = arguments.length > 1 ? resolvedType : rowParamType(row);
+    if (row.dataset.modType !== t) {
+      row.dataset.modType = t;
+      refreshModifierControls(row, t);
+    }
+    refreshComparatorControls(row, t);
   }
 
   /* The MODIFY panel: each applicable modifier as a chip with its
@@ -483,11 +529,17 @@
 
   /* FHIR's OR is a comma list on one parameter (`name=Smith,Jones`): the
    * value column stacks one input per alternative, plus the `+ or` button. */
-  function appendValues(row, rawValue) {
+  function appendValues(row, rawValue, allowComparators) {
     var host = document.createElement("span");
     host.className = "builder-row__values";
     fhirSearchValue.parseAlternatives(rawValue).alternatives.forEach(function (alternative) {
-      orValueInput(host, alternative.value, alternative.wire, alternative.error);
+      orValueInput(
+        host,
+        alternative.value,
+        alternative.wire,
+        alternative.error,
+        allowComparators,
+      );
     });
     row.appendChild(host);
 
@@ -502,23 +554,15 @@
   function appendTail(row, part) {
     var value = part.value;
     var selectedMod = part.modifier;
-    var prefix = PREFIX_RE.exec(value);
-    if (!selectedMod && prefix) {
-      selectedMod = prefix[1];
-      value = value.slice(2);
-    }
     var modifier = document.createElement("select");
     modifier.className = "builder-row__modifier";
     option(modifier, "", sections.dataset.msgMatchIs, !selectedMod);
     COLON_MODIFIERS.forEach(function (m) {
       option(modifier, m, ":" + m, selectedMod === m);
     });
-    PREFIXES.forEach(function (p) {
-      option(modifier, p, p, selectedMod === p);
-    });
     row.appendChild(modifier);
 
-    appendValues(row, value);
+    appendValues(row, value, !selectedMod);
 
     var adv = document.createElement("button");
     adv.type = "button";
@@ -575,6 +619,7 @@
     appendTail(row, part);
 
     var base = sections.dataset.type || "";
+    var leafRefillSeq = 0;
 
     /* Candidate resource types feeding hop k: the selected type of the
      * previous hop, else all of its registry targets (base type at k=0). */
@@ -647,21 +692,29 @@
     }
 
     function refillLeaf() {
+      var refillSeq = ++leafRefillSeq;
+      var leafCode = leaf.input.value.trim();
       leafTypes(function (types) {
         var pending = types.length;
         var codes = [];
         var anyRef = false;
-        if (!pending) return;
+        var resolvedTypes = [];
+        if (!pending) {
+          if (refillSeq === leafRefillSeq) regateModifiers(row, "");
+          return;
+        }
         types.forEach(function (t) {
           fetchParams(t).then(function (meta) {
             Object.keys(meta).forEach(function (code) {
               if (codes.indexOf(code) < 0) codes.push(code);
             });
-            var m = meta[leaf.input.value.trim()];
+            var m = meta[leafCode];
             if (m && m.type === "reference") anyRef = true;
-            if (--pending === 0) {
+            if (m && resolvedTypes.indexOf(m.type) < 0) resolvedTypes.push(m.type);
+            if (--pending === 0 && refillSeq === leafRefillSeq) {
               fillList(leaf.list, codes.sort());
               deeper.hidden = !anyRef;
+              regateModifiers(row, resolvedTypes.length === 1 ? resolvedTypes[0] : "");
             }
           });
         });
@@ -750,10 +803,16 @@
     appendTail(row, part);
 
     var base = sections.dataset.type || "";
+    var paramsRefillSeq = 0;
     function refillParams() {
+      var refillSeq = ++paramsRefillSeq;
       var t = type.input.value.trim();
-      if (!t) return;
+      if (!t) {
+        regateModifiers(row, "");
+        return;
+      }
       fetchParams(t).then(function (meta) {
+        if (refillSeq !== paramsRefillSeq) return;
         var codes = Object.keys(meta).sort();
         /* The link must be a reference param that can point at the base
          * type; params with no declared targets stay offered. */
@@ -766,9 +825,14 @@
           }),
         );
         fillList(leaf.list, codes);
+        regateModifiers(row, ((meta[leaf.input.value.trim()] || {}).type) || "");
       });
     }
     type.input.addEventListener("input", refillParams);
+    leaf.input.addEventListener("input", function () {
+      var meta = PARAM_META[type.input.value.trim()] || {};
+      regateModifiers(row, ((meta[leaf.input.value.trim()] || {}).type) || "");
+    });
     refillParams();
 
     return row;
@@ -917,15 +981,10 @@
       row.appendChild(drill);
     }
 
-    /* Comparator prefixes render in the modifier select but are rejoined
-     * onto the value; colon modifiers are rejoined onto the key. */
+    /* Colon modifiers are joined onto the key. Comparator prefixes are owned
+     * by each value alternative and rendered by appendValues. */
     var value = part.value;
     var selectedMod = part.modifier;
-    var prefix = PREFIX_RE.exec(value);
-    if (!selectedMod && prefix) {
-      selectedMod = prefix[1];
-      value = value.slice(2);
-    }
 
     if (kind !== "control") {
       var modifier = document.createElement("select");
@@ -937,15 +996,12 @@
         COLON_MODIFIERS.forEach(function (m) {
           option(modifier, m, ":" + m, selectedMod === m);
         });
-        PREFIXES.forEach(function (p) {
-          option(modifier, p, p, selectedMod === p);
-        });
       }
       row.appendChild(modifier);
     }
 
     if (kind === "condition") {
-      appendValues(row, value);
+      appendValues(row, value, !selectedMod);
       var adv = document.createElement("button");
       adv.type = "button";
       adv.className = "builder-row__adv";
@@ -1105,19 +1161,24 @@
       if (!key) return;
       var modifierEl = row.querySelector(".builder-row__modifier");
       var mod = modifierEl ? modifierEl.value : "";
-      var isPrefix = PREFIXES.indexOf(mod) >= 0;
       var values = [];
-      var isCondition = !!row.querySelector(".builder-row__values");
-      row.querySelectorAll(".builder-row__value").forEach(function (vi) {
-        var wire = isCondition
-          ? serializedConditionAlternative(vi)
-          : vi.value.trim() || null;
-        if (wire === null) return;
-        if (isPrefix && !PREFIX_RE.test(wire)) wire = mod + wire;
-        values.push(wire);
-      });
+      var alternatives = row.querySelectorAll(".builder-row__orvalue");
+      if (alternatives.length) {
+        alternatives.forEach(function (alternative) {
+          var input = alternative.querySelector(".builder-row__value");
+          var wire = serializedConditionAlternative(input);
+          if (wire === null) return;
+          var comparator = alternative.querySelector(".builder-row__comparator");
+          values.push((comparator ? comparator.value : "") + wire);
+        });
+      } else {
+        row.querySelectorAll(".builder-row__value").forEach(function (vi) {
+          var v = vi.value.trim();
+          if (v) values.push(v);
+        });
+      }
       var value = values.join(",");
-      if (!isPrefix && mod) key += ":" + mod;
+      if (mod) key += ":" + mod;
       parts.push(key + "=" + value);
     });
     urlInput.value =
@@ -1129,15 +1190,36 @@
   if (sections && urlInput) {
     urlInput.addEventListener("change", renderBuilder);
     sections.addEventListener("input", function (event) {
-      if (event.target.closest(".builder-row")) {
+      var row = event.target.closest(".builder-row");
+      if (row) {
         if (event.target.classList.contains("builder-row__value")) {
           event.target.dataset.fhirDirty = "true";
           delete event.target.dataset.fhirEscapeError;
         }
+        /* Key modifiers and value comparators occupied one select before
+         * #630, so preserve their mutual exclusion when either is edited. */
+        if (event.target.classList.contains("builder-row__comparator") && event.target.value) {
+          var rowModifier = row.querySelector(".builder-row__modifier");
+          if (rowModifier) {
+            rowModifier.value = "";
+            var rowPanel = row.querySelector(".builder-row__modpanel");
+            if (rowPanel) {
+              fillModPanel(rowPanel, row, applicableMods(row.dataset.modType || ""));
+            }
+          }
+        } else if (event.target.classList.contains("builder-row__modifier") && event.target.value) {
+          row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+            comparator.value = "";
+          });
+          var modifierPanel = row.querySelector(".builder-row__modpanel");
+          if (modifierPanel) {
+            fillModPanel(modifierPanel, row, applicableMods(row.dataset.modType || ""));
+          }
+        }
         updateUrl();
         if (event.target.classList.contains("builder-row__key")) {
           refreshChainAffordances();
-          regateModifiers(event.target.closest(".builder-row"));
+          regateModifiers(row);
         }
       }
     });
@@ -1169,6 +1251,11 @@
         var chipRow = modChip.closest(".builder-row");
         var sel = chipRow.querySelector(".builder-row__modifier");
         sel.value = sel.value === modChip.dataset.modChip ? "" : modChip.dataset.modChip;
+        if (sel.value) {
+          chipRow.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+            comparator.value = "";
+          });
+        }
         fillModPanel(
           chipRow.querySelector(".builder-row__modpanel"),
           chipRow,
@@ -1180,8 +1267,11 @@
       var removeOr = event.target.closest("[data-remove-or]");
       var add = event.target.closest("[data-add]");
       if (addOr) {
-        var orHost = addOr.closest(".builder-row").querySelector(".builder-row__values");
-        orValueInput(orHost, "").focus();
+        var orRow = addOr.closest(".builder-row");
+        var orHost = orRow.querySelector(".builder-row__values");
+        var addedValue = orValueInput(orHost, "");
+        refreshComparatorControls(orRow, orRow.dataset.modType || "");
+        addedValue.focus();
         return;
       }
       if (removeOr) {
@@ -1205,19 +1295,19 @@
         var from = drillFrom.closest(".builder-row");
         var refParam = from.querySelector(".builder-row__key").value.trim();
         var keptMod = from.querySelector(".builder-row__modifier").value;
-        var keptIsPrefix = PREFIXES.indexOf(keptMod) >= 0;
         var keptValues = [];
-        from.querySelectorAll(".builder-row__value").forEach(function (input) {
+        from.querySelectorAll(".builder-row__orvalue").forEach(function (alternative) {
+          var input = alternative.querySelector(".builder-row__value");
           var wire = serializedConditionAlternative(input);
           if (wire === null) return;
-          if (keptIsPrefix && !PREFIX_RE.test(wire)) wire = keptMod + wire;
-          keptValues.push(wire);
+          var comparator = alternative.querySelector(".builder-row__comparator");
+          keptValues.push((comparator ? comparator.value : "") + wire);
         });
         var chain = chainRow({
           kind: "chain",
           hops: [{ ref: refParam, type: "" }],
           key: "",
-          modifier: keptIsPrefix ? "" : keptMod,
+          modifier: keptMod,
           value: keptValues.join(","),
         });
         from.replaceWith(chain);
@@ -1339,46 +1429,66 @@
     });
   }
 
-  function plainValue(part) {
+  function plainValues(part) {
     var raw = part.value || "";
     var mod = part.modifier || "";
     if (mod === "missing" && (raw === "true" || raw === "false")) {
-      return { verb: PLAIN.missing[raw], value: "", showValue: false };
+      return [{ verb: PLAIN.missing[raw], value: "", showValue: false }];
     }
     var alternatives = fhirSearchValue
       .parseAlternatives(raw)
       .alternatives.map(function (alternative) {
-        var prefix = mod ? null : PREFIX_RE.exec(alternative.value);
-        var verbKey = mod || (prefix ? prefix[1] : "");
-        return {
-          value: prefix ? alternative.value.slice(2) : alternative.value,
-          verb:
-            PLAIN.verbs[verbKey] != null ? PLAIN.verbs[verbKey] : PLAIN.verbs[""],
-        };
+        var parsed = mod
+          ? { comparator: "", value: alternative.value }
+          : parsePrefixedValue(alternative.value);
+        var verbKey = mod || parsed.comparator;
+        var verb = PLAIN.verbs[verbKey] != null ? PLAIN.verbs[verbKey] : PLAIN.verbs[""];
+        var quoted = parsed.value ? "\u201C" + parsed.value + "\u201D" : "";
+        return { verb: verb, value: quoted, showValue: quoted !== "" };
       })
       .filter(function (alternative) {
-        return !!alternative.value;
+        return alternative.showValue;
       });
-    var verb = alternatives.length
-      ? alternatives[0].verb
-      : PLAIN.verbs[mod] != null
-        ? PLAIN.verbs[mod]
-        : PLAIN.verbs[""];
-    var joined = alternatives
-      .map(function (alternative, index) {
-        var quoted = "\u201C" + alternative.value + "\u201D";
-        return index > 0 && alternative.verb !== verb
-          ? alternative.verb + " " + quoted
-          : quoted;
-      })
-      .join(" " + PLAIN.or + " ");
-    return { verb: verb, value: joined, showValue: joined !== "" };
+    if (alternatives.length) return alternatives;
+    return [
+      {
+        verb: PLAIN.verbs[mod] != null ? PLAIN.verbs[mod] : PLAIN.verbs[""],
+        value: "",
+        showValue: false,
+      },
+    ];
   }
 
-  function renderPlainClause(withValue, withoutValue, args, plain) {
-    args.verb = plain.verb;
-    if (plain.showValue) args.value = plain.value;
-    return tpl(plain.showValue ? withValue : withoutValue, args);
+  function renderPlainClause(withValue, withoutValue, args, alternatives) {
+    var groups = [];
+    alternatives.forEach(function (alternative) {
+      var previous = groups[groups.length - 1];
+      if (
+        previous &&
+        previous.verb === alternative.verb &&
+        previous.showValue &&
+        alternative.showValue
+      ) {
+        previous.value += " " + PLAIN.or + " " + alternative.value;
+      } else {
+        groups.push({
+          verb: alternative.verb,
+          value: alternative.value,
+          showValue: alternative.showValue,
+        });
+      }
+    });
+    return groups
+      .map(function (group) {
+        var clauseArgs = {};
+        Object.keys(args).forEach(function (key) {
+          clauseArgs[key] = args[key];
+        });
+        clauseArgs.verb = group.verb;
+        if (group.showValue) clauseArgs.value = group.value;
+        return tpl(group.showValue ? withValue : withoutValue, clauseArgs);
+      })
+      .join(" " + PLAIN.or + " ");
   }
 
   function updatePlain() {
@@ -1398,14 +1508,14 @@
           })
           .concat([part.key])
           .join(PLAIN.arrow + " ");
-        var cv = plainValue(part);
+        var cv = plainValues(part);
         clauses.push(
           renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: path }, cv),
         );
         return;
       }
       if (part.kind === "has") {
-        var hv = plainValue(part);
+        var hv = plainValues(part);
         clauses.push(
           renderPlainClause(
             PLAIN.has,
@@ -1443,7 +1553,7 @@
         return;
       }
       if (CONTROL_KEYS.indexOf(part.key) >= 0 || !part.key) return;
-      var v = plainValue(part);
+      var v = plainValues(part);
       clauses.push(
         renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: part.key }, v),
       );
