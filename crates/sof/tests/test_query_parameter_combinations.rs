@@ -234,11 +234,15 @@ async fn test_csv_header_parameter_with_non_csv_format() {
         }]
     });
 
-    // header parameter should be ignored for non-CSV formats
+    // `header` is strictly `true`/`false` in production (models.rs
+    // `validate_query_params`), independent of `_format`; a non-boolean
+    // value like the old "absent" is rejected with 400 before format
+    // matters. Use a valid value so this test still exercises "header is
+    // ignored for non-CSV formats" as intended.
     let response = server
         .post("/$sql-run")
         .add_query_param("_format", "application/json")
-        .add_query_param("header", "absent")
+        .add_query_param("header", "false")
         .json(&request_body)
         .await;
 
@@ -321,10 +325,14 @@ async fn test_since_parameter_query_filtering() {
         }]
     });
 
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly so the response is a JSON array.
     // Test with _since as query parameter
     let response = server
         .post("/$sql-run")
         .add_query_param("_since", "2023-06-01T00:00:00Z")
+        .add_header("Accept", "application/json")
         .json(&request_body)
         .await;
 
@@ -378,21 +386,51 @@ async fn test_valid_since_parameter_formats() {
     }
 }
 
+/// Combines every non-`source` filtering query parameter in one request.
+///
+/// `source` is deliberately excluded: unlike when this test was written
+/// against the stub (which treated `source` as a no-op), production now
+/// really resolves it via `UniversalDataSource` (see
+/// `test_post_source_not_implemented`'s updated doc comment), so an
+/// arbitrary non-URL placeholder like `"primary-database"` is correctly
+/// rejected as an invalid source URL. `patient` / `group` also now require
+/// the referenced `Patient` / `Group` resources to be present among the
+/// supplied resources (SoF v2 spec absent-target error table, see
+/// `lib.rs::filter_resources_by_patient_and_group`), so both are supplied
+/// here.
 #[tokio::test]
 async fn test_combined_filtering_parameters() {
     let server = common::test_server().await;
 
     let request_body = json!({
         "resourceType": "Parameters",
-        "parameter": [{
-            "name": "subjectResource",
-            "resource": {
-                "resourceType": "ViewDefinition",
-                "status": "active",
-                "resource": "Patient",
-                "select": [{"column": [{"name": "id", "path": "id"}]}]
+        "parameter": [
+            {
+                "name": "subjectResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "123",
+                    "meta": {"lastUpdated": "2024-06-01T00:00:00Z"}
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Group",
+                    "id": "456",
+                    "member": [{"entity": {"reference": "Patient/123"}}]
+                }
             }
-        }]
+        ]
     });
 
     // Test all filtering parameters together
@@ -403,9 +441,13 @@ async fn test_combined_filtering_parameters() {
         .add_query_param("_since", "2024-01-01T00:00:00Z")
         .add_query_param("patient", "Patient/123")
         .add_query_param("group", "Group/456")
-        .add_query_param("source", "primary-database")
         .json(&request_body)
         .await;
 
-    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
 }

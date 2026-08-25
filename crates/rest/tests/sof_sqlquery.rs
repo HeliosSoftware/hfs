@@ -978,8 +978,8 @@ mod sof_sqlquery_tests {
     // =========================================================================
 
     /// A `$sql-run` with an inline `queryResource` whose `depends-on`
-    /// ViewDefinition is supplied via `view.viewResource` in the same body
-    /// succeeds without the ViewDefinition being stored on the server.
+    /// ViewDefinition is supplied via `context` in the same body succeeds
+    /// without the ViewDefinition being stored on the server.
     #[tokio::test]
     async fn inline_view_resource_satisfies_depends_on_without_storage() {
         let (server, backend) = create_test_server().await;
@@ -1036,10 +1036,10 @@ mod sof_sqlquery_tests {
         assert!(ids.contains(&"p1") && ids.contains(&"p2"));
     }
 
-    /// When a `view.viewResource` URL matches a `depends-on` canonical, the
+    /// When a `context` entry's URL matches a `depends-on` canonical, the
     /// inline VD is used and storage is never consulted for that dependency.
-    /// A dependency whose URL does NOT appear in any supplied `view` still
-    /// falls back to storage and returns 404 when absent.
+    /// A dependency whose URL does NOT appear in any supplied `context` entry
+    /// still falls back to storage and returns 404 when absent.
     #[tokio::test]
     async fn depends_on_not_in_inline_views_falls_back_to_storage_404() {
         let (server, _) = create_test_server().await;
