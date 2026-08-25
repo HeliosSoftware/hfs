@@ -496,6 +496,7 @@ editor-primitive-extension-hint = Este valor lleva extensiones propias (un herma
 
 editor-collapse-all = Colapsar todo
 editor-expand-all = Expandir todo
+json-view-toggle-fold = Alternar sección JSON
 editor-edit-raw = Editar crudo
 editor-versions = Versiones
 editor-versions-none = Sin versiones anteriores.

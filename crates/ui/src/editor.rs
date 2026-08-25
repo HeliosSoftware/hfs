@@ -136,6 +136,10 @@ pub struct EditorBody {
     pub pretty: String,
     /// The foldable, line-numbered JSON view shown beside the guided form.
     pub json_lines: Vec<crate::json_view::JsonLine>,
+    /// Shared JSON-view partial options. Editor hosts keep the legacy id and
+    /// path metadata used by editor-sync.js.
+    pub json_view_id: &'static str,
+    pub json_view_paths: bool,
     pub error_count: usize,
     /// Issues the validator reported against a path no row owns (an invariant
     /// on a backbone element, say). Surfaced rather than swallowed.
@@ -224,6 +228,8 @@ pub async fn render_body(
                 document: form.doc.clone(),
                 pretty: form.doc,
                 json_lines: Vec::new(),
+                json_view_id: "json-view",
+                json_view_paths: true,
                 error_count: 0,
                 orphan_errors: Vec::new(),
                 parse_error: Some(error.to_string()),
@@ -405,6 +411,8 @@ fn build_body(
         document: serde_json::to_string(&document).unwrap_or_default(),
         pretty: serde_json::to_string_pretty(&document).unwrap_or_default(),
         json_lines: crate::json_view::lines(&document),
+        json_view_id: "json-view",
+        json_view_paths: true,
         error_count: errors.len(),
         orphan_errors,
         rows,

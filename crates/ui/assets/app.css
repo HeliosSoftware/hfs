@@ -82,6 +82,10 @@
      opposite move per theme — darker on the light tint, lighter on the dark —
      so it is theme-specific (see the dark block). */
   --accent-text: #0a5f96;
+  --json-key: #0a5f96;
+  --json-string: #137333;
+  --json-number: #b4232d;
+  --json-literal: #6f42c1;
   /* Menu panel input */
   --input-bg: #f5f5f5;
   /* Pill scrollbars: thin bar, fully-rounded track and thumb. */
@@ -107,6 +111,10 @@
   --muted: #a0a0a0;
   /* Selected-item accent text on the dark tint: lighter, to clear 4.5:1. */
   --accent-text: #7cc9ff;
+  --json-key: #7cc9ff;
+  --json-string: #7ee787;
+  --json-number: #ff7b72;
+  --json-literal: #d2a8ff;
   --divider: #000000;
   --divider-glint: rgb(255 255 255 / 12%);
   --outline: #353535;
@@ -3480,7 +3488,7 @@ button.pill {
 
 .json-line__fold {
   flex: 0 0 auto;
-  width: 16px;
+  width: 24px;
   text-align: center;
   color: var(--muted);
   user-select: none;
@@ -3488,7 +3496,15 @@ button.pill {
 
 .json-line__arrow {
   cursor: pointer;
-  display: inline-block;
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
   transition: transform 0.1s;
 }
 
@@ -3501,11 +3517,11 @@ button.pill {
 .json-line--collapsed .json-line__summary { display: inline; padding-left: 2px; }
 
 /* Syntax highlighting. */
-.jt--key { color: var(--accent); }
-.jt--string { color: #1a7f37; }
-.jt--number { color: #cf222e; }
+.jt--key { color: var(--json-key); }
+.jt--string { color: var(--json-string); }
+.jt--number { color: var(--json-number); }
 .jt--bool,
-.jt--null { color: #8250df; font-weight: 600; }
+.jt--null { color: var(--json-literal); font-weight: 600; }
 .jt--punct { color: var(--muted); }
 
 /* ---- version rail ---- */
@@ -4522,6 +4538,18 @@ button.pill {
   background: var(--surface);
   font-size: 12.5px;
   overflow-x: auto;
+}
+
+.batch-row__body .json-view,
+.batch-json .json-view {
+  padding: 0;
+  max-height: 60vh;
+}
+
+.json-view__fallback {
+  margin: 0;
+  white-space: pre;
+  font: inherit;
 }
 
 .batch-footer {

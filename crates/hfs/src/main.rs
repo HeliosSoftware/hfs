@@ -666,7 +666,7 @@ async fn serve(
         // configured from HFS_UI_* client credentials.
         let self_base_url = format!("http://127.0.0.1:{}", config.port);
         let outbound_auth = AuthConfig::from_env().outbound_provider();
-        helios_ui::mount(
+        helios_ui::mount_with_body_limit(
             app,
             env!("CARGO_PKG_VERSION"),
             config.data_dir.clone(),
@@ -682,6 +682,7 @@ async fn serve(
             outbound_auth,
             config.default_fhir_version,
             config.terminology_server.clone(),
+            config.max_body_size,
         )
     };
     #[cfg(not(all(feature = "ui", not(feature = "headless"))))]

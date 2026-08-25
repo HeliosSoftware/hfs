@@ -500,6 +500,7 @@ editor-primitive-extension-hint = This value carries extensions of its own (a `_
 
 editor-collapse-all = Collapse all
 editor-expand-all = Expand all
+json-view-toggle-fold = Toggle JSON section
 editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
