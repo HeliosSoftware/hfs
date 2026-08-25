@@ -51,6 +51,32 @@ fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
     Ok(())
 }
 
+/// Decides whether a page can be resolved from `search_index` alone, returning
+/// the predicate to resolve it with.
+///
+/// Gates, and why each one is load-bearing:
+/// - `Denormalized` layout: on a legacy database the rows carry no sort key, so
+///   the fast path would order by NULL and return an arbitrary page.
+/// - no cursor, no offset: both paginate against `resources`.
+/// - default sort: any other sort key is not on the index row.
+/// - exactly one membership test: a conjunction needs rows that jointly satisfy
+///   it, which a single-row predicate cannot express.
+fn fast_index_pred(
+    query: &SearchQuery,
+    filter_sql: Option<&str>,
+    layout: super::schema::IndexLayout,
+    has_cursor: bool,
+) -> Option<String> {
+    if has_cursor
+        || query.offset.is_some()
+        || !query.sort.is_empty()
+        || layout != super::schema::IndexLayout::Denormalized
+    {
+        return None;
+    }
+    PostgresQueryBuilder::single_index_predicate(filter_sql?).map(str::to_string)
+}
+
 #[async_trait]
 impl SearchProvider for PostgresBackend {
     async fn search(
@@ -114,18 +140,12 @@ impl SearchProvider for PostgresBackend {
         // join every match first — 42,927 whole resources for a 21-row page on
         // the benchmark dataset — because the planner cannot estimate a range
         // predicate whose selectivity is conditional on `param_name`.
-        let fast_index_pred: Option<String> = if cursor.is_none()
-            && query.offset.is_none()
-            && query.sort.is_empty()
-            && self.index_layout() == super::schema::IndexLayout::Denormalized
-        {
-            search_filter
-                .as_ref()
-                .and_then(|f| PostgresQueryBuilder::single_index_predicate(&f.sql))
-                .map(str::to_string)
-        } else {
-            None
-        };
+        let fast_index_pred = fast_index_pred(
+            query,
+            search_filter.as_ref().map(|f| f.sql.as_str()),
+            self.index_layout(),
+            cursor.is_some(),
+        );
 
         let filter_clause = search_filter
             .as_ref()
@@ -1261,5 +1281,78 @@ impl PostgresBackend {
             None,
             fhir_version,
         )))
+    }
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::*;
+    use crate::backends::postgres::schema::IndexLayout;
+    use crate::types::{
+        SearchParamType, SearchParameter, SearchPrefix, SearchValue, SortDirective,
+    };
+
+    fn date_query() -> SearchQuery {
+        SearchQuery::new("Encounter").with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "2010-01-01")],
+            chain: vec![],
+            components: vec![],
+        })
+    }
+
+    fn filter_of(query: &SearchQuery) -> String {
+        PostgresQueryBuilder::build_search_query(query, 2)
+            .expect("condition")
+            .sql
+    }
+
+    #[test]
+    fn taken_for_a_default_sorted_single_parameter_page() {
+        let q = date_query();
+        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
+        assert_eq!(
+            pred.as_deref(),
+            Some("param_name = 'date' AND value_date >= $3")
+        );
+    }
+
+    #[test]
+    fn refused_on_a_legacy_layout() {
+        // The decisive gate: legacy rows have no `last_updated`, so ordering by
+        // it would return an arbitrary page rather than the first one.
+        let q = date_query();
+        assert!(fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Legacy, false).is_none());
+    }
+
+    #[test]
+    fn refused_with_a_cursor_or_offset() {
+        let q = date_query();
+        let filter = filter_of(&q);
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, true).is_none());
+
+        let mut q2 = date_query();
+        q2.offset = Some(40);
+        assert!(fast_index_pred(&q2, Some(&filter), IndexLayout::Denormalized, false).is_none());
+    }
+
+    #[test]
+    fn refused_for_a_non_default_sort() {
+        let mut q = date_query();
+        q.sort = vec![SortDirective {
+            parameter: "_id".to_string(),
+            direction: crate::types::SortDirection::Ascending,
+            param_type: Some(SearchParamType::Token),
+        }];
+        let filter = filter_of(&q);
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, false).is_none());
+    }
+
+    #[test]
+    fn refused_without_a_filter() {
+        let q = SearchQuery::new("Encounter");
+        assert!(fast_index_pred(&q, None, IndexLayout::Denormalized, false).is_none());
     }
 }
