@@ -1058,10 +1058,28 @@
       });
   }
 
-  /* The last URL the rows themselves produced. A native `change` can fire on
-   * the URL input after `updateUrl` rewrote it programmatically (the browser's
-   * dirty-value flag survives), and rebuilding the rows mid-interaction would
-   * yank focus and drop in-flight edits — so re-parsing skips its own echo. */
+  /* Keeps every type-dependent Resources control on the type parsed from the
+   * query URL. Search and Saved Queries share this script and the rail, but do
+   * not render the Resources panel or Create button, so those updates are
+   * deliberately conditional. This helper never rewrites or runs the query. */
+  function syncTypeContext(type) {
+    markRailType(type);
+    var panel = document.getElementById("resources");
+    if (!panel) return;
+    panel.dataset.selectedType = type;
+    var createBtn = document.getElementById("resource-create");
+    if (createBtn && createBtn.dataset.msgCreate) {
+      var label = createBtn.querySelector(".resources-create__label");
+      if (label) label.textContent = createBtn.dataset.msgCreate.replace("{type}", type);
+    }
+  }
+
+  /* The next URL echo the rows themselves may produce. A native `change` can
+   * fire on the URL input after `updateUrl` rewrote it programmatically (the
+   * browser's dirty-value flag survives), and rebuilding the rows
+   * mid-interaction would yank focus and drop in-flight edits. The marker is
+   * one-shot: any other render invalidates it so a later external URL cannot
+   * match stale state. */
   var lastSerialized = null;
 
   function builderHasEscapeError() {
@@ -1088,16 +1106,20 @@
   /* URL → rows. */
   function renderBuilder() {
     if (!sections || !urlInput) return;
-    if (urlInput.value === lastSerialized) return;
+    var isSerializedEcho = urlInput.value === lastSerialized;
+    lastSerialized = null;
     var parsed = parseSearchUrl(urlInput.value);
     if (!parsed) {
       sections.hidden = true;
       markRailType(null);
       return;
     }
+    // Context sync must precede the echo guard: even a URL whose rows are
+    // already current may have arrived with conflicting Resources state (#626).
+    syncTypeContext(parsed.type);
+    if (isSerializedEcho) return;
     sections.hidden = false;
     sections.dataset.type = parsed.type;
-    markRailType(parsed.type);
     loadCatalog(parsed.type);
 
     var hosts = builderHosts();
@@ -1371,14 +1393,6 @@
    * panel and the button are absent on the Saved Queries / Search pages,
    * where this rail only drives the search. */
   function selectType(type) {
-    var panel = document.getElementById("resources");
-    if (panel) panel.dataset.selectedType = type;
-    var createBtn = document.getElementById("resource-create");
-    if (createBtn && createBtn.dataset.msgCreate) {
-      var label = createBtn.querySelector(".resources-create__label");
-      if (label) label.textContent = createBtn.dataset.msgCreate.replace("{type}", type);
-    }
-    markRailType(type);
     urlInput.value = "GET /" + type;
     renderBuilder();
     runSearch("/" + encodeURIComponent(type), false);
