@@ -129,6 +129,10 @@ struct WebState {
     /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
     /// tenant's conformance resources from the tenant-maintenance page.
     data_dir: Option<PathBuf>,
+    /// The server's public base URL (`HFS_BASE_URL`) — what Bulk Import
+    /// submissions target as their recipient (#689). Distinct from the
+    /// loopback self-call base the conformance source uses.
+    public_base_url: String,
     /// The server's default FHIR version, used when seeding a new tenant.
     fhir_version: helios_fhir::FhirVersion,
     /// The server's default tenant id â€” the fallback when no stored choice
@@ -790,6 +794,7 @@ pub fn mount(
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
+    public_base_url: String,
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url,
@@ -808,6 +813,7 @@ pub fn mount(
         source,
         fhir_version,
         terminology,
+        public_base_url,
     )
 }
 
@@ -828,6 +834,7 @@ pub fn mount_with_conformance_source(
     source: Arc<dyn ConformanceSource>,
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
+    public_base_url: String,
 ) -> Router {
     let nl_enabled = nl.enabled;
 
@@ -983,6 +990,7 @@ pub fn mount_with_conformance_source(
         fhir_version,
         default_tenant,
         terminology,
+        public_base_url,
     };
 
     router

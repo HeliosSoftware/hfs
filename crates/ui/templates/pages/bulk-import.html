@@ -25,11 +25,11 @@
           <span class="field__label">{{ i18n.t("bulk-import-field-name") }}</span>
           <input class="field__input" type="text" name="name" required autocomplete="off">
         </label>
+        <!-- The recipient is fixed to this server's HFS_BASE_URL (#689);
+             shown so the target is visible, not typed. -->
         <label class="field">
           <span class="field__label">{{ i18n.t("bulk-import-field-recipient") }}</span>
-          <input class="field__input" type="url" name="recipient_base_url" required
-                 autocomplete="off" placeholder="http://localhost:8080">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-recipient-hint") }}</span>
+          <span class="field__hint">{{ recipient }}</span>
         </label>
 
         <label class="field">

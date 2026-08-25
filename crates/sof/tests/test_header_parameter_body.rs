@@ -214,9 +214,15 @@ async fn test_header_parameter_without_format_is_ignored_on_non_csv() {
         ]
     });
 
-    // No `_format` specified → defaults to JSON. The body's `header`
-    // parameter should be ignored (not error).
-    let response = server.post("/$sql-run").json(&request_body).await;
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly to exercise the non-CSV scenario this test targets. The
+    // body's `header` parameter should be ignored (not error).
+    let response = server
+        .post("/$sql-run")
+        .add_header("Accept", "application/json")
+        .json(&request_body)
+        .await;
 
     assert_eq!(
         response.status_code(),

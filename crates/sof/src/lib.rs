@@ -180,13 +180,18 @@
 //! - `R5`: FHIR 5.0.0 support
 //! - `R6`: FHIR 6.0.0 support
 
+pub mod app;
 pub mod canonical;
 pub mod compartment;
 pub mod constants;
 pub mod data_source;
+mod error;
 pub mod fhir_format;
+mod handlers;
+mod models;
 pub mod params;
 pub mod parquet_schema;
+mod parquet_zip;
 pub mod reference_collector;
 pub mod remote_fetch;
 pub mod remote_resolver;

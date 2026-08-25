@@ -103,7 +103,17 @@ where
                 message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
             })?;
 
-    let candidates: Vec<_> = result.resources.items.into_iter().collect();
+    // The search already filters by `url=`/`version=`, but a backend could in
+    // principle return an approximate match (e.g. tokenized full-text search);
+    // re-checking with the same [`canonical_matches`] predicate used for the
+    // `context` list keeps storage and inline lookups provably consistent
+    // rather than trusting two independently-implemented notions of "matches".
+    let candidates: Vec<_> = result
+        .resources
+        .items
+        .into_iter()
+        .filter(|r| canonical_matches(r.content(), url))
+        .collect();
     if candidates.is_empty() {
         // SoF v2 spec maps "Library or ViewDefinition not found" to 404.
         // Use the full canonical URL (including any |version) as the
@@ -121,6 +131,28 @@ where
             message: "unreachable: candidates was non-empty".into(),
         })?;
     Ok(chosen.content().clone())
+}
+
+/// The one canonical-matching rule shared by storage lookups
+/// ([`resolve_by_canonical_url`]) and matching against the inline `context`
+/// list ([`super::graph::fetch_dependency`], [`super::view_sources`]): a
+/// resource matches `query` when its own `url` element equals `query`'s
+/// canonical part, and — when `query` pins a version via `|` or `@` — its own
+/// `version` element equals that pinned version. A `query` with no version
+/// pin matches any version. A resource with no `url` never matches anything,
+/// since there is nothing to compare.
+pub(super) fn canonical_matches(resource: &Value, query: &str) -> bool {
+    let (canonical, version) = split_canonical_version(query);
+    let Some(resource_url) = resource.get("url").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if resource_url != canonical {
+        return false;
+    }
+    match version {
+        Some(v) => resource.get("version").and_then(|x| x.as_str()) == Some(v.as_str()),
+        None => true,
+    }
 }
 
 /// Splits `url|version` (preferred) or `url@version` (spec narrative form).
@@ -143,7 +175,8 @@ fn split_canonical_version(url: &str) -> (String, Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_canonical_version;
+    use super::{canonical_matches, split_canonical_version};
+    use serde_json::json;
 
     #[test]
     fn bare_url_has_no_version() {
@@ -179,5 +212,36 @@ mod tests {
         let (u, v) = split_canonical_version("http://example.org/ViewDefinition/x@y|2.0");
         assert_eq!(u, "http://example.org/ViewDefinition/x@y");
         assert_eq!(v.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn canonical_matches_a_bare_url_regardless_of_the_resource_version() {
+        let resource = json!({"resourceType": "ViewDefinition", "url": "http://example.org/vd"});
+        assert!(canonical_matches(&resource, "http://example.org/vd"));
+        let versioned = json!({"resourceType": "ViewDefinition", "url": "http://example.org/vd", "version": "1.0.0"});
+        assert!(canonical_matches(&versioned, "http://example.org/vd"));
+    }
+
+    #[test]
+    fn canonical_matches_requires_the_pinned_version_to_match() {
+        let resource = json!({
+            "resourceType": "ViewDefinition",
+            "url": "http://example.org/vd",
+            "version": "1.0.0"
+        });
+        assert!(canonical_matches(&resource, "http://example.org/vd|1.0.0"));
+        assert!(!canonical_matches(&resource, "http://example.org/vd|2.0.0"));
+    }
+
+    #[test]
+    fn canonical_matches_rejects_a_resource_with_no_url() {
+        let resource = json!({"resourceType": "ViewDefinition"});
+        assert!(!canonical_matches(&resource, "http://example.org/vd"));
+    }
+
+    #[test]
+    fn canonical_matches_rejects_a_different_canonical_url() {
+        let resource = json!({"resourceType": "ViewDefinition", "url": "http://example.org/other"});
+        assert!(!canonical_matches(&resource, "http://example.org/vd"));
     }
 }

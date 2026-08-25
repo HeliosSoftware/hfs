@@ -197,6 +197,7 @@ fn status_label(i18n: &I18n, status: &str) -> String {
         "in-progress" => i18n.t("bulk-import-status-in-progress"),
         "stopped" => i18n.t("bulk-import-status-stopped"),
         "completed" => i18n.t("bulk-import-status-completed"),
+        "failed" => i18n.t("bulk-import-status-failed"),
         _ => i18n.t("bulk-import-status-not-started"),
     }
 }
@@ -210,6 +211,9 @@ struct BulkImportPage {
     available: bool,
     rows: Vec<SubmissionRow>,
     error: Option<String>,
+    /// Where every new submission goes (`HFS_BASE_URL`, #689) — shown in the
+    /// dialog so the fixed recipient is visible, not invisible.
+    recipient: String,
 }
 
 #[derive(Template)]
@@ -284,14 +288,13 @@ pub async fn page(
         available,
         rows,
         error: None,
+        recipient: state.public_base_url.trim_end_matches('/').to_string(),
     })
 }
 
 #[derive(Deserialize)]
 pub struct CreateForm {
     pub name: String,
-    #[serde(default)]
-    pub recipient_base_url: String,
     #[serde(default)]
     pub auth: String,
     #[serde(default)]
@@ -322,11 +325,10 @@ pub async fn create(
     };
     let submission = Submission {
         name: form.name.trim().to_string(),
-        recipient_base_url: form
-            .recipient_base_url
-            .trim()
-            .trim_end_matches('/')
-            .to_string(),
+        // The recipient is always this server's HFS_BASE_URL (#689) — typing
+        // it per submission is how a submission ended up pointed at something
+        // that is not a Bulk Data Submit endpoint (#686).
+        recipient_base_url: state.public_base_url.trim_end_matches('/').to_string(),
         auth: if form.auth == "backend-services" {
             form.auth
         } else {
@@ -666,15 +668,22 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
         .ok_or_else(|| "token response carried no access_token".to_string())
 }
 
-/// POSTs a kick-off to the recipient, returning `(status, body-excerpt)`.
+/// The URL a submission's kick-off is POSTed to — the one failure messages
+/// must name (#686).
+fn kickoff_target(submission: &Submission) -> String {
+    format!(
+        "{}/$bulk-submit",
+        submission.recipient_base_url.trim_end_matches('/')
+    )
+}
+
+/// POSTs a kick-off to the recipient, returning
+/// `(status, content-type, body-excerpt)`.
 async fn post_kickoff(
     submission: &Submission,
     parameters: &Value,
-) -> Result<(u16, String), String> {
-    let target = format!(
-        "{}/$bulk-submit",
-        submission.recipient_base_url.trim_end_matches('/')
-    );
+) -> Result<(u16, String, String), String> {
+    let target = kickoff_target(submission);
     let mut request = reqwest::Client::new()
         .post(&target)
         .header("Content-Type", "application/fhir+json")
@@ -685,11 +694,56 @@ async fn post_kickoff(
         let token = backend_services_token(&submission.client_id, &submission.token_url).await?;
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(|e| e.to_string())?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("POST {target} failed: {e}"))?;
     let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let mut body = response.text().await.unwrap_or_default();
-    body.truncate(300);
-    Ok((status, body))
+    body.truncate(2000);
+    Ok((status, content_type, body))
+}
+
+/// Summarizes an error response for the log (#686): an OperationOutcome's own
+/// explanation when one came back; otherwise the content type and, for
+/// non-markup bodies, a short excerpt — raw HTML is never pasted.
+fn summarize_error_body(content_type: &str, body: &str) -> String {
+    if let Ok(outcome) = serde_json::from_str::<Value>(body)
+        && outcome.get("resourceType").and_then(Value::as_str) == Some("OperationOutcome")
+        && let Some(explained) = outcome
+            .get("issue")
+            .and_then(Value::as_array)
+            .and_then(|issues| {
+                issues.iter().find_map(|i| {
+                    i.get("diagnostics")
+                        .and_then(Value::as_str)
+                        .or_else(|| i.get("details")?.get("text")?.as_str())
+                })
+            })
+    {
+        return explained.to_string();
+    }
+    let kind = content_type.split(';').next().unwrap_or("").trim();
+    if kind.contains("html") || body.trim_start().starts_with('<') {
+        return format!(
+            "the response was {} ({} bytes), not a FHIR resource — is the recipient a Bulk Data Submit endpoint?",
+            if kind.is_empty() { "markup" } else { kind },
+            body.len()
+        );
+    }
+    let mut excerpt = body.trim().replace('\n', " ");
+    excerpt.truncate(160);
+    if excerpt.is_empty() {
+        format!("empty {kind} response")
+    } else {
+        format!("{kind}: {excerpt}")
+    }
 }
 
 /// Kicks off recipient-side status tracking: `POST $bulk-submit-status`
@@ -850,7 +904,7 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
     );
     let parameters = kickoff_parameters(submission, id, "in-progress", Some(&m), None);
     match post_kickoff(submission, &parameters).await {
-        Ok((status, _)) if (200..300).contains(&status) => {
+        Ok((status, _, _)) if (200..300).contains(&status) => {
             push_log(
                 submission,
                 format!("Manifest accepted by the recipient ({status})."),
@@ -874,23 +928,29 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
                 }
             }
         }
-        Ok((status, body)) => {
-            push_log(submission, "Bulk Submit request failed!".to_string());
+        Ok((status, content_type, body)) => {
+            // Name the request that actually failed — the kick-off POST, not
+            // the manifest URL, which HFS never called (#686).
             push_log(
                 submission,
                 format!(
-                    "Failed to submit manifest {}: {status} {}",
+                    "POST {} → {status}: {} (manifest {})",
+                    kickoff_target(submission),
+                    summarize_error_body(&content_type, &body),
                     m.manifest_url,
-                    body.replace('\n', " ")
                 ),
             );
+            submission.status = "failed".to_string();
         }
         Err(e) => {
-            push_log(submission, "Bulk Submit request failed!".to_string());
             push_log(
                 submission,
-                format!("Failed to submit manifest {}: {e}", m.manifest_url),
+                format!(
+                    "Bulk Submit request failed: {e} (manifest {})",
+                    m.manifest_url
+                ),
             );
+            submission.status = "failed".to_string();
         }
     }
 }
@@ -927,14 +987,17 @@ async fn set_status(
         push_log(&mut s, format!("Marking submission {status}..."));
         let parameters = kickoff_parameters(&s, &id, status, None, None);
         match post_kickoff(&s, &parameters).await {
-            Ok((code, _)) if (200..300).contains(&code) => {
+            Ok((code, _, _)) if (200..300).contains(&code) => {
                 push_log(&mut s, format!("Recipient acknowledged ({code})."));
                 s.status = status.to_string();
             }
-            Ok((code, body)) => {
+            Ok((code, content_type, body)) => {
                 push_log(
                     &mut s,
-                    format!("Recipient rejected the status change: {code} {body}"),
+                    format!(
+                        "Recipient rejected the status change: {code}: {}",
+                        summarize_error_body(&content_type, &body)
+                    ),
                 );
             }
             Err(e) => {
@@ -1049,16 +1112,19 @@ pub async fn replace_manifest(
             let parameters =
                 kickoff_parameters(&s, &id, "in-progress", Some(&replacement), Some(&old_url));
             match post_kickoff(&s, &parameters).await {
-                Ok((code, _)) if (200..300).contains(&code) => {
+                Ok((code, _, _)) if (200..300).contains(&code) => {
                     push_log(&mut s, format!("Replacement accepted ({code})."));
                     let mut entry = serde_json::to_value(&replacement).unwrap_or(Value::Null);
                     entry["lastSubmittedAt"] = json!(now_stamp());
                     s.manifests.insert(mid, entry);
                 }
-                Ok((code, body)) => {
+                Ok((code, content_type, body)) => {
                     push_log(
                         &mut s,
-                        format!("Replacement rejected: {code} {}", body.replace('\n', " ")),
+                        format!(
+                            "Replacement rejected: {code}: {}",
+                            summarize_error_body(&content_type, &body)
+                        ),
                     );
                 }
                 Err(e) => {
@@ -1105,16 +1171,19 @@ pub async fn abort_manifest(
             let parameters =
                 kickoff_parameters(&s, &id, "in-progress", Some(&empty), Some(&old_url));
             match post_kickoff(&s, &parameters).await {
-                Ok((code, _)) if (200..300).contains(&code) => {
+                Ok((code, _, _)) if (200..300).contains(&code) => {
                     push_log(&mut s, format!("Abort accepted ({code})."));
                     if let Some(entry) = s.manifests.get_mut(&mid) {
                         entry["abortedAt"] = json!(now_stamp());
                     }
                 }
-                Ok((code, body)) => {
+                Ok((code, content_type, body)) => {
                     push_log(
                         &mut s,
-                        format!("Abort rejected: {code} {}", body.replace('\n', " ")),
+                        format!(
+                            "Abort rejected: {code}: {}",
+                            summarize_error_body(&content_type, &body)
+                        ),
                     );
                 }
                 Err(e) => {

@@ -408,7 +408,7 @@ mod sof_run_tests {
         }
     }
 
-    /// A `Parameters` body wrapping a ViewDefinition via `viewResource` is accepted.
+    /// A `Parameters` body naming a ViewDefinition via `subjectResource` is accepted.
     #[tokio::test]
     async fn test_run_view_definition_parameters_body() {
         let (server, backend) = create_test_server().await;
@@ -926,7 +926,7 @@ mod sof_run_tests {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
-    /// A `Parameters` body without a `viewResource` parameter returns 400.
+    /// A `Parameters` body without a subject-naming parameter returns 400.
     #[tokio::test]
     async fn test_run_view_definition_parameters_missing_view_resource_returns_400() {
         let (server, _backend) = create_test_server().await;
@@ -1235,7 +1235,7 @@ mod sof_run_tests {
             .await
             .expect("failed to seed VD");
 
-        // Run via viewReference instead of inline viewResource.
+        // Run via subjectReference instead of an inline subjectResource.
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [{
@@ -1841,5 +1841,89 @@ mod sof_run_tests {
         );
         let families: Vec<&str> = rows.iter().filter_map(|r| r["family"].as_str()).collect();
         assert!(families.contains(&"Cole") && families.contains(&"Doe"));
+    }
+
+    // =========================================================================
+    // The renamed `view` parameter (#575): `$sql-run` extractors are
+    // deliberately permissive and silently ignore unrecognised parameter
+    // names, but `view` — the pre-ballot spelling of `context` — is a special
+    // case that gets the same didactic 400 `$sql-export` gives, instead of
+    // falling through to a generic "requires a subject" error. Any other
+    // unknown name keeps today's silently-ignored behavior.
+    // =========================================================================
+
+    /// A `$sql-run` body naming the pre-ballot `view` parameter gets a
+    /// didactic 400 pointing at the rename, not the generic "requires a
+    /// subject" 400 an unrecognised/absent subject parameter would produce.
+    #[tokio::test]
+    async fn test_run_renamed_view_param_gets_didactic_message() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "view", "part": [
+                    {"name": "viewResource", "resource": patient_view_definition()}
+                ]}
+            ]
+        });
+
+        let response = server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let outcome: Value = response.json();
+        // `RestError::BadRequest` renders through `create_operation_outcome`,
+        // which puts the message in `issue[0].details.text` rather than a
+        // top-level `diagnostics` field (that shape is specific to the raw
+        // `OperationOutcome` responses `$sql-export` builds by hand).
+        let details = outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            details.contains("renamed to `context`"),
+            "expected the didactic rename message, got: {outcome}"
+        );
+    }
+
+    /// Any other unrecognised parameter name on `$sql-run` keeps today's
+    /// behavior: the extractor silently ignores it rather than rejecting the
+    /// request, so a valid `subjectResource` alongside it still runs.
+    #[tokio::test]
+    async fn test_run_unrelated_unknown_param_is_silently_ignored() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": patient_view_definition()},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "inline-a",
+                    "name": [{"family": "InlineA"}]
+                }},
+                {"name": "banana", "valueString": "not a real parameter"}
+            ]
+        });
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "an unrelated unknown parameter must not block the run: {rows:?}"
+        );
     }
 }
