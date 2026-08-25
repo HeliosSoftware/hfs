@@ -1116,7 +1116,11 @@ pub struct ServerConfig {
     )]
     pub sof_sqlquery_max_source_rows_per_vd: usize,
 
-    /// Maximum number of depends-on ViewDefinitions a single SQLQuery Library may declare.
+    /// Maximum number of nodes in a `$sql-run`/`$sql-export` subject's
+    /// resolved dependency graph — every ViewDefinition and SQLView Library
+    /// the two-phase resolver reaches, not just the subject's direct
+    /// `depends-on` entries (SQLView nesting can pull in a graph several
+    /// levels deep; see `handlers::sof::graph`).
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_VDS", default_value = "16")]
     pub sof_sqlquery_max_vds: usize,
 

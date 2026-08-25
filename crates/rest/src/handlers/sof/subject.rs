@@ -44,6 +44,21 @@ use crate::state::AppState;
 /// `Library.type.coding.code` identifying a Library as a reusable SQL view.
 const LIBRARY_TYPE_SQL_VIEW: &str = "sql-view";
 
+/// The pre-ballot spelling of the renamed `context` parameter. A request
+/// naming this parameter — on either `$sql-run` or `$sql-export` — gets a
+/// didactic diagnostic instead of the generic "unsupported"/"unknown"
+/// parameter message (see [`RENAMED_VIEW_PARAM_MESSAGE`]).
+pub(crate) const RENAMED_VIEW_PARAM_NAME: &str = "view";
+
+/// Diagnostic text for a request that still uses the pre-ballot `view`
+/// parameter. The old shape (`{"name":"view","part":[{"name":"viewResource",…}]}`)
+/// is not accepted in any form — this is a clean cut, not a compatibility
+/// shim — but the message tells the caller exactly what changed instead of
+/// leaving them to guess from a generic "unsupported parameter" error.
+pub(crate) const RENAMED_VIEW_PARAM_MESSAGE: &str = "`view` was renamed to `context` in SQL on \
+    FHIR 3.0.0-ballot; the inline resource now hangs directly off the parameter (no \
+    `viewResource` part)";
+
 /// Which kind of artifact a subject turned out to be.
 ///
 /// The operation does not change based on the kind — the same `$sql-run`
@@ -69,10 +84,12 @@ impl SubjectKind {
         }
     }
 
-    /// Whether this kind accepts the `parameters` input. Only a Library
-    /// declares parameters; supplying them for a ViewDefinition is a 400.
+    /// Whether this kind accepts the `parameters` input. Only a SQLQuery
+    /// Library declares parameters: a ViewDefinition declares none, and the
+    /// SQLView profile constrains `Library.parameter` to `0..0`, so a SQLView
+    /// subject accepts none either. Supplying `parameters` for either is 400.
     pub fn accepts_parameters(self) -> bool {
-        !matches!(self, SubjectKind::ViewDefinition)
+        matches!(self, SubjectKind::SqlQuery)
     }
 }
 
@@ -341,10 +358,13 @@ mod tests {
     }
 
     #[test]
-    fn view_definition_declares_no_parameters() {
+    fn only_sql_query_accepts_parameters() {
+        // ViewDefinition declares no parameters at all, and the SQLView
+        // profile constrains Library.parameter to 0..0, so only SqlQuery
+        // accepts the operation's `parameters` input.
         assert!(!SubjectKind::ViewDefinition.accepts_parameters());
         assert!(SubjectKind::SqlQuery.accepts_parameters());
-        assert!(SubjectKind::SqlView.accepts_parameters());
+        assert!(!SubjectKind::SqlView.accepts_parameters());
     }
 
     #[test]
