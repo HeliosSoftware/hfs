@@ -42,6 +42,29 @@ GROUP BY param_name ORDER BY rows DESC;
 SELECT pg_size_pretty(pg_total_relation_size('search_index')) AS search_index_total,
        pg_size_pretty(pg_relation_size('search_index'))       AS heap_only;
 
+-- Which of the ~19 search_index indexes the suites actually used, and what each
+-- costs. `idx_scan = 0` after a full import+search run means nothing read it,
+-- while every write still maintained it and it still occupied cache. The heap is
+-- ~8 GB against ~23 GB of indexes on an 11 GB host, so a dead index is not free:
+-- it evicts pages the live ones need.
+--
+-- Read this BEFORE dropping anything: several indexes look redundant on paper
+-- (idx_search_token vs the code-first idx_search_token_code, idx_search_reference
+-- vs the text_pattern_ops idx_search_reference_pattern) but only a run that
+-- exercised every shape can say so.
+\echo ''
+\echo '################ INDEX USAGE AND SIZE ################'
+SELECT s.indexrelname                                  AS index_name,
+       s.idx_scan                                      AS scans,
+       s.idx_tup_read                                  AS tuples_read,
+       pg_size_pretty(pg_relation_size(s.indexrelid))  AS size
+FROM pg_stat_user_indexes s
+WHERE s.relname = 'search_index'
+ORDER BY s.idx_scan ASC, pg_relation_size(s.indexrelid) DESC;
+
+SELECT pg_size_pretty(sum(pg_relation_size(s.indexrelid))) AS all_indexes
+FROM pg_stat_user_indexes s WHERE s.relname = 'search_index';
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- COMPOSITE. Baseline A is what ships today: median 13.2s, 975ms cold single
 -- shot, 111,881 buffer READS. Only 222 of 656,737 Observations match, so the

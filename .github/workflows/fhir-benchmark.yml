@@ -772,6 +772,28 @@ jobs:
               "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
           done
 
+          # Which search_index indexes the suites actually read.
+          #
+          # The plan capture above runs before the load, so its idx_scan counters
+          # only reflect import. This one runs after every suite, so a zero here
+          # means no shape in the whole run touched that index — while every
+          # write still maintained it and it still occupied cache on an 11G host.
+          # Evidence for the next round of index pruning; nothing reads it in
+          # this run.
+          if [ "${{ matrix.backend }}" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
+            docker exec "$PG_CONTAINER" psql -U postgres -d postgres \
+              -c "SELECT s.indexrelname AS index_name, s.idx_scan AS scans,
+                         s.idx_tup_read AS tuples_read,
+                         pg_size_pretty(pg_relation_size(s.indexrelid)) AS size
+                  FROM pg_stat_user_indexes s WHERE s.relname = 'search_index'
+                  ORDER BY s.idx_scan ASC, pg_relation_size(s.indexrelid) DESC;" \
+              -c "SELECT pg_size_pretty(sum(pg_relation_size(s.indexrelid))) AS all_indexes,
+                         pg_size_pretty(pg_relation_size('search_index'))    AS heap_only
+                  FROM pg_stat_user_indexes s WHERE s.relname = 'search_index';" \
+              > "$RESULTS_DIR/index-usage.txt" 2>&1 || \
+              echo "::warning::index usage capture failed"
+          fi
+
       # ── Artifacts ────────────────────────────────────────────────────────
       # Deliberately placed immediately after the suites and BEFORE the
       # post-processing steps below. When run 30550776427's runner was killed
