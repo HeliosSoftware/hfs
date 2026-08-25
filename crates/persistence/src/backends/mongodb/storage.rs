@@ -684,12 +684,13 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, &id, &resource, &mut session)
             .await?;
 
-        // An active SearchParameter write changes a tenant's overlay: refresh
-        // the stored-param cache (which the per-tenant loader reads) and drop
-        // the cached registries. Draft copies (the seeded spec set) never
-        // overlay, so skip them — avoids an O(n²) reload storm during seeding.
+        // An overlay-affecting SearchParameter write: refresh the stored-param
+        // cache (which the per-tenant loader reads) and drop the cached
+        // registries. Seeded spec copies never affect the overlay (see
+        // `create_affects_overlay`), which keeps bulk seeding from triggering
+        // an O(n²) reload storm.
         if resource_type == "SearchParameter"
-            && crate::search::search_parameter_create_affects_overlay(&resource)
+            && self.tenant_registries().create_affects_overlay(&resource)
         {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
