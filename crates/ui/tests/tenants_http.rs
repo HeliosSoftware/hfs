@@ -48,6 +48,7 @@ fn app(store: &Arc<dyn ResourceStorage>) -> Router {
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     )
 }
 
@@ -218,6 +219,7 @@ async fn page_reports_registry_unavailable_without_a_store() {
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     )
     .oneshot(Request::get("/ui/tenants").body(Body::empty()).unwrap())
     .await
@@ -300,6 +302,7 @@ async fn version_choice_persists_to_user_settings_and_redirects_back() {
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     // Selecting a version persists it and bounces back to the referring page.
@@ -368,6 +371,7 @@ async fn version_choice_changes_the_resource_type_lists() {
             )),
             FhirVersion::R4,
             None,
+            "http://localhost:8080".to_string(),
         )
     };
 
@@ -429,6 +433,7 @@ async fn tenant_choice_persists_and_the_selector_follows_it() {
             Arc::new(helios_ui::StaticConformanceSource::empty()),
             FhirVersion::R4,
             None,
+            "http://localhost:8080".to_string(),
         )
     };
 

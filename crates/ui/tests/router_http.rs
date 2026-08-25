@@ -41,6 +41,7 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
         )),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     )
 }
 
@@ -221,6 +222,7 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     )
     .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
     .await
@@ -280,6 +282,7 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         std::sync::Arc::new(source),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     let response = app
@@ -408,6 +411,7 @@ async fn compartments_degrade_to_a_warning_when_the_fetch_is_empty() {
         helios_fhir::FhirVersion::R4,
         // No terminology server: this test is about the conformance fetch.
         None,
+        "http://localhost:8080".to_string(),
     )
     .oneshot(
         Request::get("/ui/compartments")
@@ -945,6 +949,7 @@ fn app_with_terminology(terminology: Option<String>) -> Router {
         )),
         helios_fhir::FhirVersion::R4,
         terminology,
+        "http://localhost:8080".to_string(),
     )
 }
 

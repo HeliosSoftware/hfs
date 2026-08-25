@@ -557,7 +557,6 @@ bulk-import-new = Neue Submission
 bulk-import-create-title = Bulk Submission anlegen
 bulk-import-field-name = Name der Submission
 bulk-import-field-recipient = Basis-URL des Empfängers
-bulk-import-field-recipient-hint = Die Basis-URL des Servers, an den die Daten übermittelt werden.
 bulk-import-auth = Authentifizierung
 bulk-import-auth-hint = Wie gegenüber dem Empfängerserver authentifiziert wird.
 bulk-import-auth-none = Keine
