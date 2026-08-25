@@ -84,12 +84,13 @@ jobs:
             --label github.run_id=${{ github.run_id }} \
             --label github.workflow=ui-tests \
             --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
-          docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui
+          docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui/assets
           docker cp target/debug/hfs "$RUN_CONTAINER":/work/target/debug/hfs
           docker cp data "$RUN_CONTAINER":/work/data
+          docker cp crates/ui/assets/. "$RUN_CONTAINER":/work/crates/ui/assets
           docker cp crates/ui/e2e "$RUN_CONTAINER":/work/crates/ui/e2e
           docker exec -e CI=1 -w /work/crates/ui/e2e "$RUN_CONTAINER" \
-            bash -c "npm ci && npx playwright test"
+            bash -c "npm ci && npm run test:unit && npx playwright test"
 
       - name: Copy Playwright report out
         if: always()
@@ -138,13 +139,13 @@ jobs:
 
           reap "$RUN_CONTAINER"
 
-  # T3 (#600): one extra leg, not a version matrix — builds hfs with every
-  # FHIR version feature and runs only the dedicated multi-version spec
-  # against it, so the sidebar's resource-type selector is proven against a
-  # real multi-version binary and not just the single-version default the
-  # `ui-tests` job above (and the rest of this suite) builds. Split into a
-  # build + test job, artifact-handed-off, the same shape
-  # ui-tests-matrix.yml uses for its backend matrix.
+  # Build once with every FHIR version, then boot that binary once per default
+  # version for the complete escaped-value contract. This is intentionally the
+  # version axis of an orthogonal matrix: ui-tests-matrix.yml covers all seven
+  # search-capable storage modes on R4, because the codec and REST alternative
+  # boundary run before backend dispatch. The R6 leg also retains #600's
+  # dedicated selector coverage. Split into build + test jobs,
+  # artifact-handed-off, like ui-tests-matrix.yml's backend matrix.
   ui-multiversion-build:
     name: Build HFS (multi-version + ui)
     runs-on: [self-hosted, Linux]
@@ -177,14 +178,18 @@ jobs:
           retention-days: 1
 
   ui-multiversion-tests:
-    name: helios-ui browser suite (multi-version selector)
+    name: escaped-comma smoke (${{ matrix.fhir_version }})
     needs: ui-multiversion-build
     runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        fhir_version: [R4, R4B, R5, R6]
     env:
       # Job-scoped override of the workflow-level RUN_CONTAINER: this job runs
       # concurrently with `ui-tests` above and must not fight it for the same
       # container name on the shared remote Docker host.
-      RUN_CONTAINER: ui-e2e-multiversion-${{ github.run_id }}-${{ github.run_attempt }}
+      RUN_CONTAINER: ui-e2e-${{ matrix.fhir_version }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -200,7 +205,7 @@ jobs:
       - name: Make HFS binary executable
         run: chmod +x target/debug/hfs
 
-      - name: Run browser suite (Playwright) — multi-version spec only
+      - name: Run escaped-comma smoke for the selected FHIR version
         run: |
           set -euo pipefail
           docker rm -fv "$RUN_CONTAINER" 2>/dev/null || true
@@ -209,29 +214,63 @@ jobs:
             --label github.run_id=${{ github.run_id }} \
             --label github.workflow=ui-tests \
             --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
-          docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui
+          docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui/assets
           docker cp target/debug/hfs "$RUN_CONTAINER":/work/target/debug/hfs
           docker cp data "$RUN_CONTAINER":/work/data
+          docker cp crates/ui/assets/. "$RUN_CONTAINER":/work/crates/ui/assets
           docker cp crates/ui/e2e "$RUN_CONTAINER":/work/crates/ui/e2e
-          # Pinned away from the build's natural first-enabled version (R4) so
-          # this leg also catches an "always the seed" regression (#600).
-          # boot.mjs forwards its whole environment to the spawned hfs
-          # process unchanged, so no boot.mjs change was needed for this.
-          docker exec -e CI=1 -e HFS_DEFAULT_FHIR_VERSION=R6 -w /work/crates/ui/e2e "$RUN_CONTAINER" \
-            bash -c "npm ci && npx playwright test tests/dashboard-multiversion.spec.ts"
+          # Search uses the server default rather than the sidebar selection,
+          # so each matrix leg must boot HFS with the version under test.
+          # Keep the pre-existing selector regression on the R6 leg too.
+          docker exec -e CI=1 \
+            -e HFS_DEFAULT_FHIR_VERSION=${{ matrix.fhir_version }} \
+            -w /work/crates/ui/e2e "$RUN_CONTAINER" bash -c '
+              set -euo pipefail
+              npm ci
+              npm run test:unit
+              HFS_E2E_PORT=8080 node boot.mjs >/tmp/hfs-escaped-comma.log 2>&1 &
+              server_pid=$!
+              cleanup() { kill -TERM "$server_pid" 2>/dev/null || true; }
+              trap cleanup EXIT
+              ready=0
+              for _ in $(seq 1 180); do
+                if ! kill -0 "$server_pid" 2>/dev/null; then break; fi
+                if node -e "fetch(\"http://127.0.0.1:8080/ui\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+                  ready=1
+                  break
+                fi
+                sleep 1
+              done
+              if [ "$ready" -ne 1 ]; then
+                cat /tmp/hfs-escaped-comma.log
+                exit 1
+              fi
+              HFS_E2E_BASE_URL=http://127.0.0.1:8080 \
+                npx playwright test tests/queries.spec.ts \
+                  --grep "escaped commas|literal commas|malformed FHIR|empty alternatives|drilling preserves"
+              if [ "$HFS_DEFAULT_FHIR_VERSION" = R6 ]; then
+                HFS_E2E_BASE_URL=http://127.0.0.1:8080 \
+                  npx playwright test tests/dashboard-multiversion.spec.ts
+              fi
+            '
 
       - name: Copy Playwright report out
         if: always()
         run: |
+          mkdir -p "./crates/ui/e2e/multiversion-results-${{ matrix.fhir_version }}"
           docker cp "$RUN_CONTAINER":/work/crates/ui/e2e/playwright-report \
-            ./crates/ui/e2e/playwright-report-multiversion 2>/dev/null || true
+            "./crates/ui/e2e/multiversion-results-${{ matrix.fhir_version }}/playwright-report" \
+            2>/dev/null || true
+          docker cp "$RUN_CONTAINER":/tmp/hfs-escaped-comma.log \
+            "./crates/ui/e2e/multiversion-results-${{ matrix.fhir_version }}/hfs.log" \
+            2>/dev/null || true
 
       - name: Upload Playwright report
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-report-multiversion
-          path: crates/ui/e2e/playwright-report-multiversion/
+          name: playwright-report-${{ matrix.fhir_version }}
+          path: crates/ui/e2e/multiversion-results-${{ matrix.fhir_version }}/
           retention-days: 7
 
       - name: Remove Playwright container

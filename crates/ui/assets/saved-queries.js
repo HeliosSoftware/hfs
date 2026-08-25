@@ -29,6 +29,9 @@
 (function () {
   "use strict";
 
+  var fhirSearchValue = window.HfsFhirSearchValue;
+  if (!fhirSearchValue) throw new Error("FHIR search-value codec is missing");
+
   var SETTINGS = "/_user/settings";
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
@@ -344,12 +347,19 @@
   /* Modifier select + value input + remove button, shared by every row kind. */
   /* One value input inside a row's OR stack (#414). The per-value remove
    * only renders when the stack has siblings. */
-  function orValueInput(host, value) {
+  function orValueInput(host, value, wire, escapeError) {
     var wrap = document.createElement("span");
     wrap.className = "builder-row__orvalue";
     var input = document.createElement("input");
     input.className = "builder-row__value";
     input.value = value;
+    if (wire !== undefined) {
+      input.dataset.fhirWire = wire;
+      input.dataset.fhirDirty = "false";
+    } else {
+      input.dataset.fhirDirty = "true";
+    }
+    if (escapeError) input.dataset.fhirEscapeError = escapeError;
     input.placeholder = sections.dataset.msgValue;
     input.spellcheck = false;
     wrap.appendChild(input);
@@ -476,8 +486,8 @@
   function appendValues(row, rawValue) {
     var host = document.createElement("span");
     host.className = "builder-row__values";
-    rawValue.split(",").forEach(function (v) {
-      orValueInput(host, v);
+    fhirSearchValue.parseAlternatives(rawValue).alternatives.forEach(function (alternative) {
+      orValueInput(host, alternative.value, alternative.wire, alternative.error);
     });
     row.appendChild(host);
 
@@ -998,6 +1008,27 @@
    * yank focus and drop in-flight edits — so re-parsing skips its own echo. */
   var lastSerialized = null;
 
+  function builderHasEscapeError() {
+    return !!(
+      sections && sections.querySelector(".builder-row__value[data-fhir-escape-error]")
+    );
+  }
+
+  function showEscapeError() {
+    showError(null, messages.msgInvalidFhirEscape);
+  }
+
+  function serializedConditionAlternative(input) {
+    var visual = input.value.trim();
+    var isClean = input.dataset.fhirDirty !== "true";
+    if (!visual) {
+      return isClean && input.dataset.fhirWire !== undefined ? input.dataset.fhirWire : null;
+    }
+    return isClean && input.dataset.fhirWire !== undefined
+      ? input.dataset.fhirWire
+      : fhirSearchValue.serializeAlternative(visual);
+  }
+
   /* URL → rows. */
   function renderBuilder() {
     if (!sections || !urlInput) return;
@@ -1023,11 +1054,18 @@
     });
     refreshChainAffordances();
     updatePlain();
+    if (builderHasEscapeError()) showEscapeError();
+    else clearError();
   }
 
   /* Rows → URL. */
   function updateUrl() {
     if (!sections || !urlInput) return;
+    if (builderHasEscapeError()) {
+      showEscapeError();
+      return;
+    }
+    clearError();
     var type = sections.dataset.type || "";
     var parts = [];
     sections.querySelectorAll(".builder-row").forEach(function (row) {
@@ -1069,11 +1107,14 @@
       var mod = modifierEl ? modifierEl.value : "";
       var isPrefix = PREFIXES.indexOf(mod) >= 0;
       var values = [];
+      var isCondition = !!row.querySelector(".builder-row__values");
       row.querySelectorAll(".builder-row__value").forEach(function (vi) {
-        var v = vi.value.trim();
-        if (!v) return;
-        if (isPrefix && !PREFIX_RE.test(v)) v = mod + v;
-        values.push(v);
+        var wire = isCondition
+          ? serializedConditionAlternative(vi)
+          : vi.value.trim() || null;
+        if (wire === null) return;
+        if (isPrefix && !PREFIX_RE.test(wire)) wire = mod + wire;
+        values.push(wire);
       });
       var value = values.join(",");
       if (!isPrefix && mod) key += ":" + mod;
@@ -1089,6 +1130,10 @@
     urlInput.addEventListener("change", renderBuilder);
     sections.addEventListener("input", function (event) {
       if (event.target.closest(".builder-row")) {
+        if (event.target.classList.contains("builder-row__value")) {
+          event.target.dataset.fhirDirty = "true";
+          delete event.target.dataset.fhirEscapeError;
+        }
         updateUrl();
         if (event.target.classList.contains("builder-row__key")) {
           refreshChainAffordances();
@@ -1153,15 +1198,27 @@
       } else if (drillFrom) {
         /* Convert the condition row into a forward-chain row for its
          * reference param, keeping the value the user already typed. */
+        if (builderHasEscapeError()) {
+          showEscapeError();
+          return;
+        }
         var from = drillFrom.closest(".builder-row");
         var refParam = from.querySelector(".builder-row__key").value.trim();
-        var kept = from.querySelector(".builder-row__value").value.trim();
+        var keptMod = from.querySelector(".builder-row__modifier").value;
+        var keptIsPrefix = PREFIXES.indexOf(keptMod) >= 0;
+        var keptValues = [];
+        from.querySelectorAll(".builder-row__value").forEach(function (input) {
+          var wire = serializedConditionAlternative(input);
+          if (wire === null) return;
+          if (keptIsPrefix && !PREFIX_RE.test(wire)) wire = keptMod + wire;
+          keptValues.push(wire);
+        });
         var chain = chainRow({
           kind: "chain",
           hops: [{ ref: refParam, type: "" }],
           key: "",
-          modifier: "",
-          value: kept,
+          modifier: keptIsPrefix ? "" : keptMod,
+          value: keptValues.join(","),
         });
         from.replaceWith(chain);
         chain.querySelector(".builder-row__cparam").focus();
@@ -1288,16 +1345,31 @@
     if (mod === "missing" && (raw === "true" || raw === "false")) {
       return { verb: PLAIN.missing[raw], value: "", showValue: false };
     }
-    var alternatives = raw.split(",").filter(Boolean).map(function (v) {
-      var p = PREFIX_RE.exec(v);
-      return p ? v.slice(2) : v;
-    });
-    var prefix = PREFIX_RE.exec(raw);
-    var verbKey = mod || (prefix ? prefix[1] : "");
-    var verb = PLAIN.verbs[verbKey] != null ? PLAIN.verbs[verbKey] : PLAIN.verbs[""];
+    var alternatives = fhirSearchValue
+      .parseAlternatives(raw)
+      .alternatives.map(function (alternative) {
+        var prefix = mod ? null : PREFIX_RE.exec(alternative.value);
+        var verbKey = mod || (prefix ? prefix[1] : "");
+        return {
+          value: prefix ? alternative.value.slice(2) : alternative.value,
+          verb:
+            PLAIN.verbs[verbKey] != null ? PLAIN.verbs[verbKey] : PLAIN.verbs[""],
+        };
+      })
+      .filter(function (alternative) {
+        return !!alternative.value;
+      });
+    var verb = alternatives.length
+      ? alternatives[0].verb
+      : PLAIN.verbs[mod] != null
+        ? PLAIN.verbs[mod]
+        : PLAIN.verbs[""];
     var joined = alternatives
-      .map(function (v) {
-        return "\u201C" + v + "\u201D";
+      .map(function (alternative, index) {
+        var quoted = "\u201C" + alternative.value + "\u201D";
+        return index > 0 && alternative.verb !== verb
+          ? alternative.verb + " " + quoted
+          : quoted;
       })
       .join(" " + PLAIN.or + " ");
     return { verb: verb, value: joined, showValue: joined !== "" };
@@ -1764,7 +1836,7 @@
   }
 
   function render(doc) {
-    clearError();
+    if (!builderHasEscapeError()) clearError();
     renderRecent(doc);
     /* The Search page renders the builder and the recent list but no saved
      * list; there is nothing further to draw there. */

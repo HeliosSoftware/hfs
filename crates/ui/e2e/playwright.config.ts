@@ -8,6 +8,14 @@ const PORT = Number(process.env.HFS_E2E_PORT || 8080);
 // external server and skip booting our own (see webServer, below).
 const externalBase = process.env.HFS_E2E_BASE_URL;
 const baseURL = externalBase || `http://127.0.0.1:${PORT}`;
+// Chromium withholds secure-context APIs such as navigator.clipboard from the
+// backend matrix's plain-HTTP Docker-host IP. The suite grants clipboard
+// permissions in the relevant test; this flag makes that grant effective for
+// the one external test origin without weakening HFS or skipping coverage.
+const insecureExternalOrigin =
+  externalBase && new URL(externalBase).protocol === "http:"
+    ? new URL(externalBase).origin
+    : undefined;
 
 export default defineConfig({
   testDir: "./tests",
@@ -22,6 +30,16 @@ export default defineConfig({
   use: {
     baseURL,
     trace: "on-first-retry",
+    ...(insecureExternalOrigin
+      ? {
+          // The legacy headless shell ignores Chromium's secure-origin
+          // allowlist; the full Chromium channel honors it in headless mode.
+          channel: "chromium",
+          launchOptions: {
+            args: [`--unsafely-treat-insecure-origin-as-secure=${insecureExternalOrigin}`],
+          },
+        }
+      : {}),
   },
   projects: [
     {

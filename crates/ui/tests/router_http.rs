@@ -173,7 +173,11 @@ async fn status_is_a_fragment_for_htmx_and_varies_on_the_header() {
 
 #[tokio::test]
 async fn embedded_assets_are_served() {
-    for asset in ["/ui/assets/htmx.min.js", "/ui/assets/app.css"] {
+    for asset in [
+        "/ui/assets/htmx.min.js",
+        "/ui/assets/app.css",
+        "/ui/assets/fhir-search-value.js",
+    ] {
         let response = app()
             .oneshot(Request::get(asset).body(Body::empty()).unwrap())
             .await
