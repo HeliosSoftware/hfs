@@ -48,6 +48,7 @@ mod history;
 mod i18n;
 mod json_view;
 mod search_params;
+mod sql_views;
 mod subscriptions;
 mod tenants;
 
@@ -850,9 +851,12 @@ pub fn mount_with_conformance_source(
         .route("/ui/capability-statement", get(capability_page))
         // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
         .route("/ui/batch", get(batch_page))
-        // SQL on FHIR section (#649): stub pages until each surface lands,
-        // starting with the ViewDefinition Editor.
-        .route("/ui/sql/view-definitions", get(sql_view_definitions_page))
+        // SQL on FHIR section (#649). View Definitions is the live workspace;
+        // the rest are stub pages until each surface lands.
+        .route(
+            "/ui/sql/view-definitions",
+            get(sql_view_definitions_page).post(sql_view_definitions_save),
+        )
         .route("/ui/sql/queries", get(sql_queries_page))
         .route("/ui/sql/views", get(sql_views_page))
         .route("/ui/sql/export", get(sql_export_page))
@@ -1555,25 +1559,247 @@ fn render_sql_stub(
     })
 }
 
+/// The View Definitions workspace (#649, Figma `420-2`): a filter rail of the
+/// tenant's stored ViewDefinitions, the selected one as editable JSON, and a
+/// `$sql-run` preview of its output. Save and Duplicate are plain form posts
+/// (they work without JavaScript); Delete rides `conformance-crud.js` like
+/// the other conformance viewers.
+#[derive(Template)]
+#[template(path = "pages/sql-view-definitions.html")]
+struct SqlViewDefinitionsPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    rail: Vec<sql_views::VdSummary>,
+    /// The rail's server-side name filter, echoed back into the search box.
+    filter: String,
+    /// The list fetch failed — the page says so instead of showing an empty rail.
+    degraded: Option<String>,
+    /// `?vd=` (or the first entry): id, name, and pretty JSON. `None` only
+    /// when the store holds no views and none is being created.
+    selected: Option<SelectedVd>,
+    /// `?vd=new`: the JSON below is the starter document, not a stored view.
+    is_new: bool,
+    results: Option<sql_views::RunTable>,
+    run_error: Option<String>,
+    save_error: Option<String>,
+    saved: bool,
+}
+
+struct SelectedVd {
+    id: String,
+    name: String,
+    json: String,
+}
+
+#[derive(Deserialize, Default)]
+struct SqlVdQuery {
+    vd: Option<String>,
+    filter: Option<String>,
+    run: Option<String>,
+    saved: Option<String>,
+}
+
 async fn sql_view_definitions_page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<SqlVdQuery>,
 ) -> Response {
-    render_sql_stub(
-        &state,
-        locale,
-        rv,
-        &rt,
+    let filter = query.filter.unwrap_or_default();
+    let (mut rail, degraded) = match state
+        .conformance
+        .fetch("ViewDefinition", rv.0, &rt.id)
+        .await
+    {
+        Ok(resources) => (resources, None),
+        Err(error) => {
+            tracing::warn!("ViewDefinition self-fetch failed: {error}");
+            (Vec::new(), Some(error))
+        }
+    };
+    let summaries = {
+        let mut s = sql_views::summarize(&rail);
+        if !filter.is_empty() {
+            let needle = filter.to_lowercase();
+            s.retain(|e| {
+                e.name.to_lowercase().contains(&needle)
+                    || e.resource.to_lowercase().contains(&needle)
+            });
+        }
+        s
+    };
+
+    let is_new = query.vd.as_deref() == Some("new");
+    let (selected, selected_value) = if is_new {
         (
-            "sql-view-definitions",
-            "sql-vd-title",
-            "sql-vd-lede",
-            "sql-vd-body",
-            "POST /$sql-run",
-        ),
-    )
+            Some(SelectedVd {
+                id: String::new(),
+                name: String::new(),
+                json: sql_views::starter_view_definition(),
+            }),
+            None,
+        )
+    } else {
+        // ?vd=<id>, defaulting to the first rail entry. The full resource is
+        // taken from the fetch — no second round trip.
+        let wanted = query
+            .vd
+            .clone()
+            .or_else(|| summaries.first().map(|e| e.id.clone()));
+        let found = wanted.and_then(|id| {
+            rail.iter()
+                .position(|vd| vd.get("id").and_then(serde_json::Value::as_str) == Some(&id))
+        });
+        match found.map(|i| rail.swap_remove(i)) {
+            Some(vd) => {
+                let id = vd
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = vd
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&id)
+                    .to_string();
+                let json = serde_json::to_string_pretty(&vd).unwrap_or_default();
+                (Some(SelectedVd { id, name, json }), Some(vd))
+            }
+            None => (None, None),
+        }
+    };
+
+    // `?run=1` previews the selected view through $sql-run — a plain link, so
+    // it works without JavaScript. Capped: this is a preview, not an export.
+    let (results, run_error) = match (&selected_value, query.run.as_deref() == Some("1")) {
+        (Some(vd), true) => match state.conformance.sql_run(vd, 50, rv.0, &rt.id).await {
+            Ok(rows) => (Some(sql_views::build_table(vd, &rows)), None),
+            Err(error) => (None, Some(error)),
+        },
+        _ => (None, None),
+    };
+
+    render(SqlViewDefinitionsPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "sql-view-definitions",
+        rail: summaries,
+        filter,
+        degraded,
+        selected,
+        is_new,
+        results,
+        run_error,
+        save_error: None,
+        saved: query.saved.as_deref() == Some("1"),
+    })
+}
+
+#[derive(Deserialize)]
+struct SqlVdSaveForm {
+    /// Empty for a create; the stored id for an update.
+    #[serde(default)]
+    id: String,
+    json: String,
+    /// `save` or `duplicate` — the two submit buttons of the one form.
+    #[serde(default)]
+    action: String,
+}
+
+/// Saves the editor's JSON through the server's own FHIR API and bounces back
+/// to the page with the stored view selected. A parse or server error
+/// re-renders the page with the submitted text preserved, so nothing typed is
+/// lost. Plain form semantics throughout — no JavaScript required.
+async fn sql_view_definitions_save(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlVdSaveForm>,
+) -> Response {
+    let error_page =
+        |save_error: String, json: String, is_new: bool, id: String| SqlViewDefinitionsPage {
+            status: current_status(&state, rv.0, &rt),
+            i18n: I18n::new(locale),
+            active_page: "sql-view-definitions",
+            rail: Vec::new(),
+            filter: String::new(),
+            degraded: None,
+            selected: Some(SelectedVd {
+                name: if is_new { String::new() } else { id.clone() },
+                id,
+                json,
+            }),
+            is_new,
+            results: None,
+            run_error: None,
+            save_error: Some(save_error),
+            saved: false,
+        };
+
+    let duplicate = form.action == "duplicate";
+    let mut resource: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(e) => {
+            return render(error_page(
+                format!("invalid JSON: {e}"),
+                form.json,
+                form.id.is_empty(),
+                form.id,
+            ));
+        }
+    };
+    if resource
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        != Some("ViewDefinition")
+    {
+        return render(error_page(
+            "the document must have resourceType \"ViewDefinition\"".to_string(),
+            form.json,
+            form.id.is_empty(),
+            form.id,
+        ));
+    }
+
+    let id = if duplicate || form.id.is_empty() {
+        // A create must not carry a stored id; a duplicate also gets a fresh
+        // name so the two are tellable apart in the rail.
+        if let Some(map) = resource.as_object_mut() {
+            map.remove("id");
+            if duplicate && let Some(name) = map.get("name").and_then(serde_json::Value::as_str) {
+                let copy = format!("{name}_copy");
+                map.insert("name".to_string(), serde_json::Value::String(copy));
+            }
+        }
+        None
+    } else {
+        // The path id is authoritative for an update; the body must agree.
+        if let Some(map) = resource.as_object_mut() {
+            map.insert("id".to_string(), serde_json::Value::String(form.id.clone()));
+        }
+        Some(form.id.clone())
+    };
+
+    match state
+        .conformance
+        .save_resource("ViewDefinition", id.as_deref(), resource, rv.0, &rt.id)
+        .await
+    {
+        Ok(stored) => {
+            let stored_id = stored
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            axum::response::Redirect::to(&format!(
+                "/ui/sql/view-definitions?vd={stored_id}&saved=1"
+            ))
+            .into_response()
+        }
+        Err(error) => render(error_page(error, form.json, id.is_none(), form.id)),
+    }
 }
 
 async fn sql_queries_page(

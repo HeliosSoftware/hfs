@@ -749,7 +749,6 @@ sql-stub-api = Serving API
 
 sql-vd-title = View Definitions
 sql-vd-lede = Author and manage the ViewDefinitions that SQL on FHIR runs flatten resources with.
-sql-vd-body = A ViewDefinition list and editor. Create, edit, and validate views, then run them from SQL Queries.
 
 sql-queries-title = SQL Queries
 sql-queries-lede = Run SQL on FHIR queries against this server.
@@ -766,3 +765,25 @@ sql-export-body = Start an export, follow its progress, and cancel jobs that are
 sql-files-title = Files
 sql-files-lede = Manifests and output files produced by SQL exports.
 sql-files-body = Browse each job's manifest and download its output files.
+
+## View Definitions workspace (#649)
+
+vd-new = Create New
+vd-new-title = New View Definition
+vd-rail-label = View definitions
+vd-rail-heading = View Definitions
+vd-filter = Filter views
+vd-none = No view definitions yet.
+vd-empty-lede = Create your first ViewDefinition with Create New.
+vd-degraded = The view definition list could not be loaded.
+vd-saved = Saved.
+vd-run = Run
+vd-run-failed = Running the view failed.
+vd-save = Save
+vd-duplicate = Duplicate
+vd-delete = Delete
+vd-delete-confirm = Delete view definition "{ $name }"? This cannot be undone.
+vd-delete-failed = Deleting the view definition failed.
+vd-json-heading = Definition (JSON)
+vd-results-heading = Results
+vd-results-empty = The view produced no rows.
