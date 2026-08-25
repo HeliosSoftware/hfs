@@ -63,12 +63,105 @@ test("selecting a type updates the Create label and the URL", async ({ resources
   await expect(resources.builder.url).toHaveValue("GET /Observation");
 });
 
+test("switching away and back cannot reuse a stale builder serialization", async ({
+  resources,
+  page,
+}) => {
+  await resources.goto("Patient");
+  const builderMode = page.locator("[data-mode-btn='builder']");
+  if (await builderMode.count()) await builderMode.click();
+  await resources.builder.addButton("condition").click();
+  const firstRow = resources.builder.conditionRows.first();
+  await firstRow.locator(".builder-row__key").fill("name");
+  await firstRow.locator(".builder-row__value").fill("BeforeSwitch");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?name=BeforeSwitch");
+
+  await firstRow.locator("[data-remove-row]").click();
+  await expect(resources.builder.conditionRows).toHaveCount(0);
+  await expect(resources.builder.url).toHaveValue("GET /Patient");
+
+  await resources.pickType("Observation");
+  await resources.pickType("Patient");
+  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.builder.sections).toHaveAttribute("data-type", "Patient");
+  await expect(page.locator("#query-plain-text")).toContainText("Patient");
+
+  await resources.builder.addButton("condition").click();
+  const patientRow = resources.builder.conditionRows.first();
+  await patientRow.locator(".builder-row__key").fill("name");
+  await patientRow.locator(".builder-row__value").fill("AfterSwitch");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?name=AfterSwitch");
+  await expect(page.locator("#query-plain-text")).toContainText("AfterSwitch");
+});
+
 test("a ?url= deep link still wins over the default Patient context", async ({ resources, page }) => {
   await page.goto("/ui/resources?url=" + encodeURIComponent("/Observation?status=final"), {
     waitUntil: "networkidle",
   });
   await expect(resources.builder.url).toHaveValue("GET /Observation?status=final");
+  await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
+  await expect(resources.createLabel).toHaveText("Create new Observation");
   await resources.results.waitShown();
+});
+
+test("a conflicting Resources bookmark uses the query URL type everywhere after reload", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "NavAlpha" }],
+  });
+  await waitSearchable(request, "Patient", patientId);
+
+  const bookmark =
+    "/ui/resources?type=Observation&url=" + encodeURIComponent("/Patient?name=NavAlpha");
+
+  const expectPatientContext = async () => {
+    await expect(resources.railItem("Patient")).toHaveAttribute("aria-current", "true");
+    await expect(resources.railItem("Observation")).not.toHaveAttribute("aria-current", "true");
+    await expect(page.locator("#resources")).toHaveAttribute("data-selected-type", "Patient");
+    await expect(resources.createLabel).toHaveText("Create new Patient");
+    await expect(resources.builder.url).toHaveValue("GET /Patient?name=NavAlpha");
+    await expect(page.locator("#query-plain")).toBeVisible();
+    await expect(page.locator("#query-plain-text")).toContainText("Patient");
+    await expect(page.locator("#query-plain-text")).toContainText("NavAlpha");
+    await resources.results.waitShown();
+    await expect(
+      page.locator(`#query-results-body a.url[href='/Patient/${patientId}']`),
+    ).toBeVisible();
+    await expect(resources.results.openTab).toHaveAttribute("href", "/Patient?name=NavAlpha");
+  };
+
+  const expectCreateDraft = async (type: string) => {
+    await resources.openCreate();
+    await expect(resources.modal.subject).toContainText(type);
+    expect((await resources.modal.editor.currentDoc()).resourceType).toBe(type);
+    await resources.modal.close();
+  };
+
+  await page.goto(bookmark, { waitUntil: "networkidle" });
+  await expectPatientContext();
+  await expectCreateDraft("Patient");
+
+  await page.reload({ waitUntil: "networkidle" });
+  await expectPatientContext();
+  await expectCreateDraft("Patient");
+
+  await resources.pickType("Observation");
+  await expect(page).toHaveURL(/\/ui\/resources\?type=Observation$/);
+  expect(new URL(page.url()).searchParams.has("url")).toBe(false);
+
+  await page.reload({ waitUntil: "networkidle" });
+  await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
+  await expect(resources.railItem("Patient")).not.toHaveAttribute("aria-current", "true");
+  await expect(page.locator("#resources")).toHaveAttribute("data-selected-type", "Observation");
+  await expect(resources.createLabel).toHaveText("Create new Observation");
+  await expect(resources.builder.url).toHaveValue("GET /Observation");
+  await expect(page.locator("#query-plain-text")).toContainText("Observation");
+  await resources.results.waitShown();
+  await expect(resources.results.openTab).toHaveAttribute("href", "/Observation");
+  await expectCreateDraft("Observation");
 });
 
 // Long type names (#605): the button truncates instead of widening the page
