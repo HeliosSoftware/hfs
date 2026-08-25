@@ -74,11 +74,6 @@
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-resources") }}</span>
       </a>
-      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-compartments") }}">
-        <span class="icon">{% include "icons/compartments.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-compartments") }}</span>
-      </a>
-
       <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>
       <a class="nav-item" href="/ui/batch"{% if active_page == "batch" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-batch-transaction") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>
@@ -110,12 +105,12 @@
         <span class="icon">{% include "icons/search.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-search-parameters") }}</span>
       </a>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-admin-ops") }}">
-        <span class="icon">{% include "icons/sliders.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-admin-ops") }}</span>
-      </span>
+      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-compartments") }}">
+        <span class="icon">{% include "icons/compartments.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-compartments") }}</span>
+      </a>
 
-      <div class="nav__section">{{ i18n.t("nav-section-conditional") }}</div>
+      <div class="nav__section">{{ i18n.t("nav-section-tools") }}</div>
       {% if let Some(url) = status.terminology_url() %}
       <a class="nav-item" href="{{ url }}" target="_blank" rel="noopener noreferrer" hx-boost="false"
          aria-label="{{ i18n.t("nav-terminology-new-window") }}" title="{{ i18n.t("nav-terminology-new-window") }}">

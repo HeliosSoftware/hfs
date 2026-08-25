@@ -85,7 +85,7 @@ error-generic = Algo salió mal. Vuelva a intentarlo.
 nav-section-work = Trabajo
 nav-section-batch-data = Lotes y datos
 nav-section-server = Servidor
-nav-section-conditional = Condicional
+nav-section-tools = Herramientas
 
 nav-home = Inicio
 nav-search = Buscar
@@ -98,7 +98,6 @@ nav-export = Exportar
 nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capacidad y conformidad
 nav-search-parameters = Parámetros de búsqueda
-nav-admin-ops = Administración / Operaciones
 nav-subscriptions = Suscripciones
 nav-tenants = Tenants
 
@@ -335,6 +334,7 @@ queries-recent = Recientes
 queries-recent-heading = Búsquedas recientes
 queries-recent-empty = Aún no hay búsquedas recientes — ejecuta una para registrarla aquí.
 queries-invalid-url = Escribe una búsqueda como GET /Patient?name=smith — el tipo de recurso sale de la ruta.
+queries-invalid-fhir-escape = Esta consulta contiene un escape FHIR no válido. Corrige el valor escapado antes de editarlo visualmente.
 
 queries-conditions = Condiciones
 queries-add-condition = Añadir condición

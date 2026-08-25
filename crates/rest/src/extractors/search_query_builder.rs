@@ -813,6 +813,18 @@ mod tests {
         // Escaped backslash is unescaped; other escapes (\|) are preserved.
         assert_eq!(split_unescaped_commas("a\\\\b"), vec!["a\\b"]);
         assert_eq!(split_unescaped_commas("sys\\|code"), vec!["sys\\|code"]);
+        assert_eq!(split_unescaped_commas("left\\$right"), vec!["left\\$right"]);
+        assert_eq!(split_unescaped_commas("a\\,b,c"), vec!["a,b", "c"]);
+        assert_eq!(split_unescaped_commas("a\\\\,b"), vec!["a\\", "b"]);
+        assert_eq!(
+            split_unescaped_commas("Muñoz\\,García"),
+            vec!["Muñoz,García"]
+        );
+        // Keep empty alternatives visible to validation instead of silently
+        // dropping them at this syntax boundary.
+        assert_eq!(split_unescaped_commas("a,,b"), vec!["a", "", "b"]);
+        assert_eq!(split_unescaped_commas(",a"), vec!["", "a"]);
+        assert_eq!(split_unescaped_commas("a,"), vec!["a", ""]);
         // Surrounding whitespace is trimmed.
         assert_eq!(split_unescaped_commas(" a , b "), vec!["a", "b"]);
     }

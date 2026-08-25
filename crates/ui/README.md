@@ -116,6 +116,26 @@ All of that lives in Rust behind `/ui/editor/render`, where it is tested.
 
 ---
 
+## Copy capitalization (#652)
+
+The English catalog (`locales/en/main.ftl`) follows one convention:
+
+- **Title Case** for page titles, section headings, card titles, nav entries,
+  tab labels, and action buttons/controls (`Server Dashboard`, `Add Tenant`,
+  `Save Changes`). Small words stay lowercase mid-title (`a, an, and, as, at,
+  by, for, from, in, of, on, or, the, to, with`); hyphenated compounds
+  capitalize both halves (`Per-Action Outcomes`).
+- **Sentence case** for anything that reads as a sentence or fragment:
+  ledes, help text, hints, subtitles, placeholders, confirmation prompts,
+  status values, and error messages — even when the key suffix says `-title`
+  or `-heading` (a full-sentence heading stays a sentence).
+- FHIR and spec spellings are verbatim, always: `FHIR`, `SQL on FHIR`,
+  `ViewDefinition`, `NDJSON`, env-var names.
+
+Spanish and German keep their own capitalization norms (both languages use
+sentence case where English uses Title Case); the convention above is for
+`en` only.
+
 ## Rules of the road — where things go
 
 - `crates/ui/src/` — Axum handlers/routers returning `impl IntoResponse`

@@ -2396,6 +2396,30 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_groups_compartments_under_server_and_labels_tools() {
+        for (locale, tools_label) in [("en", "Tools"), ("es", "Herramientas"), ("de", "Werkzeuge")]
+        {
+            let html = sample_index_page("1.2.3", 42, i18n(locale))
+                .render()
+                .expect("index renders");
+
+            assert!(html.contains(tools_label));
+        }
+
+        let html = sample_index_page("1.2.3", 42, i18n("en"))
+            .render()
+            .expect("index renders");
+        let server = html.find(">Server</div>").expect("Server section");
+        let compartments = html
+            .find(r#"href="/ui/compartments"#)
+            .expect("Compartments link");
+        let tools = html.find(">Tools</div>").expect("Tools section");
+
+        assert!(server < compartments && compartments < tools);
+        assert!(!html.contains("Admin / Ops"));
+    }
+
+    #[test]
     fn status_partial_is_fragment_not_full_page() {
         let html = StatusPartial {
             status: Status {
@@ -2480,7 +2504,12 @@ mod tests {
 
         assert!(html.contains(r#"id="saved-query-form""#));
         assert!(html.contains(r#"id="saved-queries""#));
+        assert!(html.contains("/ui/assets/fhir-search-value.js"));
         assert!(html.contains("/ui/assets/saved-queries.js"));
+        assert!(
+            html.find("/ui/assets/fhir-search-value.js") < html.find("/ui/assets/saved-queries.js"),
+            "the FHIR search-value codec must load before its consumer"
+        );
         // Search Builder: the featured GET URL input, both submit intents,
         // and the Recent dropdown shell the script hydrates.
         assert!(html.contains(r#"name="url""#));
@@ -2492,8 +2521,14 @@ mod tests {
         assert!(html.contains("data-addbox-close"));
         // Resource picker rail (#541): a real link per type, server-marked
         // current; no count without a dashboard provider.
-        assert!(html.contains(r#"data-type="Patient" href="/ui/queries?type=Patient""#));
-        assert!(html.contains(r#"data-type="Observation" href="/ui/queries?type=Observation""#));
+        assert!(html.contains(
+            r#"data-type="Patient" data-full-name="Patient"
+   href="/ui/queries?type=Patient""#
+        ));
+        assert!(html.contains(
+            r#"data-type="Observation" data-full-name="Observation"
+   href="/ui/queries?type=Observation""#
+        ));
         assert!(!html.contains(r#"class="count""#));
         // Saved Queries has no nav entry any more (#282 folded search / editor
         // / history / saved-queries into Resources); the route still renders.
@@ -2553,6 +2588,14 @@ mod tests {
         // parameter suggestions come from the server-rendered datalist.
         assert!(source.contains("application/fhir+json"));
         assert!(source.contains("/ui/queries/params"));
+    }
+
+    #[test]
+    fn fhir_search_value_codec_is_embedded() {
+        let file = Assets::get("fhir-search-value.js").expect("FHIR search-value codec embedded");
+        let source = std::str::from_utf8(&file.data).expect("FHIR search-value codec is UTF-8");
+        assert!(source.contains("parseAlternatives"));
+        assert!(source.contains("serializeAlternative"));
     }
 
     /// The builder's datalist fragment is fed by the SearchParameter

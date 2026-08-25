@@ -12,16 +12,16 @@ export class DashboardPage {
   get statCards(): Locator {
     return this.page.locator(".card.stat");
   }
-  /** The "Resource types" card; its `.stat__sub` names the effective FHIR
+  /** The "Resource Types" card; its `.stat__sub` names the effective FHIR
    * version ("used for R4", #553). */
   get resourceTypesCard(): Locator {
-    return this.page.locator(".card.stat", { hasText: "Resource types" });
+    return this.page.locator(".card.stat", { hasText: "Resource Types" });
   }
   get exportJobsCard(): Locator {
-    return this.page.locator("a.card.stat", { hasText: "Export jobs" });
+    return this.page.locator("a.card.stat", { hasText: "Export Jobs" });
   }
   get importJobsCard(): Locator {
-    return this.page.locator("a.card.stat", { hasText: "Import jobs" });
+    return this.page.locator("a.card.stat", { hasText: "Import Jobs" });
   }
   get chart(): Locator {
     return this.page.locator("svg.chart");
