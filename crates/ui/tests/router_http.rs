@@ -1246,3 +1246,55 @@ async fn editor_opens_the_root_picker_on_an_empty_document() {
     .await;
     assert!(!html.contains(r#"<details class="editor-add" open>"#));
 }
+
+/// #649: SQL on FHIR is a top-level nav section whose five children are real
+/// routes — the dead `nav-item--soon` placeholder is gone — and each stub
+/// page answers 200 and marks its own nav entry current.
+#[tokio::test]
+async fn sql_on_fhir_section_navigates_to_real_stub_pages() {
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">SQL on FHIR</div>"));
+    for href in [
+        "/ui/sql/view-definitions",
+        "/ui/sql/queries",
+        "/ui/sql/views",
+        "/ui/sql/export",
+        "/ui/sql/files",
+    ] {
+        assert!(
+            html.contains(&format!(r#"href="{href}""#)),
+            "{href} missing from the nav"
+        );
+    }
+    // No entry in the menu is a dead placeholder any more.
+    assert!(!html.contains("nav-item--soon"));
+
+    for href in [
+        "/ui/sql/view-definitions",
+        "/ui/sql/queries",
+        "/ui/sql/views",
+        "/ui/sql/export",
+        "/ui/sql/files",
+    ] {
+        let response = app()
+            .oneshot(Request::get(href).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{href}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(&format!(r#"href="{href}" aria-current="page""#)),
+            "{href} does not mark its nav entry current"
+        );
+        // The stub states which server operation already serves the data.
+        assert!(
+            html.contains("sql-run") || html.contains("/export/"),
+            "{href}"
+        );
+    }
+}

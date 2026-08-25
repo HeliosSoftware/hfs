@@ -84,6 +84,7 @@ error-generic = Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.
 
 nav-section-work = Arbeit
 nav-section-batch-data = Batch & Daten
+nav-section-sql-on-fhir = SQL on FHIR
 nav-section-server = Server
 nav-section-tools = Werkzeuge
 
@@ -95,7 +96,11 @@ nav-compartments = Compartments
 nav-batch-transaction = Batch / Transaktion
 nav-import = Importieren
 nav-export = Exportieren
-nav-sql-on-fhir = SQL-on-FHIR
+nav-sql-view-definitions = View-Definitionen
+nav-sql-queries = SQL-Abfragen
+nav-sql-views = SQL-Views
+nav-sql-export = SQL-Export
+nav-sql-files = Dateien
 nav-capability-conformance = Capability & Konformität
 nav-search-parameters = Suchparameter
 nav-subscriptions = Abonnements
@@ -732,3 +737,29 @@ cap-col-revincludes = Revincludes
 cap-resources-empty = Kein Ressourcentyp entspricht dem Filter.
 cap-raw-toggle = Rohes CapabilityStatement (JSON)
 cap-unavailable = Das CapabilityStatement konnte nicht vom Server geladen werden — der Selbstaufruf benötigt bei aktivierter Authentifizierung eventuell ein Ausgangs-Token.
+
+## Stubs der SQL-on-FHIR-Sektion (#649)
+
+sql-stub-heading = Demnächst
+sql-stub-planned = Geplant
+sql-stub-api = Bedienende API
+
+sql-vd-title = View-Definitionen
+sql-vd-lede = Erstelle und verwalte die ViewDefinitions, mit denen SQL on FHIR Ressourcen abflacht.
+sql-vd-body = Eine Liste und ein Editor für ViewDefinitions. Views erstellen, bearbeiten und validieren — ausgeführt werden sie unter SQL-Abfragen.
+
+sql-queries-title = SQL-Abfragen
+sql-queries-lede = Führe SQL-on-FHIR-Abfragen gegen diesen Server aus.
+sql-queries-body = Eine Abfrage verfassen, ausführen und die Ergebniszeilen direkt inspizieren.
+
+sql-views-title = SQL-Views
+sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
+sql-views-body = SQLView-Bibliotheken und die darin definierten Views, aufgelöst mit ihren Abhängigkeiten.
+
+sql-export-title = SQL-Export
+sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
+sql-export-body = Einen Export starten, den Fortschritt verfolgen und nicht mehr benötigte Aufträge abbrechen.
+
+sql-files-title = Dateien
+sql-files-lede = Manifeste und Ausgabedateien der SQL-Exporte.
+sql-files-body = Das Manifest jedes Auftrags einsehen und seine Ausgabedateien herunterladen.
