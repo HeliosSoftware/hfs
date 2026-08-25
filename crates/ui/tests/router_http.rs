@@ -744,7 +744,7 @@ async fn editor_validates_on_every_mutation_and_anchors_the_issue() {
 async fn editor_keeps_the_users_text_when_the_json_is_broken() {
     let html = edit("doc=%7B%22resourceType%22%3A&op=").await;
 
-    assert!(html.contains("editor__parse-error"));
+    assert!(html.contains("class=\"alert\""));
     // Their text is handed straight back, not discarded.
     assert!(html.contains("resourceType"));
 }

@@ -38,7 +38,7 @@
       <span>{{ i18n.t("batch-drop-browse") }}</span>
     </button>
     <input type="file" id="batch-file" accept=".json,application/json,application/fhir+json" hidden>
-    <p class="batch-error" id="batch-upload-error" role="alert" hidden></p>
+    <p class="alert" id="batch-upload-error" role="alert" hidden></p>
   </section>
 
   <!-- ============ Stage 2: preflight ============ -->
@@ -72,11 +72,13 @@
       <pre class="batch-json" id="batch-json" hidden></pre>
     </div>
 
+    <!-- The error renders inside the footer, next to the button that raised
+         it (#676) — not as detached text at the end of the page. -->
     <div class="batch-footer">
       <button type="button" class="btn" id="batch-cancel">{{ i18n.t("batch-cancel") }}</button>
+      <p class="alert alert--inline" id="batch-execute-error" role="alert" hidden></p>
       <button type="button" class="btn btn--primary" id="batch-execute">{{ i18n.t("batch-execute") }}</button>
     </div>
-    <p class="batch-error" id="batch-execute-error" role="alert" hidden></p>
   </section>
 
   <!-- ============ Stage 3: response ============ -->
