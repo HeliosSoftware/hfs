@@ -22,6 +22,11 @@ export const ROUTES = [
   "/ui/bulk-export",
   "/ui/bulk-export/active",
   "/ui/subscriptions",
+  "/ui/sql/view-definitions",
+  "/ui/sql/queries",
+  "/ui/sql/views",
+  "/ui/sql/export",
+  "/ui/sql/files",
 ];
 
 // The bulk-import detail page only exists with a submission behind it. Seed

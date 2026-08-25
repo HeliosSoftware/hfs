@@ -850,6 +850,13 @@ pub fn mount_with_conformance_source(
         .route("/ui/capability-statement", get(capability_page))
         // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
         .route("/ui/batch", get(batch_page))
+        // SQL on FHIR section (#649): stub pages until each surface lands,
+        // starting with the ViewDefinition Editor.
+        .route("/ui/sql/view-definitions", get(sql_view_definitions_page))
+        .route("/ui/sql/queries", get(sql_queries_page))
+        .route("/ui/sql/views", get(sql_views_page))
+        .route("/ui/sql/export", get(sql_export_page))
+        .route("/ui/sql/files", get(sql_files_page))
         .route("/ui/subscriptions", get(subscriptions::page))
         // Schema-driven resource editor (#264). One POST endpoint applies every
         // structural mutation and re-renders: the document rides with it.
@@ -1501,6 +1508,156 @@ async fn batch_page(
         i18n: I18n::new(locale),
         active_page: "batch",
     })
+}
+
+/// Shared stub behind the SQL on FHIR nav children (#649): every menu entry
+/// navigates somewhere real from day one; each page states what it will host
+/// and which already-routed server operation serves that data. The pages are
+/// replaced one by one, starting with the ViewDefinition Editor.
+#[derive(Template)]
+#[template(path = "pages/sql-stub.html")]
+struct SqlStubPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    title_key: &'static str,
+    lede_key: &'static str,
+    body_key: &'static str,
+    /// The server route(s) the finished page will drive, shown verbatim.
+    api: &'static str,
+}
+
+/// (active_page, title, lede, body, api) for one SQL on FHIR stub.
+type SqlStubSpec = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+fn render_sql_stub(
+    state: &WebState,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: &RequestTenant,
+    spec: SqlStubSpec,
+) -> Response {
+    let (active_page, title_key, lede_key, body_key, api) = spec;
+    render(SqlStubPage {
+        status: current_status(state, rv.0, rt),
+        i18n: I18n::new(locale),
+        active_page,
+        title_key,
+        lede_key,
+        body_key,
+        api,
+    })
+}
+
+async fn sql_view_definitions_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render_sql_stub(
+        &state,
+        locale,
+        rv,
+        &rt,
+        (
+            "sql-view-definitions",
+            "sql-vd-title",
+            "sql-vd-lede",
+            "sql-vd-body",
+            "POST /$sql-run",
+        ),
+    )
+}
+
+async fn sql_queries_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render_sql_stub(
+        &state,
+        locale,
+        rv,
+        &rt,
+        (
+            "sql-queries",
+            "sql-queries-title",
+            "sql-queries-lede",
+            "sql-queries-body",
+            "POST /$sql-run",
+        ),
+    )
+}
+
+async fn sql_views_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render_sql_stub(
+        &state,
+        locale,
+        rv,
+        &rt,
+        (
+            "sql-views",
+            "sql-views-title",
+            "sql-views-lede",
+            "sql-views-body",
+            "POST /$sql-run",
+        ),
+    )
+}
+
+async fn sql_export_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render_sql_stub(
+        &state,
+        locale,
+        rv,
+        &rt,
+        (
+            "sql-export",
+            "sql-export-title",
+            "sql-export-lede",
+            "sql-export-body",
+            "POST /$sql-export · GET /export/{job_id}/status",
+        ),
+    )
+}
+
+async fn sql_files_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render_sql_stub(
+        &state,
+        locale,
+        rv,
+        &rt,
+        (
+            "sql-files",
+            "sql-files-title",
+            "sql-files-lede",
+            "sql-files-body",
+            "GET /export/{job_id}/result · GET /export/{job_id}/{filename}",
+        ),
+    )
 }
 
 /// The read-only CapabilityStatement page (#653): the live `/metadata`

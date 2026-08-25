@@ -84,6 +84,7 @@ error-generic = Algo salió mal. Vuelva a intentarlo.
 
 nav-section-work = Trabajo
 nav-section-batch-data = Lotes y datos
+nav-section-sql-on-fhir = SQL on FHIR
 nav-section-server = Servidor
 nav-section-tools = Herramientas
 
@@ -95,7 +96,11 @@ nav-compartments = Compartimentos
 nav-batch-transaction = Lote / Transacción
 nav-import = Importar
 nav-export = Exportar
-nav-sql-on-fhir = SQL-on-FHIR
+nav-sql-view-definitions = Definiciones de vistas
+nav-sql-queries = Consultas SQL
+nav-sql-views = Vistas SQL
+nav-sql-export = Exportación SQL
+nav-sql-files = Archivos
 nav-capability-conformance = Capacidad y conformidad
 nav-search-parameters = Parámetros de búsqueda
 nav-subscriptions = Suscripciones
@@ -732,3 +737,29 @@ cap-col-revincludes = Revincludes
 cap-resources-empty = Ningún tipo de recurso coincide con el filtro.
 cap-raw-toggle = CapabilityStatement en bruto (JSON)
 cap-unavailable = No se pudo obtener la CapabilityStatement del servidor — la autollamada puede necesitar un token saliente cuando la autenticación está activada.
+
+## Stubs de la sección SQL on FHIR (#649)
+
+sql-stub-heading = Próximamente
+sql-stub-planned = Previsto
+sql-stub-api = API que lo sirve
+
+sql-vd-title = Definiciones de vistas
+sql-vd-lede = Crea y gestiona las ViewDefinitions con las que SQL on FHIR aplana recursos.
+sql-vd-body = Una lista y un editor de ViewDefinitions. Crea, edita y valida vistas, y ejecútalas después desde Consultas SQL.
+
+sql-queries-title = Consultas SQL
+sql-queries-lede = Ejecuta consultas SQL on FHIR contra este servidor.
+sql-queries-body = Redacta una consulta, ejecútala e inspecciona las filas resultantes en línea.
+
+sql-views-title = Vistas SQL
+sql-views-lede = Vistas SQL reutilizables construidas sobre ViewDefinitions.
+sql-views-body = Bibliotecas SQLView y las vistas que definen, resueltas con sus dependencias.
+
+sql-export-title = Exportación SQL
+sql-export-lede = Trabajos de exportación SQL on FHIR de larga duración.
+sql-export-body = Inicia una exportación, sigue su progreso y cancela los trabajos que ya no necesites.
+
+sql-files-title = Archivos
+sql-files-lede = Manifiestos y archivos de salida producidos por las exportaciones SQL.
+sql-files-body = Consulta el manifiesto de cada trabajo y descarga sus archivos de salida.

@@ -88,6 +88,7 @@ error-generic = Something went wrong. Please try again.
 
 nav-section-work = Work
 nav-section-batch-data = Batch & Data
+nav-section-sql-on-fhir = SQL on FHIR
 nav-section-server = Server
 nav-section-tools = Tools
 
@@ -99,7 +100,11 @@ nav-compartments = Compartments
 nav-batch-transaction = Batch / Transaction
 nav-import = Import
 nav-export = Export
-nav-sql-on-fhir = SQL-on-FHIR
+nav-sql-view-definitions = View Definitions
+nav-sql-queries = SQL Queries
+nav-sql-views = SQL Views
+nav-sql-export = SQL Export
+nav-sql-files = Files
 nav-capability-conformance = Capability & Conformance
 nav-search-parameters = Search Parameters
 nav-subscriptions = Subscriptions
@@ -735,3 +740,29 @@ cap-col-revincludes = Revincludes
 cap-resources-empty = No resource types match the filter.
 cap-raw-toggle = Raw CapabilityStatement (JSON)
 cap-unavailable = The CapabilityStatement could not be fetched from the server — the self-call may need an outbound token when authentication is enabled.
+
+## SQL on FHIR section stubs (#649)
+
+sql-stub-heading = Coming Soon
+sql-stub-planned = Planned
+sql-stub-api = Serving API
+
+sql-vd-title = View Definitions
+sql-vd-lede = Author and manage the ViewDefinitions that SQL on FHIR runs flatten resources with.
+sql-vd-body = A ViewDefinition list and editor. Create, edit, and validate views, then run them from SQL Queries.
+
+sql-queries-title = SQL Queries
+sql-queries-lede = Run SQL on FHIR queries against this server.
+sql-queries-body = Compose a query, run it, and inspect the resulting rows inline.
+
+sql-views-title = SQL Views
+sql-views-lede = Reusable SQL views layered over ViewDefinitions.
+sql-views-body = SQLView libraries and the views they define, resolved with their dependencies.
+
+sql-export-title = SQL Export
+sql-export-lede = Long-running SQL on FHIR export jobs.
+sql-export-body = Start an export, follow its progress, and cancel jobs that are no longer needed.
+
+sql-files-title = Files
+sql-files-lede = Manifests and output files produced by SQL exports.
+sql-files-body = Browse each job's manifest and download its output files.
