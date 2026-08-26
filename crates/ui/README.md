@@ -95,9 +95,10 @@ note the version bump in the commit.
 
 ### Client-side scripts
 
-Each is a small, self-contained IIFE loaded with `defer` by the one page that
-needs it — except `theme.js`, which loads **without `defer`**, before first
-paint, to avoid a flash of the wrong theme.
+Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
+`json-view.js` loads from the shared layout because its delegated behavior is
+used across workspaces. `theme.js` loads **without `defer`**, before first paint,
+to avoid a flash of the wrong theme.
 
 | Asset | Owns |
 |---|---|
