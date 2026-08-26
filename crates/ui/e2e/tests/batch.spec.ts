@@ -3,6 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import AxeBuilder from "@axe-core/playwright";
+import { axeSummary } from "../pages/axe";
 
 // The Batch/Transaction workspace (#476): upload → preflight → execute →
 // response, entirely against the ordinary FHIR API.
@@ -83,10 +84,12 @@ test("a transaction bundle uploads, previews, executes, and reports", async ({ p
   await expect(page.locator("#batch-summary")).toContainText(/created/i);
   await expect(page.locator("#batch-overall")).toHaveClass(/--ok/);
 
-  // Done is the one way out (#675): back to a clean upload stage.
+  // Done is the one way out (#675): back to a clean upload stage. Done hid
+  // the stage that held focus, so focus lands on the drop zone (#679).
   await page.locator("#batch-done").click();
   await expect(page.locator("#batch-upload")).toBeVisible();
   await expect(page.locator("#batch-preflight")).toBeHidden();
+  await expect(page.locator("#batch-drop")).toBeFocused();
 });
 
 test("JSON previews are lazy, cached, compact, accessible, and isolated per view", async ({ page }) => {
@@ -204,6 +207,7 @@ test("an invalid replacement clears the old preview and cannot execute stale or 
   await expect(page.locator("#batch-upload")).toBeVisible();
   await expect(page.locator("#batch-upload-error")).toBeVisible();
   await expect(page.locator("#batch-preflight")).toBeHidden();
+  await expect(page.locator("#batch-busy")).toBeHidden();
   await expect(page.locator("#batch-rows")).toBeEmpty();
   await expect(page.locator("#batch-json")).toBeEmpty();
 
@@ -308,4 +312,229 @@ test("a non-bundle file is rejected with a message, not a crash", async ({ page 
   await page.locator("#batch-file").setInputFiles(file);
   await expect(page.locator("#batch-upload-error")).toBeVisible();
   await expect(page.locator("#batch-preflight")).toBeHidden();
+  // The parse-side busy region clears on the failure path too (#679).
+  await expect(page.locator("#batch-busy")).toBeHidden();
+});
+
+// ---- #679: the shared busy states -----------------------------------------
+// The transient states are made deterministically observable: FileReader
+// delivery and the execute POST are both parked behind manual releases.
+
+const FOOTER_CONTROLS = ["#batch-execute", "#batch-execute-top", "#batch-cancel", "#batch-cancel-top"];
+
+test("picking a file shows the busy region before any file bytes arrive", async ({ page }) => {
+  await page.goto("/ui/batch", { waitUntil: "networkidle" });
+  // Park the read behind a manual release: the region must be up before the
+  // file is even delivered, which is the "within one frame of the pick"
+  // criterion made testable. readAsText resolves through the prototype at
+  // call time, so patching it here works.
+  await page.evaluate(() => {
+    const orig = FileReader.prototype.readAsText;
+    (window as { __releaseRead?: () => void }).__releaseRead = undefined;
+    FileReader.prototype.readAsText = function (this: FileReader, ...args: [Blob]) {
+      (window as { __releaseRead?: () => void }).__releaseRead = () => orig.apply(this, args);
+    };
+  });
+  // Focus the drop zone first: the real flow clicks it, and the focus
+  // fixup for its hidden stage is asynchronous — the containment check in
+  // batch.js must still re-home focus.
+  await page.locator("#batch-drop").focus();
+  await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
+  const busy = page.locator("#batch-busy");
+  await expect(busy).toBeVisible();
+  // The real copy, not the Fluent key: a missing key renders as the key
+  // itself and /reading/i would happily match "batch-reading".
+  await expect(busy).toContainText("Reading bundle");
+  await expect(busy).toHaveAttribute("role", "status");
+
+  await page.evaluate(() => (window as { __releaseRead?: () => void }).__releaseRead?.());
+  await expect(page.locator("#batch-preflight")).toBeVisible();
+  await expect(busy).toBeHidden();
+  // The picked file's drop zone was hidden with its stage; focus lands on
+  // the revealed stage (tabindex=-1), not its destructive primary action.
+  await expect(page.locator("#batch-preflight")).toBeFocused();
+});
+
+test("execute busies the whole footer, ignores re-entrant clicks, and lands focus on Done", async ({ page }) => {
+  // setInputFiles + preflight render + an axe scan + a real POST: the
+  // tightest budget in this file on the CI backend matrix.
+  test.slow();
+
+  let executeRequests = 0;
+  let release!: () => void;
+  const parked = new Promise<void>((resolve) => { release = resolve; });
+  await page.route((url) => url.pathname === "/", async (route) => {
+    if (route.request().method() !== "POST") return route.continue().catch(() => {});
+    executeRequests++;
+    await parked;
+    await route.continue().catch(() => {});
+  });
+
+  await page.goto("/ui/batch", { waitUntil: "networkidle" });
+  await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
+  await expect(page.locator("#batch-preflight")).toBeVisible();
+  await page.locator("#batch-execute").click();
+
+  // Both Execute copies spin, and the Cancels go inert with them: a
+  // mid-flight Cancel raced the settling response and crashed on the nulled
+  // bundle before #679.
+  await expect(page.locator("#batch-execute")).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator("#batch-execute-top")).toHaveAttribute("aria-busy", "true");
+  for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeDisabled();
+  await expect(page.locator("#batch-busy")).toBeVisible();
+  await expect(page.locator("#batch-busy")).toContainText("Executing");
+
+  // The default-motion busy button: the label yields to the animated ring,
+  // and the filled primary gets the explicit white ring (accent-on-accent
+  // vanishes in dark theme).
+  const busyStyle = await page.locator("#batch-execute").evaluate((button) => ({
+    color: getComputedStyle(button).color,
+    content: getComputedStyle(button, "::after").content,
+    animation: getComputedStyle(button, "::after").animationName,
+    ringTop: getComputedStyle(button, "::after").borderTopColor,
+  }));
+  expect(busyStyle.color).toBe("rgba(0, 0, 0, 0)");
+  expect(busyStyle.content).toBe('""');
+  expect(busyStyle.animation).toBe("spin");
+  expect(busyStyle.ringTop).toBe("rgb(255, 255, 255)");
+
+  // Re-entrant activation cannot double-POST: a real click on a disabled
+  // button dispatches nothing, and a synthetic event that does reach the
+  // handler is ignored by the busy guard.
+  await page.locator("#batch-execute").evaluate((button: HTMLButtonElement) => button.click());
+  await page
+    .locator("#batch-execute-top")
+    .evaluate((button) => button.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+
+  // The a11y gate scans routes at rest, so the held-open busy state is
+  // audited here or nowhere.
+  const { violations } = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
+    .analyze();
+  expect(violations, axeSummary(violations)).toEqual([]);
+
+  release();
+  await expect(page.locator("#batch-response")).toBeVisible();
+  await expect(page.locator("#batch-busy")).toBeHidden();
+  // Only now is the count meaningful: every request the page could have
+  // issued has been intercepted (a sync read here raced the second click).
+  expect(executeRequests).toBe(1);
+  // The disabled trigger was hidden with its stage, so focus would die on
+  // <body>; it lands on the one action the response offers instead.
+  await expect(page.locator("#batch-done")).toBeFocused();
+});
+
+test("a whole-bundle failure clears the busy state and re-enables the footer", async ({ page }) => {
+  let release!: () => void;
+  const parked = new Promise<void>((resolve) => { release = resolve; });
+  await page.route((url) => url.pathname === "/", async (route) => {
+    if (route.request().method() !== "POST") return route.continue().catch(() => {});
+    await parked;
+    await route
+      .fulfill({
+        status: 400,
+        contentType: "application/fhir+json",
+        body: JSON.stringify({
+          resourceType: "OperationOutcome",
+          issue: [{ severity: "error", code: "processing", diagnostics: "boom" }],
+        }),
+      })
+      .catch(() => {});
+  });
+
+  await page.goto("/ui/batch", { waitUntil: "networkidle" });
+  await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
+  await page.locator("#batch-execute").click();
+
+  // The busy state is genuinely entered before the failure lands…
+  await expect(page.locator("#batch-execute")).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator("#batch-busy")).toBeVisible();
+  release();
+
+  // …and a rolled-back bundle clears every part of it: the early-return
+  // branch stays on the preflight with the inline error (#676).
+  await expect(page.locator("#batch-execute-error")).toBeVisible();
+  await expect(page.locator("#batch-preflight")).toBeVisible();
+  for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeEnabled();
+  await expect(page.locator("#batch-execute")).not.toHaveAttribute("aria-busy", "true");
+  await expect(page.locator("#batch-busy")).toBeHidden();
+  // Focus returns to the trigger, which sits next to the inline error (#676).
+  await expect(page.locator("#batch-execute")).toBeFocused();
+});
+
+test("reduced-motion users get a static ring, not an animated one", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  let release!: () => void;
+  const parked = new Promise<void>((resolve) => { release = resolve; });
+  await page.route((url) => url.pathname === "/", async (route) => {
+    if (route.request().method() !== "POST") return route.continue().catch(() => {});
+    await parked;
+    await route.continue().catch(() => {});
+  });
+
+  await page.goto("/ui/batch", { waitUntil: "networkidle" });
+  await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
+  await page.locator("#batch-execute").click();
+  await expect(page.locator("#batch-execute")).toHaveAttribute("aria-busy", "true");
+
+  // The static form: the ring glyph is present but does not animate. A
+  // label-only dimmed button would read as "disabled", not "working".
+  const after = await page.locator("#batch-execute").evaluate((button) => ({
+    content: getComputedStyle(button, "::after").content,
+    animation: getComputedStyle(button, "::after").animationName,
+  }));
+  expect(after.content).toBe('""');
+  expect(after.animation).toBe("none");
+
+  release();
+  await expect(page.locator("#batch-response")).toBeVisible();
+});
+
+test("an unreadable file clears the busy region and reports the failure", async ({ page }) => {
+  await page.goto("/ui/batch", { waitUntil: "networkidle" });
+  // A folder drop or a file that vanished between pick and read fires
+  // `error`, never `load` — the busy region must not be left spinning.
+  await page.evaluate(() => {
+    FileReader.prototype.readAsText = function (this: FileReader) {
+      setTimeout(() => this.dispatchEvent(new ProgressEvent("error")), 0);
+    };
+  });
+  await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
+  await expect(page.locator("#batch-upload-error")).toBeVisible();
+  await expect(page.locator("#batch-busy")).toBeHidden();
+  await expect(page.locator("#batch-preflight")).toBeHidden();
+});
+
+test("a synchronously-failing operation cannot leave a stale region label", async ({ page }) => {
+  await page.goto("/ui/batch", { waitUntil: "networkidle" });
+  // Drives the helper directly: clear() runs as a microtask and must also
+  // cancel the label write queued for the next macrotask, or the hidden
+  // region keeps the stale label and announces it on its next reveal.
+  const state = await page.evaluate(() => {
+    const region = document.getElementById("batch-busy") as HTMLElement;
+    const button = document.getElementById("batch-execute") as HTMLButtonElement;
+    const busyApi = (window as { hfsBusy?: { during: Function } }).hfsBusy!;
+    busyApi.during(
+      [button],
+      () => {
+        throw new Error("sync");
+      },
+      { region, label: "Stale label" },
+    );
+    return new Promise<{ hidden: boolean; label: string | null; busyAttr: string | null }>(
+      (resolve) =>
+        setTimeout(
+          () =>
+            resolve({
+              hidden: region.hidden,
+              label: region.querySelector("[data-busy-label]")!.textContent,
+              busyAttr: button.getAttribute("aria-busy"),
+            }),
+          30,
+        ),
+    );
+  });
+  expect(state.hidden).toBe(true);
+  expect(state.label).toBe("");
+  expect(state.busyAttr).toBeNull();
 });

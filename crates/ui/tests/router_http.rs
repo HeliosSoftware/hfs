@@ -1422,6 +1422,57 @@ async fn batch_page_serves_the_workspace_shell() {
     assert!(html.contains(r#"src="/ui/assets/json-view.js""#));
 }
 
+/// #679: the shared busy convention. The helper is a global asset loaded from
+/// the layout before any page script, and the batch page pre-renders the
+/// status region — a live region injected at busy time is not reliably
+/// announced — with its labels riding on `data-msg-*` like the rest of the
+/// page copy.
+#[tokio::test]
+async fn batch_page_carries_the_shared_busy_affordances() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/busy.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("hfsBusy"));
+
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    // The status region ships in the shell with its full shape pinned:
+    // hidden, empty, role="status", the shared region class, and the spinner
+    // + label pair the helper drives.
+    assert!(
+        html.contains(r#"<p class="busy-status batch-busy" id="batch-busy" role="status" hidden>"#)
+    );
+    assert!(html.contains(
+        r#"<span class="spinner" aria-hidden="true"></span><span data-busy-label></span>"#
+    ));
+    // The rendered copy, not just the attribute name: a missing Fluent key
+    // falls back to the key itself and would still carry the attribute.
+    assert!(html.contains(r#"data-msg-reading="Reading bundle…""#));
+    assert!(html.contains(r#"data-msg-executing="Executing…""#));
+    assert!(html.contains(r#"data-msg-read-failed="The file could not be read""#));
+    // The stage that receives focus when the preflight appears (#679).
+    assert!(html.contains(r#"<section id="batch-preflight" tabindex="-1" hidden>"#));
+    // The helper loads from the shared layout, before the page script (both
+    // defer, so document order is execution order).
+    let busy = html
+        .find(r#"src="/ui/assets/busy.js""#)
+        .expect("busy.js in the layout");
+    let batch = html
+        .find(r#"src="/ui/assets/batch.js""#)
+        .expect("batch.js in the page");
+    assert!(busy < batch);
+}
+
 /* #546: creating a resource with required elements must not dump duplicated,
  * unanchored error lines. */
 
