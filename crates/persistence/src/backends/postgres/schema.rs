@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 17;
+pub const SCHEMA_VERSION: i32 = 18;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -338,6 +338,7 @@ async fn migrate_schema(
             14 => migrate_v14_to_v15(client).await?,
             15 => migrate_v15_to_v16(client).await?,
             16 => migrate_v16_to_v17(client).await?,
+            17 => migrate_v17_to_v18(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1028,6 +1029,131 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v17 -> v18: make the value-column indexes partial.
+///
+/// `search_index` is one wide table holding every parameter of every resource
+/// type, so for any given row almost every `value_*` column is NULL. An index
+/// with no `WHERE` clause still carries an entry for every one of those NULL
+/// rows, and — the part that actually costs — **every write pays an index
+/// insert into every such index**. A row carrying one token value was inserting
+/// into the number, quantity, canonical-quantity, uri, string, reference,
+/// reference-display, token-display and identifier-type indexes as well.
+///
+/// Measured on run 32978436956 (689,080 resources): the index set totals 28 GB
+/// against an 8.8 GB heap on an 11 GB Docker host. The schema already contained
+/// the natural experiment — `idx_search_date`, partial since v16, is **344 MB**,
+/// while `idx_search_quantity`, which has never carried a predicate, is
+/// **5622 MB**. Same table, comparable population.
+///
+/// This is why import gains lagged so far behind crud (1.74x vs 4.24x) when
+/// batching removed the write path's round trips in iteration 1: what remained
+/// was index maintenance, and index maintenance was being paid on indexes the
+/// row did not belong in.
+///
+/// Every predicate below is chosen so the planner can still prove the index
+/// usable: `value_number = $1` (or any comparison, `LIKE`, or `ILIKE`) is strict
+/// in its column and therefore implies `value_number IS NOT NULL`. No query
+/// shape loses its index — including shapes this benchmark never exercises,
+/// which is the whole reason these are rewritten as partial rather than dropped.
+/// `idx_search_string` had 0 scans in that run and is *kept*: it is the only
+/// index serving `:exact`, which the benchmark does not issue.
+///
+/// Deliberately NOT made partial:
+/// - `idx_search_string_folded` (10,583 scans). The predicate is on
+///   `COALESCE(value_string_folded, lower(value_string))`, and COALESCE is not
+///   strict — it is non-NULL precisely when the folded column IS NULL and the
+///   raw one is not. A `value_string_folded IS NOT NULL` predicate could not be
+///   proved from it, so the index would silently stop being used.
+/// - `idx_search_composite` (19,953 scans) and `idx_search_resource` (210,736
+///   scans, the hottest index in the schema). Both key on `resource_id` with no
+///   value column, and the per-resource probe does not constrain
+///   `composite_group`, so a predicate on it would not be provable either.
+///
+/// Rebuilds take a `SHARE` lock. As with v15 and v17 these run at startup under
+/// the `initialize_schema` advisory lock, before the instance serves traffic;
+/// operators with a large existing database can pre-build the replacements
+/// `CONCURRENTLY` by hand, after which `IF NOT EXISTS` makes this a no-op.
+/// `CREATE INDEX CONCURRENTLY` is not used here for the reason given on v15: a
+/// process death mid-build leaves an INVALID index that a later
+/// `IF NOT EXISTS` would skip forever.
+async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let index_stmts = [
+        // The largest index in the schema, and the only one v17 rebuilt while
+        // leaving its (absent) predicate alone — date and token_code kept theirs.
+        // Every quantity predicate is a range comparison on the value.
+        "DROP INDEX IF EXISTS idx_search_quantity",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity
+         ON search_index (tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit)
+         INCLUDE (resource_id, last_updated)
+         WHERE value_quantity_value IS NOT NULL",
+        // `numeric_predicate("value_number", ..)` — comparisons only.
+        "DROP INDEX IF EXISTS idx_search_number",
+        "CREATE INDEX IF NOT EXISTS idx_search_number
+         ON search_index (tenant_id, resource_type, param_name, value_number)
+         WHERE value_number IS NOT NULL",
+        // UCUM-canonical quantity: a range on the canonical value, optionally
+        // with `value_quantity_canonical_unit = $n`.
+        "DROP INDEX IF EXISTS idx_search_quantity_canonical",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical
+         ON search_index (tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value)
+         WHERE value_quantity_canonical_value IS NOT NULL",
+        // `=` or a prefix LIKE; the text_pattern_ops sibling is already partial.
+        "DROP INDEX IF EXISTS idx_search_reference",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference
+         ON search_index (tenant_id, resource_type, param_name, value_reference)
+         WHERE value_reference IS NOT NULL",
+        // The `system|` form binds the system alone; this index is what serves it.
+        "DROP INDEX IF EXISTS idx_search_token",
+        "CREATE INDEX IF NOT EXISTS idx_search_token
+         ON search_index (tenant_id, resource_type, param_name, value_token_system, value_token_code)
+         WHERE value_token_system IS NOT NULL",
+        // `:exact` — `value_string = $n` against the bare column.
+        "DROP INDEX IF EXISTS idx_search_string",
+        "CREATE INDEX IF NOT EXISTS idx_search_string
+         ON search_index (tenant_id, resource_type, param_name, value_string)
+         WHERE value_string IS NOT NULL",
+        // `=`, prefix LIKE, ILIKE, and the `:below` form `$1 LIKE value_uri || '%'`
+        // — all strict in value_uri.
+        "DROP INDEX IF EXISTS idx_search_uri",
+        "CREATE INDEX IF NOT EXISTS idx_search_uri
+         ON search_index (tenant_id, resource_type, param_name, value_uri)
+         WHERE value_uri IS NOT NULL",
+        // `value_token_display ILIKE $n`.
+        "DROP INDEX IF EXISTS idx_search_token_display",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_display
+         ON search_index (tenant_id, resource_type, param_name, value_token_display)
+         WHERE value_token_display IS NOT NULL",
+        // `value_reference_display ILIKE $n`.
+        "DROP INDEX IF EXISTS idx_search_reference_display",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference_display
+         ON search_index (tenant_id, resource_type, param_name, value_reference_display)
+         WHERE value_reference_display IS NOT NULL",
+        // `:of-type` binds the system, the code, or both, and either alone must
+        // still imply the predicate — hence the disjunction rather than a
+        // predicate on the leading column only.
+        "DROP INDEX IF EXISTS idx_search_identifier_type",
+        "CREATE INDEX IF NOT EXISTS idx_search_identifier_type
+         ON search_index (tenant_id, resource_type, param_name, value_identifier_type_system, value_identifier_type_code)
+         WHERE value_identifier_type_system IS NOT NULL OR value_identifier_type_code IS NOT NULL",
+        // `_contained` search always binds `is_contained = TRUE`, and virtually
+        // no row is a contained-resource row. The sibling lookup at the other
+        // call site binds `is_contained = FALSE` but reads a different index.
+        "DROP INDEX IF EXISTS idx_search_contained",
+        "CREATE INDEX IF NOT EXISTS idx_search_contained
+         ON search_index (tenant_id, contained_type, is_contained, param_name)
+         WHERE is_contained",
+    ];
+
+    for sql in index_stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v17->v18 failed: {}", e)))?;
     }
 
     Ok(())
