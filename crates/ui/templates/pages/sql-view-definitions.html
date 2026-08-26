@@ -2,10 +2,11 @@
 
 {#
   View Definitions workspace (#649, Figma 420-2): rail of stored
-  ViewDefinitions, the selected one as editable JSON, and a $sql-run preview.
-  Save/Duplicate are submit buttons of one plain form (POST back to this
-  route); Run is a plain link (?run=1); Delete rides conformance-crud.js like
-  the other conformance viewers. Everything works without JavaScript.
+  ViewDefinitions (name left, resource type right), the selected one in a
+  collapsible JSON fold, and a $sql-run Results preview. Save/Duplicate are
+  submit buttons of one plain form (POST back to this route); Run is a plain
+  link (?run=1); Delete rides conformance-crud.js like the other conformance
+  viewers. Everything works without JavaScript.
 #}
 
 {% block title %}{{ i18n.t("sql-vd-title") }} — {{ i18n.t("app-title") }}{% endblock %}
@@ -14,12 +15,9 @@
 {% block content_class %} content--app{% endblock %}
 
 {% block content %}
-<section class="page-head page-head--row">
-  <div>
-    <h1 class="page-head__title">{{ i18n.t("sql-vd-title") }}</h1>
-    <p class="page-head__lede">{{ i18n.t("sql-vd-lede") }}</p>
-  </div>
-  <a class="btn btn--primary" href="/ui/sql/view-definitions?vd=new">{{ i18n.t("vd-new") }}</a>
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("sql-vd-title") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("sql-vd-lede") }}</p>
 </section>
 
 {% if let Some(message) = degraded %}
@@ -29,7 +27,7 @@
 <p class="notice">{{ i18n.t("vd-saved") }}</p>
 {% endif %}
 
-<div class="filter-layout">
+<div class="filter-layout filter-layout--two">
   <aside class="filter-rail" aria-label="{{ i18n.t("vd-rail-label") }}">
     <div class="filter-rail__heading">{{ i18n.t("vd-rail-heading") }}</div>
     <form class="filter-rail__search" method="get" action="/ui/sql/view-definitions" role="search">
@@ -46,7 +44,7 @@
          href="/ui/sql/view-definitions?vd={{ item.id }}" title="{{ item.name }}"
          {%- if let Some(sel) = selected %}{% if sel.id == item.id %} aria-current="true"{% endif %}{% endif %}>
         <span class="filter-rail__label">{{ item.name }}</span>
-        <span class="count">{{ item.resource }}</span>
+        <span class="filter-rail__meta">{{ item.resource }}</span>
       </a>
       {% endfor %}
       {% if rail.is_empty() %}
@@ -57,18 +55,27 @@
 
   <div class="filter-center">
     {% if let Some(sel) = selected %}
+    <!-- The Figma title row: the view's name left; Run / Duplicate / Delete /
+         Create New right. Duplicate submits the form below with its own
+         intent, so it stays inside the form via the `form` attribute. -->
     <section class="page-head page-head--row">
-      <div>
-        <h1 class="page-head__title">{% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}</h1>
-      </div>
+      <h2 class="page-head__title">{% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}</h2>
       <div>
         {% if !is_new %}
         <a class="btn" href="/ui/sql/view-definitions?vd={{ sel.id }}&run=1">{{ i18n.t("vd-run") }}</a>
+        <button type="submit" class="btn" form="vd-editor-form" name="action" value="duplicate">
+          <span class="icon">{% include "icons/copy.svg" %}</span> {{ i18n.t("vd-duplicate") }}
+        </button>
         <button type="button" class="btn btn--danger" data-crud-delete
                 data-type="ViewDefinition" data-id="{{ sel.id }}"
                 data-confirm="{{ i18n.t_arg("vd-delete-confirm", "name", sel.name.to_string()) }}"
                 data-failed="{{ i18n.t("vd-delete-failed") }}"
-                data-redirect="/ui/sql/view-definitions">{{ i18n.t("vd-delete") }}</button>
+                data-redirect="/ui/sql/view-definitions">
+          <span class="icon">{% include "icons/trash.svg" %}</span> {{ i18n.t("vd-delete") }}
+        </button>
+        <a class="btn btn--primary" href="/ui/sql/view-definitions?vd=new">
+          <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
+        </a>
         {% endif %}
       </div>
     </section>
@@ -77,22 +84,22 @@
     <p class="notice notice--warn">{{ error }}</p>
     {% endif %}
 
-    <section class="card">
-      <div class="card-head">
+    <!-- The JSON fold (Figma's collapsible panel): header row with the
+         chevron, the editor inside its own inset box, Save at the foot. -->
+    <details class="card json-fold" open>
+      <summary class="card-head">
         <h3>{{ i18n.t("vd-json-heading") }}</h3>
-      </div>
-      <form method="post" action="/ui/sql/view-definitions">
+        <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+      </summary>
+      <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body">
         <input type="hidden" name="id" value="{{ sel.id }}">
-        <textarea class="field__input" name="json" rows="18" spellcheck="false"
+        <textarea class="json-editor" name="json" rows="18" spellcheck="false"
                   aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
-        <div class="card-head">
+        <div class="form-actions">
           <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
-          {% if !is_new %}
-          <button type="submit" class="btn" name="action" value="duplicate">{{ i18n.t("vd-duplicate") }}</button>
-          {% endif %}
         </div>
       </form>
-    </section>
+    </details>
 
     {% if let Some(error) = run_error %}
     <p class="notice notice--warn">{{ i18n.t("vd-run-failed") }} {{ error }}</p>
@@ -124,7 +131,12 @@
       <div class="card-head">
         <h3>{{ i18n.t("vd-none") }}</h3>
       </div>
-      <p class="page-head__lede">{{ i18n.t("vd-empty-lede") }}</p>
+      <div class="card__body">
+        <p class="page-head__lede">{{ i18n.t("vd-empty-lede") }}</p>
+        <a class="btn btn--primary" href="/ui/sql/view-definitions?vd=new">
+          <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
+        </a>
+      </div>
     </section>
     {% endif %}
   </div>
