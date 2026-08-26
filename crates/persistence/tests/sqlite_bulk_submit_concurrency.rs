@@ -64,7 +64,10 @@ async fn concurrent_streams_ingest_to_completion() {
     let (id_a, manifest_a) = seed(&backend, "a").await;
     let (id_b, manifest_b) = seed(&backend, "b").await;
 
-    const N: usize = 3000;
+    // Sized for signal, not throughput: the point is deadlock detection, and
+    // a loaded shared runner ingests slowly - the first CI run of the fixed
+    // code timed out at 300s on volume alone.
+    const N: usize = 1500;
     let a = {
         let backend = Arc::clone(&backend);
         tokio::spawn(async move {
@@ -102,7 +105,7 @@ async fn concurrent_streams_ingest_to_completion() {
         })
     };
 
-    let joined = tokio::time::timeout(Duration::from_secs(300), async {
+    let joined = tokio::time::timeout(Duration::from_secs(600), async {
         (a.await.unwrap(), b.await.unwrap())
     })
     .await
@@ -226,7 +229,7 @@ async fn two_workers_run_whole_manifests_to_completion() {
         }));
     }
 
-    tokio::time::timeout(Duration::from_secs(300), async {
+    tokio::time::timeout(Duration::from_secs(600), async {
         for h in handles {
             h.await.unwrap();
         }
