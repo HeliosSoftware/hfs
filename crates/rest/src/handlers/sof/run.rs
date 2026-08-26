@@ -357,7 +357,7 @@ where
         Some(
             parse_content_type(&format, include_header).ok_or_else(|| RestError::BadRequest {
                 message: format!(
-                    "unsupported _format value '{format}'; supported: ndjson, json, csv, parquet, fhir"
+                    "unsupported _format value '{format}'; supported: ndjson, json, csv, parquet, arrow, fhir"
                 ),
             })?,
         )
@@ -573,6 +573,7 @@ fn content_type_headers(ct: ContentType) -> (&'static str, &'static str) {
         ContentType::Json => ("application/json", "json"),
         ContentType::NdJson => ("application/x-ndjson", "ndjson"),
         ContentType::Parquet => ("application/vnd.apache.parquet", "parquet"),
+        ContentType::ArrowIpc => ("application/vnd.apache.arrow.stream", "arrow"),
     }
 }
 
@@ -604,6 +605,7 @@ fn validate_limit(limit: Option<usize>) -> Result<(), RestError> {
 /// Accept-header values map: `application/json` → `json`,
 /// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
 /// `application/octet-stream`/`application/parquet` → `parquet`,
+/// `application/vnd.apache.arrow.stream` → `arrow`,
 /// `application/fhir+json` → `fhir`. Unknown or wildcard Accept values fall
 /// through to the `ndjson` default.
 fn resolve_format(format_param: Option<&str>, headers: &HeaderMap) -> String {
@@ -625,6 +627,7 @@ fn resolve_format(format_param: Option<&str>, headers: &HeaderMap) -> String {
                 "application/octet-stream"
                 | "application/parquet"
                 | "application/vnd.apache.parquet" => Some("parquet"),
+                "application/vnd.apache.arrow.stream" => Some("arrow"),
                 "application/fhir+json" => Some("fhir"),
                 _ => None,
             });
@@ -650,6 +653,7 @@ fn parse_content_type(format: &str, include_header: bool) -> Option<ContentType>
         | "application/parquet"
         | "application/octet-stream"
         | "application/vnd.apache.parquet" => Some(ContentType::Parquet),
+        "arrow" | "application/vnd.apache.arrow.stream" => Some(ContentType::ArrowIpc),
         _ => None,
     }
 }

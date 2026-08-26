@@ -422,7 +422,7 @@ fn render_output(
             let ct = parse_content_type(format, include_header).ok_or_else(|| {
                 RestError::BadRequest {
                     message: format!(
-                        "unsupported _format value '{format}'; supported: csv, json, ndjson, parquet, fhir"
+                        "unsupported _format value '{format}'; supported: csv, json, ndjson, parquet, arrow, fhir"
                     ),
                 }
             })?;
@@ -458,6 +458,7 @@ fn parse_content_type(format: &str, include_header: bool) -> Option<ContentType>
         | "application/parquet"
         | "application/octet-stream"
         | "application/vnd.apache.parquet" => Some(ContentType::Parquet),
+        "arrow" | "application/vnd.apache.arrow.stream" => Some(ContentType::ArrowIpc),
         _ => None,
     }
 }
@@ -468,6 +469,7 @@ fn content_type_for(ct: ContentType) -> &'static str {
         ContentType::Json => "application/json",
         ContentType::NdJson => "application/x-ndjson",
         ContentType::Parquet => "application/vnd.apache.parquet",
+        ContentType::ArrowIpc => "application/vnd.apache.arrow.stream",
     }
 }
 
