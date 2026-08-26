@@ -3306,6 +3306,20 @@ fn apply_regex_flags(builder: &mut RegexBuilder, flags: &str) {
     }
 }
 
+/// A FHIR primitive element that carries extensions but no value (e.g. a
+/// data-absent-reason extension). The element exists in the tree, but it has
+/// no system value, so functions that consume the value must see an empty
+/// collection as their input (tests-fhir-r5.xml `primitivesWithoutValue`).
+fn is_valueless_element(value: &EvaluationResult) -> bool {
+    matches!(
+        value,
+        EvaluationResult::Object {
+            type_info: Some(ti),
+            ..
+        } if ti.name == "Element"
+    )
+}
+
 /// Calls a standard FHIRPath function (that doesn't take a lambda).
 fn call_function(
     name: &str,
@@ -3314,6 +3328,16 @@ fn call_function(
     // Add context parameter here, as call_function is called from evaluate_invocation which has context
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
+    let invocation_base = match name {
+        "length" | "toChars" | "substring" | "upper" | "lower" | "indexOf" | "contains"
+        | "startsWith" | "endsWith" | "matches" | "matchesFull" | "replace" | "replaceMatches"
+        | "trim" | "split" | "encode" | "decode"
+            if is_valueless_element(invocation_base) =>
+        {
+            &EvaluationResult::Empty
+        }
+        _ => invocation_base,
+    };
     match name {
         "is" | "as" => {
             if args.len() != 1 {
@@ -8088,6 +8112,11 @@ fn compare_inequality(
     // Handle empty operands: comparison with empty returns empty
     if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
         return Ok(EvaluationResult::Empty); // Return Ok(Empty)
+    }
+    // A primitive element with extensions but no value has no system value to
+    // compare: treat it as empty
+    if is_valueless_element(left) || is_valueless_element(right) {
+        return Ok(EvaluationResult::Empty);
     }
 
     // Check for collection vs singleton comparison (error)
