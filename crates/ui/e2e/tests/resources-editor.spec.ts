@@ -24,9 +24,20 @@ test("an out-of-value-set code shows a red issue inline in the editor", async ({
     name: [{ family: "E2EInline" }],
   });
 
+  await expect(resources.modal.editor.root.locator("#json-view")).toHaveCount(1);
+  await expect(
+    resources.modal.editor.root.locator('.json-line[data-jpath="name.0.family"]'),
+  ).toHaveCount(1);
+
   const genderRow = resources.modal.editor.row("gender");
   await expect(genderRow).toHaveClass(/editor-row--error/);
   await expect(genderRow.locator(".editor-row__error")).toContainText("administrative-gender");
+  await genderRow.hover();
+  await expect(
+    resources.modal.editor.root.locator('.json-line--hit[data-jpath="gender"]'),
+  ).toHaveCount(1);
+  await resources.modal.editor.root.locator('.json-line[data-jpath="gender"] .json-line__code').click();
+  await expect(resources.modal.editor.root.locator('[data-set="gender"]')).toBeFocused();
 });
 
 test("Save is blocked, in red, when the resource fails validation", async ({ resources }) => {

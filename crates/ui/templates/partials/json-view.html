@@ -1,0 +1,10 @@
+<div class="json-view"{% if !json_view_id.is_empty() %} id="{{ json_view_id }}"{% endif %}>
+  {% for line in json_lines %}
+  <div class="json-line{% if line.foldable %} json-line--foldable{% endif %}"
+       data-fold-id="{{ line.fold_id }}" data-parents="{{ line.parents }}"{% if json_view_paths && !line.path.is_empty() %} data-jpath="{{ line.path }}"{% endif %}>
+    <span class="json-line__num" aria-hidden="true">{{ line.num }}</span>
+    <span class="json-line__fold">{% if line.foldable %}<button type="button" class="json-line__arrow" data-fold="{{ line.fold_id }}" aria-expanded="true" aria-label="{{ i18n.t("json-view-toggle-fold") }}">▾</button>{% endif %}</span>
+    <span class="json-line__code" style="padding-left: {{ line.depth }}em">{% for t in line.tokens %}<span class="jt--{{ t.kind }}">{{ t.text }}</span>{% endfor %}<span class="json-line__summary">{{ line.summary }}</span></span>
+  </div>
+  {% endfor %}
+</div>

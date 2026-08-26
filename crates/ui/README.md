@@ -95,17 +95,19 @@ note the version bump in the commit.
 
 ### Client-side scripts
 
-Each is a small, self-contained IIFE loaded with `defer` by the one page that
-needs it — except `theme.js`, which loads **without `defer`**, before first
-paint, to avoid a flash of the wrong theme.
+Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
+`json-view.js` loads from the shared layout because its delegated behavior is
+used across workspaces. `theme.js` loads **without `defer`**, before first paint,
+to avoid a flash of the wrong theme.
 
 | Asset | Owns |
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
 | `saved-queries.js` | Saved queries, the visual search builder, and the `/_user/settings` read/modify/write cycle |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
+| `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
 | `resources.js` | The Resources workspace edit modal and "Create new" |
-| `batch.js` | Bundle pick → execution plan → per-entry outcomes |
+| `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
 | `resource-filter.js`, `conformance-crud.js` | The conformance viewers' rail filter and write half |
@@ -198,8 +200,12 @@ These are the shared primitives. Before styling anything, reach for one; add to
 |---|---|
 | `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current` | The button. Secondary by default; primary is the one blue action on a page. |
 | `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
+| `.panel` | Padding for a full-width card that hosts detail fields without rail behavior. |
+| `.kv-grid` | Responsive two-column key/value layout; collapses to one column on compact viewports. |
 | `.page-head`, `.page-head__title`, `.page-head__lede`, `.page-head--row` | Page heading block; the only `<h1>` treatment; `--row` puts an action on the right. |
+| `.back-link` | In-page return link with theme-safe normal, visited, hover, and focus states. |
 | `.table-wrap` > `.data-table`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper; empty-state row; footer with pagination. |
+| `.empty-state` | The same centered, muted empty treatment for non-table content. |
 | `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
 | `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
 | `.menu`, `.menu__panel`, `.menu__heading`, `.menu__option` | The `<details>` dropdown (tenant/version selectors, Recent). |
@@ -279,6 +285,7 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/resources` | GET | Resources workspace: type rail with live counts, search, edit modal |
 | `/ui/editor` | GET | Standalone schema-driven resource editor |
 | `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request |
+| `/ui/json-view/render` | POST | Renders raw `application/json` as a highlighted, foldable HTML fragment; applies no FHIR semantics and retains no payload |
 | `/ui/editor/expand` | GET | ValueSet expansion, proxied to `HFS_TERMINOLOGY_SERVER` |
 | `/ui/queries` | GET | Saved FHIR queries per resource type (#234) and the visual search builder |
 | `/ui/queries/params` | GET | Per-type search-parameter catalog backing the builder's datalist |

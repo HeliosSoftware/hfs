@@ -1668,7 +1668,16 @@ fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), En
         .ok_or_else(|| EntryParseError::Malformed("Entry request missing 'url'".to_string()))?
         .to_string();
 
-    let resource = entry.get("resource").cloned();
+    let mut resource = entry.get("resource").cloned();
+    // Per http.html#create the server ignores an id supplied on a POST — the
+    // same strip create_handler applies. Bundles that repeat shared resources
+    // under fixed ids (Synthea's Organizations/Practitioners) used to fail
+    // whole with "already exists" on the second transaction (#647).
+    if matches!(method, BundleMethod::Post)
+        && let Some(Value::Object(obj)) = resource.as_mut()
+    {
+        obj.remove("id");
+    }
     let full_url = entry
         .get("fullUrl")
         .and_then(|v| v.as_str())
