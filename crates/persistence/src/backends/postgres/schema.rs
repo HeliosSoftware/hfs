@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 19;
+pub const SCHEMA_VERSION: i32 = 20;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -340,6 +340,7 @@ async fn migrate_schema(
             16 => migrate_v16_to_v17(client).await?,
             17 => migrate_v17_to_v18(client).await?,
             18 => migrate_v18_to_v19(client).await?,
+            19 => migrate_v19_to_v20(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1030,6 +1031,68 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v19 -> v20: fold the sort key into the token index instead of carrying a
+/// second, recent-first copy of it.
+///
+/// v19 gave the fast path early termination by keying on
+/// `(…, last_updated DESC, resource_id)` with the filter column as payload. For
+/// a *range* predicate that is the only option: rows matching `value_date >= x`
+/// are spread across the whole parameter slice, so nothing but the sort key can
+/// lead the key. For an **equality** predicate it is the wrong trade, and run
+/// 33003169681 shows what it cost:
+///
+/// ```text
+/// idx_search_token_code_recent   18,522 scans   1,709,655,182 tuples read   5651 MB
+/// idx_search_date_recent         19,459 scans       38,484,711 tuples read    463 MB
+/// idx_search_quantity_recent     15,076 scans          948,762 tuples read    841 MB
+/// ```
+///
+/// ~92,000 tuples read per scan against 1,977 and 63. A selective
+/// `Observation?code=<rare LOINC>` walks ~92k index rows in `last_updated`
+/// order before it collects 22 matches — the classic trap where `LIMIT` costing
+/// assumes matches are spread uniformly along a scan ordered by something other
+/// than the filtered column. It took that shape from 202 ms to 1261 ms p99.
+///
+/// An equality predicate does not have to choose. Putting the value ahead of
+/// the sort key gives BOTH: the scan seeks straight to the one value, and
+/// *within* that value the rows are already in `last_updated DESC, resource_id
+/// ASC` order, so the LIMIT stops after 22 no matter how rare the code is.
+/// Selectivity stops mattering, which is why this also removes the need for the
+/// planner to choose between two token indexes at all — and the 5.6 GB
+/// recent-first copy goes with it, which the write path gets back.
+///
+/// `value_token_system` moves to the payload. The `system|code` form filters it
+/// from there during the same index-only scan; the `system|` form (system with
+/// no code) is served by `idx_search_token`, which v18 documents and does not
+/// touch.
+///
+/// Not applied to date or quantity: their predicates are ranges, and the two
+/// index shapes v19 created remain the right answer there — the planner picks
+/// value-first when the range is sparse (verified: plan section V) and
+/// recent-first when it is broad (section U).
+async fn migrate_v19_to_v20(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let index_stmts = [
+        "DROP INDEX IF EXISTS idx_search_token_code",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_code
+         ON search_index (tenant_id, resource_type, param_name, value_token_code,
+                          last_updated DESC, resource_id ASC)
+         INCLUDE (value_token_system)
+         WHERE value_token_code IS NOT NULL",
+        // Subsumed by the above at every selectivity, and the largest index in
+        // the schema at 5651 MB.
+        "DROP INDEX IF EXISTS idx_search_token_code_recent",
+    ];
+
+    for sql in index_stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v19->v20 failed: {}", e)))?;
     }
 
     Ok(())
