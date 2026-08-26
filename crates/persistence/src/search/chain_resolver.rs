@@ -130,6 +130,39 @@ fn intersect(mut sets: Vec<HashSet<String>>) -> HashSet<String> {
     acc
 }
 
+/// The resolver's internal page size. A balance between round trips and
+/// per-page memory; correctness never depends on it — [`search_all_pages`]
+/// drains every page.
+const RESOLVER_PAGE: u32 = 1000;
+
+/// Every match of `query`, across every page. The resolver's intermediate
+/// searches feed id rewrites, so letting a backend apply its default page
+/// size silently truncated every hop of every chain at 100 matches — both
+/// `patient.gender=female` and `=male` answered total=100 on a 21k-row
+/// Synthea set (#645).
+async fn search_all_pages<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    query: SearchQuery,
+) -> StorageResult<Vec<crate::types::StoredResource>>
+where
+    S: SearchProvider + ?Sized,
+{
+    let mut items = Vec::new();
+    let mut offset: u32 = 0;
+    loop {
+        let mut page = query.clone().with_count(RESOLVER_PAGE);
+        page.offset = Some(offset);
+        let result = storage.search(tenant, &page).await?;
+        let got = result.resources.items.len();
+        items.extend(result.resources.items);
+        if got < RESOLVER_PAGE as usize {
+            return Ok(items);
+        }
+        offset += RESOLVER_PAGE;
+    }
+}
+
 /// Resolves a forward chain (e.g. `subject.organization.name=Hospital`) to a
 /// set of `base_type` resource ids, walking from the deepest target back out.
 ///
@@ -215,11 +248,9 @@ where
             chain: vec![],
             components: vec![],
         });
-        let result = storage.search(tenant, &terminal_query).await?;
+        let items = search_all_pages(storage, tenant, terminal_query).await?;
         current_refs.extend(
-            result
-                .resources
-                .items
+            items
                 .into_iter()
                 .map(|r| format!("{}/{}", r.resource_type(), r.id())),
         );
@@ -243,8 +274,8 @@ where
                 chain: vec![],
                 components: vec![],
             });
-            let r = storage.search(tenant, &query).await?;
-            next_refs.extend(r.resources.items.into_iter().map(|res| {
+            let items = search_all_pages(storage, tenant, query).await?;
+            next_refs.extend(items.into_iter().map(|res| {
                 if i == 0 {
                     res.id().to_string()
                 } else {
@@ -325,11 +356,11 @@ where
         })
     };
 
-    let result = storage.search(tenant, &source_query).await?;
+    let items = search_all_pages(storage, tenant, source_query).await?;
 
     let extractor = SearchParameterExtractor::new(storage.search_param_registry(tenant));
     let mut ids = Vec::new();
-    for resource in result.resources.items {
+    for resource in items {
         let refs = extract_references(
             &extractor,
             storage,
