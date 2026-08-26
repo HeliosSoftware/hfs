@@ -7,7 +7,7 @@
 {% block content %}
 <header class="page-head page-head--row">
   <div>
-    <a href="/ui/bulk-import">‹ {{ i18n.t("bulk-import-all") }}</a>
+    <a class="back-link" href="/ui/bulk-import">‹ {{ i18n.t("bulk-import-all") }}</a>
     <h1 class="page-head__title">{{ name }}</h1>
   </div>
 
@@ -60,13 +60,15 @@
 <div class="card notice">{{ message }}</div>
 {% when None %}{% endmatch %}
 
-<section class="card detail">
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-recipient") }}</span><code>{{ recipient }}</code></div>
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-id") }}</span><code>{{ id }}</code></div>
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-submitter") }}</span><code>{{ submitter_display }}</code></div>
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-created") }}</span><div>{{ created_at }}</div></div>
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-status") }}</span><div>{{ status_label }}</div></div>
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-auth") }}</span><div>{{ auth }}</div></div>
+<section class="card panel bulk-import-section">
+  <div class="kv-grid">
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-recipient") }}</span><code>{{ recipient }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-id") }}</span><code>{{ id }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-submitter") }}</span><code>{{ submitter_display }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-created") }}</span><code>{{ created_at }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-status") }}</span><div>{{ status_label }}</div></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-auth") }}</span><div>{{ auth }}</div></div>
+  </div>
 
   <div class="detail__actions">
     <form method="post" action="/ui/bulk-import/{{ id }}/abort">
@@ -76,16 +78,14 @@
       <button type="submit" class="btn">{{ i18n.t("bulk-import-complete") }}</button>
     </form>
     <form method="post" action="/ui/bulk-import/{{ id }}/delete">
-      <button type="submit" class="btn">{{ i18n.t("bulk-import-delete") }}</button>
+      <button type="submit" class="btn btn--danger">{{ i18n.t("bulk-import-delete") }}</button>
     </form>
   </div>
 </section>
 
-<div hx-get="/ui/bulk-import/{{ id }}/status" hx-trigger="load" hx-swap="outerHTML">
-  <div id="bulk-status"></div>
-</div>
+<div id="bulk-status" hx-get="/ui/bulk-import/{{ id }}/status" hx-trigger="load" hx-swap="outerHTML"></div>
 
-<section class="card table-card">
+<section class="card table-card bulk-import-section">
   <div class="toolbar">
     <h2 class="toolbar__title">
       {{ i18n.t("bulk-import-manifests") }}
@@ -102,6 +102,14 @@
 
   <div class="table-wrap">
   <table class="data-table">
+    <thead>
+      <tr>
+        <th scope="col">{{ i18n.t("bulk-import-col-manifest-url") }}</th>
+        <th scope="col">{{ i18n.t("bulk-import-col-last-submitted") }}</th>
+        <th scope="col">{{ i18n.t("bulk-import-col-submit") }}</th>
+        <th scope="col">{{ i18n.t("bulk-import-col-actions") }}</th>
+      </tr>
+    </thead>
     <tbody>
       {% for m in manifests %}
       <tr>
@@ -137,7 +145,7 @@
     <h2 class="toolbar__title">{{ i18n.t("bulk-import-log") }}</h2>
   </div>
   {% if log.is_empty() %}
-  <p>{{ i18n.t("bulk-import-log-empty") }}</p>
+  <div class="empty-state">{{ i18n.t("bulk-import-log-empty") }}</div>
   {% else %}
   <pre class="detail__code">{% for line in log %}{{ line.at }}  {{ line.message }}
 {% endfor %}</pre>

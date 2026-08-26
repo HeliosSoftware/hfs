@@ -127,6 +127,48 @@ async fn creating_a_submission_lands_on_its_detail_page() {
 }
 
 #[tokio::test]
+async fn the_detail_page_uses_the_shared_full_width_components() {
+    let ctx = ctx("http://localhost:9/");
+    let detail_path = create_submission(&ctx).await;
+    let submission_id = detail_path.rsplit('/').next().unwrap();
+
+    let (status, html) = get(&ctx, &detail_path).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(html.contains(r#"<section class="card panel bulk-import-section">"#));
+    assert!(html.contains(r#"<section class="card table-card bulk-import-section">"#));
+    assert_eq!(html.matches("bulk-import-section").count(), 2);
+    assert!(html.contains(r#"<div class="kv-grid">"#));
+    assert!(!html.contains(r#"class="card detail""#));
+
+    // Machine-readable values stay mono while human-readable labels remain
+    // ordinary proportional text.
+    assert!(html.contains(r#"<span>Data Recipient</span><code>http://localhost:9</code>"#));
+    assert!(html.contains(&format!(
+        r#"<span>Submission ID</span><code>{submission_id}</code>"#
+    )));
+    assert!(html.contains(r#"<span>Submitter</span><code>"#));
+    assert!(html.contains(r#"<span>Created</span><code>"#));
+    assert!(html.contains(r#"<span>Status</span><div>Not Started</div>"#));
+    assert!(html.contains(r#"<span>Authentication</span><div>"#));
+
+    assert!(html.contains(r#"<a class="back-link" href="/ui/bulk-import">"#));
+    assert_eq!(html.matches("btn btn--danger").count(), 1);
+    assert_eq!(html.matches(r#"<th scope="col">"#).count(), 4);
+    for heading in ["Manifest URL", "Last Submitted", "Submit", "Actions"] {
+        assert!(html.contains(&format!(r#"<th scope="col">{heading}</th>"#)));
+    }
+    assert!(html.contains(r#"class="data-table__empty""#));
+    assert!(html.contains(r#"class="empty-state""#));
+
+    // The initial HTMX load is owned directly by the fragment host, so its
+    // outerHTML replacement does not leave a redundant wrapper behind.
+    assert!(html.contains(&format!(
+        r#"<div id="bulk-status" hx-get="{detail_path}/status" hx-trigger="load" hx-swap="outerHTML"></div>"#
+    )));
+}
+
+#[tokio::test]
 async fn manifests_can_be_added_and_removed() {
     let ctx = ctx("http://localhost:9/");
     let detail_path = create_submission(&ctx).await;
@@ -828,11 +870,18 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("processing 0% complete"), "{html}");
     assert!(html.contains("every 5s"), "keeps polling: {html}");
+    assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
+    assert!(html.contains(r#"class="kv-grid""#));
+    assert!(!html.contains(r#"class="card detail""#));
 
     // Second fetch: the mock flips to 200 -> result summary, polling stops.
     let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert!(!html.contains("every 5s"), "polling stopped: {html}");
     assert!(html.contains("Output files"), "{html}");
+    assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
+    assert!(html.contains(r#"class="kv-grid""#));
+    assert!(html.contains("Processing finished at <code>"), "{html}");
+    assert!(!html.contains(r#"class="card detail""#));
 
     // The log recorded the whole journey and the detail shows the summary.
     let (_, detail) = get(&ctx, &detail_path).await;
