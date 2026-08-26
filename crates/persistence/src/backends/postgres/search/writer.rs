@@ -49,7 +49,6 @@ fn parse_index_date(value: &str) -> Option<DateTime<Utc>> {
 #[derive(Default)]
 struct IndexRow {
     param_name: String,
-    param_url: String,
     composite_group: Option<i32>,
     value_string: Option<String>,
     value_string_folded: Option<String>,
@@ -77,13 +76,29 @@ struct IndexRow {
 /// Column list for the batched insert, in bind order. `COLUMNS.len() + 3`
 /// (tenant/type/resource id are bound once per row too) must stay under
 /// Postgres' 65535-parameter ceiling for `BATCH_ROWS` rows — see `BATCH_ROWS`.
+///
+/// `param_url` is deliberately absent. The column still exists and existing rows
+/// keep their values, but nothing in the workspace ever reads it — there is no
+/// SELECT, WHERE, or join on it in any backend, and `ReindexOptions`'
+/// `search_param_urls` (the one plausible consumer) has no consumers of its own.
+/// It held the SearchParameter's canonical URL, ~50-60 bytes, on every one of
+/// ~60M index rows: roughly 3 GB of an 8.5 GB heap, plus the WAL to write it,
+/// on an 11 GB Docker host. Left unbound it is NULL, which costs one bit in the
+/// null bitmap.
+///
+/// The contained-resource path below still binds it. That path inserts one row
+/// per value for `contained[]` entries only — under 5 MB of index across the
+/// whole corpus — so it is left alone rather than churned for no measurable
+/// gain.
+///
+/// Not dropped from the table: that DDL would run against real databases and
+/// cannot be undone, and it buys nothing over simply not writing the column.
 const ROW_COLUMNS: &[&str] = &[
     "tenant_id",
     "resource_type",
     "resource_id",
     "last_updated",
     "param_name",
-    "param_url",
     "composite_group",
     "value_string",
     "value_string_folded",
@@ -124,7 +139,6 @@ impl IndexRow {
     ) -> Option<Self> {
         let mut row = IndexRow {
             param_name: extracted.param_name.to_string(),
-            param_url: extracted.param_url.to_string(),
             composite_group: extracted.composite_group.map(|g| g as i32),
             ..Default::default()
         };
@@ -210,7 +224,6 @@ impl IndexRow {
     fn from_composite(row: &super::composite_rows::CompositeRow) -> Self {
         IndexRow {
             param_name: row.param_name.clone(),
-            param_url: row.param_url.clone(),
             composite_group: Some(row.composite_group),
             value_token_system: row.value_token_system.clone(),
             value_token_code: row.value_token_code.clone(),
@@ -328,7 +341,6 @@ impl PostgresSearchIndexWriter {
             params.push(Box::new(resource_id.to_string()));
             params.push(Box::new(last_updated));
             params.push(Box::new(row.param_name.clone()));
-            params.push(Box::new(row.param_url.clone()));
             params.push(Box::new(row.composite_group));
             params.push(Box::new(row.value_string.clone()));
             params.push(Box::new(row.value_string_folded.clone()));

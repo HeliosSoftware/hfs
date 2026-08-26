@@ -39,6 +39,30 @@ WHERE tenant_id = 'default' AND resource_type = 'Observation'
   AND param_name IN ('code-value-quantity','combo-code-value-quantity','code')
 GROUP BY param_name ORDER BY rows DESC;
 
+-- Full row census. The three-parameter query above was chosen to investigate the
+-- #279 composite work and says nothing about where the table's rows actually
+-- come from — which is what the import path pays for, one index insert per row
+-- per applicable index. Import is the worst remaining gap, so this reports the
+-- whole distribution: rows per (resource_type, param_name), rows per resource,
+-- and the total. Anything with a high rows/resource ratio is a candidate for
+-- writing fewer rows rather than for indexing them faster.
+\echo ''
+\echo '######## ROW CENSUS — top 30 (resource_type, param_name) by rows ########'
+SELECT resource_type, param_name, count(*) AS rows,
+       count(DISTINCT resource_id) AS resources,
+       round(count(*)::numeric / NULLIF(count(DISTINCT resource_id), 0), 2) AS rows_per_resource
+FROM search_index WHERE tenant_id = 'default'
+GROUP BY resource_type, param_name
+ORDER BY rows DESC LIMIT 30;
+
+\echo ''
+\echo '######## ROW CENSUS — totals ########'
+SELECT count(*) AS index_rows,
+       count(DISTINCT (resource_type, resource_id)) AS resources,
+       round(count(*)::numeric / NULLIF(count(DISTINCT (resource_type, resource_id)), 0), 1)
+         AS rows_per_resource
+FROM search_index WHERE tenant_id = 'default';
+
 SELECT pg_size_pretty(pg_total_relation_size('search_index')) AS search_index_total,
        pg_size_pretty(pg_relation_size('search_index'))       AS heap_only;
 
