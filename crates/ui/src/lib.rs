@@ -1607,22 +1607,6 @@ struct CompartmentsQuery {
     refresh: Option<String>,
 }
 
-/// Batch/Transaction workspace page (#476). The shell is server-rendered;
-/// batch.js drives upload â†’ preflight â†’ execute â†’ response entirely against
-/// the ordinary FHIR root, so this crate never touches storage.
-async fn batch_page(
-    State(state): State<WebState>,
-    locale: RequestLocale,
-    rv: RequestVersion,
-    rt: RequestTenant,
-) -> Response {
-    render(BatchPage {
-        status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
-        active_page: "batch",
-    })
-}
-
 /// Syntax-highlights arbitrary JSON without applying FHIR semantics or
 /// retaining the payload. Batch sends compact JSON and receives only HTML.
 async fn render_json_view(
@@ -1660,6 +1644,22 @@ async fn render_json_view(
         json_lines,
         json_view_id: String::new(),
         json_view_paths: false,
+    })
+}
+
+/// Batch/Transaction workspace page (#476). The shell is server-rendered;
+/// batch.js drives upload â†’ preflight â†’ execute â†’ response entirely against
+/// the ordinary FHIR root, so this crate never touches storage.
+async fn batch_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render(BatchPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "batch",
     })
 }
 
