@@ -63,7 +63,10 @@ async fn post_assigns_a_server_id_and_repeats_never_conflict() {
         .await;
     first.assert_status(StatusCode::CREATED);
     let first_id = first.json::<Value>()["id"].as_str().unwrap().to_string();
-    assert_ne!(first_id, "dup-test", "the client id is ignored, not honored");
+    assert_ne!(
+        first_id, "dup-test",
+        "the client id is ignored, not honored"
+    );
 
     // The exact POST that used to answer 409.
     let second = server

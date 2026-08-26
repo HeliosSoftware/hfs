@@ -1342,6 +1342,7 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
         std::sync::Arc::new(source),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     let response = app
@@ -1414,6 +1415,7 @@ async fn view_definitions_save_roundtrips_and_rejects_bad_json() {
         std::sync::Arc::new(source),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     let body = "id=&action=save&json=%7B%22resourceType%22%3A%22ViewDefinition%22%2C%22name%22%3A%22x%22%7D";
