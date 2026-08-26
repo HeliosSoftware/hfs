@@ -82,6 +82,14 @@
      opposite move per theme — darker on the light tint, lighter on the dark —
      so it is theme-specific (see the dark block). */
   --accent-text: #0a5f96;
+  --json-key: #0a5f96;
+  --json-string: #137333;
+  --json-number: #b4232d;
+  --json-literal: #6f42c1;
+  /* Destructive text clears 7:1 on the light card surface; the soft hover
+     fill keeps 5.8:1 contrast with the same foreground. */
+  --danger: #a61b12;
+  --danger-soft: #f0dfde;
   /* Menu panel input */
   --input-bg: #f5f5f5;
   /* Pill scrollbars: thin bar, fully-rounded track and thumb. */
@@ -107,6 +115,13 @@
   --muted: #a0a0a0;
   /* Selected-item accent text on the dark tint: lighter, to clear 4.5:1. */
   --accent-text: #7cc9ff;
+  --json-key: #7cc9ff;
+  --json-string: #7ee787;
+  --json-number: #ff7b72;
+  --json-literal: #d2a8ff;
+  /* Theme-specific destructive pair: 7.6:1 on the card and 5.6:1 on soft. */
+  --danger: #ff9a90;
+  --danger-soft: #453534;
   --divider: #000000;
   --divider-glint: rgb(255 255 255 / 12%);
   --outline: #353535;
@@ -1275,16 +1290,27 @@ textarea.field__input {
 }
 
 .field__hint--error {
-  color: rgb(220 38 38);
+  color: var(--danger);
 }
 
-.form-error {
-  margin-bottom: 12px;
+/* The one error treatment (#676): danger tokens, so it holds in both themes.
+   Block by default; the inline variant sits next to the button that raised
+   the error. */
+.alert {
+  display: block;
+  margin: 0 0 12px;
   padding: 10px 14px;
+  border: 1px solid var(--danger);
   border-radius: 10px;
-  background: rgb(220 38 38 / 10%);
-  color: #dc2626;
-  font-size: 14px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.alert--inline {
+  display: inline-block;
+  margin: 0;
+  padding: 5px 10px;
 }
 
 .col-num {
@@ -1575,6 +1601,22 @@ textarea.field__input {
   font-size: 13px;
   color: var(--muted);
 }
+
+.back-link,
+.back-link:visited {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+
+.back-link:hover {
+  text-decoration: underline;
+}
+
+.back-link:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
 }
 
 @layer pages {
@@ -1750,15 +1792,6 @@ textarea.field__input {
   color: var(--muted);
 }
 
-.query-error {
-  margin: 0 0 12px;
-  padding: 10px 14px;
-  font-size: 13px;
-  color: var(--text);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent);
-  border-radius: 10px;
-}
 
 @media (max-width: 900px) {
   .query-form {
@@ -1925,8 +1958,9 @@ textarea.field__input {
 .history__banner--same { color: var(--muted); }
 
 .history__banner--error {
-  background: var(--accent-soft);
-  border-color: var(--accent);
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 /* ---- the diff ---- */
@@ -2015,6 +2049,16 @@ textarea.field__input {
   grid-template-columns: 280px minmax(0, 1fr) 360px;
   gap: 20px;
   align-items: start;
+}
+
+/* Stacked section cards keep the page's vertical rhythm. Pages that lay
+   cards out in a flex/grid column get their spacing from the gap; this
+   covers the block-flow stacks (SQL Export, Files, Capability Statement,
+   the Bulk Import detail), where .card alone sat flush against the previous
+   one. The general sibling, not the adjacent one: htmx wrapper divs sit
+   between cards on the Bulk Import detail. */
+.content > .card ~ .card {
+  margin-top: 20px;
 }
 
 .filter-layout--two {
@@ -2306,13 +2350,15 @@ textarea.field__input {
   border-bottom: 0;
 }
 
-.data-table__empty td {
+.data-table__empty td,
+.empty-state {
+  margin: 0;
   color: var(--muted);
   text-align: center;
   padding: 32px 12px;
 }
 
-.data-table tbody tr:hover td,
+.data-table tbody tr:not(.data-table__empty):hover td,
 .data-table tbody tr[aria-selected="true"] td {
   background: var(--accent-soft);
 }
@@ -2465,6 +2511,16 @@ textarea.field__input {
 }
 
 @layer pages {
+/* Bulk Import detail: consistent rhythm between its non-empty cards. */
+.bulk-import-section {
+  margin-bottom: 16px;
+}
+
+/* Status cards have no actions or content after their sole grid. */
+#bulk-status.bulk-import-section > .kv-grid:only-child {
+  margin-bottom: 0;
+}
+
 /* Detail panel (right rail on the SearchParameter viewer) */
 
 .detail {
@@ -3231,8 +3287,9 @@ textarea.field__input {
 }
 
 .nl-answer--error {
-  background: var(--input-bg);
-  border-color: var(--muted);
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 .nl-answer__caveats-heading {
@@ -3505,7 +3562,7 @@ textarea.field__input {
 
 .json-line__fold {
   flex: 0 0 auto;
-  width: 16px;
+  width: 24px;
   text-align: center;
   color: var(--muted);
   user-select: none;
@@ -3513,7 +3570,15 @@ textarea.field__input {
 
 .json-line__arrow {
   cursor: pointer;
-  display: inline-block;
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
   transition: transform 0.1s;
 }
 
@@ -3526,11 +3591,11 @@ textarea.field__input {
 .json-line--collapsed .json-line__summary { display: inline; padding-left: 2px; }
 
 /* Syntax highlighting. */
-.jt--key { color: var(--accent); }
-.jt--string { color: #1a7f37; }
-.jt--number { color: #cf222e; }
+.jt--key { color: var(--json-key); }
+.jt--string { color: var(--json-string); }
+.jt--number { color: var(--json-number); }
 .jt--bool,
-.jt--null { color: #8250df; font-weight: 600; }
+.jt--null { color: var(--json-literal); font-weight: 600; }
 .jt--punct { color: var(--muted); }
 
 /* ---- version rail ---- */
@@ -3571,16 +3636,8 @@ textarea.field__input {
 }
 .editor-validity--ok { color: var(--accent); }
 
-.editor__parse-error {
-  padding: 12px 14px;
-  margin-bottom: 12px;
-  font-size: 13px;
-  background: var(--input-bg);
-  border: 1px solid var(--muted);
-  border-radius: 10px;
-}
 
-.editor__parse-error code {
+.alert code {
   display: block;
   margin-top: 6px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -3692,7 +3749,7 @@ textarea.field__input {
 .editor-row__error {
   margin: 2px 0 4px 0;
   font-size: 12px;
-  color: #cf222e;
+  color: var(--danger);
 }
 
 /* ---- "what can I add here?" ---- */
@@ -4055,11 +4112,11 @@ textarea.field__input {
   background: #eaf6ec;
 }
 .modal__status--error {
-  color: #cf222e;
+  color: var(--danger);
   font-weight: 600;
-  background: #ffebe9;
-  border-top: 1px solid #ffcdca;
-  border-bottom: 1px solid #ffcdca;
+  background: var(--danger-soft);
+  border-top: 1px solid var(--danger);
+  border-bottom: 1px solid var(--danger);
 }
 
 .modal__body {
@@ -4448,16 +4505,37 @@ textarea.field__input {
 }
 
 .request-strip__label {
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+/* The request line uses the app's mono stack at an explicit size — with no
+   rule it fell back to the UA's default monospace, visibly larger than the
+   surrounding text (#674). */
+.request-strip code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
 }
 
 .batch-tabs {
   display: flex;
   gap: 6px;
   margin-bottom: 8px;
+}
+
+/* Card content sits inset from the card border (#674): the tab row, entry
+   list, and JSON pane pick up the card's horizontal padding instead of
+   running edge-to-edge. */
+.card > .batch-tabs {
+  margin: 12px 14px 8px;
+}
+
+.card > .batch-rows,
+.card > .batch-json {
+  margin: 0 14px 12px;
 }
 
 .batch-tab {
@@ -4549,16 +4627,32 @@ textarea.field__input {
   overflow-x: auto;
 }
 
+.batch-row__body .json-view,
+.batch-json .json-view {
+  padding: 0;
+  max-height: 60vh;
+}
+
+.json-view__fallback {
+  margin: 0;
+  white-space: pre;
+  font: inherit;
+}
+
 .batch-footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
   margin-top: 14px;
 }
 
-.batch-footer__right {
-  display: flex;
-  gap: 8px;
+.batch-footer--top {
+  margin: 0 0 12px;
+}
+
+.batch-footer--end {
+  justify-content: flex-end;
 }
 
 .batch-badge {
@@ -4577,10 +4671,6 @@ textarea.field__input {
   color: var(--muted);
 }
 
-.batch-error {
-  margin-top: 10px;
-  color: var(--danger);
-}
 
 .batch-json {
   margin: 0;

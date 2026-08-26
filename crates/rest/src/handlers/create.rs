@@ -104,6 +104,18 @@ where
         });
     }
 
+    // Per http.html#create "the server ignores the id provided in the
+    // resource" — a create always assigns a fresh server id. Honoring a
+    // client id made a second POST of the same document answer 409, which
+    // broke standard transaction ingestion of bundles that repeat shared
+    // resources (#647). Internal callers that rely on caller-supplied ids
+    // for idempotency (spec seeding) go straight to storage, not through
+    // this handler.
+    let mut resource = resource;
+    if let Some(obj) = resource.as_object_mut() {
+        obj.remove("id");
+    }
+
     // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
     state
         .validation()

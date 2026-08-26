@@ -8,8 +8,49 @@ use axum::{
     http::{Request, StatusCode, header},
     routing::get,
 };
+use helios_persistence::{
+    StorageResult,
+    core::{SettingsStore, StoredUserSettings},
+};
 use http_body_util::BodyExt;
+use serde_json::Value;
+use std::sync::Arc;
 use tower::ServiceExt;
+
+struct NoSettingsAccess;
+
+#[async_trait::async_trait]
+impl SettingsStore for NoSettingsAccess {
+    async fn get_settings(&self, _user_key: &str) -> StorageResult<Option<StoredUserSettings>> {
+        panic!("JSON preview must not read settings")
+    }
+
+    async fn put_settings(
+        &self,
+        _user_key: &str,
+        _document: Value,
+        _if_match_version: Option<i64>,
+    ) -> StorageResult<StoredUserSettings> {
+        panic!("JSON preview must not write settings")
+    }
+
+    async fn patch_settings(
+        &self,
+        _user_key: &str,
+        _merge_patch: Value,
+        _if_match_version: Option<i64>,
+    ) -> StorageResult<StoredUserSettings> {
+        panic!("JSON preview must not write settings")
+    }
+
+    async fn delete_settings(&self, _user_key: &str) -> StorageResult<bool> {
+        panic!("JSON preview must not delete settings")
+    }
+
+    async fn purge_tenant_settings(&self, _tenant_id: &str) -> StorageResult<u64> {
+        panic!("JSON preview must not purge settings")
+    }
+}
 
 fn app() -> Router {
     app_with(nl(true, true))
@@ -45,9 +86,68 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
     )
 }
 
+fn app_with_body_limit(max_body_size: usize) -> Router {
+    helios_ui::mount_with_conformance_source_and_body_limit(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        max_body_size,
+    )
+}
+
+fn production_app() -> Router {
+    helios_ui::mount(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        "http://127.0.0.1:9".to_string(),
+        Arc::new(helios_auth::NoOpOutboundAuthProvider),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+    )
+}
+
+fn app_with_unavailable_settings() -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        Some(Arc::new(NoSettingsAccess)),
+        "default".to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+    )
+}
+
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    String::from_utf8(bytes.to_vec()).unwrap()
+    // Normalized to LF: what line endings the response carries depends on how
+    // the build checkout materialized the templates (#671), which is exactly
+    // what these assertions must not depend on.
+    String::from_utf8(bytes.to_vec())
+        .unwrap()
+        .replace("\r\n", "\n")
 }
 
 fn assert_recent_types_are_pinned_above_the_list(html: &str) {
@@ -675,6 +775,136 @@ async fn editor_renders_a_foldable_line_numbered_json_view() {
     // Syntax highlighting: keys and strings are tokenised.
     assert!(html.contains("jt--key"));
     assert!(html.contains("jt--string"));
+    assert_eq!(html.matches(r#"id="json-view""#).count(), 1);
+    assert!(html.contains(r#"data-jpath="name.0.family""#));
+    assert!(html.contains(r#"class="json-line__num" aria-hidden="true""#));
+    assert!(html.contains(r#"aria-expanded="true""#));
+}
+
+#[tokio::test]
+async fn json_view_endpoint_renders_a_normal_bundle_without_editor_contracts() {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"resourceType":"Bundle","type":"batch","entry":[{"resource":{"resourceType":"Patient","a\"\\\n\t\u0001":"<script>alert(1)</script>"},"request":{"method":"POST","url":"Patient"}}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let html = body_text(response).await;
+    assert!(html.contains(r#"class="json-view""#));
+    assert!(!html.contains(r#"id="json-view""#));
+    assert!(!html.contains("data-jpath"));
+    assert!(html.contains("&#60;script&#62;alert(1)&#60;/script&#62;"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+    assert!(html.contains(r#"a\&#34;\\\n\t\u0001"#));
+}
+
+#[tokio::test]
+async fn json_view_endpoint_rejects_compact_structural_amplification() {
+    // Roughly 20 KiB on the wire used to expand to about 3.5 MiB of HTML.
+    // It is comfortably below the default body limit but above the rendering
+    // budget, so rejection happens before a large line Vec/template String.
+    let document = format!(
+        "[{}]",
+        std::iter::repeat_n("0", 10_000)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert!(document.len() < 25_000);
+
+    let response = app()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(document))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn json_view_endpoint_skips_preferences_but_keeps_locale_negotiation() {
+    let response = app_with_unavailable_settings()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT_LANGUAGE, "es")
+                .body(Body::from(r#"{"nested":{"n":1}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"aria-label="Alternar sección JSON""#));
+}
+
+#[tokio::test]
+async fn json_view_endpoint_rejects_invalid_or_oversized_json() {
+    let invalid = app()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let oversized = app_with_body_limit(16)
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"long":"01234567890123456789"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn production_mount_applies_the_default_json_view_body_limit() {
+    let app = production_app();
+
+    let normal = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"resourceType":"Patient"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(normal.status(), StatusCode::OK);
+
+    let over_default_limit = format!(r#"{{"value":"{}"}}"#, "x".repeat(10 * 1024 * 1024));
+    let oversized = app
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(over_default_limit))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]
@@ -748,7 +978,7 @@ async fn editor_validates_on_every_mutation_and_anchors_the_issue() {
 async fn editor_keeps_the_users_text_when_the_json_is_broken() {
     let html = edit("doc=%7B%22resourceType%22%3A&op=").await;
 
-    assert!(html.contains("editor__parse-error"));
+    assert!(html.contains("class=\"alert\""));
     // Their text is handed straight back, not discarded.
     assert!(html.contains("resourceType"));
 }
@@ -904,10 +1134,17 @@ async fn resources_deep_links_focus_the_selected_type() {
     // list is a flat rail in the content under the fixed page head (app-shell
     // pattern shared with Search Parameters), not a full-height menu panel.
     assert!(html.contains(r#"data-selected-type="Observation""#));
-    assert!(html.contains(
-        r#"data-type="Observation" data-full-name="Observation"
-   href="/ui/resources?type=Observation" title="Observation" aria-current="true""#
-    ));
+    // Debug-printed on failure so a byte-level mismatch (a stray CR, an
+    // attribute drift) is visible in CI output instead of a blind false.
+    let anchor = r#"data-type="Observation" data-full-name="Observation""#;
+    // Explicit \n, not a raw literal spanning source lines: the literal must
+    // not inherit whatever endings this file was checked out with.
+    let expected = "data-type=\"Observation\" data-full-name=\"Observation\"\n   href=\"/ui/resources?type=Observation\" title=\"Observation\" aria-current=\"true\"";
+    assert!(
+        html.contains(expected),
+        "rail entry mismatch; rendered around the anchor: {:?}",
+        html.find(anchor).map(|i| &html[i..html.len().min(i + 220)]),
+    );
     assert!(html.contains(r#"class="filter-rail" id="resources""#));
     // Create and the builder prefill both follow the deep-linked type.
     assert!(html.contains("Create new Observation"));
@@ -1182,6 +1419,7 @@ async fn batch_page_serves_the_workspace_shell() {
     // The semantics copy rides in as data for batch.js.
     assert!(html.contains("data-msg-semantics-transaction"));
     assert!(html.contains(r#"src="/ui/assets/batch.js""#));
+    assert!(html.contains(r#"src="/ui/assets/json-view.js""#));
 }
 
 /* #546: creating a resource with required elements must not dump duplicated,
@@ -1258,10 +1496,10 @@ async fn editor_opens_the_root_picker_on_an_empty_document() {
 }
 
 /// #649: SQL on FHIR is a top-level nav section whose five children are real
-/// routes — the dead `nav-item--soon` placeholder is gone — and each stub
-/// page answers 200 and marks its own nav entry current.
+/// routes — the dead `nav-item--soon` placeholder is gone — and each page
+/// answers 200 and marks its own nav entry current.
 #[tokio::test]
-async fn sql_on_fhir_section_navigates_to_real_stub_pages() {
+async fn sql_on_fhir_section_navigates_to_real_pages() {
     let response = app()
         .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
         .await
@@ -1301,16 +1539,223 @@ async fn sql_on_fhir_section_navigates_to_real_stub_pages() {
             html.contains(&format!(r#"href="{href}" aria-current="page""#)),
             "{href} does not mark its nav entry current"
         );
-        // A stub states which server operation already serves the data; View
-        // Definitions is the live workspace and asserts its own content in
-        // `view_definitions_workspace_lists_edits_and_previews`.
-        if href != "/ui/sql/view-definitions" {
-            assert!(
-                html.contains("sql-run") || html.contains("/export/"),
-                "{href}"
-            );
-        }
     }
+}
+
+/// #649: SQL Export offers the stored subjects, follows a job by ?job= —
+/// running with a cancel form, finished with a link to Files — and Files
+/// tables a finished job's manifest as download links.
+#[tokio::test]
+async fn sql_export_and_files_follow_a_job_through_the_manifest() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "exportId", "valueString": "job-9"},
+            {"name": "_format", "valueCode": "csv"},
+            {"name": "output", "part": [
+                {"name": "name", "valueString": "patients"},
+                {"name": "location", "valueUri": "http://s/export/job-9/patients-0.csv"},
+            ]},
+        ]
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![
+                serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1",
+                "name": "patients", "resource": "Patient"}),
+            ],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![
+                serde_json::json!({"resourceType": "Library", "id": "q1", "name": "counts",
+                "status": "active",
+                "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+            ],
+        )
+        .with_export_status(helios_ui::SqlExportStatus::Running(Some("2/3".to_string())))
+        .with_export_manifest(Ok(manifest));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+    );
+
+    // The form offers both stored subjects.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/export").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="ViewDefinition/vd1""#));
+    assert!(html.contains(r#"value="Library/q1""#));
+
+    // Starting redirects to the job the gateway handed back.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/export")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("subject=ViewDefinition%2Fvd1&format=csv"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/export?job=static-job&started=1"
+    );
+    // No subject selected: the page explains instead of submitting.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/export")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("format=csv"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("at least one subject"));
+
+    // A running job shows its progress and the cancel form.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/export?job=job-9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("2/3"));
+    assert!(html.contains("/ui/sql/export/cancel"));
+
+    // Files tables the manifest with its download links.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/files?job=job-9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("patients"));
+    assert!(html.contains(r#"href="http://s/export/job-9/patients-0.csv""#));
+    assert!(html.contains(">csv<"));
+}
+
+/// #649: the SQL Queries and SQL Views workspaces list Libraries of their own
+/// kind only, decode the SQL attachment into its editor pane, and save via a
+/// plain form that re-embeds the SQL and redirects to the stored library.
+#[tokio::test]
+async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]},
+            "content": [{"contentType": "application/sql", "data": "U0VMRUNUIDE="}]}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "draft",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+    );
+
+    // The Queries page lists only the sql-query Library and decodes its SQL.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("patient_counts"));
+    assert!(!html.contains("flat_patients"));
+    assert!(html.contains("SELECT 1"));
+    assert!(html.contains(r#"name="sql""#));
+    assert!(html.contains(r#"data-type="Library""#));
+
+    // The Views page holds the other kind.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/views").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("flat_patients"));
+    assert!(!html.contains("patient_counts"));
+
+    // Save re-embeds the SQL pane and redirects to the stored library.
+    let body = "id=&action=save&sql=SELECT%202&json=%7B%22resourceType%22%3A%22Library%22%2C%22name%22%3A%22x%22%7D";
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/queries?lib=static-created&saved=1"
+    );
+
+    // Bad JSON re-renders with both panes preserved.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/views")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("id=&action=save&sql=SELECT%203&json=%7Bnope"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(html.contains("{nope"));
+    assert!(html.contains("SELECT 3"));
 }
 
 /// #649: the View Definitions workspace lists stored views in the rail

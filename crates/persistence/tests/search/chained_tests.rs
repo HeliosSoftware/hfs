@@ -257,3 +257,75 @@ async fn test_reverse_chaining_no_matches() {
 
     assert!(result.resources.is_empty());
 }
+
+/// #645: the resolver's intermediate searches must drain every page. With the
+/// terminal hop left at the backend's default page size, any hop matching
+/// more than 100 resources silently truncated the whole chain — both
+/// `patient.gender=female` and `=male` answered exactly total=100 on a
+/// Synthea set where each should have been in the thousands.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_chained_search_survives_hops_beyond_the_default_page() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    // 150 female patients, one Observation each: the terminal hop
+    // (Patient?gender=female) matches more than one default page.
+    for i in 0..150 {
+        let pid = format!("chained-page-p{i}");
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                &pid,
+                json!({"resourceType": "Patient", "id": pid, "gender": "female"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let oid = format!("chained-page-o{i}");
+        backend
+            .create_or_update(
+                &tenant,
+                "Observation",
+                &oid,
+                json!({"resourceType": "Observation", "id": oid, "status": "final",
+                       "code": {"text": "hr"},
+                       "subject": {"reference": format!("Patient/{pid}")}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "patient".to_string(),
+        param_type: SearchParamType::Reference,
+        modifier: None,
+        values: vec![SearchValue::eq("female")],
+        chain: vec![ChainedParameter {
+            reference_param: "patient".to_string(),
+            target_type: Some("Patient".to_string()),
+            target_param: "gender".to_string(),
+        }],
+        components: vec![],
+    });
+
+    let rewritten = resolve_chains(&backend, &tenant, &query).await.unwrap();
+    let id_filter = rewritten
+        .parameters
+        .iter()
+        .find(|p| p.name == "_id")
+        .expect("chains rewrite into an _id filter");
+    assert_eq!(
+        id_filter.values.len(),
+        150,
+        "every matching id survives, not just the first page"
+    );
+
+    let result = backend
+        .search(&tenant, &rewritten.with_count(1000))
+        .await
+        .unwrap();
+    assert_eq!(result.resources.items.len(), 150);
+}

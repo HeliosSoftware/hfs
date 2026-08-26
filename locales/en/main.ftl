@@ -505,6 +505,7 @@ editor-primitive-extension-hint = This value carries extensions of its own (a `_
 
 editor-collapse-all = Collapse all
 editor-expand-all = Expand all
+json-view-toggle-fold = Toggle JSON section
 editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
@@ -542,16 +543,15 @@ batch-tab-actions = Actions
 batch-tab-json = Bundle JSON
 batch-no-body = (no body — this entry only addresses a resource)
 batch-cancel = Cancel
-batch-upload-another = Upload another
 batch-execute = Execute
+batch-plan-heading = Execution Plan
+batch-done = Done
 batch-response-heading = Per-Action Outcomes
 batch-sum-created = created
 batch-sum-updated = updated
 batch-sum-other = read/other
 batch-sum-failed = failed
 batch-request-failed = The request failed
-batch-back = Back to Bundle
-batch-execute-again = Execute again
 
 ## Bulk Import workspace (#527)
 
@@ -610,6 +610,10 @@ bulk-import-field-output-format-hint = The format for the Bulk Data files in the
 bulk-import-field-headers = File request headers
 bulk-import-field-headers-hint = HTTP headers the Data Recipient should use when requesting a data file, one "Name: value" per line.
 bulk-import-manifests = Manifests
+bulk-import-col-manifest-url = Manifest URL
+bulk-import-col-last-submitted = Last Submitted
+bulk-import-col-submit = Submit
+bulk-import-col-actions = Actions
 bulk-import-no-manifests = No manifests yet. Add one to submit data.
 bulk-import-submit = Submit
 bulk-import-submit-all = Submit All
@@ -743,28 +747,21 @@ cap-unavailable = The CapabilityStatement could not be fetched from the server �
 
 ## SQL on FHIR section stubs (#649)
 
-sql-stub-heading = Coming Soon
-sql-stub-planned = Planned
-sql-stub-api = Serving API
 
 sql-vd-title = View Definitions
 sql-vd-lede = Author and manage the ViewDefinitions that SQL on FHIR runs flatten resources with.
 
 sql-queries-title = SQL Queries
 sql-queries-lede = Run SQL on FHIR queries against this server.
-sql-queries-body = Compose a query, run it, and inspect the resulting rows inline.
 
 sql-views-title = SQL Views
 sql-views-lede = Reusable SQL views layered over ViewDefinitions.
-sql-views-body = SQLView libraries and the views they define, resolved with their dependencies.
 
 sql-export-title = SQL Export
 sql-export-lede = Long-running SQL on FHIR export jobs.
-sql-export-body = Start an export, follow its progress, and cancel jobs that are no longer needed.
 
 sql-files-title = Files
 sql-files-lede = Manifests and output files produced by SQL exports.
-sql-files-body = Browse each job's manifest and download its output files.
 
 ## View Definitions workspace (#649)
 
@@ -787,3 +784,42 @@ vd-delete-failed = Deleting the view definition failed.
 vd-json-heading = Definition (JSON)
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
+
+## SQL Queries / SQL Views workspaces (#649)
+
+sql-queries-new-title = New SQL Query
+sql-views-new-title = New SQL View
+lib-filter = Filter libraries
+lib-none = No libraries yet.
+lib-empty-lede = Create your first library with Create New.
+lib-degraded = The library list could not be loaded.
+lib-sql-heading = SQL
+lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
+lib-delete-failed = Deleting the library failed.
+
+## SQL Export and Files pages (#649)
+
+export-start-failed = Starting the export failed.
+export-started = Export started.
+export-cancelled = Cancellation requested.
+export-job-heading = Export Job
+export-job-id = Job id
+export-job-state = State
+export-state-running = Running
+export-state-done = Finished
+export-state-unknown = This job is unknown — it may have been cancelled or reclaimed.
+export-refresh = Refresh
+export-cancel = Cancel Job
+export-view-files = View Files
+export-new-heading = New Export
+export-no-subjects = Nothing to export yet — create a ViewDefinition first.
+export-format = Output format
+export-start = Start Export
+files-job-heading = Export Job
+files-load = Load Manifest
+files-error = Loading the manifest failed.
+files-outputs-heading = Outputs
+files-col-output = Output
+files-col-downloads = Downloads
+files-shard = File { $n }
+files-empty = The job produced no output files.

@@ -501,6 +501,7 @@ editor-primitive-extension-hint = Este valor lleva extensiones propias (un herma
 
 editor-collapse-all = Colapsar todo
 editor-expand-all = Expandir todo
+json-view-toggle-fold = Alternar sección JSON
 editor-edit-raw = Editar crudo
 editor-versions = Versiones
 editor-versions-none = Sin versiones anteriores.
@@ -539,16 +540,15 @@ batch-tab-actions = Acciones
 batch-tab-json = JSON del bundle
 batch-no-body = (sin cuerpo — esta entrada solo direcciona un recurso)
 batch-cancel = Cancelar
-batch-upload-another = Subir otro
 batch-execute = Ejecutar
+batch-plan-heading = Plan de ejecución
+batch-done = Hecho
 batch-response-heading = Resultados por acción
 batch-sum-created = creados
 batch-sum-updated = actualizados
 batch-sum-other = lecturas/otros
 batch-sum-failed = fallidos
 batch-request-failed = La petición falló
-batch-back = Volver al bundle
-batch-execute-again = Ejecutar de nuevo
 
 ## Bulk Import workspace (#527)
 
@@ -607,6 +607,10 @@ bulk-import-field-output-format-hint = El formato de los archivos Bulk Data del 
 bulk-import-field-headers = Cabeceras de petición de archivos
 bulk-import-field-headers-hint = Cabeceras HTTP que el receptor debe usar al pedir un archivo de datos, una "Nombre: valor" por línea.
 bulk-import-manifests = Manifests
+bulk-import-col-manifest-url = URL del manifiesto
+bulk-import-col-last-submitted = Último envío
+bulk-import-col-submit = Enviar
+bulk-import-col-actions = Acciones
 bulk-import-no-manifests = Aún no hay manifests. Añada uno para enviar datos.
 bulk-import-submit = Enviar
 bulk-import-submit-all = Enviar todo
@@ -740,28 +744,21 @@ cap-unavailable = No se pudo obtener la CapabilityStatement del servidor — la 
 
 ## Stubs de la sección SQL on FHIR (#649)
 
-sql-stub-heading = Próximamente
-sql-stub-planned = Previsto
-sql-stub-api = API que lo sirve
 
 sql-vd-title = Definiciones de vistas
 sql-vd-lede = Crea y gestiona las ViewDefinitions con las que SQL on FHIR aplana recursos.
 
 sql-queries-title = Consultas SQL
 sql-queries-lede = Ejecuta consultas SQL on FHIR contra este servidor.
-sql-queries-body = Redacta una consulta, ejecútala e inspecciona las filas resultantes en línea.
 
 sql-views-title = Vistas SQL
 sql-views-lede = Vistas SQL reutilizables construidas sobre ViewDefinitions.
-sql-views-body = Bibliotecas SQLView y las vistas que definen, resueltas con sus dependencias.
 
 sql-export-title = Exportación SQL
 sql-export-lede = Trabajos de exportación SQL on FHIR de larga duración.
-sql-export-body = Inicia una exportación, sigue su progreso y cancela los trabajos que ya no necesites.
 
 sql-files-title = Archivos
 sql-files-lede = Manifiestos y archivos de salida producidos por las exportaciones SQL.
-sql-files-body = Consulta el manifiesto de cada trabajo y descarga sus archivos de salida.
 
 ## Espacio de definiciones de vistas (#649)
 
@@ -784,3 +781,42 @@ vd-delete-failed = No se pudo eliminar la definición de vista.
 vd-json-heading = Definición (JSON)
 vd-results-heading = Resultados
 vd-results-empty = La vista no produjo filas.
+
+## Espacios de consultas y vistas SQL (#649)
+
+sql-queries-new-title = Nueva consulta SQL
+sql-views-new-title = Nueva vista SQL
+lib-filter = Filtrar bibliotecas
+lib-none = Aún no hay bibliotecas.
+lib-empty-lede = Crea tu primera biblioteca con «Crear nueva».
+lib-degraded = No se pudo cargar la lista de bibliotecas.
+lib-sql-heading = SQL
+lib-delete-confirm = ¿Eliminar «{ $name }»? Esta acción no se puede deshacer.
+lib-delete-failed = No se pudo eliminar la biblioteca.
+
+## Páginas de exportación SQL y archivos (#649)
+
+export-start-failed = No se pudo iniciar la exportación.
+export-started = Exportación iniciada.
+export-cancelled = Cancelación solicitada.
+export-job-heading = Trabajo de exportación
+export-job-id = Id del trabajo
+export-job-state = Estado
+export-state-running = En ejecución
+export-state-done = Terminado
+export-state-unknown = Trabajo desconocido: puede haberse cancelado o purgado.
+export-refresh = Actualizar
+export-cancel = Cancelar trabajo
+export-view-files = Ver archivos
+export-new-heading = Nueva exportación
+export-no-subjects = Nada que exportar todavía: crea primero una ViewDefinition.
+export-format = Formato de salida
+export-start = Iniciar exportación
+files-job-heading = Trabajo de exportación
+files-load = Cargar manifiesto
+files-error = No se pudo cargar el manifiesto.
+files-outputs-heading = Salidas
+files-col-output = Salida
+files-col-downloads = Descargas
+files-shard = Archivo { $n }
+files-empty = El trabajo no produjo archivos de salida.

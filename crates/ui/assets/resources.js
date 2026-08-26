@@ -177,10 +177,6 @@
 
   /* Delegated editor interactions within the modal body. */
   editorBody.addEventListener("click", function (event) {
-    var arrow = event.target.closest("[data-fold]");
-    if (arrow) { toggleFold(arrow.dataset.fold); return; }
-    var foldAllBtn = event.target.closest("[data-json-fold]");
-    if (foldAllBtn) { setAllFolds(foldAllBtn.dataset.jsonFold === "all"); return; }
     if (event.target.id === "editor-json-edit") {
       var raw = editorBody.querySelector("#editor-json-raw");
       var viewEl = editorBody.querySelector("#json-view");
@@ -280,30 +276,6 @@
       item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) < 0;
     });
   });
-
-  /* JSON fold helpers, scoped to the modal body. */
-  function toggleFold(foldId) {
-    var opener = editorBody.querySelector('.json-line[data-fold-id="' + foldId + '"]');
-    if (!opener) return;
-    opener.classList.toggle("json-line--collapsed", !opener.classList.contains("json-line--collapsed"));
-    reflowFolds();
-  }
-  function setAllFolds(collapse) {
-    editorBody.querySelectorAll(".json-line--foldable").forEach(function (o) {
-      if (o.dataset.parents) o.classList.toggle("json-line--collapsed", collapse);
-    });
-    reflowFolds();
-  }
-  function reflowFolds() {
-    editorBody.querySelectorAll(".json-line").forEach(function (line) {
-      var parents = (line.dataset.parents || "").split(" ");
-      line.hidden = parents.some(function (p) {
-        if (!p) return false;
-        var o = editorBody.querySelector('.json-line[data-fold-id="' + p + '"]');
-        return o && o.classList.contains("json-line--collapsed");
-      });
-    });
-  }
 
   function openResource(type, id) {
     current = { type: type, id: id };

@@ -25,7 +25,15 @@
       })
       .catch(function (error) {
         btn.disabled = false;
-        window.alert(btn.dataset.failed + " (" + error.message + ")");
+        /* The shared error treatment, next to the button that failed (#676) —
+           not a native alert dialog. Replaced on the next attempt. */
+        var existing = btn.parentNode.querySelector(".alert");
+        if (existing) existing.remove();
+        var note = document.createElement("span");
+        note.className = "alert alert--inline";
+        note.setAttribute("role", "alert");
+        note.textContent = btn.dataset.failed + " (" + error.message + ")";
+        btn.insertAdjacentElement("afterend", note);
       });
   });
 })();

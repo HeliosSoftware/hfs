@@ -175,6 +175,14 @@ async fn the_export_page_uses_form_panels_with_name_and_hint_up_top() {
 }
 
 #[tokio::test]
+async fn the_active_exports_page_uses_the_shared_back_link() {
+    let (base, _) = serve().await;
+    let (status, html) = get_text(&base, "/ui/bulk-export/active").await;
+    assert_eq!(status, 200);
+    assert!(html.contains(r#"<a class="back-link" href="/ui/bulk-export">"#));
+}
+
+#[tokio::test]
 async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     let (base, mock) = serve().await;
 
