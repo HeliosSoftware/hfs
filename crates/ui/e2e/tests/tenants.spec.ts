@@ -64,7 +64,7 @@ test.describe("tenants", () => {
     await tenants.addForm.locator("input[name=id]").fill(id);
     await tenants.addForm.locator("input[name=display_name]").fill("Second");
     await tenants.addForm.locator("button[type=submit]").click();
-    await expect(page.locator("#tenant-rows .form-error")).toContainText("already exists");
+    await expect(page.locator("#tenant-rows .alert")).toContainText("already exists");
     await expect(tenants.addForm.locator("input[name=id]")).toHaveValue(id);
     await expect(tenants.addForm.locator("input[name=display_name]")).toHaveValue("Second");
   });

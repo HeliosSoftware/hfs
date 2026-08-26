@@ -38,11 +38,19 @@
       <span>{{ i18n.t("batch-drop-browse") }}</span>
     </button>
     <input type="file" id="batch-file" accept=".json,application/json,application/fhir+json" hidden>
-    <p class="batch-error" id="batch-upload-error" role="alert" hidden></p>
+    <p class="alert" id="batch-upload-error" role="alert" hidden></p>
   </section>
 
   <!-- ============ Stage 2: preflight ============ -->
   <section id="batch-preflight" hidden>
+    <!-- Cancel/Execute at the top as well as the bottom (#675): a large
+         bundle must not push the only actions below the fold. Both copies
+         drive the same handlers. -->
+    <div class="batch-footer batch-footer--top">
+      <button type="button" class="btn" id="batch-cancel-top">{{ i18n.t("batch-cancel") }}</button>
+      <button type="button" class="btn btn--primary" id="batch-execute-top">{{ i18n.t("batch-execute") }}</button>
+    </div>
+
     <div class="request-strip">
       <span class="request-strip__label">{{ i18n.t("batch-request") }}</span>
       <code id="batch-request-line"></code>
@@ -53,6 +61,9 @@
     <p class="notice" id="batch-semantics"></p>
 
     <div class="card">
+      <div class="card-head">
+        <h3><span class="icon">{% include "icons/layers.svg" %}</span> {{ i18n.t("batch-plan-heading") }}</h3>
+      </div>
       <div class="batch-tabs" role="tablist">
         <button type="button" class="batch-tab" id="batch-tab-actions" role="tab" aria-selected="true">{{ i18n.t("batch-tab-actions") }}</button>
         <button type="button" class="batch-tab" id="batch-tab-json" role="tab" aria-selected="false">{{ i18n.t("batch-tab-json") }}</button>
@@ -61,21 +72,20 @@
       <pre class="batch-json" id="batch-json" hidden></pre>
     </div>
 
+    <!-- The error renders inside the footer, next to the button that raised
+         it (#676) — not as detached text at the end of the page. -->
     <div class="batch-footer">
       <button type="button" class="btn" id="batch-cancel">{{ i18n.t("batch-cancel") }}</button>
-      <div class="batch-footer__right">
-        <button type="button" class="btn" id="batch-upload-another">{{ i18n.t("batch-upload-another") }}</button>
-        <button type="button" class="btn btn--primary" id="batch-execute">{{ i18n.t("batch-execute") }}</button>
-      </div>
+      <p class="alert alert--inline" id="batch-execute-error" role="alert" hidden></p>
+      <button type="button" class="btn btn--primary" id="batch-execute">{{ i18n.t("batch-execute") }}</button>
     </div>
-    <p class="batch-error" id="batch-execute-error" role="alert" hidden></p>
   </section>
 
   <!-- ============ Stage 3: response ============ -->
   <section id="batch-response" hidden>
     <div class="card">
       <div class="card-head">
-        <h3>{{ i18n.t("batch-response-heading") }}</h3>
+        <h3><span class="icon">{% include "icons/check.svg" %}</span> {{ i18n.t("batch-response-heading") }}</h3>
         <span class="batch-badge" id="batch-overall"></span>
       </div>
       <!-- The aggregate Steve asked for: how many resources this run created,
@@ -83,11 +93,15 @@
       <p class="batch-summary" id="batch-summary"></p>
       <ol class="batch-rows" id="batch-outcomes"></ol>
     </div>
-    <div class="batch-footer">
-      <button type="button" class="btn" id="batch-back">{{ i18n.t("batch-back") }}</button>
-      <button type="button" class="btn btn--primary" id="batch-execute-again">{{ i18n.t("batch-execute-again") }}</button>
+    <!-- One way out (#675): the run already happened, so the only offer is
+         Done — no re-running a mutation that succeeded. -->
+    <div class="batch-footer batch-footer--end">
+      <button type="button" class="btn btn--primary" id="batch-done">{{ i18n.t("batch-done") }}</button>
     </div>
   </section>
+
+  <!-- Cloned by batch.js into each row's disclosure control (#674). -->
+  <template id="batch-chevron"><span class="icon">{% include "icons/chevron-down.svg" %}</span></template>
 </div>
 
 <script src="/ui/assets/batch.js" defer></script>

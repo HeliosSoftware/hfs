@@ -539,16 +539,15 @@ batch-tab-actions = Acciones
 batch-tab-json = JSON del bundle
 batch-no-body = (sin cuerpo — esta entrada solo direcciona un recurso)
 batch-cancel = Cancelar
-batch-upload-another = Subir otro
 batch-execute = Ejecutar
+batch-plan-heading = Plan de ejecución
+batch-done = Hecho
 batch-response-heading = Resultados por acción
 batch-sum-created = creados
 batch-sum-updated = actualizados
 batch-sum-other = lecturas/otros
 batch-sum-failed = fallidos
 batch-request-failed = La petición falló
-batch-back = Volver al bundle
-batch-execute-again = Ejecutar de nuevo
 
 ## Bulk Import workspace (#527)
 

@@ -1275,16 +1275,27 @@ textarea.field__input {
 }
 
 .field__hint--error {
-  color: rgb(220 38 38);
+  color: var(--danger);
 }
 
-.form-error {
-  margin-bottom: 12px;
+/* The one error treatment (#676): danger tokens, so it holds in both themes.
+   Block by default; the inline variant sits next to the button that raised
+   the error. */
+.alert {
+  display: block;
+  margin: 0 0 12px;
   padding: 10px 14px;
+  border: 1px solid var(--danger);
   border-radius: 10px;
-  background: rgb(220 38 38 / 10%);
-  color: #dc2626;
-  font-size: 14px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.alert--inline {
+  display: inline-block;
+  margin: 0;
+  padding: 5px 10px;
 }
 
 .col-num {
@@ -1750,15 +1761,6 @@ textarea.field__input {
   color: var(--muted);
 }
 
-.query-error {
-  margin: 0 0 12px;
-  padding: 10px 14px;
-  font-size: 13px;
-  color: var(--text);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent);
-  border-radius: 10px;
-}
 
 @media (max-width: 900px) {
   .query-form {
@@ -1925,8 +1927,9 @@ textarea.field__input {
 .history__banner--same { color: var(--muted); }
 
 .history__banner--error {
-  background: var(--accent-soft);
-  border-color: var(--accent);
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 /* ---- the diff ---- */
@@ -3241,8 +3244,9 @@ textarea.field__input {
 }
 
 .nl-answer--error {
-  background: var(--input-bg);
-  border-color: var(--muted);
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 .nl-answer__caveats-heading {
@@ -3581,16 +3585,8 @@ textarea.field__input {
 }
 .editor-validity--ok { color: var(--accent); }
 
-.editor__parse-error {
-  padding: 12px 14px;
-  margin-bottom: 12px;
-  font-size: 13px;
-  background: var(--input-bg);
-  border: 1px solid var(--muted);
-  border-radius: 10px;
-}
 
-.editor__parse-error code {
+.alert code {
   display: block;
   margin-top: 6px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -3702,7 +3698,7 @@ textarea.field__input {
 .editor-row__error {
   margin: 2px 0 4px 0;
   font-size: 12px;
-  color: #cf222e;
+  color: var(--danger);
 }
 
 /* ---- "what can I add here?" ---- */
@@ -4065,11 +4061,11 @@ textarea.field__input {
   background: #eaf6ec;
 }
 .modal__status--error {
-  color: #cf222e;
+  color: var(--danger);
   font-weight: 600;
-  background: #ffebe9;
-  border-top: 1px solid #ffcdca;
-  border-bottom: 1px solid #ffcdca;
+  background: var(--danger-soft);
+  border-top: 1px solid var(--danger);
+  border-bottom: 1px solid var(--danger);
 }
 
 .modal__body {
@@ -4458,16 +4454,37 @@ textarea.field__input {
 }
 
 .request-strip__label {
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+/* The request line uses the app's mono stack at an explicit size — with no
+   rule it fell back to the UA's default monospace, visibly larger than the
+   surrounding text (#674). */
+.request-strip code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
 }
 
 .batch-tabs {
   display: flex;
   gap: 6px;
   margin-bottom: 8px;
+}
+
+/* Card content sits inset from the card border (#674): the tab row, entry
+   list, and JSON pane pick up the card's horizontal padding instead of
+   running edge-to-edge. */
+.card > .batch-tabs {
+  margin: 12px 14px 8px;
+}
+
+.card > .batch-rows,
+.card > .batch-json {
+  margin: 0 14px 12px;
 }
 
 .batch-tab {
@@ -4563,12 +4580,16 @@ textarea.field__input {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
   margin-top: 14px;
 }
 
-.batch-footer__right {
-  display: flex;
-  gap: 8px;
+.batch-footer--top {
+  margin: 0 0 12px;
+}
+
+.batch-footer--end {
+  justify-content: flex-end;
 }
 
 .batch-badge {
@@ -4587,10 +4608,6 @@ textarea.field__input {
   color: var(--muted);
 }
 
-.batch-error {
-  margin-top: 10px;
-  color: var(--danger);
-}
 
 .batch-json {
   margin: 0;

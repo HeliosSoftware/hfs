@@ -47,7 +47,12 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
 
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    String::from_utf8(bytes.to_vec()).unwrap()
+    // Normalized to LF: what line endings the response carries depends on how
+    // the build checkout materialized the templates (#671), which is exactly
+    // what these assertions must not depend on.
+    String::from_utf8(bytes.to_vec())
+        .unwrap()
+        .replace("\r\n", "\n")
 }
 
 fn assert_recent_types_are_pinned_above_the_list(html: &str) {
@@ -748,7 +753,7 @@ async fn editor_validates_on_every_mutation_and_anchors_the_issue() {
 async fn editor_keeps_the_users_text_when_the_json_is_broken() {
     let html = edit("doc=%7B%22resourceType%22%3A&op=").await;
 
-    assert!(html.contains("editor__parse-error"));
+    assert!(html.contains("class=\"alert\""));
     // Their text is handed straight back, not discarded.
     assert!(html.contains("resourceType"));
 }
@@ -904,10 +909,17 @@ async fn resources_deep_links_focus_the_selected_type() {
     // list is a flat rail in the content under the fixed page head (app-shell
     // pattern shared with Search Parameters), not a full-height menu panel.
     assert!(html.contains(r#"data-selected-type="Observation""#));
-    assert!(html.contains(
-        r#"data-type="Observation" data-full-name="Observation"
-   href="/ui/resources?type=Observation" title="Observation" aria-current="true""#
-    ));
+    // Debug-printed on failure so a byte-level mismatch (a stray CR, an
+    // attribute drift) is visible in CI output instead of a blind false.
+    let anchor = r#"data-type="Observation" data-full-name="Observation""#;
+    // Explicit \n, not a raw literal spanning source lines: the literal must
+    // not inherit whatever endings this file was checked out with.
+    let expected = "data-type=\"Observation\" data-full-name=\"Observation\"\n   href=\"/ui/resources?type=Observation\" title=\"Observation\" aria-current=\"true\"";
+    assert!(
+        html.contains(expected),
+        "rail entry mismatch; rendered around the anchor: {:?}",
+        html.find(anchor).map(|i| &html[i..html.len().min(i + 220)]),
+    );
     assert!(html.contains(r#"class="filter-rail" id="resources""#));
     // Create and the builder prefill both follow the deep-linked type.
     assert!(html.contains("Create new Observation"));
