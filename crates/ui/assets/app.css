@@ -4152,10 +4152,16 @@ textarea.field__input {
    The label names the selected type ("Create new Patient") and can grow long
    (#605) — the button caps its width and truncates the label rather than
    pushing the header row wider than the page. */
-.resources-create {
+.resources-create-wrap {
   flex: 0 1 auto;
   min-width: 0;
   max-width: 320px;
+}
+
+.resources-create {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .resources-create__label {

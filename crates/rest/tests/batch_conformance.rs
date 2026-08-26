@@ -82,6 +82,18 @@ async fn seed_patient(backend: &SqliteBackend, id: &str, family: &str) {
         .expect("Failed to seed patient");
 }
 
+async fn seed_audit_event(backend: &SqliteBackend, id: &str) {
+    backend
+        .create(
+            &test_tenant(),
+            "AuditEvent",
+            json!({ "resourceType": "AuditEvent", "id": id }),
+            FhirVersion::R4,
+        )
+        .await
+        .expect("Failed to seed AuditEvent");
+}
+
 /// Helper: post a batch bundle and return the parsed response body.
 async fn post_batch(server: &TestServer, bundle: Value) -> Value {
     let response = server
@@ -807,6 +819,304 @@ mod transaction_errors {
             .await;
 
         response.assert_status(StatusCode::BAD_REQUEST);
+    }
+}
+
+mod resource_type_admission {
+    use super::*;
+
+    #[tokio::test]
+    async fn batch_keeps_valid_siblings_and_rejects_invalid_write_types() {
+        let (server, backend) = create_test_server().await;
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [
+                    {
+                        "request": { "method": "PUT", "url": "Patient/good" },
+                        "resource": { "resourceType": "Patient", "id": "good" }
+                    },
+                    {
+                        "request": { "method": "PUT", "url": "NoLongerValid/bad" },
+                        "resource": { "resourceType": "NoLongerValid", "id": "bad" }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "201 Created");
+        assert_eq!(body["entry"][1]["response"]["status"], "400 Bad Request");
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "good")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .read(&test_tenant(), "NoLongerValid", "bad")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_missing_mismatched_and_audit_event_bodies() {
+        let (server, backend) = create_test_server().await;
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [
+                    {
+                        "request": { "method": "PUT", "url": "Patient/missing" },
+                        "resource": { "id": "missing" }
+                    },
+                    {
+                        "request": { "method": "PUT", "url": "Patient/mismatch" },
+                        "resource": { "resourceType": "Observation", "id": "mismatch" }
+                    },
+                    {
+                        "request": { "method": "POST", "url": "AuditEvent" },
+                        "resource": { "resourceType": "AuditEvent" }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(body["entry"][1]["response"]["status"], "400 Bad Request");
+        assert_eq!(
+            body["entry"][2]["response"]["status"],
+            "405 Method Not Allowed"
+        );
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "mismatch")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_type_failure_prevents_every_sibling_write() {
+        let (server, backend) = create_test_server().await;
+        let response = server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [
+                    {
+                        "request": { "method": "PUT", "url": "Patient/sibling" },
+                        "resource": { "resourceType": "Patient", "id": "sibling" }
+                    },
+                    {
+                        "request": { "method": "PUT", "url": "NoLongerValid/bad" },
+                        "resource": { "resourceType": "NoLongerValid", "id": "bad" }
+                    }
+                ]
+            }))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let outcome: Value = response.json();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "sibling")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .read(&test_tenant(), "NoLongerValid", "bad")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_audit_event_failure_prevents_sibling_write() {
+        let (server, backend) = create_test_server().await;
+        let response = server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [
+                    {
+                        "request": { "method": "PUT", "url": "Patient/sibling" },
+                        "resource": { "resourceType": "Patient", "id": "sibling" }
+                    },
+                    {
+                        "request": { "method": "POST", "url": "AuditEvent" },
+                        "resource": { "resourceType": "AuditEvent" }
+                    }
+                ]
+            }))
+            .await;
+
+        response.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "sibling")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_audit_event_delete_is_405_without_blocking_valid_siblings() {
+        let (server, backend) = create_test_server().await;
+        seed_audit_event(&backend, "audit-1").await;
+        seed_audit_event(&backend, "audit-2").await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [
+                    {
+                        "request": {
+                            "method": "DELETE",
+                            "url": "https://example.test/fhir/AuditEvent/audit-1"
+                        }
+                    },
+                    {
+                        "request": { "method": "DELETE", "url": "fhir/AuditEvent/audit-2" }
+                    },
+                    {
+                        "request": { "method": "PUT", "url": "Patient/good" },
+                        "resource": { "resourceType": "Patient", "id": "good" }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            body["entry"][0]["response"]["status"],
+            "405 Method Not Allowed"
+        );
+        assert_eq!(
+            body["entry"][1]["response"]["status"],
+            "405 Method Not Allowed"
+        );
+        assert_eq!(body["entry"][2]["response"]["status"], "201 Created");
+        assert!(
+            backend
+                .read(&test_tenant(), "AuditEvent", "audit-1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "good")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .read(&test_tenant(), "AuditEvent", "audit-2")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_audit_event_delete_preflight_prevents_all_mutations() {
+        for audit_url in [
+            "https://example.test/fhir/AuditEvent/audit-1",
+            "fhir/AuditEvent/audit-1",
+        ] {
+            let (server, backend) = create_test_server().await;
+            seed_audit_event(&backend, "audit-1").await;
+            seed_patient(&backend, "existing", "Keep").await;
+
+            let response = server
+                .post("/")
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&json!({
+                    "resourceType": "Bundle",
+                    "type": "transaction",
+                    "entry": [
+                        {
+                            "request": { "method": "DELETE", "url": "Patient/existing" }
+                        },
+                        {
+                            "request": { "method": "PUT", "url": "Patient/new" },
+                            "resource": { "resourceType": "Patient", "id": "new" }
+                        },
+                        {
+                            "request": { "method": "DELETE", "url": audit_url }
+                        }
+                    ]
+                }))
+                .await;
+
+            response.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+            assert!(
+                backend
+                    .read(&test_tenant(), "AuditEvent", "audit-1")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "AuditEvent must survive {audit_url}"
+            );
+            assert!(
+                backend
+                    .read(&test_tenant(), "Patient", "existing")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "sibling delete must not run for {audit_url}"
+            );
+            assert!(
+                backend
+                    .read(&test_tenant(), "Patient", "new")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "sibling write must not run for {audit_url}"
+            );
+        }
     }
 }
 

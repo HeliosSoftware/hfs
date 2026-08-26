@@ -320,10 +320,16 @@ fn build_resource_capability(
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
     revinclude_by_target: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
 ) -> serde_json::Value {
-    let mut entry = serde_json::json!({
-        "type": resource_type,
-        "profile": format!("http://hl7.org/fhir/StructureDefinition/{}", resource_type),
-        "interaction": [
+    let interactions = if resource_type == "AuditEvent" {
+        serde_json::json!([
+            { "code": "read" },
+            { "code": "vread" },
+            { "code": "history-instance" },
+            { "code": "history-type" },
+            { "code": "search-type" }
+        ])
+    } else {
+        serde_json::json!([
             { "code": "read" },
             { "code": "vread" },
             { "code": "update" },
@@ -333,16 +339,25 @@ fn build_resource_capability(
             { "code": "history-type" },
             { "code": "create" },
             { "code": "search-type" }
-        ],
+        ])
+    };
+
+    let mut entry = serde_json::json!({
+        "type": resource_type,
+        "profile": format!("http://hl7.org/fhir/StructureDefinition/{}", resource_type),
+        "interaction": interactions,
         "versioning": "versioned",
         "readHistory": true,
-        "updateCreate": true,
-        "conditionalCreate": true,
         "conditionalRead": "full-support",
-        "conditionalUpdate": true,
-        "conditionalDelete": "single",
         "searchParam": build_search_params(resource_type, registry, supports_contained, modifier_map)
     });
+
+    if resource_type != "AuditEvent" {
+        entry["updateCreate"] = serde_json::Value::Bool(true);
+        entry["conditionalCreate"] = serde_json::Value::Bool(true);
+        entry["conditionalUpdate"] = serde_json::Value::Bool(true);
+        entry["conditionalDelete"] = serde_json::Value::String("single".to_string());
+    }
 
     // Advertise real `_include` targets: one "Type:code" per reference param on
     // this type. Omitted entirely when the type has no reference params.

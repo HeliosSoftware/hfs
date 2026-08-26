@@ -289,6 +289,11 @@
   }
 
   function openNew(type) {
+    if (
+      !type ||
+      root.dataset.createEligible !== "true" ||
+      root.dataset.createTarget !== type
+    ) return;
     current = { type: type, id: "" };
     subject.textContent = type + " · " + "new";
     openModal();
@@ -319,7 +324,7 @@
       // `panel.dataset.selectedType` (the rail's `<aside>`) is the single
       // source of truth for the selected type (#605) — the button carries no
       // type of its own any more.
-      openNew(root.dataset.selectedType || "Patient");
+      openNew(root.dataset.selectedType);
     });
   }
 
