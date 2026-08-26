@@ -199,16 +199,23 @@ jobs:
   benchmark:
     name: Benchmark (${{ matrix.backend }})
     needs: [setup, build]
-    # Pinned to ONE machine. HFS and k6 run natively on the runner (only Postgres
-    # is on the remote Docker host), so a run that lands on a different agent is
-    # measuring different hardware and cannot be compared with the previous one.
-    # Runs 32790578934 and 32861672614 both landed on github-agent6; 32867744843
-    # drew github-agent2 and would have been read against them regardless.
-    # `setup` and `build` stay unpinned — they only produce artifacts.
-    runs-on:
-      - self-hosted
-      - Linux
-      - ${{ inputs.runner || 'github-agent6' }}
+    # UNPINNED, deliberately. This job used to carry a third `runs-on` entry
+    # naming one agent, to keep HFS and k6 — which run natively on the runner,
+    # unlike Postgres — on identical hardware across runs. That pin cost more
+    # than it bought: no runner advertises that label, and `runs-on` matches
+    # LABELS rather than runner names, so the job queued forever instead of
+    # failing. Run 32885795253 sat 5 hours unclaimed and 32972099076 was still
+    # queued with the whole pool provably idle. The label could not be added by
+    # dispatch either — `runs-on` referenced an `inputs.runner` that was never
+    # declared under workflow_dispatch, so it always resolved to the literal.
+    #
+    # The comparability that pin protected is now recovered by reading rather
+    # than by scheduling: `runner-info.txt` records the agent and its CPU/RAM in
+    # every artifact, benchcmp.py reads runner_name from the jobs API and shouts
+    # on a mismatch, and each run carries its own ambient controls (search
+    # shapes untouched by the change under test) so a code delta can be read
+    # within one run instead of across two.
+    runs-on: [self-hosted, Linux]
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -694,6 +701,29 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE/bench-results"
           RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}"
           mkdir -p "$RESULTS_DIR"
+
+          # Which machine measured this run, recorded INSIDE the artifact.
+          # This job is unpinned (see the `runs-on` note), so consecutive runs
+          # can land on different agents — and HFS and k6 run natively on the
+          # runner, so that is a hardware change riding along with the code
+          # change. benchcmp.py reads runner_name from the jobs API, but the API
+          # is queryable only while the run is retained and says nothing about
+          # the agent's size; the artifact outlives it and travels with the
+          # numbers. Anyone reading these results later can tell a 2x from a
+          # bigger box apart from a 2x from the code.
+          {
+            echo "runner_name:  ${RUNNER_NAME:-unknown}"
+            echo "runner_cpus:  $(nproc 2>/dev/null || echo '?')"
+            echo "runner_ram:   $(free -g 2>/dev/null | awk '/^Mem:/{print $2"G"}' || echo '?')"
+            echo "runner_ip:    ${RUNNER_IP:-unknown}"
+            echo "docker_host:  ${DOCKER_HOST_IP:-unknown}"
+            echo "github_run:   ${{ github.run_id }}"
+            echo "git_sha:      ${{ github.sha }}"
+            echo "git_ref:      ${{ github.ref_name }}"
+            echo "backend:      ${{ matrix.backend }}"
+            echo "pg_pool_max:  ${{ inputs.hfs_pg_max_connections || '32' }}"
+          } > "$RESULTS_DIR/runner-info.txt"
+          cat "$RESULTS_DIR/runner-info.txt"
 
           # Resolve suite list. 'search' needs data, so 'import' must precede it;
           # canonical order keeps that invariant for the 'all' case.
