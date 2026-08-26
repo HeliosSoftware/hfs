@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 21;
+pub const SCHEMA_VERSION: i32 = 22;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -342,6 +342,7 @@ async fn migrate_schema(
             18 => migrate_v18_to_v19(client).await?,
             19 => migrate_v19_to_v20(client).await?,
             20 => migrate_v20_to_v21(client).await?,
+            21 => migrate_v21_to_v22(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1032,6 +1033,67 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v21 -> v22: stop paying for a surrogate key and a composite index nobody
+/// asks about on rows that have no composite.
+///
+/// Search is now 1.6x off the best published server while import is 11.1x off,
+/// so the remaining work is on the write path. Both changes here remove work
+/// from every inserted row without changing what any query can find.
+///
+/// **`search_index.id BIGSERIAL PRIMARY KEY`.** Nothing reads it — no query in
+/// the backend selects, filters, orders by, joins on, or returns it; rows are
+/// addressed by (tenant_id, resource_type, resource_id) and the FK cascade uses
+/// that too. `ROW_COLUMNS` in the writer never mentions it. It is a surrogate
+/// key that exists because the table was written with one by habit, and on run
+/// 33013229956 its index was **963 MB with 0 scans** — as it was in every run
+/// today. Each inserted row pays a sequence `nextval()`, a btree insert into
+/// that 963 MB index, and 8 bytes of heap, roughly 60M times over an import.
+/// Dropping the column drops all three. The table is left without a primary
+/// key, which is correct here: the write path deletes a resource's rows and
+/// reinserts them, so there is no uniqueness to enforce, and no logical
+/// replication depends on a replica identity.
+///
+/// **`idx_search_composite` becomes partial.** It is
+/// (tenant_id, resource_type, resource_id, param_name, composite_group) with no
+/// predicate, so all ~60M rows are indexed and every insert pays into 3796 MB —
+/// but `composite_group` is NULL for every row that is not part of a composite.
+/// `build_composite_condition` emits `composite_group IS NOT NULL` literally
+/// (query_builder.rs, asserted in its tests), so the planner can prove the
+/// partial index usable for exactly the queries that want it. Non-composite
+/// rows stop paying for it entirely.
+///
+/// Anything still probing this index *without* constraining `composite_group`
+/// falls back to `idx_search_resource` (tenant_id, resource_type, resource_id),
+/// a column prefix of it that v15 documents as the hottest index in the schema
+/// — 289,929 scans on that run. So the fallback is an index scan, not a seq
+/// scan.
+///
+/// Deliberately NOT dropped: `idx_search_composite_token_token`, 1571 MB at 0
+/// scans in every run today. It is already partial on `composite_group`, and it
+/// serves token-token composites that this benchmark never issues but real
+/// callers do. Same rule as `idx_search_string` in v18 — zero scans here means
+/// the benchmark misses the shape, not that nobody needs it.
+async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        // Drops the PRIMARY KEY constraint, its 963 MB index, and the sequence
+        // with it.
+        "ALTER TABLE search_index DROP COLUMN IF EXISTS id",
+        "DROP INDEX IF EXISTS idx_search_composite",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite
+         ON search_index (tenant_id, resource_type, resource_id, param_name, composite_group)
+         WHERE composite_group IS NOT NULL",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v21->v22 failed: {}", e)))?;
     }
 
     Ok(())
