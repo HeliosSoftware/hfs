@@ -11,6 +11,7 @@ import { QueriesPage } from "./queries";
 import { SearchPage } from "./search";
 import { SearchParametersPage } from "./search-parameters";
 import { TenantsPage } from "./tenants";
+import { BulkImportPage } from "./bulk-import";
 
 type Fixtures = {
   chrome: AppChrome;
@@ -22,6 +23,7 @@ type Fixtures = {
   search: SearchPage;
   searchParameters: SearchParametersPage;
   tenants: TenantsPage;
+  bulkImport: BulkImportPage;
 };
 
 export const test = base.extend<Fixtures>({
@@ -47,6 +49,7 @@ export const test = base.extend<Fixtures>({
   search: async ({ page }, use) => use(new SearchPage(page)),
   searchParameters: async ({ page }, use) => use(new SearchParametersPage(page)),
   tenants: async ({ page }, use) => use(new TenantsPage(page)),
+  bulkImport: async ({ page }, use) => use(new BulkImportPage(page)),
 });
 
 export { expect };

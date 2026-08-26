@@ -1,27 +1,31 @@
 {% if polling %}
-<div id="bulk-status" class="card detail"
+<div id="bulk-status" class="card panel bulk-import-section"
      hx-get="/ui/bulk-import/{{ id }}/status"
      hx-trigger="every 5s"
      hx-swap="outerHTML">
-  <div class="detail__field">
-    <span>{{ i18n.t("bulk-import-processing") }}</span>
-    <div>{% if !progress.is_empty() %}{{ progress }}{% else %}{{ i18n.t("bulk-import-processing-waiting") }}{% endif %}</div>
+  <div class="kv-grid">
+    <div class="detail__field detail__field--wide">
+      <span>{{ i18n.t("bulk-import-processing") }}</span>
+      <div>{% if !progress.is_empty() %}{{ progress }}{% else %}{{ i18n.t("bulk-import-processing-waiting") }}{% endif %}</div>
+    </div>
   </div>
 </div>
 {% else %}
 {% if !completed_at.is_empty() %}
-<div id="bulk-status" class="card detail">
-  <div class="detail__field">
-    <span>{{ i18n.t("bulk-import-result") }}</span>
-    <div>{{ i18n.t("bulk-import-result-finished") }} {{ completed_at }}</div>
-  </div>
-  <div class="detail__field">
-    <span>{{ i18n.t("bulk-import-result-outputs") }}</span>
-    <div>{{ outputs }}</div>
-  </div>
-  <div class="detail__field">
-    <span>{{ i18n.t("bulk-import-result-errors") }}</span>
-    <div>{{ errors }}</div>
+<div id="bulk-status" class="card panel bulk-import-section">
+  <div class="kv-grid">
+    <div class="detail__field detail__field--wide">
+      <span>{{ i18n.t("bulk-import-result") }}</span>
+      <div>{{ i18n.t("bulk-import-result-finished") }} <code>{{ completed_at }}</code></div>
+    </div>
+    <div class="detail__field">
+      <span>{{ i18n.t("bulk-import-result-outputs") }}</span>
+      <div>{{ outputs }}</div>
+    </div>
+    <div class="detail__field">
+      <span>{{ i18n.t("bulk-import-result-errors") }}</span>
+      <div>{{ errors }}</div>
+    </div>
   </div>
 </div>
 {% else %}

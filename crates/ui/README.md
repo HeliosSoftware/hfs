@@ -200,8 +200,12 @@ These are the shared primitives. Before styling anything, reach for one; add to
 |---|---|
 | `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current` | The button. Secondary by default; primary is the one blue action on a page. |
 | `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
+| `.panel` | Padding for a full-width card that hosts detail fields without rail behavior. |
+| `.kv-grid` | Responsive two-column key/value layout; collapses to one column on compact viewports. |
 | `.page-head`, `.page-head__title`, `.page-head__lede`, `.page-head--row` | Page heading block; the only `<h1>` treatment; `--row` puts an action on the right. |
+| `.back-link` | In-page return link with theme-safe normal, visited, hover, and focus states. |
 | `.table-wrap` > `.data-table`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper; empty-state row; footer with pagination. |
+| `.empty-state` | The same centered, muted empty treatment for non-table content. |
 | `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
 | `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
 | `.menu`, `.menu__panel`, `.menu__heading`, `.menu__option` | The `<details>` dropdown (tenant/version selectors, Recent). |

@@ -19,7 +19,7 @@
 </form>
 
 {% if let Some(message) = parse_error %}
-<div class="editor__parse-error" role="alert">
+<div class="alert" role="alert">
   <strong>{{ i18n.t("editor-invalid-json") }}</strong>
   <code>{{ message }}</code>
 </div>

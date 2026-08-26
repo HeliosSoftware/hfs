@@ -71,6 +71,9 @@ test("a transaction bundle uploads, previews, executes, and reports", async ({ p
   await expect(page.locator("#batch-json .json-view")).toBeVisible();
   await page.locator("#batch-tab-actions").click();
 
+  // The execute error slot lives inside the footer, next to its button (#676).
+  await expect(page.locator(".batch-footer #batch-execute-error")).toHaveCount(1);
+
   // Execute: outcomes per entry plus the aggregate summary.
   await page.locator("#batch-execute").click();
   await expect(page.locator("#batch-response")).toBeVisible();
@@ -80,10 +83,10 @@ test("a transaction bundle uploads, previews, executes, and reports", async ({ p
   await expect(page.locator("#batch-summary")).toContainText(/created/i);
   await expect(page.locator("#batch-overall")).toHaveClass(/--ok/);
 
-  // Back to the preflight keeps the parsed bundle.
-  await page.locator("#batch-back").click();
-  await expect(page.locator("#batch-preflight")).toBeVisible();
-  await expect(page.locator("#batch-rows .batch-row")).toHaveCount(2);
+  // Done is the one way out (#675): back to a clean upload stage.
+  await page.locator("#batch-done").click();
+  await expect(page.locator("#batch-upload")).toBeVisible();
+  await expect(page.locator("#batch-preflight")).toBeHidden();
 });
 
 test("JSON previews are lazy, cached, compact, accessible, and isolated per view", async ({ page }) => {

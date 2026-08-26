@@ -540,16 +540,15 @@ batch-tab-actions = Acciones
 batch-tab-json = JSON del bundle
 batch-no-body = (sin cuerpo — esta entrada solo direcciona un recurso)
 batch-cancel = Cancelar
-batch-upload-another = Subir otro
 batch-execute = Ejecutar
+batch-plan-heading = Plan de ejecución
+batch-done = Hecho
 batch-response-heading = Resultados por acción
 batch-sum-created = creados
 batch-sum-updated = actualizados
 batch-sum-other = lecturas/otros
 batch-sum-failed = fallidos
 batch-request-failed = La petición falló
-batch-back = Volver al bundle
-batch-execute-again = Ejecutar de nuevo
 
 ## Bulk Import workspace (#527)
 
@@ -608,6 +607,10 @@ bulk-import-field-output-format-hint = El formato de los archivos Bulk Data del 
 bulk-import-field-headers = Cabeceras de petición de archivos
 bulk-import-field-headers-hint = Cabeceras HTTP que el receptor debe usar al pedir un archivo de datos, una "Nombre: valor" por línea.
 bulk-import-manifests = Manifests
+bulk-import-col-manifest-url = URL del manifiesto
+bulk-import-col-last-submitted = Último envío
+bulk-import-col-submit = Enviar
+bulk-import-col-actions = Acciones
 bulk-import-no-manifests = Aún no hay manifests. Añada uno para enviar datos.
 bulk-import-submit = Enviar
 bulk-import-submit-all = Enviar todo

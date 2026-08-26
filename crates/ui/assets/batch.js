@@ -196,7 +196,10 @@
 
       var arrow = document.createElement("span");
       arrow.className = "batch-row__arrow";
-      arrow.textContent = "▾";
+      /* The app's chevron icon, template-rendered so the SVG stays vendored
+         in templates/icons rather than inlined here (#674). */
+      var chevron = document.getElementById("batch-chevron");
+      if (chevron) arrow.appendChild(chevron.content.cloneNode(true));
 
       head.appendChild(num);
       head.appendChild(chip);
@@ -251,9 +254,7 @@
     show("upload");
   }
   document.getElementById("batch-cancel").addEventListener("click", reset);
-  document.getElementById("batch-upload-another").addEventListener("click", function () {
-    fileInput.click();
-  });
+  document.getElementById("batch-cancel-top").addEventListener("click", reset);
 
   /* ---- stage 3: execute and report ------------------------------------ */
 
@@ -282,10 +283,10 @@
       });
   }
   document.getElementById("batch-execute").addEventListener("click", execute);
-  document.getElementById("batch-execute-again").addEventListener("click", execute);
-  document.getElementById("batch-back").addEventListener("click", function () {
-    show("preflight");
-  });
+  document.getElementById("batch-execute-top").addEventListener("click", execute);
+  /* The run already happened: Done lands back on a clean upload stage
+     rather than offering to re-run a mutation that succeeded (#675). */
+  document.getElementById("batch-done").addEventListener("click", reset);
 
   function renderResponse(response, body) {
     overall.textContent = String(response.status);
