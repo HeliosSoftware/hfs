@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 20;
+pub const SCHEMA_VERSION: i32 = 21;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -341,6 +341,7 @@ async fn migrate_schema(
             17 => migrate_v17_to_v18(client).await?,
             18 => migrate_v18_to_v19(client).await?,
             19 => migrate_v19_to_v20(client).await?,
+            20 => migrate_v20_to_v21(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1031,6 +1032,63 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v20 -> v21: restore the recent-first token index alongside v20's.
+///
+/// v20 dropped `idx_search_token_code_recent` on the reasoning that a value-first
+/// key serves an equality predicate at every selectivity — true, and it fixed
+/// `Observation?code` (1261 ms -> 255 ms p99). But it cost 50x on
+/// `Observation?category` (38 ms -> 1693 ms) and 6x on `Encounter?status`, and
+/// took the search suite from 1645 to 1065 RPS.
+///
+/// The isolated plan did not show it: single-value `category=laboratory` EXPLAINs
+/// at 0.717 ms under v20, better than v19's 1.408 ms. The regression lives in
+/// queries the plan capture did not model. The benchmark's token values include
+/// comma lists —
+///
+/// ```text
+/// category: "laboratory,vital-signs", "laboratory,vital-signs,survey"
+/// code:     "8302-2,29463-7", "8480-6,8462-4,8867-4"
+/// status:   "finished,in-progress", "finished,in-progress,planned"
+/// ```
+///
+/// — roughly a fifth to a quarter of requests for those parameters, which is
+/// precisely the tail a p99 reports. A comma list is an OR over several equality
+/// tests. A recent-first index serves it as ONE stream already ordered by
+/// `last_updated`, filtering the set membership as it goes, so the LIMIT still
+/// stops at 22. A value-first key cannot: each value is its own ordered run, and
+/// merging them into `last_updated DESC` order means sorting the whole match set
+/// — ~500k rows for `category`.
+///
+/// So the two shapes are not redundant, they are complementary, and which one
+/// wins depends on the predicate rather than on the data:
+/// - one value, any selectivity -> value-first (v20's `idx_search_token_code`)
+/// - several values, or a range -> recent-first (this index)
+///
+/// Both now exist and the planner picks per query. That is the same division v19
+/// established for date and quantity, where the sparse range picks value-first
+/// and the broad range picks recent-first — verified in plan sections V and U.
+///
+/// This re-adds 5.6 GB. The write path pays for it, which is a real cost on an
+/// 11 GB host and the reason v20 was worth trying; the measurement says search
+/// buys more than the write path loses.
+async fn migrate_v20_to_v21(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let index_stmts = [
+        "CREATE INDEX IF NOT EXISTS idx_search_token_code_recent
+         ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+         INCLUDE (value_token_code)
+         WHERE value_token_code IS NOT NULL",
+    ];
+
+    for sql in index_stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v20->v21 failed: {}", e)))?;
     }
 
     Ok(())

@@ -444,3 +444,39 @@ JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Encounter'
                 AND r.id = c.resource_id
 WHERE r.is_deleted = FALSE
 ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## Y. FAST PATH token Observation?category=laboratory,vital-signs — MULTI-VALUE ########'
+-- The shape v20 regressed 50x and no earlier section modelled: a comma list is
+-- an OR over equality tests. Look for idx_search_token_code_recent driving ONE
+-- ordered Index Only Scan with rows=22 and a streaming Unique. A BitmapOr, or a
+-- Sort over tens of thousands of rows, means the merge could not stay ordered.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'category'
+         AND value_token_code IN ('laboratory', 'vital-signs')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## Z. FAST PATH token Observation?code=8302-2,29463-7 — MULTI-VALUE, SELECTIVE ########'
+-- The other regime: a comma list whose members are each rare. Value-first may
+-- legitimately win here even though it must sort, because the match set is tiny.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'code'
+         AND value_token_code IN ('8302-2', '29463-7')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
