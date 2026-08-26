@@ -143,15 +143,42 @@
         return null;
       }
     }
-    var match = /^\/?([A-Za-z]+)(?:\?(.*))?$/.exec(text);
-    if (!match) return null;
-    return { type: match[1], query: (match[2] || "").trim() };
+    var queryAt = text.indexOf("?");
+    var path = queryAt >= 0 ? text.slice(0, queryAt) : text;
+    var query = queryAt >= 0 ? text.slice(queryAt + 1).trim() : "";
+    var segments = path.split("/").filter(Boolean);
+    var resourceType = segments[segments.length - 1] || "";
+    if (!/^[A-Za-z]+$/.test(resourceType)) return null;
+    return { type: resourceType, query: query };
   }
 
   function searchPath(resourceType, query) {
     return (
       "/" + encodeURIComponent(resourceType) + (query ? "?" + query : "")
     );
+  }
+
+  /* The semantic search context is independent from a server-provided pager
+   * URL. FHIR paging links may be opaque and need not contain a resource type. */
+  function resultContext(raw) {
+    var parsed = parseSearchUrl(raw);
+    if (!parsed) return null;
+    var text = (raw || "").trim().replace(/^GET\s+/i, "");
+    try {
+      var url = new URL(text, window.location.href);
+      var segments = url.pathname.split("/").filter(Boolean);
+      segments.pop();
+      url.pathname = "/" + segments.join("/");
+      url.search = "";
+      url.hash = "";
+      return {
+        type: parsed.type,
+        query: parsed.query,
+        baseUrl: url.href.replace(/\/$/, ""),
+      };
+    } catch (e) {
+      return null;
+    }
   }
 
   /* ---- Visual builder: rows kept in two-way sync with the GET URL ------ */
@@ -1585,8 +1612,10 @@
 
   /* ---- Results: the FHIR search response, rendered in-page ------------- */
 
-  /* The last path handed to runSearch — what a data-changed re-run repeats. */
+  /* The last path that rendered successfully. A failed page request must not
+   * replace it, because data-changed re-runs the visible page. */
   var lastSearchPath = null;
+  var lastSearchContext = null;
 
   var results = {
     card: document.getElementById("query-results"),
@@ -1594,6 +1623,7 @@
     body: document.getElementById("query-results-body"),
     meta: document.getElementById("query-results-meta"),
     note: document.getElementById("query-results-note"),
+    error: document.getElementById("query-results-error"),
     open: document.getElementById("query-results-open"),
     prev: document.getElementById("query-results-prev"),
     next: document.getElementById("query-results-next"),
@@ -1671,47 +1701,57 @@
     return null;
   }
 
-  function renderResults(path, ok, body) {
-    var card = results.card;
-    if (!card) return;
-    card.hidden = false;
-    results.open.href = path;
-    results.head.textContent = "";
-    results.body.textContent = "";
-    results.meta.textContent = "";
-    results.note.textContent = "";
-    results.prev.hidden = true;
-    results.next.hidden = true;
-
-    if (!ok || !body || body.resourceType !== "Bundle") {
-      var diagnostics =
-        body &&
-        body.issue &&
-        body.issue[0] &&
-        (body.issue[0].diagnostics ||
-          (body.issue[0].details && body.issue[0].details.text));
-      results.note.textContent = diagnostics || messages.msgError;
-      return;
+  /* Build a complete replacement before touching the visible result. If a
+   * response is not a search Bundle, or its shape cannot be rendered, the
+   * previous page stays intact. */
+  function safeResourceHref(entry, context, resource) {
+    if (entry && typeof entry.fullUrl === "string") {
+      try {
+        var fullUrl = new URL(entry.fullUrl, window.location.href);
+        if (
+          (fullUrl.protocol === "http:" || fullUrl.protocol === "https:") &&
+          !fullUrl.username &&
+          !fullUrl.password
+        ) {
+          return fullUrl.href;
+        }
+      } catch (e) {
+        // Fall through to the route built from the trusted search context.
+      }
     }
+    return (
+      context.baseUrl +
+      "/" +
+      encodeURIComponent(context.type) +
+      "/" +
+      encodeURIComponent(resource.id || "")
+    );
+  }
 
-    var parsed = parseSearchUrl(path) || { type: "", query: "" };
-    var entries = body.entry || [];
+  function prepareResults(body, context) {
+    if (!body || body.resourceType !== "Bundle") return null;
+    if (!context || !/^[A-Za-z]+$/.test(context.type)) return null;
+    var entries = Array.isArray(body.entry) ? body.entry : [];
     var primary = entries.filter(function (entry) {
       return (
-        entry.resource && entry.resource.resourceType === parsed.type
+        entry &&
+        entry.resource &&
+        entry.resource.resourceType === context.type
       );
     });
     var included = entries.length - primary.length;
 
-    var total =
-      typeof body.total === "number" ? body.total : primary.length;
-    var meta = card.dataset.msgTotal.replace("{count}", total);
+    var total = typeof body.total === "number" ? body.total : primary.length;
+    var meta = results.card.dataset.msgTotal.replace("{count}", total);
     if (included > 0)
-      meta += " · " + card.dataset.msgIncluded.replace("{count}", included);
-    results.meta.textContent = meta;
+      meta +=
+        " · " +
+        results.card.dataset.msgIncluded.replace("{count}", included);
 
-    var columns = elementColumns(parsed.query);
-    if (!columns.length) columns = DEFAULT_COLUMNS[parsed.type] || [];
+    var columns = elementColumns(context.query);
+    if (!columns.length) columns = DEFAULT_COLUMNS[context.type] || [];
+
+    var head = document.createDocumentFragment();
     var headRow = document.createElement("tr");
     var th = document.createElement("th");
     th.textContent = "id";
@@ -1722,17 +1762,18 @@
       headRow.appendChild(cellEl);
     });
     var thUpdated = document.createElement("th");
-    thUpdated.textContent = card.dataset.msgUpdated;
+    thUpdated.textContent = results.card.dataset.msgUpdated;
     headRow.appendChild(thUpdated);
-    results.head.appendChild(headRow);
+    head.appendChild(headRow);
 
+    var rows = document.createDocumentFragment();
     primary.forEach(function (entry) {
       var resource = entry.resource;
       var row = document.createElement("tr");
       var idCell = document.createElement("td");
       var link = document.createElement("a");
       link.className = "url";
-      link.href = "/" + parsed.type + "/" + resource.id;
+      link.href = safeResourceHref(entry, context, resource);
       link.target = "_blank";
       link.rel = "noopener";
       link.textContent = resource.id || "";
@@ -1745,39 +1786,101 @@
         row,
         resource.meta && resource.meta.lastUpdated
           ? whenText(resource.meta.lastUpdated)
-          : ""
+          : "",
       );
-      results.body.appendChild(row);
+      rows.appendChild(row);
     });
 
-    if (!primary.length) results.note.textContent = card.dataset.msgEmpty;
+    var sortValue = "";
+    splitQuery(context.query).forEach(function (part) {
+      if (part.key === "_sort") sortValue = part.value;
+    });
 
+    return {
+      head: head,
+      rows: rows,
+      meta: meta,
+      note: primary.length ? "" : results.card.dataset.msgEmpty,
+      sort: sortValue,
+      prev: pagerLink(body, "previous"),
+      next: pagerLink(body, "next"),
+    };
+  }
+
+  function clearResultsError() {
+    if (!results.error) return;
+    results.error.textContent = "";
+    results.error.hidden = true;
+  }
+
+  function renderResults(path, body, context) {
+    var card = results.card;
+    if (!card) return false;
+    var prepared = prepareResults(body, context);
+    if (!prepared) return false;
+
+    card.hidden = false;
+    results.open.href = path;
+    results.head.replaceChildren(prepared.head);
+    results.body.replaceChildren(prepared.rows);
+    results.meta.textContent = prepared.meta;
+    results.note.textContent = prepared.note;
     if (results.sort) {
-      var sortValue = "";
-      splitQuery(parsed.query).forEach(function (part) {
-        if (part.key === "_sort") sortValue = part.value;
-      });
-      results.sort.value = sortValue;
-      if (results.sort.value !== sortValue) results.sort.value = "";
+      results.sort.value = prepared.sort;
+      if (results.sort.value !== prepared.sort) results.sort.value = "";
     }
 
-    var prevUrl = pagerLink(body, "previous");
-    var nextUrl = pagerLink(body, "next");
-    if (prevUrl) {
+    if (prepared.prev) {
       results.prev.hidden = false;
-      results.prev.dataset.url = prevUrl;
+      results.prev.dataset.url = prepared.prev;
+    } else {
+      results.prev.hidden = true;
+      delete results.prev.dataset.url;
     }
-    if (nextUrl) {
+    if (prepared.next) {
       results.next.hidden = false;
-      results.next.dataset.url = nextUrl;
+      results.next.dataset.url = prepared.next;
+    } else {
+      results.next.hidden = true;
+      delete results.next.dataset.url;
     }
+
+    clearResultsError();
+    lastSearchPath = path;
+    lastSearchContext = context;
+    return true;
+  }
+
+  function failedOrigin(path) {
+    try {
+      var origin = new URL(path, window.location.href).origin;
+      return origin && origin !== "null" ? origin : window.location.origin;
+    } catch (e) {
+      return window.location.origin;
+    }
+  }
+
+  function showResultsError(path) {
+    if (results.card) results.card.hidden = false;
+    if (results.error) {
+      results.error.textContent = results.card.dataset.msgFetchError.replace(
+        "{origin}",
+        failedOrigin(path),
+      );
+      results.error.hidden = false;
+    }
+    document.dispatchEvent(
+      new CustomEvent("hfs:data-changed", {
+        detail: { source: "query-results", failed: true },
+      }),
+    );
   }
 
   /* Runs a search against the FHIR API and renders the Bundle in-page.
    * `record` adds it to the roaming recent list (explicit runs only, so
    * paging does not spam recents). */
-  function runSearch(path, record) {
-    lastSearchPath = path;
+  function runSearch(path, record, context) {
+    var requestedContext = context || resultContext(path);
     if (!results.card) {
       window.open(path, "_blank", "noopener");
     } else {
@@ -1786,17 +1889,17 @@
         credentials: "same-origin",
       })
         .then(function (response) {
-          return response
-            .json()
-            .catch(function () {
-              return null;
-            })
-            .then(function (body) {
-              renderResults(path, response.ok, body);
-            });
+          if (!response.ok) return null;
+          return response.json().catch(function () {
+            return null;
+          });
+        })
+        .then(function (body) {
+          if (!renderResults(path, body, requestedContext))
+            showResultsError(path);
         })
         .catch(function () {
-          renderResults(path, false, null);
+          showResultsError(path);
         });
     }
     if (record) recordRecent(path);
@@ -1805,21 +1908,18 @@
   results.card &&
     results.card.addEventListener("click", function (event) {
       var pager = event.target.closest("button[data-url]");
-      if (pager) runSearch(pager.dataset.url, false);
+      if (pager) runSearch(pager.dataset.url, false, lastSearchContext);
     });
 
   /* Sort re-runs the current results path with the picked `_sort` (#416). */
   results.sort &&
     results.sort.addEventListener("change", function () {
-      var current = results.open && results.open.getAttribute("href");
-      if (!current) return;
-      var parsed = parseSearchUrl(current);
-      if (!parsed) return;
-      var parts = (parsed.query || "").split("&").filter(function (p) {
+      if (!lastSearchContext) return;
+      var parts = (lastSearchContext.query || "").split("&").filter(function (p) {
         return p && p.indexOf("_sort=") !== 0;
       });
       if (results.sort.value) parts.push("_sort=" + results.sort.value);
-      runSearch(searchPath(parsed.type, parts.join("&")), false);
+      runSearch(searchPath(lastSearchContext.type, parts.join("&")), false);
     });
 
   /* ---- Recent searches & the saved list -------------------------------- */
@@ -2233,8 +2333,10 @@
    * modal announces it): re-run the last search so the table shows what is
    * actually stored, without recording a new recent. The rail's counts are
    * server-rendered (#541) and catch up on the next full page load. */
-  document.addEventListener("hfs:data-changed", function () {
-    if (lastSearchPath) runSearch(lastSearchPath, false);
+  document.addEventListener("hfs:data-changed", function (event) {
+    if (event.detail && event.detail.source === "query-results") return;
+    if (lastSearchPath)
+      runSearch(lastSearchPath, false, lastSearchContext);
   });
 
   reload();

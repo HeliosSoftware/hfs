@@ -20,8 +20,8 @@ use axum::{
 };
 use helios_auth::Principal;
 use helios_persistence::core::{
-    ExportPartKey, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestFetchParams, ManifestStatus,
-    ResourceStorage, SubmissionId, SubmissionStatus, submission_output_job_id,
+    DownloadUrl, ExportPartKey, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestFetchParams,
+    ManifestStatus, ResourceStorage, SubmissionId, SubmissionStatus, submission_output_job_id,
 };
 use serde_json::{Value, json};
 
@@ -37,6 +37,10 @@ const SUBMIT_SCOPE: &str = "bulk-submit";
 
 /// Query parameter selecting a status-manifest page (1-based).
 const PAGE_PARAM: &str = "page";
+
+fn external_download_url(download: &DownloadUrl) -> Option<String> {
+    (!download.requires_access_token).then(|| download.url.clone())
+}
 
 /// The code system for the `submissionStatus` Coding (per the IG).
 const SUBMISSION_STATUS_SYSTEM: &str = "http://hl7.org/fhir/event-status";
@@ -395,7 +399,7 @@ where
         });
     }
 
-    let request_url = format!("{}/$bulk-submit", state.base_url().trim_end_matches('/'));
+    let request_url = state.public_url_for_request(&tenant, ["$bulk-submit"]);
     // Capture `Prefer: handling=` before consuming the body.
     let strict = request
         .headers()
@@ -610,11 +614,7 @@ where
         .ensure_poll_token(ctx, &sub_id)
         .await
         .map_err(RestError::from)?;
-    let status_url = format!(
-        "{}/bulk-submit-status/{}",
-        state.base_url().trim_end_matches('/'),
-        token
-    );
+    let status_url = state.public_url_for_request(&tenant, ["bulk-submit-status", token.as_str()]);
     Response::builder()
         .status(StatusCode::ACCEPTED)
         .header("Content-Location", status_url)
@@ -689,7 +689,7 @@ fn parse_page_param(query: Option<&str>) -> RestResult<usize> {
 pub async fn bulk_submit_poll_handler<S>(
     State(state): State<AppState<S>>,
     Path(token): Path<String>,
-    _tenant: TenantExtractor,
+    tenant: TenantExtractor,
     PeerIp(peer): PeerIp,
     request: Request,
 ) -> RestResult<Response>
@@ -724,6 +724,12 @@ where
             id: token.clone(),
         })?;
     if !owns_submission(principal.as_ref(), target.owner_subject.as_deref()) {
+        return Err(RestError::NotFound {
+            resource_type: "bulk-submit-status".to_string(),
+            id: token.clone(),
+        });
+    }
+    if target.tenant.tenant_id().as_str() != tenant.tenant_id() {
         return Err(RestError::NotFound {
             resource_type: "bulk-submit-status".to_string(),
             id: token.clone(),
@@ -776,7 +782,6 @@ where
         .map_err(RestError::from)?;
     let job_id = submission_output_job_id(sub_id);
     let ttl = Duration::from_secs(cfg.file_url_ttl_secs);
-    let base = state.base_url().trim_end_matches('/');
 
     // Slice the artifact rows into the requested page. Backends return them in a
     // stable order (`ORDER BY id`) and rows are append-only until the whole
@@ -832,13 +837,14 @@ where
         // submit ownership + `system/bulk-submit` — never the export-file surface.
         // Pre-signed URLs (S3) are capability URLs and are used as-is.
         requires_token |= dl.requires_access_token;
-        let url = if dl.requires_access_token {
-            format!(
-                "{base}/bulk-submit-file/{token}/{resource_type}-{}",
-                f.part_index
-            )
+        let url = if let Some(external) = external_download_url(&dl) {
+            external
         } else {
-            dl.url
+            let part = format!("{resource_type}-{}", f.part_index);
+            state.public_url_for_request(
+                &tenant,
+                ["bulk-submit-file", token.as_str(), part.as_str()],
+            )
         };
         let url = serde_json::Value::String(url);
         match f.file_type.as_str() {
@@ -882,9 +888,14 @@ where
     // A single `next` link chains to the following page; the last page has none.
     let mut link_arr = Vec::new();
     if page < total_pages {
+        let query = format!("{PAGE_PARAM}={}", page + 1);
         link_arr.push(json!({
             "relation": "next",
-            "url": format!("{base}/bulk-submit-status/{token}?{PAGE_PARAM}={}", page + 1),
+            "url": state.public_url_for_request_with_query(
+                &tenant,
+                ["bulk-submit-status", token.as_str()],
+                Some(&query),
+            ),
         }));
     }
 
@@ -925,7 +936,7 @@ fn severity_array(cs: &Value) -> Value {
 pub async fn bulk_submit_cancel_handler<S>(
     State(state): State<AppState<S>>,
     Path(token): Path<String>,
-    _tenant: TenantExtractor,
+    tenant: TenantExtractor,
     request: Request,
 ) -> RestResult<Response>
 where
@@ -960,6 +971,12 @@ where
             id: token.clone(),
         });
     }
+    if target.tenant.tenant_id().as_str() != tenant.tenant_id() {
+        return Err(RestError::NotFound {
+            resource_type: "bulk-submit-status".to_string(),
+            id: token.clone(),
+        });
+    }
     let ctx = &target.tenant;
     let sub_id = &target.submission_id;
 
@@ -988,7 +1005,7 @@ where
 pub async fn bulk_submit_file_handler<S>(
     State(state): State<AppState<S>>,
     Path((token, part)): Path<(String, String)>,
-    _tenant: TenantExtractor,
+    tenant: TenantExtractor,
     request: Request,
 ) -> RestResult<Response>
 where
@@ -1018,6 +1035,12 @@ where
             id: format!("{token}/{part}"),
         })?;
     if !owns_submission(principal.as_ref(), target.owner_subject.as_deref()) {
+        return Err(RestError::NotFound {
+            resource_type: "bulk-submit-file".to_string(),
+            id: format!("{token}/{part}"),
+        });
+    }
+    if target.tenant.tenant_id().as_str() != tenant.tenant_id() {
         return Err(RestError::NotFound {
             resource_type: "bulk-submit-file".to_string(),
             id: format!("{token}/{part}"),
@@ -1075,6 +1098,16 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn presigned_download_url_is_preserved_byte_for_byte() {
+        let url = "https://s3.example/object?X-Amz-Signature=a%2Fb&x=1";
+        let download = DownloadUrl {
+            url: url.to_string(),
+            requires_access_token: false,
+        };
+        assert_eq!(external_download_url(&download).as_deref(), Some(url));
+    }
 
     fn param(name: &str, key: &str, val: Value) -> Value {
         json!({ "name": name, key: val })

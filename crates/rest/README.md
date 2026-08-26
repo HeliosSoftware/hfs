@@ -424,6 +424,11 @@ curl http://localhost:8080/acme/metadata
 # Returns implementation.url: "http://localhost:8080/acme"
 ```
 
+All advertised URLs use `HFS_BASE_URL`. Set it to the public origin and any
+reverse-proxy prefix, such as `https://fhir.example.com/fhir`. URL-routed
+requests append the selected tenant after that prefix. Header-routed requests
+keep the configured base unchanged. Forwarding headers never override it.
+
 ### URL-Based Routing Setup
 
 To enable URL-based tenant routing:

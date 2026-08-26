@@ -638,10 +638,7 @@ where
 
     let job_id = controller.submit(task);
     // Spec: `Content-Location` must be the absolute URL of the status endpoint.
-    let location = format!(
-        "{base}/export/{job_id}/status",
-        base = state.base_url().trim_end_matches('/'),
-    );
+    let location = state.public_url_for_request(tenant, ["export", job_id.as_str(), "status"]);
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -768,10 +765,8 @@ where
         // it never communicates the job's outcome. The outcome (manifest on
         // success, OperationOutcome on failure) is served from the result URL.
         Some(JobStatus::Failed { .. }) | Some(JobStatus::Completed { .. }) => {
-            let result_url = format!(
-                "{base}/export/{job_id}/result",
-                base = state.base_url().trim_end_matches('/'),
-            );
+            let result_url =
+                state.public_url_for_request(&tenant, ["export", job_id.as_str(), "result"]);
             let mut headers = HeaderMap::new();
             if let Ok(v) = HeaderValue::from_str(&result_url) {
                 headers.insert(header::LOCATION, v);
@@ -783,7 +778,7 @@ where
 
 /// Constructs the SQL-on-FHIR v2 completion manifest as a FHIR `Parameters` resource.
 fn build_completion_manifest(
-    base_url: &str,
+    status_url: &str,
     job_id: &str,
     outputs: &[(String, String)],
     submitted_at: chrono::DateTime<chrono::Utc>,
@@ -822,10 +817,6 @@ fn build_completion_manifest(
         })
         .collect();
 
-    let status_url = format!(
-        "{base}/export/{job_id}/status",
-        base = base_url.trim_end_matches('/'),
-    );
     let duration_secs = (completed_at - submitted_at).num_seconds().max(0);
 
     let mut params: Vec<Value> = vec![
@@ -934,8 +925,14 @@ where
             // (e.g. an S3 pre-signing error) must not yield a manifest with a
             // missing/empty `location`, so surface it as a 500 instead.
             let mut outputs: Vec<(String, String)> = Vec::with_capacity(files.len());
+            let public_base_url = state.public_base_url_for_request(&tenant);
             for f in &files {
-                match controller.download_url(tenant.tenant_id(), &job_id, &f.filename) {
+                match controller.download_url(
+                    tenant.tenant_id(),
+                    &public_base_url,
+                    &job_id,
+                    &f.filename,
+                ) {
                     Some(url) => outputs.push((f.view_name.clone(), url)),
                     None => {
                         return Ok((
@@ -967,11 +964,13 @@ where
             if let Ok(v) = HeaderValue::from_str(&expires_str) {
                 headers.insert(header::EXPIRES, v);
             }
+            let status_url =
+                state.public_url_for_request(&tenant, ["export", job_id.as_str(), "status"]);
             Ok((
                 StatusCode::OK,
                 headers,
                 axum::Json(build_completion_manifest(
-                    state.base_url(),
+                    &status_url,
                     &job_id,
                     &outputs,
                     submitted_at,

@@ -128,8 +128,9 @@ where
         })?;
 
     // Build the self link URL
+    let public_base = state.public_base_url_for_request(&tenant);
     let self_link = build_compartment_search_url(
-        state.base_url(),
+        &public_base,
         &compartment_type,
         &compartment_id,
         &target_type,
@@ -137,7 +138,8 @@ where
     );
 
     // Convert result to FHIR Bundle
-    let bundle = result.to_bundle(state.base_url(), &self_link);
+    let mut bundle = result.to_bundle(&public_base, &self_link);
+    rewrite_bundle_full_urls(&mut bundle, &state, &tenant);
 
     debug!(
         compartment_type = %compartment_type,
@@ -261,14 +263,16 @@ where
         helios_persistence::types::Page::new(collected, helios_persistence::types::PageInfo::end());
     let result = helios_persistence::core::SearchResult::new(page);
 
+    let public_base = state.public_base_url_for_request(&tenant);
     let self_link = build_compartment_search_url(
-        state.base_url(),
+        &public_base,
         &compartment_type,
         &compartment_id,
         "*",
         &search_params,
     );
-    let bundle = result.to_bundle(state.base_url(), &self_link);
+    let mut bundle = result.to_bundle(&public_base, &self_link);
+    rewrite_bundle_full_urls(&mut bundle, &state, &tenant);
 
     debug!(
         compartment_type = %compartment_type,
@@ -288,20 +292,34 @@ fn build_compartment_search_url(
     target_type: &str,
     params: &SearchParams,
 ) -> String {
-    let path = format!(
-        "{}/{}/{}/{}",
-        base_url, compartment_type, compartment_id, target_type
-    );
-
     let query: String = params
         .iter()
         .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
         .collect::<Vec<_>>()
         .join("&");
-    if query.is_empty() {
-        path
-    } else {
-        format!("{}?{}", path, query)
+    crate::public_url::PublicUrl::parse(base_url)
+        .expect("request public base was built from validated configuration")
+        .with_segments_and_query([compartment_type, compartment_id, target_type], &query)
+}
+
+fn rewrite_bundle_full_urls<S>(
+    bundle: &mut helios_persistence::types::SearchBundle,
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+) where
+    S: ResourceStorage,
+{
+    for entry in &mut bundle.entry {
+        let Some(resource) = entry.resource.as_ref() else {
+            continue;
+        };
+        let Some(resource_type) = resource.get("resourceType").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(id) = resource.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        entry.full_url = Some(state.public_url_for_request(tenant, [resource_type, id]));
     }
 }
 

@@ -16,8 +16,9 @@ use helios_auth::Principal;
 use helios_fhir::FhirVersion;
 use helios_persistence::core::ExportDataProvider;
 use helios_persistence::core::{
-    ExportJobId, ExportLevel, ExportManifest, ExportOutputFile, ExportRequest, ExportStatus,
-    GroupExportProvider, PatientExportProvider, ResourceStorage, StartExportInput, TypeFilter,
+    DownloadUrl, ExportJobId, ExportLevel, ExportManifest, ExportOutputFile, ExportRequest,
+    ExportStatus, GroupExportProvider, PatientExportProvider, ResourceStorage, StartExportInput,
+    TypeFilter,
 };
 use helios_persistence::error::{BulkExportError, StorageError};
 
@@ -49,6 +50,10 @@ fn bad_request(msg: impl Into<String>) -> RestError {
     RestError::BadRequest {
         message: msg.into(),
     }
+}
+
+fn external_download_url(download: &DownloadUrl) -> Option<String> {
+    (!download.requires_access_token).then(|| download.url.clone())
 }
 
 // Shared `Prefer` / `Parameters` parsing helpers live in `bulk_common`.
@@ -282,11 +287,7 @@ where
     )
     .await;
 
-    let status_url = format!(
-        "{}/export-status/{}",
-        state.base_url().trim_end_matches('/'),
-        job_id
-    );
+    let status_url = state.public_url_for_request(tenant, ["export-status", job_id.as_str()]);
 
     Response::builder()
         .status(StatusCode::ACCEPTED)
@@ -381,13 +382,12 @@ where
     let headers = request.headers().clone();
     let uri = request.uri().clone();
     let raw_query = uri.query().map(|q| q.to_string());
-    let full_url = format!(
-        "{}{}",
-        state.base_url().trim_end_matches('/'),
-        uri.path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or(uri.path())
-    );
+    let endpoint_segments: Vec<&str> = match &level {
+        ExportLevel::System => vec!["$export"],
+        ExportLevel::Patient => vec!["Patient", "$export"],
+        ExportLevel::Group { group_id } => vec!["Group", group_id, "$export"],
+    };
+    let full_url = state.public_url_for_request_with_query(&tenant, endpoint_segments, uri.query());
     let principal = request.extensions().get::<Principal>().cloned();
 
     let body_json: Option<serde_json::Value> = if method == Method::POST {
@@ -487,34 +487,55 @@ where
             let ttl = Duration::from_secs(cfg.file_url_ttl_secs);
             let mut output_files = Vec::new();
             let mut error_files = Vec::new();
-            let mut requires_token = true;
+            let mut requires_token = None;
             for entry in &raw.output {
-                let url = output
+                let download = output
                     .download_url(&entry.key, ttl)
                     .await
                     .map_err(map_storage_err)?;
-                requires_token = url.requires_access_token;
+                requires_token =
+                    Some(requires_token.unwrap_or(false) || download.requires_access_token);
+                let url = if let Some(external) = external_download_url(&download) {
+                    external
+                } else {
+                    let part = format!("{}-{}", entry.key.resource_type, entry.key.part_index);
+                    state.public_url_for_request(
+                        &tenant,
+                        ["export-file", job_id.as_str(), part.as_str()],
+                    )
+                };
                 output_files.push(ExportOutputFile {
                     resource_type: entry.resource_type.clone(),
-                    url: url.url,
+                    url,
                     count: Some(entry.count),
                 });
             }
             for entry in &raw.errors {
-                let url = output
+                let download = output
                     .download_url(&entry.key, ttl)
                     .await
                     .map_err(map_storage_err)?;
+                requires_token =
+                    Some(requires_token.unwrap_or(false) || download.requires_access_token);
+                let url = if let Some(external) = external_download_url(&download) {
+                    external
+                } else {
+                    let part = format!("{}-{}", entry.key.resource_type, entry.key.part_index);
+                    state.public_url_for_request(
+                        &tenant,
+                        ["export-file", job_id.as_str(), part.as_str()],
+                    )
+                };
                 error_files.push(ExportOutputFile {
                     resource_type: entry.resource_type.clone(),
-                    url: url.url,
+                    url,
                     count: Some(entry.count),
                 });
             }
             let manifest = ExportManifest {
                 transaction_time: raw.transaction_time,
                 request: raw.request_url,
-                requires_access_token: requires_token,
+                requires_access_token: requires_token.unwrap_or(true),
                 output: output_files,
                 error: error_files,
                 deleted: Vec::new(),
@@ -732,5 +753,20 @@ fn owns_job(principal: Option<&Principal>, owner_subject: Option<&str>) -> bool 
                     .iter()
                     .any(|s| s.resource_type == helios_auth::scope::ResourceTypeSpec::Wildcard)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presigned_download_url_is_preserved_byte_for_byte() {
+        let url = "https://s3.example/object?X-Amz-Signature=a%2Fb&x=1";
+        let download = DownloadUrl {
+            url: url.to_string(),
+            requires_access_token: false,
+        };
+        assert_eq!(external_download_url(&download).as_deref(), Some(url));
     }
 }

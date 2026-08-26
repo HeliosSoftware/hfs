@@ -27,6 +27,44 @@ use serde_json::{Value, json};
 use crate::i18n::{I18n, RequestLocale};
 use crate::{RequestTenant, RequestVersion, WebState, current_status, render, settings_user_key};
 
+fn public_url_with_segments<'a>(
+    public_base_url: &str,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut url = reqwest::Url::parse(public_base_url)
+        .expect("WebState requires a valid HTTP(S) public base URL");
+    {
+        let mut path = url
+            .path_segments_mut()
+            .expect("HTTP(S) public base URL supports path segments");
+        path.pop_if_empty();
+        for segment in segments {
+            path.push(segment);
+        }
+    }
+    url.to_string().trim_end_matches('/').to_string()
+}
+
+fn recipient_base_url(state: &WebState, tenant: &RequestTenant) -> String {
+    recipient_base_url_value(
+        &state.public_base_url,
+        state.tenant_path_routing,
+        &tenant.id,
+    )
+}
+
+fn recipient_base_url_value(
+    public_base_url: &str,
+    tenant_path_routing: bool,
+    tenant_id: &str,
+) -> String {
+    if tenant_path_routing {
+        public_url_with_segments(public_base_url, [tenant_id])
+    } else {
+        public_base_url.to_string()
+    }
+}
+
 /// Log entries kept per submission. The whole settings document is capped at
 /// 256 KiB server-side, so the log must stay bounded.
 const LOG_CAP: usize = 100;
@@ -288,7 +326,7 @@ pub async fn page(
         available,
         rows,
         error: None,
-        recipient: state.public_base_url.trim_end_matches('/').to_string(),
+        recipient: recipient_base_url(&state, &rt),
     })
 }
 
@@ -328,7 +366,7 @@ pub async fn create(
         // The recipient is always this server's HFS_BASE_URL (#689) — typing
         // it per submission is how a submission ended up pointed at something
         // that is not a Bulk Data Submit endpoint (#686).
-        recipient_base_url: state.public_base_url.trim_end_matches('/').to_string(),
+        recipient_base_url: recipient_base_url(&state, &rt),
         auth: if form.auth == "backend-services" {
             form.auth
         } else {
@@ -671,10 +709,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
 /// The URL a submission's kick-off is POSTed to — the one failure messages
 /// must name (#686).
 fn kickoff_target(submission: &Submission) -> String {
-    format!(
-        "{}/$bulk-submit",
-        submission.recipient_base_url.trim_end_matches('/')
-    )
+    public_url_with_segments(&submission.recipient_base_url, ["$bulk-submit"])
 }
 
 /// POSTs a kick-off to the recipient, returning
@@ -750,10 +785,7 @@ fn summarize_error_body(content_type: &str, body: &str) -> String {
 /// (submitter + submissionId, `Prefer: respond-async`), returning the poll
 /// URL the recipient hands back in `Content-Location`.
 async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, String> {
-    let target = format!(
-        "{}/$bulk-submit-status",
-        submission.recipient_base_url.trim_end_matches('/')
-    );
+    let target = public_url_with_segments(&submission.recipient_base_url, ["$bulk-submit-status"]);
     // Only the identifying parameters ride the status kick-off.
     let parameters = kickoff_parameters(submission, id, "", None, None);
     let identifying: Vec<Value> = parameters["parameter"]
@@ -1138,15 +1170,11 @@ pub async fn replace_manifest(
 }
 
 /// `POST /ui/bulk-import/{id}/manifests/{mid}/abort` — abort one manifest by
-/// replacing it with the empty manifest this server hosts. The empty
-/// manifest's URL is derived from the request's Host header, since that is
-/// the address the recipient reached us... the address the *browser* reached
-/// us on, which is the best externally-visible base the UI can know.
+/// replacing it with the empty manifest this server hosts.
 pub async fn abort_manifest(
     State(state): State<WebState>,
     rt: RequestTenant,
     principal: Option<Extension<helios_auth::Principal>>,
-    headers: axum::http::HeaderMap,
     Path((id, mid)): Path<(String, String)>,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
@@ -1158,13 +1186,12 @@ pub async fn abort_manifest(
             .unwrap_or_default()
             .to_string();
         if !old_url.is_empty() {
-            let host = headers
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("localhost:8080");
             let empty = Manifest {
-                manifest_url: format!("http://{host}/ui/bulk-import/empty-manifest.json"),
-                fhir_base_url: format!("http://{host}"),
+                manifest_url: public_url_with_segments(
+                    &state.public_base_url,
+                    ["ui", "bulk-import", "empty-manifest.json"],
+                ),
+                fhir_base_url: recipient_base_url(&state, &rt),
                 ..Default::default()
             };
             push_log(&mut s, format!("Aborting manifest \"{old_url}\"..."));
@@ -1216,4 +1243,33 @@ pub async fn test_auth(
         Err(e) => (false, e),
     };
     render(TestAuthResult { ok, message })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recipient_base_preserves_prefix_and_adds_path_tenant() {
+        assert_eq!(
+            recipient_base_url_value("https://public.example/fhir", true, "acme"),
+            "https://public.example/fhir/acme"
+        );
+    }
+
+    #[test]
+    fn recipient_base_stays_unprefixed_for_header_only_routing() {
+        assert_eq!(
+            recipient_base_url_value("https://public.example/fhir", false, "acme"),
+            "https://public.example/fhir"
+        );
+    }
+
+    #[test]
+    fn public_url_builder_encodes_tenant_segments() {
+        assert_eq!(
+            recipient_base_url_value("https://public.example/fhir", true, "north clinic"),
+            "https://public.example/fhir/north%20clinic"
+        );
+    }
 }

@@ -36,6 +36,7 @@ pub struct MessagingChannel {
     client: Client,
     auth_provider: Arc<dyn OutboundAuthProvider>,
     source_endpoint: String,
+    source_endpoint_resolver: Option<Arc<dyn Fn(&str) -> String + Send + Sync>>,
     /// When `true`, dispatch to private/loopback IPs is allowed. Default
     /// `false`; tests and local dev opt in.
     private_endpoints_allowed: bool,
@@ -54,8 +55,18 @@ impl MessagingChannel {
             client,
             auth_provider,
             source_endpoint,
+            source_endpoint_resolver: None,
             private_endpoints_allowed: false,
         }
+    }
+
+    /// Resolve the default source endpoint from the subscription tenant.
+    pub fn with_source_endpoint_resolver(
+        mut self,
+        resolver: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    ) -> Self {
+        self.source_endpoint_resolver = Some(resolver);
+        self
     }
 
     /// Replace the HTTP client (used by tests).
@@ -69,6 +80,13 @@ impl MessagingChannel {
     pub fn with_private_endpoints_allowed(mut self, allowed: bool) -> Self {
         self.private_endpoints_allowed = allowed;
         self
+    }
+
+    fn source_endpoint_for(&self, tenant_id: &str) -> String {
+        self.source_endpoint_resolver
+            .as_ref()
+            .map(|resolver| resolver(tenant_id))
+            .unwrap_or_else(|| self.source_endpoint.clone())
     }
 
     async fn send(
@@ -100,12 +118,9 @@ impl MessagingChannel {
 
         // Wrap the prebuilt notification bundle as a message bundle.
         let notification_type = notification_type_from_bundle(bundle);
-        let message_bundle = wrap_as_message_bundle(
-            bundle,
-            subscription,
-            &self.source_endpoint,
-            notification_type,
-        )?;
+        let source_endpoint = self.source_endpoint_for(&subscription.tenant_id);
+        let message_bundle =
+            wrap_as_message_bundle(bundle, subscription, &source_endpoint, notification_type)?;
 
         let mut request = self
             .client
@@ -300,6 +315,20 @@ mod tests {
             Arc::new(StaticBearerOutboundAuthProvider::new(token)),
         )
         .with_private_endpoints_allowed(true)
+    }
+
+    #[test]
+    fn default_source_endpoint_resolves_per_tenant_but_explicit_stays_fixed() {
+        let resolver: Arc<dyn Fn(&str) -> String + Send + Sync> =
+            Arc::new(|tenant| format!("https://public.example/fhir/{tenant}"));
+        let dynamic = channel_with_noop().with_source_endpoint_resolver(resolver);
+        assert_eq!(
+            dynamic.source_endpoint_for("acme"),
+            "https://public.example/fhir/acme"
+        );
+
+        let explicit = channel_with_noop();
+        assert_eq!(explicit.source_endpoint_for("acme"), SOURCE);
     }
 
     fn handshake_bundle(sub: &ActiveSubscription) -> Value {

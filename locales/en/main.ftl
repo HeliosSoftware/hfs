@@ -426,6 +426,7 @@ queries-open-tab = Open in New Tab
 queries-col-updated = Updated
 queries-prev = Previous
 queries-next = Next
+queries-results-fetch-error = Could not load results from { $origin }. Check HFS_BASE_URL and try again.
 
 queries-rail-heading = Resource Types
 queries-rail-filter = Filter types

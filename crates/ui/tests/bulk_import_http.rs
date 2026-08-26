@@ -53,6 +53,24 @@ fn app(ctx: &Ctx) -> Router {
     )
 }
 
+fn app_with_path_tenant(ctx: &Ctx, tenant: &str) -> Router {
+    helios_ui::mount_with_conformance_source_and_body_limit_and_tenant_routing(
+        Router::new(),
+        "9.9.9",
+        None,
+        helios_ui::NlSearch::default(),
+        None,
+        Some(Arc::clone(&ctx.settings)),
+        tenant.to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::empty()),
+        FhirVersion::R4,
+        None,
+        ctx.recipient.clone(),
+        10 * 1024 * 1024,
+        true,
+    )
+}
+
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -104,6 +122,24 @@ async fn the_list_page_renders_and_offers_creation() {
     assert!(html.contains("Bulk Import"));
     assert!(html.contains("New Submission"));
     assert!(html.contains("No submissions yet"));
+}
+
+#[tokio::test]
+async fn recipient_includes_public_prefix_and_selected_path_tenant() {
+    let ctx = ctx("https://public.example/fhir/");
+    let response = app_with_path_tenant(&ctx, "acme")
+        .oneshot(
+            Request::get("/ui/bulk-import")
+                .header("host", "spoofed.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("https://public.example/fhir/acme"));
+    assert!(!html.contains("spoofed.example"));
 }
 
 #[tokio::test]

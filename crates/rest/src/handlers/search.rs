@@ -423,10 +423,12 @@ where
     }
 
     // Build the self link URL
-    let self_link = build_search_url(state.base_url(), resource_type, &search_params);
+    let public_base = state.public_base_url_for_request(tenant);
+    let self_link = build_search_url(&public_base, resource_type, &search_params);
 
     // Convert result to FHIR Bundle
-    let bundle = result.to_bundle(state.base_url(), &self_link);
+    let mut bundle = result.to_bundle(&public_base, &self_link);
+    rewrite_bundle_full_urls(&mut bundle, state, tenant);
 
     // Parse subsetting parameters
     let summary_mode = search_params
@@ -537,10 +539,12 @@ where
         })?;
 
     // Build the self link URL
-    let self_link = build_system_search_url(state.base_url(), &search_params);
+    let public_base = state.public_base_url_for_request(&tenant);
+    let self_link = build_system_search_url(&public_base, &search_params);
 
     // Convert result to FHIR Bundle
-    let bundle = result.to_bundle(state.base_url(), &self_link);
+    let mut bundle = result.to_bundle(&public_base, &self_link);
+    rewrite_bundle_full_urls(&mut bundle, state, &tenant);
 
     // Parse subsetting parameters
     let summary_mode = search_params
@@ -573,20 +577,37 @@ where
 /// Builds a type-level search URL from base URL and parameters.
 fn build_search_url(base_url: &str, resource_type: &str, params: &SearchParams) -> String {
     let query = encode_query(params);
-    if query.is_empty() {
-        format!("{}/{}", base_url, resource_type)
-    } else {
-        format!("{}/{}?{}", base_url, resource_type, query)
-    }
+    crate::public_url::PublicUrl::parse(base_url)
+        .expect("request public base was built from validated configuration")
+        .with_segments_and_query([resource_type], &query)
 }
 
 /// Builds a system-level search URL from base URL and parameters.
 fn build_system_search_url(base_url: &str, params: &SearchParams) -> String {
     let query = encode_query(params);
-    if query.is_empty() {
-        base_url.to_string()
-    } else {
-        format!("{}?{}", base_url, query)
+    crate::public_url::PublicUrl::parse(base_url)
+        .expect("request public base was built from validated configuration")
+        .with_segments_and_query(std::iter::empty::<&str>(), &query)
+}
+
+fn rewrite_bundle_full_urls<S>(
+    bundle: &mut SearchBundle,
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+) where
+    S: ResourceStorage,
+{
+    for entry in &mut bundle.entry {
+        let Some(resource) = entry.resource.as_ref() else {
+            continue;
+        };
+        let Some(resource_type) = resource.get("resourceType").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(id) = resource.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        entry.full_url = Some(state.public_url_for_request(tenant, [resource_type, id]));
     }
 }
 

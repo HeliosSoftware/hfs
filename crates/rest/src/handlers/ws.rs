@@ -18,6 +18,7 @@ use helios_persistence::core::ResourceStorage;
 use tracing::{debug, info, warn};
 
 use crate::error::{RestError, RestResult};
+use crate::extractors::TenantExtractor;
 use crate::state::AppState;
 
 /// WebSocket binding handler.
@@ -26,6 +27,7 @@ use crate::state::AppState;
 /// `bind-with-token <binding-token>` as the first message.
 pub async fn ws_bind_handler<S>(
     State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
     ws: WebSocketUpgrade,
 ) -> RestResult<Response>
 where
@@ -38,10 +40,33 @@ where
         })?;
 
     let engine = Arc::clone(engine);
-    let base_url = state.base_url().to_string();
+    let base_url = state.public_base_url_for_request(&tenant);
+    let request_tenant_id = tenant.tenant_id().to_string();
 
     // Upgrade the HTTP connection to WebSocket.
-    Ok(ws.on_upgrade(move |socket| handle_ws_connection(socket, engine, base_url)))
+    Ok(ws.on_upgrade(move |socket| {
+        handle_ws_connection(socket, engine, request_tenant_id, base_url)
+    }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BindingTokenRejection {
+    InvalidOrExpired,
+    TenantMismatch { token_tenant_id: String },
+}
+
+fn validate_binding_token_for_request(
+    manager: &helios_subscriptions::WsBindingTokenManager,
+    token: &str,
+    request_tenant_id: &str,
+) -> Result<(String, String), BindingTokenRejection> {
+    let (token_tenant_id, subscription_id) = manager
+        .validate_and_consume(token)
+        .ok_or(BindingTokenRejection::InvalidOrExpired)?;
+    if token_tenant_id != request_tenant_id {
+        return Err(BindingTokenRejection::TenantMismatch { token_tenant_id });
+    }
+    Ok((token_tenant_id, subscription_id))
 }
 
 /// Handles the WebSocket connection lifecycle after upgrade.
@@ -51,6 +76,7 @@ where
 async fn handle_ws_connection(
     mut socket: WebSocket,
     engine: Arc<helios_subscriptions::SubscriptionEngine>,
+    request_tenant_id: String,
     base_url: String,
 ) {
     let token = match receive_bind_token(&mut socket).await {
@@ -59,12 +85,24 @@ async fn handle_ws_connection(
     };
 
     // Validate and consume the binding token (single-use).
-    let (tenant_id, subscription_id) = match engine.ws_token_manager().validate_and_consume(&token)
-    {
-        Some(binding) => binding,
-        None => {
+    let (tenant_id, subscription_id) = match validate_binding_token_for_request(
+        engine.ws_token_manager(),
+        &token,
+        &request_tenant_id,
+    ) {
+        Ok(binding) => binding,
+        Err(BindingTokenRejection::InvalidOrExpired) => {
             warn!("Invalid or expired WebSocket binding token");
             close_with_policy_violation(&mut socket, "invalid-or-expired-token").await;
+            return;
+        }
+        Err(BindingTokenRejection::TenantMismatch { token_tenant_id }) => {
+            warn!(
+                request_tenant_id = %request_tenant_id,
+                token_tenant_id = %token_tenant_id,
+                "WebSocket binding token tenant does not match request tenant"
+            );
+            close_with_policy_violation(&mut socket, "tenant-mismatch").await;
             return;
         }
     };
@@ -249,7 +287,9 @@ async fn close_with_policy_violation(socket: &mut WebSocket, reason: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_bind_with_token_message;
+    use super::{
+        BindingTokenRejection, parse_bind_with_token_message, validate_binding_token_for_request,
+    };
 
     #[test]
     fn test_parse_bind_with_token_message() {
@@ -267,5 +307,30 @@ mod tests {
         );
         assert_eq!(parse_bind_with_token_message("bind-with-token"), None);
         assert_eq!(parse_bind_with_token_message("hello"), None);
+    }
+
+    #[test]
+    fn binding_token_tenant_must_match_request_tenant() {
+        let manager = helios_subscriptions::WsBindingTokenManager::new(30);
+        let (token, _) = manager.generate_token("acme", "subscription-1");
+
+        assert_eq!(
+            validate_binding_token_for_request(&manager, &token, "other"),
+            Err(BindingTokenRejection::TenantMismatch {
+                token_tenant_id: "acme".to_string(),
+            })
+        );
+        assert!(manager.validate_and_consume(&token).is_none());
+    }
+
+    #[test]
+    fn binding_token_matching_request_tenant_is_accepted() {
+        let manager = helios_subscriptions::WsBindingTokenManager::new(30);
+        let (token, _) = manager.generate_token("acme", "subscription-1");
+
+        assert_eq!(
+            validate_binding_token_for_request(&manager, &token, "acme"),
+            Ok(("acme".to_string(), "subscription-1".to_string()))
+        );
     }
 }

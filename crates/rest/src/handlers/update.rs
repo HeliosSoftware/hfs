@@ -230,11 +230,13 @@ where
         );
     }
 
+    let location = created
+        .then(|| state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]));
     build_update_response(
         status,
         &stored,
         headers,
-        &state,
+        location.as_deref(),
         created,
         &prefer,
         negotiated.format,
@@ -331,7 +333,7 @@ where
                 StatusCode::OK,
                 &stored,
                 headers,
-                &state,
+                None,
                 false,
                 &prefer,
                 negotiated.format,
@@ -352,11 +354,13 @@ where
         }
         ConditionalUpdateResult::Created(stored) => {
             let headers = ResourceHeaders::from_stored(&stored, &state);
+            let location =
+                state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]);
             build_update_response(
                 StatusCode::CREATED,
                 &stored,
                 headers,
-                &state,
+                Some(&location),
                 true,
                 &prefer,
                 negotiated.format,
@@ -394,20 +398,14 @@ fn build_update_response(
     status: StatusCode,
     stored: &helios_persistence::types::StoredResource,
     headers: ResourceHeaders,
-    state: &AppState<impl ResourceStorage>,
+    location: Option<&str>,
     created: bool,
     prefer: &PreferHeader,
     format: FhirFormat,
 ) -> RestResult<Response> {
     let mut header_map = headers.to_header_map();
 
-    if created {
-        let location = format!(
-            "{}/{}/{}",
-            state.base_url(),
-            stored.resource_type(),
-            stored.id()
-        );
+    if let Some(location) = location {
         header_map.insert(header::LOCATION, location.parse().unwrap());
     }
 
