@@ -26,7 +26,6 @@ off
 __pycache__/
 *.pyc
 /edson/docs/
-/.claude/skills/hts-api-skill/
 /.claude/skills/frontend-design/
 /.agents/skills/frontend-design/
 /.vscode/
