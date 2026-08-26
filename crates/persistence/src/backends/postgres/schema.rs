@@ -1098,6 +1098,14 @@ async fn migrate_v15_to_v16(client: &deadpool_postgres::Client) -> StorageResult
 /// of `search_index`, so it would be pure write amplification on the import path.
 /// See `build_composite_condition` for why the `EXISTS` form was rejected.
 ///
+/// Also deliberately NOT dropped: `idx_search_token`. It reads as superseded by
+/// the code-first `idx_search_token_code` added below, but the two serve
+/// different shapes: `build_token_condition` emits `value_token_system = $n`
+/// alone for the `system|` form, which has no leading equality on the code and
+/// so cannot seek a code-first index — doubly so because `idx_search_token_code`
+/// is partial on `value_token_code IS NOT NULL`. System-only token search has
+/// this index or it has a scan.
+///
 /// Also deliberately NOT dropped: `idx_search_resource`. It reads as redundant (a
 /// column prefix of `idx_search_composite`), but it is the per-resource probe in
 /// the new plans and takes ~12M scans in a 30 s run — the hottest index in the
@@ -1152,7 +1160,13 @@ async fn migrate_v14_to_v15(client: &deadpool_postgres::Client) -> StorageResult
         // added in v10 and is populated only on write, never backfilled, so rows
         // predating the upgrade have NULL there and must fall back to the raw column.
         //
-        // `text_pattern_ops` also serves plain `=`, so this covers `:exact` too.
+        // NOTE: this does NOT cover `:exact`. `text_pattern_ops` does serve plain
+        // `=`, but this index is on the COALESCE *expression*, and `:exact` emits
+        // `value_string = $n` against the bare column (build_string_condition),
+        // which no expression index on a different expression can match. The
+        // `:exact` shape is served by `idx_search_string` — which is why that
+        // index is load-bearing rather than the redundant duplicate it appears
+        // to be next to this one. Do not prune it.
         "CREATE INDEX IF NOT EXISTS idx_search_string_folded_pattern
          ON search_index (tenant_id, resource_type, param_name,
                           (COALESCE(value_string_folded, lower(value_string))) text_pattern_ops)
