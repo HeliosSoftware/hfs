@@ -18,7 +18,7 @@
 //! a raw binary stream in the format's native media type, *not* a serialized
 //! `Binary` resource envelope. When `_format=fhir` is requested the response is
 //! a `Parameters` resource instead — the documented exception to the `Binary`
-//! return. By default, flat formats (csv/json/ndjson/parquet) are returned as
+//! return. By default, flat formats (csv/json/ndjson/parquet/arrow) are returned as
 //! raw payload bytes with the format's `Content-Type`. Callers that want the
 //! serialized `Binary` envelope (base64 `data`) can request it by setting
 //! `Accept: application/fhir+json` on a *flat* `_format`; this envelope axis
@@ -274,6 +274,7 @@ where
 /// Accept mapping: `application/json` → `json`,
 /// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
 /// `application/octet-stream`/`application/parquet` → `parquet`,
+/// `application/vnd.apache.arrow.stream` → `arrow`,
 /// `application/fhir+json` → `fhir`. `application/fhir+xml` is **not**
 /// mapped — the FHIR formatter only emits JSON, and routing xml-asking
 /// clients to a JSON response was misleading. Unknown Accept values fall
@@ -301,6 +302,7 @@ fn resolve_format(
                 "application/octet-stream"
                 | "application/parquet"
                 | "application/vnd.apache.parquet" => Some("parquet"),
+                "application/vnd.apache.arrow.stream" => Some("arrow"),
                 "application/fhir+json" => Some("fhir"),
                 _ => None,
             });

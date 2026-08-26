@@ -36,7 +36,7 @@
 //! | `resource` | Resource | FHIR resources to transform instead of server data (ViewDefinition subjects only) |
 //! | `patient` | Reference | Restrict the data feeding the view to these patients' compartments |
 //! | `group` | Reference | Restrict to members of these Groups |
-//! | `_format` | code | Output format: `ndjson`, `csv`, `json`, `parquet`, `fhir` (optional; defaults to `ndjson`; may also come from `Accept`) |
+//! | `_format` | code | Output format: `ndjson`, `csv`, `json`, `parquet`, `arrow`, `fhir` (optional; defaults to `ndjson`; may also come from `Accept`) |
 //! | `_limit` | integer | Maximum number of output rows |
 //! | `_since` | instant | Only include resources modified after this time |
 //!
@@ -83,7 +83,7 @@ use crate::state::AppState;
 /// merged in via [`merge_params`] and take precedence.
 #[derive(Debug, Default, Deserialize)]
 pub struct RunQueryParams {
-    /// Output format: `ndjson`, `csv`, `json`, `parquet`, `fhir`. Optional
+    /// Output format: `ndjson`, `csv`, `json`, `parquet`, `arrow`, `fhir`. Optional
     /// (`0..1`); defaults to `ndjson`. May also be supplied via the `Accept`
     /// header, with `_format` taking precedence.
     #[serde(rename = "_format")]
@@ -429,7 +429,7 @@ where
         return Ok(streaming_ndjson_response(stream, &runner_label));
     }
 
-    // Buffered paths (csv, json array, parquet) — collect the stream first.
+    // Buffered paths (csv, json array, parquet, arrow) — collect the stream first.
     let (ct, body) = format_stream(stream, content_type).await?;
     let (ct, body) = if wants_envelope {
         let wrapped = wrap_in_binary_envelope(ct, &body).map_err(map_sof_lib_error_to_rest)?;
@@ -750,7 +750,7 @@ fn streaming_ndjson_response(
 
 /// Renders a `RowStream` to `(content_type_header, bytes)` for the requested
 /// format. NDJSON has its own dedicated streaming path
-/// ([`streaming_ndjson_response`]); buffered formats (csv, json, parquet) drain
+/// ([`streaming_ndjson_response`]); buffered formats (csv, json, parquet, arrow) drain
 /// here and pass through `helios_sof::format_output` so REST output matches
 /// `sof-server` / `pysof` byte-for-byte. Takes the already-validated
 /// `ContentType` so there's no re-parse-with-`expect` here (audit item #15).

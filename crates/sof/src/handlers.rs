@@ -588,17 +588,22 @@ pub async fn sql_run_handler(
                 .into_response());
         }
 
-        let response = if matches!(validated_params.format, ContentType::Parquet) {
-            // Add Content-Disposition for parquet so browsers download as
-            // `.parquet` rather than rendering octet-stream as binary noise.
+        let response = if matches!(
+            validated_params.format,
+            ContentType::Parquet | ContentType::ArrowIpc
+        ) {
+            // Add Content-Disposition for the binary columnar formats so
+            // browsers download a file rather than rendering binary noise.
+            let filename = if validated_params.format == ContentType::Parquet {
+                "attachment; filename=\"output.parquet\""
+            } else {
+                "attachment; filename=\"output.arrow\""
+            };
             (
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, mime_type),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        "attachment; filename=\"output.parquet\"",
-                    ),
+                    (header::CONTENT_DISPOSITION, filename),
                 ],
                 filtered_output,
             )
