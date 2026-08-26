@@ -25,7 +25,6 @@ off
 # Python bytecode (e.g. audit test helpers under crates/hfs/tests/audit)
 __pycache__/
 *.pyc
-/edson/docs/
 /.claude/skills/frontend-design/
 /.agents/skills/frontend-design/
 /.vscode/
