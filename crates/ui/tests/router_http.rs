@@ -8,8 +8,49 @@ use axum::{
     http::{Request, StatusCode, header},
     routing::get,
 };
+use helios_persistence::{
+    StorageResult,
+    core::{SettingsStore, StoredUserSettings},
+};
 use http_body_util::BodyExt;
+use serde_json::Value;
+use std::sync::Arc;
 use tower::ServiceExt;
+
+struct NoSettingsAccess;
+
+#[async_trait::async_trait]
+impl SettingsStore for NoSettingsAccess {
+    async fn get_settings(&self, _user_key: &str) -> StorageResult<Option<StoredUserSettings>> {
+        panic!("JSON preview must not read settings")
+    }
+
+    async fn put_settings(
+        &self,
+        _user_key: &str,
+        _document: Value,
+        _if_match_version: Option<i64>,
+    ) -> StorageResult<StoredUserSettings> {
+        panic!("JSON preview must not write settings")
+    }
+
+    async fn patch_settings(
+        &self,
+        _user_key: &str,
+        _merge_patch: Value,
+        _if_match_version: Option<i64>,
+    ) -> StorageResult<StoredUserSettings> {
+        panic!("JSON preview must not write settings")
+    }
+
+    async fn delete_settings(&self, _user_key: &str) -> StorageResult<bool> {
+        panic!("JSON preview must not delete settings")
+    }
+
+    async fn purge_tenant_settings(&self, _tenant_id: &str) -> StorageResult<u64> {
+        panic!("JSON preview must not purge settings")
+    }
+}
 
 fn app() -> Router {
     app_with(nl(true, true))
@@ -37,6 +78,60 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
         None,
         "default".to_string(),
         std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+    )
+}
+
+fn app_with_body_limit(max_body_size: usize) -> Router {
+    helios_ui::mount_with_conformance_source_and_body_limit(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        max_body_size,
+    )
+}
+
+fn production_app() -> Router {
+    helios_ui::mount(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        "http://127.0.0.1:9".to_string(),
+        Arc::new(helios_auth::NoOpOutboundAuthProvider),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+    )
+}
+
+fn app_with_unavailable_settings() -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        Some(Arc::new(NoSettingsAccess)),
+        "default".to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
             std::path::Path::new("../../data"),
         )),
         helios_fhir::FhirVersion::R4,
@@ -680,6 +775,136 @@ async fn editor_renders_a_foldable_line_numbered_json_view() {
     // Syntax highlighting: keys and strings are tokenised.
     assert!(html.contains("jt--key"));
     assert!(html.contains("jt--string"));
+    assert_eq!(html.matches(r#"id="json-view""#).count(), 1);
+    assert!(html.contains(r#"data-jpath="name.0.family""#));
+    assert!(html.contains(r#"class="json-line__num" aria-hidden="true""#));
+    assert!(html.contains(r#"aria-expanded="true""#));
+}
+
+#[tokio::test]
+async fn json_view_endpoint_renders_a_normal_bundle_without_editor_contracts() {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"resourceType":"Bundle","type":"batch","entry":[{"resource":{"resourceType":"Patient","a\"\\\n\t\u0001":"<script>alert(1)</script>"},"request":{"method":"POST","url":"Patient"}}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let html = body_text(response).await;
+    assert!(html.contains(r#"class="json-view""#));
+    assert!(!html.contains(r#"id="json-view""#));
+    assert!(!html.contains("data-jpath"));
+    assert!(html.contains("&#60;script&#62;alert(1)&#60;/script&#62;"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+    assert!(html.contains(r#"a\&#34;\\\n\t\u0001"#));
+}
+
+#[tokio::test]
+async fn json_view_endpoint_rejects_compact_structural_amplification() {
+    // Roughly 20 KiB on the wire used to expand to about 3.5 MiB of HTML.
+    // It is comfortably below the default body limit but above the rendering
+    // budget, so rejection happens before a large line Vec/template String.
+    let document = format!(
+        "[{}]",
+        std::iter::repeat_n("0", 10_000)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert!(document.len() < 25_000);
+
+    let response = app()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(document))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn json_view_endpoint_skips_preferences_but_keeps_locale_negotiation() {
+    let response = app_with_unavailable_settings()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT_LANGUAGE, "es")
+                .body(Body::from(r#"{"nested":{"n":1}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"aria-label="Alternar sección JSON""#));
+}
+
+#[tokio::test]
+async fn json_view_endpoint_rejects_invalid_or_oversized_json() {
+    let invalid = app()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let oversized = app_with_body_limit(16)
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"long":"01234567890123456789"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn production_mount_applies_the_default_json_view_body_limit() {
+    let app = production_app();
+
+    let normal = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"resourceType":"Patient"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(normal.status(), StatusCode::OK);
+
+    let over_default_limit = format!(r#"{{"value":"{}"}}"#, "x".repeat(10 * 1024 * 1024));
+    let oversized = app
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(over_default_limit))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]
@@ -1194,6 +1419,7 @@ async fn batch_page_serves_the_workspace_shell() {
     // The semantics copy rides in as data for batch.js.
     assert!(html.contains("data-msg-semantics-transaction"));
     assert!(html.contains(r#"src="/ui/assets/batch.js""#));
+    assert!(html.contains(r#"src="/ui/assets/json-view.js""#));
 }
 
 /* #546: creating a resource with required elements must not dump duplicated,
@@ -1270,10 +1496,10 @@ async fn editor_opens_the_root_picker_on_an_empty_document() {
 }
 
 /// #649: SQL on FHIR is a top-level nav section whose five children are real
-/// routes — the dead `nav-item--soon` placeholder is gone — and each stub
-/// page answers 200 and marks its own nav entry current.
+/// routes — the dead `nav-item--soon` placeholder is gone — and each page
+/// answers 200 and marks its own nav entry current.
 #[tokio::test]
-async fn sql_on_fhir_section_navigates_to_real_stub_pages() {
+async fn sql_on_fhir_section_navigates_to_real_pages() {
     let response = app()
         .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
         .await

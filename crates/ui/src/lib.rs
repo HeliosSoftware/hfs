@@ -59,8 +59,8 @@ pub use conformance::{ConformanceSource, SqlExportStatus, StaticConformanceSourc
 
 use askama::Template;
 use axum::{
-    Router,
-    extract::{Query, RawQuery, State},
+    Json, Router,
+    extract::{DefaultBodyLimit, Query, RawQuery, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Response},
@@ -241,6 +241,14 @@ async fn resolve_prefs(
     mut request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
+    // Batch JSON previews need locale negotiation, but no tenant or FHIR
+    // version preference. Avoid the settings and tenant-registry reads on this
+    // high-frequency, stateless rendering route; the locale middleware remains
+    // in the inner stack and still stamps RequestLocale before the handler.
+    if request.uri().path() == "/ui/json-view/render" {
+        return next.run(request).await;
+    }
+
     let mut version = state.fhir_version;
     let mut tenant = RequestTenant {
         id: state.default_tenant.clone(),
@@ -688,6 +696,16 @@ struct BatchPage {
     active_page: &'static str,
 }
 
+/// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
+#[derive(Template)]
+#[template(path = "partials/json-view.html")]
+struct JsonViewFragment {
+    i18n: I18n,
+    json_lines: Vec<json_view::JsonLine>,
+    json_view_id: String,
+    json_view_paths: bool,
+}
+
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
 /// are codegen'd into the binary; a tenant-scoped override layer is open
 /// question 1 on the issue.
@@ -796,13 +814,47 @@ pub fn mount(
     terminology: Option<String>,
     public_base_url: String,
 ) -> Router {
+    mount_with_body_limit(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        self_base_url,
+        outbound_auth,
+        fhir_version,
+        terminology,
+        public_base_url,
+        10 * 1024 * 1024,
+    )
+}
+
+/// [`mount`] with an explicit request-body limit for UI rendering endpoints.
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_body_limit(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    max_body_size: usize,
+) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url,
         outbound_auth,
         fhir_version,
         data_dir.clone(),
     ));
-    mount_with_conformance_source(
+    mount_with_conformance_source_and_body_limit(
         fhir_app,
         hfs_version,
         data_dir,
@@ -814,6 +866,7 @@ pub fn mount(
         fhir_version,
         terminology,
         public_base_url,
+        max_body_size,
     )
 }
 
@@ -835,6 +888,39 @@ pub fn mount_with_conformance_source(
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
     public_base_url: String,
+) -> Router {
+    mount_with_conformance_source_and_body_limit(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        source,
+        fhir_version,
+        terminology,
+        public_base_url,
+        10 * 1024 * 1024,
+    )
+}
+
+/// [`mount_with_conformance_source`] with an explicit UI request-body limit.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_conformance_source_and_body_limit(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    max_body_size: usize,
 ) -> Router {
     let nl_enabled = nl.enabled;
 
@@ -860,8 +946,7 @@ pub fn mount_with_conformance_source(
         .route("/ui/capability-statement", get(capability_page))
         // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
         .route("/ui/batch", get(batch_page))
-        // SQL on FHIR section (#649). View Definitions is the live workspace;
-        // the rest are stub pages until each surface lands.
+        // SQL on FHIR workspaces (#649).
         .route(
             "/ui/sql/view-definitions",
             get(sql_view_definitions_page).post(sql_view_definitions_save),
@@ -888,6 +973,10 @@ pub fn mount_with_conformance_source(
         .route(
             "/ui/editor/render",
             axum::routing::post(editor::render_body),
+        )
+        .route(
+            "/ui/json-view/render",
+            axum::routing::post(render_json_view).layer(DefaultBodyLimit::max(max_body_size)),
         )
         .route("/ui/status", get(status))
         .route("/ui/history", get(history_page))
@@ -1516,6 +1605,46 @@ struct CompartmentsQuery {
     target: String,
     /// Set by the CRUD flows after a write: drop the cached definitions first.
     refresh: Option<String>,
+}
+
+/// Syntax-highlights arbitrary JSON without applying FHIR semantics or
+/// retaining the payload. Batch sends compact JSON and receives only HTML.
+async fn render_json_view(
+    locale: RequestLocale,
+    Json(document): Json<serde_json::Value>,
+) -> Response {
+    // A compact JSON array can turn a few KiB into thousands of HTML lines.
+    // Keep previews below 4,000 lines and a conservative 2 MiB output estimate
+    // so the configured request-body limit cannot be used for amplification.
+    const MAX_LINES: usize = 4_000;
+    const MAX_ESTIMATED_HTML_BYTES: usize = 2 * 1024 * 1024;
+
+    let json_lines = match json_view::try_lines(
+        &document,
+        json_view::RenderOptions {
+            include_paths: false,
+            budget: Some(json_view::RenderBudget {
+                max_lines: MAX_LINES,
+                max_estimated_html_bytes: MAX_ESTIMATED_HTML_BYTES,
+            }),
+        },
+    ) {
+        Ok(lines) => lines,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "JSON preview exceeds the rendering budget",
+            )
+                .into_response();
+        }
+    };
+
+    render(JsonViewFragment {
+        i18n: I18n::new(locale),
+        json_lines,
+        json_view_id: String::new(),
+        json_view_paths: false,
+    })
 }
 
 /// Batch/Transaction workspace page (#476). The shell is server-rendered;
