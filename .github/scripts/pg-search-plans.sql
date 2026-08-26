@@ -373,3 +373,74 @@ WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = F
               HAVING MAX(CASE WHEN value_token_code = '8867-4' THEN 1 ELSE 0 END) = 1
                  AND MAX(CASE WHEN value_quantity_value > 100 THEN 1 ELSE 0 END) = 1))
 ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- U-X. THE SQL THE SERVER ACTUALLY EMITS.
+--
+-- Sections A-T measure hand-written levers. None of them is the fast-path query
+-- the #279/v17 path builds, so when v17's targeted shapes stayed slow and its
+-- untargeted ones regressed 12x, this capture could not say why — the plan for
+-- the emitted SQL had never been recorded. These four sections close that gap:
+-- the exact shape from `search_impl.rs`, over both selectivity regimes.
+--
+-- What to look for: `idx_search_*_recent` (v19) driving an Index Only Scan with
+-- rows≈22 and a streaming `Unique`, meaning the LIMIT stopped the scan. A Sort
+-- node, or `rows` in the tens of thousands, means early termination did NOT
+-- happen and the recent-first index was not chosen.
+-- ────────────────────────────────────────────────────────────────────────────
+
+\echo ''
+\echo '######## U. FAST PATH date Observation?date=gt2010 — non-selective (early termination expected) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'date' AND value_date >= '2010-01-01'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## V. FAST PATH date Observation?date=gt2200 — sparse (value-first index must still win) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'date' AND value_date >= '2200-01-01'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## W. FAST PATH token Observation?category=laboratory — the 4162ms shape ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'category' AND value_token_code = 'laboratory'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## X. FAST PATH token Encounter?class=AMB — the shape v17 regressed 12x ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+         AND param_name = 'class' AND value_token_code = 'AMB'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Encounter'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;

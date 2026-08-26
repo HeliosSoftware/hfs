@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 18;
+pub const SCHEMA_VERSION: i32 = 19;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -339,6 +339,7 @@ async fn migrate_schema(
             15 => migrate_v15_to_v16(client).await?,
             16 => migrate_v16_to_v17(client).await?,
             17 => migrate_v17_to_v18(client).await?,
+            18 => migrate_v18_to_v19(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1029,6 +1030,75 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v18 -> v19: recent-first indexes so the fast path can terminate early.
+///
+/// Every search ends `ORDER BY last_updated DESC, id ASC LIMIT n`, and the
+/// #279/v17 fast path takes that top-n from `search_index` directly:
+///
+/// ```sql
+/// SELECT DISTINCT resource_id, last_updated FROM search_index
+/// WHERE tenant_id = $1 AND resource_type = $2 AND <one membership test>
+/// ORDER BY last_updated DESC, resource_id ASC LIMIT 22
+/// ```
+///
+/// v17 put `last_updated` on those indexes as `INCLUDE (resource_id,
+/// last_updated)`. **`INCLUDE` columns are payload, not key columns — they
+/// cannot satisfy an `ORDER BY`.** So no index supplied the required order and
+/// Postgres had to read every matching index row and sort it to find 22. v17
+/// paid the storage for the column and got none of the ordering benefit, which
+/// is why the shapes it targeted stayed slow (`Observation?date` p99 4075 ms,
+/// `Observation?category` 4162 ms on run 32994869043) even after v18 freed
+/// 13 GB of index footprint — ruling out cache pressure as the cause.
+///
+/// It also explains the regressions v17 introduced. Before v17 a shape like
+/// `Encounter?class=AMB` could drive from `idx_resources_search`
+/// (tenant_id, resource_type, last_updated DESC, id ASC), scanning `resources`
+/// already in sort order and probing `search_index` per row, stopping after 22
+/// — 18 ms. The fast path forced `search_index` to be the driver and replaced
+/// that early termination with a full sort: 216 ms, a 12x regression.
+///
+/// These indexes put the sort key in the KEY, in the exact order the fast path
+/// asks for, with the filter column as payload so the scan stays index-only.
+/// Within a fixed (tenant_id, resource_type, param_name) — all bound by
+/// equality — the remaining key order is precisely
+/// `last_updated DESC, resource_id ASC`, so the `DISTINCT` becomes a streaming
+/// `Unique` over presorted input and the `LIMIT` stops the scan.
+///
+/// The value-first indexes from v18 are KEPT alongside these: a *selective*
+/// filter is still better served by seeking on the value and joining a handful
+/// of rows, and a recent-first scan would have to walk the whole parameter
+/// slice to find its 22 matches. Two shapes of index for two selectivity
+/// regimes, with the planner choosing — rather than a gate in our SQL trying to
+/// guess selectivity at build time, which it cannot see.
+///
+/// Partial, for the reason v18 gives: a row carrying a token value must not pay
+/// an index insert into the date and quantity indexes.
+async fn migrate_v18_to_v19(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let index_stmts = [
+        "CREATE INDEX IF NOT EXISTS idx_search_date_recent
+         ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+         INCLUDE (value_date)
+         WHERE value_date IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_code_recent
+         ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+         INCLUDE (value_token_code)
+         WHERE value_token_code IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_recent
+         ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+         INCLUDE (value_quantity_value, value_quantity_unit)
+         WHERE value_quantity_value IS NOT NULL",
+    ];
+
+    for sql in index_stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v18->v19 failed: {}", e)))?;
     }
 
     Ok(())
