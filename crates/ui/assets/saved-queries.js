@@ -175,12 +175,13 @@
   }
 
   var catalogType = null;
+  var catalogLoadSeq = 0;
 
   /* Per-type parameter metadata from the catalog fragment's data attributes:
    * type -> { code: { type: "reference"|..., targets: ["Patient", ...] } }.
    * Feeds the chaining controls; promise-cached so each type is fetched once. */
   var PARAM_META = {};
-  var paramMetaPromises = {};
+  var paramCatalogPromises = {};
   function parseCatalog(html) {
     var tpl = document.createElement("template");
     tpl.innerHTML = html;
@@ -193,10 +194,10 @@
     });
     return { meta: meta, datalist: tpl.content.querySelector("datalist") };
   }
-  function fetchParams(type) {
-    if (!type) return Promise.resolve({});
-    if (paramMetaPromises[type]) return paramMetaPromises[type];
-    paramMetaPromises[type] = fetch(
+  function fetchCatalog(type) {
+    if (!type) return Promise.resolve({ meta: {}, datalist: null });
+    if (paramCatalogPromises[type]) return paramCatalogPromises[type];
+    paramCatalogPromises[type] = fetch(
       "/ui/queries/params?type=" + encodeURIComponent(type),
       { credentials: "same-origin" },
     )
@@ -204,33 +205,44 @@
         return response.ok ? response.text() : null;
       })
       .then(function (html) {
-        if (!html) return {};
-        var parsed = parseCatalog(html);
+        var parsed = html
+          ? parseCatalog(html)
+          : { meta: {}, datalist: null };
         PARAM_META[type] = parsed.meta;
-        return parsed.meta;
+        return parsed;
+      })
+      .catch(function () {
+        PARAM_META[type] = {};
+        return { meta: {}, datalist: null };
       });
-    return paramMetaPromises[type];
+    return paramCatalogPromises[type];
+  }
+  function fetchParams(type) {
+    return fetchCatalog(type).then(function (catalog) {
+      return catalog.meta;
+    });
   }
 
   /* Swaps the parameter datalist for the current resource type. The
    * fragment is server-rendered from the SearchParameter registry. */
   function loadCatalog(type) {
-    if (!type || type === catalogType) return;
+    if (!type) return Promise.resolve({});
+    var loadSeq = ++catalogLoadSeq;
     catalogType = type;
-    fetch("/ui/queries/params?type=" + encodeURIComponent(type), {
-      credentials: "same-origin",
-    })
-      .then(function (response) {
-        return response.ok ? response.text() : null;
-      })
-      .then(function (html) {
-        if (!html) return;
-        var parsed = parseCatalog(html);
-        PARAM_META[type] = parsed.meta;
-        var current = document.getElementById("param-options");
-        if (parsed.datalist && current) current.replaceWith(parsed.datalist);
-        refreshChainAffordances();
-      });
+    return fetchCatalog(type).then(function (parsed) {
+      if (
+        loadSeq !== catalogLoadSeq ||
+        catalogType !== type ||
+        !sections ||
+        sections.dataset.type !== type
+      )
+        return parsed.meta;
+      var current = document.getElementById("param-options");
+      if (parsed.datalist && current)
+        current.replaceWith(parsed.datalist.cloneNode(true));
+      refreshChainAffordances();
+      return parsed.meta;
+    });
   }
 
   function splitQuery(query) {
@@ -410,15 +422,19 @@
    * prefixes only apply to the ordered families. Unknown or unregistered
    * params keep the full lists. */
   var MODS_BY_TYPE = {
-    string: ["exact", "contains", "missing"],
-    token: ["text", "not", "in", "not-in", "of-type", "missing"],
-    reference: ["identifier", "missing"],
-    uri: ["below", "above", "missing"],
+    string: ["exact", "contains", "text", "missing"],
+    token: [
+      "text", "not", "above", "below", "in", "not-in", "of-type", "missing",
+    ],
+    reference: [
+      "contains", "text", "above", "below", "identifier", "missing",
+    ],
+    uri: ["contains", "above", "below", "missing"],
     date: ["missing"],
     number: ["missing"],
     quantity: ["missing"],
-    composite: ["missing"],
-    special: ["missing"],
+    composite: [],
+    special: [],
   };
   var PREFIX_TYPES = ["date", "number", "quantity"];
 
@@ -430,32 +446,57 @@
     return PREFIX_TYPES.indexOf(paramType) >= 0 ? PREFIXES : [];
   }
 
-  /* Rebuilds a row's modifier select and MODIFY chips for its param type. */
+  function knownParamType(paramType) {
+    return Object.prototype.hasOwnProperty.call(MODS_BY_TYPE, paramType);
+  }
+
+  function compatibleModifier(modifier, paramType) {
+    if (!modifier) return true;
+    if ((MODS_BY_TYPE[paramType] || []).indexOf(modifier) >= 0) return true;
+    if (modifier === "text-advanced" || modifier === "code-text") {
+      return paramType === "token" || paramType === "reference";
+    }
+    return paramType === "reference" && /^[A-Z]/.test(modifier);
+  }
+
+  /* Rebuilds a row's modifier select and MODIFY chips for its param type.
+   * A known type discards an incompatible operator; unknown parameters keep
+   * pasted operators verbatim. */
   function refreshModifierControls(row, paramType) {
     var modifier = row.querySelector(".builder-row__modifier");
-    if (!modifier) return;
-    var selected = modifier.value;
+    if (!modifier) return false;
+    var originalSelected = modifier.value;
+    var selected = originalSelected;
+    var known = row.dataset.compatState === "known";
     var mods = applicableMods(paramType);
+    if (known && !compatibleModifier(selected, paramType)) selected = "";
     modifier.textContent = "";
     option(modifier, "", sections.dataset.msgMatchIs, !selected);
     mods.forEach(function (m) {
       option(modifier, m, ":" + m, selected === m);
     });
-    /* A modifier from a pasted URL stays selectable even when the type
-     * would not offer it. */
+    /* Compatibility-only and unknown modifiers remain selectable without
+     * becoming chips in the visible modifier matrix. */
     if (selected && mods.indexOf(selected) < 0) {
       option(modifier, selected, ":" + selected, true);
     }
     var panel = row.querySelector(".builder-row__modpanel");
     if (panel) fillModPanel(panel, row, mods);
+    return originalSelected !== selected;
   }
 
   /* Re-gates the per-value comparator selects without discarding an explicit
    * prefix from a pasted URL whose parameter type is unknown or unexpected. */
   function refreshComparatorControls(row, paramType) {
     var prefixes = applicablePrefixes(paramType);
+    var known = row.dataset.compatState === "known";
+    var changed = false;
     row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
       var selected = comparator.value;
+      if (known && prefixes.indexOf(selected) < 0) {
+        changed = changed || !!selected;
+        selected = "";
+      }
       comparator.textContent = "";
       option(comparator, "", sections.dataset.msgMatchIs, !selected);
       prefixes.forEach(function (prefix) {
@@ -466,6 +507,36 @@
       }
       comparator.hidden = prefixes.length === 0 && !selected;
     });
+    return changed;
+  }
+
+  /* A modifier-bearing value is literal while the modifier is active, so its
+   * leading comparator was not split during hydration. If reconciliation
+   * removes that modifier and lands on an ordered type, move the prefix into
+   * the comparator control and keep the preserved wire value in step. */
+  function rehydrateComparatorPrefixes(row) {
+    var changed = false;
+    row.querySelectorAll(".builder-row__orvalue").forEach(function (alternative) {
+      var comparator = alternative.querySelector(".builder-row__comparator");
+      var input = alternative.querySelector(".builder-row__value");
+      var parsed = parsePrefixedValue(input.value);
+      if (!comparator || !parsed.comparator) return;
+      var wire = parsePrefixedValue(
+        input.dataset.fhirWire === undefined
+          ? input.value
+          : input.dataset.fhirWire,
+      );
+      comparator.value = parsed.comparator;
+      input.value = parsed.value;
+      if (wire.comparator === parsed.comparator) {
+        input.dataset.fhirWire = wire.value;
+      } else {
+        delete input.dataset.fhirWire;
+        input.dataset.fhirDirty = "true";
+      }
+      changed = true;
+    });
+    return changed;
   }
 
   /* Best-effort param type for a row's modifier target, from the cached
@@ -489,14 +560,106 @@
     return (((PARAM_META[base] || {})[key.value.trim()] || {}).type) || "";
   }
 
-  /* Re-gates a row's modifier controls when its param type changed. */
+  function builderCompatibilityPending() {
+    return !!(
+      compatibilitySyncQueued ||
+      (sections &&
+        sections.querySelector(".builder-row[data-compat-state='pending']"))
+    );
+  }
+
+  function builderConsumersBlocked() {
+    return (
+      builderCompatibilityPending() ||
+      !!(sections && !sections.hidden && builderHasEscapeError())
+    );
+  }
+
+  var pendingBuilderConsumers = [];
+  function syncBuilderAvailability() {
+    var pending = builderConsumersBlocked();
+    if (form) {
+      form.querySelectorAll("[data-intent]").forEach(function (control) {
+        control.disabled = pending;
+      });
+    }
+    var copy = document.getElementById("query-copy");
+    if (copy) copy.disabled = pending;
+    if (root) {
+      root
+        .querySelectorAll("button[data-action='run']")
+        .forEach(function (control) {
+          control.disabled = pending;
+        });
+    }
+    if (pending) return;
+    var ready = pendingBuilderConsumers;
+    pendingBuilderConsumers = [];
+    ready.forEach(function (consumer) {
+      if (consumer.revision === builderRevision) consumer.callback();
+    });
+  }
+
+  function consumeWhenBuilderReady(revision, callback) {
+    if (!builderConsumersBlocked()) {
+      if (revision === builderRevision) callback();
+      return;
+    }
+    pendingBuilderConsumers.push({ revision: revision, callback: callback });
+  }
+
+  var compatibilitySyncQueued = false;
+  var compatibilitySyncNeeded = false;
+  var compatibilitySyncGeneration = 0;
+  function resetCompatibilitySync() {
+    compatibilitySyncGeneration += 1;
+    compatibilitySyncQueued = false;
+    compatibilitySyncNeeded = false;
+  }
+  function queueCompatibilitySync(needsUpdate) {
+    compatibilitySyncNeeded = compatibilitySyncNeeded || !!needsUpdate;
+    if (compatibilitySyncQueued) return;
+    var generation = compatibilitySyncGeneration;
+    compatibilitySyncQueued = true;
+    Promise.resolve().then(function () {
+      if (generation !== compatibilitySyncGeneration) return;
+      compatibilitySyncQueued = false;
+      if (!builderCompatibilityPending()) {
+        var shouldUpdate = compatibilitySyncNeeded;
+        compatibilitySyncNeeded = false;
+        if (shouldUpdate && !builderUrlEdited) updateUrl();
+        syncBuilderAvailability();
+      }
+    });
+  }
+
+  function markCompatibilityPending(row) {
+    row.dataset.compatState = "pending";
+    syncBuilderAvailability();
+  }
+
+  function noteBuilderUserEdit() {
+    builderRevision += 1;
+    if (builderCompatibilityPending()) compatibilitySyncNeeded = true;
+  }
+
+  /* Settles one row as a known type or as unknown/ambiguous. Unknown rows
+   * remain permissive; known rows reconcile both key modifiers and value
+   * prefixes before the URL can be consumed. */
   function regateModifiers(row, resolvedType) {
     var t = arguments.length > 1 ? resolvedType : rowParamType(row);
-    if (row.dataset.modType !== t) {
-      row.dataset.modType = t;
-      refreshModifierControls(row, t);
+    var wasPending = row.dataset.compatState === "pending";
+    var known = knownParamType(t);
+    row.dataset.compatState = known ? "known" : "unknown";
+    row.dataset.modType = known ? t : "";
+    var modifierRemoved = refreshModifierControls(row, known ? t : "");
+    var changed = modifierRemoved;
+    changed = refreshComparatorControls(row, known ? t : "") || changed;
+    if (modifierRemoved && PREFIX_TYPES.indexOf(t) >= 0) {
+      changed = rehydrateComparatorPrefixes(row) || changed;
     }
-    refreshComparatorControls(row, t);
+    if (wasPending) queueCompatibilitySync(changed);
+    else syncBuilderAvailability();
   }
 
   /* The MODIFY panel: each applicable modifier as a chip with its
@@ -560,6 +723,9 @@
     COLON_MODIFIERS.forEach(function (m) {
       option(modifier, m, ":" + m, selectedMod === m);
     });
+    if (selectedMod && COLON_MODIFIERS.indexOf(selectedMod) < 0) {
+      option(modifier, selectedMod, ":" + selectedMod, true);
+    }
     row.appendChild(modifier);
 
     appendValues(row, value, !selectedMod);
@@ -617,6 +783,7 @@
     row.appendChild(deeper);
 
     appendTail(row, part);
+    markCompatibilityPending(row);
 
     var base = sections.dataset.type || "";
     var leafRefillSeq = 0;
@@ -694,13 +861,15 @@
     function refillLeaf() {
       var refillSeq = ++leafRefillSeq;
       var leafCode = leaf.input.value.trim();
+      markCompatibilityPending(row);
       leafTypes(function (types) {
         var pending = types.length;
         var codes = [];
         var anyRef = false;
         var resolvedTypes = [];
         if (!pending) {
-          if (refillSeq === leafRefillSeq) regateModifiers(row, "");
+          if (refillSeq === leafRefillSeq && row.isConnected)
+            regateModifiers(row, "");
           return;
         }
         types.forEach(function (t) {
@@ -711,7 +880,11 @@
             var m = meta[leafCode];
             if (m && m.type === "reference") anyRef = true;
             if (m && resolvedTypes.indexOf(m.type) < 0) resolvedTypes.push(m.type);
-            if (--pending === 0 && refillSeq === leafRefillSeq) {
+            if (
+              --pending === 0 &&
+              refillSeq === leafRefillSeq &&
+              row.isConnected
+            ) {
               fillList(leaf.list, codes.sort());
               deeper.hidden = !anyRef;
               regateModifiers(row, resolvedTypes.length === 1 ? resolvedTypes[0] : "");
@@ -745,7 +918,7 @@
         hops[k].type = typeSel.value;
         for (var j = k + 1; j < hops.length; j++) segRefill(j);
         refillLeaf();
-        updateUrl();
+        if (!builderCompatibilityPending()) updateUrl();
       });
 
       hopsHost.appendChild(seg);
@@ -765,8 +938,9 @@
       leaf.input.value = "";
       addSegment(hops.length - 1);
       refillLeaf();
+      noteBuilderUserEdit();
       leaf.input.focus();
-      updateUrl();
+      if (!builderCompatibilityPending()) updateUrl();
     });
 
     /* updateUrl reads the hops through the row's DOM state. */
@@ -801,18 +975,20 @@
     row.appendChild(leaf.input);
 
     appendTail(row, part);
+    markCompatibilityPending(row);
 
     var base = sections.dataset.type || "";
     var paramsRefillSeq = 0;
     function refillParams() {
       var refillSeq = ++paramsRefillSeq;
       var t = type.input.value.trim();
+      markCompatibilityPending(row);
       if (!t) {
         regateModifiers(row, "");
         return;
       }
       fetchParams(t).then(function (meta) {
-        if (refillSeq !== paramsRefillSeq) return;
+        if (refillSeq !== paramsRefillSeq || !row.isConnected) return;
         var codes = Object.keys(meta).sort();
         /* The link must be a reference param that can point at the base
          * type; params with no declared targets stay offered. */
@@ -829,10 +1005,7 @@
       });
     }
     type.input.addEventListener("input", refillParams);
-    leaf.input.addEventListener("input", function () {
-      var meta = PARAM_META[type.input.value.trim()] || {};
-      regateModifiers(row, ((meta[leaf.input.value.trim()] || {}).type) || "");
-    });
+    leaf.input.addEventListener("input", refillParams);
     refillParams();
 
     return row;
@@ -926,7 +1099,9 @@
    * reference, per the registry metadata for the current base type. */
   function refreshChainAffordances() {
     if (!sections) return;
-    var meta = PARAM_META[sections.dataset.type || ""] || {};
+    var type = sections.dataset.type || "";
+    var loaded = Object.prototype.hasOwnProperty.call(PARAM_META, type);
+    var meta = PARAM_META[type] || {};
     sections
       .querySelectorAll("#builder-conditions .builder-row")
       .forEach(function (row) {
@@ -935,9 +1110,14 @@
         var key = row.querySelector(".builder-row__key");
         var drill = row.querySelector("[data-chain-from]");
         if (!key || !drill) return;
+        if (!loaded) {
+          drill.hidden = true;
+          markCompatibilityPending(row);
+          return;
+        }
         var m = meta[key.value.trim()];
         drill.hidden = !(m && m.type === "reference");
-        regateModifiers(row);
+        regateModifiers(row, (m && m.type) || "");
       });
   }
 
@@ -996,6 +1176,9 @@
         COLON_MODIFIERS.forEach(function (m) {
           option(modifier, m, ":" + m, selectedMod === m);
         });
+        if (selectedMod && COLON_MODIFIERS.indexOf(selectedMod) < 0) {
+          option(modifier, selectedMod, ":" + selectedMod, true);
+        }
       }
       row.appendChild(modifier);
     }
@@ -1032,6 +1215,7 @@
       panel.className = "builder-row__modpanel";
       panel.hidden = true;
       row.appendChild(panel);
+      markCompatibilityPending(row);
     }
 
     return row;
@@ -1081,6 +1265,8 @@
    * one-shot: any other render invalidates it so a later external URL cannot
    * match stale state. */
   var lastSerialized = null;
+  var builderRevision = 0;
+  var builderUrlEdited = false;
 
   function builderHasEscapeError() {
     return !!(
@@ -1110,17 +1296,32 @@
     lastSerialized = null;
     var parsed = parseSearchUrl(urlInput.value);
     if (!parsed) {
+      resetCompatibilitySync();
+      builderRevision += 1;
+      builderUrlEdited = false;
       sections.hidden = true;
       markRailType(null);
+      sections
+        .querySelectorAll(".builder-row[data-compat-state='pending']")
+        .forEach(function (row) {
+          row.dataset.compatState = "unknown";
+        });
+      syncBuilderAvailability();
       return;
     }
     // Context sync must precede the echo guard: even a URL whose rows are
     // already current may have arrived with conflicting Resources state (#626).
     syncTypeContext(parsed.type);
-    if (isSerializedEcho) return;
+    if (isSerializedEcho) {
+      resetCompatibilitySync();
+      syncBuilderAvailability();
+      return;
+    }
+    resetCompatibilitySync();
+    builderRevision += 1;
+    builderUrlEdited = false;
     sections.hidden = false;
     sections.dataset.type = parsed.type;
-    loadCatalog(parsed.type);
 
     var hosts = builderHosts();
     Object.keys(hosts).forEach(function (kind) {
@@ -1131,6 +1332,8 @@
       hosts[kind].appendChild(builderRow(kind, part));
     });
     refreshChainAffordances();
+    syncBuilderAvailability();
+    loadCatalog(parsed.type);
     updatePlain();
     if (builderHasEscapeError()) showEscapeError();
     else clearError();
@@ -1139,8 +1342,14 @@
   /* Rows → URL. */
   function updateUrl() {
     if (!sections || !urlInput) return;
+    if (builderCompatibilityPending()) {
+      syncBuilderAvailability();
+      return;
+    }
+    compatibilitySyncNeeded = false;
     if (builderHasEscapeError()) {
       showEscapeError();
+      syncBuilderAvailability();
       return;
     }
     clearError();
@@ -1207,13 +1416,24 @@
       "GET /" + type + (parts.length ? "?" + parts.join("&") : "");
     lastSerialized = urlInput.value;
     updatePlain();
+    syncBuilderAvailability();
   }
 
   if (sections && urlInput) {
+    urlInput.addEventListener("input", function () {
+      builderRevision += 1;
+      builderUrlEdited = true;
+    });
     urlInput.addEventListener("change", renderBuilder);
     sections.addEventListener("input", function (event) {
       var row = event.target.closest(".builder-row");
       if (row) {
+        if (
+          row.classList.contains("builder-row--chain") &&
+          event.target.classList.contains("builder-row__ctype")
+        )
+          markCompatibilityPending(row);
+        noteBuilderUserEdit();
         if (event.target.classList.contains("builder-row__value")) {
           event.target.dataset.fhirDirty = "true";
           delete event.target.dataset.fhirEscapeError;
@@ -1238,11 +1458,10 @@
             fillModPanel(modifierPanel, row, applicableMods(row.dataset.modType || ""));
           }
         }
-        updateUrl();
         if (event.target.classList.contains("builder-row__key")) {
           refreshChainAffordances();
-          regateModifiers(row);
         }
+        if (!builderCompatibilityPending()) updateUrl();
       }
     });
     sections.addEventListener("click", function (event) {
@@ -1251,6 +1470,7 @@
       var toggleIterate = event.target.closest("[data-toggle-iterate]");
       var toggleMods = event.target.closest("[data-toggle-mods]");
       if (toggleIterate) {
+        noteBuilderUserEdit();
         var on = toggleIterate.getAttribute("aria-pressed") === "true";
         toggleIterate.setAttribute("aria-pressed", on ? "false" : "true");
         updateUrl();
@@ -1261,7 +1481,7 @@
       if (toggleMods) {
         var modRow = toggleMods.closest(".builder-row");
         var modPanel = modRow.querySelector(".builder-row__modpanel");
-        regateModifiers(modRow);
+        if (modRow.dataset.compatState !== "pending") regateModifiers(modRow);
         if (modPanel.hidden) {
           refreshModifierControls(modRow, modRow.dataset.modType || "");
         }
@@ -1270,6 +1490,7 @@
         return;
       }
       if (modChip) {
+        noteBuilderUserEdit();
         var chipRow = modChip.closest(".builder-row");
         var sel = chipRow.querySelector(".builder-row__modifier");
         sel.value = sel.value === modChip.dataset.modChip ? "" : modChip.dataset.modChip;
@@ -1289,6 +1510,7 @@
       var removeOr = event.target.closest("[data-remove-or]");
       var add = event.target.closest("[data-add]");
       if (addOr) {
+        noteBuilderUserEdit();
         var orRow = addOr.closest(".builder-row");
         var orHost = orRow.querySelector(".builder-row__values");
         var addedValue = orValueInput(orHost, "");
@@ -1297,6 +1519,7 @@
         return;
       }
       if (removeOr) {
+        noteBuilderUserEdit();
         var orWrap = removeOr.closest(".builder-row__orvalue");
         if (orWrap.parentElement.children.length > 1) {
           orWrap.remove();
@@ -1305,6 +1528,7 @@
         return;
       }
       if (remove) {
+        noteBuilderUserEdit();
         remove.closest(".builder-row").remove();
         updateUrl();
       } else if (drillFrom) {
@@ -1333,6 +1557,7 @@
           value: keptValues.join(","),
         });
         from.replaceWith(chain);
+        noteBuilderUserEdit();
         chain.querySelector(".builder-row__cparam").focus();
         updateUrl();
       } else if (add) {
@@ -1344,6 +1569,7 @@
             value: "",
           });
           builderHosts().include.appendChild(inc);
+          noteBuilderUserEdit();
           inc.querySelector(kind === "include-rev" ? ".builder-row__itype" : ".builder-row__iparam").focus();
           return;
         }
@@ -1357,6 +1583,7 @@
             value: "",
           });
           builderHosts().condition.appendChild(has);
+          noteBuilderUserEdit();
           has.querySelector(".builder-row__htype").focus();
           return;
         }
@@ -1367,6 +1594,8 @@
         };
         var row = builderRow(kind, part);
         builderHosts()[kind].appendChild(row);
+        noteBuilderUserEdit();
+        if (kind === "condition") refreshChainAffordances();
         row.querySelector(kind === "condition" ? ".builder-row__key" : ".builder-row__value").focus();
       }
     });
@@ -1964,7 +2193,10 @@
     renderRecent(doc);
     /* The Search page renders the builder and the recent list but no saved
      * list; there is nothing further to draw there. */
-    if (!root) return;
+    if (!root) {
+      syncBuilderAvailability();
+      return;
+    }
 
     var byType = savedQueries(doc);
     root.textContent = "";
@@ -2039,6 +2271,7 @@
       empty.textContent = messages.msgEmpty;
       root.appendChild(empty);
     }
+    syncBuilderAvailability();
   }
 
   /* Errors surface next to the query strip — the control they are almost
@@ -2102,15 +2335,24 @@
 
   /* Loads a query into the builder without running it. */
   function loadIntoBuilder(path) {
-    if (!urlInput) return;
+    if (!urlInput) return builderRevision;
     urlInput.value = "GET " + path;
     renderBuilder();
+    return builderRevision;
+  }
+
+  function runCurrentBuilderSearch(record) {
+    var parsed = parseSearchUrl(urlInput && urlInput.value);
+    if (!parsed) return false;
+    runSearch(searchPath(parsed.type, parsed.query), record);
+    return true;
   }
 
   /* Copy the query exactly as shown: what gets copied is what would run. */
   var copyButton = document.getElementById("query-copy");
   if (copyButton && navigator.clipboard) {
     copyButton.addEventListener("click", function () {
+      if (builderConsumersBlocked()) return;
       navigator.clipboard.writeText(urlInput.value || "");
     });
   } else if (copyButton) {
@@ -2134,11 +2376,13 @@
 
         if (target.dataset.action === "run") {
           var path = searchPath(resourceType, entry.query || "");
-          loadIntoBuilder(path);
-          runSearch(path, true);
-          mutate(resourceType, id, {
-            lastAccessedAt: new Date().toISOString(),
-            accessCount: (Number(entry.accessCount) || 0) + 1,
+          var revision = loadIntoBuilder(path);
+          consumeWhenBuilderReady(revision, function () {
+            if (!runCurrentBuilderSearch(true)) return;
+            mutate(resourceType, id, {
+              lastAccessedAt: new Date().toISOString(),
+              accessCount: (Number(entry.accessCount) || 0) + 1,
+            });
           });
         } else if (target.dataset.action === "rename") {
           var name = window.prompt(messages.msgRenamePrompt, entry.name || "");
@@ -2194,6 +2438,7 @@
   if (form) {
     form.addEventListener("submit", function (event) {
       event.preventDefault();
+      if (builderConsumersBlocked()) return;
       var intent =
         (event.submitter && event.submitter.dataset.intent) || "run";
       var parsed = parseSearchUrl(form.elements.url.value);
@@ -2243,10 +2488,10 @@
    * runs immediately — also what saved/recent entries could link to. */
   var deepLink = new URLSearchParams(window.location.search).get("url");
   if (deepLink && urlInput) {
-    loadIntoBuilder(deepLink.replace(/^GET\s+/i, ""));
-    var parsedDeep = parseSearchUrl(urlInput.value);
-    if (parsedDeep)
-      runSearch(searchPath(parsedDeep.type, parsedDeep.query), true);
+    var deepRevision = loadIntoBuilder(deepLink.replace(/^GET\s+/i, ""));
+    consumeWhenBuilderReady(deepRevision, function () {
+      runCurrentBuilderSearch(true);
+    });
   } else {
     // Resources opens in Patient (or `?type=`) context (#605): the same
     // path as a rail click, so the builder and results match the type the

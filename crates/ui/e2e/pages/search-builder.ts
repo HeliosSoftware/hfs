@@ -57,7 +57,11 @@ export class SearchBuilder {
   }
 
   async run(query: string): Promise<void> {
-    await this.url.fill(query);
+    await this.setUrl(query);
+    await this.page.waitForFunction(() => {
+      const button = document.querySelector<HTMLButtonElement>("[data-intent='run']");
+      return !!button && !button.disabled;
+    });
     await this.runButton.click();
   }
 
