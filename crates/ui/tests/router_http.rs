@@ -1301,16 +1301,223 @@ async fn sql_on_fhir_section_navigates_to_real_stub_pages() {
             html.contains(&format!(r#"href="{href}" aria-current="page""#)),
             "{href} does not mark its nav entry current"
         );
-        // A stub states which server operation already serves the data; View
-        // Definitions is the live workspace and asserts its own content in
-        // `view_definitions_workspace_lists_edits_and_previews`.
-        if href != "/ui/sql/view-definitions" {
-            assert!(
-                html.contains("sql-run") || html.contains("/export/"),
-                "{href}"
-            );
-        }
     }
+}
+
+/// #649: SQL Export offers the stored subjects, follows a job by ?job= —
+/// running with a cancel form, finished with a link to Files — and Files
+/// tables a finished job's manifest as download links.
+#[tokio::test]
+async fn sql_export_and_files_follow_a_job_through_the_manifest() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "exportId", "valueString": "job-9"},
+            {"name": "_format", "valueCode": "csv"},
+            {"name": "output", "part": [
+                {"name": "name", "valueString": "patients"},
+                {"name": "location", "valueUri": "http://s/export/job-9/patients-0.csv"},
+            ]},
+        ]
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![
+                serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1",
+                "name": "patients", "resource": "Patient"}),
+            ],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![
+                serde_json::json!({"resourceType": "Library", "id": "q1", "name": "counts",
+                "status": "active",
+                "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+            ],
+        )
+        .with_export_status(helios_ui::SqlExportStatus::Running(Some("2/3".to_string())))
+        .with_export_manifest(Ok(manifest));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+    );
+
+    // The form offers both stored subjects.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/export").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="ViewDefinition/vd1""#));
+    assert!(html.contains(r#"value="Library/q1""#));
+
+    // Starting redirects to the job the gateway handed back.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/export")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("subject=ViewDefinition%2Fvd1&format=csv"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/export?job=static-job&started=1"
+    );
+    // No subject selected: the page explains instead of submitting.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/export")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("format=csv"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("at least one subject"));
+
+    // A running job shows its progress and the cancel form.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/export?job=job-9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("2/3"));
+    assert!(html.contains("/ui/sql/export/cancel"));
+
+    // Files tables the manifest with its download links.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/files?job=job-9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("patients"));
+    assert!(html.contains(r#"href="http://s/export/job-9/patients-0.csv""#));
+    assert!(html.contains(">csv<"));
+}
+
+/// #649: the SQL Queries and SQL Views workspaces list Libraries of their own
+/// kind only, decode the SQL attachment into its editor pane, and save via a
+/// plain form that re-embeds the SQL and redirects to the stored library.
+#[tokio::test]
+async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]},
+            "content": [{"contentType": "application/sql", "data": "U0VMRUNUIDE="}]}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "draft",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+    );
+
+    // The Queries page lists only the sql-query Library and decodes its SQL.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("patient_counts"));
+    assert!(!html.contains("flat_patients"));
+    assert!(html.contains("SELECT 1"));
+    assert!(html.contains(r#"name="sql""#));
+    assert!(html.contains(r#"data-type="Library""#));
+
+    // The Views page holds the other kind.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/views").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("flat_patients"));
+    assert!(!html.contains("patient_counts"));
+
+    // Save re-embeds the SQL pane and redirects to the stored library.
+    let body = "id=&action=save&sql=SELECT%202&json=%7B%22resourceType%22%3A%22Library%22%2C%22name%22%3A%22x%22%7D";
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/queries?lib=static-created&saved=1"
+    );
+
+    // Bad JSON re-renders with both panes preserved.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/views")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("id=&action=save&sql=SELECT%203&json=%7Bnope"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(html.contains("{nope"));
+    assert!(html.contains("SELECT 3"));
 }
 
 /// #649: the View Definitions workspace lists stored views in the rail
@@ -1342,6 +1549,7 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
         std::sync::Arc::new(source),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     let response = app
@@ -1414,6 +1622,7 @@ async fn view_definitions_save_roundtrips_and_rejects_bad_json() {
         std::sync::Arc::new(source),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     );
 
     let body = "id=&action=save&json=%7B%22resourceType%22%3A%22ViewDefinition%22%2C%22name%22%3A%22x%22%7D";

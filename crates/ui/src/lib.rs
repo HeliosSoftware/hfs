@@ -48,12 +48,14 @@ mod history;
 mod i18n;
 mod json_view;
 mod search_params;
+mod sql_export;
+mod sql_libraries;
 mod sql_views;
 mod subscriptions;
 mod tenants;
 
 #[doc(hidden)]
-pub use conformance::{ConformanceSource, StaticConformanceSource};
+pub use conformance::{ConformanceSource, SqlExportStatus, StaticConformanceSource};
 
 use askama::Template;
 use axum::{
@@ -864,9 +866,19 @@ pub fn mount_with_conformance_source(
             "/ui/sql/view-definitions",
             get(sql_view_definitions_page).post(sql_view_definitions_save),
         )
-        .route("/ui/sql/queries", get(sql_queries_page))
-        .route("/ui/sql/views", get(sql_views_page))
-        .route("/ui/sql/export", get(sql_export_page))
+        .route(
+            "/ui/sql/queries",
+            get(sql_queries_page).post(sql_queries_save),
+        )
+        .route("/ui/sql/views", get(sql_views_page).post(sql_views_save))
+        .route(
+            "/ui/sql/export",
+            get(sql_export_page).post(sql_export_start),
+        )
+        .route(
+            "/ui/sql/export/cancel",
+            axum::routing::post(sql_export_cancel),
+        )
         .route("/ui/sql/files", get(sql_files_page))
         .route("/ui/subscriptions", get(subscriptions::page))
         // Schema-driven resource editor (#264). One POST endpoint applies every
@@ -1522,51 +1534,6 @@ async fn batch_page(
     })
 }
 
-/// Shared stub behind the SQL on FHIR nav children (#649): every menu entry
-/// navigates somewhere real from day one; each page states what it will host
-/// and which already-routed server operation serves that data. The pages are
-/// replaced one by one, starting with the ViewDefinition Editor.
-#[derive(Template)]
-#[template(path = "pages/sql-stub.html")]
-struct SqlStubPage {
-    status: Status,
-    i18n: I18n,
-    active_page: &'static str,
-    title_key: &'static str,
-    lede_key: &'static str,
-    body_key: &'static str,
-    /// The server route(s) the finished page will drive, shown verbatim.
-    api: &'static str,
-}
-
-/// (active_page, title, lede, body, api) for one SQL on FHIR stub.
-type SqlStubSpec = (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-);
-
-fn render_sql_stub(
-    state: &WebState,
-    locale: RequestLocale,
-    rv: RequestVersion,
-    rt: &RequestTenant,
-    spec: SqlStubSpec,
-) -> Response {
-    let (active_page, title_key, lede_key, body_key, api) = spec;
-    render(SqlStubPage {
-        status: current_status(state, rv.0, rt),
-        i18n: I18n::new(locale),
-        active_page,
-        title_key,
-        lede_key,
-        body_key,
-        api,
-    })
-}
-
 /// The View Definitions workspace (#649, Figma `420-2`): a filter rail of the
 /// tenant's stored ViewDefinitions, the selected one as editable JSON, and a
 /// `$sql-run` preview of its output. Save and Duplicate are plain form posts
@@ -1810,25 +1777,308 @@ async fn sql_view_definitions_save(
     }
 }
 
+/// What tells the SQL Queries workspace apart from SQL Views: both edit and
+/// run `Library` resources, differing only in the `LibraryTypesCodes` code,
+/// their route, and their labels.
+struct LibraryKind {
+    code: &'static str,
+    base_href: &'static str,
+    active_page: &'static str,
+    title_key: &'static str,
+    lede_key: &'static str,
+    new_title_key: &'static str,
+}
+
+const SQL_QUERY_KIND: LibraryKind = LibraryKind {
+    code: "sql-query",
+    base_href: "/ui/sql/queries",
+    active_page: "sql-queries",
+    title_key: "sql-queries-title",
+    lede_key: "sql-queries-lede",
+    new_title_key: "sql-queries-new-title",
+};
+
+const SQL_VIEW_KIND: LibraryKind = LibraryKind {
+    code: "sql-view",
+    base_href: "/ui/sql/views",
+    active_page: "sql-views",
+    title_key: "sql-views-title",
+    lede_key: "sql-views-lede",
+    new_title_key: "sql-views-new-title",
+};
+
+/// The SQL Queries / SQL Views workspace (#649): the same shape as View
+/// Definitions — rail, editor, `$sql-run` preview — over `Library` resources
+/// of the page's kind, with the SQL decoded out of its base64 attachment into
+/// an editor pane of its own and re-embedded on save.
+#[derive(Template)]
+#[template(path = "pages/sql-library.html")]
+struct SqlLibraryPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    base_href: &'static str,
+    title_key: &'static str,
+    lede_key: &'static str,
+    new_title_key: &'static str,
+    rail: Vec<sql_libraries::LibSummary>,
+    filter: String,
+    degraded: Option<String>,
+    selected: Option<SelectedLib>,
+    is_new: bool,
+    results: Option<sql_views::RunTable>,
+    run_error: Option<String>,
+    save_error: Option<String>,
+    saved: bool,
+}
+
+struct SelectedLib {
+    id: String,
+    name: String,
+    json: String,
+    sql: String,
+}
+
+#[derive(Deserialize, Default)]
+struct SqlLibQuery {
+    lib: Option<String>,
+    filter: Option<String>,
+    run: Option<String>,
+    saved: Option<String>,
+}
+
+async fn sql_library_page(
+    state: WebState,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    query: SqlLibQuery,
+    kind: &LibraryKind,
+) -> Response {
+    let filter = query.filter.unwrap_or_default();
+    let (mut libraries, degraded) = match state.conformance.fetch("Library", rv.0, &rt.id).await {
+        Ok(resources) => (resources, None),
+        Err(error) => {
+            tracing::warn!("Library self-fetch failed: {error}");
+            (Vec::new(), Some(error))
+        }
+    };
+    let summaries = {
+        let mut s = sql_libraries::summarize(&libraries, kind.code);
+        if !filter.is_empty() {
+            let needle = filter.to_lowercase();
+            s.retain(|e| e.name.to_lowercase().contains(&needle));
+        }
+        s
+    };
+
+    let is_new = query.lib.as_deref() == Some("new");
+    let (selected, selected_value) = if is_new {
+        (
+            Some(SelectedLib {
+                id: String::new(),
+                name: String::new(),
+                json: sql_libraries::starter_library(kind.code),
+                sql: sql_libraries::STARTER_SQL.to_string(),
+            }),
+            None,
+        )
+    } else {
+        let wanted = query
+            .lib
+            .clone()
+            .or_else(|| summaries.first().map(|e| e.id.clone()));
+        let found = wanted.and_then(|id| {
+            libraries
+                .iter()
+                .position(|l| l.get("id").and_then(serde_json::Value::as_str) == Some(&id))
+        });
+        match found.map(|i| libraries.swap_remove(i)) {
+            Some(lib) => {
+                let id = lib
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = lib
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&id)
+                    .to_string();
+                let sql = sql_libraries::extract_sql(&lib);
+                let json = serde_json::to_string_pretty(&lib).unwrap_or_default();
+                (
+                    Some(SelectedLib {
+                        id,
+                        name,
+                        json,
+                        sql,
+                    }),
+                    Some(lib),
+                )
+            }
+            None => (None, None),
+        }
+    };
+
+    let (results, run_error) = match (&selected_value, query.run.as_deref() == Some("1")) {
+        (Some(lib), true) => match state.conformance.sql_run(lib, 50, rv.0, &rt.id).await {
+            Ok(rows) => (Some(sql_views::build_table(lib, &rows)), None),
+            Err(error) => (None, Some(error)),
+        },
+        _ => (None, None),
+    };
+
+    render(SqlLibraryPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: kind.active_page,
+        base_href: kind.base_href,
+        title_key: kind.title_key,
+        lede_key: kind.lede_key,
+        new_title_key: kind.new_title_key,
+        rail: summaries,
+        filter,
+        degraded,
+        selected,
+        is_new,
+        results,
+        run_error,
+        save_error: None,
+        saved: query.saved.as_deref() == Some("1"),
+    })
+}
+
+#[derive(Deserialize)]
+struct SqlLibSaveForm {
+    #[serde(default)]
+    id: String,
+    json: String,
+    /// The decoded SQL pane; re-embedded as the base64 attachment on save.
+    #[serde(default)]
+    sql: String,
+    #[serde(default)]
+    action: String,
+}
+
+async fn sql_library_save(
+    state: WebState,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    form: SqlLibSaveForm,
+    kind: &LibraryKind,
+) -> Response {
+    let error_page =
+        |save_error: String, json: String, sql: String, is_new: bool, id: String| SqlLibraryPage {
+            status: current_status(&state, rv.0, &rt),
+            i18n: I18n::new(locale),
+            active_page: kind.active_page,
+            base_href: kind.base_href,
+            title_key: kind.title_key,
+            lede_key: kind.lede_key,
+            new_title_key: kind.new_title_key,
+            rail: Vec::new(),
+            filter: String::new(),
+            degraded: None,
+            selected: Some(SelectedLib {
+                name: if is_new { String::new() } else { id.clone() },
+                id,
+                json,
+                sql,
+            }),
+            is_new,
+            results: None,
+            run_error: None,
+            save_error: Some(save_error),
+            saved: false,
+        };
+
+    let duplicate = form.action == "duplicate";
+    let mut resource: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(e) => {
+            return render(error_page(
+                format!("invalid JSON: {e}"),
+                form.json,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+            ));
+        }
+    };
+    if resource
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        != Some("Library")
+    {
+        return render(error_page(
+            "the document must have resourceType \"Library\"".to_string(),
+            form.json,
+            form.sql,
+            form.id.is_empty(),
+            form.id,
+        ));
+    }
+    sql_libraries::embed_sql(&mut resource, &form.sql);
+
+    let id = if duplicate || form.id.is_empty() {
+        if let Some(map) = resource.as_object_mut() {
+            map.remove("id");
+            if duplicate && let Some(name) = map.get("name").and_then(serde_json::Value::as_str) {
+                let copy = format!("{name}_copy");
+                map.insert("name".to_string(), serde_json::Value::String(copy));
+            }
+        }
+        None
+    } else {
+        if let Some(map) = resource.as_object_mut() {
+            map.insert("id".to_string(), serde_json::Value::String(form.id.clone()));
+        }
+        Some(form.id.clone())
+    };
+
+    match state
+        .conformance
+        .save_resource("Library", id.as_deref(), resource, rv.0, &rt.id)
+        .await
+    {
+        Ok(stored) => {
+            let stored_id = stored
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            axum::response::Redirect::to(&format!("{}?lib={stored_id}&saved=1", kind.base_href))
+                .into_response()
+        }
+        Err(error) => render(error_page(
+            error,
+            form.json,
+            form.sql,
+            id.is_none(),
+            form.id,
+        )),
+    }
+}
+
 async fn sql_queries_page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<SqlLibQuery>,
 ) -> Response {
-    render_sql_stub(
-        &state,
-        locale,
-        rv,
-        &rt,
-        (
-            "sql-queries",
-            "sql-queries-title",
-            "sql-queries-lede",
-            "sql-queries-body",
-            "POST /$sql-run",
-        ),
-    )
+    sql_library_page(state, locale, rv, rt, query, &SQL_QUERY_KIND).await
+}
+
+async fn sql_queries_save(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlLibSaveForm>,
+) -> Response {
+    sql_library_save(state, locale, rv, rt, form, &SQL_QUERY_KIND).await
 }
 
 async fn sql_views_page(
@@ -1836,20 +2086,97 @@ async fn sql_views_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<SqlLibQuery>,
 ) -> Response {
-    render_sql_stub(
-        &state,
-        locale,
-        rv,
-        &rt,
-        (
-            "sql-views",
-            "sql-views-title",
-            "sql-views-lede",
-            "sql-views-body",
-            "POST /$sql-run",
-        ),
-    )
+    sql_library_page(state, locale, rv, rt, query, &SQL_VIEW_KIND).await
+}
+
+async fn sql_views_save(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlLibSaveForm>,
+) -> Response {
+    sql_library_save(state, locale, rv, rt, form, &SQL_VIEW_KIND).await
+}
+
+/// One checkbox row of the export form: a runnable subject the store holds.
+struct ExportSubject {
+    /// `ViewDefinition/{id}` or `Library/{id}` — the `subjectReference`.
+    reference: String,
+    name: String,
+    /// "ViewDefinition", "SQL Query", or "SQL View", for the row's tag.
+    kind: &'static str,
+}
+
+/// The SQL Export page (#649): pick stored subjects, submit a `$sql-export`
+/// job, and follow it — running (with progress), finished (a link to Files),
+/// or unknown. Submission and cancel are plain forms; refresh is a plain
+/// link. Job state lives on the server per the async pattern; the page holds
+/// no state of its own beyond the `?job=` id in the URL.
+#[derive(Template)]
+#[template(path = "pages/sql-export.html")]
+struct SqlExportPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    subjects: Vec<ExportSubject>,
+    degraded: Option<String>,
+    job: Option<String>,
+    job_status: Option<SqlExportStatus>,
+    started: bool,
+    cancelled: bool,
+    start_error: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct SqlExportQuery {
+    job: Option<String>,
+    started: Option<String>,
+    cancelled: Option<String>,
+}
+
+/// The stored subjects `$sql-export` can run: every ViewDefinition, and every
+/// Library carrying a SQL on FHIR kind.
+async fn export_subjects(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+) -> (Vec<ExportSubject>, Option<String>) {
+    let mut subjects = Vec::new();
+    let mut degraded = None;
+    match state
+        .conformance
+        .fetch("ViewDefinition", version, tenant)
+        .await
+    {
+        Ok(vds) => {
+            for e in sql_views::summarize(&vds) {
+                subjects.push(ExportSubject {
+                    reference: format!("ViewDefinition/{}", e.id),
+                    name: e.name,
+                    kind: "ViewDefinition",
+                });
+            }
+        }
+        Err(error) => degraded = Some(error),
+    }
+    match state.conformance.fetch("Library", version, tenant).await {
+        Ok(libs) => {
+            for (code, kind) in [("sql-query", "SQL Query"), ("sql-view", "SQL View")] {
+                for e in sql_libraries::summarize(&libs, code) {
+                    subjects.push(ExportSubject {
+                        reference: format!("Library/{}", e.id),
+                        name: e.name,
+                        kind,
+                    });
+                }
+            }
+        }
+        Err(error) => degraded = degraded.or(Some(error)),
+    }
+    (subjects, degraded)
 }
 
 async fn sql_export_page(
@@ -1857,20 +2184,119 @@ async fn sql_export_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<SqlExportQuery>,
 ) -> Response {
-    render_sql_stub(
-        &state,
-        locale,
-        rv,
-        &rt,
-        (
-            "sql-export",
-            "sql-export-title",
-            "sql-export-lede",
-            "sql-export-body",
-            "POST /$sql-export · GET /export/{job_id}/status",
-        ),
-    )
+    let (subjects, degraded) = export_subjects(&state, rv.0, &rt.id).await;
+    let job_status = match &query.job {
+        Some(job) => Some(state.conformance.sql_export_status(job, &rt.id).await),
+        None => None,
+    };
+    render(SqlExportPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "sql-export",
+        subjects,
+        degraded,
+        job: query.job,
+        job_status,
+        started: query.started.as_deref() == Some("1"),
+        cancelled: query.cancelled.as_deref() == Some("1"),
+        start_error: None,
+    })
+}
+
+/// Starts an export over the checked subjects. The form repeats `subject=`
+/// per checkbox, which `Form`-into-a-struct cannot express, so the raw body
+/// is parsed by hand.
+async fn sql_export_start(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let mut format = "ndjson".to_string();
+    let mut refs: Vec<String> = Vec::new();
+    for (k, v) in form_urlencoded::parse(&body) {
+        match k.as_ref() {
+            "subject" => refs.push(v.into_owned()),
+            "format" => format = v.into_owned(),
+            _ => {}
+        }
+    }
+    let error_page = |start_error: String| async {
+        let (subjects, degraded) = export_subjects(&state, rv.0, &rt.id).await;
+        render(SqlExportPage {
+            status: current_status(&state, rv.0, &rt),
+            i18n: I18n::new(locale),
+            active_page: "sql-export",
+            subjects,
+            degraded,
+            job: None,
+            job_status: None,
+            started: false,
+            cancelled: false,
+            start_error: Some(start_error),
+        })
+    };
+    if refs.is_empty() {
+        return error_page("select at least one subject".to_string()).await;
+    }
+    // The output name is the reference's id segment — unique within the job
+    // and recognizable in the manifest.
+    let subjects: Vec<(String, String)> = refs
+        .into_iter()
+        .map(|r| (r.rsplit('/').next().unwrap_or(&r).to_string(), r))
+        .collect();
+    match state
+        .conformance
+        .sql_export_start(&subjects, &format, &rt.id)
+        .await
+    {
+        Ok(job) => axum::response::Redirect::to(&format!("/ui/sql/export?job={job}&started=1"))
+            .into_response(),
+        Err(error) => error_page(error).await,
+    }
+}
+
+#[derive(Deserialize)]
+struct SqlExportCancelForm {
+    job: String,
+}
+
+async fn sql_export_cancel(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlExportCancelForm>,
+) -> Response {
+    let ok = state
+        .conformance
+        .sql_export_cancel(&form.job, &rt.id)
+        .await
+        .is_ok();
+    let suffix = if ok { "&cancelled=1" } else { "" };
+    axum::response::Redirect::to(&format!("/ui/sql/export?job={}{suffix}", form.job))
+        .into_response()
+}
+
+/// The Files page (#649): a finished job's completion manifest — one row per
+/// output with its shard download links, served straight off the FHIR API's
+/// result endpoint.
+#[derive(Template)]
+#[template(path = "pages/sql-files.html")]
+struct SqlFilesPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    job: String,
+    outputs: Option<Vec<sql_export::ManifestOutput>>,
+    format: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct SqlFilesQuery {
+    job: Option<String>,
 }
 
 async fn sql_files_page(
@@ -1878,20 +2304,30 @@ async fn sql_files_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<SqlFilesQuery>,
 ) -> Response {
-    render_sql_stub(
-        &state,
-        locale,
-        rv,
-        &rt,
-        (
-            "sql-files",
-            "sql-files-title",
-            "sql-files-lede",
-            "sql-files-body",
-            "GET /export/{job_id}/result · GET /export/{job_id}/{filename}",
-        ),
-    )
+    let job = query.job.unwrap_or_default();
+    let (outputs, format, error) = if job.is_empty() {
+        (None, None, None)
+    } else {
+        match state.conformance.sql_export_manifest(&job, &rt.id).await {
+            Ok(manifest) => (
+                Some(sql_export::manifest_outputs(&manifest)),
+                sql_export::manifest_value(&manifest, "_format"),
+                None,
+            ),
+            Err(error) => (None, None, Some(error)),
+        }
+    };
+    render(SqlFilesPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "sql-files",
+        job,
+        outputs,
+        format,
+        error,
+    })
 }
 
 /// The read-only CapabilityStatement page (#653): the live `/metadata`

@@ -740,28 +740,21 @@ cap-unavailable = Das CapabilityStatement konnte nicht vom Server geladen werden
 
 ## Stubs der SQL-on-FHIR-Sektion (#649)
 
-sql-stub-heading = Demnächst
-sql-stub-planned = Geplant
-sql-stub-api = Bedienende API
 
 sql-vd-title = View-Definitionen
 sql-vd-lede = Erstelle und verwalte die ViewDefinitions, mit denen SQL on FHIR Ressourcen abflacht.
 
 sql-queries-title = SQL-Abfragen
 sql-queries-lede = Führe SQL-on-FHIR-Abfragen gegen diesen Server aus.
-sql-queries-body = Eine Abfrage verfassen, ausführen und die Ergebniszeilen direkt inspizieren.
 
 sql-views-title = SQL-Views
 sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
-sql-views-body = SQLView-Bibliotheken und die darin definierten Views, aufgelöst mit ihren Abhängigkeiten.
 
 sql-export-title = SQL-Export
 sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
-sql-export-body = Einen Export starten, den Fortschritt verfolgen und nicht mehr benötigte Aufträge abbrechen.
 
 sql-files-title = Dateien
 sql-files-lede = Manifeste und Ausgabedateien der SQL-Exporte.
-sql-files-body = Das Manifest jedes Auftrags einsehen und seine Ausgabedateien herunterladen.
 
 ## View-Definitionen-Arbeitsbereich (#649)
 
@@ -784,3 +777,42 @@ vd-delete-failed = Die View-Definition konnte nicht gelöscht werden.
 vd-json-heading = Definition (JSON)
 vd-results-heading = Ergebnisse
 vd-results-empty = Die View hat keine Zeilen erzeugt.
+
+## SQL-Abfragen- / SQL-Views-Arbeitsbereiche (#649)
+
+sql-queries-new-title = Neue SQL-Abfrage
+sql-views-new-title = Neue SQL-View
+lib-filter = Bibliotheken filtern
+lib-none = Noch keine Bibliotheken.
+lib-empty-lede = Lege mit „Neu erstellen" die erste Bibliothek an.
+lib-degraded = Die Bibliotheksliste konnte nicht geladen werden.
+lib-sql-heading = SQL
+lib-delete-confirm = „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
+lib-delete-failed = Die Bibliothek konnte nicht gelöscht werden.
+
+## SQL-Export- und Dateien-Seiten (#649)
+
+export-start-failed = Der Export konnte nicht gestartet werden.
+export-started = Export gestartet.
+export-cancelled = Abbruch angefordert.
+export-job-heading = Exportauftrag
+export-job-id = Auftrags-ID
+export-job-state = Status
+export-state-running = Läuft
+export-state-done = Abgeschlossen
+export-state-unknown = Unbekannter Auftrag — möglicherweise abgebrochen oder bereinigt.
+export-refresh = Aktualisieren
+export-cancel = Auftrag abbrechen
+export-view-files = Dateien anzeigen
+export-new-heading = Neuer Export
+export-no-subjects = Noch nichts zu exportieren — lege zuerst eine ViewDefinition an.
+export-format = Ausgabeformat
+export-start = Export starten
+files-job-heading = Exportauftrag
+files-load = Manifest laden
+files-error = Das Manifest konnte nicht geladen werden.
+files-outputs-heading = Ausgaben
+files-col-output = Ausgabe
+files-col-downloads = Downloads
+files-shard = Datei { $n }
+files-empty = Der Auftrag hat keine Ausgabedateien erzeugt.
