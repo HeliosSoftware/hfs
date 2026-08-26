@@ -197,3 +197,47 @@ fn empty_extension_list_returns_empty() {
         EvaluationResult::fhir_string("bd-1".to_string(), "id")
     );
 }
+
+#[test]
+fn scalar_operations_treat_an_extension_only_primitive_as_empty() {
+    let given = r4::String {
+        id: Some("given-1".to_string()),
+        extension: None,
+        value: None,
+    };
+    let patient = r4::Patient {
+        name: Some(vec![r4::HumanName {
+            given: Some(vec![given]),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let ctx = ctx_with_patient(patient);
+
+    // The FHIR Element remains navigable even without a primitive value.
+    assert_eq!(
+        eval("Patient.name.given.first().exists()", &ctx),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        eval("Patient.name.given.first().hasValue()", &ctx),
+        EvaluationResult::boolean(false)
+    );
+
+    // Its implicit System primitive value is empty, so scalar operations
+    // propagate {} instead of raising a type error.
+    for expression in [
+        "Patient.name.given.first().length()",
+        "Patient.name.given.first().toChars()",
+        "Patient.name.given.first().substring(0, 1)",
+        "Patient.name.given.first().upper()",
+        "Patient.name.given.first() < 'x'",
+        "Patient.name.given.first().exists() and Patient.name.given.first().length() = 1",
+    ] {
+        assert_eq!(
+            eval(expression, &ctx),
+            EvaluationResult::Empty,
+            "{expression}"
+        );
+    }
+}
