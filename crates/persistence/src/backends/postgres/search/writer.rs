@@ -151,7 +151,7 @@ const BATCH_ROWS: usize = 128;
 /// written by an older build still has the rows, and nothing here reads them,
 /// so both shapes answer identically. That is why it needs no schema version
 /// and no migration.
-const PARAMS_ANSWERED_FROM_RESOURCES: [&str; 2] = ["_id", "_lastUpdated"];
+pub(crate) const PARAMS_ANSWERED_FROM_RESOURCES: [&str; 2] = ["_id", "_lastUpdated"];
 
 /// Whether [`PARAMS_ANSWERED_FROM_RESOURCES`] covers this parameter.
 pub(crate) fn answered_from_resources(param_name: &str) -> bool {

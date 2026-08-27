@@ -922,6 +922,24 @@ mod tests {
         );
     }
 
+    /// `resources_backed` decides that a chain terminal reads `resources`;
+    /// `resources_backed_condition` decides *how*. If a parameter were added to
+    /// the writer's list without a column mapping here, the terminal would be
+    /// built as `FROM resources` with a predicate naming a `search_index`
+    /// column, and the whole chain would error at the database instead of
+    /// answering. The two must stay in step.
+    #[test]
+    fn every_resources_backed_param_has_a_column_mapping() {
+        for param in super::super::writer::PARAMS_ANSWERED_FROM_RESOURCES {
+            assert!(resources_backed(param), "{param} must be recognised");
+            assert!(
+                resources_backed_condition(param, "si1", &SearchValue::eq("x"), 2).is_some(),
+                "{param} has no `resources` column mapping"
+            );
+        }
+        assert!(resources_backed_condition("code", "si1", &SearchValue::eq("x"), 2).is_none());
+    }
+
     #[test]
     fn an_indexed_chain_terminal_still_reads_search_index() {
         // The substitution must be confined to the two resources-backed
