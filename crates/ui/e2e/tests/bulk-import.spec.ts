@@ -212,3 +212,37 @@ test("the Add Manifest dialog labels Format and sizes its textarea", async ({
   expect(styles.boxSizing).toBe("border-box");
   expect(styles.fontFamily.toLowerCase()).not.toContain("monospace");
 });
+
+// #721: the New Submission summary doubles as the modal backdrop; the
+// button's fixed height used to beat the inset stretch and shrink it to a
+// bar across the top of the viewport, so clicking anywhere lower neither
+// closed the dialog nor dimmed the page. The dialog also repeated the
+// server-fixed recipient URL as a read-only row.
+test("the open New Submission dialog backdrop covers the viewport", async ({ page }) => {
+  await page.goto("/ui/bulk-import");
+  const toggle = page.locator("summary.btn", { hasText: "New Submission" });
+  await toggle.click();
+  const backdrop = await toggle.boundingBox();
+  const viewport = page.viewportSize()!;
+  expect(backdrop!.height).toBeGreaterThan(viewport.height * 0.9);
+  await expect(
+    page.locator(".addbox__panel .field__label", { hasText: "Recipient base URL" }),
+  ).toHaveCount(0);
+  // Clicking the backdrop low on the screen closes the dialog.
+  await page.mouse.click(viewport.width / 2, viewport.height - 10);
+  await expect(page.locator(".addbox__panel")).not.toBeVisible();
+});
+
+// The Test authentication button wires an htmx post to a fragment target
+// inside the dialog. The handler's outcome states are covered by the Rust
+// ring; this asserts the round trip lands in #test-auth-result.
+test("Test authentication reports its outcome inside the dialog", async ({ page }) => {
+  await page.goto("/ui/bulk-import");
+  await page.locator("summary.btn", { hasText: "New Submission" }).click();
+  await page.locator("input[name='client_id']").fill("e2e-client");
+  await page
+    .locator("input[name='token_url']")
+    .fill(new URL("/health", page.url()).toString());
+  await page.locator("button[formaction='/ui/bulk-import/test-auth']").click();
+  await expect(page.locator("#test-auth-result .field__hint")).toBeVisible();
+});

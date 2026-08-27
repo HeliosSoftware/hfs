@@ -1266,6 +1266,12 @@ textarea.field__input {
   position: fixed;
   inset: 0;
   z-index: 40;
+  /* The summary doubles as the button (.btn/.btn--primary), whose fixed
+     height would beat the inset stretch and shrink the backdrop to a bar
+     across the top of the viewport. */
+  height: auto;
+  padding: 0;
+  border: 0;
   background: rgb(10 14 20 / 45%);
   border-radius: 0;
   cursor: default;

@@ -211,9 +211,6 @@ struct BulkImportPage {
     available: bool,
     rows: Vec<SubmissionRow>,
     error: Option<String>,
-    /// Where every new submission goes (`HFS_BASE_URL`, #689) — shown in the
-    /// dialog so the fixed recipient is visible, not invisible.
-    recipient: String,
 }
 
 #[derive(Template)]
@@ -288,7 +285,6 @@ pub async fn page(
         available,
         rows,
         error: None,
-        recipient: state.public_base_url.trim_end_matches('/').to_string(),
     })
 }
 
