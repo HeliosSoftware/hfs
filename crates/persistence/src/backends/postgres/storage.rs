@@ -1118,21 +1118,21 @@ impl PostgresBackend {
                 );
             }
             Err(e) => {
+                // There used to be a fallback here that indexed `_id` and
+                // `_lastUpdated`. Both are now answered from the `resources`
+                // columns they restate (see `PARAMS_ANSWERED_FROM_RESOURCES`),
+                // so they keep working with no index rows at all and the
+                // fallback had nothing left to write. Every other parameter of
+                // this resource is unindexed either way — that is what the
+                // extraction failure means — so the warning is the whole
+                // remaining behaviour.
                 tracing::warn!(
-                    "Dynamic extraction failed for {}/{}: {}. Using minimal fallback (_id, _lastUpdated only).",
+                    "Dynamic extraction failed for {}/{}: {}. Resource is stored but not indexed; \
+                     `_id` and `_lastUpdated` still resolve from the resources table.",
                     resource_type,
                     resource_id,
                     e
                 );
-                // Fall back to minimal extraction (just _id and _lastUpdated)
-                self.index_minimal_fallback(
-                    client,
-                    tenant_id,
-                    resource_type,
-                    resource_id,
-                    resource,
-                )
-                .await?;
             }
         }
 
@@ -1141,8 +1141,15 @@ impl PostgresBackend {
             .await?;
 
         // Index FTS content for _text and _content searches
-        self.index_fts_content(client, tenant_id, resource_type, resource_id, mode, resource)
-            .await?;
+        self.index_fts_content(
+            client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            mode,
+            resource,
+        )
+        .await?;
 
         Ok(())
     }
@@ -1253,51 +1260,6 @@ impl PostgresBackend {
             )
             .await
             .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Index minimal fallback search parameters.
-    ///
-    /// Only indexes `_id` and `_lastUpdated` when dynamic extraction fails.
-    async fn index_minimal_fallback(
-        &self,
-        client: &deadpool_postgres::Client,
-        tenant_id: &str,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
-    ) -> StorageResult<()> {
-        // _id - always available from resource.id
-        if let Some(id) = resource.get("id").and_then(|v| v.as_str()) {
-            client
-                .execute(
-                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code)
-                     VALUES ($1, $2, $3, '_id', $4)",
-                    &[&tenant_id, &resource_type, &resource_id, &id],
-                )
-                .await
-                .map_err(|e| internal_error(format!("Failed to insert _id index: {}", e)))?;
-        }
-
-        // _lastUpdated - from resource.meta.lastUpdated
-        if let Some(last_updated) = resource
-            .get("meta")
-            .and_then(|m| m.get("lastUpdated"))
-            .and_then(|v| v.as_str())
-        {
-            let normalized = normalize_date_for_pg(last_updated);
-            client
-                .execute(
-                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_date)
-                     VALUES ($1, $2, $3, '_lastUpdated', $4::timestamptz)",
-                    &[&tenant_id, &resource_type, &resource_id, &normalized],
-                )
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to insert _lastUpdated index: {}", e))
-                })?;
-        }
 
         Ok(())
     }
@@ -3301,25 +3263,6 @@ impl ReindexTarget for PostgresBackend {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// Normalize a date string for PostgreSQL TIMESTAMPTZ.
-fn normalize_date_for_pg(value: &str) -> String {
-    if value.contains('T') {
-        if value.contains('+') || value.contains('Z') || value.ends_with("-00:00") {
-            value.to_string()
-        } else {
-            format!("{}+00:00", value)
-        }
-    } else if value.len() == 10 {
-        format!("{}T00:00:00+00:00", value)
-    } else if value.len() == 7 {
-        format!("{}-01T00:00:00+00:00", value)
-    } else if value.len() == 4 {
-        format!("{}-01-01T00:00:00+00:00", value)
-    } else {
-        value.to_string()
-    }
-}
 
 // ============================================================================
 // FTS Content Extraction (local copy to avoid cross-feature dependency on sqlite)

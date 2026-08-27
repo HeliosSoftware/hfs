@@ -246,6 +246,7 @@ impl ChainQueryBuilder {
         // Last-resort heuristic for params not in the registry, matching SQLite.
         match param_name {
             "_id" | "id" => Ok(SearchParamType::Token),
+            "_lastUpdated" => Ok(SearchParamType::Date),
             "name" | "family" | "given" | "text" | "display" => Ok(SearchParamType::String),
             "identifier" | "code" | "status" | "type" | "category" => Ok(SearchParamType::Token),
             _ => Err(ChainError::UnknownTerminalParam {
@@ -297,16 +298,32 @@ impl ChainQueryBuilder {
             self.build_terminal_condition(chain, value, param_num)?;
         let terminal_type = &chain.links[chain.links.len() - 1].target_type;
 
-        // Innermost (terminal) query.
-        let mut current_sql = format!(
-            "SELECT '{tt}/' || si{n}.resource_id FROM search_index si{n} \
-             WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = '{tt}' \
-             AND si{n}.param_name = '{tp}' AND {cond}",
-            tt = terminal_type,
-            n = chain.links.len(),
-            tp = chain.terminal_param,
-            cond = terminal_sql,
-        );
+        // Innermost (terminal) query. `_id` and `_lastUpdated` are not indexed
+        // (see `PARAMS_ANSWERED_FROM_RESOURCES`); they are read from the
+        // `resources` columns they restate, which is also what the unchained
+        // form of the same search does. `is_deleted = FALSE` keeps that read at
+        // parity with the index it replaces: a soft delete clears the
+        // resource's `search_index` rows, so the subquery never saw one.
+        let mut current_sql = if resources_backed(&chain.terminal_param) {
+            format!(
+                "SELECT '{tt}/' || si{n}.id FROM resources si{n} \
+                 WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = '{tt}' \
+                 AND si{n}.is_deleted = FALSE AND {cond}",
+                tt = terminal_type,
+                n = chain.links.len(),
+                cond = terminal_sql,
+            )
+        } else {
+            format!(
+                "SELECT '{tt}/' || si{n}.resource_id FROM search_index si{n} \
+                 WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = '{tt}' \
+                 AND si{n}.param_name = '{tp}' AND {cond}",
+                tt = terminal_type,
+                n = chain.links.len(),
+                tp = chain.terminal_param,
+                cond = terminal_sql,
+            )
+        };
 
         // Wrap with each chain link from innermost to outermost.
         for (i, link) in chain.links.iter().enumerate().rev() {
@@ -357,6 +374,12 @@ impl ChainQueryBuilder {
         param_num: usize,
     ) -> StorageResult<(String, SqlParam)> {
         let alias = format!("si{}", chain.links.len());
+
+        if let Some(resolved) =
+            resources_backed_condition(&chain.terminal_param, &alias, value, param_num)
+        {
+            return Ok(resolved);
+        }
 
         let (condition, param) = match chain.terminal_type {
             SearchParamType::String => {
@@ -500,18 +523,35 @@ impl ChainQueryBuilder {
                  WHERE {alias}.tenant_id = $1 AND {alias}.resource_type = '{src_type}' \
                  AND {alias}.param_name = '{ref_param}' \
                  AND {alias}.value_reference LIKE '{base_type}/%' \
-                 AND {alias}.resource_id IN (\
-                   SELECT si{depth2}.resource_id FROM search_index si{depth2} \
-                   WHERE si{depth2}.tenant_id = $1 AND si{depth2}.resource_type = '{src_type}' \
-                   AND si{depth2}.param_name = '{search_param_name}' AND {search_condition}\
-                 )",
+                 AND {alias}.resource_id IN ({inner})",
                 alias = alias,
                 src_type = rc.source_type,
                 ref_param = rc.reference_param,
                 base_type = self.base_type,
-                depth2 = depth2,
-                search_param_name = rc.search_param,
-                search_condition = search_condition,
+                inner = if resources_backed(&rc.search_param) {
+                    // Same substitution as the forward chain's terminal.
+                    format!(
+                        "SELECT si{depth2}.id FROM resources si{depth2} \
+                         WHERE si{depth2}.tenant_id = $1 \
+                         AND si{depth2}.resource_type = '{src_type}' \
+                         AND si{depth2}.is_deleted = FALSE AND {search_condition}",
+                        depth2 = depth2,
+                        src_type = rc.source_type,
+                        search_condition = search_condition,
+                    )
+                } else {
+                    format!(
+                        "SELECT si{depth2}.resource_id FROM search_index si{depth2} \
+                         WHERE si{depth2}.tenant_id = $1 \
+                         AND si{depth2}.resource_type = '{src_type}' \
+                         AND si{depth2}.param_name = '{search_param_name}' \
+                         AND {search_condition}",
+                        depth2 = depth2,
+                        src_type = rc.source_type,
+                        search_param_name = rc.search_param,
+                        search_condition = search_condition,
+                    )
+                },
             );
 
             Ok((sql, vec![search_param]))
@@ -569,6 +609,10 @@ impl ChainQueryBuilder {
         };
 
         let alias = format!("si{}", depth);
+
+        if let Some(resolved) = resources_backed_condition(param_name, &alias, value, param_num) {
+            return Ok(resolved);
+        }
 
         let (condition, param) = match param_type {
             SearchParamType::String => {
@@ -643,6 +687,51 @@ fn parse_chain_part(part: &str) -> (String, Option<String>) {
         (param.to_string(), Some(type_mod.to_string()))
     } else {
         (part.to_string(), None)
+    }
+}
+
+/// Whether a chain terminal is answered from `resources` rather than
+/// `search_index`.
+///
+/// The list is [`super::writer::PARAMS_ANSWERED_FROM_RESOURCES`], reached
+/// through its predicate so the write side and this read side cannot drift:
+/// a parameter added there stops being indexed and starts being read from the
+/// column in the same edit.
+fn resources_backed(param_name: &str) -> bool {
+    super::writer::answered_from_resources(param_name)
+}
+
+/// The terminal condition for a `resources`-backed chain parameter, against
+/// the `resources` columns the parameter restates.
+///
+/// `Observation?subject:Patient._id=p1` and
+/// `Patient?_has:Observation:subject:_lastUpdated=gt2024-01-01` are the shapes
+/// this serves. Returns `None` for every other parameter, leaving the caller's
+/// `search_index` dispatch untouched.
+///
+/// `_id` compares `resources.id` for equality, which is what
+/// `SearchQueryBuilder::build_id_condition` does for the unchained form, and
+/// what the `search_index` row it replaces held in `value_token_code`.
+/// `_lastUpdated` reuses the same prefix-aware date comparison the indexed path
+/// applies to `value_date`, pointed at `resources.last_updated` — the column the
+/// row was a copy of.
+fn resources_backed_condition(
+    param_name: &str,
+    alias: &str,
+    value: &SearchValue,
+    param_num: usize,
+) -> Option<(String, SqlParam)> {
+    match param_name {
+        "_id" => Some((
+            format!("{}.id = ${}", alias, param_num),
+            SqlParam::Text(value.value.clone()),
+        )),
+        "_lastUpdated" => Some(build_date_condition(
+            &format!("{}.last_updated", alias),
+            value,
+            param_num,
+        )),
+        _ => None,
     }
 }
 
@@ -781,6 +870,134 @@ mod tests {
         assert!(frag.sql.contains("ILIKE $2 ESCAPE '\\'"));
         assert_eq!(frag.params.len(), 1);
         assert!(matches!(&frag.params[0], SqlParam::Text(s) if s == "%Hospital%"));
+    }
+
+    #[test]
+    fn chained_id_reads_the_resources_table() {
+        // `_id` is no longer indexed (`PARAMS_ANSWERED_FROM_RESOURCES`), so the
+        // terminal must resolve against `resources.id`. Reading
+        // `search_index.param_name = '_id'` here would silently return nothing.
+        let registry = obs_subject_patient_org_name();
+        let builder = ChainQueryBuilder::new("t", "Observation", registry);
+        let parsed = builder.parse_chain("subject._id").unwrap();
+        assert_eq!(parsed.terminal_type, SearchParamType::Token);
+
+        let frag = builder
+            .build_forward_chain_sql(&parsed, &SearchValue::eq("p1"))
+            .unwrap();
+
+        assert!(
+            frag.sql.contains("FROM resources si1"),
+            "terminal must read resources: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("param_name = '_id'"),
+            "no _id rows exist to match: {}",
+            frag.sql
+        );
+        assert!(frag.sql.contains("'Patient/' || si1.id"), "{}", frag.sql);
+        assert!(frag.sql.contains("si1.is_deleted = FALSE"), "{}", frag.sql);
+        assert!(frag.sql.contains("si1.id = $2"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 1);
+        assert!(matches!(&frag.params[0], SqlParam::Text(s) if s == "p1"));
+    }
+
+    #[test]
+    fn chained_last_updated_reads_the_resources_table() {
+        let registry = obs_subject_patient_org_name();
+        let builder = ChainQueryBuilder::new("t", "Observation", registry);
+        let parsed = builder.parse_chain("subject._lastUpdated").unwrap();
+        assert_eq!(parsed.terminal_type, SearchParamType::Date);
+
+        let frag = builder
+            .build_forward_chain_sql(&parsed, &SearchValue::parse("gt2024-01-01"))
+            .unwrap();
+
+        assert!(frag.sql.contains("FROM resources si1"), "{}", frag.sql);
+        assert!(
+            frag.sql.contains("si1.last_updated > $2"),
+            "the prefix must survive: {}",
+            frag.sql
+        );
+    }
+
+    /// `resources_backed` decides that a chain terminal reads `resources`;
+    /// `resources_backed_condition` decides *how*. If a parameter were added to
+    /// the writer's list without a column mapping here, the terminal would be
+    /// built as `FROM resources` with a predicate naming a `search_index`
+    /// column, and the whole chain would error at the database instead of
+    /// answering. The two must stay in step.
+    #[test]
+    fn every_resources_backed_param_has_a_column_mapping() {
+        for param in super::super::writer::PARAMS_ANSWERED_FROM_RESOURCES {
+            assert!(resources_backed(param), "{param} must be recognised");
+            assert!(
+                resources_backed_condition(param, "si1", &SearchValue::eq("x"), 2).is_some(),
+                "{param} has no `resources` column mapping"
+            );
+        }
+        assert!(resources_backed_condition("code", "si1", &SearchValue::eq("x"), 2).is_none());
+    }
+
+    #[test]
+    fn an_indexed_chain_terminal_still_reads_search_index() {
+        // The substitution must be confined to the two resources-backed
+        // parameters; everything else keeps the index path.
+        let registry = obs_subject_patient_org_name();
+        let builder = ChainQueryBuilder::new("t", "Observation", registry);
+        let parsed = builder.parse_chain("subject.organization.name").unwrap();
+        let frag = builder
+            .build_forward_chain_sql(&parsed, &SearchValue::eq("Hospital"))
+            .unwrap();
+        assert!(!frag.sql.contains("FROM resources"), "{}", frag.sql);
+        assert_eq!(frag.sql.matches("FROM search_index").count(), 3);
+    }
+
+    #[test]
+    fn reverse_chain_on_id_reads_the_resources_table() {
+        // `Patient?_has:Observation:subject:_id=obs-1`.
+        let registry = obs_subject_patient_org_name();
+        let builder = ChainQueryBuilder::new("t", "Patient", registry);
+        let rc = ReverseChainedParameter {
+            source_type: "Observation".to_string(),
+            reference_param: "subject".to_string(),
+            search_param: "_id".to_string(),
+            value: Some(SearchValue::eq("obs-1")),
+            nested: None,
+        };
+        let frag = builder.build_reverse_chain_sql(&rc).unwrap();
+
+        assert!(
+            frag.sql.contains("SELECT si2.id FROM resources si2"),
+            "{}",
+            frag.sql
+        );
+        assert!(frag.sql.contains("si2.is_deleted = FALSE"), "{}", frag.sql);
+        assert!(frag.sql.contains("si2.id = $2"), "{}", frag.sql);
+        // The outer link still walks the reference rows in search_index.
+        assert!(
+            frag.sql.contains("si1.param_name = 'subject'"),
+            "{}",
+            frag.sql
+        );
+        assert!(!frag.sql.contains("param_name = '_id'"), "{}", frag.sql);
+    }
+
+    #[test]
+    fn reverse_chain_on_an_indexed_param_still_reads_search_index() {
+        let registry = obs_subject_patient_org_name();
+        let builder = ChainQueryBuilder::new("t", "Patient", registry);
+        let rc = ReverseChainedParameter {
+            source_type: "Observation".to_string(),
+            reference_param: "subject".to_string(),
+            search_param: "code".to_string(),
+            value: Some(SearchValue::eq("1234-5")),
+            nested: None,
+        };
+        let frag = builder.build_reverse_chain_sql(&rc).unwrap();
+        assert!(!frag.sql.contains("FROM resources"), "{}", frag.sql);
+        assert!(frag.sql.contains("si2.param_name = 'code'"), "{}", frag.sql);
     }
 
     #[test]

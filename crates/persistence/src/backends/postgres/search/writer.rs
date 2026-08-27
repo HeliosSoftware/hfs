@@ -127,6 +127,37 @@ const ROW_COLUMNS: &[&str] = &[
 /// Postgres' 65535 ceiling, and roughly one statement per imported resource.
 const BATCH_ROWS: usize = 128;
 
+/// Search parameters this backend answers from `resources` rather than from
+/// `search_index`, and therefore does not index.
+///
+/// `_id` and `_lastUpdated` are the `resources.id` and `resources.last_updated`
+/// columns restated as index rows. Every read path here already prefers the
+/// column: `build_parameter_condition` routes `_id` to `id = $n` and
+/// `_lastUpdated` to a `last_updated` comparison before it ever looks at a
+/// value column; `sort_expression` maps both to the bare columns rather than
+/// the correlated `search_index` subquery it uses for indexed parameters;
+/// `build_missing_condition` selects from `resources`; `primary_keyset_key`
+/// pages on `last_updated`; and `build_contained_condition` excludes
+/// `_`-prefixed parameters outright. `ChainQueryBuilder` was the one path that
+/// still read the rows, for a chained or reverse-chained terminal such as
+/// `Observation?subject:Patient._id=p1`, and it now reads `resources` too.
+///
+/// The rows cost one insert per resource per parameter with no reader. On the
+/// row census for run 33029355759, `Observation | _id` alone is 689,080 rows —
+/// one for each Observation — and across all 1,632,067 resources `_id` is
+/// ~1.63M of the table's 39.5M rows.
+///
+/// This is a write-side decision only, and it is one-directional: a database
+/// written by an older build still has the rows, and nothing here reads them,
+/// so both shapes answer identically. That is why it needs no schema version
+/// and no migration.
+pub(crate) const PARAMS_ANSWERED_FROM_RESOURCES: [&str; 2] = ["_id", "_lastUpdated"];
+
+/// Whether [`PARAMS_ANSWERED_FROM_RESOURCES`] covers this parameter.
+pub(crate) fn answered_from_resources(param_name: &str) -> bool {
+    PARAMS_ANSWERED_FROM_RESOURCES.contains(&param_name)
+}
+
 impl IndexRow {
     /// Flattens one extracted value into a row.
     ///
@@ -264,7 +295,8 @@ impl PostgresSearchIndexWriter {
         layout: IndexLayout,
         values: Vec<ExtractedValue>,
     ) -> StorageResult<usize> {
-        let (plain, composites) = Self::split_for_layout(values, layout);
+        let (plain, composites) =
+            Self::split_for_layout(Self::drop_resources_backed(values), layout);
 
         let mut rows: Vec<IndexRow> = Vec::with_capacity(plain.len() + composites.len());
         for value in &plain {
@@ -286,6 +318,17 @@ impl PostgresSearchIndexWriter {
         )
         .await?;
         Ok(rows.len())
+    }
+
+    /// Drops the values this backend answers from `resources` columns.
+    ///
+    /// See [`PARAMS_ANSWERED_FROM_RESOURCES`]. Split out from `write_values` so
+    /// the rule is assertable without a database.
+    fn drop_resources_backed(values: Vec<ExtractedValue>) -> Vec<ExtractedValue> {
+        values
+            .into_iter()
+            .filter(|v| !answered_from_resources(&v.param_name))
+            .collect()
     }
 
     /// Splits extracted values into the row shapes the database's layout expects.
@@ -418,6 +461,9 @@ impl PostgresSearchIndexWriter {
         last_updated: DateTime<Utc>,
         extracted: &ExtractedValue,
     ) -> StorageResult<()> {
+        if answered_from_resources(&extracted.param_name) {
+            return Ok(());
+        }
         let Some(row) = IndexRow::from_extracted(extracted, resource_type, resource_id) else {
             return Ok(());
         };
@@ -765,6 +811,32 @@ mod tests {
             PostgresSearchIndexWriter::split_for_layout(values, IndexLayout::Legacy);
         assert_eq!(plain.len(), 2, "one row per component");
         assert!(folded.is_empty(), "nothing is folded on a legacy layout");
+    }
+
+    /// `_id` and `_lastUpdated` restate `resources.id` and
+    /// `resources.last_updated`; nothing on this backend reads their index rows
+    /// (`PARAMS_ANSWERED_FROM_RESOURCES`), so writing them is one insert per
+    /// resource per parameter for no reader.
+    #[test]
+    fn resources_backed_params_are_not_indexed() {
+        let named = |name: &str, value: IndexValue| ExtractedValue {
+            param_name: name.to_string(),
+            ..extracted(value)
+        };
+        let kept = PostgresSearchIndexWriter::drop_resources_backed(vec![
+            named("_id", IndexValue::token_code("abc")),
+            named(
+                "_lastUpdated",
+                IndexValue::date("2024-01-15T10:30:00Z".to_string()),
+            ),
+            named("code", IndexValue::token_code("8302-2")),
+            // Not on the list: a real parameter whose name merely starts with
+            // an underscore must keep its rows.
+            named("_profile", IndexValue::uri("http://example.org/p")),
+            named("_tag", IndexValue::token_code("t")),
+        ]);
+        let names: Vec<&str> = kept.iter().map(|v| v.param_name.as_str()).collect();
+        assert_eq!(names, vec!["code", "_profile", "_tag"]);
     }
 
     /// The push order in `build_insert` and `ROW_COLUMNS` are maintained by
