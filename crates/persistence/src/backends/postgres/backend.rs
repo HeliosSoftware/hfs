@@ -39,6 +39,13 @@ pub struct PostgresBackend {
     /// Unset until then, which reads as [`IndexLayout::Legacy`] — the form that
     /// is correct against either layout.
     index_layout: Arc<std::sync::OnceLock<super::schema::IndexLayout>>,
+    /// Whether the `resource_fts` table exists, resolved once.
+    ///
+    /// The FTS write path used to ask `information_schema.tables` on every
+    /// single resource write — 254,970 catalog queries in one 5-minute crud
+    /// run. The answer only changes when the schema is created or migrated,
+    /// both of which happen before the instance serves traffic.
+    fts_table_exists: Arc<std::sync::OnceLock<bool>>,
 }
 
 impl Debug for PostgresBackend {
@@ -338,6 +345,7 @@ impl PostgresBackend {
             registries,
             stored_by_tenant,
             index_layout: Arc::new(std::sync::OnceLock::new()),
+            fts_table_exists: Arc::new(std::sync::OnceLock::new()),
         })
     }
 

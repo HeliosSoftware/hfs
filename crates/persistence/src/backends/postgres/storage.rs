@@ -1141,7 +1141,7 @@ impl PostgresBackend {
             .await?;
 
         // Index FTS content for _text and _content searches
-        self.index_fts_content(client, tenant_id, resource_type, resource_id, resource)
+        self.index_fts_content(client, tenant_id, resource_type, resource_id, mode, resource)
             .await?;
 
         Ok(())
@@ -1177,6 +1177,30 @@ impl PostgresBackend {
         Ok(count)
     }
 
+    /// Whether `resource_fts` exists, asked of the catalog at most once.
+    ///
+    /// This used to be an `information_schema.tables` lookup on every resource
+    /// write. `information_schema` views are joins over the system catalogs, so
+    /// that is not a free question, and the answer cannot change while the
+    /// instance is serving: the table is created by `initialize_schema` and
+    /// only migrations touch it, both of which run at startup under an advisory
+    /// lock before any request is accepted.
+    async fn fts_table_exists(&self, client: &deadpool_postgres::Client) -> StorageResult<bool> {
+        if let Some(known) = self.fts_table_exists.get() {
+            return Ok(*known);
+        }
+        let exists = client
+            .query_opt(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = 'resource_fts'",
+                &[],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to check FTS table: {}", e)))?
+            .is_some();
+        let _ = self.fts_table_exists.set(exists);
+        Ok(exists)
+    }
+
     /// Index full-text search content for _text and _content searches.
     ///
     /// Populates the resource_fts table using PostgreSQL tsvector/tsquery.
@@ -1186,18 +1210,10 @@ impl PostgresBackend {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        mode: IndexWrite,
         resource: &Value,
     ) -> StorageResult<()> {
-        // Check if FTS table exists
-        let fts_exists = client
-            .query_opt(
-                "SELECT 1 FROM information_schema.tables WHERE table_name = 'resource_fts'",
-                &[],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to check FTS table: {}", e)))?;
-
-        if fts_exists.is_none() {
+        if !self.fts_table_exists(client).await? {
             return Ok(());
         }
 
@@ -1208,13 +1224,19 @@ impl PostgresBackend {
             return Ok(());
         }
 
-        // Delete existing FTS entry first
-        let _ = client
-            .execute(
-                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await;
+        // `resource_fts` has no unique key, so a rewrite has to clear the old
+        // row first. A `Fresh` write asserts nothing is indexed under this id —
+        // the same assertion that lets the `search_index` clearing DELETE be
+        // skipped above — so on the create path this statement only ever
+        // deleted zero rows.
+        if mode == IndexWrite::Replace {
+            let _ = client
+                .execute(
+                    "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                    &[&tenant_id, &resource_type, &resource_id],
+                )
+                .await;
+        }
 
         // Insert into FTS table (the trigger will populate tsvector columns)
         client
@@ -3237,10 +3259,17 @@ impl ReindexTarget for PostgresBackend {
         // Same defect as the SQLite side — this is not PostgreSQL-specific.
         //
         // Not counted in `count`, which reports `search_index` entries only.
-        // `index_fts_content` is DELETE-then-INSERT here, so it is idempotent
-        // regardless of what ran before it.
-        self.index_fts_content(&client, tenant_id, resource_type, resource_id, content)
-            .await?;
+        // Passed `Replace` so it stays DELETE-then-INSERT here and is idempotent
+        // regardless of what ran before it — a reindex can find a row present.
+        self.index_fts_content(
+            &client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            IndexWrite::Replace,
+            content,
+        )
+        .await?;
 
         Ok(count)
     }
