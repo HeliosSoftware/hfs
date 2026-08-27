@@ -591,9 +591,7 @@ impl SubmitClaimStrategy for S3Backend {
     }
 
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
-        let new_expiry = Utc::now()
-            + chrono::Duration::from_std(lease.lease_duration)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+        let new_expiry = lease.renewed_expiry();
         self.fenced_mutate(lease, |state| {
             state.lease_expiry = Some(new_expiry);
         })

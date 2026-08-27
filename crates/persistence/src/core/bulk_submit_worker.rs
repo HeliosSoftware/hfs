@@ -52,6 +52,16 @@ pub struct ManifestLease {
     pub fencing_token: u64,
 }
 
+impl ManifestLease {
+    /// The expiry a successful heartbeat renews to: now plus the duration the
+    /// lease was claimed with. Shared by every backend's `heartbeat`.
+    pub fn renewed_expiry(&self) -> DateTime<Utc> {
+        Utc::now()
+            + chrono::Duration::from_std(self.lease_duration)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60))
+    }
+}
+
 /// The worker's view of a claimed manifest: everything needed to fetch + ingest it.
 #[derive(Debug, Clone)]
 pub struct ManifestWorkerView {

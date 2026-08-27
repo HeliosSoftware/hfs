@@ -1351,10 +1351,7 @@ impl SubmitClaimStrategy for SqliteBackend {
 
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
         let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        let now = Utc::now();
-        let new_expiry = now
-            + chrono::Duration::from_std(lease.lease_duration)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+        let new_expiry = lease.renewed_expiry();
         let affected = conn
             .execute(
                 "UPDATE bulk_manifests SET lease_expiry = ?1

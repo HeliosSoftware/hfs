@@ -1264,9 +1264,7 @@ impl SubmitClaimStrategy for MongoBackend {
     }
 
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
-        let new_expiry = now_at_bson_precision()
-            + chrono::Duration::from_std(lease.lease_duration)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+        let new_expiry = from_bson_time(&to_bson_time(lease.renewed_expiry()));
         self.fenced_update(
             lease,
             doc! { "$set": { "lease_expiry": to_bson_time(new_expiry) } },
