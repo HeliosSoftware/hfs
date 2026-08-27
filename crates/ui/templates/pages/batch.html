@@ -67,25 +67,22 @@
          server will treat failures — all-or-nothing vs. entry-by-entry. -->
     <p class="notice" id="batch-semantics"></p>
 
+    <!-- A failed execute reports here, above the plan (#730) — on a long
+         plan the page may be scrolled anywhere when the attempt fails. -->
+    <p class="alert" id="batch-execute-error" role="alert" hidden></p>
+
     <div class="card">
       <div class="card-head">
         <h3><span class="icon">{% include "icons/layers.svg" %}</span> {{ i18n.t("batch-plan-heading") }}</h3>
       </div>
       <div class="batch-tabs" role="tablist">
-        <button type="button" class="batch-tab" id="batch-tab-actions" role="tab" aria-selected="true">{{ i18n.t("batch-tab-actions") }}</button>
-        <button type="button" class="batch-tab" id="batch-tab-json" role="tab" aria-selected="false">{{ i18n.t("batch-tab-json") }}</button>
+        <button type="button" class="batch-tab" id="batch-tab-actions" role="tab" aria-selected="true"><span class="icon">{% include "icons/sliders.svg" %}</span> {{ i18n.t("batch-tab-actions") }}</button>
+        <button type="button" class="batch-tab" id="batch-tab-json" role="tab" aria-selected="false"><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("batch-tab-json") }}</button>
       </div>
       <ol class="batch-rows" id="batch-rows"></ol>
       <div class="batch-json" id="batch-json" hidden></div>
     </div>
 
-    <!-- The error renders inside the footer, next to the button that raised
-         it (#676) — not as detached text at the end of the page. -->
-    <div class="batch-footer">
-      <button type="button" class="btn" id="batch-cancel">{{ i18n.t("batch-cancel") }}</button>
-      <p class="alert alert--inline" id="batch-execute-error" role="alert" hidden></p>
-      <button type="button" class="btn btn--primary" id="batch-execute">{{ i18n.t("batch-execute") }}</button>
-    </div>
   </section>
 
   <!-- ============ Stage 3: response ============ -->
@@ -93,10 +90,13 @@
     <div class="card">
       <div class="card-head">
         <h3><span class="icon">{% include "icons/check.svg" %}</span> {{ i18n.t("batch-response-heading") }}</h3>
-        <span class="batch-badge" id="batch-overall"></span>
+        <!-- The created count reads at a glance next to the status (#729);
+             the rest of the tally stays in the summary line below. -->
+        <div class="card-head__meta">
+          <span class="batch-created" id="batch-created"></span>
+          <span class="batch-badge" id="batch-overall"></span>
+        </div>
       </div>
-      <!-- The aggregate Steve asked for: how many resources this run created,
-           updated, or failed — not just per-row badges. -->
       <p class="batch-summary" id="batch-summary"></p>
       <ol class="batch-rows" id="batch-outcomes"></ol>
     </div>
