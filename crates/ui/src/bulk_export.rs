@@ -163,10 +163,29 @@ struct JobCard {
     status: String,
     status_label: String,
     progress: String,
+    /// `0`–`100` for the progress track (#735): terminal states fill the bar,
+    /// in-progress parses the percentage out of the recipient's X-Progress.
+    progress_pct: String,
     error: String,
     file_count: usize,
     files: Vec<(String, String)>,
     elapsed: String,
+}
+
+fn progress_pct(status: &str, progress: &str) -> String {
+    if matches!(status, "complete" | "failed" | "cancelled") {
+        return "100".to_string();
+    }
+    let Some(idx) = progress.find('%') else {
+        return "0".to_string();
+    };
+    let digits: String = progress[..idx]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let pct: String = digits.chars().rev().collect();
+    if pct.is_empty() { "0".to_string() } else { pct }
 }
 
 fn status_label(i18n: &I18n, status: &str) -> String {
@@ -200,6 +219,7 @@ fn job_card(i18n: &I18n, id: &str, job: &ExportJob) -> JobCard {
         },
         status_label: status_label(i18n, &job.status),
         status: job.status.clone(),
+        progress_pct: progress_pct(&job.status, &job.progress),
         progress: job.progress.clone(),
         error: job.error.clone(),
         file_count: job.files.len(),
