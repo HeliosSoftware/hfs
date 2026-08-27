@@ -306,6 +306,14 @@ impl SearchParameterExtractor {
             }
         }
 
+        // Re-apply the target-type restriction that `simplify_resolve_pattern`
+        // had to strip from the expression. See [`Self::resolve_target_types`].
+        if matches!(param.param_type, SearchParamType::Reference)
+            && let Some(allowed) = self.resolve_target_types(&rewritten, resource_type)
+        {
+            Self::restrict_reference_targets(&mut results, &allowed);
+        }
+
         Ok(results)
     }
 
@@ -433,6 +441,25 @@ impl SearchParameterExtractor {
     fn filter_expression_for_resource(&self, expression: &str, resource_type: &str) -> String {
         // Split into union members at top level only, then keep the ones that
         // apply to this resource type.
+        match self.retained_parts(expression, resource_type) {
+            // If no parts match, return the original expression.
+            // This handles expressions that don't use ResourceType prefix.
+            None => expression.to_string(),
+            Some(parts) => parts
+                .iter()
+                .map(|p| self.simplify_resolve_pattern(p))
+                .collect::<Vec<_>>()
+                .join(" | "),
+        }
+    }
+
+    /// The union members of `expression` that apply to `resource_type`, before
+    /// `.where(resolve() is X)` is stripped.
+    ///
+    /// `None` means no member named this resource type, in which case callers
+    /// fall back to the whole expression and nothing can be concluded about the
+    /// reference targets.
+    fn retained_parts(&self, expression: &str, resource_type: &str) -> Option<Vec<String>> {
         let parts: Vec<String> = split_union_members(expression)
             .into_iter()
             .filter_map(|p| {
@@ -448,17 +475,42 @@ impl SearchParameterExtractor {
                         || p.chars().nth(resource_type.len()) == Some('.'));
                 matches_type.then(|| p.to_string())
             })
-            .map(|p| self.simplify_resolve_pattern(&p))
             .collect();
+        (!parts.is_empty()).then_some(parts)
+    }
 
-        if parts.is_empty() {
-            // If no parts match, return the original expression
-            // This handles expressions that don't use ResourceType prefix
-            expression.to_string()
-        } else {
-            // Join the filtered parts back with |
-            parts.join(" | ")
+    /// The resource types a reference parameter is restricted to, if the
+    /// definition restricts it at all.
+    ///
+    /// `simplify_resolve_pattern` has to strip `.where(resolve() is Patient)`
+    /// before evaluation — `resolve()` cannot follow a reference out of the one
+    /// resource being indexed. Stripping it silently widened the parameter:
+    /// `Provenance.patient` is defined as `Provenance.target.where(resolve() is
+    /// Patient)`, and indexing every `target` made `Provenance?patient=X` match
+    /// a Provenance whose target is an *Encounter* with id X. On the benchmark
+    /// corpus it also made `Provenance | patient` the second-largest parameter
+    /// in the table at 1,626,336 rows — one per target, 1,626 per resource —
+    /// nearly all of which no `patient` search should ever return.
+    ///
+    /// The type a reference points at is already in the reference string, so the
+    /// restriction can be applied at extraction time without resolving anything.
+    /// Returns `None` — meaning "do not filter" — unless EVERY retained union
+    /// member carries a `resolve() is` clause; a member without one contributes
+    /// unrestricted references, and dropping those would lose real index rows.
+    fn resolve_target_types(
+        &self,
+        expression: &str,
+        resource_type: &str,
+    ) -> Option<Vec<String>> {
+        let parts = self.retained_parts(expression, resource_type)?;
+        let mut types = Vec::new();
+        for part in &parts {
+            let ty = resolve_target_type(part)?;
+            if !types.contains(&ty) {
+                types.push(ty);
+            }
         }
+        (!types.is_empty()).then_some(types)
     }
 
     /// Simplifies common `.where(resolve() is ResourceType)` patterns.
@@ -479,6 +531,33 @@ impl SearchParameterExtractor {
             }
         }
         expr.to_string()
+    }
+
+    /// Keeps only the reference values whose target type the parameter allows.
+    ///
+    /// Conservative by construction: a value is dropped only when its type can
+    /// be read off the reference AND is not in `allowed`. Contained (`#x`),
+    /// `urn:uuid:` and bare-id references carry no type, so they are kept — a
+    /// false positive costs a row, a false negative costs a search result.
+    fn restrict_reference_targets(values: &mut Vec<ExtractedValue>, allowed: &[String]) {
+        values.retain(|v| match &v.value {
+            IndexValue::Reference {
+                reference,
+                resource_type,
+                ..
+            } => {
+                // The converter already parses the plain forms; fall back for
+                // the ones it does not (versioned references).
+                let ty = resource_type
+                    .as_deref()
+                    .or_else(|| reference_target_type(reference));
+                match ty {
+                    Some(ty) => allowed.iter().any(|a| a == ty),
+                    None => true,
+                }
+            }
+            _ => true,
+        });
     }
 
     /// Evaluates a FHIRPath expression against a resource using the helios-fhirpath evaluator.
@@ -538,6 +617,39 @@ const NON_INDEXABLE_PARAM_CODES: [&str; 1] = ["_in"];
 /// `x.where(v = 'a`, whose parse error aborts extraction for *every* member of
 /// that parameter, concrete ones included.
 ///
+
+/// The resource type in a `.where(resolve() is X)` clause, if the part has one.
+fn resolve_target_type(part: &str) -> Option<String> {
+    let start = part.find(".where(resolve() is ")? + ".where(resolve() is ".len();
+    let rest = &part[start..];
+    let end = rest.find(')')?;
+    let ty = rest[..end].trim();
+    // Only a plain resource type name is usable; anything else (a union, a
+    // profile URL) leaves the parameter unrestricted.
+    let plain = !ty.is_empty()
+        && ty.starts_with(|c: char| c.is_ascii_uppercase())
+        && ty.chars().all(|c| c.is_ascii_alphanumeric());
+    plain.then(|| ty.to_string())
+}
+
+/// The resource type a reference string points at, when it is stated.
+///
+/// Handles the relative (`Patient/123`), versioned (`Patient/123/_history/2`)
+/// and absolute (`http://host/fhir/Patient/123`) forms. Returns `None` for
+/// contained (`#id`), `urn:` and bare-id references, whose type is not stated.
+fn reference_target_type(reference: &str) -> Option<&str> {
+    if reference.starts_with('#') || reference.starts_with("urn:") {
+        return None;
+    }
+    let base = reference.split("/_history/").next().unwrap_or(reference);
+    let mut segments = base.rsplitn(3, '/');
+    let _id = segments.next()?;
+    let ty = segments.next()?;
+    let plain = !ty.is_empty()
+        && ty.starts_with(|c: char| c.is_ascii_uppercase())
+        && ty.chars().all(|c| c.is_ascii_alphanumeric());
+    plain.then_some(ty)
+}
 
 /// A `|` inside `(...)`, `[...]`, `'...'` (with `\'` escapes) or a backtick
 /// delimited identifier therefore stays part of its member. Members are
@@ -1146,6 +1258,79 @@ mod tests {
         assert_eq!(careplan_filtered, "CarePlan.subject");
         let obs_filtered = extractor.filter_expression_for_resource(patient_expr, "Observation");
         assert_eq!(obs_filtered, "Observation.subject");
+    }
+
+    #[test]
+    fn resolve_target_types_recovers_what_stripping_discards() {
+        let extractor = create_test_extractor();
+
+        // Provenance.patient — the parameter this cost the most on. Stripping
+        // the clause is required for evaluation, but the restriction it
+        // expressed is recoverable and must be re-applied to the values.
+        let prov = "Provenance.target.where(resolve() is Patient)";
+        assert_eq!(
+            extractor.filter_expression_for_resource(prov, "Provenance"),
+            "Provenance.target"
+        );
+        assert_eq!(
+            extractor.resolve_target_types(prov, "Provenance"),
+            Some(vec!["Patient".to_string()])
+        );
+
+        // A member without a resolve clause leaves the parameter unrestricted:
+        // filtering on the other member's type would drop real index rows.
+        let mixed = "Observation.subject.where(resolve() is Patient) | Observation.performer";
+        assert_eq!(extractor.resolve_target_types(mixed, "Observation"), None);
+
+        // No member names this resource type, so the caller falls back to the
+        // whole expression and nothing can be concluded.
+        assert_eq!(extractor.resolve_target_types(prov, "Patient"), None);
+    }
+
+    #[test]
+    fn reference_target_type_reads_only_the_stated_forms() {
+        assert_eq!(reference_target_type("Patient/123"), Some("Patient"));
+        assert_eq!(
+            reference_target_type("Patient/123/_history/2"),
+            Some("Patient")
+        );
+        assert_eq!(
+            reference_target_type("http://ex.org/fhir/Encounter/9"),
+            Some("Encounter")
+        );
+        // Untyped forms must stay unfiltered — a false positive costs one index
+        // row, a false negative costs a search result.
+        assert_eq!(reference_target_type("#contained"), None);
+        assert_eq!(reference_target_type("urn:uuid:0f2b"), None);
+        assert_eq!(reference_target_type("123"), None);
+        assert_eq!(reference_target_type("some/lowercase/123"), None);
+    }
+
+    #[test]
+    fn restrict_reference_targets_keeps_the_undeterminable() {
+        let make = |r: &str| {
+            ExtractedValue::new(
+                "patient",
+                "http://example.org/sp",
+                SearchParamType::Reference,
+                IndexValue::reference(r),
+            )
+        };
+        let mut vals = vec![
+            make("Patient/1"),
+            make("Encounter/2"),
+            make("urn:uuid:3"),
+            make("#c"),
+        ];
+        SearchParameterExtractor::restrict_reference_targets(&mut vals, &["Patient".to_string()]);
+        let refs: Vec<String> = vals
+            .iter()
+            .map(|v| match &v.value {
+                IndexValue::Reference { reference, .. } => reference.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(refs, vec!["Patient/1", "urn:uuid:3", "#c"]);
     }
 
     #[test]
