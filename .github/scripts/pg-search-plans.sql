@@ -905,3 +905,151 @@ SELECT indexname, indexdef FROM pg_indexes
 WHERE tablename = 'search_index'
   AND indexname LIKE 'idx_search_composite%'
 ORDER BY indexname;
+
+-- ── Seat G: index-removal verification (relabelled AS.. to avoid collision) ──
+\echo '################ v27 — THE FOUR DROPPED INDEXES ################'
+-- v27 drops `idx_search_reference`, `idx_search_reference_display`,
+-- `idx_search_token_display` and `idx_search_string_folded` on the argument
+-- that NO predicate the query builder emits can seek any of them, and that the
+-- (tenant_id, resource_type, param_name) slice each would still have been
+-- scanned for is served by a surviving index over a superset of its rows.
+--
+-- Sections AM–AR are that argument's falsification test. Read them together:
+-- a Seq Scan on `search_index`, or an index scan with no `Index Cond` on the
+-- value column where one is claimed, means the argument is wrong and the index
+-- has to come back.
+
+\echo ''
+\echo '######## AS. LIVE INDEX SET on search_index (must show none of the four) ########'
+-- The record of what actually exists after the migration, so a later run can be
+-- read without guessing which schema version produced it.
+SELECT indexname, pg_size_pretty(pg_relation_size(indexname::regclass)) AS size, indexdef
+FROM pg_indexes WHERE tablename = 'search_index' ORDER BY indexname;
+
+-- A real stored reference for the shapes below. COALESCE keeps this to exactly
+-- one row even on an empty table, so `:'ref'` is always set.
+SELECT COALESCE((SELECT value_reference FROM search_index
+                 WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                   AND param_name = 'subject' AND value_reference IS NOT NULL
+                 LIMIT 1), 'Patient/no-such-id') AS ref \gset
+
+\echo ''
+\echo '######## AT. REFERENCE Observation?subject=<ref> — does text_pattern_ops serve `=`? ########'
+-- THE claim behind dropping `idx_search_reference`. It and
+-- `idx_search_reference_pattern` have identical key columns and an identical
+-- partial predicate; the only difference is the operator class. The drop is
+-- correct only because `text_pattern_ops` carries `=` at
+-- BTEqualStrategyNumber — text equality is `texteq`, byte equality under any
+-- deterministic collation, so both families share it.
+--
+-- EXPECT: `Index Scan using idx_search_reference_pattern` (or a Bitmap Index
+-- Scan on it) with `Index Cond: ((value_reference = '…') OR (value_reference ~>=~ …))`,
+-- and single- to low-double-digit buffers.
+--
+-- FALSIFIED IF: the value predicate appears under `Filter:` instead of
+-- `Index Cond:`, or the plan reads the whole `subject` slice. That would mean
+-- `=` is not reachable through this index and `idx_search_reference` must be
+-- restored.
+         AND param_name = 'subject'
+         AND (value_reference = :'ref'
+              OR value_reference LIKE :'ref' || '/\_history/%' ESCAPE '\')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+\echo '######## AU. AN COUNTERFACTUAL — the same shape with idx_search_reference back ########'
+-- The paired "before", in the same pass and against the same cache. DDL is
+-- transactional, so the ROLLBACK leaves the database exactly as it was.
+--
+-- This one BUILDS an index over every reference row (the largest single row
+-- class left in the table), so it is the most expensive block in this file.
+-- The timeouts bound it: if it cannot finish, the transaction aborts and the
+-- schema is untouched — that is a missing measurement, not a broken database.
+--
+-- EXPECT: the same plan and the same hit+read as AN, with the index name
+-- swapped. That is what "subsumed" means here. A materially cheaper plan would
+-- mean the drop cost something real on the read side and should be reverted.
+BEGIN;
+SET LOCAL lock_timeout = '30s';
+SET LOCAL statement_timeout = '600s';
+CREATE INDEX idx_search_reference_v26
+  ON search_index (tenant_id, resource_type, param_name, value_reference)
+  WHERE value_reference IS NOT NULL;
+         AND param_name = 'subject'
+         AND (value_reference = :'ref'
+              OR value_reference LIKE :'ref' || '/\_history/%' ESCAPE '\')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+ROLLBACK;
+
+\echo ''
+\echo '######## AV. TOKEN Observation?code:text=blood — the token_display shape ########'
+-- `value_token_display ILIKE $n`. `idx_search_token_display` was a btree in the
+-- DEFAULT operator class, and `match_pattern_prefix` derives bounds for a
+-- case-insensitive pattern only into a `text_pattern_ops` family, and only when
+-- the fixed prefix carries no letter — so this predicate could never seek that
+-- index. It could only scan the index's (tenant_id, resource_type, param_name)
+-- slice with the ILIKE as a filter, and `idx_search_token_code` covers that
+-- slice over a superset of the rows (`IndexValue::Token` always sets
+-- `value_token_code`; `from_composite` never sets a display).
+--
+-- EXPECT: an index scan on one of the surviving (tenant, type, param) indexes
+-- with `Filter: (value_token_display ~~* '%blood%')`, and rows removed by
+-- filter. FALSIFIED IF: `Seq Scan on search_index`.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'code'
+         AND value_token_display ILIKE '%blood%'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+\echo '######## AW. REFERENCE Observation?subject:code-text=a — the reference_display shape ########'
+-- `value_reference_display ILIKE $n || '%'`. Same argument as AP, and stronger:
+-- the pattern here is an `OpExpr` (`$n || '%'`), not a `Const`, so no fixed
+-- prefix can be read off it at plan time even in principle.
+--
+-- EXPECT: an index scan on a surviving (tenant, type, param) index with
+-- `Filter: (value_reference_display ~~* …)`. FALSIFIED IF: Seq Scan.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'subject'
+         AND value_reference_display ILIKE 'a' || '%'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AX. v27 INDEX ENTRIES REMOVED — rows x indexes each row stopped entering ########'
+-- The write-side size of the change, counted the way the import path pays it:
+-- one btree insert per row per applicable index. `rows` is how many rows of
+-- that kind the table holds; `entries_saved` is how many index insertions per
+-- import v27 removes for them.
+--
+-- `idx_search_string` (`:exact`) and `idx_search_string_folded_pattern` (the
+-- COALESCE the default string search seeks) are deliberately NOT in this list:
+-- they survive, and a string row still enters both.
+SELECT 'reference rows (idx_search_reference)' AS class,
+       count(*) FILTER (WHERE value_reference IS NOT NULL) AS rows,
+       count(*) FILTER (WHERE value_reference IS NOT NULL) AS entries_saved
+FROM search_index WHERE tenant_id = 'default'
+UNION ALL
+SELECT 'reference rows with a display (idx_search_reference_display)',
+       count(*) FILTER (WHERE value_reference_display IS NOT NULL),
+       count(*) FILTER (WHERE value_reference_display IS NOT NULL)
+FROM search_index WHERE tenant_id = 'default'
+UNION ALL
+SELECT 'token rows with a display (idx_search_token_display)',
+       count(*) FILTER (WHERE value_token_display IS NOT NULL),
+       count(*) FILTER (WHERE value_token_display IS NOT NULL)
+FROM search_index WHERE tenant_id = 'default'
+UNION ALL
+SELECT 'rows in idx_search_string_folded (predicate: value_string IS NOT NULL)',
+       count(*) FILTER (WHERE value_string IS NOT NULL),
+       count(*) FILTER (WHERE value_string IS NOT NULL)
+FROM search_index WHERE tenant_id = 'default';

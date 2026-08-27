@@ -2688,6 +2688,174 @@ mod tests {
         assert!(!frag.sql.contains("COALESCE"), "{}", frag.sql);
     }
 
+    /// Builds a token `SearchParameter` with an optional modifier.
+    fn token_param(name: &str, modifier: Option<SearchModifier>, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: vec![SearchValue::new(SearchPrefix::Eq, value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    /// Builds a reference `SearchParameter` with an optional modifier.
+    fn reference_param(
+        name: &str,
+        modifier: Option<SearchModifier>,
+        value: &str,
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Reference,
+            modifier,
+            values: vec![SearchValue::new(SearchPrefix::Eq, value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    /// v27 dropped `idx_search_string_folded`, the btree on the bare
+    /// `value_string_folded` column, because no emitted predicate can seek it:
+    /// the column is only ever read through `COALESCE(value_string_folded,
+    /// lower(value_string))`, which an index on the bare column cannot match,
+    /// and `sort_value_column` maps `String` to `value_string`.
+    ///
+    /// If a bare predicate on the folded column is ever added back it will get a
+    /// sequential scan and nobody will notice, so pin the rule here.
+    #[test]
+    fn the_folded_column_is_only_ever_read_through_the_coalesce() {
+        for modifier in [
+            None,
+            Some(SearchModifier::Contains),
+            Some(SearchModifier::Text),
+            Some(SearchModifier::Exact),
+        ] {
+            let query = SearchQuery::new("Patient").with_parameter(string_param(
+                "name",
+                modifier.clone(),
+                "Emilia",
+            ));
+            let frag =
+                PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+            assert_eq!(
+                frag.sql.matches("value_string_folded").count(),
+                frag.sql.matches(FOLDED_STRING_EXPR).count(),
+                "modifier {:?} reads the folded column outside the indexed \
+                 COALESCE, which no index in the schema can serve: {}",
+                modifier,
+                frag.sql
+            );
+        }
+        assert_eq!(
+            sort_value_column(SearchParamType::String),
+            Some("value_string")
+        );
+    }
+
+    /// v27 dropped `idx_search_token_display` and `idx_search_reference_display`.
+    /// Both were btrees in the default operator class, and `ILIKE` is not
+    /// sargable against one at any prefix — so they were only ever scanners of
+    /// their `(tenant_id, resource_type, param_name)` slice, which
+    /// `idx_search_token_code` and `idx_search_reference_pattern` cover over a
+    /// superset of the rows.
+    ///
+    /// The drop is safe exactly as long as `ILIKE` stays the only operator on
+    /// these columns. An `=` or a prefix `LIKE` added later WOULD be sargable
+    /// and would then want an index that no longer exists.
+    #[test]
+    fn display_columns_are_only_ever_matched_with_ilike() {
+        let cases: Vec<(SearchQuery, &str)> = vec![
+            (
+                SearchQuery::new("Observation").with_parameter(token_param(
+                    "code",
+                    Some(SearchModifier::Text),
+                    "Blood",
+                )),
+                "value_token_display",
+            ),
+            (
+                SearchQuery::new("Observation").with_parameter(token_param(
+                    "code",
+                    Some(SearchModifier::CodeText),
+                    "Blood",
+                )),
+                "value_token_display",
+            ),
+            (
+                SearchQuery::new("Observation").with_parameter(reference_param(
+                    "subject",
+                    Some(SearchModifier::Text),
+                    "Emilia",
+                )),
+                "value_reference_display",
+            ),
+            (
+                SearchQuery::new("Observation").with_parameter(reference_param(
+                    "subject",
+                    Some(SearchModifier::CodeText),
+                    "Emilia",
+                )),
+                "value_reference_display",
+            ),
+        ];
+
+        for (query, column) in cases {
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("display shape");
+            let mentions = frag.sql.matches(column).count();
+            assert!(mentions > 0, "expected a {column} predicate: {}", frag.sql);
+            assert_eq!(
+                frag.sql.matches(&format!("{column} ILIKE")).count(),
+                mentions,
+                "{column} must only ever be matched with ILIKE — anything \
+                 sargable needs an index this schema no longer has: {}",
+                frag.sql
+            );
+        }
+    }
+
+    /// v27 dropped `idx_search_reference` and kept its `text_pattern_ops` twin
+    /// `idx_search_reference_pattern`, which has the same key columns and the
+    /// same partial predicate. That family carries `=` but NOT the ordering
+    /// operators, so the drop holds only while every predicate on
+    /// `value_reference` is equality or a `LIKE` — and it is the pattern index,
+    /// not this one, that the prefix `LIKE`s need.
+    #[test]
+    fn reference_predicates_never_need_a_collation_ordered_index() {
+        let queries = [
+            SearchQuery::new("Observation").with_parameter(reference_param(
+                "subject",
+                None,
+                "Patient/p1",
+            )),
+            SearchQuery::new("Observation").with_parameter(reference_param("subject", None, "p1")),
+            SearchQuery::new("Observation").with_parameter(reference_param(
+                "subject",
+                Some(SearchModifier::Below),
+                "http://h/Organization/o1",
+            )),
+            SearchQuery::new("Observation").with_parameter(reference_param(
+                "subject",
+                Some(SearchModifier::Contains),
+                "p1",
+            )),
+        ];
+
+        for query in queries {
+            let frag =
+                PostgresQueryBuilder::build_search_query(&query, 2).expect("reference shape");
+            for op in [" < ", " > ", " <= ", " >= ", "ORDER BY value_reference"] {
+                assert!(
+                    !frag.sql.contains(op),
+                    "an ordering comparison on value_reference cannot use the \
+                     text_pattern_ops index that survives v27 (`{op}`): {}",
+                    frag.sql
+                );
+            }
+        }
+    }
+
     #[test]
     fn system_qualified_token_is_one_extractable_equality_conjunction() {
         // `Encounter?class=http://…v3-ActCode|AMB`. This is the shape v24's
