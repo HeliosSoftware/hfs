@@ -1233,6 +1233,13 @@ textarea.field__input {
   justify-content: flex-end;
 }
 
+/* Dialog feet pair a plain button with the primary; both sit on the primary's
+   metrics so the row lines up. */
+.addbox__actions .btn {
+  height: 36px;
+  padding: 0 18px;
+}
+
 .spinner {
   width: 14px;
   height: 14px;
