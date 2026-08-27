@@ -456,8 +456,10 @@ jobs:
         working-directory: crates/pysof
         run: uv run maturin develop
 
-      # The workspace test loops skip pysof (it is not a default member), so
-      # its Rust suites run here. maturin develop above already compiled the
+      # Runs pysof's Rust suites in the job that owns the crate. (test-rust's
+      # `cargo test --workspace` does also select pysof — `--workspace`
+      # overrides default-members — but this keeps a pysof-scoped signal next
+      # to the Python tests.) maturin develop above already compiled the
       # dependency tree into the shared target dir with the same dev profile.
       - name: Run Rust tests
         working-directory: crates/pysof

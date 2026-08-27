@@ -96,13 +96,17 @@ note the version bump in the commit.
 ### Client-side scripts
 
 Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
-`json-view.js` loads from the shared layout because its delegated behavior is
-used across workspaces. `theme.js` loads **without `defer`**, before first paint,
-to avoid a flash of the wrong theme.
+`json-view.js` and `busy.js` load from the shared layout because their behavior
+is used across workspaces — `busy.js` ahead of every page script (defer runs in
+document order) because page scripts call into it. `theme.js` loads **without
+`defer`**, before first paint, to avoid a flash of the wrong theme. `busy.js`
+is the crate's one exported global (`window.hfsBusy`): unlike the closed IIFEs
+it exists to be called by the others.
 
 | Asset | Owns |
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
+| `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
 | `saved-queries.js` | Saved queries, the visual search builder, and the `/_user/settings` read/modify/write cycle |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
 | `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
@@ -217,9 +221,30 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.tabs`, `.tab`, `.tab--on` | Tab strip. |
 | `.filter-rail`, `.nav-panel` | Left rails: the filter list inside a page; the type panel flush against the sidebar. |
 | `.icon-button`, `.icon-button--danger` | Bare icon action (table rows). |
+| `.busy-status` > `.spinner` | Inline working state: the ring plus a short label, `role="status"` in the markup so it announces. |
 
 Starting a new page: copy `templates/pages/_scaffold.html` (or crib
 `tenants.html`, the smallest real page). Both compose only this vocabulary.
+
+### Busy states
+
+One convention for "this control is doing something" (#679), in two lanes:
+
+- **Fetch-driven scripts** call `window.hfsBusy` (`assets/busy.js`).
+  `during(buttons, work)` disables the controls, stamps `aria-busy="true"`,
+  and clears when the promise `work()` returns settles — pass a *function*,
+  never a promise, so the re-entrancy guard runs before the request exists;
+  a `work()` that navigates away returns a promise that never settles.
+  `region(el, label)` reveals a pre-rendered `.busy-status` element and
+  labels its `[data-busy-label]`; `opts.region`/`opts.label` on `during` tie
+  one to the same lifetime. The CSS ring keys off `aria-busy`, so the
+  visuals cannot ship without the semantics; reduced motion gets the same
+  ring as a static glyph. The `::after` ring must keep `content: ""` — CSS
+  generated *text* would join the accessible name.
+- **htmx controls** use `hx-disabled-elt` (#581); `hx-indicator` is
+  deliberately absent (the tenants tests pin this). A pending state that
+  outlives the request belongs in the swapped fragment, like the tenants
+  provisioning row.
 
 ---
 

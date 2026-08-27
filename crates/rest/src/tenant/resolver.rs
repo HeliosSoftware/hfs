@@ -386,6 +386,13 @@ mod tests {
         request.into_parts().0
     }
 
+    #[cfg(all(feature = "R4", any(feature = "R5", feature = "R6")))]
+    #[test]
+    fn later_version_resource_paths_are_reserved_under_r4() {
+        assert!(is_reserved_path("ActorDefinition", &FhirVersion::R4));
+        assert!(is_reserved_path("actordefinition", &FhirVersion::R4));
+    }
+
     /// `Ok(Some(id))` unwrapped, for the many assertions that only care about
     /// the resolved value.
     fn extracted(

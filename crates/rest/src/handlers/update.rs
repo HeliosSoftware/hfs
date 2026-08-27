@@ -14,6 +14,7 @@ use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirResource, FhirVersionExtractor, TenantExtractor};
+use crate::fhir_types::admit_resource_type;
 use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
@@ -68,6 +69,15 @@ pub async fn update_handler<S>(
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
+    // Determine FHIR version from header or use server default
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
+
+    admit_resource_type(&resource_type, &resource, fhir_version).map_err(|error| {
+        RestError::BadRequest {
+            message: error.to_string(),
+        }
+    })?;
+
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {
@@ -75,9 +85,6 @@ where
             resource_type: resource_type.to_string(),
         });
     }
-
-    // Determine FHIR version from header or use server default
-    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
@@ -90,22 +97,6 @@ where
         if_match = ?conditional.if_match_tags(),
         "Processing update request"
     );
-
-    // Validate resourceType in body matches URL
-    if let Some(body_type) = resource.get("resourceType").and_then(|v| v.as_str()) {
-        if body_type != resource_type {
-            return Err(RestError::BadRequest {
-                message: format!(
-                    "Resource type in body ({}) does not match URL ({})",
-                    body_type, resource_type
-                ),
-            });
-        }
-    } else {
-        return Err(RestError::BadRequest {
-            message: "Resource must contain resourceType".to_string(),
-        });
-    }
 
     // Validate ID in body matches URL (if present)
     if let Some(body_id) = resource.get("id").and_then(|v| v.as_str()) {
@@ -277,6 +268,19 @@ where
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
+    admit_resource_type(&resource_type, &resource, fhir_version).map_err(|error| {
+        RestError::BadRequest {
+            message: error.to_string(),
+        }
+    })?;
+
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "PUT".to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
+
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
 
@@ -294,18 +298,6 @@ where
         fhir_version = %fhir_version,
         "Processing conditional update request"
     );
-
-    // Validate resourceType
-    if let Some(body_type) = resource.get("resourceType").and_then(|v| v.as_str()) {
-        if body_type != resource_type {
-            return Err(RestError::BadRequest {
-                message: format!(
-                    "Resource type in body ({}) does not match URL ({})",
-                    body_type, resource_type
-                ),
-            });
-        }
-    }
 
     // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
     state

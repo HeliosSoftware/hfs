@@ -42,4 +42,19 @@ for (const theme of THEMES) {
       ).toEqual([]);
     });
   }
+
+
+  test(`invalid Resources create state is accessible — ${theme}`, async ({ page, chrome }) => {
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/resources?type=patient", { waitUntil: "networkidle" });
+
+    const create = page.locator("#resource-create");
+    const reason = page.locator("#resource-create-reason");
+    await expect(create).toBeDisabled();
+    await expect(create).toHaveAttribute("aria-describedby", "resource-create-reason");
+    await expect(reason).toBeVisible();
+
+    const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+    expect(violations).toEqual([]);
+  });
 }

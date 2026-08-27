@@ -1046,3 +1046,43 @@ async fn test_poll_rate_limit_of_zero_disables_throttling() {
         );
     }
 }
+
+/// #646: a `processing` manifest whose worker lease expired without renewal
+/// or reclaim used to poll as a quiet "processing" forever — a frozen worker
+/// pool was indistinguishable from progress. The poll now names the stall.
+#[tokio::test]
+async fn test_poll_reports_a_stalled_ingestion() {
+    // lease_duration_secs = 0 makes the stall threshold (3 leases) immediate.
+    let (server, backend, _fetcher, _output, _tmp) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            lease_duration_secs: 0,
+            ..Default::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    // A worker claims the manifest (zero-duration lease: expired on arrival)
+    // and then never heartbeats, finishes, or gets reclaimed — the freeze.
+    let worker_id = WorkerId::new("frozen-worker");
+    backend
+        .claim_next_manifest(&worker_id, Duration::ZERO)
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let progress = resp
+        .headers()
+        .get("x-progress")
+        .expect("X-Progress")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        progress.contains("stalled"),
+        "a dead worker pool must be visible to the poller, got: {progress}"
+    );
+}

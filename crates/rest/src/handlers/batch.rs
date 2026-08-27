@@ -26,6 +26,7 @@ use tracing::{debug, error, warn};
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
+use crate::fhir_types::{admit_resource_type, is_valid_resource_type};
 use crate::handlers::extract_patient_from_resource;
 use crate::middleware::prefer::PreferHeader;
 use crate::state::AppState;
@@ -186,9 +187,11 @@ where
     let writes_conformance = entries.iter().any(|entry| {
         entry
             .get("request")
-            .and_then(|request| request.get("url"))
-            .and_then(Value::as_str)
-            .and_then(|url| parse_request_url(url).ok())
+            .and_then(|request| {
+                let method = parse_entry_method(request).ok()?;
+                let url = request.get("url").and_then(Value::as_str)?;
+                parse_bundle_request_url(&method, url).ok()
+            })
             .is_some_and(|(resource_type, _)| resource_type == "StructureDefinition")
     });
     if writes_conformance {
@@ -487,6 +490,34 @@ where
         }
     }
 
+    // Admit every mutation before reference resolution, configurable
+    // validation, or storage. A transaction with one invalid write is declined
+    // whole, so none of its otherwise valid siblings can commit or delete.
+    for (index, entry, _) in &indexed_entries {
+        if !matches!(
+            entry.method,
+            BundleMethod::Post | BundleMethod::Put | BundleMethod::Delete
+        ) {
+            continue;
+        }
+        let (resource_type, _) =
+            parse_request_url(&entry.url).map_err(|error| RestError::BadRequest {
+                message: format!("Entry {index}: {error}"),
+            })?;
+        admit_bundle_mutation(
+            &entry.method,
+            &resource_type,
+            entry.resource.as_ref(),
+            fhir_version,
+        )
+        .map_err(|error| match error {
+            RestError::BadRequest { message } => RestError::BadRequest {
+                message: format!("Entry {index}: {message}"),
+            },
+            other => other,
+        })?;
+    }
+
     // GET search entries (`Patient?name=x`, bare `Patient`) cannot run inside
     // the storage transaction; the spec orders GETs after all writes, so they
     // execute against the just-committed state instead (#478). Their queries
@@ -771,7 +802,7 @@ where
     let if_match = request.get("ifMatch").and_then(|v| v.as_str());
 
     // Parse the URL to extract resource type and ID
-    let (resource_type, id) = match parse_request_url(url) {
+    let (resource_type, id) = match parse_bundle_request_url(&method, url) {
         Ok(parsed) => parsed,
         Err(e) => {
             return create_error_result(400, &e);
@@ -875,6 +906,12 @@ where
                 }
             };
 
+            if let Err(error) =
+                admit_bundle_mutation(&method, &resource_type, Some(&resource), fhir_version)
+            {
+                return entry_failure(error);
+            }
+
             // Write-path validation (per-entry outcome in batch semantics).
             if let Err(e) = state
                 .validation()
@@ -913,6 +950,12 @@ where
                     return create_error_result(400, "PUT entry missing resource");
                 }
             };
+
+            if let Err(error) =
+                admit_bundle_mutation(&method, &resource_type, Some(&resource), fhir_version)
+            {
+                return entry_failure(error);
+            }
 
             // `PUT Patient` names no instance to update. Left to fall through it
             // reaches `create_or_update` with an empty id, and that writes a row
@@ -980,6 +1023,10 @@ where
             }
         }
         BundleMethod::Delete => {
+            if let Err(error) = admit_bundle_mutation(&method, &resource_type, None, fhir_version) {
+                return entry_failure(error);
+            }
+
             // Mirror of the PUT guard above. FHIR defines no unconditional
             // type-level delete, and an empty id would otherwise target the
             // empty-id row a pre-#503 conditional PUT could have written.
@@ -1030,6 +1077,42 @@ where
         // outside the value set never reach this point — `parse_entry_method`
         // refuses them at the top of this function.
     }
+}
+
+/// Applies the type and immutability gates shared by batch and transaction
+/// mutations. The caller decides whether the error belongs to one batch entry
+/// or rejects the whole transaction.
+fn admit_bundle_mutation(
+    method: &BundleMethod,
+    resource_type: &str,
+    resource: Option<&Value>,
+    fhir_version: FhirVersion,
+) -> RestResult<()> {
+    if matches!(method, BundleMethod::Post | BundleMethod::Put) {
+        let resource = resource.ok_or_else(|| RestError::BadRequest {
+            message: format!("{method} entry missing resource"),
+        })?;
+
+        admit_resource_type(resource_type, resource, fhir_version).map_err(|error| {
+            RestError::BadRequest {
+                message: error.to_string(),
+            }
+        })?;
+    }
+
+    if resource_type == "AuditEvent"
+        && matches!(
+            method,
+            BundleMethod::Post | BundleMethod::Put | BundleMethod::Delete
+        )
+    {
+        return Err(RestError::MethodNotAllowed {
+            method: bundle_method_to_http_method(method).to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1263,6 +1346,83 @@ fn parse_request_url(url: &str) -> Result<(String, String), String> {
         resource_type.to_string(),
         segments.next().unwrap_or_default().to_string(),
     ))
+}
+
+/// Parses the target of a Bundle request using the method's URL shape.
+///
+/// Mutation URLs may be absolute or carry a server path prefix. POST targets
+/// the final path segment as a resource type, while PUT, PATCH, and DELETE
+/// target the final two segments as `[type]/[id]`. This matches the transaction
+/// backends. GET keeps the existing type, instance, and history interpretation.
+fn parse_bundle_request_url(
+    method: &BundleMethod,
+    request_url: &str,
+) -> Result<(String, String), String> {
+    if matches!(method, BundleMethod::Get) {
+        return parse_request_url(request_url);
+    }
+
+    let path = match url::Url::parse(request_url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => parsed.path().to_string(),
+        Ok(_) => return Err("Entry request.url uses an unsupported absolute scheme".to_string()),
+        Err(_) => request_url
+            .split_once('?')
+            .map_or(request_url, |(path, _)| path)
+            .to_string(),
+    };
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    match method {
+        BundleMethod::Post => segments
+            .last()
+            .map(|resource_type| ((*resource_type).to_string(), String::new()))
+            .ok_or_else(|| "Entry request.url is empty".to_string()),
+        BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete => {
+            if request_url
+                .split_once('?')
+                .is_some_and(|(_, query)| !query.is_empty())
+                && segments
+                    .last()
+                    .is_some_and(|segment| is_valid_resource_type(segment))
+            {
+                return Ok((
+                    segments.last().expect("checked above").to_string(),
+                    String::new(),
+                ));
+            }
+            if segments.len() < 2 {
+                return Err(format!(
+                    "{method} entry request.url must address an instance ('[type]/[id]')"
+                ));
+            }
+            let len = segments.len();
+            Ok((segments[len - 2].to_string(), segments[len - 1].to_string()))
+        }
+        BundleMethod::Get => unreachable!("GET returned above"),
+    }
+}
+
+/// Rewrites a mutation URL to the relative form every transaction backend
+/// parses identically. The query is retained so existing refusal and
+/// conditional-interaction checks still see it before storage.
+fn canonical_bundle_mutation_url(
+    method: &BundleMethod,
+    request_url: &str,
+) -> Result<String, String> {
+    let (resource_type, id) = parse_bundle_request_url(method, request_url)?;
+    let mut canonical = if id.is_empty() {
+        resource_type
+    } else {
+        format!("{resource_type}/{id}")
+    };
+    if let Some((_, query)) = request_url.split_once('?') {
+        canonical.push('?');
+        canonical.push_str(query);
+    }
+    Ok(canonical)
 }
 
 /// Returns the conditional criteria an entry URL carries, if any.
@@ -1663,11 +1823,19 @@ fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), En
     // agrees with the per-entry result the batch arm would produce.
     let method = parse_entry_method(request).map_err(EntryParseError::Method)?;
 
-    let url = request
+    let raw_url = request
         .get("url")
         .and_then(|v| v.as_str())
         .ok_or_else(|| EntryParseError::Malformed("Entry request missing 'url'".to_string()))?
         .to_string();
+    let url = if matches!(
+        method,
+        BundleMethod::Post | BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
+    ) {
+        canonical_bundle_mutation_url(&method, &raw_url).map_err(EntryParseError::Malformed)?
+    } else {
+        raw_url
+    };
 
     let mut resource = entry.get("resource").cloned();
     // Per http.html#create the server ignores an id supplied on a POST — the
@@ -2778,6 +2946,43 @@ mod tests {
                 "url: {url}"
             );
         }
+    }
+
+    #[test]
+    fn mutation_url_parser_handles_absolute_prefixed_and_type_level_targets() {
+        assert_eq!(
+            parse_bundle_request_url(&BundleMethod::Post, "https://example.test/fhir/Patient")
+                .unwrap(),
+            ("Patient".to_string(), String::new())
+        );
+        assert_eq!(
+            parse_bundle_request_url(
+                &BundleMethod::Put,
+                "https://example.test/fhir/Patient/p1?_format=json"
+            )
+            .unwrap(),
+            ("Patient".to_string(), "p1".to_string())
+        );
+        assert_eq!(
+            parse_bundle_request_url(&BundleMethod::Delete, "fhir/AuditEvent/audit-1").unwrap(),
+            ("AuditEvent".to_string(), "audit-1".to_string())
+        );
+        assert_eq!(
+            canonical_bundle_mutation_url(
+                &BundleMethod::Delete,
+                "https://example.test/fhir/AuditEvent/audit-1"
+            )
+            .unwrap(),
+            "AuditEvent/audit-1"
+        );
+        assert_eq!(
+            canonical_bundle_mutation_url(
+                &BundleMethod::Post,
+                "https://example.test/fhir/Patient?ignored=value"
+            )
+            .unwrap(),
+            "Patient?ignored=value"
+        );
     }
 
     /// The empty-URL arm used to be unreachable — `str::split` always yields at

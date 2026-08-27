@@ -76,3 +76,45 @@ test("an example chip fills the box and translates", async ({ page, search }) =>
   await expect(search.nlText).not.toHaveValue("");
   await expect(search.nlAnswer).toBeVisible();
 });
+
+// #679: the shared busy state replaces the ad-hoc submit disable — and the
+// guard must gate the request itself, since Enter and the example chips can
+// re-enter translate() while the submit button is disabled.
+test("translating busies the submit button, and re-entry cannot double-POST", async ({
+  page,
+  search,
+}) => {
+  let posts = 0;
+  let release!: () => void;
+  const parked = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(/\/\$nl-search$/, async (route) => {
+    posts++;
+    await parked;
+    await route
+      .fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          supported: true,
+          target: "Patient",
+          query: "name=smith",
+          explanation: "ok",
+        }),
+      })
+      .catch(() => {});
+  });
+
+  await search.goto();
+  await search.nlText.fill("patients named smith");
+  await search.nlSubmit.click();
+
+  await expect(search.nlSubmit).toHaveAttribute("aria-busy", "true");
+  await expect(search.nlSubmit).toBeDisabled();
+  // Enter in the textarea re-enters translate() around the disabled button.
+  await search.nlText.press("Enter");
+
+  release();
+  await expect(search.nlAnswer).toHaveClass(/nl-answer--ok/);
+  await expect(search.nlSubmit).not.toHaveAttribute("aria-busy", "true");
+  await expect(search.nlSubmit).toBeEnabled();
+  expect(posts, "re-entry while busy must not issue a second POST").toBe(1);
+});

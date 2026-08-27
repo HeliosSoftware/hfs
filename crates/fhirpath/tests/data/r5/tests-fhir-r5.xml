@@ -1769,44 +1769,48 @@ Any text enclosed within is ignored
 	</group>
 
 	<group name="primitivesWithoutValue" description="FHIR primitive elements that carry extensions but no value (e.g. the data-absent-reason extension). Such an element is present in the tree, but it has no system value, so functions that need the value get an empty collection as input, and return empty (see hasValue()/getValue() in the FHIR spec)">
-		<test name="testNoValueExists" inputfile="patient-name-extensions.json">
+		<test name="testNoValueExists" testing="exists" inputfile="patient-name-extensions.json">
 			<expression>Patient.name.given.first().exists()</expression>
 			<output type="boolean">true</output>
 		</test>
-		<test name="testNoValueExistsElement" inputfile="patient-name-extensions.json" mode="element">
+		<test name="testNoValueExistsElement" testing="exists" inputfile="patient-name-extensions.json" mode="element">
 			<expression>Patient.name.given.first().exists()</expression>
 			<output type="boolean">true</output>
 		</test>
-		<test name="testNoValueHasValue" inputfile="patient-name-extensions.json">
+		<test name="testNoValueHasValue" testing="hasValue" inputfile="patient-name-extensions.json">
 			<expression>Patient.name.given.first().hasValue()</expression>
 			<output type="boolean">false</output>
 		</test>
-		<test name="testNoValueLength" inputfile="patient-name-extensions.json">
+		<test name="testNoValueLength" testing="length" inputfile="patient-name-extensions.json">
+			<!-- no value means no string to take the length of: empty in, empty out -->
 			<expression>Patient.name.given.first().length()</expression>
 		</test>
-		<test name="testNoValueLengthElement" inputfile="patient-name-extensions.json" mode="element">
+		<test name="testNoValueLengthElement" testing="length" inputfile="patient-name-extensions.json" mode="element">
 			<expression>Patient.name.given.first().length()</expression>
 		</test>
-		<test name="testValueLength" inputfile="patient-name-extensions.json">
+		<test name="testValueLength" testing="length" inputfile="patient-name-extensions.json">
 			<expression>Patient.name.given.last().length()</expression>
 			<output type="integer">5</output>
 		</test>
-		<test name="testNoValueToChars" inputfile="patient-name-extensions.json">
+		<test name="testNoValueToChars" testing="toChars" inputfile="patient-name-extensions.json">
 			<expression>Patient.name.given.first().toChars()</expression>
 		</test>
-		<test name="testNoValueSubstring" inputfile="patient-name-extensions.json">
+		<test name="testNoValueSubstring" testing="substring" inputfile="patient-name-extensions.json">
 			<expression>Patient.name.given.first().substring(0, 1)</expression>
 		</test>
-		<test name="testNoValueUpper" inputfile="patient-name-extensions.json">
+		<test name="testNoValueUpper" testing="upper" inputfile="patient-name-extensions.json">
 			<expression>Patient.name.given.first().upper()</expression>
 		</test>
-		<test name="testNoValueComparison" inputfile="patient-name-extensions.json">
+		<test name="testNoValueComparison" testing="comparison" inputfile="patient-name-extensions.json">
+			<!-- comparing with something that has no value is comparing with empty -->
 			<expression>Patient.name.given.first() &lt; 'x'</expression>
 		</test>
-		<test name="testNoValueInvariant" inputfile="patient-name-extensions.json">
+		<test name="testNoValueInvariant" testing="length" inputfile="patient-name-extensions.json">
+			<!-- the pattern used by invariants that check the length of a name part: exists() is true, but
+			     length() is empty, so the whole expression is empty (and therefore not true) -->
 			<expression>Patient.name.given.first().exists() and Patient.name.given.first().length() = 1</expression>
 		</test>
-		<test name="testNoValueInvariantElement" inputfile="patient-name-extensions.json" mode="element">
+		<test name="testNoValueInvariantElement" testing="length" inputfile="patient-name-extensions.json" mode="element">
 			<expression>Patient.name.given.first().exists() and Patient.name.given.first().length() = 1</expression>
 		</test>
 	</group>

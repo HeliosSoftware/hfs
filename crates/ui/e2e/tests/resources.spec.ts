@@ -36,6 +36,9 @@ test("picking a rail type updates the URL and back navigates", async ({ resource
 
   await page.goBack();
   await expect(page).toHaveURL(/\/ui\/resources\?type=Patient/);
+  await expect(resources.railItem("Patient")).toHaveAttribute("aria-current", "true");
+  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.createLabel).toHaveText("Create new Patient");
 });
 
 // Opening in Patient context (#605): the client takes the same path as a
@@ -102,6 +105,64 @@ test("a ?url= deep link still wins over the default Patient context", async ({ r
   await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
   await expect(resources.createLabel).toHaveText("Create new Observation");
   await resources.results.waitShown();
+});
+
+test("invalid, wrong-case, and empty inputs fail closed without losing the typed query", async ({
+  resources,
+  page,
+}) => {
+  for (const [target, expected] of [
+    ["?type=NoLongerValid", "GET /NoLongerValid"],
+    ["?type=patient", "GET /patient"],
+    ["?url=" + encodeURIComponent("/NoLongerValid?name=kept"), "GET /NoLongerValid?name=kept"],
+    ["?type=Patient&url=" + encodeURIComponent("/NoLongerValid"), "GET /NoLongerValid"],
+  ] as const) {
+    await page.goto("/ui/resources" + target, { waitUntil: "networkidle" });
+    await expect(resources.builder.url).toHaveValue(expected);
+    await expect(resources.createButton).toBeDisabled();
+    await expect(page.locator("#resource-create-reason")).toBeVisible();
+    await expect(page.locator("#type-rail-list [aria-current='true']")).toHaveCount(0);
+  }
+
+  await page.goto("/ui/resources?type=", { waitUntil: "networkidle" });
+  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.createButton).toBeEnabled();
+});
+
+test("manual URL edits and popstate keep Create on the effective query type", async ({
+  resources,
+  page,
+}) => {
+  await resources.goto("Patient");
+  await resources.builder.url.fill("GET /patient");
+  await resources.builder.url.dispatchEvent("change");
+  await expect(resources.createButton).toBeDisabled();
+  await expect(page.locator("#resources")).toHaveAttribute("data-selected-type", "patient");
+
+  await resources.builder.url.fill("GET /Observation?status=final");
+  await resources.builder.url.dispatchEvent("change");
+  await expect(resources.createButton).toBeEnabled();
+  await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
+
+  await resources.pickType("Encounter");
+  await page.goBack();
+  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.createButton).toBeEnabled();
+  await expect(resources.railItem("Patient")).toHaveAttribute("aria-current", "true");
+});
+
+test("openNew refuses a disabled target even if script removes the native disabled flag", async ({
+  resources,
+  page,
+}) => {
+  await page.goto("/ui/resources?type=patient", { waitUntil: "networkidle" });
+  await expect(resources.createButton).toBeDisabled();
+  await resources.createButton.evaluate((button: HTMLButtonElement) => {
+    button.disabled = false;
+    button.click();
+  });
+  await expect(resources.modal.root).toBeHidden();
+  await expect(page.locator("#resource-editor-body")).toBeEmpty();
 });
 
 test("a conflicting Resources bookmark uses the query URL type everywhere after reload", async ({
@@ -215,12 +276,17 @@ test("counts render next to each type from the dashboard snapshot", async ({
     .not.toBe("");
 });
 
-test("every resource type is reachable — Create targets each one", async ({ resources }) => {
+test("every rail type is searchable, while Create opens only eligible targets", async ({ resources }) => {
   await resources.goto("Patient");
   const types = await resources.railTypes();
 
   for (const type of types) {
     await resources.pickType(type);
+    if (await resources.createButton.isDisabled()) {
+      await expect(resources.modal.root).toBeHidden();
+      await expect(resources.page.locator("#resource-create-reason")).toBeVisible();
+      continue;
+    }
     await resources.createButton.click();
     await resources.modal.waitOpen();
     expect(
@@ -229,6 +295,30 @@ test("every resource type is reachable — Create targets each one", async ({ re
     ).toBe(type);
     await resources.modal.closeWithEscape();
   }
+});
+
+test("create eligibility follows the effective FHIR version", async ({ resources }) => {
+  const version = process.env.HFS_DEFAULT_FHIR_VERSION || "R4";
+  const boundary = {
+    R4: { accepted: "Media", rejected: "ActorDefinition" },
+    R4B: { accepted: "SubscriptionTopic", rejected: "ActorDefinition" },
+    R5: { accepted: "ActorDefinition", rejected: "DocumentManifest" },
+    R6: { accepted: "ActorDefinition", rejected: "Media" },
+  }[version];
+  expect(boundary, `No Resources boundary is defined for ${version}`).toBeTruthy();
+
+  await resources.goto(boundary!.accepted);
+  await expect(resources.railItem(boundary!.accepted)).toHaveAttribute("aria-current", "true");
+  await expect(resources.createButton).toBeEnabled();
+  await resources.openCreate();
+  expect((await resources.modal.editor.currentDoc()).resourceType).toBe(boundary!.accepted);
+  await resources.modal.close();
+
+  await resources.goto(boundary!.rejected);
+  await expect(resources.builder.url).toHaveValue(`GET /${boundary!.rejected}`);
+  await expect(resources.createButton).toBeDisabled();
+  await expect(resources.page.locator("#resource-create-reason")).toBeVisible();
+  await expect(resources.page.locator("#type-rail-list [aria-current='true']")).toHaveCount(0);
 });
 
 // "Recently used" group (#603): a per-browser convenience, populated by
