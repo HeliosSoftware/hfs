@@ -1005,6 +1005,27 @@ impl EvaluationResult {
         }
     }
 
+    /// Returns true when this is the Object representation of a FHIR primitive
+    /// element that carries id/extension metadata but no value (e.g. a
+    /// `_field` sibling holding only a data-absent-reason extension).
+    ///
+    /// Such an element is present in the tree (`exists()` is true) but has no
+    /// system value, so value-consuming operations must treat it as empty
+    /// input (see `hasValue()`/`getValue()` in the FHIR spec). The producers
+    /// tag this case with type `FHIR.Element` (`Element<V, E>`) or
+    /// `FHIR.decimal` (`DecimalElement<E>`); valued primitives are scalar
+    /// variants, never Objects, and genuine complex types carry their own
+    /// struct name, so those tags are unambiguous.
+    pub fn is_valueless_primitive_element(&self) -> bool {
+        match self {
+            EvaluationResult::Object {
+                type_info: Some(ti),
+                ..
+            } => ti.namespace == "FHIR" && (ti.name == "Element" || ti.name == "decimal"),
+            _ => false,
+        }
+    }
+
     // === Value Extraction Methods ===
 
     /// Extracts the boolean value if this is a Boolean variant.

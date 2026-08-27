@@ -43,6 +43,7 @@ fn test_rust_sof_error_to_py_err_coverage() {
             RustSofError::InvalidSourceContent(_) => {}
             RustSofError::UnsupportedSourceProtocol(_) => {}
             RustSofError::ParquetConversionError(_) => {}
+            RustSofError::ArrowConversionError(_) => {}
             RustSofError::ReferencedResourceNotFound(_) => {}
         }
     }
@@ -51,7 +52,7 @@ fn test_rust_sof_error_to_py_err_coverage() {
 #[test]
 fn test_content_type_parsing_coverage() {
     // Test the ContentType parsing that's used in the PyO3 functions
-    let valid_formats = ["json", "csv", "ndjson", "parquet"];
+    let valid_formats = ["json", "csv", "ndjson", "parquet", "arrow"];
 
     for format in &valid_formats {
         let result = ContentType::from_string(format);
@@ -65,6 +66,7 @@ fn test_content_type_parsing_coverage() {
             ContentType::Json => "json",
             ContentType::NdJson => "ndjson",
             ContentType::Parquet => "parquet",
+            ContentType::ArrowIpc => "arrow",
         };
         assert!(!format_str.is_empty());
     }

@@ -171,6 +171,251 @@ fn primitive_without_metadata_returns_empty() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Value-consuming operations on primitives that carry extensions but no value
+// (fhir-test-cases `primitivesWithoutValue`): the element is present as a node
+// (`exists()` is true) but has no system value, so anything that consumes the
+// value receives empty input and returns empty, and comparing it with anything
+// is comparing with empty.
+// ---------------------------------------------------------------------------
+
+fn syllable_count_extension() -> Extension {
+    Extension {
+        url: "https://example.org/syllable-count".to_string().into(),
+        value: Some(ExtensionValue::Code(r4::Code {
+            id: None,
+            extension: None,
+            value: Some("five".to_string()),
+        })),
+        ..Default::default()
+    }
+}
+
+/// Mirrors the r5 `patient-name-extensions.json` fixture: `given[0]` carries
+/// only an extension (no value), `given[1]` is "James".
+fn patient_with_valueless_given() -> EvaluationContext {
+    let name = r4::HumanName {
+        given: Some(vec![
+            r4::String {
+                id: None,
+                extension: Some(vec![syllable_count_extension()]),
+                value: None,
+            },
+            r4::String {
+                id: None,
+                extension: None,
+                value: Some("James".to_string()),
+            },
+        ]),
+        ..Default::default()
+    };
+    ctx_with_patient(r4::Patient {
+        id: Some("p1".to_string().into()),
+        name: Some(vec![name]),
+        ..Default::default()
+    })
+}
+
+fn assert_string_result(expr: &str, ctx: &EvaluationContext, expected: &str) {
+    match eval(expr, ctx) {
+        EvaluationResult::String(s, _, _) => assert_eq!(s, expected, "for {expr}"),
+        other => panic!("expected string {expected:?} for {expr}, got {other:?}"),
+    }
+}
+
+#[test]
+fn valueless_primitive_string_functions_return_empty() {
+    let ctx = patient_with_valueless_given();
+    for expr in [
+        "Patient.name.given.first().length()",
+        "Patient.name.given.first().upper()",
+        "Patient.name.given.first().lower()",
+        "Patient.name.given.first().toChars()",
+        "Patient.name.given.first().substring(0, 1)",
+        "Patient.name.given.first().trim()",
+        "Patient.name.given.first().contains('a')",
+        "Patient.name.given.first().indexOf('a')",
+        "Patient.name.given.first().startsWith('a')",
+        "Patient.name.given.first().replace('a', 'b')",
+        "Patient.name.given.first().matches('a')",
+        "Patient.name.given.first().split(',')",
+    ] {
+        assert_eq!(
+            eval(expr, &ctx),
+            EvaluationResult::Empty,
+            "expected empty for {expr}"
+        );
+    }
+}
+
+#[test]
+fn valueless_primitive_as_string_function_argument_is_empty() {
+    let ctx = patient_with_valueless_given();
+    assert_eq!(
+        eval("'abc'.startsWith(Patient.name.given.first())", &ctx),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("'abc'.indexOf(Patient.name.given.first())", &ctx),
+        EvaluationResult::Empty
+    );
+}
+
+#[test]
+fn valueless_primitive_conversions_return_empty() {
+    let ctx = patient_with_valueless_given();
+    assert_eq!(
+        eval("Patient.name.given.first().toString()", &ctx),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("Patient.name.given.first().toInteger()", &ctx),
+        EvaluationResult::Empty
+    );
+}
+
+#[test]
+fn comparison_with_valueless_primitive_is_empty() {
+    let ctx = patient_with_valueless_given();
+    assert_eq!(
+        eval("Patient.name.given.first() < 'x'", &ctx),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("Patient.name.given.first() >= 'x'", &ctx),
+        EvaluationResult::Empty
+    );
+}
+
+#[test]
+fn invariant_pattern_with_valueless_primitive_is_empty() {
+    // The pattern used by invariants that check the length of a name part:
+    // exists() is true, but length() = 1 is empty, so the conjunction is empty.
+    let ctx = patient_with_valueless_given();
+    assert_eq!(
+        eval(
+            "Patient.name.given.first().exists() and Patient.name.given.first().length() = 1",
+            &ctx
+        ),
+        EvaluationResult::Empty
+    );
+}
+
+#[test]
+fn equality_with_valueless_primitive_is_empty() {
+    let ctx = patient_with_valueless_given();
+    assert_eq!(
+        eval("Patient.name.given.first() = 'x'", &ctx),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("Patient.name.given.first() != 'x'", &ctx),
+        EvaluationResult::Empty
+    );
+    // Both operands value-less: still comparing empty with empty.
+    assert_eq!(
+        eval(
+            "Patient.name.given.first() = Patient.name.given.first()",
+            &ctx
+        ),
+        EvaluationResult::Empty
+    );
+}
+
+#[test]
+fn equivalence_with_valueless_primitive_uses_empty_semantics() {
+    let ctx = patient_with_valueless_given();
+    assert_eq!(
+        eval("Patient.name.given.first() ~ 'x'", &ctx),
+        EvaluationResult::boolean(false)
+    );
+    assert_eq!(
+        eval("Patient.name.given.first() !~ 'x'", &ctx),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        eval("Patient.name.given.first() ~ {}", &ctx),
+        EvaluationResult::boolean(true)
+    );
+}
+
+#[test]
+fn membership_with_valueless_primitive_is_empty() {
+    let ctx = patient_with_valueless_given();
+    assert_eq!(
+        eval("Patient.name.given.first() in ('Peter' | 'James')", &ctx),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval(
+            "('Peter' | 'James') contains Patient.name.given.first()",
+            &ctx
+        ),
+        EvaluationResult::Empty
+    );
+}
+
+#[test]
+fn arithmetic_with_valueless_primitive_propagates_empty() {
+    let ctx = patient_with_valueless_given();
+    assert_eq!(
+        eval("Patient.name.given.first() + 'x'", &ctx),
+        EvaluationResult::Empty
+    );
+    // `&` treats an empty operand as '' per the spec.
+    assert_string_result("'Mr ' & Patient.name.given.first()", &ctx, "Mr ");
+}
+
+#[test]
+fn join_skips_valueless_items() {
+    let ctx = patient_with_valueless_given();
+    assert_string_result("Patient.name.given.join(',')", &ctx, "James");
+}
+
+#[test]
+fn valueless_decimal_primitive_has_no_value() {
+    // Decimal primitives have a distinct runtime representation
+    // (DecimalElement); an extension-only decimal must behave like any other
+    // value-less primitive.
+    let quantity = r4::Quantity {
+        value: Some(r4::Decimal {
+            id: None,
+            extension: Some(vec![syllable_count_extension()]),
+            value: None,
+        }),
+        ..Default::default()
+    };
+    let reference_range = r4::ObservationReferenceRange {
+        low: Some(quantity),
+        ..Default::default()
+    };
+    let observation = r4::Observation {
+        reference_range: Some(vec![reference_range]),
+        ..Default::default()
+    };
+    let resources = vec![FhirResource::R4(Box::new(r4::Resource::Observation(
+        Box::new(observation),
+    )))];
+    let ctx = EvaluationContext::new(resources);
+
+    assert_eq!(
+        eval("Observation.referenceRange.low.value.exists()", &ctx),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        eval("Observation.referenceRange.low.value.hasValue()", &ctx),
+        EvaluationResult::boolean(false)
+    );
+    assert_eq!(
+        eval("Observation.referenceRange.low.value.abs()", &ctx),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("Observation.referenceRange.low.value + 1", &ctx),
+        EvaluationResult::Empty
+    );
+}
+
 #[test]
 fn empty_extension_list_returns_empty() {
     // birthDate has empty extension Vec
@@ -196,4 +441,48 @@ fn empty_extension_list_returns_empty() {
         eval("Patient.birthDate.id", &ctx),
         EvaluationResult::fhir_string("bd-1".to_string(), "id")
     );
+}
+
+#[test]
+fn scalar_operations_treat_an_extension_only_primitive_as_empty() {
+    let given = r4::String {
+        id: Some("given-1".to_string()),
+        extension: None,
+        value: None,
+    };
+    let patient = r4::Patient {
+        name: Some(vec![r4::HumanName {
+            given: Some(vec![given]),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let ctx = ctx_with_patient(patient);
+
+    // The FHIR Element remains navigable even without a primitive value.
+    assert_eq!(
+        eval("Patient.name.given.first().exists()", &ctx),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        eval("Patient.name.given.first().hasValue()", &ctx),
+        EvaluationResult::boolean(false)
+    );
+
+    // Its implicit System primitive value is empty, so scalar operations
+    // propagate {} instead of raising a type error.
+    for expression in [
+        "Patient.name.given.first().length()",
+        "Patient.name.given.first().toChars()",
+        "Patient.name.given.first().substring(0, 1)",
+        "Patient.name.given.first().upper()",
+        "Patient.name.given.first() < 'x'",
+        "Patient.name.given.first().exists() and Patient.name.given.first().length() = 1",
+    ] {
+        assert_eq!(
+            eval(expression, &ctx),
+            EvaluationResult::Empty,
+            "{expression}"
+        );
+    }
 }

@@ -198,6 +198,7 @@ fn decode_manifest(doc: &Document) -> StorageResult<SubmissionManifest> {
         replaces_manifest_url: opt_str(doc, "replaces_manifest_url"),
         status,
         added_at: opt_time(doc, "added_at").unwrap_or_else(Utc::now),
+        lease_expiry: opt_time(doc, "lease_expiry"),
         total_entries: doc.get_i64("total_entries").unwrap_or(0).max(0) as u64,
         processed_entries: doc.get_i64("processed_entries").unwrap_or(0).max(0) as u64,
         failed_entries: doc.get_i64("failed_entries").unwrap_or(0).max(0) as u64,
@@ -767,6 +768,7 @@ impl BulkSubmitProvider for MongoBackend {
             total_entries: 0,
             processed_entries: 0,
             failed_entries: 0,
+            lease_expiry: None,
         };
 
         let mut document = manifest_filter(tenant, submission_id, &manifest.manifest_id);

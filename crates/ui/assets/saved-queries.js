@@ -205,9 +205,7 @@
         return response.ok ? response.text() : null;
       })
       .then(function (html) {
-        var parsed = html
-          ? parseCatalog(html)
-          : { meta: {}, datalist: null };
+        var parsed = html ? parseCatalog(html) : { meta: {}, datalist: null };
         PARAM_META[type] = parsed.meta;
         return parsed;
       })
@@ -223,8 +221,9 @@
     });
   }
 
-  /* Swaps the parameter datalist for the current resource type. The
-   * fragment is server-rendered from the SearchParameter registry. */
+  /* Swaps the parameter datalist for the current resource type. The fragment
+   * is server-rendered from the SearchParameter registry; a render for a
+   * newer type must not install a stale datalist. */
   function loadCatalog(type) {
     if (!type) return Promise.resolve({});
     var loadSeq = ++catalogLoadSeq;
@@ -389,6 +388,9 @@
       option(comparator, prefix, prefix, parsed.comparator === prefix);
     });
     comparator.hidden = !parsed.comparator;
+    if (wire !== undefined && parsed.comparator) {
+      comparator.dataset.comparatorSource = "hydrated";
+    }
     wrap.appendChild(comparator);
     var input = document.createElement("input");
     input.className = "builder-row__value";
@@ -446,10 +448,14 @@
     return PREFIX_TYPES.indexOf(paramType) >= 0 ? PREFIXES : [];
   }
 
+  /* A parameter whose type the registry pins down; anything else (unknown
+   * code, ambiguous chain leaf, failed catalog) stays permissive. */
   function knownParamType(paramType) {
     return Object.prototype.hasOwnProperty.call(MODS_BY_TYPE, paramType);
   }
 
+  /* Beyond the chips a type offers, the spec keeps two compatibility
+   * spellings and reference type modifiers legal (#627). */
   function compatibleModifier(modifier, paramType) {
     if (!modifier) return true;
     if ((MODS_BY_TYPE[paramType] || []).indexOf(modifier) >= 0) return true;
@@ -459,84 +465,358 @@
     return paramType === "reference" && /^[A-Z]/.test(modifier);
   }
 
+  /* Parameter types arrive asynchronously from the registry. A row whose
+   * parameter is being edited must not be runnable in the interval between
+   * the visual edit and that metadata settling: its comparator may still
+   * describe the old parameter. */
+  var typeResolutionSeq = 0;
+
+  function builderHasPendingType() {
+    return !!(
+      sections && sections.querySelector(".builder-row[data-param-pending='true']")
+    );
+  }
+
+  /* A row is `pending` from the moment its type resolution starts until that
+   * metadata settles it as `known` or `unknown`; a deferred consumer (a
+   * saved-query run, a deep link) may not read the builder before then. */
+  function builderCompatibilityPending() {
+    return !!(
+      sections && sections.querySelector(".builder-row[data-compat-state='pending']")
+    );
+  }
+
+  /* Run and Enter wait for the row being edited; Save and Copy additionally
+   * wait for a parameter transition, whose operators may still describe the
+   * old parameter. A malformed escape blocks all of them. */
+  function builderHasParamTransition() {
+    return !!(
+      sections &&
+      sections.querySelector(".builder-row[data-comparator-transition='true']")
+    );
+  }
+
+  function builderRunBlocked() {
+    return builderHasPendingType() || builderHasEscapeError();
+  }
+
+  function builderWriteBlocked() {
+    return builderHasParamTransition() || builderHasEscapeError();
+  }
+
+  function builderHasPendingSerialization() {
+    if (!sections) return false;
+    return Array.prototype.some.call(
+      sections.querySelectorAll(".builder-row"),
+      function (row) {
+        return !!(
+          row._modifierPending || row._comparatorClassificationPending
+        );
+      },
+    );
+  }
+
+  /* Every builder consumer reflects the blocked state, and anything that
+   * deferred until the builder settled is released here. */
+  var pendingBuilderConsumers = [];
+  function refreshRunAvailability() {
+    var runBlocked = builderRunBlocked();
+    var writeBlocked = builderWriteBlocked();
+    if (form) {
+      form.querySelectorAll("[data-intent]").forEach(function (control) {
+        control.disabled =
+          control.dataset.intent === "run" ? runBlocked : writeBlocked;
+      });
+    }
+    var copy = document.getElementById("query-copy");
+    if (copy) copy.disabled = writeBlocked;
+    if (root) {
+      root
+        .querySelectorAll("button[data-action='run']")
+        .forEach(function (control) {
+          control.disabled = runBlocked;
+        });
+    }
+    if (runBlocked || writeBlocked || builderCompatibilityPending()) return;
+    var ready = pendingBuilderConsumers;
+    pendingBuilderConsumers = [];
+    ready.forEach(function (consumer) {
+      if (consumer.revision === builderRevision) consumer.callback();
+    });
+  }
+
+  /* Auto-runs (saved entries, deep links) are one-shot against the builder
+   * revision they were queued for: a user edit in the meantime cancels
+   * them rather than running a query nobody asked for. */
+  function consumeWhenBuilderReady(revision, callback) {
+    if (
+      !builderCompatibilityPending() &&
+      !builderRunBlocked() &&
+      !builderWriteBlocked()
+    ) {
+      if (revision === builderRevision) callback();
+      return;
+    }
+    pendingBuilderConsumers.push({ revision: revision, callback: callback });
+  }
+
+  function noteBuilderUserEdit() {
+    builderRevision += 1;
+  }
+
+  function beginTypeResolution(row, userTransition) {
+    var token = String(++typeResolutionSeq);
+    row.dataset.typeResolution = token;
+    row.dataset.compatState = "pending";
+    if (!userTransition && row._hydrationPending === undefined) {
+      row._hydrationPending = true;
+      row._hydrationToken = token;
+    }
+    if (userTransition) {
+      row.dataset.paramPending = "true";
+      row.dataset.comparatorTransition = "true";
+    }
+    refreshRunAvailability();
+    return token;
+  }
+
+  function finishTypeResolution(row, token, resolvedType) {
+    var isSourceHydration = row._hydrationToken === token;
+    if (isSourceHydration) {
+      classifyHydratedComparators(
+        row,
+        resolvedType,
+        !!row._comparatorClassificationPending,
+      );
+      row._hydrationPending = false;
+      delete row._hydrationToken;
+      if (row._modifierPending) {
+        clearComparatorsForModifier(row);
+        delete row._modifierPending;
+        row._pendingNeedsSerialization = true;
+      }
+      if (row._comparatorClassificationPending) {
+        delete row._comparatorClassificationPending;
+        row._pendingNeedsSerialization = true;
+      }
+    }
+    if (row.dataset.typeResolution !== token) {
+      if (isSourceHydration && row._deferredTypeResolution) {
+        var deferred = row._deferredTypeResolution;
+        delete row._deferredTypeResolution;
+        finishTypeResolution(row, deferred.token, deferred.resolvedType);
+      }
+      return;
+    }
+    if (row.dataset.comparatorTransition === "true" && row._hydrationPending) {
+      row._deferredTypeResolution = { token: token, resolvedType: resolvedType };
+      return;
+    }
+    var mode = row.dataset.comparatorTransition === "true" ? "transition" : "hydrate";
+    var wireChanged = regateModifiers(row, resolvedType, mode);
+    var pendingNeedsSerialization = !!row._pendingNeedsSerialization;
+    delete row._pendingNeedsSerialization;
+    delete row.dataset.comparatorTransition;
+    delete row.dataset.paramPending;
+    delete row.dataset.typeResolution;
+    refreshRunAvailability();
+    if (!row.isConnected) return;
+    /* Only dropping a comparator during a user transition changes the wire.
+     * Hydration must preserve the URL exactly as supplied, including its GET
+     * spelling and percent encoding. Narration still needs the resolved type. */
+    if (wireChanged || pendingNeedsSerialization) updateUrl();
+    else updatePlain();
+  }
+
   /* Rebuilds a row's modifier select and MODIFY chips for its param type.
-   * A known type discards an incompatible operator; unknown parameters keep
-   * pasted operators verbatim. */
-  function refreshModifierControls(row, paramType) {
+   * Once the registry pins the type down, a modifier it cannot support
+   * belonged to the parameter that was there before and is dropped (#627);
+   * unknown and ambiguous parameters keep pasted operators verbatim.
+   * Returns whether the selection changed, which the wire must follow. */
+  function refreshModifierControls(row, paramType, reconcile) {
     var modifier = row.querySelector(".builder-row__modifier");
     if (!modifier) return false;
-    var originalSelected = modifier.value;
-    var selected = originalSelected;
-    var known = row.dataset.compatState === "known";
+    var original = modifier.value;
+    var selected = original;
     var mods = applicableMods(paramType);
-    if (known && !compatibleModifier(selected, paramType)) selected = "";
+    if (reconcile && !compatibleModifier(selected, paramType)) selected = "";
     modifier.textContent = "";
     option(modifier, "", sections.dataset.msgMatchIs, !selected);
     mods.forEach(function (m) {
       option(modifier, m, ":" + m, selected === m);
     });
-    /* Compatibility-only and unknown modifiers remain selectable without
-     * becoming chips in the visible modifier matrix. */
+    /* Compatibility-only and unknown modifiers stay selectable without
+     * joining the visible modifier matrix. */
     if (selected && mods.indexOf(selected) < 0) {
       option(modifier, selected, ":" + selected, true);
     }
     var panel = row.querySelector(".builder-row__modpanel");
     if (panel) fillModPanel(panel, row, mods);
-    return originalSelected !== selected;
+    return original !== selected;
   }
 
-  /* Re-gates the per-value comparator selects without discarding an explicit
-   * prefix from a pasted URL whose parameter type is unknown or unexpected. */
-  function refreshComparatorControls(row, paramType) {
+  /* Re-gates the per-value comparator selects. Hydrated values keep their
+   * exact wire: a prefix-looking value on a known string is folded back into
+   * the text input. During a user parameter transition, an incompatible
+   * comparator belongs to the old parameter and is discarded instead. */
+  function foldComparatorIntoLiteral(comparator) {
+    var alternative = comparator.closest(".builder-row__orvalue");
+    var input = alternative && alternative.querySelector(".builder-row__value");
+    if (!input || !comparator.value) return;
+    input.value = comparator.value + input.value;
+    if (input.dataset.fhirWire !== undefined) {
+      input.dataset.fhirWire = comparator.value + input.dataset.fhirWire;
+    }
+    comparator.value = "";
+  }
+
+  function classifyHydratedComparators(row, sourceType, classifySelected) {
+    if (!sourceType || PREFIX_TYPES.indexOf(sourceType) >= 0) return;
+    row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+      if (
+        !classifySelected &&
+        comparator.dataset.comparatorSource !== "hydrated"
+      ) {
+        return;
+      }
+      foldComparatorIntoLiteral(comparator);
+      comparator.dataset.comparatorSource = "literal";
+    });
+  }
+
+  function rowHasSelectedComparator(row) {
+    return Array.prototype.some.call(
+      row.querySelectorAll(".builder-row__comparator"),
+      function (comparator) {
+        return !!comparator.value;
+      },
+    );
+  }
+
+  function beginComparatorClassification(row) {
+    if (!row._hydrationPending) return;
+    row._comparatorClassificationPending = true;
+    row.dataset.paramPending = "true";
+    refreshRunAvailability();
+  }
+
+  function cancelComparatorClassification(row) {
+    if (
+      !row._comparatorClassificationPending ||
+      rowHasSelectedComparator(row)
+    ) {
+      return;
+    }
+    delete row._comparatorClassificationPending;
+    if (
+      !row._modifierPending &&
+      row.dataset.comparatorTransition !== "true"
+    ) {
+      delete row.dataset.paramPending;
+      refreshRunAvailability();
+    }
+  }
+
+  function clearComparatorsForModifier(row) {
+    row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+      comparator.value = "";
+    });
+  }
+
+  function enforceModifierComparatorExclusion(row) {
+    var unresolvedHydratedPrefix =
+      row._hydrationPending &&
+      Array.prototype.some.call(
+        row.querySelectorAll(".builder-row__comparator"),
+        function (comparator) {
+          return (
+            comparator.dataset.comparatorSource === "hydrated" &&
+            !!comparator.value
+          );
+        },
+      );
+    if (unresolvedHydratedPrefix) {
+      row._modifierPending = true;
+      row.dataset.paramPending = "true";
+      refreshRunAvailability();
+      return false;
+    }
+    clearComparatorsForModifier(row);
+    cancelComparatorClassification(row);
+    return true;
+  }
+
+  function cancelPendingModifier(row, retainComparatorClassification) {
+    if (!row._modifierPending) return;
+    delete row._modifierPending;
+    if (retainComparatorClassification) {
+      row._comparatorClassificationPending = true;
+      row.dataset.paramPending = "true";
+      return;
+    }
+    if (row._comparatorClassificationPending) return;
+    if (row.dataset.comparatorTransition !== "true") {
+      delete row.dataset.paramPending;
+      refreshRunAvailability();
+    }
+  }
+
+  function refreshComparatorControls(row, paramType, mode) {
     var prefixes = applicablePrefixes(paramType);
-    var known = row.dataset.compatState === "known";
-    var changed = false;
+    var modifier = row.querySelector(".builder-row__modifier");
+    var hasModifier = !!(modifier && modifier.value);
+    var wireChanged = false;
     row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
       var selected = comparator.value;
-      if (known && prefixes.indexOf(selected) < 0) {
-        changed = changed || !!selected;
+      var alternative = comparator.closest(".builder-row__orvalue");
+      var input = alternative && alternative.querySelector(".builder-row__value");
+
+      if (paramType && selected && prefixes.indexOf(selected) < 0) {
+        if (mode === "hydrate" && input) {
+          foldComparatorIntoLiteral(comparator);
+        } else if (mode === "transition") {
+          wireChanged = true;
+        }
         selected = "";
+      } else if (
+        paramType &&
+        prefixes.length &&
+        !selected &&
+        !hasModifier &&
+        mode &&
+        input
+      ) {
+        /* A value previously known to be a string may become ordered after
+         * the user changes its parameter. Reflect a now-valid prefix in the
+         * comparator control rather than leaving DOM and wire semantics out
+         * of sync. */
+        var parsed = parsePrefixedValue(input.value);
+        if (parsed.comparator) {
+          selected = parsed.comparator;
+          input.value = parsed.value;
+          if (input.dataset.fhirWire !== undefined) {
+            var parsedWire = parsePrefixedValue(input.dataset.fhirWire);
+            if (parsedWire.comparator === selected) {
+              input.dataset.fhirWire = parsedWire.value;
+            } else {
+              input.dataset.fhirDirty = "true";
+            }
+          }
+        }
       }
+
       comparator.textContent = "";
       option(comparator, "", sections.dataset.msgMatchIs, !selected);
       prefixes.forEach(function (prefix) {
         option(comparator, prefix, prefix, selected === prefix);
       });
-      if (selected && prefixes.indexOf(selected) < 0) {
+      /* Unknown/unregistered parameters remain permissive. */
+      if (!paramType && selected && prefixes.indexOf(selected) < 0) {
         option(comparator, selected, selected, true);
       }
       comparator.hidden = prefixes.length === 0 && !selected;
     });
-    return changed;
-  }
-
-  /* A modifier-bearing value is literal while the modifier is active, so its
-   * leading comparator was not split during hydration. If reconciliation
-   * removes that modifier and lands on an ordered type, move the prefix into
-   * the comparator control and keep the preserved wire value in step. */
-  function rehydrateComparatorPrefixes(row) {
-    var changed = false;
-    row.querySelectorAll(".builder-row__orvalue").forEach(function (alternative) {
-      var comparator = alternative.querySelector(".builder-row__comparator");
-      var input = alternative.querySelector(".builder-row__value");
-      var parsed = parsePrefixedValue(input.value);
-      if (!comparator || !parsed.comparator) return;
-      var wire = parsePrefixedValue(
-        input.dataset.fhirWire === undefined
-          ? input.value
-          : input.dataset.fhirWire,
-      );
-      comparator.value = parsed.comparator;
-      input.value = parsed.value;
-      if (wire.comparator === parsed.comparator) {
-        input.dataset.fhirWire = wire.value;
-      } else {
-        delete input.dataset.fhirWire;
-        input.dataset.fhirDirty = "true";
-      }
-      changed = true;
-    });
-    return changed;
+    return wireChanged;
   }
 
   /* Best-effort param type for a row's modifier target, from the cached
@@ -560,106 +840,36 @@
     return (((PARAM_META[base] || {})[key.value.trim()] || {}).type) || "";
   }
 
-  function builderCompatibilityPending() {
-    return !!(
-      compatibilitySyncQueued ||
-      (sections &&
-        sections.querySelector(".builder-row[data-compat-state='pending']"))
-    );
-  }
-
-  function builderConsumersBlocked() {
-    return (
-      builderCompatibilityPending() ||
-      !!(sections && !sections.hidden && builderHasEscapeError())
-    );
-  }
-
-  var pendingBuilderConsumers = [];
-  function syncBuilderAvailability() {
-    var pending = builderConsumersBlocked();
-    if (form) {
-      form.querySelectorAll("[data-intent]").forEach(function (control) {
-        control.disabled = pending;
-      });
-    }
-    var copy = document.getElementById("query-copy");
-    if (copy) copy.disabled = pending;
-    if (root) {
-      root
-        .querySelectorAll("button[data-action='run']")
-        .forEach(function (control) {
-          control.disabled = pending;
-        });
-    }
-    if (pending) return;
-    var ready = pendingBuilderConsumers;
-    pendingBuilderConsumers = [];
-    ready.forEach(function (consumer) {
-      if (consumer.revision === builderRevision) consumer.callback();
-    });
-  }
-
-  function consumeWhenBuilderReady(revision, callback) {
-    if (!builderConsumersBlocked()) {
-      if (revision === builderRevision) callback();
-      return;
-    }
-    pendingBuilderConsumers.push({ revision: revision, callback: callback });
-  }
-
-  var compatibilitySyncQueued = false;
-  var compatibilitySyncNeeded = false;
-  var compatibilitySyncGeneration = 0;
-  function resetCompatibilitySync() {
-    compatibilitySyncGeneration += 1;
-    compatibilitySyncQueued = false;
-    compatibilitySyncNeeded = false;
-  }
-  function queueCompatibilitySync(needsUpdate) {
-    compatibilitySyncNeeded = compatibilitySyncNeeded || !!needsUpdate;
-    if (compatibilitySyncQueued) return;
-    var generation = compatibilitySyncGeneration;
-    compatibilitySyncQueued = true;
-    Promise.resolve().then(function () {
-      if (generation !== compatibilitySyncGeneration) return;
-      compatibilitySyncQueued = false;
-      if (!builderCompatibilityPending()) {
-        var shouldUpdate = compatibilitySyncNeeded;
-        compatibilitySyncNeeded = false;
-        if (shouldUpdate && !builderUrlEdited) updateUrl();
-        syncBuilderAvailability();
-      }
-    });
-  }
-
-  function markCompatibilityPending(row) {
-    row.dataset.compatState = "pending";
-    syncBuilderAvailability();
-  }
-
-  function noteBuilderUserEdit() {
-    builderRevision += 1;
-    if (builderCompatibilityPending()) compatibilitySyncNeeded = true;
-  }
-
-  /* Settles one row as a known type or as unknown/ambiguous. Unknown rows
-   * remain permissive; known rows reconcile both key modifiers and value
-   * prefixes before the URL can be consumed. */
-  function regateModifiers(row, resolvedType) {
+  /* Settles a row against its resolved param type: an unknown type stays
+   * permissive, a known one reconciles the key modifier before the value
+   * comparators, so a prefix freed by dropping the modifier can move into
+   * the comparator control in the same pass. */
+  function regateModifiers(row, resolvedType, comparatorMode) {
     var t = arguments.length > 1 ? resolvedType : rowParamType(row);
-    var wasPending = row.dataset.compatState === "pending";
     var known = knownParamType(t);
-    row.dataset.compatState = known ? "known" : "unknown";
-    row.dataset.modType = known ? t : "";
-    var modifierRemoved = refreshModifierControls(row, known ? t : "");
-    var changed = modifierRemoved;
-    changed = refreshComparatorControls(row, known ? t : "") || changed;
-    if (modifierRemoved && PREFIX_TYPES.indexOf(t) >= 0) {
-      changed = rehydrateComparatorPrefixes(row) || changed;
+    var wireChanged = false;
+    if (row.dataset.modType !== t || known) {
+      row.dataset.modType = t;
+      wireChanged = refreshModifierControls(row, t, known && !!comparatorMode);
     }
-    if (wasPending) queueCompatibilitySync(changed);
-    else syncBuilderAvailability();
+    wireChanged =
+      refreshComparatorControls(row, t, comparatorMode) || wireChanged;
+    row.dataset.compatState = known ? "known" : "unknown";
+    return wireChanged;
+  }
+
+  function resolveDirectParamType(row, userTransition) {
+    var token = beginTypeResolution(row, userTransition);
+    var base = sections.dataset.type || "";
+    var key = row.querySelector(".builder-row__key").value.trim();
+    fetchParams(base).then(
+      function (meta) {
+        finishTypeResolution(row, token, ((meta[key] || {}).type) || "");
+      },
+      function () {
+        finishTypeResolution(row, token, "");
+      },
+    );
   }
 
   /* The MODIFY panel: each applicable modifier as a chip with its
@@ -783,7 +993,6 @@
     row.appendChild(deeper);
 
     appendTail(row, part);
-    markCompatibilityPending(row);
 
     var base = sections.dataset.type || "";
     var leafRefillSeq = 0;
@@ -858,18 +1067,17 @@
       parentTypes(hops.length, done);
     }
 
-    function refillLeaf() {
+    function refillLeaf(userTransition) {
+      var typeToken = beginTypeResolution(row, userTransition);
       var refillSeq = ++leafRefillSeq;
       var leafCode = leaf.input.value.trim();
-      markCompatibilityPending(row);
       leafTypes(function (types) {
         var pending = types.length;
         var codes = [];
         var anyRef = false;
         var resolvedTypes = [];
         if (!pending) {
-          if (refillSeq === leafRefillSeq && row.isConnected)
-            regateModifiers(row, "");
+          if (refillSeq === leafRefillSeq) finishTypeResolution(row, typeToken, "");
           return;
         }
         types.forEach(function (t) {
@@ -880,14 +1088,17 @@
             var m = meta[leafCode];
             if (m && m.type === "reference") anyRef = true;
             if (m && resolvedTypes.indexOf(m.type) < 0) resolvedTypes.push(m.type);
-            if (
-              --pending === 0 &&
-              refillSeq === leafRefillSeq &&
-              row.isConnected
-            ) {
-              fillList(leaf.list, codes.sort());
-              deeper.hidden = !anyRef;
-              regateModifiers(row, resolvedTypes.length === 1 ? resolvedTypes[0] : "");
+            if (--pending === 0) {
+              var finalType = resolvedTypes.length === 1 ? resolvedTypes[0] : "";
+              if (refillSeq === leafRefillSeq) {
+                fillList(leaf.list, codes.sort());
+                deeper.hidden = !anyRef;
+                finishTypeResolution(row, typeToken, finalType);
+              } else if (!userTransition) {
+                /* Even when a later leaf edit superseded this UI refill, its
+                 * source type is still needed to classify hydrated values. */
+                finishTypeResolution(row, typeToken, finalType);
+              }
             }
           });
         });
@@ -912,13 +1123,13 @@
       ref.input.addEventListener("input", function () {
         hops[k].ref = ref.input.value.trim();
         segRefill(k);
-        refillLeaf();
+        refillLeaf(true);
       });
       typeSel.addEventListener("change", function () {
         hops[k].type = typeSel.value;
         for (var j = k + 1; j < hops.length; j++) segRefill(j);
-        refillLeaf();
-        if (!builderCompatibilityPending()) updateUrl();
+        refillLeaf(true);
+        updateUrl();
       });
 
       hopsHost.appendChild(seg);
@@ -928,19 +1139,20 @@
     hops.forEach(function (_, k) {
       addSegment(k);
     });
-    refillLeaf();
+    refillLeaf(false);
 
-    leaf.input.addEventListener("input", refillLeaf);
+    leaf.input.addEventListener("input", function () {
+      refillLeaf(true);
+    });
     deeper.addEventListener("click", function () {
       var refName = leaf.input.value.trim();
       if (!refName) return;
       hops.push({ ref: refName, type: "" });
       leaf.input.value = "";
       addSegment(hops.length - 1);
-      refillLeaf();
-      noteBuilderUserEdit();
+      refillLeaf(true);
       leaf.input.focus();
-      if (!builderCompatibilityPending()) updateUrl();
+      updateUrl();
     });
 
     /* updateUrl reads the hops through the row's DOM state. */
@@ -975,20 +1187,28 @@
     row.appendChild(leaf.input);
 
     appendTail(row, part);
-    markCompatibilityPending(row);
 
     var base = sections.dataset.type || "";
     var paramsRefillSeq = 0;
-    function refillParams() {
+    function refillParams(userTransition) {
+      var typeToken = beginTypeResolution(row, userTransition);
       var refillSeq = ++paramsRefillSeq;
       var t = type.input.value.trim();
-      markCompatibilityPending(row);
       if (!t) {
-        regateModifiers(row, "");
+        finishTypeResolution(row, typeToken, "");
         return;
       }
       fetchParams(t).then(function (meta) {
-        if (refillSeq !== paramsRefillSeq || !row.isConnected) return;
+        var resolvedType = ((meta[leaf.input.value.trim()] || {}).type) || "";
+        if (refillSeq !== paramsRefillSeq) {
+          if (!userTransition) {
+            /* Preserve the original leaf's type classification even after a
+             * newer leaf edit superseded its suggestions. */
+            var sourceType = ((meta[part.key] || {}).type) || "";
+            finishTypeResolution(row, typeToken, sourceType);
+          }
+          return;
+        }
         var codes = Object.keys(meta).sort();
         /* The link must be a reference param that can point at the base
          * type; params with no declared targets stay offered. */
@@ -1001,12 +1221,20 @@
           }),
         );
         fillList(leaf.list, codes);
-        regateModifiers(row, ((meta[leaf.input.value.trim()] || {}).type) || "");
+        finishTypeResolution(
+          row,
+          typeToken,
+          resolvedType,
+        );
       });
     }
-    type.input.addEventListener("input", refillParams);
-    leaf.input.addEventListener("input", refillParams);
-    refillParams();
+    type.input.addEventListener("input", function () {
+      refillParams(true);
+    });
+    leaf.input.addEventListener("input", function () {
+      refillParams(true);
+    });
+    refillParams(false);
 
     return row;
   }
@@ -1110,14 +1338,14 @@
         var key = row.querySelector(".builder-row__key");
         var drill = row.querySelector("[data-chain-from]");
         if (!key || !drill) return;
+        /* Until the catalog answers there is no basis for the affordance;
+         * the row's own type resolution reveals it. */
         if (!loaded) {
           drill.hidden = true;
-          markCompatibilityPending(row);
           return;
         }
         var m = meta[key.value.trim()];
         drill.hidden = !(m && m.type === "reference");
-        regateModifiers(row, (m && m.type) || "");
       });
   }
 
@@ -1215,7 +1443,8 @@
       panel.className = "builder-row__modpanel";
       panel.hidden = true;
       row.appendChild(panel);
-      markCompatibilityPending(row);
+
+      resolveDirectParamType(row, false);
     }
 
     return row;
@@ -1265,8 +1494,10 @@
    * one-shot: any other render invalidates it so a later external URL cannot
    * match stale state. */
   var lastSerialized = null;
+
+  /* Bumped by every builder render and every user edit: a deferred auto-run
+   * only fires against the revision it was queued for. */
   var builderRevision = 0;
-  var builderUrlEdited = false;
 
   function builderHasEscapeError() {
     return !!(
@@ -1276,6 +1507,7 @@
 
   function showEscapeError() {
     showError(null, messages.msgInvalidFhirEscape);
+    refreshRunAvailability();
   }
 
   function serializedConditionAlternative(input) {
@@ -1296,9 +1528,7 @@
     lastSerialized = null;
     var parsed = parseSearchUrl(urlInput.value);
     if (!parsed) {
-      resetCompatibilitySync();
       builderRevision += 1;
-      builderUrlEdited = false;
       sections.hidden = true;
       markRailType(null);
       sections
@@ -1306,22 +1536,20 @@
         .forEach(function (row) {
           row.dataset.compatState = "unknown";
         });
-      syncBuilderAvailability();
+      refreshRunAvailability();
       return;
     }
     // Context sync must precede the echo guard: even a URL whose rows are
     // already current may have arrived with conflicting Resources state (#626).
     syncTypeContext(parsed.type);
     if (isSerializedEcho) {
-      resetCompatibilitySync();
-      syncBuilderAvailability();
+      refreshRunAvailability();
       return;
     }
-    resetCompatibilitySync();
     builderRevision += 1;
-    builderUrlEdited = false;
     sections.hidden = false;
     sections.dataset.type = parsed.type;
+    loadCatalog(parsed.type);
 
     var hosts = builderHosts();
     Object.keys(hosts).forEach(function (kind) {
@@ -1331,9 +1559,8 @@
       var kind = bucketFor(part);
       hosts[kind].appendChild(builderRow(kind, part));
     });
+    refreshRunAvailability();
     refreshChainAffordances();
-    syncBuilderAvailability();
-    loadCatalog(parsed.type);
     updatePlain();
     if (builderHasEscapeError()) showEscapeError();
     else clearError();
@@ -1342,14 +1569,16 @@
   /* Rows → URL. */
   function updateUrl() {
     if (!sections || !urlInput) return;
-    if (builderCompatibilityPending()) {
-      syncBuilderAvailability();
+    /* Interactions against an unresolved hydrated prefix are transactional:
+     * no edit may expose an unclassified modifier/comparator state through
+     * the URL, Copy, Save, or Run. */
+    if (builderHasPendingSerialization()) {
+      refreshRunAvailability();
       return;
     }
-    compatibilitySyncNeeded = false;
     if (builderHasEscapeError()) {
       showEscapeError();
-      syncBuilderAvailability();
+      refreshRunAvailability();
       return;
     }
     clearError();
@@ -1366,6 +1595,11 @@
           var ref = segs[si].querySelector(".builder-row__chainref").value.trim();
           if (!ref) return;
           var ctype = segs[si].querySelector(".builder-row__ctype").value;
+          if (!ctype && row.chainHops && row.chainHops[si]) {
+            /* Preserve a hydrated qualifier while its async select options
+             * are still loading. User selections update chainHops too. */
+            ctype = row.chainHops[si].type;
+          }
           pieces.push(ref + (ctype ? ":" + ctype : ""));
         }
         key = pieces.join(".") + "." + leaf;
@@ -1416,24 +1650,22 @@
       "GET /" + type + (parts.length ? "?" + parts.join("&") : "");
     lastSerialized = urlInput.value;
     updatePlain();
-    syncBuilderAvailability();
+    refreshRunAvailability();
   }
 
   if (sections && urlInput) {
-    urlInput.addEventListener("input", function () {
-      builderRevision += 1;
-      builderUrlEdited = true;
-    });
+    urlInput.addEventListener("input", noteBuilderUserEdit);
     urlInput.addEventListener("change", renderBuilder);
     sections.addEventListener("input", function (event) {
       var row = event.target.closest(".builder-row");
       if (row) {
-        if (
-          row.classList.contains("builder-row--chain") &&
-          event.target.classList.contains("builder-row__ctype")
-        )
-          markCompatibilityPending(row);
+        var deferUpdate = false;
         noteBuilderUserEdit();
+        var directKeyChanged =
+          event.target.classList.contains("builder-row__key") &&
+          !row.classList.contains("builder-row--chain") &&
+          !row.classList.contains("builder-row--has");
+        if (directKeyChanged) resolveDirectParamType(row, true);
         if (event.target.classList.contains("builder-row__value")) {
           event.target.dataset.fhirDirty = "true";
           delete event.target.dataset.fhirEscapeError;
@@ -1441,6 +1673,11 @@
         /* Key modifiers and value comparators occupied one select before
          * #630, so preserve their mutual exclusion when either is edited. */
         if (event.target.classList.contains("builder-row__comparator") && event.target.value) {
+          cancelPendingModifier(
+            row,
+            !!(row._modifierPending && row._hydrationPending),
+          );
+          beginComparatorClassification(row);
           var rowModifier = row.querySelector(".builder-row__modifier");
           if (rowModifier) {
             rowModifier.value = "";
@@ -1449,19 +1686,21 @@
               fillModPanel(rowPanel, row, applicableMods(row.dataset.modType || ""));
             }
           }
+        } else if (event.target.classList.contains("builder-row__comparator")) {
+          cancelComparatorClassification(row);
         } else if (event.target.classList.contains("builder-row__modifier") && event.target.value) {
-          row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
-            comparator.value = "";
-          });
+          deferUpdate = !enforceModifierComparatorExclusion(row);
           var modifierPanel = row.querySelector(".builder-row__modpanel");
           if (modifierPanel) {
             fillModPanel(modifierPanel, row, applicableMods(row.dataset.modType || ""));
           }
+        } else if (event.target.classList.contains("builder-row__modifier")) {
+          cancelPendingModifier(row);
         }
+        if (!deferUpdate) updateUrl();
         if (event.target.classList.contains("builder-row__key")) {
           refreshChainAffordances();
         }
-        if (!builderCompatibilityPending()) updateUrl();
       }
     });
     sections.addEventListener("click", function (event) {
@@ -1494,17 +1733,18 @@
         var chipRow = modChip.closest(".builder-row");
         var sel = chipRow.querySelector(".builder-row__modifier");
         sel.value = sel.value === modChip.dataset.modChip ? "" : modChip.dataset.modChip;
+        var modifierDeferred = false;
         if (sel.value) {
-          chipRow.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
-            comparator.value = "";
-          });
+          modifierDeferred = !enforceModifierComparatorExclusion(chipRow);
+        } else {
+          cancelPendingModifier(chipRow);
         }
         fillModPanel(
           chipRow.querySelector(".builder-row__modpanel"),
           chipRow,
           applicableMods(chipRow.dataset.modType || ""),
         );
-        updateUrl();
+        if (!modifierDeferred) updateUrl();
         return;
       }
       var removeOr = event.target.closest("[data-remove-or]");
@@ -1522,7 +1762,9 @@
         noteBuilderUserEdit();
         var orWrap = removeOr.closest(".builder-row__orvalue");
         if (orWrap.parentElement.children.length > 1) {
+          var removeOrRow = orWrap.closest(".builder-row");
           orWrap.remove();
+          cancelComparatorClassification(removeOrRow);
           updateUrl();
         }
         return;
@@ -1530,6 +1772,7 @@
       if (remove) {
         noteBuilderUserEdit();
         remove.closest(".builder-row").remove();
+        refreshRunAvailability();
         updateUrl();
       } else if (drillFrom) {
         /* Convert the condition row into a forward-chain row for its
@@ -1672,7 +1915,34 @@
     });
   }
 
-  function plainValues(part) {
+  function partParamType(part, baseType) {
+    if (part.kind === "has") {
+      return ((((PARAM_META[part.hasType] || {})[part.key] || {}).type) || "");
+    }
+    if (part.kind === "chain") {
+      var wanted = part.hops
+        .map(function (hop) {
+          return hop.ref + (hop.type ? ":" + hop.type : "");
+        })
+        .concat([part.key])
+        .join(".");
+      var found = "";
+      if (sections) {
+        sections.querySelectorAll(".builder-row--chain").forEach(function (row) {
+          if (found) return;
+          var pieces = (row.chainHops || []).map(function (hop) {
+            return hop.ref + (hop.type ? ":" + hop.type : "");
+          });
+          pieces.push(row.querySelector(".builder-row__cparam").value.trim());
+          if (pieces.join(".") === wanted) found = row.dataset.modType || "";
+        });
+      }
+      return found;
+    }
+    return ((((PARAM_META[baseType] || {})[part.key] || {}).type) || "");
+  }
+
+  function plainValues(part, paramType) {
     var raw = part.value || "";
     var mod = part.modifier || "";
     if (mod === "missing" && (raw === "true" || raw === "false")) {
@@ -1681,7 +1951,7 @@
     var alternatives = fhirSearchValue
       .parseAlternatives(raw)
       .alternatives.map(function (alternative) {
-        var parsed = mod
+        var parsed = mod || (paramType && PREFIX_TYPES.indexOf(paramType) < 0)
           ? { comparator: "", value: alternative.value }
           : parsePrefixedValue(alternative.value);
         var verbKey = mod || parsed.comparator;
@@ -1751,14 +2021,14 @@
           })
           .concat([part.key])
           .join(PLAIN.arrow + " ");
-        var cv = plainValues(part);
+        var cv = plainValues(part, partParamType(part, parsed.type));
         clauses.push(
           renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: path }, cv),
         );
         return;
       }
       if (part.kind === "has") {
-        var hv = plainValues(part);
+        var hv = plainValues(part, partParamType(part, parsed.type));
         clauses.push(
           renderPlainClause(
             PLAIN.has,
@@ -1796,7 +2066,7 @@
         return;
       }
       if (CONTROL_KEYS.indexOf(part.key) >= 0 || !part.key) return;
-      var v = plainValues(part);
+      var v = plainValues(part, partParamType(part, parsed.type));
       clauses.push(
         renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: part.key }, v),
       );
@@ -2194,7 +2464,7 @@
     /* The Search page renders the builder and the recent list but no saved
      * list; there is nothing further to draw there. */
     if (!root) {
-      syncBuilderAvailability();
+      refreshRunAvailability();
       return;
     }
 
@@ -2271,7 +2541,7 @@
       empty.textContent = messages.msgEmpty;
       root.appendChild(empty);
     }
-    syncBuilderAvailability();
+    refreshRunAvailability();
   }
 
   /* Errors surface next to the query strip — the control they are almost
@@ -2341,6 +2611,8 @@
     return builderRevision;
   }
 
+  /* Runs whatever the builder settled on, which may differ from the query
+   * that was loaded once incompatible operators were reconciled. */
   function runCurrentBuilderSearch(record) {
     var parsed = parseSearchUrl(urlInput && urlInput.value);
     if (!parsed) return false;
@@ -2352,7 +2624,7 @@
   var copyButton = document.getElementById("query-copy");
   if (copyButton && navigator.clipboard) {
     copyButton.addEventListener("click", function () {
-      if (builderConsumersBlocked()) return;
+      if (builderWriteBlocked()) return;
       navigator.clipboard.writeText(urlInput.value || "");
     });
   } else if (copyButton) {
@@ -2438,9 +2710,9 @@
   if (form) {
     form.addEventListener("submit", function (event) {
       event.preventDefault();
-      if (builderConsumersBlocked()) return;
       var intent =
         (event.submitter && event.submitter.dataset.intent) || "run";
+      if (builderRunBlocked() || builderWriteBlocked()) return;
       var parsed = parseSearchUrl(form.elements.url.value);
       if (!parsed) {
         reload().then(function () {
