@@ -755,9 +755,31 @@ where
         } else {
             (manifests.iter().filter(|m| m.status.is_terminal()).count() * 100) / manifests.len()
         };
+        // A `processing` manifest whose lease expired several lease-durations
+        // ago has a worker that stopped heartbeating and no healthy worker
+        // reclaiming it (#646). Say so: the old answer was a quiet
+        // "processing" forever, indistinguishable from progress. State is not
+        // mutated — a remote worker deployment may still legitimately pick
+        // the manifest back up, and the reclaim path stays the authority.
+        let stall_after = chrono::Duration::seconds((cfg.lease_duration_secs as i64) * 3);
+        let now = chrono::Utc::now();
+        let stalled = manifests.iter().any(|m| {
+            m.status == helios_persistence::core::ManifestStatus::Processing
+                && m.lease_expiry.is_some_and(|e| now - e > stall_after)
+        });
+        let progress = if stalled {
+            tracing::warn!(
+                submission = %sub_id,
+                "bulk-submit ingestion appears stalled: a processing manifest's \
+                 worker lease expired without renewal or reclaim"
+            );
+            format!("stalled at {pct}% - a worker stopped without handoff; see server logs")
+        } else {
+            format!("processing {pct}% complete")
+        };
         return Response::builder()
             .status(StatusCode::ACCEPTED)
-            .header("X-Progress", format!("processing {pct}% complete"))
+            .header("X-Progress", progress)
             .header("Retry-After", cfg.retry_after_secs.to_string())
             .body(Body::empty())
             .map_err(|e| RestError::InternalError {
