@@ -2,8 +2,8 @@
 //!
 //! Covers the ordinary search path for the SQL-on-FHIR IG's ViewDefinition
 //! SearchParameters (`url`, `name`, `status`, `date`) once they are seeded
-//! from `data/search-parameters-r*.json`, plus the CapabilityStatement
-//! entries for `ViewDefinition` and `Library`.
+//! from the custom `data/sql-on-fhir-search-parameters.json` file, plus the
+//! CapabilityStatement entries for `ViewDefinition` and `Library`.
 
 mod common;
 
@@ -23,9 +23,11 @@ use serde_json::{Value, json};
 const X_TENANT_ID: HeaderName = HeaderName::from_static("x-tenant-id");
 
 /// Creates a test server backed by an in-memory SQLite database, wired to the
-/// real `data/search-parameters-r*.json` so the ViewDefinition SearchParameters
-/// this ticket adds are actually loaded — the same setup `search_integration.rs`
-/// and `rest_conformance.rs` use.
+/// real workspace `data/` directory so the ViewDefinition SearchParameters
+/// this ticket adds are actually loaded from `sql-on-fhir-search-parameters.json`
+/// (a custom file, loaded additively alongside the spec bundles by
+/// `SearchParameterLoader::load_custom_from_directory`) — the same setup
+/// `search_integration.rs` and `rest_conformance.rs` use.
 async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -329,9 +331,7 @@ mod capability_statement {
                 let definition = param["definition"].as_str().unwrap_or_default();
                 assert_eq!(
                     definition,
-                    format!(
-                        "http://hl7.org/fhir/uv/sql-on-fhir/SearchParameter/ViewDefinition-{name}"
-                    )
+                    format!("http://hl7.org/fhir/SearchParameter/ViewDefinition-{name}")
                 );
             }
         }

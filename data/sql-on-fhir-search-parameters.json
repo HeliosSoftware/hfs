@@ -1,0 +1,1354 @@
+{
+  "resourceType": "Bundle",
+  "id": "sql-on-fhir-search-parameters",
+  "type": "collection",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-context",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-context",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.1"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionContextSearchParam",
+        "title": "ViewDefinition Context Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "A use context assigned to the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "context",
+        "base": ["ViewDefinition"],
+        "type": "token",
+        "expression": "(ViewDefinition.useContext.value.ofType(CodeableConcept))",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-context-quantity",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-context-quantity",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.2"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionContextQuantitySearchParam",
+        "title": "ViewDefinition Context-quantity Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "A quantity- or range-valued use context assigned to the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "context-quantity",
+        "base": ["ViewDefinition"],
+        "type": "quantity",
+        "expression": "(ViewDefinition.useContext.value.ofType(Quantity)) | (ViewDefinition.useContext.value.ofType(Range))",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-context-type",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-context-type",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.3"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionContextTypeSearchParam",
+        "title": "ViewDefinition Context-type Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "A type of use context assigned to the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "context-type",
+        "base": ["ViewDefinition"],
+        "type": "token",
+        "expression": "ViewDefinition.useContext.code",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-context-type-quantity",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-context-type-quantity",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.4"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionContextTypeQuantitySearchParam",
+        "title": "ViewDefinition Context-type-quantity Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "A use context type and quantity- or range-based value assigned to the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "context-type-quantity",
+        "base": ["ViewDefinition"],
+        "type": "composite",
+        "expression": "ViewDefinition.useContext",
+        "processingMode": "normal",
+        "component": [
+          {
+            "definition": "http://hl7.org/fhir/SearchParameter/ViewDefinition-context-type",
+            "expression": "code"
+          },
+          {
+            "definition": "http://hl7.org/fhir/SearchParameter/ViewDefinition-context-quantity",
+            "expression": "value.ofType(Quantity) | value.ofType(Range)"
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-context-type-value",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-context-type-value",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.5"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionContextTypeValueSearchParam",
+        "title": "ViewDefinition Context-type-value Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "A use context type and value assigned to the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "context-type-value",
+        "base": ["ViewDefinition"],
+        "type": "composite",
+        "expression": "ViewDefinition.useContext",
+        "processingMode": "normal",
+        "component": [
+          {
+            "definition": "http://hl7.org/fhir/SearchParameter/ViewDefinition-context-type",
+            "expression": "code"
+          },
+          {
+            "definition": "http://hl7.org/fhir/SearchParameter/ViewDefinition-context",
+            "expression": "value.ofType(CodeableConcept)"
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-date",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-date",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.6"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionDateSearchParam",
+        "title": "ViewDefinition Date Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "The view definition publication date",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "date",
+        "base": ["ViewDefinition"],
+        "type": "date",
+        "expression": "ViewDefinition.date",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-description",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-description",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.7"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionDescriptionSearchParam",
+        "title": "ViewDefinition Description Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "The description of the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "description",
+        "base": ["ViewDefinition"],
+        "type": "string",
+        "expression": "ViewDefinition.description",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-identifier",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-identifier",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.8"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionIdentifierSearchParam",
+        "title": "ViewDefinition Identifier Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "External identifier for the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "identifier",
+        "base": ["ViewDefinition"],
+        "type": "token",
+        "expression": "ViewDefinition.identifier",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-jurisdiction",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-jurisdiction",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.9"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionJurisdictionSearchParam",
+        "title": "ViewDefinition Jurisdiction Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "Intended jurisdiction for the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "jurisdiction",
+        "base": ["ViewDefinition"],
+        "type": "token",
+        "expression": "ViewDefinition.jurisdiction",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-name",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-name",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.10"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionNameSearchParam",
+        "title": "ViewDefinition Name Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "Computationally friendly name of the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "name",
+        "base": ["ViewDefinition"],
+        "type": "string",
+        "expression": "ViewDefinition.name",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-profile",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-profile",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.11"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionProfileSearchParam",
+        "title": "ViewDefinition Profile Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "A FHIR profile the view definition is intended to be executed against",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "profile",
+        "base": ["ViewDefinition"],
+        "type": "reference",
+        "expression": "ViewDefinition.profile",
+        "processingMode": "normal",
+        "target": ["StructureDefinition"]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-publisher",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-publisher",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.12"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionPublisherSearchParam",
+        "title": "ViewDefinition Publisher Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "Name of the publisher of the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "publisher",
+        "base": ["ViewDefinition"],
+        "type": "string",
+        "expression": "ViewDefinition.publisher",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-resource",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-resource",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.13"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionResourceSearchParam",
+        "title": "ViewDefinition Resource Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "The FHIR resource type the view definition is based upon",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "resource",
+        "base": ["ViewDefinition"],
+        "type": "token",
+        "expression": "ViewDefinition.resource",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-status",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-status",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.14"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionStatusSearchParam",
+        "title": "ViewDefinition Status Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "The current status of the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "status",
+        "base": ["ViewDefinition"],
+        "type": "token",
+        "expression": "ViewDefinition.status",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-title",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-title",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.15"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionTitleSearchParam",
+        "title": "ViewDefinition Title Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "The human-friendly name of the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "title",
+        "base": ["ViewDefinition"],
+        "type": "string",
+        "expression": "ViewDefinition.title",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-url",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-url",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.16"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionUrlSearchParam",
+        "title": "ViewDefinition Url Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "The uri that identifies the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "url",
+        "base": ["ViewDefinition"],
+        "type": "uri",
+        "expression": "ViewDefinition.url",
+        "processingMode": "normal"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "SearchParameter",
+        "id": "ViewDefinition-version",
+        "language": "en",
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+            "valueCode": "fhir"
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+            "valueInteger": 2,
+            "_valueInteger": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          },
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+            "valueCode": "trial-use",
+            "_valueCode": {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-conformance-derivedFrom",
+                  "valueCanonical": "http://hl7.org/fhir/uv/sql-on-fhir/ImplementationGuide/hl7.fhir.uv.sql-on-fhir"
+                }
+              ]
+            }
+          }
+        ],
+        "url": "http://hl7.org/fhir/SearchParameter/ViewDefinition-version",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.4.642.40.77.40.17"
+          }
+        ],
+        "version": "3.0.0-ballot",
+        "name": "ViewDefinitionVersionSearchParam",
+        "title": "ViewDefinition Version Search Parameter",
+        "status": "active",
+        "date": "2026-08-13T15:42:34+00:00",
+        "publisher": "HL7 International / FHIR Infrastructure",
+        "contact": [
+          {
+            "name": "HL7 International / FHIR Infrastructure",
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://www.hl7.org/Special/committees/fiwg"
+              }
+            ]
+          }
+        ],
+        "description": "The business version of the view definition",
+        "jurisdiction": [
+          {
+            "coding": [
+              {
+                "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+                "code": "001",
+                "display": "World"
+              }
+            ]
+          }
+        ],
+        "code": "version",
+        "base": ["ViewDefinition"],
+        "type": "token",
+        "expression": "ViewDefinition.version",
+        "processingMode": "normal"
+      }
+    }
+  ]
+}

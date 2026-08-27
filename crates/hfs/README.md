@@ -279,6 +279,7 @@ data/
 ├── search-parameters-r4b.json  # FHIR R4B SearchParameters (HL7 spec)
 ├── search-parameters-r5.json   # FHIR R5 SearchParameters (HL7 spec)
 ├── search-parameters-r6.json   # FHIR R6 SearchParameters (auto-downloaded at build time)
+├── sql-on-fhir-search-parameters.json  # SQL-on-FHIR IG ViewDefinition search params (custom file)
 └── *.json                      # Custom SearchParameter files (see below)
 ```
 
