@@ -77,7 +77,7 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 /// | subjectResource | CanonicalResource | 0 | 1 | The ViewDefinition to execute, supplied inline. |
 /// | subjectCanonical | canonical | 0 | 1 | Canonical URL of the subject. **Rejected**: no resource store. |
 /// | subjectReference | Reference | 0 | 1 | Literal location of the subject. **Rejected**: no resource store. |
-/// | _format | code | 0 | 1 | Output format — `json`, `ndjson`, `csv`, `parquet`, `fhir`. Defaults to `ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
+/// | _format | code | 0 | 1 | Output format — `json`, `ndjson`, `csv`, `parquet`, `arrow`, `fhir`. Defaults to `ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
 /// | header | boolean | 0 | 1 | CSV only. `true` (default) returns a header row. |
 /// | patient | Reference | 0 | * | Restrict the resources feeding the view to these patients' compartments. |
 /// | group | Reference | 0 | * | Restrict to members of these Groups (resolved via `Group.member.entity` against inline resources). |
@@ -590,17 +590,22 @@ pub async fn sql_run_handler(
                 .into_response());
         }
 
-        let response = if matches!(validated_params.format, ContentType::Parquet) {
-            // Add Content-Disposition for parquet so browsers download as
-            // `.parquet` rather than rendering octet-stream as binary noise.
+        let response = if matches!(
+            validated_params.format,
+            ContentType::Parquet | ContentType::ArrowIpc
+        ) {
+            // Add Content-Disposition for the binary columnar formats so
+            // browsers download a file rather than rendering binary noise.
+            let filename = if validated_params.format == ContentType::Parquet {
+                "attachment; filename=\"output.parquet\""
+            } else {
+                "attachment; filename=\"output.arrow\""
+            };
             (
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, mime_type),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        "attachment; filename=\"output.parquet\"",
-                    ),
+                    (header::CONTENT_DISPOSITION, filename),
                 ],
                 filtered_output,
             )
