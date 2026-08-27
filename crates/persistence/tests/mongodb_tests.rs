@@ -301,6 +301,22 @@ mod shared_mongo {
 #[path = "multitenancy/tenant_id_fidelity_suite.rs"]
 mod tenant_id_fidelity_suite;
 
+/// The backend-agnostic day-precision date-boundary suite (issue #519) — the
+/// #456 table that #463 pinned for SQLite only. Same `#[path]` arrangement.
+#[path = "search/date_boundary_suite.rs"]
+mod date_boundary_suite;
+
+/// #519: MongoDB's date handler was explicitly unverified. Needs the full
+/// registry so `birthdate` extracts into the search index at write time.
+#[tokio::test]
+async fn mongodb_day_precision_date_boundaries() {
+    let Some(backend) = create_backend_with_full_registry("date_boundary").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    date_boundary_suite::day_precision_boundaries(&backend, "date-boundary-519").await;
+}
+
 fn create_tenant(tenant_id: &str) -> TenantContext {
     TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access())
 }

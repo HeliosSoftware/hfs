@@ -125,15 +125,55 @@ impl CompartmentCatalog {
             .remove(&(tenant.to_string(), version));
     }
 
-    /// Every resource type of the version, from the first CompartmentDefinition
-    /// (each enumerates the full set — 145 in R4). Used by the queries page's
-    /// resource picker rail.
+    /// Every resource type of the version. Used by the resource pickers on
+    /// the Search, Queries, Resources, and Bulk Export pages, which pass the
+    /// sidebar's selected version (#562).
+    ///
+    /// Two sources, unioned (#648): the first CompartmentDefinition enumerates
+    /// the spec's set (145 in R4, 157 in R5) — but HFS serves resources the
+    /// spec's compartments never mention, `ViewDefinition` first among them,
+    /// so the generated `Resource` enum's names join in. The compartment
+    /// fetch failing (degraded page) still leaves the enum's full list. For
+    /// versions other than the server's seeded default the definitions come
+    /// from the shipped spec bundles, not storage — see [`crate::conformance`].
     pub async fn resource_type_names(&self, tenant: &str, version: FhirVersion) -> Vec<String> {
-        self.definitions(tenant, version)
+        let mut names: Vec<String> = self
+            .definitions(tenant, version)
             .await
             .first()
             .map(|def| def.resource.iter().map(|r| r.code.clone()).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for extra in provider_type_names(version) {
+            if !names.iter().any(|n| n == extra) {
+                names.push(extra.to_string());
+            }
+        }
+        names.sort();
+        names
+    }
+}
+
+/// The generated `Resource` enum's type names for `version` — the authority
+/// on what this build actually serves, `ViewDefinition` included (#648).
+fn provider_type_names(version: FhirVersion) -> Vec<&'static str> {
+    use helios_fhir::FhirResourceTypeProvider;
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => {
+            <helios_fhir::r4::Resource as FhirResourceTypeProvider>::get_resource_type_names()
+        }
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => {
+            <helios_fhir::r4b::Resource as FhirResourceTypeProvider>::get_resource_type_names()
+        }
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => {
+            <helios_fhir::r5::Resource as FhirResourceTypeProvider>::get_resource_type_names()
+        }
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => {
+            <helios_fhir::r6::Resource as FhirResourceTypeProvider>::get_resource_type_names()
+        }
     }
 }
 

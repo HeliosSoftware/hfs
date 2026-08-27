@@ -1,0 +1,103 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("bulk-export-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
+
+{% block content %}
+<header class="page-head page-head--row">
+  <h1 class="page-head__title">{{ i18n.t("bulk-export-title") }}</h1>
+  <a class="btn" href="/ui/bulk-export/active">
+    {{ i18n.t("bulk-export-active-link") }}
+    <span class="toolbar__count">{{ active_count }}</span>
+  </a>
+</header>
+
+{% if !available %}
+<div class="card notice">{{ i18n.t("bulk-export-unavailable") }}</div>
+{% else %}
+
+{% match error %}{% when Some(message) %}
+<div class="card notice">{{ message }}</div>
+{% when None %}{% endmatch %}
+
+<form method="post" action="/ui/bulk-export" class="bulk-export-form">
+  <section class="card form-panel">
+    <h2 class="toolbar__title">{{ i18n.t("bulk-export-scope") }}</h2>
+    <label class="field">
+      <span class="field__label">{{ i18n.t("bulk-export-field-name") }}</span>
+      <input class="field__input" type="text" name="name" autocomplete="off"
+             placeholder="{{ i18n.t("bulk-export-field-name-placeholder") }}">
+    </label>
+    <label class="field">
+      <input type="radio" name="scope" value="system" checked>
+      <b>{{ i18n.t("bulk-export-scope-system") }}</b>
+      <span class="field__hint">{{ i18n.t("bulk-export-scope-system-hint") }}</span>
+    </label>
+    <label class="field">
+      <input type="radio" name="scope" value="patient">
+      <b>{{ i18n.t("bulk-export-scope-patient") }}</b>
+      <span class="field__hint">{{ i18n.t("bulk-export-scope-patient-hint") }}</span>
+    </label>
+    <label class="field">
+      <input type="radio" name="scope" value="group">
+      <b>{{ i18n.t("bulk-export-scope-group") }}</b>
+      <span class="field__hint">{{ i18n.t("bulk-export-scope-group-hint") }}</span>
+    </label>
+    <label class="field field--group-id">
+      <span class="field__label">{{ i18n.t("bulk-export-field-group-id") }}</span>
+      <input class="field__input" type="text" name="group_id" autocomplete="off">
+      <span class="field__hint">{{ i18n.t("bulk-export-field-group-id-hint") }}</span>
+    </label>
+  </section>
+
+  <section class="card table-card">
+    <div class="toolbar">
+      <h2 class="toolbar__title">{{ i18n.t("bulk-export-types") }}</h2>
+    </div>
+    <p class="field__hint">{{ i18n.t("bulk-export-types-hint") }}</p>
+    <div class="typegrid">
+      {% for t in resource_types %}
+      <label class="typegrid__item"><input type="checkbox" name="types" value="{{ t }}"> {{ t }}</label>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="card form-panel">
+    <h2 class="toolbar__title">{{ i18n.t("bulk-export-narrow") }}</h2>
+    <label class="field">
+      <span class="field__label">{{ i18n.t("bulk-export-field-elements") }}</span>
+      <input class="field__input" type="text" name="elements" autocomplete="off"
+             placeholder="id,meta,name">
+    </label>
+    <label class="field">
+      <span class="field__label">{{ i18n.t("bulk-export-field-type-filter") }}</span>
+      <input class="field__input" type="text" name="type_filter" autocomplete="off"
+             placeholder="Patient?active=true">
+    </label>
+    <label class="field">
+      <span class="field__label">{{ i18n.t("bulk-export-field-since") }}</span>
+      <select class="field__input" name="since_preset">
+        <option value="">{{ i18n.t("bulk-export-since-all") }}</option>
+        <option value="day">{{ i18n.t("bulk-export-since-day") }}</option>
+        <option value="week">{{ i18n.t("bulk-export-since-week") }}</option>
+        <option value="month">{{ i18n.t("bulk-export-since-month") }}</option>
+        <option value="custom">{{ i18n.t("bulk-export-since-custom") }}</option>
+      </select>
+    </label>
+    <label class="field">
+      <span class="field__label">{{ i18n.t("bulk-export-field-since-custom") }}</span>
+      <input class="field__input" type="text" name="since_custom" autocomplete="off"
+             placeholder="2026-08-01T00:00:00Z">
+      <span class="field__hint">{{ i18n.t("bulk-export-field-since-custom-hint") }}</span>
+    </label>
+  </section>
+
+  <div class="detail__actions">
+    <button type="submit" class="btn btn--primary">
+      {{ i18n.t("bulk-export-start") }}
+    </button>
+  </div>
+</form>
+{% endif %}
+{% endblock %}

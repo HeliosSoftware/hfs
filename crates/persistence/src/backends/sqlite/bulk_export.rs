@@ -563,6 +563,23 @@ impl BulkExportStorage for SqliteBackend {
         Ok(count as u64)
     }
 
+    async fn count_exports_by_status(
+        &self,
+        tenant: &TenantContext,
+        status: ExportStatus,
+    ) -> StorageResult<u64> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bulk_export_jobs WHERE tenant_id = ?1 AND status = ?2",
+                params![tenant_id, status.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| internal_error(format!("Failed to count exports by status: {e}")))?;
+        Ok(count as u64)
+    }
+
     async fn list_expired_exports(
         &self,
         now: DateTime<Utc>,
@@ -1641,6 +1658,69 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(backend.count_active_exports(&tenant).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn count_exports_by_status_splits_accepted_and_in_progress_per_tenant() {
+        let backend = create_test_backend();
+        let tenant_a = create_test_tenant();
+        let tenant_b = TenantContext::new(
+            TenantId::new("other-tenant"),
+            TenantPermissions::full_access(),
+        );
+
+        backend
+            .start_export(&tenant_a, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        backend
+            .start_export(&tenant_a, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Move one of tenant A's jobs to in-progress via the real worker path.
+        let worker = WorkerId::new("worker-1");
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("a job should be claimable");
+        backend
+            .mark_export_in_progress(&tenant_a, &lease.job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend
+                .count_exports_by_status(&tenant_a, ExportStatus::Accepted)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            backend
+                .count_exports_by_status(&tenant_a, ExportStatus::InProgress)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            backend
+                .count_exports_by_status(&tenant_a, ExportStatus::Complete)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            backend
+                .count_exports_by_status(&tenant_b, ExportStatus::Accepted)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // The concurrency-cap aggregate is unaffected by the new method.
+        assert_eq!(backend.count_active_exports(&tenant_a).await.unwrap(), 2);
     }
 
     #[tokio::test]

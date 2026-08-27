@@ -10,6 +10,7 @@ use crate::types::{
     SearchValue, strip_reference_version,
 };
 
+use super::modifier_handlers::{build_missing_condition, get_missing_value, is_missing_modifier};
 use super::parameter_handlers::{
     CompositeHandler, DateHandler, NumberHandler, QuantityHandler, ReferenceHandler, StringHandler,
     TokenHandler, UriHandler,
@@ -382,16 +383,36 @@ impl QueryBuilder {
         param: &SearchParameter,
         param_offset: usize,
     ) -> Option<SqlFragment> {
-        // Handle special parameters. `_tag`/`_profile`/`_security`/`_source`
-        // are NOT special on the query side: the extractor indexes them from
-        // meta like any typed parameter (rows in search_index under their own
-        // param_name), so they take the regular token/uri path below. Routing
+        if param.values.is_empty() {
+            return None;
+        }
+
+        // `:missing` is a resource-level presence test. Resolve it before the
+        // composite and ordinary value paths so it is not wrapped in a subquery
+        // that simultaneously requires an index row for the same parameter.
+        if is_missing_modifier(&param.modifier) {
+            let is_missing = get_missing_value(&param.values[0].value);
+            return Some(build_missing_condition(param, is_missing));
+        }
+
+        // Handle special parameters. `_tag`/`_profile`/`_security`/`_source`/
+        // `_language` are NOT special on the query side: the extractor indexes
+        // them from `meta` (and, for `_language`, from `Resource.language`)
+        // like any typed parameter — rows in search_index under their own
+        // param_name — so they take the regular token/uri path below. Routing
         // them into the special handler silently dropped the condition and
-        // returned the unfiltered result set (#474).
+        // returned the unfiltered result set (#474). `_language` is indexed
+        // only on R5/R6, where the spec first defines it; on R4/R4B it is not
+        // a registered parameter and never reaches here.
+        //
+        // Anything added to this list must have a working regular path, and
+        // anything left off it must have an arm in
+        // `build_special_parameter_condition` — the `_ => None` fallback there
+        // drops the filter rather than narrowing it.
         if param.name.starts_with('_')
             && !matches!(
                 param.name.as_str(),
-                "_tag" | "_profile" | "_security" | "_source"
+                "_tag" | "_profile" | "_security" | "_source" | "_language"
             )
         {
             return self.build_special_parameter_condition(param, param_offset);
@@ -724,11 +745,6 @@ impl QueryBuilder {
         value: &SearchValue,
         param_offset: usize,
     ) -> Option<SqlFragment> {
-        // Handle :missing modifier
-        if let Some(SearchModifier::Missing) = &param.modifier {
-            return self.build_missing_condition(param, value);
-        }
-
         // Build condition based on parameter type
         let fragment = match param.param_type {
             SearchParamType::String => {
@@ -769,29 +785,6 @@ impl QueryBuilder {
             None
         } else {
             Some(fragment)
-        }
-    }
-
-    /// Builds a condition for the :missing modifier.
-    fn build_missing_condition(
-        &self,
-        param: &SearchParameter,
-        value: &SearchValue,
-    ) -> Option<SqlFragment> {
-        let is_missing = value.value.to_lowercase() == "true";
-
-        if is_missing {
-            // Missing = true: resources with NO index entry for this param
-            Some(SqlFragment::new(format!(
-                "resource_id NOT IN (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}')",
-                param.name
-            )))
-        } else {
-            // Missing = false: resources WITH an index entry for this param
-            Some(SqlFragment::new(format!(
-                "resource_id IN (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}')",
-                param.name
-            )))
         }
     }
 
@@ -971,6 +964,71 @@ mod tests {
         assert!(frag.params.is_empty());
     }
 
+    /// Every indexed `_`-prefixed parameter must produce a real condition.
+    ///
+    /// `build_special_parameter_condition`'s `_ => None` arm *drops* the
+    /// parameter rather than narrowing it, so a search whose only filter is a
+    /// missing arm answers with every resource of the type — the #474 failure
+    /// mode. `_language` (R5/R6) is indexed by the extractor exactly like the
+    /// `meta` set and so belongs on the regular token path with them; before
+    /// this it fell through to the `None` arm.
+    #[test]
+    fn indexed_meta_parameters_are_not_dropped() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+
+        for (name, param_type, value) in [
+            ("_language", SearchParamType::Token, "en-US"),
+            ("_source", SearchParamType::Uri, "http://example.org/src"),
+            ("_tag", SearchParamType::Token, "http://sys|t1"),
+            ("_profile", SearchParamType::Uri, "http://example.org/sd"),
+            ("_security", SearchParamType::Token, "http://sys|R"),
+        ] {
+            let param = SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: None,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            };
+
+            let fragment = builder
+                .build_parameter_condition(&param, 2)
+                .unwrap_or_else(|| {
+                    panic!("{name} produced no condition — the filter would be dropped")
+                });
+            assert!(
+                fragment.sql.contains(&format!("param_name = '{name}'")),
+                "{name} should read its own search_index rows, got: {}",
+                fragment.sql
+            );
+        }
+    }
+
+    /// `_in` never reaches the index — nothing writes rows for it, and the
+    /// SQLite special-parameter path has no arm for it, so a query naming it
+    /// would silently return the whole type. `helios-rest` rejects it before
+    /// the backend is asked; this pins the backend half of that contract so a
+    /// future "just let it through" change has to confront the drop. Update it
+    /// when membership resolution lands (#638).
+    #[test]
+    fn membership_parameter_has_no_backend_condition() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let param = SearchParameter {
+            name: "_in".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("List/42")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        assert!(
+            builder.build_parameter_condition(&param, 2).is_none(),
+            "_in must not be answered by the index; it is rejected at the REST layer"
+        );
+    }
+
     #[test]
     fn test_query_builder_basic() {
         let builder = QueryBuilder::new("tenant1", "Patient");
@@ -1000,6 +1058,56 @@ mod tests {
         let fragment = builder.build(&query);
 
         assert!(fragment.sql.contains("param_name = 'name'"));
+    }
+
+    #[test]
+    fn missing_parameter_bypasses_generic_value_wrapper() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+
+        for (value, membership) in [("true", "NOT IN"), ("false", "IN")] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "birthdate".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: Some(SearchModifier::Missing),
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            });
+
+            let fragment = builder.build(&query);
+
+            assert!(
+                fragment.sql.contains(&format!("resource_id {membership}")),
+                "{value}: {}",
+                fragment.sql
+            );
+            assert_eq!(
+                fragment.sql.matches("param_name = 'birthdate'").count(),
+                1,
+                ":missing must not be wrapped in a second birthdate membership query: {}",
+                fragment.sql
+            );
+            assert!(
+                fragment.sql.contains("is_contained = 0"),
+                "contained rows must not establish top-level presence: {}",
+                fragment.sql
+            );
+        }
+    }
+
+    #[test]
+    fn missing_parameter_without_values_is_ignored() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let param = SearchParameter {
+            name: "birthdate".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![],
+            chain: vec![],
+            components: vec![],
+        };
+
+        assert!(builder.build_parameter_condition(&param, 2).is_none());
     }
 
     #[test]

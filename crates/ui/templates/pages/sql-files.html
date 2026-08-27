@@ -1,0 +1,65 @@
+{% extends "layouts/base.html" %}
+
+{#
+  Files (#649): a finished $sql-export job's completion manifest — one row
+  per output with its shard download links, straight off the FHIR API's
+  result endpoint. Plain form + links; works without JavaScript.
+#}
+
+{% block title %}{{ i18n.t("sql-files-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("sql-files-title") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("sql-files-lede") }}</p>
+</section>
+
+<section class="card">
+  <div class="card-head">
+    <h3>{{ i18n.t("files-job-heading") }}</h3>
+  </div>
+  <form method="get" action="/ui/sql/files">
+    <div class="detail__field">
+      <span><label for="files-job">{{ i18n.t("export-job-id") }}</label></span>
+      <div><input id="files-job" class="field__input" type="text" name="job" value="{{ job }}"></div>
+    </div>
+    <div class="card-head">
+      <button type="submit" class="btn btn--primary">{{ i18n.t("files-load") }}</button>
+    </div>
+  </form>
+</section>
+
+{% if let Some(message) = error %}
+<p class="notice notice--warn">{{ i18n.t("files-error") }} {{ message }}</p>
+{% endif %}
+
+{% if let Some(rows) = outputs %}
+<section class="card table-card">
+  <div class="card-head">
+    <h3>{{ i18n.t("files-outputs-heading") }}{% if let Some(f) = format %} <span class="tag">{{ f }}</span>{% endif %}</h3>
+  </div>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr><th>{{ i18n.t("files-col-output") }}</th><th>{{ i18n.t("files-col-downloads") }}</th></tr>
+      </thead>
+      <tbody>
+        {% for out in rows %}
+        <tr>
+          <td>{{ out.name }}</td>
+          <td>
+            {% for loc in out.locations %}
+            <a href="{{ loc }}">{{ i18n.t_arg("files-shard", "n", loop.index.to_string()) }}</a>
+            {% endfor %}
+          </td>
+        </tr>
+        {% endfor %}
+        {% if rows.is_empty() %}
+        <tr class="data-table__empty"><td colspan="2">{{ i18n.t("files-empty") }}</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

@@ -136,7 +136,20 @@ impl SearchModifier {
             // (it negates a code match). Our backends only implement it for
             // token; advertising it for other types was incorrect.
             SearchModifier::Not => param_type == SearchParamType::Token,
-            SearchModifier::Missing => true, // Valid for all types
+            // `:missing` tests whether a single-element search parameter has an
+            // indexed value. FHIR excludes composite/combination parameters;
+            // special parameters do not have the single-element semantics this
+            // modifier requires.
+            SearchModifier::Missing => matches!(
+                param_type,
+                SearchParamType::String
+                    | SearchParamType::Token
+                    | SearchParamType::Date
+                    | SearchParamType::Number
+                    | SearchParamType::Quantity
+                    | SearchParamType::Reference
+                    | SearchParamType::Uri
+            ),
             // `:above`/`:below` are defined for token, uri, and reference.
             // Reference uses URL/path-prefix hierarchy (canonical `|version`
             // comparison is not implemented).
@@ -890,9 +903,21 @@ mod tests {
         // `:not` is token-only per the FHIR spec.
         assert!(SearchModifier::Not.is_valid_for(SearchParamType::Token));
         assert!(!SearchModifier::Not.is_valid_for(SearchParamType::String));
-        // `:missing` is valid for every parameter type.
-        assert!(SearchModifier::Missing.is_valid_for(SearchParamType::String));
-        assert!(SearchModifier::Missing.is_valid_for(SearchParamType::Reference));
+        // `:missing` is valid for ordinary single-element parameter types, but
+        // not for composite/combination or special parameters.
+        for param_type in [
+            SearchParamType::String,
+            SearchParamType::Token,
+            SearchParamType::Date,
+            SearchParamType::Number,
+            SearchParamType::Quantity,
+            SearchParamType::Reference,
+            SearchParamType::Uri,
+        ] {
+            assert!(SearchModifier::Missing.is_valid_for(param_type));
+        }
+        assert!(!SearchModifier::Missing.is_valid_for(SearchParamType::Composite));
+        assert!(!SearchModifier::Missing.is_valid_for(SearchParamType::Special));
         // `:in`/`:not-in` are token-only per the FHIR spec (not uri).
         assert!(SearchModifier::In.is_valid_for(SearchParamType::Token));
         assert!(!SearchModifier::In.is_valid_for(SearchParamType::Uri));

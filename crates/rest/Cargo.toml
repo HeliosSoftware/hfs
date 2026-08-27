@@ -120,7 +120,6 @@ hmac = "0.12"                                            # A*CBC-HS* authenticat
 sha2 = "0.10"                                            # Concat KDF, A*CBC-HS*
 p256 = { version = "0.13", features = ["ecdh", "jwk", "pem", "pkcs8"] }  # ECDH-ES (P-256)
 p384 = { version = "0.13", features = ["ecdh", "jwk", "pem", "pkcs8"] }  # ECDH-ES (P-384)
-rsa = { version = "0.9", features = ["pem"] }                # RS384 public JWK derivation (#529)
 flate2 = "1"                                             # JWE `zip: "DEF"` payloads
 
 [dev-dependencies]
@@ -133,6 +132,12 @@ helios-observability = { path = "../observability" }
 
 # Key generation for the JWE round-trip tests
 rand = "0.8"
+
+# `SearchProvider::search_param_registry` returns a `parking_lot::RwLock`, and
+# the batch unit tests' mock storage has to satisfy that trait since #478
+# widened `process_batch`'s bound. Test-only: the crate's own code reaches the
+# registry through `helios-persistence` and never names the lock type.
+parking_lot = "0.12"
 
 # Temp files
 tempfile = "3"

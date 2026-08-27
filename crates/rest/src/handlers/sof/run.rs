@@ -1,36 +1,55 @@
-//! `$viewdefinition-run` operation handler.
+//! `$sql-run` operation handler.
 //!
-//! Implements the SQL-on-FHIR
-//! [`$viewdefinition-run`](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/operations-viewdefinition-run.html)
-//! operation. Both `POST` and `GET` are routed:
+//! Implements the SQL on FHIR
+//! [`$sql-run`](http://hl7.org/fhir/uv/sql-on-fhir/OperationDefinition-SQLRun.html)
+//! operation: synchronous evaluation of a single subject, returning the rows in
+//! the requested output format.
 //!
-//! - `POST /ViewDefinition/$viewdefinition-run` — supply the ViewDefinition inline in the body
-//! - `POST /ViewDefinition/{id}/$viewdefinition-run` — run a stored ViewDefinition (body may override)
-//! - `GET /ViewDefinition/$viewdefinition-run?viewReference=ViewDefinition/{id}&_format=ndjson`
-//! - `GET /ViewDefinition/{id}/$viewdefinition-run?_format=ndjson`
+//! The operation is invoked at the **system level** only
+//! (`system=true, type=false, instance=false`) and names what it acts on
+//! through a subject parameter rather than through the request path, so one
+//! endpoint serves ViewDefinitions, SQLQuery Libraries and SQLView Libraries
+//! alike. This handler resolves the subject (see [`super::subject`]) and then
+//! dispatches: a ViewDefinition is projected here, while a Library's dependency
+//! graph is materialized and its SQL executed by [`super::sqlquery`].
+//!
+//! ```text
+//! POST /$sql-run                                    (subject in the body)
+//! GET  /$sql-run?subjectCanonical=http://…&_format=ndjson
+//! GET  /$sql-run?subjectReference=ViewDefinition/123
+//! ```
+//!
+//! `GET` is available whenever every supplied parameter is primitive.
+//! `subjectResource` and `resource` carry resources, so they require `POST`.
 //!
 //! ## Request body (POST)
 //!
-//! Accepts a FHIR `Parameters` resource or a raw `ViewDefinition` JSON object.
+//! Accepts a FHIR `Parameters` resource, or a raw `ViewDefinition` JSON object
+//! as shorthand for a `Parameters` body whose only entry is `subjectResource`.
 //!
 //! | Parameter | Type | Description |
 //! |-----------|------|-------------|
-//! | `viewResource` | Resource | The ViewDefinition to execute (Parameters form) |
-//! | `patient` | string | Restrict to this patient reference |
-//! | `group` | string | Restrict to this group reference |
-//! | `_format` | string | Output format: `ndjson`, `csv`, `json`, `parquet` (optional; defaults to `ndjson`; may also be supplied via `Accept`) |
+//! | `subjectCanonical` | canonical | Canonical URL of the subject, optionally `\|version`-pinned |
+//! | `subjectReference` | Reference | Literal location of the subject |
+//! | `subjectResource` | CanonicalResource | The subject, supplied inline |
+//! | `parameters` | Parameters | Values for the parameters a Library declares (Library subjects only) |
+//! | `resource` | Resource | FHIR resources to transform instead of server data (ViewDefinition subjects only) |
+//! | `patient` | Reference | Restrict the data feeding the view to these patients' compartments |
+//! | `group` | Reference | Restrict to members of these Groups |
+//! | `_format` | code | Output format: `ndjson`, `csv`, `json`, `parquet`, `fhir` (optional; defaults to `ndjson`; may also come from `Accept`) |
 //! | `_limit` | integer | Maximum number of output rows |
 //! | `_since` | instant | Only include resources modified after this time |
 //!
 //! ## Response
 //!
 //! - `200 OK` — stream of output rows in the requested format
-//! - `400 Bad Request` — unsupported `_format` value or invalid parameters
-//! - `422 Unprocessable Entity` — ViewDefinition could not be compiled or executed
+//! - `400 Bad Request` — unsupported `_format`, no subject or more than one, or a parameter the subject kind does not accept
+//! - `404 Not Found` — the subject could not be resolved
+//! - `422 Unprocessable Entity` — the subject could not be compiled or executed
 //! - `501 Not Implemented` — `source` parameter (storage-backed server)
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -42,9 +61,8 @@ use helios_sof::fhir_format::{
     format_view_fhir_parameters, wrap_in_binary_envelope,
 };
 use helios_sof::{
-    ContentType, ExtractedRunParams, RunOptions, body_has_view_definition,
-    create_bundle_from_resources_for_version, extract_run_params_from_json,
-    filter_resources_by_patient_and_group, filter_resources_by_since,
+    ContentType, ExtractedRunParams, RunOptions, create_bundle_from_resources_for_version,
+    extract_run_params_from_json, filter_resources_by_patient_and_group, filter_resources_by_since,
     parse_view_definition_for_version, process_view_definition, run_view_definition_with_options,
     split_csv_refs,
 };
@@ -52,21 +70,24 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::references::resolve_resource_canonical_or_relative;
+use super::sqlquery::{SqlQueryRunQuery, run_library_subject};
+use super::subject::{
+    RENAMED_VIEW_PARAM_MESSAGE, RENAMED_VIEW_PARAM_NAME, SubjectKind, SubjectRef, resolve_subject,
+};
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
 
-/// Query parameters for `$viewdefinition-run`.
+/// Query-string parameters for `$sql-run`.
 ///
 /// `patient` and `group` accept either a single reference or a comma-separated
 /// list (spec is `0..*`). Repeated entries supplied in a `Parameters` body are
 /// merged in via [`merge_params`] and take precedence.
 #[derive(Debug, Default, Deserialize)]
 pub struct RunQueryParams {
-    /// Output format: `ndjson`, `csv`, `json`, `parquet`. Optional per SoF
-    /// v2 PR #353 (`0..1`); defaults to `ndjson`. May also be supplied via
-    /// the `Accept` header (with `_format` taking precedence).
+    /// Output format: `ndjson`, `csv`, `json`, `parquet`, `fhir`. Optional
+    /// (`0..1`); defaults to `ndjson`. May also be supplied via the `Accept`
+    /// header, with `_format` taking precedence.
     #[serde(rename = "_format")]
     pub format: Option<String>,
 
@@ -87,170 +108,176 @@ pub struct RunQueryParams {
     /// Filter by group references (comma-separated for multiple).
     pub group: Option<String>,
 
-    /// Reference to a stored ViewDefinition. Only meaningful on GET requests
-    /// (POST callers supply `viewResource`/`viewReference` in the body).
-    #[serde(rename = "viewReference")]
-    pub view_reference: Option<String>,
+    /// Canonical URL of the subject, optionally `|version`-pinned. An
+    /// *identity*, resolved through the canonical index.
+    #[serde(rename = "subjectCanonical")]
+    pub subject_canonical: Option<String>,
+
+    /// Literal location of the subject — a relative URL on this server, or an
+    /// absolute one. A *location*, read directly. Not a canonical URL.
+    #[serde(rename = "subjectReference")]
+    pub subject_reference: Option<String>,
 
     /// External data source. HFS rejects this with 501 (storage-backed; the
     /// stateless `sof-server` is the right place for source-based ETL).
     pub source: Option<String>,
 }
 
-/// `POST` (or `GET`) `/ViewDefinition/$viewdefinition-run`
+/// `POST` (or `GET`) `[base]/$sql-run`
 ///
-/// On `POST`, the ViewDefinition must be supplied in the request body either as:
-/// - A raw `ViewDefinition` JSON object, or
-/// - A FHIR `Parameters` resource with a `viewResource` parameter.
+/// Evaluates a single subject and returns the rows. The subject is named by
+/// `subjectCanonical`, `subjectReference` or `subjectResource` — exactly one —
+/// rather than by the request path, which is why the operation is invoked at
+/// the system level and serves all three artifact kinds.
 ///
-/// On `GET`, no body is permitted (per spec: `viewResource` and `resource` are
-/// POST-only). The ViewDefinition must come from the `viewReference` query
-/// parameter.
+/// `GET` is available whenever every supplied parameter is primitive, which is
+/// what keeps the operation usable from a browser or a command line. It
+/// therefore accepts `subjectCanonical` and `subjectReference` on the query
+/// string but not `subjectResource` or `resource`, both of which carry a
+/// resource and so require `POST`.
 ///
-/// When the body is a `Parameters` resource, additional parameter entries
-/// (`_format`, `_limit`, `_since`, `patient`, `group`, `header`) override
-/// the corresponding query-string values per the SQL-on-FHIR spec.
-pub async fn run_view_definition_handler<S>(
+/// On `POST` the body is either a FHIR `Parameters` resource or, as a
+/// shorthand, a bare `ViewDefinition` — the latter being equivalent to a
+/// `Parameters` body whose only entry is `subjectResource`. Body parameters
+/// take precedence over the corresponding query-string values.
+pub async fn sql_run_handler<S>(
     State(state): State<AppState<S>>,
     Query(query_params): Query<RunQueryParams>,
     tenant: TenantExtractor,
     headers: HeaderMap,
     body: Option<axum::extract::Json<Value>>,
-) -> Result<impl IntoResponse, RestError>
+) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
     let body_value = body.map(|j| j.0);
-    let body_params = body_value
-        .as_ref()
-        .map(extract_run_params_from_json)
-        .unwrap_or_default();
-    let view_json = match body_value.as_ref() {
-        Some(b) => resolve_view_from_body(&state, &tenant, b).await?,
-        None => match query_params.view_reference.as_deref() {
-            Some(reference) => resolve_view_reference(&state, &tenant, reference).await?,
-            None => {
-                return Err(RestError::BadRequest {
-                    message: "GET $viewdefinition-run requires a 'viewReference' query parameter; \
-                              use POST to supply 'viewResource' or 'resource' in the body"
-                        .to_string(),
-                });
-            }
-        },
-    };
-    let params = merge_params(query_params, &body_params);
-    execute_view(state, params, body_params, tenant, view_json, &headers).await
-}
 
-/// `POST` (or `GET`) `/ViewDefinition/{id}/$viewdefinition-run`
-///
-/// Looks up the stored ViewDefinition by ID and runs it. On POST, if the body
-/// contains a `viewResource` (or is itself a `ViewDefinition` resource), the
-/// body overrides the stored definition. GET infers the ViewDefinition from
-/// the path id and ignores any body.
-pub async fn run_stored_view_definition_handler<S>(
-    State(state): State<AppState<S>>,
-    Path(id): Path<String>,
-    Query(query_params): Query<RunQueryParams>,
-    tenant: TenantExtractor,
-    headers: HeaderMap,
-    body: Option<axum::extract::Json<Value>>,
-) -> Result<impl IntoResponse, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    let body_value = body.map(|j| j.0);
-    let body_params = body_value
-        .as_ref()
-        .map(extract_run_params_from_json)
-        .unwrap_or_default();
-    // Spec: at instance level the server infers `viewReference` from the URL
-    // path. A body that supplies a different `viewResource`/`viewReference`
-    // would silently change which view runs — reject that with 400 + invalid.
-    // A body that supplies the *same* view as the path is allowed (no-op).
+    // The extractors below are deliberately permissive and silently ignore
+    // any parameter name they don't recognise — that's the existing,
+    // intentional behavior for `$sql-run`'s unknown parameters, and this
+    // handler does not introduce general strict validation. `view` is the
+    // one exception: it is the pre-ballot spelling of `context`, so a
+    // request naming it gets the same didactic 400 that `$sql-export`
+    // gives, instead of silently falling through to a generic
+    // "requires a subject" error.
     if let Some(b) = body_value.as_ref() {
-        if body_has_view_definition(b) {
-            ensure_instance_body_matches_path(b, &id, &body_params)?;
+        if body_names_parameter(b, RENAMED_VIEW_PARAM_NAME) {
+            return Err(RestError::BadRequest {
+                message: RENAMED_VIEW_PARAM_MESSAGE.to_string(),
+            });
         }
     }
-    let stored = state
-        .storage()
-        .read(tenant.context(), "ViewDefinition", &id)
-        .await
-        .map_err(|e| RestError::InternalError {
-            message: format!("failed to read ViewDefinition: {e}"),
-        })?
-        .ok_or_else(|| RestError::NotFound {
-            resource_type: "ViewDefinition".to_string(),
-            id: id.clone(),
-        })?;
-    let view_json = stored.content().clone();
-    let params = merge_params(query_params, &body_params);
-    execute_view(state, params, body_params, tenant, view_json, &headers).await
-}
 
-/// Verifies that a body-supplied `viewResource`/`viewReference` on an
-/// instance-level URL refers to the same ViewDefinition as the path id.
-/// Returns 400 + `invalid` when it doesn't.
-fn ensure_instance_body_matches_path(
-    body: &Value,
-    path_id: &str,
-    body_params: &ExtractedRunParams,
-) -> Result<(), RestError> {
-    // Bare ViewDefinition body: its `id` (if present) must match the path.
-    if body.get("resourceType").and_then(|v| v.as_str()) == Some("ViewDefinition") {
-        let body_id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if body_id.is_empty() || body_id == path_id {
-            return Ok(());
-        }
+    let body_params = body_value
+        .as_ref()
+        .map(extract_run_params_from_json)
+        .unwrap_or_default();
+
+    let subject_ref = build_subject_ref(&query_params, &body_params, body_value.as_ref());
+    let subject = resolve_subject(&state, tenant.context(), &subject_ref, "$sql-run").await?;
+
+    // `resource` carries inline FHIR resources to transform instead of using
+    // server data, and requires a ViewDefinition subject: how inline resources
+    // would reach each dependency view of a query is not specified.
+    if !body_params.inline_resources.is_empty() && subject.kind != SubjectKind::ViewDefinition {
         return Err(RestError::BadRequest {
-            message: format!(
-                "instance-level URL is bound to ViewDefinition/{path_id}; \
-                 body must not supply a different ViewDefinition (got id='{body_id}'). \
-                 POST to /ViewDefinition/$viewdefinition-run for ad-hoc runs."
-            ),
+            message: "the 'resource' parameter requires a ViewDefinition subject; how inline \
+                      resources reach each dependency view of a SQLQuery or SQLView is not \
+                      specified"
+                .to_string(),
         });
     }
 
-    // Parameters body: inline viewResource or viewReference must agree.
-    if let Some(view) = &body_params.view_resource {
-        let body_id = view.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if !body_id.is_empty() && body_id != path_id {
-            return Err(RestError::BadRequest {
-                message: format!(
-                    "instance-level URL is bound to ViewDefinition/{path_id}; \
-                     body viewResource has a different id='{body_id}'. \
-                     POST to /ViewDefinition/$viewdefinition-run for ad-hoc runs."
-                ),
-            });
-        }
-    }
-    if let Some(reference) = &body_params.view_reference {
-        let trimmed = reference.trim();
-        let expected_relative = format!("ViewDefinition/{path_id}");
-        // Accept the relative form, or any canonical/absolute URL that ends
-        // with `/ViewDefinition/{path_id}` (with optional `|version` /
-        // `@version` suffix).
-        let matches_relative = trimmed == expected_relative;
-        let matches_canonical = {
-            let without_suffix = trimmed
-                .split_once('|')
-                .map(|(u, _)| u)
-                .unwrap_or_else(|| trimmed.rsplit_once('@').map(|(u, _)| u).unwrap_or(trimmed));
-            without_suffix.ends_with(&format!("/{expected_relative}"))
-        };
-        if !matches_relative && !matches_canonical {
-            return Err(RestError::BadRequest {
-                message: format!(
-                    "instance-level URL is bound to ViewDefinition/{path_id}; \
-                     body viewReference '{reference}' refers to a different ViewDefinition. \
-                     POST to /ViewDefinition/$viewdefinition-run for ad-hoc runs."
-                ),
-            });
-        }
+    // `parameters` binds values the subject declares. A ViewDefinition declares
+    // none, so supplying them for one is a 400 rather than a silent no-op.
+    let has_parameters = body_value
+        .as_ref()
+        .map(|b| body_names_parameter(b, "parameters"))
+        .unwrap_or(false);
+    if has_parameters && !subject.kind.accepts_parameters() {
+        return Err(RestError::BadRequest {
+            message: "the 'parameters' parameter requires a SQLQuery subject; a ViewDefinition \
+                      declares no parameters, and the SQLView profile constrains \
+                      Library.parameter to 0..0"
+                .to_string(),
+        });
     }
 
-    Ok(())
+    match subject.kind {
+        SubjectKind::ViewDefinition => {
+            let params = merge_params(query_params, &body_params);
+            execute_view(
+                state,
+                params,
+                body_params,
+                tenant,
+                subject.resource,
+                &headers,
+            )
+            .await
+        }
+        SubjectKind::SqlQuery | SubjectKind::SqlView => {
+            let library_query = SqlQueryRunQuery {
+                format: query_params.format,
+                header: query_params.header,
+                limit: query_params.limit.map(|n| n as u32),
+            };
+            run_library_subject(
+                state,
+                tenant,
+                body_value.unwrap_or(Value::Null),
+                library_query,
+                &headers,
+                subject.resource,
+            )
+            .await
+        }
+    }
+}
+
+/// Collects the subject naming parameters from the query string and body.
+///
+/// A bare `ViewDefinition` body is the shorthand for `subjectResource`. Body
+/// values win over the query string, matching how every other parameter is
+/// merged.
+fn build_subject_ref(
+    query: &RunQueryParams,
+    body_params: &ExtractedRunParams,
+    body: Option<&Value>,
+) -> SubjectRef {
+    // The bare-resource shorthand: the body *is* the subject.
+    if let Some(b) = body {
+        if b.get("resourceType").and_then(|v| v.as_str()) == Some("ViewDefinition") {
+            return SubjectRef {
+                resource: Some(b.clone()),
+                ..Default::default()
+            };
+        }
+    }
+    SubjectRef {
+        canonical: body_params
+            .subject_canonical
+            .clone()
+            .or_else(|| query.subject_canonical.clone()),
+        reference: body_params
+            .subject_reference
+            .clone()
+            .or_else(|| query.subject_reference.clone()),
+        resource: body_params.subject_resource.clone(),
+    }
+}
+
+/// Whether a `Parameters` body carries an entry with the given name. Used for
+/// presence checks where the value's shape does not matter.
+fn body_names_parameter(body: &Value, name: &str) -> bool {
+    body.get("parameter")
+        .and_then(|p| p.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|e| e.get("name").and_then(|n| n.as_str()) == Some(name))
+        })
+        .unwrap_or(false)
 }
 
 /// Merges body parameters onto query-string parameters with body precedence
@@ -277,82 +304,11 @@ fn merge_params(query: RunQueryParams, body: &ExtractedRunParams) -> RunQueryPar
         since: body.since.clone().or(query.since),
         patient: query.patient,
         group: query.group,
-        view_reference: query.view_reference,
+        subject_canonical: query.subject_canonical,
+        subject_reference: query.subject_reference,
         source: body.source.clone().or(query.source),
     }
 }
-
-/// Resolves a ViewDefinition from a request body, fetching from storage when
-/// the caller supplies a `viewReference` instead of an inline `viewResource`.
-/// Supports relative references of the form `ViewDefinition/{id}`; canonical
-/// and absolute URL forms are rejected with a 400 until they are wired up.
-async fn resolve_view_from_body<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    body: &Value,
-) -> Result<Value, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    // Bare ViewDefinition body is used as-is.
-    if body.get("resourceType").and_then(|v| v.as_str()) == Some("ViewDefinition") {
-        return Ok(body.clone());
-    }
-
-    // Parameters body: look for viewResource first, fall back to viewReference.
-    if body.get("resourceType").and_then(|v| v.as_str()) == Some("Parameters") {
-        let extracted = extract_run_params_from_json(body);
-
-        // 1. Inline viewResource takes precedence when both are present.
-        if let Some(view) = extracted.view_resource {
-            return Ok(view);
-        }
-
-        // 2. Otherwise, resolve viewReference.
-        if let Some(reference) = extracted.view_reference {
-            return resolve_view_reference(state, tenant, &reference).await;
-        }
-
-        return Err(RestError::BadRequest {
-            message: "Parameters body must contain a 'viewResource' or 'viewReference' parameter"
-                .to_string(),
-        });
-    }
-
-    // Anything else is an error.
-    let rt = body
-        .get("resourceType")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    Err(RestError::BadRequest {
-        message: format!("Expected a ViewDefinition or Parameters body, got resourceType='{rt}'"),
-    })
-}
-
-/// Resolves a FHIR reference string into a stored ViewDefinition.
-///
-/// Supports all three spec-listed forms via the shared
-/// [`resolve_resource_canonical_or_relative`] helper:
-/// - Relative: `ViewDefinition/{id}`
-/// - Canonical URL with `|version` (FHIR convention) or `@version` (spec
-///   narrative form)
-/// - Absolute URL
-///
-/// Advertised by `/$sql-on-fhir-capabilities` as
-/// `supportsRelativeReference`, `supportsCanonicalReference`, and
-/// `supportsAbsoluteReference`.
-async fn resolve_view_reference<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    reference: &str,
-) -> Result<Value, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    resolve_resource_canonical_or_relative(state, tenant.context(), "ViewDefinition", reference)
-        .await
-}
-
 /// Resolves the SofRunner and executes the view, returning a streaming response.
 ///
 /// Inline `resource:` parameters are evaluated through the in-process

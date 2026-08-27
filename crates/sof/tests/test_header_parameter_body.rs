@@ -21,7 +21,7 @@ async fn test_header_parameter_boolean_true() {
                 "valueCode": "text/csv"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -45,10 +45,7 @@ async fn test_header_parameter_boolean_true() {
         ]
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     assert_eq!(response.status_code(), StatusCode::OK);
     assert_eq!(
@@ -81,7 +78,7 @@ async fn test_header_parameter_boolean_false() {
                 "valueCode": "text/csv"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -105,10 +102,7 @@ async fn test_header_parameter_boolean_false() {
         ]
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     assert_eq!(response.status_code(), StatusCode::OK);
     assert_eq!(
@@ -141,7 +135,7 @@ async fn test_header_parameter_overrides_query() {
                 "valueCode": "text/csv"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -165,7 +159,7 @@ async fn test_header_parameter_overrides_query() {
 
     // Query parameter says true, but body should override
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_query_param("header", "true")
         .json(&request_body)
         .await;
@@ -198,7 +192,7 @@ async fn test_header_parameter_without_format_is_ignored_on_non_csv() {
                 "valueBoolean": true
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -220,10 +214,13 @@ async fn test_header_parameter_without_format_is_ignored_on_non_csv() {
         ]
     });
 
-    // No `_format` specified → defaults to JSON. The body's `header`
-    // parameter should be ignored (not error).
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly to exercise the non-CSV scenario this test targets. The
+    // body's `header` parameter should be ignored (not error).
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
+        .add_header("Accept", "application/json")
         .json(&request_body)
         .await;
 
@@ -251,7 +248,7 @@ async fn test_header_parameter_with_csv_accept() {
                 "valueBoolean": false
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -275,7 +272,7 @@ async fn test_header_parameter_with_csv_accept() {
 
     // Accept header requests CSV
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Accept", "text/csv")
         .json(&request_body)
         .await;
@@ -311,7 +308,7 @@ async fn test_invalid_header_parameter_type() {
                 "valueCode": "text/csv"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -333,10 +330,7 @@ async fn test_invalid_header_parameter_type() {
         ]
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     // Should get bad request for non-boolean header value
     let status = response.status_code();
@@ -377,7 +371,7 @@ async fn test_both_format_and_header_in_body() {
                 "valueBoolean": true
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -401,10 +395,7 @@ async fn test_both_format_and_header_in_body() {
         ]
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     assert_eq!(response.status_code(), StatusCode::OK);
     assert_eq!(

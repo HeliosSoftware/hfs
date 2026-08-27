@@ -232,6 +232,9 @@ fn sweep(version: FhirVersion, version_dir: &str) -> (Manifest, Samples) {
         // coverage is the Inferno job's business (issue #368).
         use_meta_profiles: true,
         unknown_profile: UnknownProfilePolicy::Ignore,
+        // The sweep judges the published examples exactly as a default
+        // $validate would — the opt-in extension-context warnings stay off.
+        ..Default::default()
     };
 
     // Sort for determinism: readdir order is filesystem-dependent and the

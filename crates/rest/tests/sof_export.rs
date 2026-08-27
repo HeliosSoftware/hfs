@@ -1,6 +1,6 @@
-//! Handler-level tests for `$viewdefinition-export`.
+//! Handler-level tests for `$sql-export`.
 //!
-//! Tests the POST `/ViewDefinition/$viewdefinition-export`, GET/DELETE
+//! Tests the POST `/$sql-export`, GET/DELETE
 //! `/export/{job-id}/status`, and GET `/export/{job-id}/{file}` endpoints
 //! using an in-memory SQLite backend and InMemoryController.
 
@@ -130,7 +130,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -167,7 +167,7 @@ mod sof_export_tests {
 
         // Submit
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -209,7 +209,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -310,7 +310,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -350,7 +350,7 @@ mod sof_export_tests {
 
         // Submit (no data seeded — export will complete fast, but we'll cancel immediately)
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -413,7 +413,7 @@ mod sof_export_tests {
         let server = TestServer::new(app).expect("failed to create test server");
 
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -438,7 +438,7 @@ mod sof_export_tests {
         });
 
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&bad_view)
@@ -458,7 +458,7 @@ mod sof_export_tests {
 
         // Submit
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -560,7 +560,7 @@ mod sof_export_tests {
 
         // Submit
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -627,7 +627,7 @@ mod sof_export_tests {
 
         // Submit with _format=parquet
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export?_format=parquet")
+            .post("/$sql-export?_format=parquet")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -717,7 +717,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -813,7 +813,7 @@ mod sof_export_tests {
 
         // Tenant A submits an export.
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "tenant-a")
             .json(&patient_view())
@@ -865,7 +865,7 @@ mod sof_export_tests {
     async fn test_export_missing_prefer_returns_400() {
         let (server, _backend) = create_test_server_with_export().await;
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
             .await;
@@ -887,7 +887,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export?clientTrackingId=tracker-42")
+            .post("/$sql-export?clientTrackingId=tracker-42")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -920,7 +920,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export?_format=json")
+            .post("/$sql-export?_format=json")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -989,7 +989,7 @@ mod sof_export_tests {
     async fn test_export_source_param_rejected_in_query() {
         let (server, _backend) = create_test_server_with_export().await;
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export?source=s3://bucket")
+            .post("/$sql-export?source=s3://bucket")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -1015,14 +1015,14 @@ mod sof_export_tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "view", "part": [
-                    {"name": "viewResource", "resource": patient_view()}
+                {"name": "subject", "part": [
+                    {"name": "subjectResource", "resource": patient_view()}
                 ]},
                 {"name": "source", "valueString": "s3://bucket"}
             ]
         });
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
@@ -1046,7 +1046,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -1149,19 +1149,19 @@ mod sof_export_tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "view", "part": [
+                {"name": "subject", "part": [
                     {"name": "name", "valueString": "demographics"},
-                    {"name": "viewResource", "resource": patient_view()}
+                    {"name": "subjectResource", "resource": patient_view()}
                 ]},
-                {"name": "view", "part": [
+                {"name": "subject", "part": [
                     {"name": "name", "valueString": "demographics2"},
-                    {"name": "viewResource", "resource": patient_view()}
+                    {"name": "subjectResource", "resource": patient_view()}
                 ]}
             ]
         });
 
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
@@ -1443,7 +1443,7 @@ mod sof_export_tests {
         let (server, _backend) = create_test_server_with_export().await;
 
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -1479,7 +1479,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -1552,7 +1552,7 @@ mod sof_export_tests {
         let (server, _backend) = create_test_server_with_export().await;
 
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export?clientTrackingId=tracker-99")
+            .post("/$sql-export?clientTrackingId=tracker-99")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -1598,67 +1598,42 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 20b. Instance-level endpoint rejects any input parameter (spec scopes
-    //      every input parameter to system+type level only — the instance
-    //      URL `/ViewDefinition/{id}/$viewdefinition-export` identifies the
-    //      view entirely from the URL path).
+    // 20b. The pre-ballot type- and instance-level export endpoints were
+    //      consolidated into the system-level `$sql-export`, which is
+    //      `system=true, type=false, instance=false`. A stored view is named
+    //      by `subject.subjectReference` instead of by the URL path.
     // =========================================================================
 
     #[tokio::test]
-    async fn test_export_instance_level_rejects_query_params() {
-        let (server, backend) = create_test_server_with_export().await;
-        // Stash a ViewDefinition so the instance-level handler doesn't
-        // bail on a "stored view not found" 404 before reaching our check.
-        backend
-            .create(
-                &test_tenant(),
-                "ViewDefinition",
-                patient_view(),
-                FhirVersion::R4,
-            )
-            .await
-            .expect("seed ViewDefinition");
+    async fn test_pre_ballot_export_urls_are_not_routed() {
+        let (server, _backend) = create_test_server_with_export().await;
 
-        // Find the stored id (auto-assigned).
-        let view_id = backend
-            .search(
-                &test_tenant(),
-                &helios_persistence::types::SearchQuery::new("ViewDefinition"),
-            )
-            .await
-            .expect("search ViewDefinition")
-            .resources
-            .items
-            .first()
-            .expect("no ViewDefinition returned")
-            .id()
-            .to_string();
-
-        let resp = server
-            .post(&format!(
-                "/ViewDefinition/{view_id}/$viewdefinition-export?_format=csv"
-            ))
-            .add_header(PREFER, "respond-async")
-            .add_header(X_TENANT_ID, "test-tenant")
-            .await;
-        assert_eq!(
-            resp.status_code(),
-            StatusCode::BAD_REQUEST,
-            "instance-level _format must be rejected: {}",
-            resp.text()
-        );
-        let body: Value = resp.json();
-        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
-        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
-        assert!(
-            diag.contains("instance-level") && diag.contains("_format"),
-            "diagnostics must name the offending param and scope: {body}"
-        );
+        for url in [
+            "/ViewDefinition/$viewdefinition-export",
+            "/ViewDefinition/some-id/$viewdefinition-export",
+            "/$viewdefinition-export",
+            "/Library/$sqlquery-export",
+            "/Library/some-id/$sqlquery-export",
+        ] {
+            let resp = server
+                .post(url)
+                .add_header(PREFER, "respond-async")
+                .add_header(X_TENANT_ID, "test-tenant")
+                .json(&patient_view())
+                .expect_failure()
+                .await;
+            assert_ne!(
+                resp.status_code(),
+                StatusCode::ACCEPTED,
+                "{url} was consolidated into $sql-export and must not start a job"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn test_export_instance_level_rejects_body_params() {
+    async fn test_export_stored_view_by_subject_reference() {
         let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
         backend
             .create(
                 &test_tenant(),
@@ -1668,6 +1643,7 @@ mod sof_export_tests {
             )
             .await
             .expect("seed ViewDefinition");
+
         let view_id = backend
             .search(
                 &test_tenant(),
@@ -1684,24 +1660,27 @@ mod sof_export_tests {
 
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [{"name": "_format", "valueCode": "csv"}]
+            "parameter": [{"name": "subject", "part": [
+                {"name": "subjectReference",
+                 "valueReference": {"reference": format!("ViewDefinition/{view_id}")}}
+            ]}]
         });
         let resp = server
-            .post(&format!("/ViewDefinition/{view_id}/$viewdefinition-export"))
+            .post("/$sql-export?_format=csv")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
             .await;
         assert_eq!(
             resp.status_code(),
-            StatusCode::BAD_REQUEST,
-            "instance-level body params must be rejected: {}",
+            StatusCode::ACCEPTED,
+            "a stored view named by subjectReference must be exportable: {}",
             resp.text()
         );
     }
 
     // =========================================================================
-    // 21. System-level endpoint: POST /$viewdefinition-export (spec defines
+    // 21. System-level endpoint: POST /$sql-export (spec defines
     //     this operation at system, type, AND instance levels).
     // =========================================================================
 
@@ -1711,7 +1690,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let resp = server
-            .post("/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -1744,7 +1723,7 @@ mod sof_export_tests {
     async fn test_export_unknown_query_param_rejected() {
         let (server, _backend) = create_test_server_with_export().await;
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export?bogus=1")
+            .post("/$sql-export?bogus=1")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -1761,7 +1740,7 @@ mod sof_export_tests {
 
     // =========================================================================
     // 22b. `_limit` is not in the spec's input parameter table for
-    //      $viewdefinition-export (unlike $viewdefinition-run). It must be
+    //      $sql-export (unlike $sql-run). It must be
     //      rejected as an unsupported query parameter.
     // =========================================================================
 
@@ -1769,7 +1748,7 @@ mod sof_export_tests {
     async fn test_export_limit_query_param_rejected() {
         let (server, _backend) = create_test_server_with_export().await;
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export?_limit=100")
+            .post("/$sql-export?_limit=100")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -1794,14 +1773,14 @@ mod sof_export_tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "view", "part": [
-                    {"name": "viewResource", "resource": patient_view()}
+                {"name": "subject", "part": [
+                    {"name": "subjectResource", "resource": patient_view()}
                 ]},
                 {"name": "unknownThing", "valueString": "x"}
             ]
         });
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
@@ -1812,6 +1791,43 @@ mod sof_export_tests {
             outcome["issue"][0]["code"].as_str(),
             Some("not-supported"),
             "{outcome}"
+        );
+    }
+
+    // =========================================================================
+    // 23b. The renamed `view` parameter gets a didactic 400 instead of the
+    //      generic "unsupported body parameter" message. The old shape is
+    //      still rejected outright — there is no compatibility window.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_renamed_view_param_gets_didactic_message() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "view", "part": [
+                    {"name": "viewResource", "resource": patient_view()}
+                ]}
+            ]
+        });
+        let resp = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let outcome: Value = resp.json();
+        assert_eq!(
+            outcome["issue"][0]["code"].as_str(),
+            Some("not-supported"),
+            "{outcome}"
+        );
+        let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diagnostics.contains("renamed to `context`"),
+            "expected the didactic rename message, got: {diagnostics}"
         );
     }
 
@@ -1830,15 +1846,15 @@ mod sof_export_tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "view", "part": [
-                    {"name": "viewResource", "resource": patient_view()}
+                {"name": "subject", "part": [
+                    {"name": "subjectResource", "resource": patient_view()}
                 ]},
                 {"name": "_format", "valueCode": "csv"},
                 {"name": "clientTrackingId", "valueString": "body-tid"}
             ]
         });
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
@@ -1888,14 +1904,14 @@ mod sof_export_tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "view", "part": [
-                    {"name": "viewResource", "resource": patient_view()}
+                {"name": "subject", "part": [
+                    {"name": "subjectResource", "resource": patient_view()}
                 ]},
                 {"name": "_format", "valueCode": "ndjson"}
             ]
         });
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export?_format=csv")
+            .post("/$sql-export?_format=csv")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
@@ -1929,7 +1945,7 @@ mod sof_export_tests {
         let (server, _backend) = create_test_server_with_export().await;
         // Note: no `seed_patients` — the referenced Patient cannot exist.
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export?patient=Patient/missing-1")
+            .post("/$sql-export?patient=Patient/missing-1")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -1957,7 +1973,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export?_format=xml")
+            .post("/$sql-export?_format=xml")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -1994,19 +2010,19 @@ mod sof_export_tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "view", "part": [
+                {"name": "subject", "part": [
                     {"name": "name", "valueString": "demographics"},
-                    {"name": "viewResource", "resource": patient_view()}
+                    {"name": "subjectResource", "resource": patient_view()}
                 ]},
-                {"name": "view", "part": [
+                {"name": "subject", "part": [
                     {"name": "name", "valueString": "demographics"},
-                    {"name": "viewResource", "resource": patient_view()}
+                    {"name": "subjectResource", "resource": patient_view()}
                 ]}
             ]
         });
 
         let resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
@@ -2040,7 +2056,7 @@ mod sof_export_tests {
         seed_patients(&backend).await;
 
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&patient_view())
@@ -2108,7 +2124,7 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 31. `_format=fhir` is rejected on $viewdefinition-export with 400. Per
+    // 31. `_format=fhir` is rejected on $sql-export with 400. Per
     //     spec PR #365 (commit 8c21fc4), `fhir` applies to the synchronous run
     //     operations only; the export `_format` binds to ExportOutputFormatCodes
     //     (csv, ndjson, parquet, json), since a newline-delimited Parameters
@@ -2133,7 +2149,7 @@ mod sof_export_tests {
             }]
         });
         let submit_resp = server
-            .post("/ViewDefinition/$viewdefinition-export?_format=fhir")
+            .post("/$sql-export?_format=fhir")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&view)
@@ -2158,7 +2174,7 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 32. $sqlquery-export: kick-off → poll (200 + manifest) → download.
+    // 32. $sql-export: kick-off → poll (200 + manifest) → download.
     // =========================================================================
 
     use base64::Engine as _;
@@ -2214,13 +2230,13 @@ mod sof_export_tests {
     }
 
     fn sqlquery_export_body(library: Value, name: Option<&str>) -> Value {
-        let mut parts = vec![json!({"name": "queryResource", "resource": library})];
+        let mut parts = vec![json!({"name": "subjectResource", "resource": library})];
         if let Some(n) = name {
             parts.insert(0, json!({"name": "name", "valueString": n}));
         }
         json!({
             "resourceType": "Parameters",
-            "parameter": [{"name": "query", "part": parts}]
+            "parameter": [{"name": "subject", "part": parts}]
         })
     }
 
@@ -2238,7 +2254,7 @@ mod sof_export_tests {
         let body = sqlquery_export_body(library, Some("families"));
 
         let submit_resp = server
-            .post("/$sqlquery-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
@@ -2300,7 +2316,7 @@ mod sof_export_tests {
     #[tokio::test]
     async fn test_sqlquery_export_fhir_format_rejected() {
         // Per spec PR #365 (commit 8c21fc4), `fhir` is a run-operation-only
-        // format; $sqlquery-export must reject it with 400.
+        // format; $sql-export must reject it with 400.
         let (server, backend) = create_test_server_with_export().await;
         seed_patients(&backend).await;
         let vd_ref = seed_patient_flat_view(&backend).await;
@@ -2313,7 +2329,7 @@ mod sof_export_tests {
         let body = sqlquery_export_body(library, None);
 
         let submit_resp = server
-            .post("/$sqlquery-export?_format=fhir")
+            .post("/$sql-export?_format=fhir")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
@@ -2321,7 +2337,7 @@ mod sof_export_tests {
         assert_eq!(
             submit_resp.status_code(),
             StatusCode::BAD_REQUEST,
-            "fhir is a run-operation-only format; $sqlquery-export must reject it: {}",
+            "fhir is a run-operation-only format; $sql-export must reject it: {}",
             submit_resp.text()
         );
         let out: Value = submit_resp.json();
@@ -2334,12 +2350,11 @@ mod sof_export_tests {
     }
 
     #[tokio::test]
-    async fn test_sqlquery_export_instance_level() {
+    async fn test_sqlquery_export_stored_library_by_subject_reference() {
         let (server, backend) = create_test_server_with_export().await;
         seed_patients(&backend).await;
         let vd_ref = seed_patient_flat_view(&backend).await;
 
-        // Seed the Library so the instance route can read it by id.
         let library = sql_library("SELECT family FROM pt", &vd_ref, "pt");
         backend
             .create_or_update(
@@ -2352,10 +2367,18 @@ mod sof_export_tests {
             .await
             .expect("seed library");
 
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "subject", "part": [
+                {"name": "subjectReference",
+                 "valueReference": {"reference": "Library/demo-lib"}}
+            ]}]
+        });
         let submit_resp = server
-            .post("/Library/demo-lib/$sqlquery-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
             .await;
         assert_eq!(
             submit_resp.status_code(),
@@ -2381,28 +2404,32 @@ mod sof_export_tests {
         assert_eq!(status, Some("completed"));
     }
 
+    /// `subject` is `1..*`, and the spec is explicit that a request supplying
+    /// none is rejected with 400.
     #[tokio::test]
-    async fn test_sqlquery_export_missing_query_returns_422() {
+    async fn test_export_without_a_subject_returns_400() {
         let (server, _backend) = create_test_server_with_export().await;
         let resp = server
-            .post("/$sqlquery-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&json!({"resourceType": "Parameters", "parameter": []}))
             .await;
         assert_eq!(
             resp.status_code(),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::BAD_REQUEST,
             "{}",
             resp.text()
         );
+        let outcome: Value = resp.json();
+        assert_eq!(outcome["issue"][0]["code"].as_str(), Some("required"));
     }
 
     #[tokio::test]
     async fn test_sqlquery_export_missing_prefer_returns_400() {
         let (server, _backend) = create_test_server_with_export().await;
         let resp = server
-            .post("/$sqlquery-export")
+            .post("/$sql-export")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&json!({"resourceType": "Parameters", "parameter": []}))
             .await;
@@ -2414,13 +2441,13 @@ mod sof_export_tests {
         let (server, _backend) = create_test_server_with_export().await;
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [{"name": "query", "part": [
-                {"name": "queryReference",
+            "parameter": [{"name": "subject", "part": [
+                {"name": "subjectReference",
                  "valueReference": {"reference": "Library/does-not-exist"}}
             ]}]
         });
         let resp = server
-            .post("/$sqlquery-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
@@ -2434,7 +2461,7 @@ mod sof_export_tests {
         let vd_ref = seed_patient_flat_view(&backend).await;
         let library = sql_library("DELETE FROM pt", &vd_ref, "pt");
         let resp = server
-            .post("/$sqlquery-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&sqlquery_export_body(library, None))
@@ -2447,24 +2474,29 @@ mod sof_export_tests {
         );
     }
 
+    /// `context` accepts inline resources only. There is deliberately no
+    /// `contextCanonical` or `contextReference` sibling: dependencies are
+    /// matched to context entries *by* canonical URL, and the parameter exists
+    /// precisely for dependencies the server could not resolve, so naming one
+    /// by URL would hand the server back the URL it already failed on.
     #[tokio::test]
-    async fn test_sqlquery_export_view_reference_rejected_with_400() {
-        let (server, _backend) = create_test_server_with_export().await;
+    async fn test_context_by_reference_is_rejected_with_400() {
+        let (server, backend) = create_test_server_with_export().await;
+        let vd_ref = seed_patient_flat_view(&backend).await;
+        let library = sql_library("SELECT family FROM pt", &vd_ref, "pt");
+
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "query", "part": [
-                    {"name": "queryReference",
-                     "valueReference": {"reference": "Library/any"}}
+                {"name": "subject", "part": [
+                    {"name": "subjectResource", "resource": library}
                 ]},
-                {"name": "view", "part": [
-                    {"name": "viewReference",
-                     "valueReference": {"reference": "ViewDefinition/patient-flat"}}
-                ]}
+                {"name": "context",
+                 "valueReference": {"reference": "ViewDefinition/patient-flat"}}
             ]
         });
         let resp = server
-            .post("/$sqlquery-export")
+            .post("/$sql-export")
             .add_header(PREFER, "respond-async")
             .add_header(X_TENANT_ID, "test-tenant")
             .json(&body)
@@ -2472,7 +2504,7 @@ mod sof_export_tests {
         assert_eq!(
             resp.status_code(),
             StatusCode::BAD_REQUEST,
-            "view.viewReference must be rejected: {}",
+            "a context entry naming an artifact by reference must be rejected: {}",
             resp.text()
         );
         let out: Value = resp.json();

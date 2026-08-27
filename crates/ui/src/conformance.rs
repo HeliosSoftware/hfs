@@ -6,11 +6,18 @@
 //! `/CompartmentDefinition`. This crate reads them from that FHIR API over
 //! HTTP rather than from disk, so the UI shows exactly what the server holds.
 //!
+//! Storage only ever holds the server's default FHIR version (seeding is
+//! keyed on `HFS_DEFAULT_FHIR_VERSION`), so a fetch for any *other* enabled
+//! version answers from the shipped `data/` spec bundles instead (#562) —
+//! the correct per-version spec set, minus tenant-stored custom resources,
+//! which only exist for the seeded default.
+//!
 //! [`ConformanceSource`] abstracts the fetch so tests can inject a
 //! [`StaticConformanceSource`] (offline, from the shipped `data/` bundles)
 //! instead of standing up a real server.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,6 +36,84 @@ pub trait ConformanceSource: Send + Sync {
         version: FhirVersion,
         tenant: &str,
     ) -> Result<Vec<Value>, String>;
+
+    /// The server's live CapabilityStatement for `version` and `tenant`
+    /// (`GET /metadata`, #653), or an `Err` message when the fetch fails —
+    /// the page degrades, it never fabricates capabilities.
+    async fn metadata(&self, version: FhirVersion, tenant: &str) -> Result<Value, String> {
+        let _ = (version, tenant);
+        Err("metadata is not available from this source".to_string())
+    }
+
+    /// Runs `$sql-run` with `view_definition` as the inline subject and
+    /// returns the output rows (`_format=json`), or an `Err` message the page
+    /// shows in place of the results table (#649).
+    async fn sql_run(
+        &self,
+        view_definition: &Value,
+        limit: usize,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Vec<Value>, String> {
+        let _ = (view_definition, limit, version, tenant);
+        Err("$sql-run is not available from this source".to_string())
+    }
+
+    /// Creates (`id: None`) or updates one resource through the server's own
+    /// FHIR API and returns the stored resource. Backs the ViewDefinition
+    /// editor's plain-form save, which must work without JavaScript (#649).
+    async fn save_resource(
+        &self,
+        resource_type: &str,
+        id: Option<&str>,
+        resource: Value,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Value, String> {
+        let _ = (resource_type, id, resource, version, tenant);
+        Err("saving is not available from this source".to_string())
+    }
+
+    /// Submits a `$sql-export` job over `(output name, reference)` subjects
+    /// and returns the job id from its `Content-Location` (#649).
+    async fn sql_export_start(
+        &self,
+        subjects: &[(String, String)],
+        format: &str,
+        tenant: &str,
+    ) -> Result<String, String> {
+        let _ = (subjects, format, tenant);
+        Err("$sql-export is not available from this source".to_string())
+    }
+
+    /// Polls a job's status URL (#649).
+    async fn sql_export_status(&self, job_id: &str, tenant: &str) -> SqlExportStatus {
+        let _ = (job_id, tenant);
+        SqlExportStatus::Unknown
+    }
+
+    /// Cancels a job; `Ok` when the server accepted the cancellation (#649).
+    async fn sql_export_cancel(&self, job_id: &str, tenant: &str) -> Result<(), String> {
+        let _ = (job_id, tenant);
+        Err("$sql-export is not available from this source".to_string())
+    }
+
+    /// The completion manifest `Parameters` of a finished job (#649).
+    async fn sql_export_manifest(&self, job_id: &str, tenant: &str) -> Result<Value, String> {
+        let _ = (job_id, tenant);
+        Err("$sql-export is not available from this source".to_string())
+    }
+}
+
+/// What a `$sql-export` status poll answered (#649).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlExportStatus {
+    /// `202` — still running, with the `X-Progress` header when sent.
+    Running(Option<String>),
+    /// `303` — finished (the manifest tells success from failure).
+    Done,
+    /// `404` — unknown, cancelled, or reclaimed.
+    Unknown,
 }
 
 /// Reads conformance resources from the server's own FHIR API over HTTP.
@@ -40,29 +125,144 @@ pub(crate) struct HttpConformanceSource {
     client: reqwest::Client,
     base_url: String,
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    /// The version the server seeds into storage (`HFS_DEFAULT_FHIR_VERSION`).
+    /// Fetches for this version go over HTTP; any other enabled version
+    /// answers from the spec bundles in `data_dir` (#562).
+    default_version: FhirVersion,
+    data_dir: Option<PathBuf>,
 }
 
 impl HttpConformanceSource {
     pub fn new(
         base_url: String,
         outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+        default_version: FhirVersion,
+        data_dir: Option<PathBuf>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // Redirects stay manual: the async export pattern's status poll
+            // answers `303 See Other` when a job finishes, and following it
+            // would make "done" indistinguishable from "running" (#649). No
+            // other self-call relies on HTTP redirects.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client builds"),
             base_url: base_url.trim_end_matches('/').to_string(),
             outbound_auth,
+            default_version,
+            data_dir,
         }
+    }
+
+    /// A request with the tenant header and outbound auth applied.
+    async fn authorized(
+        &self,
+        request: reqwest::RequestBuilder,
+        tenant: &str,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let request = if tenant.is_empty() {
+            request
+        } else {
+            request.header("X-Tenant-ID", tenant)
+        };
+        self.outbound_auth
+            .authorize(request, &self.base_url)
+            .await
+            .map_err(|e| format!("outbound auth failed: {e}"))
+    }
+
+    /// Loads `resource_type` for a non-default `version` from the shipped
+    /// `data/` spec bundles. Storage cannot answer these: seeding only writes
+    /// the default version, and the FHIR search surface has no per-version
+    /// filter, so the bundle is the authoritative set for the version.
+    async fn fetch_spec_bundle(
+        &self,
+        resource_type: &str,
+        version: FhirVersion,
+    ) -> Result<Vec<Value>, String> {
+        let Some(dir) = self.data_dir.clone() else {
+            return Err(format!(
+                "no {resource_type} data for FHIR {}: storage holds the server default ({}) and no data directory is configured",
+                version.as_str(),
+                self.default_version.as_str(),
+            ));
+        };
+        let resource_type = resource_type.to_string();
+        tokio::task::spawn_blocking(move || match resource_type.as_str() {
+            "SearchParameter" => helios_fhir::search::SearchParameterLoader::new(version)
+                .load_spec_resources(&dir)
+                .map_err(|e| {
+                    format!(
+                        "loading the FHIR {} SearchParameter bundle failed: {e}",
+                        version.as_str()
+                    )
+                }),
+            "CompartmentDefinition" => {
+                helios_fhir::compartment::CompartmentDefinitionLoader::new(version)
+                    .load_spec_resources(&dir)
+                    .map_err(|e| {
+                        format!(
+                            "loading the FHIR {} CompartmentDefinition bundle failed: {e}",
+                            version.as_str()
+                        )
+                    })
+            }
+            other => Err(format!("unsupported conformance type {other}")),
+        })
+        .await
+        .map_err(|e| format!("spec bundle load failed: {e}"))?
     }
 }
 
 #[async_trait]
 impl ConformanceSource for HttpConformanceSource {
+    /// `GET /metadata` on the loopback base (#653). `/metadata` composes the
+    /// statement fresh from live server state and selects the described
+    /// version from the Accept header's `fhirVersion` parameter, so the
+    /// sidebar's selection rides the request — no spec-bundle fallback here,
+    /// the endpoint itself is version-aware.
+    async fn metadata(&self, version: FhirVersion, tenant: &str) -> Result<Value, String> {
+        let url = format!("{}/metadata", self.base_url);
+        let mut request = self.client.get(&url).header(
+            "Accept",
+            format!(
+                "application/fhir+json; fhirVersion={}",
+                version.as_mime_param()
+            ),
+        );
+        if !tenant.is_empty() {
+            request = request.header("X-Tenant-ID", tenant);
+        }
+        let request = self
+            .outbound_auth
+            .authorize(request, &self.base_url)
+            .await
+            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("{url} returned {}", response.status()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("parsing the CapabilityStatement failed: {e}"))
+    }
+
     async fn fetch(
         &self,
         resource_type: &str,
-        _version: FhirVersion,
+        version: FhirVersion,
         tenant: &str,
     ) -> Result<Vec<Value>, String> {
+        // Storage only holds the seeded default version; any other enabled
+        // version answers from the shipped spec bundles (#562).
+        if version != self.default_version {
+            return self.fetch_spec_bundle(resource_type, version).await;
+        }
         // Ask for everything at once, then follow `next` links for whatever
         // the server's `_count` policy withheld (#460): the request says
         // 10000, but a server capping at 1000 used to silently truncate the
@@ -72,10 +272,13 @@ impl ConformanceSource for HttpConformanceSource {
         let mut resources = Vec::new();
         // Generous page bound — only a runaway self-linking server hits it.
         for _ in 0..100 {
-            let mut request = self
-                .client
-                .get(&url)
-                .header("Accept", "application/fhir+json");
+            let mut request = self.client.get(&url).header(
+                "Accept",
+                format!(
+                    "application/fhir+json; fhirVersion={}",
+                    version.as_mime_param()
+                ),
+            );
             // Scope the self-call to the effective tenant (#344); an empty id
             // means the server default and needs no header.
             if !tenant.is_empty() {
@@ -110,6 +313,276 @@ impl ConformanceSource for HttpConformanceSource {
         }
         Ok(resources)
     }
+
+    /// `POST /$sql-run` on the loopback base with the ViewDefinition as the
+    /// inline subject (the handler's raw-resource shorthand for a Parameters
+    /// body). Storage holds the seeded default version only, so any other
+    /// version degrades with a message rather than running against the wrong
+    /// data.
+    async fn sql_run(
+        &self,
+        view_definition: &Value,
+        limit: usize,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Vec<Value>, String> {
+        if version != self.default_version {
+            return Err(format!(
+                "$sql-run reads stored data, which holds the server default (FHIR {}); switch the sidebar back to run this view",
+                self.default_version.as_str(),
+            ));
+        }
+        let url = format!("{}/$sql-run?_format=json&_limit={limit}", self.base_url);
+        // The Parameters envelope, not the raw-resource shorthand: the
+        // shorthand is ViewDefinition-only, while `subjectResource` carries
+        // Library subjects (SQL Queries / SQL Views) just the same.
+        let body = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{ "name": "subjectResource", "resource": view_definition }],
+        });
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&body);
+        if !tenant.is_empty() {
+            request = request.header("X-Tenant-ID", tenant);
+        }
+        let request = self
+            .outbound_auth
+            .authorize(request, &self.base_url)
+            .await
+            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            // $sql-run explains its 4xx in an OperationOutcome; surface its
+            // diagnostics so an invalid view reads as more than a status code.
+            let detail = response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|o| outcome_diagnostics(&o))
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default();
+            return Err(format!("$sql-run returned {status}{detail}"));
+        }
+        response
+            .json::<Vec<Value>>()
+            .await
+            .map_err(|e| format!("parsing $sql-run rows failed: {e}"))
+    }
+
+    async fn save_resource(
+        &self,
+        resource_type: &str,
+        id: Option<&str>,
+        resource: Value,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Value, String> {
+        let url = match id {
+            Some(id) => format!("{}/{resource_type}/{id}", self.base_url),
+            None => format!("{}/{resource_type}", self.base_url),
+        };
+        let accept = format!(
+            "application/fhir+json; fhirVersion={}",
+            version.as_mime_param()
+        );
+        let mut request = match id {
+            Some(_) => self.client.put(&url),
+            None => self.client.post(&url),
+        }
+        .header("Content-Type", accept.clone())
+        .header("Accept", accept)
+        .json(&resource);
+        if !tenant.is_empty() {
+            request = request.header("X-Tenant-ID", tenant);
+        }
+        let request = self
+            .outbound_auth
+            .authorize(request, &self.base_url)
+            .await
+            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let detail = response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|o| outcome_diagnostics(&o))
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default();
+            return Err(format!("saving to {url} returned {status}{detail}"));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("parsing the saved resource failed: {e}"))
+    }
+
+    async fn sql_export_start(
+        &self,
+        subjects: &[(String, String)],
+        format: &str,
+        tenant: &str,
+    ) -> Result<String, String> {
+        self.export_start(subjects, format, tenant).await
+    }
+
+    async fn sql_export_status(&self, job_id: &str, tenant: &str) -> SqlExportStatus {
+        self.export_status(job_id, tenant).await
+    }
+
+    async fn sql_export_cancel(&self, job_id: &str, tenant: &str) -> Result<(), String> {
+        self.export_cancel(job_id, tenant).await
+    }
+
+    async fn sql_export_manifest(&self, job_id: &str, tenant: &str) -> Result<Value, String> {
+        self.export_manifest(job_id, tenant).await
+    }
+}
+
+impl HttpConformanceSource {
+    async fn export_start(
+        &self,
+        subjects: &[(String, String)],
+        format: &str,
+        tenant: &str,
+    ) -> Result<String, String> {
+        let mut params: Vec<Value> = vec![serde_json::json!({
+            "name": "_format", "valueCode": format,
+        })];
+        for (name, reference) in subjects {
+            params.push(serde_json::json!({
+                "name": "subject",
+                "part": [
+                    { "name": "name", "valueString": name },
+                    { "name": "subjectReference", "valueReference": { "reference": reference } },
+                ],
+            }));
+        }
+        let url = format!("{}/$sql-export", self.base_url);
+        let request = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Prefer", "respond-async")
+            .json(&serde_json::json!({ "resourceType": "Parameters", "parameter": params }));
+        let response = self
+            .authorized(request, tenant)
+            .await?
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        let status = response.status();
+        if status != reqwest::StatusCode::ACCEPTED {
+            let detail = response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|o| outcome_diagnostics(&o))
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default();
+            return Err(format!("$sql-export returned {status}{detail}"));
+        }
+        // `Content-Location: …/export/{job-id}/status` — the id is the
+        // second-to-last path segment.
+        response
+            .headers()
+            .get("content-location")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|loc| {
+                let mut segments = loc.trim_end_matches('/').rsplit('/');
+                (segments.next() == Some("status"))
+                    .then(|| segments.next())
+                    .flatten()
+                    .map(String::from)
+            })
+            .ok_or_else(|| "the 202 carried no job id in Content-Location".to_string())
+    }
+
+    async fn export_status(&self, job_id: &str, tenant: &str) -> SqlExportStatus {
+        let url = format!("{}/export/{job_id}/status", self.base_url);
+        let request = match self.authorized(self.client.get(&url), tenant).await {
+            Ok(r) => r,
+            Err(_) => return SqlExportStatus::Unknown,
+        };
+        match request.send().await {
+            Ok(response) => match response.status().as_u16() {
+                202 => SqlExportStatus::Running(
+                    response
+                        .headers()
+                        .get("x-progress")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from),
+                ),
+                303 => SqlExportStatus::Done,
+                _ => SqlExportStatus::Unknown,
+            },
+            Err(_) => SqlExportStatus::Unknown,
+        }
+    }
+
+    async fn export_cancel(&self, job_id: &str, tenant: &str) -> Result<(), String> {
+        let url = format!("{}/export/{job_id}/status", self.base_url);
+        let response = self
+            .authorized(self.client.delete(&url), tenant)
+            .await?
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("cancelling returned {}", response.status()))
+        }
+    }
+
+    async fn export_manifest(&self, job_id: &str, tenant: &str) -> Result<Value, String> {
+        let url = format!("{}/export/{job_id}/result", self.base_url);
+        let response = self
+            .authorized(self.client.get(&url), tenant)
+            .await?
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|e| format!("parsing the manifest failed: {e}"))?;
+        if !status.is_success() {
+            let detail = outcome_diagnostics(&body)
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default();
+            return Err(format!("the result endpoint returned {status}{detail}"));
+        }
+        Ok(body)
+    }
+}
+
+/// The first issue explanation of an OperationOutcome, if that is what this
+/// is — `diagnostics` when present, else the issue's `details.text`.
+fn outcome_diagnostics(outcome: &Value) -> Option<String> {
+    outcome.get("issue")?.as_array()?.iter().find_map(|i| {
+        i.get("diagnostics")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                i.get("details")
+                    .and_then(|d| d.get("text"))
+                    .and_then(Value::as_str)
+            })
+            .map(String::from)
+    })
 }
 
 /// The `next` page URL of a searchset Bundle, if any.
@@ -154,6 +627,10 @@ fn extract_bundle_resources(bundle: &Value) -> Vec<Value> {
 #[doc(hidden)]
 pub struct StaticConformanceSource {
     map: HashMap<(String, FhirVersion), Vec<Value>>,
+    metadata: Option<Value>,
+    sql_rows: Option<Result<Vec<Value>, String>>,
+    export_status: SqlExportStatus,
+    export_manifest: Option<Result<Value, String>>,
 }
 
 impl StaticConformanceSource {
@@ -161,7 +638,35 @@ impl StaticConformanceSource {
     pub fn empty() -> Self {
         Self {
             map: HashMap::new(),
+            metadata: None,
+            sql_rows: None,
+            export_status: SqlExportStatus::Unknown,
+            export_manifest: None,
         }
+    }
+
+    /// Seeds what `sql_export_status()` answers (#649).
+    pub fn with_export_status(mut self, status: SqlExportStatus) -> Self {
+        self.export_status = status;
+        self
+    }
+
+    /// Seeds what `sql_export_manifest()` answers (#649).
+    pub fn with_export_manifest(mut self, outcome: Result<Value, String>) -> Self {
+        self.export_manifest = Some(outcome);
+        self
+    }
+
+    /// Seeds the CapabilityStatement `metadata()` answers with (#653).
+    pub fn with_metadata(mut self, statement: Value) -> Self {
+        self.metadata = Some(statement);
+        self
+    }
+
+    /// Seeds what `sql_run()` answers (#649): `Ok` rows or the `Err` message.
+    pub fn with_sql_run(mut self, outcome: Result<Vec<Value>, String>) -> Self {
+        self.sql_rows = Some(outcome);
+        self
     }
 
     /// Seeds one `(resource_type, version)` slot.
@@ -212,6 +717,66 @@ impl ConformanceSource for StaticConformanceSource {
             .cloned()
             .unwrap_or_default())
     }
+
+    async fn metadata(&self, _version: FhirVersion, _tenant: &str) -> Result<Value, String> {
+        self.metadata
+            .clone()
+            .ok_or_else(|| "no metadata seeded".to_string())
+    }
+
+    async fn sql_run(
+        &self,
+        _view_definition: &Value,
+        limit: usize,
+        _version: FhirVersion,
+        _tenant: &str,
+    ) -> Result<Vec<Value>, String> {
+        match &self.sql_rows {
+            Some(Ok(rows)) => Ok(rows.iter().take(limit).cloned().collect()),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("no $sql-run outcome seeded".to_string()),
+        }
+    }
+
+    async fn sql_export_start(
+        &self,
+        _subjects: &[(String, String)],
+        _format: &str,
+        _tenant: &str,
+    ) -> Result<String, String> {
+        Ok("static-job".to_string())
+    }
+
+    async fn sql_export_status(&self, _job_id: &str, _tenant: &str) -> SqlExportStatus {
+        self.export_status.clone()
+    }
+
+    async fn sql_export_cancel(&self, _job_id: &str, _tenant: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn sql_export_manifest(&self, _job_id: &str, _tenant: &str) -> Result<Value, String> {
+        self.export_manifest
+            .clone()
+            .unwrap_or_else(|| Err("no manifest seeded".to_string()))
+    }
+
+    /// Echoes the resource back with an id, so the save handler's redirect
+    /// (and a test's assertion on it) has something stable to point at.
+    async fn save_resource(
+        &self,
+        _resource_type: &str,
+        id: Option<&str>,
+        mut resource: Value,
+        _version: FhirVersion,
+        _tenant: &str,
+    ) -> Result<Value, String> {
+        let id = id.unwrap_or("static-created").to_string();
+        if let Some(map) = resource.as_object_mut() {
+            map.insert("id".to_string(), Value::String(id));
+        }
+        Ok(resource)
+    }
 }
 
 #[cfg(test)]
@@ -244,14 +809,83 @@ mod tests {
         );
     }
 
+    /// #562: a fetch for a version other than the server default answers from
+    /// the shipped spec bundles without touching HTTP — nothing listens at the
+    /// base URL, so reaching for it would fail the fetch.
+    #[cfg(feature = "R4B")]
+    #[tokio::test]
+    async fn non_default_versions_answer_from_the_spec_bundles() {
+        let source = HttpConformanceSource::new(
+            "http://127.0.0.1:1".to_string(),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            Some(std::path::PathBuf::from("../../data")),
+        );
+        let defs = source
+            .fetch("CompartmentDefinition", FhirVersion::R4B, "")
+            .await
+            .expect("spec bundle load");
+        let patient = defs
+            .iter()
+            .find(|d| d["code"] == "Patient")
+            .expect("patient compartment");
+        let codes: Vec<&str> = patient["resource"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["code"].as_str())
+            .collect();
+        // The set is genuinely the R4B one: Ingredient joined in R4B,
+        // EffectEvidenceSynthesis left after R4.
+        assert!(codes.contains(&"Ingredient"));
+        assert!(!codes.contains(&"EffectEvidenceSynthesis"));
+    }
+
+    /// #562: with no data directory a non-default version cannot be served —
+    /// the fetch fails loudly (degraded page) instead of silently answering
+    /// with the wrong version's set.
+    #[cfg(feature = "R4B")]
+    #[tokio::test]
+    async fn non_default_version_without_a_data_dir_fails_loudly() {
+        let source = HttpConformanceSource::new(
+            "http://127.0.0.1:1".to_string(),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+        let err = source
+            .fetch("CompartmentDefinition", FhirVersion::R4B, "")
+            .await
+            .expect_err("no data dir to answer from");
+        assert!(err.contains(FhirVersion::R4B.as_str()), "{err}");
+    }
+
     /// #460: a server that caps `_count` answers in pages; the fetch must
     /// follow `next` links and return the union, not the first page.
+    /// The self-call also names the requested version on the Accept header
+    /// (#562) — the handler rejects a request without it.
     #[tokio::test]
     async fn http_fetch_follows_next_links() {
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
         use axum::{Router, extract::Query, routing::get};
         use std::collections::HashMap;
 
-        async fn page(Query(q): Query<HashMap<String, String>>) -> axum::Json<Value> {
+        async fn page(
+            headers: HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::response::Response {
+            let accept = headers
+                .get("accept")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if !accept.contains("fhirVersion=4.0") {
+                return axum::http::StatusCode::NOT_ACCEPTABLE.into_response();
+            }
+            inner(q).into_response()
+        }
+
+        fn inner(q: HashMap<String, String>) -> axum::Json<Value> {
             let offset: usize = q.get("_offset").map(|o| o.parse().unwrap()).unwrap_or(0);
             let mut bundle = serde_json::json!({
                 "resourceType": "Bundle",
@@ -277,6 +911,8 @@ mod tests {
         let source = HttpConformanceSource::new(
             format!("http://{addr}"),
             std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
         );
         let resources = source
             .fetch("SearchParameter", FhirVersion::R4, "")

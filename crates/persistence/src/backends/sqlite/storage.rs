@@ -204,12 +204,13 @@ impl ResourceStorage for SqliteBackend {
         // Index the resource for search
         self.index_resource(&conn, tenant_id, resource_type, &id, &resource)?;
 
-        // An *active* SearchParameter write changes this tenant's overlay — drop
-        // its cached registry so the next access rebuilds from storage. Draft
-        // copies (e.g. the seeded spec set) never overlay, so skip them and
-        // avoid an O(n²) rebuild storm during bulk seeding.
+        // An overlay-affecting SearchParameter write changes this tenant's
+        // registry — drop the cached copy so the next access rebuilds from
+        // storage. Seeded spec copies never affect the overlay (see
+        // `create_affects_overlay`), which keeps bulk seeding from triggering
+        // an O(n²) rebuild storm.
         if resource_type == "SearchParameter"
-            && crate::search::search_parameter_create_affects_overlay(&resource)
+            && self.tenant_registries().create_affects_overlay(&resource)
         {
             self.tenant_registries().invalidate(tenant_id);
         }
@@ -1112,9 +1113,10 @@ impl SqliteBackend {
         self.delete_search_index(&conn, tenant_id, resource_type, id)?;
         self.index_resource(&conn, tenant_id, resource_type, id, &resource)?;
 
-        // A restored *active* SearchParameter re-enters this tenant's overlay.
+        // A restored overlay-affecting SearchParameter re-enters this tenant's
+        // overlay.
         if resource_type == "SearchParameter"
-            && crate::search::search_parameter_create_affects_overlay(&resource)
+            && self.tenant_registries().create_affects_overlay(&resource)
         {
             self.tenant_registries().invalidate(tenant_id);
         }
@@ -2919,23 +2921,11 @@ impl SqliteBackend {
         let mut search_params = Vec::with_capacity(params.len());
 
         for (name, value) in params {
-            // Look up the parameter definition to get its type
+            // Look up the parameter definition to get its type, falling back to
+            // the shared registry-miss guess when it is not registered.
             let param_type = self
                 .lookup_param_type(&registry, resource_type, name)
-                .unwrap_or({
-                    // Fallback for common parameters when not in registry
-                    match name.as_str() {
-                        "_id" => SearchParamType::Token,
-                        "_lastUpdated" => SearchParamType::Date,
-                        "_tag" | "_profile" | "_security" => SearchParamType::Token,
-                        "identifier" => SearchParamType::Token,
-                        // Common reference parameters across many resource types
-                        "patient" | "subject" | "encounter" | "performer" | "author"
-                        | "requester" | "recorder" | "asserter" | "practitioner"
-                        | "organization" | "location" | "device" => SearchParamType::Reference,
-                        _ => SearchParamType::String, // Default fallback
-                    }
-                });
+                .unwrap_or_else(|| crate::search::fallback_param_type(name));
 
             search_params.push(SearchParameter {
                 name: name.clone(),

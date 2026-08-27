@@ -159,12 +159,44 @@ async fn execute_search<S>(
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    let bundle_json = execute_search_bundle(state, &tenant, resource_type, pairs, strict).await?;
+    format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format).map_err(|_| {
+        RestError::InternalError {
+            message: "Failed to serialize response".to_string(),
+        }
+    })
+}
+
+/// Executes a type-level search and returns the searchset Bundle as JSON.
+///
+/// The HTTP search handlers wrap this in content negotiation; bundle
+/// processing (`GET [type]?params` entries in batch/transaction Bundles,
+/// #478) embeds the returned Bundle as an entry resource.
+pub(crate) async fn execute_search_bundle<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    resource_type: &str,
+    pairs: Vec<(String, String)>,
+    strict: bool,
+) -> RestResult<serde_json::Value>
+where
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
+{
     // Reject known-but-unimplemented control parameters instead of silently
     // ignoring them (which returns an unfiltered, misleading `200`). `_query`
     // (named queries) is not implemented by any backend. (`_list` is implemented
     // via list resolution; `_score` as an output/`_sort` concept; `_contained` /
     // `_containedType` are parsed below and gated per backend capability.)
-    const UNSUPPORTED_PARAMS: [&str; 1] = ["_query"];
+    //
+    // `_in` (R5/R6) asks whether a resource is a member of a referenced List or
+    // Group; resolving that is not implemented (#638). It cannot be left to fall
+    // through, because it *is* a registered parameter of type `reference` on
+    // those versions — so `Prefer: handling=lenient` would not drop it, and the
+    // backends would answer it with whatever their reference path makes of the
+    // spec's placeholder `Resource.id` expression: an identity test on
+    // PostgreSQL, an unfiltered result set on SQLite. Use `_list` for List
+    // membership.
+    const UNSUPPORTED_PARAMS: [&str; 2] = ["_query", "_in"];
     if let Some((key, _)) = pairs
         .iter()
         .find(|(k, _)| UNSUPPORTED_PARAMS.contains(&k.as_str()))
@@ -427,11 +459,7 @@ where
         append_ignored_params_outcome(&mut bundle_json, &ignored_params);
     }
 
-    format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format).map_err(|_| {
-        RestError::InternalError {
-            message: "Failed to serialize response".to_string(),
-        }
-    })
+    Ok(bundle_json)
 }
 
 /// Appends a `search.mode = outcome` entry to a searchset bundle reporting the

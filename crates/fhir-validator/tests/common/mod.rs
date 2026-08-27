@@ -73,6 +73,7 @@ pub fn run_fixture_file(sub: &str, name: &str) {
             // in fixtures are fixture bugs — surface them as errors.
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Error,
+            ..Default::default()
         };
         let outcome = validator.validate_sync(&case.data, &opts);
         let actual = serde_json::to_value(&outcome.errors).expect("errors serialize");

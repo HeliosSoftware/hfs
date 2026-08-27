@@ -1,6 +1,6 @@
 # SQL-on-FHIR
 
-The `helios-sof` crate implements the [SQL-on-FHIR](https://sql-on-fhir.org/ig/latest/index.html) specification. It transforms FHIR resources into tabular data using ViewDefinitions and ships two executables.
+The `helios-sof` crate implements the [SQL-on-FHIR](http://hl7.org/fhir/uv/sql-on-fhir/index.html) specification. It transforms FHIR resources into tabular data using ViewDefinitions and ships two executables.
 
 ## CLI — `sof-cli`
 
@@ -27,7 +27,7 @@ cargo run --bin sof-server
 
 ### Endpoint
 
-`POST /ViewDefinition/$viewdefinition-run`
+`POST /$sql-run`
 
 Request body parameters (JSON):
 
@@ -35,7 +35,7 @@ Request body parameters (JSON):
 |-----------|-------------|
 | `_format` | Output format: `csv`, `ndjson`, `json`, `parquet` |
 | `header` | CSV header row: `true` / `false` |
-| `viewResource` | ViewDefinition resource (JSON) |
+| `subjectResource` | ViewDefinition resource (JSON) |
 | `resource` | FHIR resources to transform |
 | `patient` | Filter by patient reference |
 | `_limit` | Limit results (1–10000) |

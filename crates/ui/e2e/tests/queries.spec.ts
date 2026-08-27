@@ -1,5 +1,5 @@
 import { test, expect } from "../pages/fixtures";
-import { createResource } from "../pages/api";
+import { createResource, waitSearchable } from "../pages/api";
 
 // The Saved Queries workspace (/ui/queries): the shared query builder and the
 // in-page results table — run a query, add builder rows, page through results,
@@ -32,7 +32,10 @@ test.describe("query builder", () => {
     queries,
     request,
   }) => {
-    for (let i = 0; i < 3; i++) await createResource(request, "Device", {});
+    const devices = [];
+    for (let i = 0; i < 3; i++) devices.push(await createResource(request, "Device", {}));
+    // Indices refresh per resource type: wait on each device, not just the last.
+    for (const id of devices) await waitSearchable(request, "Device", id);
 
     await queries.goto();
     await queries.builder.run("Device?_count=2");
@@ -62,11 +65,15 @@ test.describe("query builder", () => {
       name: [{ family: "ChainLinked" }],
       generalPractitioner: [{ reference: `Practitioner/${gp}` }],
     });
-    await createResource(request, "Observation", {
+    const observation = await createResource(request, "Observation", {
       status: "final",
       code: { coding: [{ code: `chain-94-${tag}` }] },
       subject: { reference: `Patient/${patient}` },
     });
+    // The chained query touches three indices; each refreshes on its own tick.
+    await waitSearchable(request, "Practitioner", gp);
+    await waitSearchable(request, "Patient", patient);
+    await waitSearchable(request, "Observation", observation);
 
     await queries.goto();
     await queries.builder.run(
@@ -141,6 +148,25 @@ test.describe("query builder", () => {
     await expect
       .poll(async () => chain.locator(".builder-row__ctype option").count())
       .toBeGreaterThan(1);
+  });
+
+  test("drilling preserves a literal comma and every real OR alternative", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?general-practitioner=a%5C%2Cb,c");
+    const row = queries.builder.conditionRows.first();
+    const drill = queries.builder.drillButton(row);
+    await expect(drill).toBeVisible();
+    await drill.click();
+
+    const chain = queries.builder.chainRows.first();
+    await expect(chain.locator(".builder-row__value")).toHaveCount(2);
+    await expect(chain.locator(".builder-row__value").nth(0)).toHaveValue("a,b");
+    await expect(chain.locator(".builder-row__value").nth(1)).toHaveValue("c");
+    await chain.locator(".builder-row__cparam").fill("name");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?general-practitioner.name=a\\,b,c",
+    );
   });
 
   test("a _has query hydrates into a reverse-chain row and round-trips", async ({
@@ -228,6 +254,92 @@ test.describe("query builder", () => {
     await expect(queries.builder.url).toHaveValue("GET /Patient?name=Smith,Garcia");
   });
 
+  test("escaped commas stay one visual value through narration, editing and Run", async ({
+    queries,
+    request,
+  }) => {
+    const tag = Date.now().toString(36);
+    const literalName = `Comma,Literal-${tag}`;
+    const escapedName = encodeURIComponent(literalName.replace(",", "\\,"));
+    const literal = await createResource(request, "Patient", {
+      name: [{ family: literalName }],
+    });
+    const comma = await createResource(request, "Patient", {
+      name: [{ family: `Comma-${tag}` }],
+    });
+    const literalWord = await createResource(request, "Patient", {
+      name: [{ family: `Literal-${tag}` }],
+    });
+    for (const id of [literal, comma, literalWord]) {
+      await waitSearchable(request, "Patient", id);
+    }
+
+    await queries.goto();
+    await queries.builder.setUrl(`Patient?name:exact=${escapedName}`);
+    const row = queries.builder.conditionRows.first();
+    const value = row.locator(".builder-row__value");
+    await expect(value).toHaveCount(1);
+    await expect(value).toHaveValue(literalName);
+    await expect(queries.page.locator("#query-plain-text")).toContainText(
+      `name is exactly “${literalName}”`,
+    );
+    await expect(queries.page.locator("#query-plain-text")).not.toContainText("” or “");
+
+    const requestSent = queries.page.waitForRequest((candidate) => {
+      const url = new URL(candidate.url());
+      return url.pathname === "/Patient" && url.searchParams.has("name:exact");
+    });
+    await queries.builder.runButton.click();
+    const sent = await requestSent;
+    expect(new URL(sent.url()).searchParams.get("name:exact")).toBe(
+      literalName.replace(",", "\\,"),
+    );
+    await queries.results.waitShown();
+    await expect(queries.results.rows).toHaveCount(1);
+    await expect(queries.results.rows.first()).toContainText(literal);
+
+    await value.fill(`Comma,Edited-${tag}`);
+    await expect(queries.builder.url).toHaveValue(
+      `GET /Patient?name:exact=Comma\\,Edited-${tag}`,
+    );
+  });
+
+  test("literal commas coexist with real OR values in conditions, chains and _has", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?name=a%5C%2Cb,c");
+    let row = queries.builder.conditionRows.first();
+    await expect(row.locator(".builder-row__value")).toHaveCount(2);
+    await expect(row.locator(".builder-row__value").nth(0)).toHaveValue("a,b");
+    await expect(row.locator(".builder-row__value").nth(1)).toHaveValue("c");
+    await row.locator("[data-remove-or]").nth(1).click();
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name=a\\,b");
+
+    await queries.builder.setUrl("Patient?general-practitioner.name=a%5C%2Cb,c");
+    row = queries.builder.chainRows.first();
+    await expect(row.locator(".builder-row__value")).toHaveCount(2);
+    await expect(row.locator(".builder-row__value").nth(0)).toHaveValue("a,b");
+
+    await queries.builder.setUrl("Patient?_has:Observation:patient:code=a%5C%2Cb,c");
+    row = queries.builder.hasRows.first();
+    await expect(row.locator(".builder-row__value")).toHaveCount(2);
+    await expect(row.locator(".builder-row__value").nth(0)).toHaveValue("a,b");
+  });
+
+  test("malformed FHIR escapes keep the GET unchanged until corrected", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?name=a%5Cx");
+    const row = queries.builder.conditionRows.first();
+    await expect(queries.builder.error).toBeVisible();
+    await expect(queries.builder.error).toContainText("invalid FHIR escape");
+
+    await row.locator(".builder-row__key").fill("family");
+    await expect(queries.builder.url).toHaveValue("Patient?name=a%5Cx");
+
+    await row.locator(".builder-row__value").fill("a\\x");
+    await expect(queries.builder.error).toBeHidden();
+    await expect(queries.builder.url).toHaveValue("GET /Patient?family=a\\\\x");
+  });
+
   test("the + or button stacks a value; the per-value × removes it", async ({
     queries,
   }) => {
@@ -242,14 +354,147 @@ test.describe("query builder", () => {
     await expect(queries.builder.url).toHaveValue("GET /Patient?name=Jones");
   });
 
-  test("comparator OR values keep a prefix per alternative", async ({ queries }) => {
-    await queries.builder.setUrl("Patient?birthdate=ge1980-01-01,le1990-12-31");
+  test("unchanged empty alternatives survive an unrelated visual edit", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?name=a,,b");
     const row = queries.builder.conditionRows.first();
-    await expect(row.locator(".builder-row__value")).toHaveCount(2);
-    // The second alternative keeps its own comparator on round-trip.
-    await row.locator(".builder-row__value").nth(0).fill("ge1985-01-01");
+    await expect(row.locator(".builder-row__value")).toHaveCount(3);
+    await row.locator(".builder-row__key").fill("family");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?family=a,,b");
+  });
+
+  test("modifier values that resemble comparators remain literal", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?name:exact=ge1980,le1990");
+    const row = queries.builder.conditionRows.first();
+    const comparators = row.locator(".builder-row__comparator");
+    const values = row.locator(".builder-row__value");
+
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("exact");
+    await expect(comparators.nth(0)).toHaveValue("");
+    await expect(comparators.nth(1)).toHaveValue("");
+    await expect(values.nth(0)).toHaveValue("ge1980");
+    await expect(values.nth(1)).toHaveValue("le1990");
+    await expect(queries.page.locator("#query-plain-text")).toContainText(
+      "name is exactly “ge1980” or “le1990”",
+    );
+
+    await values.nth(0).fill("ge1981");
     await expect(queries.builder.url).toHaveValue(
-      "GET /Patient?birthdate=ge1985-01-01,le1990-12-31",
+      "GET /Patient?name:exact=ge1981,le1990",
+    );
+  });
+
+  const mixedComparatorOrders = [
+    {
+      name: "le then ge",
+      query: "Patient?birthdate=le1979-12-31,ge1980-01-02",
+      comparators: ["le", "ge"],
+      values: ["1979-12-31", "1980-01-02"],
+      narration:
+        "birthdate is on or before “1979-12-31” or birthdate is on or after “1980-01-02”",
+    },
+    {
+      name: "ge then le",
+      query: "Patient?birthdate=ge1980-01-02,le1979-12-31",
+      comparators: ["ge", "le"],
+      values: ["1980-01-02", "1979-12-31"],
+      narration:
+        "birthdate is on or after “1980-01-02” or birthdate is on or before “1979-12-31”",
+    },
+  ];
+
+  for (const scenario of mixedComparatorOrders) {
+    test(`mixed date comparators hydrate independently: ${scenario.name}`, async ({ queries }) => {
+      await queries.builder.setUrl(scenario.query);
+      const row = queries.builder.conditionRows.first();
+      const alternatives = row.locator(".builder-row__orvalue");
+      const comparators = row.locator(".builder-row__comparator");
+      const values = row.locator(".builder-row__value");
+
+      await expect(alternatives).toHaveCount(2);
+      await expect(comparators).toHaveCount(2);
+      await expect(comparators.nth(0)).toHaveValue(scenario.comparators[0]);
+      await expect(comparators.nth(1)).toHaveValue(scenario.comparators[1]);
+      await expect(comparators.nth(0)).toBeVisible();
+      await expect(comparators.nth(1)).toBeVisible();
+      await expect(values.nth(0)).toHaveValue(scenario.values[0]);
+      await expect(values.nth(1)).toHaveValue(scenario.values[1]);
+      await values.nth(0).fill(scenario.values[0]);
+      await expect(queries.builder.url).toHaveValue(`GET /${scenario.query}`);
+      await expect(queries.page.locator("#query-plain-text")).toContainText(
+        scenario.narration,
+      );
+    });
+  }
+
+  test("editing one date comparator leaves its sibling unchanged", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?birthdate=le1979-12-31,ge1980-01-02");
+    const row = queries.builder.conditionRows.first();
+    const comparators = row.locator(".builder-row__comparator");
+    const values = row.locator(".builder-row__value");
+
+    await comparators.nth(1).selectOption("gt");
+    await expect(comparators.nth(0)).toHaveValue("le");
+    await expect(comparators.nth(1)).toHaveValue("gt");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?birthdate=le1979-12-31,gt1980-01-02",
+    );
+    await expect(queries.page.locator("#query-plain-text")).toContainText(
+      "birthdate is on or before “1979-12-31” or birthdate is after “1980-01-02”",
+    );
+
+    await values.nth(0).fill("1978-12-31");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?birthdate=le1978-12-31,gt1980-01-02",
+    );
+    await expect(comparators.nth(1)).toHaveValue("gt");
+  });
+
+  test("adding and removing date alternatives keeps comparators with their values", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?birthdate=le1979-12-31");
+    const row = queries.builder.conditionRows.first();
+
+    await row.locator("[data-add-or]").click();
+    const alternatives = row.locator(".builder-row__orvalue");
+    await expect(alternatives).toHaveCount(2);
+    await expect(alternatives.nth(1).locator(".builder-row__comparator")).toHaveValue("");
+    await alternatives.nth(1).locator(".builder-row__comparator").selectOption("ge");
+    await alternatives.nth(1).locator(".builder-row__value").fill("1980-01-02");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?birthdate=le1979-12-31,ge1980-01-02",
+    );
+
+    await alternatives.nth(0).locator("[data-remove-or]").click();
+    await expect(alternatives).toHaveCount(1);
+    await expect(alternatives.first().locator(".builder-row__comparator")).toHaveValue("ge");
+    await expect(alternatives.first().locator(".builder-row__value")).toHaveValue(
+      "1980-01-02",
+    );
+    await expect(queries.builder.url).toHaveValue("GET /Patient?birthdate=ge1980-01-02");
+  });
+
+  test("date comparators stay available in forward and reverse chains", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?link:Patient.birthdate=1980-01-02");
+    const chain = queries.builder.chainRows.first();
+    const chainComparator = chain.locator(".builder-row__comparator");
+    await expect(chain).toHaveAttribute("data-mod-type", "date");
+    await expect(chainComparator).toBeVisible();
+    await chainComparator.selectOption("ge");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?link:Patient.birthdate=ge1980-01-02",
+    );
+
+    await queries.builder.setUrl("Patient?_has:Observation:patient:date=2020-01-01");
+    const reverseChain = queries.builder.hasRows.first();
+    const reverseComparator = reverseChain.locator(".builder-row__comparator");
+    await expect(reverseChain).toHaveAttribute("data-mod-type", "date");
+    await expect(reverseComparator).toBeVisible();
+    await reverseComparator.selectOption("le");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_has:Observation:patient:date=le2020-01-01",
     );
   });
 
@@ -267,22 +512,209 @@ test.describe("query builder", () => {
     expect(opts).not.toContain(":in");
   });
 
-  test("the MODIFY panel explains chips and clicking one applies it", async ({
-    queries,
-  }) => {
+  test("the MODIFY panel explains its chips", async ({ queries }) => {
     await queries.builder.setUrl("Patient?name=ann");
     const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
     await row.locator("[data-toggle-mods]").click();
     const panel = row.locator(".builder-row__modpanel");
     await expect(panel).toBeVisible();
     const chip = panel.locator("[data-mod-chip=contains]");
     await expect(chip).toContainText(":contains");
     await expect(chip).toContainText("anywhere");
-
-    await chip.click();
-    await expect(row.locator(".builder-row__modifier")).toHaveValue("contains");
-    await expect(queries.builder.url).toHaveValue("GET /Patient?name:contains=ann");
   });
+
+  test("choosing a comparator clears the active modifier chip", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?birthdate=1980-01-02");
+    const row = queries.builder.conditionRows.first();
+    await row.locator("[data-toggle-mods]").click();
+    const missingChip = row.locator("[data-mod-chip=missing]");
+
+    await missingChip.click();
+    await expect(missingChip).toHaveAttribute("aria-pressed", "true");
+    await row.locator(".builder-row__comparator").selectOption("ge");
+
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(missingChip).toHaveAttribute("aria-pressed", "false");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?birthdate=ge1980-01-02");
+  });
+
+  const modifierLayoutScenarios = [
+    {
+      name: "desktop string with two OR values in Spanish",
+      width: 1280,
+      lang: "es",
+      query: "Patient?name=ann,anne",
+      modType: "string",
+      requiredChip: "contains",
+      interaction: {
+        chip: "contains",
+        url: "GET /Patient?name:contains=ann,anne",
+      },
+    },
+    {
+      name: "token just above the responsive breakpoint in German",
+      width: 901,
+      lang: "de",
+      query: "Patient?gender=male",
+      modType: "token",
+      requiredChip: "of-type",
+    },
+    {
+      name: "date alternatives with independent comparators",
+      width: 901,
+      lang: "en",
+      query: "Patient?birthdate=le1979-12-31,ge1980-01-02",
+      modType: "date",
+      requiredChip: "missing",
+    },
+    {
+      name: "unknown parameter at a narrow width in English",
+      width: 760,
+      lang: "en",
+      query: "Patient?custom-param=value",
+      requiredChip: "above",
+      wraps: true,
+    },
+  ];
+
+  for (const scenario of modifierLayoutScenarios) {
+    test(`the MODIFY panel preserves layout for ${scenario.name}`, async ({
+      page,
+      queries,
+    }) => {
+      await page.setViewportSize({ width: scenario.width, height: 900 });
+      await page.goto(`/ui/queries?lang=${scenario.lang}`, { waitUntil: "networkidle" });
+      await expect(page.locator("html")).toHaveAttribute("lang", scenario.lang);
+      await queries.builder.setUrl(scenario.query);
+
+      const row = queries.builder.conditionRows.first();
+      if ("modType" in scenario) {
+        await expect(row).toHaveAttribute("data-mod-type", scenario.modType);
+      }
+
+      const primaryControls = row.locator(
+        ".builder-row__key, .builder-row__modifier, .builder-row__values, " +
+          ".builder-row__or, .builder-row__adv, [data-remove-row]",
+      );
+      const primaryBounds = () =>
+        primaryControls.evaluateAll((elements) => {
+          const rowRect = elements[0].closest(".builder-row")!.getBoundingClientRect();
+          return elements.map((element) => {
+            const rect = element.getBoundingClientRect();
+            return [
+              rect.x - rowRect.x,
+              rect.y - rowRect.y,
+              rect.width,
+              rect.height,
+            ].map(Math.round);
+          });
+        });
+
+      const before = await primaryBounds();
+      const toggle = row.locator("[data-toggle-mods]");
+      await toggle.click();
+      const panel = row.locator(".builder-row__modpanel");
+      await expect(panel).toBeVisible();
+      await expect(panel.locator(`[data-mod-chip='${scenario.requiredChip}']`)).toBeVisible();
+
+      expect(await primaryBounds()).toEqual(before);
+      const geometry = await row.evaluate((element) => {
+        const rowRect = element.getBoundingClientRect();
+        const relativeBox = (node: Element, parentRect = rowRect) => {
+          const rect = node.getBoundingClientRect();
+          return {
+            x: rect.x - parentRect.x,
+            y: rect.y - parentRect.y,
+            width: rect.width,
+            height: rect.height,
+          };
+        };
+        const panel = element.querySelector(".builder-row__modpanel")!;
+        const panelBox = relativeBox(panel);
+        const panelClientRect = panel.getBoundingClientRect();
+        const visibleLeaves = Array.from(
+          element.querySelectorAll(
+            ".builder-row__key, .builder-row__modifier, .builder-row__comparator, " +
+              ".builder-row__value, " +
+              ".builder-row__remove--or, .builder-row__or, .builder-row__adv, [data-remove-row]",
+          ),
+        ).filter((leaf) => {
+          const style = getComputedStyle(leaf);
+          return style.display !== "none" && style.visibility !== "hidden";
+        });
+        const leafBoxes = visibleLeaves.map((leaf) => relativeBox(leaf));
+        const chips = Array.from(panel.querySelectorAll(".builder-row__modchip")).map((chip) =>
+          relativeBox(chip, panelClientRect),
+        );
+        const overlaps = (
+          first: ReturnType<typeof relativeBox>,
+          second: ReturnType<typeof relativeBox>,
+        ) =>
+          first.x < second.x + second.width - 1 &&
+          first.x + first.width > second.x + 1 &&
+          first.y < second.y + second.height - 1 &&
+          first.y + first.height > second.y + 1;
+        const pairwiseClear = (boxes: ReturnType<typeof relativeBox>[]) =>
+          boxes.every((box, index) => boxes.slice(index + 1).every((other) => !overlaps(box, other)));
+        const within = (box: ReturnType<typeof relativeBox>, width: number, height: number) =>
+          box.x >= -1 &&
+          box.y >= -1 &&
+          box.x + box.width <= width + 1 &&
+          box.y + box.height <= height + 1;
+        const valueWidths = Array.from(element.querySelectorAll(".builder-row__value")).map(
+          (value) => value.getBoundingClientRect().width,
+        );
+        return {
+          panelBelowControls:
+            panelBox.y >= Math.max(...leafBoxes.map((box) => box.y + box.height)) - 1,
+          panelFullWidth:
+            Math.abs(panelBox.x) <= 1 && Math.abs(panelBox.width - rowRect.width) <= 1,
+          noOverflow:
+            element.scrollWidth <= element.clientWidth + 1 &&
+            panel.scrollWidth <= panel.clientWidth + 1,
+          controlsDoNotOverlap: pairwiseClear(leafBoxes),
+          chipsDoNotOverlap: pairwiseClear(chips),
+          controlsContained: leafBoxes.every((box) =>
+            within(box, rowRect.width, rowRect.height),
+          ),
+          panelContained: within(panelBox, rowRect.width, rowRect.height),
+          chipsContained: chips.every((box) =>
+            within(box, panelClientRect.width, panelClientRect.height),
+          ),
+          minimumValueWidth: Math.min(...valueWidths),
+          chipsWrap: chips.some((chip) => chip.y >= chips[0].y + chips[0].height - 1),
+        };
+      });
+
+      expect(geometry).toMatchObject({
+        panelBelowControls: true,
+        panelFullWidth: true,
+        noOverflow: true,
+        controlsDoNotOverlap: true,
+        chipsDoNotOverlap: true,
+        controlsContained: true,
+        panelContained: true,
+        chipsContained: true,
+      });
+      expect(geometry.minimumValueWidth).toBeGreaterThan(120);
+      if ("wraps" in scenario) expect(geometry.chipsWrap).toBe(true);
+
+      if ("interaction" in scenario) {
+        const chip = panel.locator(`[data-mod-chip='${scenario.interaction.chip}']`);
+        await chip.click();
+        await expect(chip).toHaveAttribute("aria-pressed", "true");
+        await expect(row.locator(".builder-row__modifier")).toHaveValue(
+          scenario.interaction.chip,
+        );
+        await expect(queries.builder.url).toHaveValue(scenario.interaction.url);
+      }
+
+      await toggle.click();
+      await expect(panel).toBeHidden();
+      expect(await primaryBounds()).toEqual(before);
+    });
+  }
 
   /* ---- results sort + typed columns (#416) ---------------------------- */
 
@@ -390,6 +822,18 @@ test.describe("query builder", () => {
     await expect.poll(async () => queries.builder.paramOptions.count()).toBeGreaterThan(0);
   });
 
+  // Picking a type updates the URL (and back navigates) without a full
+  // reload — the click handler is an enhancement over the rail's real
+  // <a href> (#541).
+  test("picking a rail type updates the URL and back navigates", async ({ queries, page }) => {
+    await queries.railItem("Observation").click();
+    await expect(page).toHaveURL(/\/ui\/queries\?type=Observation/);
+    await expect(queries.railItem("Observation")).toHaveAttribute("aria-current", "true");
+
+    await page.goBack();
+    await expect(page).toHaveURL(/\/ui\/queries$/);
+  });
+
   test("a run is recorded under the Recent disclosure", async ({ queries, request }) => {
     await createResource(request, "Patient", { name: [{ family: "Recent" }] });
     await queries.goto();
@@ -398,5 +842,62 @@ test.describe("query builder", () => {
 
     await queries.builder.recentToggle.click();
     await expect(queries.builder.recentPanel).toContainText(/Patient/);
+  });
+
+  test("escaped commas survive Copy, Saved and Recent reloads", async ({
+    context,
+    page,
+    queries,
+  }) => {
+    const tag = Date.now().toString(36);
+    const name = `Escaped comma ${tag}`;
+    const query = `Patient?name:exact=Copy%5C%2C${tag}`;
+    const getQuery = `GET /${query}`;
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+
+    await queries.builder.setUrl(query);
+    await queries.builder.copyButton.click();
+    await expect
+      .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(query);
+
+    await queries.builder.nameInput.fill(name);
+    await queries.builder.saveButton.click();
+    await expect(queries.savedList).toContainText(name);
+
+    await page.reload({ waitUntil: "networkidle" });
+    await queries.builder.recentToggle.click();
+    await queries.builder.recentPanel.locator("[data-saved-load]", { hasText: name }).click();
+    await expect(queries.builder.url).toHaveValue(getQuery);
+    await expect(queries.builder.conditionRows.first().locator(".builder-row__value")).toHaveValue(
+      `Copy,${tag}`,
+    );
+
+    const recentSaved = page.waitForResponse((response) => {
+      const request = response.request();
+      return (
+        new URL(response.url()).pathname === "/_user/settings" &&
+        request.method() === "PATCH" &&
+        response.ok()
+      );
+    });
+    const requestSent = page.waitForRequest((candidate) => {
+      const url = new URL(candidate.url());
+      return url.pathname === "/Patient" && url.searchParams.has("name:exact");
+    });
+    await queries.builder.runButton.click();
+    const [, sent] = await Promise.all([
+      recentSaved,
+      requestSent,
+      queries.results.waitShown(),
+    ]);
+    expect(new URL(sent.url()).searchParams.get("name:exact")).toBe(`Copy\\,${tag}`);
+    await page.reload({ waitUntil: "networkidle" });
+    await queries.builder.recentToggle.click();
+    await queries.builder.recentPanel.getByRole("button", { name: getQuery, exact: true }).click();
+    await expect(queries.builder.url).toHaveValue(getQuery);
+    await expect(queries.builder.conditionRows.first().locator(".builder-row__value")).toHaveValue(
+      `Copy,${tag}`,
+    );
   });
 });

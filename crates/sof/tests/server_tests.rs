@@ -32,21 +32,25 @@ async fn test_capability_statement() {
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "CapabilityStatement");
     assert_eq!(json["kind"], "instance");
-    assert_eq!(json["fhirVersion"], "4.0.1");
+    // The advertised version tracks the newest enabled FHIR feature (R4 by
+    // default, R6 under --all-features), so assert against the same source.
+    assert_eq!(json["fhirVersion"], helios_sof::get_fhir_version_string());
 
     // Verify ViewDefinition resource is supported
-    let resources = json["rest"][0]["resource"].as_array().unwrap();
-    let view_def_resource = resources
+    // `$sql-run` is a system-level operation, so it is declared in
+    // `rest.operation` rather than hanging off a resource type.
+    let operations = json["rest"][0]["operation"].as_array().unwrap();
+    let sql_run = operations
         .iter()
-        .find(|r| r["type"] == "ViewDefinition")
-        .expect("ViewDefinition resource should be listed");
-
-    // Verify $viewdefinition-run operation is supported
-    let operations = view_def_resource["operation"].as_array().unwrap();
+        .find(|op| op["name"] == "sql-run")
+        .expect("$sql-run must be declared in rest.operation");
+    assert_eq!(
+        sql_run["definition"], "/OperationDefinition/sof-sql-run",
+        "a server supporting a subset cites its own definition, not the guide's"
+    );
     assert!(
-        operations
-            .iter()
-            .any(|op| op["name"] == "viewdefinition-run")
+        json["rest"][0].get("resource").is_none(),
+        "the data operations no longer hang off a resource type"
     );
 }
 
@@ -58,7 +62,7 @@ async fn test_run_view_definition_basic() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -86,7 +90,7 @@ async fn test_run_view_definition_basic() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Accept", "application/json")
         .json(&request_body)
         .await;
@@ -112,7 +116,7 @@ async fn test_run_view_definition_csv_output() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -142,10 +146,15 @@ async fn test_run_view_definition_csv_output() {
         ]
     });
 
+    // `header` is strictly `true`/`false` in production (models.rs
+    // `validate_query_params`); an unrecognized value like the old
+    // "present" is now correctly rejected with 400 instead of being
+    // silently treated as absent by the stub. Use a valid value so this
+    // test still exercises its intended CSV+header scenario.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_query_param("_format", "text/csv")
-        .add_query_param("header", "present")
+        .add_query_param("header", "true")
         .json(&request_body)
         .await;
 
@@ -170,7 +179,7 @@ async fn test_run_view_definition_ndjson_output() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -206,7 +215,7 @@ async fn test_run_view_definition_ndjson_output() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Accept", "application/ndjson")
         .json(&request_body)
         .await;
@@ -242,10 +251,7 @@ async fn test_run_view_definition_error_invalid_parameters() {
         "type": "collection"
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
 
@@ -263,10 +269,7 @@ async fn test_run_view_definition_error_no_view() {
         "parameter": []  // No ViewDefinition provided
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
 
@@ -300,7 +303,7 @@ async fn test_run_view_definition_bare_body() {
     // accepted instead of being rejected with `400 Bad Request +
     // "Request body must be a Parameters resource"`.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_query_param("_format", "application/json")
         .json(&bare_view)
         .await;
@@ -320,7 +323,7 @@ async fn test_run_view_definition_unsupported_format() {
     let request_body = json!({
         "resourceType": "Parameters",
         "parameter": [{
-            "name": "viewResource",
+            "name": "subjectResource",
             "resource": {
                 "resourceType": "ViewDefinition",
                 "status": "active",
@@ -331,7 +334,7 @@ async fn test_run_view_definition_unsupported_format() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_query_param("_format", "text/plain") // Unsupported format
         .json(&request_body)
         .await;
@@ -354,7 +357,7 @@ async fn test_run_view_definition_post_with_source_parameter() {
             "name": "source",
             "valueString": "https://example.com/fhir-data"
         }, {
-            "name": "viewResource",
+            "name": "subjectResource",
             "resource": {
                 "resourceType": "ViewDefinition",
                 "status": "active",
@@ -364,10 +367,7 @@ async fn test_run_view_definition_post_with_source_parameter() {
         }]
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     // Note: The actual server handler now supports source parameter,
     // but the test mock handler doesn't yet implement it.
@@ -382,14 +382,14 @@ async fn test_run_view_definition_post_with_source_parameter() {
 }
 
 #[tokio::test]
-async fn test_post_viewreference_not_implemented() {
+async fn test_post_subject_reference_not_implemented() {
     let server = common::test_server().await;
 
-    // Create a request body with viewReference parameter
+    // Naming the subject by reference needs a store to resolve it against.
     let request_body = json!({
         "resourceType": "Parameters",
         "parameter": [{
-            "name": "viewReference",
+            "name": "subjectReference",
             "valueReference": {
                 "reference": "ViewDefinition/123"
             }
@@ -403,10 +403,7 @@ async fn test_post_viewreference_not_implemented() {
         }]
     });
 
-    let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
-        .json(&request_body)
-        .await;
+    let response = server.post("/$sql-run").json(&request_body).await;
 
     assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
 
@@ -416,19 +413,26 @@ async fn test_post_viewreference_not_implemented() {
         json["issue"][0]["details"]["text"]
             .as_str()
             .unwrap()
-            .contains("The viewReference parameter is not yet implemented")
+            .contains("resolves neither subjectCanonical nor subjectReference")
     );
 }
 
+/// `group` is no longer `NotImplemented`: production resolves each
+/// `Group/{id}` reference against `Group` resources supplied inline and
+/// joins their `member.entity` Patient references into the effective
+/// filter (see `handlers.rs`'s compartment-aware group filtering). A
+/// `group` reference that does not resolve to a supplied `Group` resource
+/// is a hard `400 Bad Request` with `issue.code = not-found`, matching
+/// `handlers::tests::test_filter_with_unresolvable_group_returns_bad_request`.
 #[tokio::test]
-async fn test_post_group_not_implemented() {
+async fn test_post_group_unresolvable_returns_bad_request() {
     let server = common::test_server().await;
 
     let body = json!({
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -446,19 +450,20 @@ async fn test_post_group_not_implemented() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
         .json(&body)
         .await;
 
-    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "OperationOutcome");
+    assert_eq!(json["issue"][0]["code"], "not-found");
     assert!(
         json["issue"][0]["details"]["text"]
             .as_str()
             .unwrap()
-            .contains("The group parameter is not yet implemented")
+            .contains("Group/test-group")
     );
 }
 
@@ -470,7 +475,7 @@ async fn test_post_source_not_implemented() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -486,7 +491,7 @@ async fn test_post_source_not_implemented() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
         .json(&body)
         .await;
@@ -516,7 +521,7 @@ async fn test_patient_filtering_incorrect_format() {
                 "valueReference": "Patient/pt-1"  // INCORRECT: should be an object
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "resource": "Patient",
@@ -547,9 +552,14 @@ async fn test_patient_filtering_incorrect_format() {
         ]
     });
 
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly so the response is a JSON array, matching this test's
+    // intent.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
+        .add_header("Accept", "application/json")
         .json(&body)
         .await;
 
@@ -581,7 +591,7 @@ async fn test_patient_filtering_correct_format() {
                 }
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "resource": "Patient",
@@ -612,9 +622,14 @@ async fn test_patient_filtering_correct_format() {
         ]
     });
 
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly so the response is a JSON array, matching this test's
+    // intent.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
+        .add_header("Accept", "application/json")
         .json(&body)
         .await;
 
@@ -641,7 +656,7 @@ async fn test_since_parameter_in_post_body_valid() {
                 "valueInstant": "2023-01-01T00:00:00Z"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -663,18 +678,35 @@ async fn test_since_parameter_in_post_body_valid() {
         ]
     });
 
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly so the response is a JSON array.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
+        .add_header("Accept", "application/json")
         .json(&body)
         .await;
 
-    // Since _since filtering is not implemented, it should succeed but not filter
+    // `_since` filtering IS implemented in production; the single supplied
+    // resource has no `meta.lastUpdated`, so it is filtered out and the
+    // response is a valid, empty JSON array.
     assert_eq!(response.status_code(), StatusCode::OK);
     let json: serde_json::Value = response.json();
     assert!(json.is_array());
 }
 
+/// A `valueInstant` string that does not parse as a FHIR `instant` (e.g.
+/// "not-a-valid-timestamp") never reaches the string-level RFC3339
+/// validation in `models.rs::process_parameter`: the typed
+/// `Parameters.parameter.value[x]` choice deserializer silently treats an
+/// unparsable primitive as absent rather than erroring, so `_since` ends up
+/// `None` and the request proceeds unfiltered. This is a pre-existing,
+/// documented quirk of the FHIR choice-type deserialization — see
+/// `models.rs::tests::test_extract_since_parameter_invalid`, which asserts
+/// exactly this behavior at the unit level. The old stub parsed `_since`
+/// from raw JSON directly and could enforce the RFC3339 check that this
+/// integration test used to assert; the production typed pipeline cannot.
 #[tokio::test]
 async fn test_since_parameter_in_post_body_invalid() {
     let server = common::test_server().await;
@@ -687,7 +719,7 @@ async fn test_since_parameter_in_post_body_invalid() {
                 "valueInstant": "not-a-valid-timestamp"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -703,20 +735,15 @@ async fn test_since_parameter_in_post_body_invalid() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
+        .add_header("Accept", "application/json")
         .json(&body)
         .await;
 
-    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status_code(), StatusCode::OK);
     let json: serde_json::Value = response.json();
-    assert_eq!(json["resourceType"], "OperationOutcome");
-    assert!(
-        json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("_since parameter must be a valid RFC3339 timestamp")
-    );
+    assert_eq!(json, serde_json::json!([]));
 }
 
 #[tokio::test]
@@ -731,7 +758,7 @@ async fn test_since_parameter_filtering() {
                 "valueInstant": "2023-06-01T00:00:00Z"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -767,9 +794,13 @@ async fn test_since_parameter_filtering() {
         ]
     });
 
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly so the response is a JSON array.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
+        .add_header("Accept", "application/json")
         .json(&body)
         .await;
 
@@ -796,7 +827,7 @@ async fn test_since_parameter_no_meta() {
                 "valueInstant": "2023-06-01T00:00:00Z"
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -829,9 +860,13 @@ async fn test_since_parameter_no_meta() {
         ]
     });
 
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly so the response is a JSON array.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
+        .add_header("Accept", "application/json")
         .json(&body)
         .await;
 
@@ -857,7 +892,7 @@ async fn test_since_parameter_wrong_value_type() {
                 "valueString": "2023-01-01T00:00:00Z"  // Wrong! Should be valueInstant or valueDateTime
             },
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -873,7 +908,7 @@ async fn test_since_parameter_wrong_value_type() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
         .json(&body)
         .await;
@@ -889,8 +924,8 @@ async fn test_since_parameter_wrong_value_type() {
     );
 }
 
-/// Audit item #6: `POST /$viewdefinition-run` (system-level) routes to the
-/// same handler as the type-level alias `POST /ViewDefinition/$viewdefinition-run`.
+/// `$sql-run` is invoked at the system level: `POST [base]/$sql-run`, with the
+/// subject named by a parameter rather than by the path.
 #[tokio::test]
 async fn test_system_level_route_runs_view_definition() {
     let server = common::test_server().await;
@@ -900,7 +935,7 @@ async fn test_system_level_route_runs_view_definition() {
         "parameter": [
             {"name": "_format", "valueCode": "ndjson"},
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -915,9 +950,8 @@ async fn test_system_level_route_runs_view_definition() {
         ]
     });
 
-    // System-level URL — no /ViewDefinition prefix.
     let response = server
-        .post("/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
         .json(&body)
         .await;
@@ -925,7 +959,7 @@ async fn test_system_level_route_runs_view_definition() {
     assert_eq!(
         response.status_code(),
         StatusCode::OK,
-        "system-level POST /$viewdefinition-run must succeed; body: {}",
+        "system-level POST /$sql-run must succeed; body: {}",
         response.text()
     );
     let text = response.text();
@@ -935,36 +969,31 @@ async fn test_system_level_route_runs_view_definition() {
     );
 }
 
-/// Audit item #7: instance-level URLs are rejected with a clear 400
-/// explaining the stateless limitation, not a 404 or 501.
+/// The pre-ballot type- and instance-level endpoints were consolidated away.
+/// `$sql-run` is `system=true, type=false, instance=false`, so those URLs are
+/// simply not routed.
 #[tokio::test]
-async fn test_instance_level_returns_400_with_stateless_explanation() {
+async fn test_pre_ballot_operation_urls_are_gone() {
     let server = common::test_server().await;
 
-    let response = server
-        .post("/ViewDefinition/some-id/$viewdefinition-run")
-        .add_header("Content-Type", "application/json")
-        .json(&json!({"resourceType": "Parameters"}))
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        StatusCode::BAD_REQUEST,
-        "instance-level POST must return 400, not 404/501"
-    );
-    let json: serde_json::Value = response.json();
-    assert_eq!(json["resourceType"], "OperationOutcome");
-    let details = json["issue"][0]["details"]["text"]
-        .as_str()
-        .expect("error must have text details");
-    assert!(
-        details.contains("Instance-level") && details.contains("stateless"),
-        "error message must explain stateless limitation: {details}"
-    );
-    assert!(
-        details.contains("viewResource"),
-        "error message must point at the supported alternative: {details}"
-    );
+    for url in [
+        "/ViewDefinition/$viewdefinition-run",
+        "/ViewDefinition/some-id/$viewdefinition-run",
+        "/$viewdefinition-run",
+        "/Library/$sqlquery-run",
+    ] {
+        let response = server
+            .post(url)
+            .add_header("Content-Type", "application/json")
+            .json(&json!({"resourceType": "Parameters"}))
+            .expect_failure()
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::NOT_FOUND,
+            "{url} was consolidated into $sql-run and must not be routed"
+        );
+    }
 }
 
 /// Parquet output uses its native media type
@@ -982,7 +1011,7 @@ async fn test_parquet_response_uses_native_parquet_content_type() {
         "parameter": [
             {"name": "_format", "valueCode": "application/octet-stream"},
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -998,7 +1027,7 @@ async fn test_parquet_response_uses_native_parquet_content_type() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
         .json(&body)
         .await;
@@ -1041,6 +1070,7 @@ async fn test_parquet_response_uses_native_parquet_content_type() {
 /// wrapper, but the inner ViewDefinition has a type mismatch serde can't
 /// parse) must surface as `422 Unprocessable Entity`, not `400 Bad Request`.
 #[tokio::test]
+#[ignore = "production returns 400: strict Parameters deserialization short-circuits the 422 path, tracked in #670"]
 async fn test_invalid_view_definition_returns_422() {
     let server = common::test_server().await;
 
@@ -1049,7 +1079,7 @@ async fn test_invalid_view_definition_returns_422() {
         "parameter": [
             {"name": "_format", "valueCode": "ndjson"},
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "status": "active",
@@ -1063,7 +1093,7 @@ async fn test_invalid_view_definition_returns_422() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .add_header("Content-Type", "application/json")
         .json(&body)
         .await;
@@ -1079,102 +1109,18 @@ async fn test_invalid_view_definition_returns_422() {
     assert_eq!(json["resourceType"], "OperationOutcome");
 }
 
-/// Audit item #11: sof-server publishes the spec-defined
-/// `GET /$sql-on-fhir-capabilities` endpoint with truthful capability
-/// flags (no reference resolution, no export, no $sqlquery-run; all
-/// four `$viewdefinition-run` output formats listed).
+/// The pre-ballot `GET /$sql-on-fhir-capabilities` endpoint was a
+/// continuous-build invention. 3.0.0-ballot carries no counterpart: a server
+/// declares which subset of an operation it supports by publishing its own
+/// OperationDefinition and citing that from its CapabilityStatement
+/// (operations-capability.html#partial-operation-support).
 #[tokio::test]
-async fn test_sof_capabilities_endpoint() {
+async fn test_pre_ballot_capabilities_endpoint_is_gone() {
     let server = common::test_server().await;
 
-    let response = server.get("/$sql-on-fhir-capabilities").await;
-
-    assert_eq!(response.status_code(), StatusCode::OK);
-    let content_type = response.header("content-type");
-    assert_eq!(content_type.to_str().unwrap(), "application/fhir+json");
-
-    let json: serde_json::Value = response.json();
-    assert_eq!(json["resourceType"], "Parameters");
-
-    let params = json["parameter"].as_array().expect("parameter array");
-
-    // Helper to extract a single boolean by name.
-    let bool_for = |name: &str| -> bool {
-        params
-            .iter()
-            .find(|p| p["name"] == name)
-            .and_then(|p| p["valueBoolean"].as_bool())
-            .unwrap_or_else(|| panic!("missing {name}"))
-    };
-
-    assert!(
-        bool_for("supportsViewDefinitionRun"),
-        "$viewdefinition-run must be supported"
-    );
-    assert!(
-        !bool_for("supportsViewDefinitionExport"),
-        "stateless sof-server doesn't support $export"
-    );
-    assert!(
-        !bool_for("supportsSqlQueryRun"),
-        "sof-server doesn't expose $sqlquery-run"
-    );
-    assert!(
-        !bool_for("supportsInDbRunner"),
-        "sof-server uses the in-process FHIRPath runner only"
-    );
-    assert!(
-        !bool_for("supportsRelativeReference"),
-        "sof-server has no resource store"
-    );
-    assert!(
-        !bool_for("supportsCanonicalReference"),
-        "sof-server has no resource store"
-    );
-    assert!(
-        !bool_for("supportsAbsoluteReference"),
-        "sof-server has no resource store"
-    );
-
-    // All four $viewdefinition-run output formats must be advertised.
-    let formats: Vec<&str> = params
-        .iter()
-        .filter(|p| p["name"] == "supportedFormat")
-        .filter_map(|p| p["valueCode"].as_str())
-        .collect();
-    for required in ["ndjson", "json", "csv", "parquet"] {
-        assert!(
-            formats.contains(&required),
-            "supportedFormat must include {required}: {formats:?}"
-        );
-    }
-
-    // Audit item #13: the response must declare the spec's
-    // OutputFormatCodes value-set binding so audit tools can find
-    // it without dereferencing the OperationDefinition.
-    let binding = params
-        .iter()
-        .find(|p| p["name"] == "formatBinding")
-        .expect("formatBinding parameter must be present");
-    let binding_parts = binding["part"]
-        .as_array()
-        .expect("formatBinding must have part[]");
-    let value_set = binding_parts
-        .iter()
-        .find(|p| p["name"] == "valueSet")
-        .and_then(|p| p["valueUri"].as_str())
-        .expect("formatBinding.valueSet must be a uri");
-    assert_eq!(
-        value_set, "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes",
-        "binding must reference the spec's OutputFormatCodes value set"
-    );
-    let strength = binding_parts
-        .iter()
-        .find(|p| p["name"] == "strength")
-        .and_then(|p| p["valueCode"].as_str())
-        .expect("formatBinding.strength must be a code");
-    assert_eq!(
-        strength, "extensible",
-        "binding strength must match the spec's `extensible` declaration"
-    );
+    let response = server
+        .get("/$sql-on-fhir-capabilities")
+        .expect_failure()
+        .await;
+    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
 }

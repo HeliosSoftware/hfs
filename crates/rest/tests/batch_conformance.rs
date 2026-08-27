@@ -908,3 +908,602 @@ mod conditional_references {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 }
+
+// =============================================================================
+// Conditional Entry Tests (#503)
+// =============================================================================
+
+/// Conditional interactions expressed in an entry URL (`[type]?[criteria]`) are
+/// refused rather than resolved, and — the point of #503 — nothing is written.
+///
+/// Before the fix the criteria rode along inside the parsed resource type, so a
+/// conditional `PUT`/`DELETE` addressed storage with a type like
+/// `Patient?identifier=http:` and an empty id. Resolving these is #511.
+mod conditional_entries {
+    use super::*;
+
+    /// Posts a bundle and returns the raw response without asserting on status,
+    /// so declined transactions can be inspected.
+    async fn post_bundle(server: &TestServer, bundle: Value) -> axum_test::TestResponse {
+        server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&bundle)
+            .await
+    }
+
+    async fn patient_count(backend: &SqliteBackend) -> u64 {
+        backend
+            .count(&test_tenant(), Some("Patient"))
+            .await
+            .expect("count failed")
+    }
+
+    #[tokio::test]
+    async fn conditional_put_is_refused_and_writes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": {
+                        "method": "PUT",
+                        "url": "Patient?identifier=http://example.org|12345"
+                    },
+                    "resource": { "resourceType": "Patient", "name": [{"family": "Conditional"}] }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "a refused conditional PUT must not create a resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_is_refused_and_deletes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": { "method": "DELETE", "url": "Patient?name=Nguyen" }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "a refused conditional DELETE must not remove a resource"
+        );
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "p1")
+                .await
+                .expect("read failed")
+                .is_some(),
+            "the seeded patient must survive"
+        );
+    }
+
+    /// The corruption #503 closes: `create_or_update` with an empty id inserts
+    /// `"id": ""` into the resource and delegates to `create`, whose id fallback
+    /// fires on an absent id rather than an empty one — so the row is written,
+    /// and every later type-level PUT reads it back and overwrites it.
+    #[tokio::test]
+    async fn a_type_level_put_never_writes_an_empty_id_row() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": { "method": "PUT", "url": "Patient" },
+                    "resource": { "resourceType": "Patient", "name": [{"family": "NoId"}] }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(patient_count(&backend).await, before);
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "")
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "no resource may be stored under the empty id"
+        );
+    }
+
+    /// An instance URL carrying a control parameter still addresses its
+    /// instance — the query is dropped, not read as criteria.
+    #[tokio::test]
+    async fn an_instance_url_with_a_query_still_resolves() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": { "method": "GET", "url": "Patient/p1?_format=json" }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "200 OK");
+        assert_eq!(body["entry"][0]["resource"]["id"], "p1");
+    }
+
+    /// A transaction carrying a query-bearing non-GET entry is declined whole,
+    /// before anything executes — so the sibling create in the same bundle must
+    /// not have landed. Backends parse entry URLs query-blind, so letting it
+    /// through commits the criteria as part of the resource type or the id.
+    #[tokio::test]
+    async fn a_transaction_with_a_conditional_url_is_declined_intact() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [
+                    {
+                        "request": { "method": "POST", "url": "Patient" },
+                        "resource": { "resourceType": "Patient", "name": [{"family": "Sibling"}] }
+                    },
+                    {
+                        "request": {
+                            "method": "PUT",
+                            "url": "Patient?identifier=http://example.org|12345"
+                        },
+                        "resource": { "resourceType": "Patient" }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["code"], "not-supported");
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "the bundle must be declined before any entry is applied"
+        );
+    }
+
+    /// GET entries are left to #478: a transaction search URL is not declined
+    /// by the query guard, so that work lands on an untouched arm.
+    #[tokio::test]
+    async fn a_transaction_get_with_a_query_is_not_declined_by_the_query_guard() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [{
+                    "request": { "method": "GET", "url": "Patient?name=Nguyen" }
+                }]
+            }),
+        )
+        .await;
+
+        let body: Value = response.json();
+        // `details.text`, not `diagnostics`: the guard raises
+        // `RestError::NotSupported`, and `create_operation_outcome` writes only
+        // `details.text` — `RestError` never renders a `diagnostics` field. As
+        // written against `diagnostics` the third conjunct was unsatisfiable,
+        // so `declined_by_the_guard` was permanently false and the negated
+        // assert below held even if a GET entry *were* declined by the guard,
+        // which is the one thing this test exists to catch.
+        let declined_by_the_guard = body["resourceType"] == "OperationOutcome"
+            && body["issue"][0]["code"] == "not-supported"
+            && body["issue"][0]["details"]["text"]
+                .as_str()
+                .is_some_and(|d| d.contains("carries a query string"));
+        assert!(
+            !declined_by_the_guard,
+            "GET entries must stay on #478's path, not this guard: {body}"
+        );
+    }
+}
+
+// =============================================================================
+// Entry Method Tests (#502)
+// =============================================================================
+
+/// The batch and transaction arms parse `request.method` through one shared
+/// matcher, so they accept exactly the same codes and refuse the rest with the
+/// same status.
+///
+/// `Bundle.entry.request.method` is a `code` with a required binding to
+/// `http-verb`, whose concepts are case-sensitive and uppercase — so a lowercase
+/// verb is invalid instance data, and the transaction arm's old `to_uppercase()`
+/// was the non-conformant matcher rather than batch being wrongly strict.
+mod entry_methods {
+    use super::*;
+
+    async fn post_bundle(server: &TestServer, bundle: Value) -> axum_test::TestResponse {
+        server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&bundle)
+            .await
+    }
+
+    async fn patient_count(backend: &SqliteBackend) -> u64 {
+        backend
+            .count(&test_tenant(), Some("Patient"))
+            .await
+            .expect("count failed")
+    }
+
+    fn batch_of(entries: Vec<Value>) -> Value {
+        json!({ "resourceType": "Bundle", "type": "batch", "entry": entries })
+    }
+
+    /// PATCH is declined at 501 — the status all three backends already return
+    /// from inside a transaction, and the one both READMEs already claimed.
+    #[tokio::test]
+    async fn batch_patch_is_declined_at_501_and_changes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let body = post_batch(
+            &server,
+            batch_of(vec![json!({
+                "request": { "method": "PATCH", "url": "Patient/p1" },
+                "resource": { "resourceType": "Patient", "name": [{"family": "Patched"}] }
+            })]),
+        )
+        .await;
+
+        assert_eq!(
+            body["entry"][0]["response"]["status"],
+            "501 Not Implemented"
+        );
+        let stored = backend
+            .read(&test_tenant(), "Patient", "p1")
+            .await
+            .expect("read failed")
+            .expect("patient must survive");
+        assert_eq!(stored.content()["name"][0]["family"], "Nguyen");
+    }
+
+    /// HEAD is a legal http-verb code this server does not accept in a Bundle.
+    #[tokio::test]
+    async fn batch_head_is_refused_at_405() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = post_batch(
+            &server,
+            batch_of(vec![json!({
+                "request": { "method": "HEAD", "url": "Patient/p1" }
+            })]),
+        )
+        .await;
+
+        assert_eq!(
+            body["entry"][0]["response"]["status"],
+            "405 Method Not Allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_refuses_a_lowercase_verb_and_a_missing_one() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            batch_of(vec![
+                json!({
+                    "request": { "method": "post", "url": "Patient" },
+                    "resource": { "resourceType": "Patient" }
+                }),
+                json!({ "request": { "url": "Patient/p1" } }),
+            ]),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(body["entry"][1]["response"]["status"], "400 Bad Request");
+        assert_eq!(patient_count(&backend).await, before);
+    }
+
+    /// **The regression test for #502.** On the old code this entry created a
+    /// Patient: the transaction matcher upper-cased `"post"` and dispatched it,
+    /// while the same Bundle 405'd as a batch.
+    #[tokio::test]
+    async fn a_transaction_lowercase_verb_no_longer_writes() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [{
+                    "request": { "method": "post", "url": "Patient" },
+                    "resource": { "resourceType": "Patient", "name": [{"family": "Lowercase"}] }
+                }]
+            }),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "a lowercase verb must not create a resource"
+        );
+    }
+
+    /// A PATCH transaction is declined before anything executes, so a sibling
+    /// create in the same bundle must not have landed.
+    #[tokio::test]
+    async fn a_transaction_patch_is_declined_intact_at_501() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [
+                    {
+                        "request": { "method": "POST", "url": "Patient" },
+                        "resource": { "resourceType": "Patient", "name": [{"family": "Sibling"}] }
+                    },
+                    {
+                        "request": { "method": "PATCH", "url": "Patient/p1" },
+                        "resource": { "resourceType": "Patient" }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        response.assert_status(StatusCode::NOT_IMPLEMENTED);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["code"], "not-supported");
+        assert!(
+            body["issue"][0]["details"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("PATCH")),
+            "the outcome must name PATCH: {body}"
+        );
+        assert_eq!(patient_count(&backend).await, before);
+    }
+
+    /// The two arms agree on status, which is what #502 asks for: HEAD is 405
+    /// whether it arrives per-entry in a batch or as a whole-bundle transaction
+    /// failure. Flattening the refusal at the transaction boundary would have
+    /// made this 400 and re-created the divergence in a new place.
+    #[tokio::test]
+    async fn the_two_arms_agree_on_the_refusal_status() {
+        let (server, _backend) = create_test_server().await;
+
+        let batch = post_batch(
+            &server,
+            batch_of(vec![json!({
+                "request": { "method": "HEAD", "url": "Patient/p1" }
+            })]),
+        )
+        .await;
+        assert_eq!(
+            batch["entry"][0]["response"]["status"],
+            "405 Method Not Allowed"
+        );
+
+        let transaction = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [{ "request": { "method": "HEAD", "url": "Patient/p1" } }]
+            }),
+        )
+        .await;
+        transaction.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+    }
+}
+
+// =============================================================================
+// GET Search Entry Tests (#478)
+// =============================================================================
+
+mod search_entries {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_batch_get_search_entry_returns_searchset() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+        seed_patient(&backend, "p2", "Smith").await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{
+                "request": { "method": "GET", "url": "Patient?family=Nguyen" }
+            }]
+        });
+
+        let body = post_batch(&server, bundle).await;
+        let entry = &body["entry"][0];
+
+        assert_eq!(entry["response"]["status"].as_str().unwrap(), "200 OK");
+        let searchset = &entry["resource"];
+        assert_eq!(searchset["resourceType"].as_str().unwrap(), "Bundle");
+        assert_eq!(searchset["type"].as_str().unwrap(), "searchset");
+        assert_eq!(searchset["entry"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            searchset["entry"][0]["resource"]["name"][0]["family"]
+                .as_str()
+                .unwrap(),
+            "Nguyen"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_get_bare_type_is_a_search() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+        seed_patient(&backend, "p2", "Smith").await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{
+                "request": { "method": "GET", "url": "Patient" }
+            }]
+        });
+
+        let body = post_batch(&server, bundle).await;
+        let searchset = &body["entry"][0]["resource"];
+
+        assert_eq!(searchset["type"].as_str().unwrap(), "searchset");
+        assert_eq!(searchset["entry"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_mixes_search_and_read_entries() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                { "request": { "method": "GET", "url": "Patient/p1" } },
+                { "request": { "method": "GET", "url": "Patient?family=Nguyen" } }
+            ]
+        });
+
+        let body = post_batch(&server, bundle).await;
+
+        let read = &body["entry"][0];
+        assert_eq!(read["response"]["status"].as_str().unwrap(), "200 OK");
+        assert_eq!(
+            read["resource"]["resourceType"].as_str().unwrap(),
+            "Patient"
+        );
+
+        let search = &body["entry"][1];
+        assert_eq!(search["response"]["status"].as_str().unwrap(), "200 OK");
+        assert_eq!(search["resource"]["type"].as_str().unwrap(), "searchset");
+    }
+
+    #[tokio::test]
+    async fn test_transaction_get_search_sees_the_bundles_own_writes() {
+        let (server, _backend) = create_test_server().await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "Patient",
+                        "name": [{"family": "Tran"}]
+                    },
+                    "request": { "method": "POST", "url": "Patient" }
+                },
+                { "request": { "method": "GET", "url": "Patient?family=Tran" } }
+            ]
+        });
+
+        let body = post_batch(&server, bundle).await;
+        assert_eq!(body["type"].as_str().unwrap(), "transaction-response");
+
+        let created = &body["entry"][0];
+        assert_eq!(
+            created["response"]["status"].as_str().unwrap(),
+            "201 Created"
+        );
+
+        let search = &body["entry"][1];
+        assert_eq!(search["response"]["status"].as_str().unwrap(), "200 OK");
+        let searchset = &search["resource"];
+        assert_eq!(searchset["type"].as_str().unwrap(), "searchset");
+        assert_eq!(
+            searchset["entry"].as_array().unwrap().len(),
+            1,
+            "the search runs after the writes and must see the created patient"
+        );
+        assert_eq!(
+            searchset["entry"][0]["resource"]["name"][0]["family"]
+                .as_str()
+                .unwrap(),
+            "Tran"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transaction_get_by_id_still_reads_in_transaction() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [{
+                "request": { "method": "GET", "url": "Patient/p1" }
+            }]
+        });
+
+        let body = post_batch(&server, bundle).await;
+        let entry = &body["entry"][0];
+        assert_eq!(entry["response"]["status"].as_str().unwrap(), "200 OK");
+        assert_eq!(
+            entry["resource"]["resourceType"].as_str().unwrap(),
+            "Patient"
+        );
+    }
+}

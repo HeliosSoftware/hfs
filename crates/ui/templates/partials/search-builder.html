@@ -20,7 +20,8 @@
     </span>
     <input class="query-builder__url" name="url" required spellcheck="false"
            placeholder="{{ i18n.t("queries-url-placeholder") }}"
-           aria-label="{{ i18n.t("queries-url-label") }}">
+           aria-label="{{ i18n.t("queries-url-label") }}"
+           {% if let Some(v) = builder_url %}value="GET {{ v }}"{% endif %}>
     <button class="btn query-builder__copy" type="button" id="query-copy"
             aria-label="{{ i18n.t("search-copy") }}" title="{{ i18n.t("search-copy") }}">
       <span class="icon">{% include "icons/copy.svg" %}</span>
@@ -31,7 +32,11 @@
         {{ i18n.t("queries-recent") }}
       </summary>
       <div class="menu__panel menu__panel--right">
-        <div class="menu__heading">{{ i18n.t("queries-recent-heading") }}</div>
+        <div class="menu__heading menu__heading--row">
+          {{ i18n.t("queries-recent-heading") }}
+          <button type="button" class="addbox__x" data-addbox-close
+                  aria-label="{{ i18n.t("ui-close") }}" title="{{ i18n.t("ui-close") }}">×</button>
+        </div>
         <div id="recent-searches"
              data-msg-empty="{{ i18n.t("queries-recent-empty") }}"
              data-msg-delete="{{ i18n.t("queries-delete") }}"
@@ -50,15 +55,21 @@
     {
       "find": "{{ i18n.t("plain-find") }}",
       "clause": "{{ i18n.t("plain-clause") }}",
+      "clauseNoValue": "{{ i18n.t("plain-clause-no-value") }}",
       "and": "{{ i18n.t("plain-and") }}",
       "or": "{{ i18n.t("plain-or") }}",
       "arrow": "{{ i18n.t("plain-arrow") }}",
       "has": "{{ i18n.t("plain-has") }}",
+      "hasNoValue": "{{ i18n.t("plain-has-no-value") }}",
       "include": "{{ i18n.t("plain-include") }}",
       "revinclude": "{{ i18n.t("plain-revinclude") }}",
       "iterate": "{{ i18n.t("plain-iterate") }}",
       "count": "{{ i18n.t("plain-count") }}",
       "sort": "{{ i18n.t("plain-sort") }}",
+      "missing": {
+        "true": "{{ i18n.t("plain-verb-missing-true") }}",
+        "false": "{{ i18n.t("plain-verb-missing-false") }}"
+      },
       "verbs": {
         "": "{{ i18n.t("plain-verb-is") }}",
         "contains": "{{ i18n.t("plain-verb-contains") }}",
@@ -112,20 +123,20 @@
        data-msg-mod-not-in="{{ i18n.t("queries-mod-not-in") }}"
        data-msg-mod-identifier="{{ i18n.t("queries-mod-identifier") }}"
        data-msg-mod-of-type="{{ i18n.t("queries-mod-of-type") }}">
-    <div class="builder-section">
+    <div>
       <h3 class="builder-section__title">{{ i18n.t("queries-conditions") }}</h3>
       <div class="builder-rows" id="builder-conditions"></div>
       <button class="btn builder-add" type="button" data-add="condition">+ {{ i18n.t("queries-add-condition") }}</button>
       <button class="btn builder-add" type="button" data-add="has">{{ i18n.t("queries-add-has") }}</button>
     </div>
-    <div class="builder-section">
+    <div>
       <h3 class="builder-section__title">{{ i18n.t("queries-related-heading") }}</h3>
       <p class="builder-section__sub">{{ i18n.t("queries-related-sub") }}</p>
       <div class="builder-rows" id="builder-includes"></div>
       <button class="btn builder-add" type="button" data-add="include-fwd">→ {{ i18n.t("queries-related-add-include") }}</button>
       <button class="btn builder-add" type="button" data-add="include-rev">← {{ i18n.t("queries-related-add-revinclude") }}</button>
     </div>
-    <div class="builder-section">
+    <div>
       <h3 class="builder-section__title">{{ i18n.t("queries-result-controls") }}</h3>
       <div class="builder-rows" id="builder-controls"></div>
       <button class="btn builder-add" type="button" data-add="control">+ _count</button>

@@ -1,7 +1,7 @@
 //! Unit tests for parameter validation and filtering functionality
 //!
 //! This module tests the query parameter validation, parsing, and result filtering
-//! logic for the $viewdefinition-run operation.
+//! logic for the $sql-run operation.
 
 use chrono::{DateTime, Utc};
 use helios_sof::ContentType;

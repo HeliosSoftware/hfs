@@ -1,17 +1,24 @@
 //! Parse a SQLQuery Library (FHIR Library profile) into the parts the engine
 //! needs: the SQL string, parameter declarations, and depends-on ViewDefinitions.
 //!
-//! See <https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/StructureDefinition-SQLQuery.html>
+//! See <http://hl7.org/fhir/uv/sql-on-fhir/StructureDefinition-SQLQuery.html>
 
 use base64::Engine;
 use serde_json::Value;
 
 use super::SqlQueryError;
+use crate::canonical::{LEGACY_LIBRARY_TYPES_CODE_SYSTEM, LIBRARY_TYPES_CODE_SYSTEM};
 
 /// `Library.type.coding.system` value the SQLQuery profile fixes.
-pub const LIBRARY_TYPE_SYSTEM: &str = "https://sql-on-fhir.org/ig/CodeSystem/LibraryTypesCodes";
+pub const LIBRARY_TYPE_SYSTEM: &str = LIBRARY_TYPES_CODE_SYSTEM;
 /// `Library.type.coding.code` value the SQLQuery profile fixes.
 pub const LIBRARY_TYPE_CODE: &str = "sql-query";
+/// `Library.type.coding.code` value the SQLView profile fixes. SQLView
+/// profiles Library the same way SQLQuery does (same `depends-on` /
+/// SQL-content shape), so `parse_sqlquery_library` accepts both codes; the
+/// caller (`crates/rest`) is responsible for telling the two apart (e.g.
+/// SQLView forbids `parameter`).
+pub const LIBRARY_TYPE_CODE_SQL_VIEW: &str = "sql-view";
 
 /// SQL dialect the engine speaks. Used to pick the most specific
 /// `application/sql;dialect=…` content attachment.
@@ -82,26 +89,41 @@ pub fn parse_sqlquery_library(library_json: &Value) -> Result<SqlQueryLibrary, S
     })
 }
 
-/// Spec: `Library.type` SHALL carry `LibraryTypesCodes#sql-query`.
+/// Spec: `Library.type` SHALL carry `LibraryTypesCodes#sql-query` (SQLQuery
+/// profile) or `LibraryTypesCodes#sql-view` (SQLView profile). SQLView
+/// Libraries are shaped identically to SQLQuery ones for parsing purposes
+/// (SQL content + `depends-on` relatedArtifacts); the SQLQuery-vs-SQLView
+/// distinction that actually matters (SQLView forbids `parameter`, SQLView
+/// cannot be a top-level subject with parameters) is enforced by the caller,
+/// not here.
 fn validate_library_type(library_json: &Value) -> Result<(), SqlQueryError> {
     let codings = library_json
         .get("type")
         .and_then(|t| t.get("coding"))
         .and_then(|c| c.as_array())
         .ok_or_else(|| {
-            SqlQueryError::MalformedLibrary(
-                "Library.type.coding[] is required and must include LibraryTypesCodes#sql-query"
-                    .to_string(),
-            )
+            SqlQueryError::MalformedLibrary(format!(
+                "Library.type.coding[] is required and must include LibraryTypesCodes#{LIBRARY_TYPE_CODE} or LibraryTypesCodes#{LIBRARY_TYPE_CODE_SQL_VIEW}"
+            ))
         })?;
+    // The ballot reissued the `LibraryTypesCodes` canonical along with every
+    // other URL the guide publishes. Libraries authored against 2.0.0 or the
+    // pre-ballot build carry the old system, and both releases stay published,
+    // so accept either.
     let ok = codings.iter().any(|c| {
         let code = c.get("code").and_then(|v| v.as_str());
         let system = c.get("system").and_then(|v| v.as_str());
-        code == Some(LIBRARY_TYPE_CODE) && (system.is_none() || system == Some(LIBRARY_TYPE_SYSTEM))
+        matches!(
+            code,
+            Some(LIBRARY_TYPE_CODE) | Some(LIBRARY_TYPE_CODE_SQL_VIEW)
+        ) && matches!(
+            system,
+            None | Some(LIBRARY_TYPES_CODE_SYSTEM) | Some(LEGACY_LIBRARY_TYPES_CODE_SYSTEM)
+        )
     });
     if !ok {
         return Err(SqlQueryError::MalformedLibrary(format!(
-            "Library.type must include coding {{system: {LIBRARY_TYPE_SYSTEM}, code: {LIBRARY_TYPE_CODE}}}"
+            "Library.type must include coding {{system: {LIBRARY_TYPE_SYSTEM}, code: {LIBRARY_TYPE_CODE}}} or {{system: {LIBRARY_TYPE_SYSTEM}, code: {LIBRARY_TYPE_CODE_SQL_VIEW}}}"
         )));
     }
     Ok(())
@@ -342,7 +364,7 @@ mod tests {
         lib["content"] = json!([{
             "contentType": "application/sql",
             "extension": [{
-                "url": "https://sql-on-fhir.org/ig/StructureDefinition/sql-text",
+                "url": "http://hl7.org/fhir/uv/sql-on-fhir/StructureDefinition/sql-text",
                 "valueString": "SELECT 2"
             }]
         }]);
@@ -388,6 +410,42 @@ mod tests {
     fn rejects_library_without_sql_query_type() {
         let mut lib = library_skeleton("SELECT 1");
         lib["type"] = json!({"coding": [{"code": "logic-library"}]});
+        let err = parse_sqlquery_library(&lib).unwrap_err();
+        assert!(matches!(err, SqlQueryError::MalformedLibrary(_)));
+    }
+
+    #[test]
+    fn accepts_sql_view_type() {
+        let mut lib = library_skeleton("SELECT * FROM t");
+        lib["type"] = json!({
+            "coding": [{"system": LIBRARY_TYPE_SYSTEM, "code": LIBRARY_TYPE_CODE_SQL_VIEW}]
+        });
+        let parsed = parse_sqlquery_library(&lib).unwrap();
+        assert_eq!(parsed.sql, "SELECT * FROM t");
+    }
+
+    #[test]
+    fn accepts_sql_view_type_with_legacy_system() {
+        let mut lib = library_skeleton("SELECT 1");
+        lib["type"] = json!({
+            "coding": [{"system": LEGACY_LIBRARY_TYPES_CODE_SYSTEM, "code": LIBRARY_TYPE_CODE_SQL_VIEW}]
+        });
+        let parsed = parse_sqlquery_library(&lib).unwrap();
+        assert_eq!(parsed.sql, "SELECT 1");
+    }
+
+    #[test]
+    fn accepts_sql_view_type_without_system() {
+        let mut lib = library_skeleton("SELECT 1");
+        lib["type"] = json!({"coding": [{"code": LIBRARY_TYPE_CODE_SQL_VIEW}]});
+        let parsed = parse_sqlquery_library(&lib).unwrap();
+        assert_eq!(parsed.sql, "SELECT 1");
+    }
+
+    #[test]
+    fn rejects_unknown_library_type_code() {
+        let mut lib = library_skeleton("SELECT 1");
+        lib["type"] = json!({"coding": [{"system": LIBRARY_TYPE_SYSTEM, "code": "logic-library"}]});
         let err = parse_sqlquery_library(&lib).unwrap_err();
         assert!(matches!(err, SqlQueryError::MalformedLibrary(_)));
     }

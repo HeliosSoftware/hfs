@@ -1,25 +1,25 @@
-//! `$sqlquery-run` operation handler (SQL-on-FHIR v2).
+//! Executing a `$sql-run` whose subject is a SQLQuery or SQLView Library.
 //!
-//! Implements three routes per the spec:
-//! - `POST /$sqlquery-run` (system)
-//! - `POST /Library/$sqlquery-run` (type)
-//! - `POST /Library/{id}/$sqlquery-run` (instance — `{id}` binds the Library)
+//! `$sql-run` is invoked at the system level and names its subject by
+//! parameter, so this module has no routes of its own: [`super::run`] resolves
+//! the subject and dispatches here when it turns out to be a Library.
 //!
-//! Execution model: the SQLQuery Library declares one or more `relatedArtifact`
-//! ViewDefinitions (`type=depends-on`, with a `label`). For each, this handler
-//! calls the wired `SofRunner` to produce a row stream, materializes the rows
-//! into a per-request in-memory SQLite database (one table per `label`), binds
-//! the supplied `Library.parameter` values to the SQL, runs the user's query,
-//! truncates the result to a caller-supplied `_limit` (if any), and serializes
-//! the result in the requested `_format`.
+//! Execution model: the subject Library declares one or more `relatedArtifact`
+//! dependencies (`type=depends-on`, with a `label`), each either a leaf
+//! ViewDefinition or a SQLView Library whose own SQL may declare further
+//! dependencies — see [`super::graph`] for the two-phase resolver that walks
+//! this graph. This handler resolves the full graph, materializes it into a
+//! per-request in-memory SQLite database, binds the supplied
+//! `Library.parameter` values to the subject's SQL, runs it, truncates the
+//! result to a caller-supplied `_limit` (if any), and serializes the result
+//! in the requested `_format`.
 //!
 //! ## Output shape for flat formats
 //!
 //! The spec declares the operation's `return` parameter as `Binary` (1..1):
 //! a raw binary stream in the format's native media type, *not* a serialized
-//! `Binary` resource envelope (spec PR #365, commit `86c178b`; same shape as
-//! `$viewdefinition-run`). When `_format=fhir` is requested the response is a
-//! `Parameters` resource instead — the documented exception to the `Binary`
+//! `Binary` resource envelope. When `_format=fhir` is requested the response is
+//! a `Parameters` resource instead — the documented exception to the `Binary`
 //! return. By default, flat formats (csv/json/ndjson/parquet) are returned as
 //! raw payload bytes with the format's `Content-Type`. Callers that want the
 //! serialized `Binary` envelope (base64 `data`) can request it by setting
@@ -48,31 +48,26 @@
 //! ViewDefinition projection, or accept the `valueString` fallback.
 
 use axum::{
-    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use futures::Stream;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
-use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::SqlQueryError;
 use helios_sof::{
-    ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableSchema, bind_supplied_params,
+    ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, bind_supplied_params,
     extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::time::Duration;
 use tracing::warn;
 
-use super::references::resolve_resource_canonical_or_relative;
 use super::view_sources::extract_table_source_views;
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
 
-/// Query-string parameters accepted by `$sqlquery-run`. The spec ships every
+/// Query-string parameters accepted by `$sql-run`. The spec ships every
 /// `in` parameter on the operation; we only honor the ones that make sense in
 /// a URL: `_format`, `header`, and `_limit`. Everything else (Library,
 /// parameters, source) is body-only.
@@ -91,42 +86,19 @@ pub struct SqlQueryRunQuery {
     pub limit: Option<u32>,
 }
 
-/// `POST /$sqlquery-run` and `POST /Library/$sqlquery-run`.
-pub async fn sqlquery_run_handler<S>(
-    State(state): State<AppState<S>>,
-    Query(query): Query<SqlQueryRunQuery>,
-    tenant: TenantExtractor,
-    headers: HeaderMap,
-    body: axum::extract::Json<Value>,
-) -> Result<Response, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    run_sqlquery(state, tenant, body.0, query, &headers, None).await
-}
-
-/// `POST /Library/{id}/$sqlquery-run`.
-pub async fn sqlquery_run_instance_handler<S>(
-    State(state): State<AppState<S>>,
-    Path(id): Path<String>,
-    Query(query): Query<SqlQueryRunQuery>,
-    tenant: TenantExtractor,
-    headers: HeaderMap,
-    body: axum::extract::Json<Value>,
-) -> Result<Response, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    run_sqlquery(state, tenant, body.0, query, &headers, Some(id)).await
-}
-
-async fn run_sqlquery<S>(
+/// Executes a `$sql-run` whose subject is a SQLQuery or SQLView Library.
+///
+/// The subject has already been named, fetched and classified by
+/// [`super::subject::resolve_subject`], so `library_json` arrives resolved. The
+/// dependency graph it declares in `relatedArtifact` is materialized here,
+/// then its SQL runs against the resulting tables.
+pub(super) async fn run_library_subject<S>(
     state: AppState<S>,
     tenant: TenantExtractor,
     body: Value,
     query: SqlQueryRunQuery,
     headers: &HeaderMap,
-    path_id: Option<String>,
+    library_json: Value,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -147,8 +119,7 @@ where
     }
 
     // _format precedence: body (Parameters) > query string > Accept header
-    // > `ndjson` default. SoF v2 PR #353 makes `_format` `0..1` defaulting
-    // to `ndjson`.
+    // > `ndjson` default. `_format` is `0..1`.
     let format = resolve_format(params.format.as_deref(), query.format.as_deref(), headers);
 
     // Spec: the `source` parameter is 0..1 and points at an external data
@@ -159,119 +130,75 @@ where
     if params.source.is_some() {
         return Err(RestError::BadRequest {
             message: "the 'source' parameter is not supported by this server; \
-                      the query will only run against the SQLQuery Library's \
+                      the query will only run against the Library's \
                       depends-on ViewDefinitions"
                 .to_string(),
         });
     }
 
-    // Mutual exclusion: queryResource and queryReference cannot both be supplied.
-    if params.query_reference.is_some() && params.query_resource.is_some() {
-        return Err(RestError::BadRequest {
-            message: "supply at most one of queryReference or queryResource".to_string(),
-        });
-    }
-
-    // Instance route binds the Library by path id; body queryReference / queryResource
-    // would conflict.
-    if path_id.is_some() && (params.query_reference.is_some() || params.query_resource.is_some()) {
-        return Err(RestError::BadRequest {
-            message: "the instance route binds Library by path id; \
-                      do not also supply queryReference or queryResource in the body"
-                .to_string(),
-        });
-    }
-
-    let library_json = resolve_library(&state, &tenant, &path_id, &params).await?;
     let library = parse_sqlquery_library(&library_json).map_err(sqlquery_err_to_rest)?;
 
-    // Cap depends-on count.
-    let max_vds = state.config().sof_sqlquery_max_vds;
-    if library.depends_on.len() > max_vds {
-        return Err(RestError::UnprocessableEntity {
-            message: format!(
-                "Library declares {} depends-on ViewDefinitions; max allowed is {}",
-                library.depends_on.len(),
-                max_vds
-            ),
-        });
-    }
-
-    // SELECT-only validation.
+    // SELECT-only validation of the subject's own SQL.
     validate_select_only(&library.sql)?;
 
-    // Materialize each depends-on VD into the engine.
     let runner = state
         .sof_runner()
         .ok_or_else(|| RestError::NotImplemented {
-            feature: "$sqlquery-run is not available: the configured storage backend does not \
+            feature: "$sql-run is not available: the configured storage backend does not \
                       provide a SOF runner"
                 .to_string(),
         })?
         .clone();
-    let mut engine = InMemorySqlEngine::open().map_err(sqlquery_err_to_rest)?;
-    let max_source_rows = state.config().sof_sqlquery_max_source_rows_per_vd;
 
-    // Keep each materialized VD's schema around for output-column type refinement.
-    let mut schemas_in_order: Vec<(String, TableSchema)> = Vec::new();
-    for dep in &library.depends_on {
-        let label = dep.label.clone();
-        let vd_json = match inline_views
-            .iter()
-            .find(|vd| vd.get("url").and_then(|u| u.as_str()) == Some(dep.url.as_str()))
-        {
-            Some(vd) => vd.clone(),
-            None => resolve_canonical_view_definition(&state, tenant.context(), &dep.url).await?,
-        };
-        let schema = TableSchema::from_view_definition(&vd_json);
-        engine
-            .create_table(&label, &schema)
-            .map_err(sqlquery_err_to_rest)?;
+    // Phase 1: resolve the full dependency graph — every ViewDefinition and
+    // SQLView Library it reaches, at any depth — before materializing
+    // anything. `library_json` was already classified by
+    // `super::subject::resolve_subject`; re-classifying here is cheap and
+    // tells us whether the subject itself is bound by the SQLView profile's
+    // `parameter 0..0` constraint.
+    let is_sql_view = matches!(
+        super::subject::classify_subject(&library_json)?,
+        super::subject::SubjectKind::SqlView
+    );
+    let subject_url = library_json.get("url").and_then(|v| v.as_str());
+    let fetcher = super::graph::StorageArtifactFetcher::new(&state, tenant.context());
+    let subject_node = super::graph::SubjectNode {
+        identity: subject_url,
+        is_sql_view,
+        parameters_empty: library.parameters.is_empty(),
+        depends_on: &library.depends_on,
+    };
+    let plan = super::graph::build_plan(&fetcher, &inline_views, subject_node)
+        .await
+        .map_err(super::graph::errors_to_rest_error)?;
 
-        let row_stream = runner
-            .run_view(tenant.context(), vd_json, ViewFilters::default())
-            .await
-            .map_err(|e| RestError::UnprocessableEntity {
-                message: format!("ViewDefinition '{label}' failed to materialize: {e}"),
-            })?;
-        let row_stream = adapt_row_stream(row_stream);
-        engine
-            .insert_rows(&label, &schema, Box::pin(row_stream), max_source_rows)
-            .await
-            .map_err(sqlquery_err_to_rest)?;
-        schemas_in_order.push((label, schema));
-    }
+    let max_vds = state.config().sof_sqlquery_max_vds;
+    super::graph::check_max_nodes(&plan, max_vds)?;
 
     // Bind Library.parameter values from the supplied `parameters` Parameters.
     let bindings = bind_supplied_params(&library.parameters, params.parameters.as_ref())
         .map_err(sqlquery_err_to_rest)?;
 
-    // Run user SQL with timeout + row cap.
-    let max_rows = state.config().sof_sqlquery_max_rows;
-    let timeout_secs = state.config().sof_sqlquery_timeout_secs;
-    let interrupt = engine.interrupt_handle();
-    let watchdog = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
-        interrupt.interrupt();
-    });
-    let sql = library.sql.clone();
-    let exec_result =
-        tokio::task::spawn_blocking(move || engine.execute_select(&sql, &bindings, max_rows)).await;
-    watchdog.abort();
-    let mut result = match exec_result {
-        Ok(Ok(r)) => r,
-        Ok(Err(SqlQueryError::Sqlite(e))) if e.to_string().contains("interrupted") => {
-            return Err(RestError::UnprocessableEntity {
-                message: format!("query exceeded {timeout_secs}s timeout"),
-            });
-        }
-        Ok(Err(e)) => return Err(sqlquery_err_to_rest(e)),
-        Err(join_err) => {
-            return Err(RestError::InternalError {
-                message: format!("sqlquery worker panicked: {join_err}"),
-            });
-        }
+    // Phase 2: materialize the plan and run the subject's own SQL, with the
+    // same row caps and timeout the pre-graph single-level code enforced.
+    let engine = InMemorySqlEngine::open().map_err(sqlquery_err_to_rest)?;
+    let limits = super::graph::ExecLimits {
+        max_source_rows_per_vd: state.config().sof_sqlquery_max_source_rows_per_vd,
+        max_rows: state.config().sof_sqlquery_max_rows,
+        timeout_secs: state.config().sof_sqlquery_timeout_secs,
     };
+    let (mut result, schemas_in_order) = super::graph::execute_plan(
+        engine,
+        &runner,
+        tenant.context(),
+        &ViewFilters::default(),
+        &plan,
+        &library.sql,
+        &bindings,
+        limits,
+    )
+    .await
+    .map_err(|e| RestError::UnprocessableEntity { message: e })?;
 
     // SoF v2 PR #353: apply caller-supplied `_limit` as a soft cap on the
     // final result set, AFTER SQL evaluation (including any in-query LIMIT).
@@ -285,12 +212,12 @@ where
     }
 
     // Refine output column types: when a result column name matches a column
-    // we materialized from a depends-on ViewDefinition, prefer the VD-declared
-    // FHIR type. Walk depends-on in declaration order so the lookup is
-    // deterministic when two VDs declare the same column name.
+    // we materialized from a leaf ViewDefinition anywhere in the dependency
+    // graph, prefer the VD-declared FHIR type. Walk leaves in plan order so
+    // the lookup is deterministic when two VDs declare the same column name.
     let mut name_to_type: std::collections::HashMap<String, ColumnFhirType> =
         std::collections::HashMap::new();
-    for (_label, schema) in &schemas_in_order {
+    for schema in &schemas_in_order {
         for col in &schema.columns {
             name_to_type
                 .entry(col.name.clone())
@@ -316,7 +243,7 @@ where
 /// Resolves the output format. Precedence (SoF v2 PR #353): body `_format` >
 /// URL `_format` > Accept header > `ndjson` default. `_format` is `0..1`.
 ///
-/// Accept mapping mirrors `$viewdefinition-run`: `application/json` → `json`,
+/// Accept mapping: `application/json` → `json`,
 /// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
 /// `application/octet-stream`/`application/parquet` → `parquet`,
 /// `application/fhir+json` → `fhir`. `application/fhir+xml` is **not**
@@ -419,72 +346,6 @@ pub(crate) fn validate_select_only(sql: &str) -> Result<(), RestError> {
             })
         }
     }
-}
-
-async fn resolve_library<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    path_id: &Option<String>,
-    params: &helios_sof::SqlQueryRunParams,
-) -> Result<Value, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    // Instance route wins.
-    if let Some(id) = path_id {
-        let stored = state
-            .storage()
-            .read(tenant.context(), "Library", id)
-            .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("failed to read Library: {e}"),
-            })?
-            .ok_or_else(|| RestError::NotFound {
-                resource_type: "Library".to_string(),
-                id: id.clone(),
-            })?;
-        return Ok(stored.content().clone());
-    }
-    if let Some(library_json) = &params.query_resource {
-        return Ok(library_json.clone());
-    }
-    if let Some(reference) = &params.query_reference {
-        return resolve_library_reference(state, tenant.context(), reference).await;
-    }
-    Err(RestError::BadRequest {
-        message: "supply queryReference, queryResource, or use the instance route".to_string(),
-    })
-}
-
-async fn resolve_library_reference<S>(
-    state: &AppState<S>,
-    tenant: &TenantContext,
-    reference: &str,
-) -> Result<Value, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    resolve_resource_canonical_or_relative(state, tenant, "Library", reference).await
-}
-
-async fn resolve_canonical_view_definition<S>(
-    state: &AppState<S>,
-    tenant: &TenantContext,
-    url: &str,
-) -> Result<Value, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    resolve_resource_canonical_or_relative(state, tenant, "ViewDefinition", url).await
-}
-
-/// Convert a `RowStream<Result<Value, SofError>>` into a stream
-/// `Result<Value, String>` for the engine (it doesn't know the persistence type).
-fn adapt_row_stream(
-    stream: helios_persistence::core::sof_runner::RowStream,
-) -> impl Stream<Item = Result<Value, String>> + Send {
-    use futures::StreamExt;
-    stream.map(|r| r.map_err(|e| e.to_string()))
 }
 
 fn render_output(
@@ -604,7 +465,7 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
             ),
         },
         SqlQueryError::Sqlite(err) => {
-            warn!(error = %err, "sqlite error during $sqlquery-run");
+            warn!(error = %err, "sqlite error during $sql-run");
             RestError::UnprocessableEntity {
                 message: format!("SQLite error: {err}"),
             }

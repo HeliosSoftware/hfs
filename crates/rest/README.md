@@ -134,6 +134,16 @@ the background and is polled via `/$reindex-status/[job_id]`.
   deployment, poll the node you kicked off against.
 - The `s3` backend standalone has no search index of any kind, so `$reindex`
   there returns `501`. Every other backend and composite supports it.
+- The same applies after a **server upgrade that adds a parameter to the
+  built-in set**, not just after an operator edits one. Resources written
+  before the upgrade were extracted under the old definitions and have no index
+  rows for the new parameter, so it matches nothing on that older data until a
+  `$reindex` runs. Two current cases: `_source` (`meta.source`), which no
+  version of the server indexed before [#523], and `_language`
+  (`Resource.language`) on R5/R6. Neither returns an error on stale data — it
+  simply under-matches, which is the failure mode a reindex exists to clear.
+
+[#523]: https://github.com/HeliosSoftware/hfs/issues/523
 
 Both operations emit BALP `AuditEvent`s — purge on completion or failure,
 reindex at start and at its terminal state (complete / cancel / fail, outcome
@@ -341,16 +351,16 @@ rather than PHI and providers commonly leave them unencrypted.
 
 ### SQL-on-FHIR Async Export
 
-Separate from Bulk Data Export, the SQL-on-FHIR `$viewdefinition-export` and
-`$sqlquery-export` operations run asynchronously and write their tabular output
+Separate from Bulk Data Export, the SQL-on-FHIR `$sql-export` and
+`$sql-export` operations run asynchronously and write their tabular output
 to a dedicated *export sink*, configured via `HFS_EXPORT_*`. The whole subsystem
-is gated by `HFS_SOF_ENABLED` (which also enables `$viewdefinition-run`); when
+is gated by `HFS_SOF_ENABLED` (which also enables `$sql-run`); when
 enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 `postgres`).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$viewdefinition-run`/`-export`, `$sqlquery-*`). |
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`). |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. |
 | `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |
@@ -361,6 +371,15 @@ enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`. Aligns with the manifest's advertised 24h `Expires`. |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
+
+`$sql-run` and `$sql-export` both accept a repeating `context` parameter
+carrying ViewDefinitions or SQLView Libraries inline, matched to the
+subject's dependency graph by canonical URL at any depth. Resolution is
+**server-first**: for each dependency, storage is checked before `context`,
+so `context` only applies to URLs the server cannot resolve on its own — a
+`context` entry that duplicates an artifact the server already has is
+silently ignored (there is no channel to attach a warning to a streamed
+`$sql-run`/`$sql-export` response).
 
 Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
 job's already-written partial shards immediately; the reaper above reclaims
@@ -499,20 +518,46 @@ curl -X POST http://localhost:8080/ \
   }'
 ```
 
+### Entry Methods
+
+`Bundle.entry.request.method` is matched **case-sensitively** in both bundle types.
+It is a `code` with a required binding to `http://hl7.org/fhir/ValueSet/http-verb`,
+whose concepts are `caseSensitive: true` and uppercase in every supported FHIR
+version — so a lowercase `"post"` is invalid instance data and is refused with
+`400`, not silently accepted. `GET`, `POST`, `PUT` and `DELETE` dispatch; `PATCH`
+and `HEAD` are refused as described under Current Limitations.
+
 ### Conditional Operations in Bundles
 
-Bundle entries support conditional headers:
-- `ifMatch` - ETag for optimistic locking on `PUT` **and `DELETE`** entries, in
-  both `batch` and `transaction` bundles. Parsed as the comma-separated list
-  RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
-- `ifNoneMatch` - Prevent overwrites (`*` for conditional create)
-- `ifNoneExist` - Search query for conditional create
+- `ifMatch` — **supported.** ETag for optimistic locking on `PUT` **and `DELETE`**
+  entries, in both `batch` and `transaction` bundles. Parsed as the comma-separated
+  list RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
+- `ifNoneMatch` — **parsed and ignored.** `parse_bundle_entry` populates
+  `BundleEntry.if_none_match`; no handler or backend reads it.
+- `ifNoneExist` — **MongoDB transactions only.** MongoDB resolves it inside the
+  bundle's session. The batch path never reads it, and SQLite/PostgreSQL ignore it
+  in a transaction and create a duplicate. Tracked by #511.
+
+Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
+`DELETE [type]?[criteria]`) are **not resolved**:
+
+- In a `batch`, such an entry is refused per-entry with `400`; nothing is written.
+- In a `transaction`, any non-`GET` entry whose URL carries a query string
+  declines the whole bundle with `400 not-supported` before anything executes,
+  because the backends parse entry URLs query-blind and would otherwise commit
+  the criteria as part of the resource type or the id.
+
+Note that `/metadata` advertises `conditionalCreate`, `conditionalUpdate` and
+`conditionalDelete` for every resource type. That is accurate for the resource
+endpoints and **not** for bundle entries; reconciling the two is #511.
 
 ### Current Limitations
 
 The following FHIR transaction features are not yet implemented:
+- **Conditional interactions in bundle entries** - `[type]?[criteria]` URLs are refused rather than resolved (#511)
 - **Conditional reference resolution** - References like `Patient?identifier=12345` are not resolved
-- **PATCH method** - PATCH operations in bundles return 501 Not Implemented
+- **PATCH method** - PATCH operations in bundles return 501 Not Implemented, in both `batch` (per entry) and `transaction` (whole bundle). Send the patch to the instance endpoint instead
+- **HEAD entries** - refused with 405. `HEAD` is a legal `http-verb` code and is served on the instance-read route, but not inside a Bundle
 - **Prefer header** - `return=minimal` and `return=OperationOutcome` not honored
 - **Duplicate detection** - Same resource appearing twice in a transaction is not detected
 

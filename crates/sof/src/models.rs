@@ -3,12 +3,12 @@
 //! This module contains data structures for handling HTTP requests and responses,
 //! including parameter parsing and content type negotiation.
 
+use crate::{ContentType, SofParameters};
 use chrono::{DateTime, Utc};
-use helios_sof::{ContentType, SofParameters};
 use serde::Deserialize;
 use tracing::debug;
 
-/// Query parameters for ViewDefinition/$viewdefinition-run endpoint
+/// Query parameters for the system-level `$sql-run` endpoint.
 #[derive(Debug, Deserialize)]
 pub struct RunQueryParams {
     /// Output format override (alternative to Accept header)
@@ -27,9 +27,14 @@ pub struct RunQueryParams {
     #[serde(rename = "_since")]
     pub since: Option<String>,
 
-    /// Reference to ViewDefinition(s) for GET requests
-    #[serde(rename = "viewReference")]
-    pub view_reference: Option<String>,
+    /// Literal location of the subject, for GET requests.
+    #[serde(rename = "subjectReference")]
+    pub subject_reference: Option<String>,
+
+    /// Canonical URL of the subject, for GET requests. Distinct from
+    /// `subjectReference`: an identity rather than a location.
+    #[serde(rename = "subjectCanonical")]
+    pub subject_canonical: Option<String>,
 
     /// Filter resources by patient (reference)
     #[serde(rename = "patient")]
@@ -73,8 +78,11 @@ pub struct ValidatedRunParams {
     /// Include only resources modified after this time
     pub since: Option<DateTime<Utc>>,
 
-    /// Reference to ViewDefinition(s)
-    pub view_reference: Option<String>,
+    /// Literal location of the subject.
+    pub subject_reference: Option<String>,
+
+    /// Canonical URL of the subject.
+    pub subject_canonical: Option<String>,
 
     /// Filter resources by patient
     pub patient: Option<String>,
@@ -86,7 +94,7 @@ pub struct ValidatedRunParams {
     pub source: Option<String>,
 
     /// Parquet-specific options
-    pub parquet_options: Option<helios_sof::ParquetOptions>,
+    pub parquet_options: Option<crate::ParquetOptions>,
 }
 
 /// Parameters for ViewDefinition/$viewdefinition-run operation - now using proper FHIR Parameters
@@ -205,7 +213,7 @@ pub fn validate_query_params(
             "snappy".to_string() // Default
         };
 
-        Some(helios_sof::ParquetOptions {
+        Some(crate::ParquetOptions {
             row_group_size_mb,
             page_size_kb,
             compression,
@@ -219,7 +227,8 @@ pub fn validate_query_params(
         format,
         limit,
         since,
-        view_reference: params.view_reference.clone(),
+        subject_reference: params.subject_reference.clone(),
+        subject_canonical: params.subject_canonical.clone(),
         patient: params.patient.clone(),
         group: params.group.clone(),
         source: params.source.clone(),
@@ -242,7 +251,7 @@ pub fn parse_content_type(
     accept_header: Option<&str>,
     format_param: Option<&str>,
     header_param: Option<bool>,
-) -> Result<ContentType, helios_sof::SofError> {
+) -> Result<ContentType, crate::SofError> {
     let apply_csv_header = |s: &str| -> String {
         if s == "text/csv" {
             match header_param {
@@ -269,16 +278,17 @@ pub fn parse_content_type(
 ///
 /// `patient` and `group` are `Vec<String>` to match the SoF v2 spec
 /// (`patient` is `0..1`, `group` is `0..*`) and the shared permissive
-/// extractor in [`helios_sof::params`]. The strict path used to keep
+/// extractor in [`crate::params`]. The strict path used to keep
 /// only `Option<String>` here, which silently dropped earlier entries
 /// when callers supplied multiple `group` references.
 #[derive(Debug, Default)]
 pub struct ExtractedParameters {
-    pub view_definition: Option<serde_json::Value>,
+    pub subject_resource: Option<serde_json::Value>,
     pub resources: Vec<serde_json::Value>,
     pub format: Option<String>,
     pub header: Option<bool>,
-    pub view_reference: Option<String>,
+    pub subject_reference: Option<String>,
+    pub subject_canonical: Option<String>,
     pub patient: Vec<String>,
     pub group: Vec<String>,
     pub source: Option<String>,
@@ -304,38 +314,53 @@ fn process_parameter(
     };
 
     match name {
-        "viewResource" => {
+        "subjectResource" => {
             if let Some(resource) = param_json.get("resource") {
-                // Check if a ViewDefinition has already been provided
-                if result.view_definition.is_some() {
+                // `subjectResource` is 0..1: one subject per run.
+                if result.subject_resource.is_some() {
                     return Err(
-                        "Only one viewResource parameter is allowed. Multiple ViewDefinitions are not supported"
+                        "Only one subjectResource parameter is allowed. $sql-run evaluates a single subject"
                             .to_string(),
                     );
                 }
-                result.view_definition = Some(resource.clone());
+                result.subject_resource = Some(resource.clone());
             } else if has_any_value_field(&param_json) {
                 return Err(
-                    "viewResource parameter must contain a 'resource' field, not a value[X] field"
+                    "subjectResource parameter must contain a 'resource' field, not a value[X] field"
                         .to_string(),
                 );
             }
         }
-        "viewReference" => {
+        "subjectReference" => {
             // Check for valueReference first
             if let Some(value_ref) = param_json.get("valueReference") {
                 if let Some(reference) = value_ref.get("reference") {
                     if let Some(ref_str) = reference.as_str() {
-                        result.view_reference = Some(ref_str.to_string());
+                        result.subject_reference = Some(ref_str.to_string());
                     }
                 }
             } else if let Some(value_str) = param_json.get("valueString") {
                 if let Some(ref_str) = value_str.as_str() {
-                    result.view_reference = Some(ref_str.to_string());
+                    result.subject_reference = Some(ref_str.to_string());
                 }
             } else if has_any_value_field(&param_json) {
                 return Err(
-                    "viewReference parameter must use valueReference or valueString".to_string(),
+                    "subjectReference parameter must use valueReference or valueString".to_string(),
+                );
+            }
+        }
+        "subjectCanonical" => {
+            // A canonical URL, optionally `|version`-pinned. Distinct from
+            // `subjectReference`, which names a literal location.
+            let read = ["valueCanonical", "valueUri", "valueUrl", "valueString"]
+                .iter()
+                .find_map(|k| param_json.get(*k).and_then(|v| v.as_str()));
+            if let Some(url) = read {
+                result.subject_canonical = Some(url.to_string());
+            } else if has_any_value_field(&param_json) {
+                return Err(
+                    "subjectCanonical parameter must use valueCanonical, valueUri or valueString"
+                        .to_string(),
                 );
             }
         }
@@ -670,7 +695,7 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
 // `apply_json_filtering` / `apply_csv_filtering` /
 // `apply_pagination_to_records` / `apply_pagination_to_lines` helpers
 // re-parsed and re-truncated serialized output bytes even though
-// `helios_sof::run_view_definition_with_options` already applies
+// `crate::run_view_definition_with_options` already applies
 // `_limit` at the structured-row level (via
 // `apply_pagination_to_result`) before serialization. The serialized-
 // byte pass was inefficient (re-parsed/re-serialized JSON every time),
@@ -723,7 +748,8 @@ mod tests {
             header: None,
             limit: Some(10),
             since: Some("2023-01-01T00:00:00Z".to_string()),
-            view_reference: None,
+            subject_reference: None,
+            subject_canonical: None,
             patient: None,
             group: None,
             source: None,
@@ -746,7 +772,8 @@ mod tests {
             header: None,
             limit: Some(0),
             since: None,
-            view_reference: None,
+            subject_reference: None,
+            subject_canonical: None,
             patient: None,
             group: None,
             source: None,
@@ -772,7 +799,8 @@ mod tests {
             header: None,
             limit: None,
             since: Some("invalid-date".to_string()),
-            view_reference: None,
+            subject_reference: None,
+            subject_canonical: None,
             patient: None,
             group: None,
             source: None,
@@ -796,14 +824,14 @@ mod tests {
     // `apply_csv_filtering` / `apply_json_filtering` helpers. End-to-end
     // `_limit` behavior is exercised by `test_run_view_definition_limit`
     // (and equivalents) via the HTTP layer + the structured-row pass
-    // inside `helios_sof::run_view_definition_with_options`.
+    // inside `crate::run_view_definition_with_options`.
 
     #[test]
     fn test_extract_viewreference_parameter() {
         let params_json = serde_json::json!({
             "resourceType": "Parameters",
             "parameter": [{
-                "name": "viewReference",
+                "name": "subjectReference",
                 "valueReference": {
                     "reference": "ViewDefinition/123"
                 }
@@ -817,7 +845,7 @@ mod tests {
             let extracted = extract_all_parameters(run_params).unwrap();
 
             assert_eq!(
-                extracted.view_reference,
+                extracted.subject_reference,
                 Some("ViewDefinition/123".to_string())
             );
         }
@@ -921,7 +949,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 {
-                    "name": "viewResource",
+                    "name": "subjectResource",
                     "resource": {
                         "resourceType": "ViewDefinition",
                         "status": "active",
@@ -951,7 +979,7 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
-            assert!(extracted.view_definition.is_some());
+            assert!(extracted.subject_resource.is_some());
             assert_eq!(extracted.patient, vec!["Patient/123".to_string()]);
             assert_eq!(extracted.format, Some("csv".to_string()));
             assert_eq!(extracted.header, Some(false));
@@ -1269,7 +1297,7 @@ mod tests {
         let params_json = serde_json::json!({
             "resourceType": "Parameters",
             "parameter": [{
-                "name": "viewReference",
+                "name": "subjectReference",
                 "valueBoolean": true
             }]
         });
@@ -1282,7 +1310,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "viewReference parameter must use valueReference or valueString"
+                "subjectReference parameter must use valueReference or valueString"
             );
         }
 
@@ -1290,7 +1318,7 @@ mod tests {
         let params_json = serde_json::json!({
             "resourceType": "Parameters",
             "parameter": [{
-                "name": "viewResource",
+                "name": "subjectResource",
                 "valueString": "ViewDefinition/123"
             }]
         });
@@ -1303,7 +1331,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "viewResource parameter must contain a 'resource' field, not a value[X] field"
+                "subjectResource parameter must contain a 'resource' field, not a value[X] field"
             );
         }
 
@@ -1332,7 +1360,7 @@ mod tests {
         let params_json = serde_json::json!({
             "resourceType": "Parameters",
             "parameter": [{
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "resource": "Patient",
@@ -1344,7 +1372,7 @@ mod tests {
                     }]
                 }
             }, {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "resource": "Observation",
@@ -1366,7 +1394,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "Only one viewResource parameter is allowed. Multiple ViewDefinitions are not supported"
+                "Only one subjectResource parameter is allowed. $sql-run evaluates a single subject"
             );
         }
     }

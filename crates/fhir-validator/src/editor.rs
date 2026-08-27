@@ -216,21 +216,77 @@ fn merged_required(
     out
 }
 
-/// The schema governing the node at `path`.
+/// The schema governing the node at `path`, by element names alone.
 ///
 /// Indices do not change the schema — an item of a repeating element is
-/// governed by the element itself.
+/// governed by the element itself. Prefer [`schema_at_in`] when the document
+/// is in hand: a profiled extension is only recognizable from the instance.
 pub fn schema_at(
     resolver: &dyn SchemaResolver,
     root_type: &str,
     path: &[Step],
 ) -> Option<Arc<FhirSchema>> {
+    schema_at_in(resolver, root_type, None, path)
+}
+
+/// The schema governing the node at `path`, following the document (#606).
+///
+/// Name-only resolution treats every `extension` item as the base
+/// `Extension`. With the document in hand, an item whose `url` is a canonical
+/// the resolver knows continues from that profile's schema — so a profiled
+/// extension's constrained `value[x]`, sub-extension slices, bindings, and
+/// `short` texts all reach the editor. A sub-extension of a complex profile
+/// (a relative `url` like `"code"`) resolves through the slice it matches.
+/// Anything unrecognized falls back to the base shape.
+pub fn schema_at_in(
+    resolver: &dyn SchemaResolver,
+    root_type: &str,
+    document: Option<&Value>,
+    path: &[Step],
+) -> Option<Arc<FhirSchema>> {
     let mut current = resolver.resolve(root_type)?;
+    let mut node = document;
+    let mut in_extension = false;
 
     for step in path {
-        let Step::Field(name) = step else { continue };
-        let elements = merged_elements(resolver, &current, &mut HashSet::new());
-        current = Arc::clone(elements.get(name)?);
+        match step {
+            Step::Field(name) => {
+                let elements = merged_elements(resolver, &current, &mut HashSet::new());
+                current = Arc::clone(elements.get(name)?);
+                in_extension = name == "extension" || name == "modifierExtension";
+                node = node.and_then(|value| value.get(name));
+            }
+            Step::Index(index) => {
+                node = node.and_then(|value| value.get(*index));
+                if !in_extension {
+                    continue;
+                }
+                let Some(item) = node else { continue };
+                // An absolute url naming a known profile governs the item; a
+                // relative one (a complex extension's sub-extension) resolves
+                // through the slice it matches. The `://` guard keeps names
+                // like "code" from colliding with type schemas.
+                let by_url = item
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|url| url.contains("://"))
+                    .and_then(|url| resolver.resolve(url));
+                if let Some(profile) = by_url {
+                    current = profile;
+                } else if let Some(slicing) = &current.slicing
+                    && let Some(slice_schema) = slicing
+                        .slices
+                        .iter()
+                        .find(|(name, slice)| {
+                            name.as_str() != "@default"
+                                && crate::engine::slicing::slice_matches(slice, item)
+                        })
+                        .and_then(|(_, slice)| slice.schema.as_deref())
+                {
+                    current = Arc::new(slice_schema.clone());
+                }
+            }
+        }
     }
     Some(current)
 }
@@ -292,7 +348,7 @@ pub fn addable(
     document: &Value,
     path: &[Step],
 ) -> Vec<Addable> {
-    let Some(schema) = schema_at(resolver, root_type, path) else {
+    let Some(schema) = schema_at_in(resolver, root_type, Some(document), path) else {
         return Vec::new();
     };
     let elements = merged_elements(resolver, &schema, &mut HashSet::new());
@@ -451,7 +507,7 @@ pub fn present_children(
         return Vec::new();
     };
 
-    let elements = schema_at(resolver, root_type, path)
+    let elements = schema_at_in(resolver, root_type, Some(document), path)
         .map(|schema| merged_elements(resolver, &schema, &mut HashSet::new()))
         .unwrap_or_default();
 
@@ -536,7 +592,7 @@ pub fn add_element(
     path: &[Step],
     name: &str,
 ) -> Option<Path> {
-    let schema = schema_at(resolver, root_type, path)?;
+    let schema = schema_at_in(resolver, root_type, Some(&*document), path)?;
     let elements = merged_elements(resolver, &schema, &mut HashSet::new());
     let element = elements.get(name)?;
     let repeats = element.array.unwrap_or(false);
@@ -606,23 +662,59 @@ pub fn remove_at(document: &mut Value, path: &[Step]) -> bool {
 
 /// Sets a primitive value at `path`. An empty string removes the element rather
 /// than storing `""`, which is not a valid FHIR primitive.
-pub fn set_value(document: &mut Value, path: &[Step], raw: &str) -> bool {
+pub fn set_value(
+    resolver: &dyn SchemaResolver,
+    root_type: &str,
+    document: &mut Value,
+    path: &[Step],
+    raw: &str,
+) -> bool {
     if raw.is_empty() {
         return remove_at(document, path);
     }
+    let declared =
+        schema_at_in(resolver, root_type, Some(&*document), path).and_then(|s| s.type_.clone());
     let Some(node) = node_at_mut(document, path) else {
         return false;
     };
-    // Keep JSON types honest: booleans and numbers are not strings in FHIR.
-    *node = match raw {
-        "true" => Value::Bool(true),
-        "false" => Value::Bool(false),
-        _ => match raw.parse::<i64>() {
-            Ok(number) if !raw.starts_with('0') || raw == "0" => Value::from(number),
+    *node = coerce_primitive(declared.as_deref(), raw);
+    true
+}
+
+/// The JSON type the declared FHIR primitive demands. Only booleans and the
+/// numeric primitives leave string-land; a date of `1974`, an id of `123`, or
+/// an identifier value of `12345` merely *looks* numeric and must stay a
+/// string — guessing from the shape of the text turned all of them into JSON
+/// numbers the validator then rejected. (`integer64` stays a string too: FHIR
+/// serializes it that way.) An element the schema does not know keeps the old
+/// shape-based guess, so unknown keys still round-trip their JSON types.
+fn coerce_primitive(declared: Option<&str>, raw: &str) -> Value {
+    match declared {
+        Some("boolean") => match raw {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
             _ => Value::String(raw.to_string()),
         },
-    };
-    true
+        Some("integer") | Some("positiveInt") | Some("unsignedInt") => raw
+            .parse::<i64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(raw.to_string())),
+        Some("decimal") => match raw.parse::<f64>() {
+            Ok(number) if number.is_finite() => serde_json::Number::from_f64(number)
+                .map(Value::Number)
+                .unwrap_or_else(|| Value::String(raw.to_string())),
+            _ => Value::String(raw.to_string()),
+        },
+        Some(_) => Value::String(raw.to_string()),
+        None => match raw {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => match raw.parse::<i64>() {
+                Ok(number) if !raw.starts_with('0') || raw == "0" => Value::from(number),
+                _ => Value::String(raw.to_string()),
+            },
+        },
+    }
 }
 
 /// Picks a concrete arm of a `value[x]`: creates `valueString` and drops any
@@ -635,7 +727,7 @@ pub fn choose_type(
     declarer: &str,
     arm: &str,
 ) -> Option<Path> {
-    let schema = schema_at(resolver, root_type, path)?;
+    let schema = schema_at_in(resolver, root_type, Some(&*document), path)?;
     let elements = merged_elements(resolver, &schema, &mut HashSet::new());
     let choices = elements.get(declarer)?.choices.clone()?;
     if !choices.contains(&arm.to_string()) {
@@ -691,6 +783,22 @@ pub fn add_extension(
     {
         object.insert("url".to_string(), Value::String(url.to_string()));
     }
+    // A profile that allows exactly one value type seeds that arm on add
+    // (#606): the constraint becomes self-evident and a pick disappears. Now
+    // that the url is in the instance, resolution at `created` is the
+    // profile's schema, so `choose_type` sees the constrained choice group.
+    if url.contains("://")
+        && let Some(profile) = resolver.resolve(url)
+    {
+        let elements = merged_elements(resolver, &profile, &mut HashSet::new());
+        if let Some((declarer, arms)) = elements
+            .iter()
+            .find_map(|(name, e)| e.choices.clone().map(|c| (name.clone(), c)))
+            && arms.len() == 1
+        {
+            let _ = choose_type(resolver, root_type, document, &created, &declarer, &arms[0]);
+        }
+    }
     Some(created)
 }
 
@@ -704,10 +812,11 @@ pub fn is_resource(schema: &FhirSchema) -> bool {
 pub fn slice_label(
     resolver: &dyn SchemaResolver,
     root_type: &str,
+    document: &Value,
     path: &[Step],
     item: &Value,
 ) -> Option<String> {
-    let parent = schema_at(resolver, root_type, path)?;
+    let parent = schema_at_in(resolver, root_type, Some(document), path)?;
     let slicing = parent.slicing.as_ref()?;
     slicing
         .slices
@@ -730,7 +839,7 @@ pub fn add_slice_element(
     slice_name: &str,
 ) -> Option<Path> {
     let added = add_element(resolver, root_type, document, path, name)?;
-    let parent_schema = schema_at(resolver, root_type, path);
+    let parent_schema = schema_at_in(resolver, root_type, Some(&*document), path);
     // Look the sliced element up through the same base/type merge that
     // `schema_at` and `addable` use: a differential profile may inherit the
     // sliced element rather than restating it, and the un-merged element map
@@ -783,6 +892,76 @@ mod tests {
 
     fn registry() -> Arc<crate::SchemaRegistry> {
         core_registry(FhirVersion::R4)
+    }
+
+    /// #606: an extension item whose url names a known profile is governed by
+    /// that profile — the value[x] choice narrows to what it allows.
+    #[test]
+    fn a_profiled_extension_constrains_the_value_choice() {
+        let registry = registry();
+        let document = json!({
+            "resourceType": "Patient",
+            "extension": [{ "url": "http://hl7.org/fhir/StructureDefinition/patient-birthPlace" }]
+        });
+        let path = path_from_string("extension.0");
+
+        let schema =
+            schema_at_in(&*registry, "Patient", Some(&document), &path).expect("profile resolves");
+        assert_eq!(
+            schema.url.as_deref(),
+            Some("http://hl7.org/fhir/StructureDefinition/patient-birthPlace")
+        );
+
+        let arms: Vec<Vec<String>> = addable(&*registry, "Patient", &document, &path)
+            .into_iter()
+            .filter_map(|a| match a.kind {
+                AddableKind::Choice(arms) => Some(arms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(arms, vec![vec!["valueAddress".to_string()]]);
+    }
+
+    /// #606: an unknown url degrades to the base Extension shape — the full
+    /// arm set, exactly as before.
+    #[test]
+    fn an_unknown_extension_url_keeps_the_base_shape() {
+        let registry = registry();
+        let document = json!({
+            "resourceType": "Patient",
+            "extension": [{ "url": "http://example.org/nobody-knows-this" }]
+        });
+        let path = path_from_string("extension.0");
+        let arms = addable(&*registry, "Patient", &document, &path)
+            .into_iter()
+            .find_map(|a| match a.kind {
+                AddableKind::Choice(arms) => Some(arms),
+                _ => None,
+            })
+            .expect("base value[x] offered");
+        assert!(arms.len() > 10, "base Extension offers the full arm set");
+    }
+
+    /// #606: adding a profiled extension whose profile allows exactly one
+    /// value type seeds that arm immediately.
+    #[test]
+    fn adding_a_single_arm_extension_seeds_the_arm() {
+        let registry = registry();
+        let mut document = json!({ "resourceType": "Patient" });
+        let created = add_extension(
+            &*registry,
+            "Patient",
+            &mut document,
+            &[],
+            "http://hl7.org/fhir/StructureDefinition/patient-birthPlace",
+            false,
+        )
+        .expect("extension added");
+        let node = node_at(&document, &created).expect("node exists");
+        assert!(
+            node.get("valueAddress").is_some(),
+            "the single allowed arm is seeded: {node}"
+        );
     }
 
     fn donald() -> Value {
@@ -881,18 +1060,32 @@ mod tests {
         assert!(names(&list).contains(&"period"));
     }
 
-    /// And extensions nest, because `Extension.extension` is recursive.
+    /// Extensions nest through the base `Extension` shape — but a *simple*
+    /// profiled extension prohibits sub-extensions, and with resolution now
+    /// following the document (#606) the editor honors that: donald's
+    /// birthPlace stops offering `extension`, while an unprofiled one keeps
+    /// the recursive shape.
     #[test]
     fn extensions_nest() {
         let registry = registry();
         let path = path_from_string("extension.0");
         let list = addable(registry.as_ref(), "Patient", &donald(), &path);
 
-        assert!(names(&list).contains(&"extension"));
+        // birthPlace is a simple extension: nested extension is 0..0.
+        assert!(!names(&list).contains(&"extension"));
         // url is set and does not repeat.
         assert!(!names(&list).contains(&"url"));
         // The value[x] is spent by valueAddress.
         assert!(!names(&list).contains(&"value"));
+
+        // An extension the resolver does not know keeps the recursive base
+        // shape, nested extension included.
+        let unknown = json!({
+            "resourceType": "Patient",
+            "extension": [{ "url": "http://example.org/unknown" }]
+        });
+        let list = addable(registry.as_ref(), "Patient", &unknown, &path);
+        assert!(names(&list).contains(&"extension"));
     }
 
     #[test]
@@ -1077,15 +1270,78 @@ mod tests {
 
     #[test]
     fn setting_a_value_keeps_json_types_honest() {
+        let registry = registry();
+        let resolver = registry.as_ref();
         let mut patient = donald();
-        add_element(registry().as_ref(), "Patient", &mut patient, &[], "active").unwrap();
+        add_element(resolver, "Patient", &mut patient, &[], "active").unwrap();
 
-        set_value(&mut patient, &path_from_string("active"), "true");
+        set_value(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("active"),
+            "true",
+        );
         assert_eq!(patient["active"], json!(true));
 
         // Clearing a field removes it rather than storing "".
-        set_value(&mut patient, &path_from_string("active"), "");
+        set_value(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("active"),
+            "",
+        );
         assert!(patient.get("active").is_none());
+    }
+
+    #[test]
+    fn coercion_follows_the_declared_type_not_the_shape_of_the_text() {
+        let registry = registry();
+        let resolver = registry.as_ref();
+        let mut patient = donald();
+
+        // A year-precision date is legal FHIR and must stay a string, even
+        // though it parses as an integer.
+        add_element(resolver, "Patient", &mut patient, &[], "birthDate").unwrap();
+        set_value(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("birthDate"),
+            "1974",
+        );
+        assert_eq!(patient["birthDate"], json!("1974"));
+
+        // Same for string-typed elements whose content merely looks numeric.
+        add_element(resolver, "Patient", &mut patient, &[], "identifier").unwrap();
+        add_element(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("identifier.0"),
+            "value",
+        )
+        .unwrap();
+        set_value(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("identifier.0.value"),
+            "12345",
+        );
+        assert_eq!(patient["identifier"][0]["value"], json!("12345"));
+
+        // A key the schema does not know keeps the old shape-based guess.
+        patient["unknownField"] = json!(0);
+        set_value(
+            resolver,
+            "Patient",
+            &mut patient,
+            &path_from_string("unknownField"),
+            "7",
+        );
+        assert_eq!(patient["unknownField"], json!(7));
     }
 }
 
@@ -1171,11 +1427,18 @@ mod slice_tests {
             "seeded so it matches: {doc}"
         );
 
-        let label = slice_label(registry.as_ref(), "Sliced", &[], &doc["identifier"][0]);
+        let label = slice_label(
+            registry.as_ref(),
+            "Sliced",
+            &doc,
+            &[],
+            &doc["identifier"][0],
+        );
         assert_eq!(label, None, "slice_label reads the parent of the ITEM path");
         let label = slice_label(
             registry.as_ref(),
             "Sliced",
+            &doc,
             &[Step::Field("identifier".to_string())],
             &doc["identifier"][0],
         );

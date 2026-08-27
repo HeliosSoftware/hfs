@@ -851,6 +851,29 @@ mod string_search {
     }
 
     #[tokio::test]
+    async fn test_membership_parameter_in_is_rejected() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `_in` asks whether the resource belongs to a referenced List or
+        // Group. That is unimplemented, and it must not fall through: on R5/R6
+        // it is a registered `reference` parameter, so lenient handling would
+        // not drop it and the spec's placeholder `Resource.id` expression makes
+        // the backends answer a membership question with an identity test
+        // (PostgreSQL) or with the entire resource type (SQLite). Rejecting is
+        // the only answer that is not silently wrong (#535).
+        let response = server
+            .get("/Patient?_in=42")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["code"], "invalid");
+    }
+
+    #[tokio::test]
     async fn test_modifier_invalid_for_param_type_returns_400() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
@@ -874,6 +897,107 @@ mod string_search {
                 .unwrap()
                 .contains("above")
         );
+    }
+}
+
+// =============================================================================
+// :missing Modifier Tests
+// =============================================================================
+
+mod missing_modifier {
+    use super::*;
+
+    fn entry_ids(body: &Value) -> Vec<String> {
+        let mut ids: Vec<String> = get_bundle_entries(body)
+            .iter()
+            .map(|entry| {
+                entry["resource"]["id"]
+                    .as_str()
+                    .expect("search result must carry a logical id")
+                    .to_string()
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn test_missing_boolean_polarity_returns_exact_membership() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        backend
+            .create(
+                &test_tenant(),
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "patient-without-birthdate",
+                    "active": true
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed Patient without birthDate");
+
+        let missing = server
+            .get("/Patient?birthdate:missing=true&_total=accurate&_count=100")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        missing.assert_status_ok();
+        let missing_body: Value = missing.json();
+        assert_eq!(missing_body["total"], 1);
+        assert_eq!(entry_ids(&missing_body), vec!["patient-without-birthdate"]);
+
+        let present = server
+            .get("/Patient?birthdate:missing=false&_total=accurate&_count=100")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        present.assert_status_ok();
+        let present_body: Value = present.json();
+        assert_eq!(present_body["total"], 4);
+        assert_eq!(
+            entry_ids(&present_body),
+            vec!["patient-1", "patient-2", "patient-3", "patient-4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_requires_an_exact_boolean_literal() {
+        let (server, _) = create_test_server().await;
+
+        for value in ["invalid", "", "TRUE", "true,false"] {
+            let response = server
+                .get(&format!("/Patient?birthdate:missing={value}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+
+            response.assert_status(StatusCode::BAD_REQUEST);
+            let body: Value = response.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "value={value:?}");
+            assert_eq!(body["issue"][0]["code"], "invalid", "value={value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_missing_rejects_non_indexed_and_contained_searches() {
+        let (server, _) = create_test_server().await;
+
+        for query in [
+            "/Patient?_text:missing=true",
+            "/Patient?_content:missing=true",
+            "/Patient?_contained=true&birthdate:missing=true",
+            "/Patient?_contained=both&birthdate:missing=true",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+
+            response.assert_status(StatusCode::BAD_REQUEST);
+            let body: Value = response.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "query={query}");
+            assert_eq!(body["issue"][0]["code"], "invalid", "query={query}");
+        }
     }
 }
 

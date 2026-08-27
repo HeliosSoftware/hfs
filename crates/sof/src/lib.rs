@@ -1,7 +1,7 @@
 //! # SQL-on-FHIR Implementation
 //!
 //! This crate provides a complete implementation of the [SQL-on-FHIR
-//! specification](https://sql-on-fhir.org/ig/latest),
+//! specification](http://hl7.org/fhir/uv/sql-on-fhir),
 //! enabling the transformation of FHIR resources into tabular data using declarative
 //! ViewDefinitions. It supports all major FHIR versions (R4, R4B, R5, R6) through
 //! a version-agnostic abstraction layer.
@@ -180,12 +180,18 @@
 //! - `R5`: FHIR 5.0.0 support
 //! - `R6`: FHIR 6.0.0 support
 
+pub mod app;
+pub mod canonical;
 pub mod compartment;
 pub mod constants;
 pub mod data_source;
+mod error;
 pub mod fhir_format;
+mod handlers;
+mod models;
 pub mod params;
 pub mod parquet_schema;
+mod parquet_zip;
 pub mod reference_collector;
 pub mod remote_fetch;
 pub mod remote_resolver;
@@ -195,7 +201,7 @@ pub mod traits;
 pub use compartment::{resolve_group_members_to_patient_refs, resource_in_patient_compartment};
 pub use constants::{ConstantValue, parse_constant_from_json};
 pub use params::{
-    ExtractedRunParams, body_has_view_definition, extract_run_params_from_json, split_csv_refs,
+    ExtractedRunParams, body_has_subject, extract_run_params_from_json, split_csv_refs,
 };
 pub use remote_fetch::{RemoteResolver, prefetch_external_resources};
 pub use remote_resolver::{
@@ -2676,8 +2682,36 @@ fn validate_select_with_context<S: ViewDefinitionSelectTrait>(
 where
     S::Select: ViewDefinitionSelectTrait,
 {
-    // Determine if we're entering a forEach context at this level
-    let entering_foreach = select.for_each().is_some() || select.for_each_or_null().is_some();
+    // `sql-expressions` invariant (SQL on FHIR 3.0.0-ballot): a select carries at
+    // most one iteration directive.
+    //
+    //   (forEach.exists().toInteger() + forEachOrNull.exists().toInteger()
+    //    + repeat.exists().toInteger()) <= 1
+    //
+    // 2.0.0 stated this as `(forEach | forEachOrNull | repeat).count() <= 1`, but
+    // FHIRPath `|` discards duplicates, so two directives sharing one expression
+    // slipped through. The ballot counts the elements present instead, so any two
+    // are an error whatever their values. Without this check the evaluator below
+    // silently honours whichever directive it tests for first and drops the rest.
+    let directives = [
+        select.for_each().is_some(),
+        select.for_each_or_null().is_some(),
+        select.repeat().is_some(),
+    ];
+    if directives.iter().filter(|present| **present).count() > 1 {
+        return Err(SofError::InvalidViewDefinition(
+            "A select may specify at most one of 'forEach', 'forEachOrNull' and 'repeat' \
+             (sql-expressions invariant)"
+                .to_string(),
+        ));
+    }
+
+    // Determine if we're entering an iteration context at this level. `repeat`
+    // counts here alongside forEach/forEachOrNull: it iterates the traversed nodes
+    // one row apiece, so a column under it is single-valued for the same reason.
+    let entering_foreach = select.for_each().is_some()
+        || select.for_each_or_null().is_some()
+        || select.repeat().is_some();
     let current_foreach_context = in_foreach_context || entering_foreach;
 
     // Validate collection attribute with the current forEach context

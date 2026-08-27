@@ -42,9 +42,26 @@ test("there is no expand/collapse toggle", async ({ page }) => {
 test("the Batch & Data section lists Import and Export", async ({ page, chrome }) => {
   await page.goto("/ui", { waitUntil: "networkidle" });
   await chrome.sidebar.hover();
-  // Import went live with the Bulk Import workspace (#527); Export and
-  // SQL-on-FHIR are still placeholders.
   await expect(chrome.navLink("/ui/bulk-import")).toBeVisible();
-  await expect(chrome.soonItem("Export")).toBeVisible();
-  await expect(chrome.soonItem("SQL-on-FHIR")).toBeVisible();
+  await expect(chrome.navLink("/ui/bulk-export")).toBeVisible();
+});
+
+test("SQL on FHIR is its own section with five navigable children", async ({
+  page,
+  chrome,
+}) => {
+  // #649: the former coming-soon placeholder inside Batch & Data became a
+  // top-level section whose every child is a real route.
+  await page.goto("/ui", { waitUntil: "networkidle" });
+  await chrome.sidebar.hover();
+  for (const href of [
+    "/ui/sql/view-definitions",
+    "/ui/sql/queries",
+    "/ui/sql/views",
+    "/ui/sql/export",
+    "/ui/sql/files",
+  ]) {
+    await expect(chrome.navLink(href)).toBeVisible();
+  }
+  await expect(page.locator(".nav-item--soon")).toHaveCount(0);
 });

@@ -1,8 +1,10 @@
 {% extends "layouts/base.html" %}
+{% import "partials/type_rail.html" as rail %}
 
 {% block title %}{{ i18n.t("queries-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
-{% block content_class %} content--wide{% endblock %}
+{% block body_class %}app-shell{% endblock %}
+{% block content_class %} content--app{% endblock %}
 
 {% block content %}
 <section class="page-head">
@@ -12,25 +14,31 @@
 
 <div class="queries-layout">
   <!--
-    Resource picker rail (hi-fi Search screen): the version's resource types
-    from the spec, with live counts hydrated client-side via the standard
-    _summary=count search. Picking a type re-keys the builder.
+    Resource picker rail (hi-fi Search screen, #541): the version's resource
+    types from the spec, with counts server-rendered from the dashboard
+    snapshot. Picking a type re-keys the builder.
+
+    Same flat rail as Resources (#603 follow-up): the "RESOURCE TYPES"
+    heading, rounded filter input, and item rows are `.nav-panel`/`.filter-rail`
+    classes shared across Resources, Search, Saved Queries, and Search
+    Parameters — no bordered card around it here.
   -->
-  <aside class="card filter-rail" aria-label="{{ i18n.t("queries-rail-heading") }}">
+  <aside class="filter-rail" aria-label="{{ i18n.t("queries-rail-heading") }}">
+    <div class="filter-rail__heading">{{ i18n.t("queries-rail-heading") }}</div>
     <div class="filter-rail__search">
       <span class="icon">{% include "icons/search.svg" %}</span>
       <input type="search" id="type-rail-filter"
              placeholder="{{ i18n.t("queries-rail-filter") }}"
              aria-label="{{ i18n.t("queries-rail-filter") }}">
     </div>
-    <div class="filter-rail__heading">{{ i18n.t("queries-rail-heading") }}</div>
+    <div class="filter-rail__group" id="type-rail-recent"
+         data-recent-key="hfs-recent-types" data-rail-list="type-rail-list" hidden>
+      <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("sp-rail-recent") }}</div>
+    </div>
+    <div class="filter-rail__divider" aria-hidden="true"></div>
+    <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
     <div class="filter-rail__list" id="type-rail-list">
-      {% for t in resource_types %}
-      <button type="button" class="filter-rail__item" data-rail-type="{{ t }}">
-        <span>{{ t }}</span>
-        <span class="count" data-count-for="{{ t }}"></span>
-      </button>
-      {% endfor %}
+      {% call rail::rail_items(rail_entries) %}{% endcall %}
     </div>
   </aside>
 
@@ -61,5 +69,7 @@
   </div>
 </div>
 
+<script src="/ui/assets/fhir-search-value.js" defer></script>
 <script src="/ui/assets/saved-queries.js" defer></script>
+<script src="/ui/assets/resource-filter.js" defer></script>
 {% endblock %}

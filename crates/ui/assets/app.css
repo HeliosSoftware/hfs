@@ -11,6 +11,13 @@
  * paint; with JS disabled the page stays light, which is the design default.
  */
 
+/* Cascade layers (#543): tokens < base < components < pages. A page-layer
+   rule outranks a component rule regardless of specificity, and shared
+   component definitions can never be accidentally beaten by an earlier
+   page block. Every rule below lives in exactly one layer. */
+@layer tokens, base, components, pages;
+
+@layer base {
 /* Vendored Figtree variable font (OFL) — no runtime CDN, per crate rules. */
 @font-face {
   font-family: "Figtree";
@@ -33,7 +40,9 @@
     U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
     U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
+}
 
+@layer tokens {
 :root {
   color-scheme: light;
   /* Page + panes */
@@ -55,6 +64,14 @@
   --outline: #e4e4e4;
   /* Chart */
   --grid-line: #dcdcdc;
+  /* Series palette (#555): six distinguishable strokes, legible on both
+     themes at 1.5px. Slot 1 is the brand accent. */
+  --series-1: #33b8ff;
+  --series-2: #7c6cff;
+  --series-3: #2fbf71;
+  --series-4: #f39c2d;
+  --series-5: #e35d8a;
+  --series-6: #8a93a6;
   --accent: #33b8ff;
   --accent-soft: rgb(51 184 255 / 15%);
   /* A darker cast of the accent for the one place the light celeste can't work:
@@ -67,9 +84,13 @@
   --accent-text: #0a5f96;
   /* Menu panel input */
   --input-bg: #f5f5f5;
+  /* Pill scrollbars: thin bar, fully-rounded track and thumb. */
+  --scroll-track: #ececec;
+  --scroll-thumb: #bdbdbd;
+  --scroll-thumb-hover: #a0a0a0;
   /* Semantic status tokens (referenced by .tag--*, .lint__item--*, .notice--warn,
-     .btn--danger, .batch-badge--*, and .tag--stored/config/conflict families).
-     Colors clear 4.5:1 on the light surfaces per WCAG 2.2 AA. */
+   .btn--danger, .batch-badge--*, and .tag--stored/config/conflict families).
+   Colors clear 4.5:1 on the light surfaces per WCAG 2.2 AA. */
   --ok: #1a7a3a;
   --ok-soft: rgb(26 122 58 / 12%);
   --warn: #a45d00;
@@ -100,6 +121,9 @@
   --outline: #353535;
   --grid-line: rgb(255 255 255 / 12%);
   --input-bg: #1a1a1a;
+  --scroll-track: rgb(255 255 255 / 7%);
+  --scroll-thumb: rgb(255 255 255 / 25%);
+  --scroll-thumb-hover: rgb(255 255 255 / 38%);
   /* Semantic status tokens (dark theme): each raised for 4.5:1 on the
      dark surfaces; the -soft variants stay translucent to sit on cards. */
   --ok: #6bd48b;
@@ -109,7 +133,9 @@
   --danger: #ff8a80;
   --danger-soft: rgb(255 138 128 / 15%);
 }
+}
 
+@layer base {
 * {
   box-sizing: border-box;
 }
@@ -122,21 +148,9 @@ body {
   font-size: 15px;
   line-height: 1.2;
 }
-
-/* The fixed sidebar sits outside the grid flow, so the flow columns need
-   explicit placement — otherwise the pane auto-fills the rail column. */
-.pane {
-  grid-column: 2;
 }
 
-body.has-nav-panel .nav-panel {
-  grid-column: 2;
-}
-
-body.has-nav-panel .pane {
-  grid-column: 3;
-}
-
+@layer base {
 svg {
   display: block;
 }
@@ -147,6 +161,38 @@ svg {
   display: none !important;
 }
 
+/* Minimal pill scrollbars everywhere: an 8px bar whose track and thumb are
+   fully-rounded pills. The standard properties are Firefox-only on purpose:
+   Chromium also understands scrollbar-width, and when it is set it IGNORES
+   the ::-webkit-scrollbar styling below — so they must never apply there. */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+  }
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--scroll-track);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+}
+}
+
+@layer components {
 /* ---------- Sidebar ---------- */
 
 .sidebar {
@@ -180,6 +226,18 @@ svg {
   align-items: center;
   gap: 12px;
   padding: 4px 0;
+  color: inherit;
+  text-decoration: none;
+}
+
+.brand:hover .brand__name,
+.brand:focus-visible .brand__name {
+  color: var(--accent-text);
+}
+
+.brand:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
 }
 
 .brand__logo {
@@ -492,6 +550,7 @@ button.menu__option {
 /* ---------- Top bar + content pane ---------- */
 
 .pane {
+  grid-column: 2;
   display: flex;
   flex-direction: column;
   background: var(--bg-content);
@@ -588,16 +647,12 @@ button.menu__option {
 .content {
   flex: 1;
   padding: 24px 32px 32px;
-  max-width: 1161px;
 }
 
-.page-title {
-  margin: 8px 0 24px;
-  font-size: 35px;
-  font-weight: 500;
-  letter-spacing: -0.7px;
-  color: var(--text);
-}
+/* App-shell rules live at the end of the file in @layer pages: they override
+   per-page layout rules (.queries-layout, .filter-rail) that live in that
+   later layer, where a rule here in components would lose regardless of
+   specificity. */
 
 /* ---------- Cards ---------- */
 
@@ -657,7 +712,30 @@ button.menu__option {
   font-size: 12px;
   color: var(--muted);
 }
+}
 
+@layer components {
+.stat--link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+
+.stat--link:hover {
+  border-color: var(--accent);
+}
+
+.stat--link:focus-visible {
+  outline: 2px solid var(--outline);
+  outline-offset: 2px;
+}
+
+.stat__value--unavailable {
+  color: var(--muted);
+}
+}
+
+@layer pages {
 /* ---------- Chart card ---------- */
 
 .chart-card {
@@ -674,7 +752,9 @@ button.menu__option {
   display: flex;
   gap: 8px;
 }
+}
 
+@layer components {
 .pill {
   display: flex;
   align-items: center;
@@ -689,12 +769,6 @@ button.menu__option {
   color: var(--muted);
 }
 
-.pill--square {
-  width: 42px;
-  padding: 0;
-  justify-content: center;
-}
-
 /* A pill rendered as a real <button> (e.g. the chart-expand affordance) keeps
    the pill look but sheds the native button chrome and inherits type. */
 button.pill {
@@ -703,7 +777,9 @@ button.pill {
   color: inherit;
   cursor: pointer;
 }
+}
 
+@layer pages {
 .chart {
   width: 100%;
   height: auto;
@@ -808,6 +884,207 @@ button.pill {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---------- Functional chart (#555): multi-series, picker, tooltip -------- */
+
+/* Legend focus (#602): the focused line carries the weight, the rest recede
+   but stay on the chart at their true values. */
+.chart .series--focused { stroke-width: 3; }
+.chart .series--receded { opacity: 0.25; }
+
+/* The invisible twin polyline inside each line's focus anchor: a 14px hit
+   corridor, since a 1.5px stroke is no click target. */
+.chart .series-hit {
+  stroke: transparent;
+  stroke-width: 14;
+  fill: none;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.chart-legend__item--focused {
+  font-weight: 600;
+  color: var(--text-strong);
+}
+.chart-legend__item--focused .chart-legend__dot {
+  outline: 2px solid var(--text-strong);
+  outline-offset: 1px;
+}
+
+/* Series palette: slot N styles both the polyline and its legend dot. */
+.chart .series--1 { stroke: var(--series-1); }
+.chart .series--2 { stroke: var(--series-2); }
+.chart .series--3 { stroke: var(--series-3); }
+.chart .series--4 { stroke: var(--series-4); }
+.chart .series--5 { stroke: var(--series-5); }
+.chart .series--6 { stroke: var(--series-6); }
+
+.chart-legend__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.chart-legend__dot--1 { background: var(--series-1); }
+.chart-legend__dot--2 { background: var(--series-2); }
+.chart-legend__dot--3 { background: var(--series-3); }
+.chart-legend__dot--4 { background: var(--series-4); }
+.chart-legend__dot--5 { background: var(--series-5); }
+.chart-legend__dot--6 { background: var(--series-6); }
+
+/* Type picker: the mockup's checkbox menu, as plain toggle links. */
+.chart-pick summary.pill {
+  cursor: pointer;
+  max-width: 320px;
+}
+
+.chart-pick .menu__panel {
+  min-width: 260px;
+}
+
+/* The option list scrolls on its own so the heading and the filter stay put
+   however many types the tenant stores. */
+.chart-pick__list {
+  max-height: min(340px, 50vh);
+  overflow-y: auto;
+}
+
+.chart-pick__option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+}
+
+.chart-pick__box {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: #ffffff;
+  border: 1.5px solid var(--surface-border);
+  border-radius: 4px;
+}
+
+.chart-pick__option--on .chart-pick__box {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+/* "View all resources" (#599) sits above the filter input, set off from the
+   scrolling option list below it by a divider. */
+.chart-pick__option--all {
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.chart-pick__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chart-pick__count {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-pick__none {
+  margin: 4px 8px 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Tooltip host: the wrapper is the positioning context for the readout and
+   the vertical guide the script moves along the buckets. */
+.chart-wrap {
+  position: relative;
+  /* The svg scales its viewBox (text included) with rendered width; cap it so
+     axis labels stay near their designed size on wide panes. */
+  max-width: 1440px;
+  margin: 0 auto;
+}
+
+.chart-tip {
+  position: absolute;
+  pointer-events: none;
+  min-width: 150px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 16%);
+  z-index: 5;
+  font-size: 12px;
+}
+
+.chart-tip__date {
+  margin-bottom: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.chart-tip__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 1px 0;
+}
+
+.chart-tip__name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.chart-tip__value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.chart-guide {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  background: var(--accent);
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.chart-empty {
+  padding: 56px 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* The tabular alternative to the plot — same numbers, as text. */
+.chart-table {
+  margin-top: 12px;
+}
+
+.chart-table > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+  width: fit-content;
+}
+
+.chart-table > summary:hover {
+  color: var(--text);
+}
+
+}
+@layer components {
 /* ---------- Tenant maintenance (/ui/tenants) ---------- */
 
 .stat-grid--2 {
@@ -851,6 +1128,52 @@ button.pill {
   color: var(--muted);
 }
 
+  /* Quick-links strip on the HTS dashboard: a full-width `.card` that stacks
+   the eyebrow label above a wrapping row of `.pill` anchors. Kept HTS-scoped
+   via the class name so it never interferes with HFS card layouts. */
+  .hts-quick-strip {
+    padding: 16px 20px;
+    display: grid;
+    gap: 12px;
+  }
+  .hts-quick-strip .hts-quick-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  /* Accessible sr-only helper — hides the element visually while keeping it
+     in the accessibility tree. Referenced by row headings in the HTS
+     dashboard partial and by outcome/import announcements. Without this rule
+     those `<h2>`s would render at browser default size and break the
+     visual hierarchy. */
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .notice {
+    padding: 20px 24px;
+    color: var(--muted);
+  }
+
+.stat-grid--5 {
+  grid-template-columns: repeat(5, 1fr);
+}
+
+@media (max-width: 1100px) {
+  .stat-grid--5 {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
 .table-card {
   padding: 20px;
 }
@@ -860,6 +1183,31 @@ button.pill {
   align-items: center;
   gap: 16px;
   margin-bottom: 16px;
+}
+
+/* Same scale as .card-head h3 — a toolbar is the in-card section header. */
+.toolbar__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.toolbar__count {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+/* A .toolbar__count inside a .btn (e.g. "Active Exports N") stays plain and
+   matches the label color; only the gap separates it from the text (#608). */
+.btn .toolbar__count {
+  margin-left: 8px;
+  color: inherit;
+  font-variant-numeric: tabular-nums;
 }
 
 .toolbar__search {
@@ -882,33 +1230,6 @@ button.pill {
   outline: none;
   font-size: 15px;
   color: var(--text);
-}
-
-/* Buttons */
-.button {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  height: 42px;
-  padding: 0 16px;
-  border: 1px solid var(--surface-border);
-  border-radius: 12px;
-  background: var(--surface);
-  color: var(--text);
-  font: inherit;
-  font-weight: 500;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.button--primary {
-  background: var(--accent);
-  border-color: transparent;
-  color: #002438;
-}
-
-.button--primary:hover {
-  background: var(--accent-strong, #1aa5f0);
 }
 
 /* Add-tenant disclosure */
@@ -959,11 +1280,24 @@ button.pill {
   width: 100%;
   height: 40px;
   padding: 0 12px;
+  box-sizing: border-box;
   border: 1px solid var(--surface-border);
   border-radius: 10px;
   background: var(--input-bg, var(--surface));
   color: var(--text);
+  /* Form controls do not inherit the page font by default — a bare textarea
+     falls back to the UA's monospace (#685). */
+  font: inherit;
   font-size: 15px;
+}
+
+/* Multi-line variant (#685): sized by its rows= within the panel, never able
+   to widen the dialog. */
+textarea.field__input {
+  height: auto;
+  min-height: 64px;
+  padding: 8px 12px;
+  resize: vertical;
 }
 
 .field__input:focus {
@@ -981,6 +1315,34 @@ button.pill {
 
 .addbox__actions {
   margin-top: 4px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--outline);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+}
+
+/* In-table provisioning state for tenants being created in the background
+   (#581): the row polls in via the rows fragment until the job finishes. */
+.provisioning {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
 }
 
 /* Form action bar: submit/cancel row at the bottom of `.field`-stacked
@@ -1036,40 +1398,6 @@ button.pill {
   font-size: 14px;
 }
 
-/* Data table */
-.data-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.data-table th {
-  text-align: left;
-  padding: 10px 12px;
-  font-size: 12px;
-  font-weight: 500;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
-  color: var(--muted);
-  border-bottom: 1px solid var(--divider);
-}
-
-.data-table td {
-  padding: 14px 12px;
-  border-bottom: 1px solid var(--divider);
-  color: var(--text);
-  vertical-align: middle;
-}
-
-.data-table tbody tr:last-child td {
-  border-bottom: 0;
-}
-
-.data-table__empty td {
-  color: var(--muted);
-  text-align: center;
-  padding: 32px 12px;
-}
-
 .col-num {
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -1085,7 +1413,9 @@ button.pill {
   align-items: center;
   gap: 12px;
 }
+}
 
+@layer pages {
 .tenant-id {
   display: flex;
   flex-direction: column;
@@ -1102,19 +1432,17 @@ button.pill {
   color: var(--muted);
 }
 
-.tag {
-  display: inline-block;
-  margin-left: 8px;
-  padding: 1px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 500;
-  vertical-align: middle;
 }
-
+@layer components {
 .tag--muted {
   background: var(--accent-soft);
   color: var(--muted);
+}
+
+/* Failed provisioning job row (#581), matching .btn--danger's tokens. */
+.tag--danger {
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .icon-button {
@@ -1146,7 +1474,9 @@ button.pill {
     grid-template-columns: repeat(2, 1fr);
   }
 }
+}
 
+@layer pages {
 /* ---------------------------------------------------------------------------
    History & Versions (#236, Figma "History & Versions").
 
@@ -1198,28 +1528,31 @@ button.pill {
 .history__id { width: 200px; }
 .history__slash { color: var(--muted); }
 
-/* Tabs (Instance / Type feed / System feed).
-   `flex-wrap: wrap` is needed for tab strips with many items (e.g. the HTS
-   operations selector — 7 ops). Short strips fit on one line either way. */
+/* Tabs — one definition for both tab designs (history's underline feed
+   switcher and the compartment viewer's pill links); the blocks used to be
+   defined twice and render their cascade-merge, which this preserves. */
 .tabs {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
   margin-bottom: 16px;
   border-bottom: 1px solid var(--surface-border);
+  padding: 8px;
 }
 
 .tab {
-  padding: 8px 14px;
+  padding: 8px 16px;
   font: inherit;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--muted);
   background: transparent;
   border: 0;
   border-bottom: 2px solid transparent;
   margin-bottom: -1px;
   cursor: pointer;
+  border-radius: 9px;
+  text-decoration: none;
 }
 
 .tab:hover { color: var(--text); }
@@ -1334,6 +1667,8 @@ button.pill {
   border-radius: 8px;
 }
 
+}
+@layer components {
 /* ---- Saved queries (#234) ---------------------------------------------- */
 
 .page-head {
@@ -1352,7 +1687,9 @@ button.pill {
   font-size: 13px;
   color: var(--muted);
 }
+}
 
+@layer pages {
 .query-form-card {
   padding: 20px;
   margin-bottom: 24px;
@@ -1398,7 +1735,9 @@ button.pill {
 .query-builder__name input:focus {
   border-color: var(--accent);
 }
+}
 
+@layer components {
 .btn {
   display: inline-flex;
   align-items: center;
@@ -1413,11 +1752,24 @@ button.pill {
   border-radius: 9px;
   box-shadow: var(--surface-shadow);
   cursor: pointer;
+  text-decoration: none;
 }
 
 .btn:hover {
   background: var(--accent-soft);
   border-color: var(--accent);
+}
+
+/* The app's own focus indicator (#682): keyboard focus gets the accent ring,
+   and a mouse click never leaves the UA's default ring behind — buttons and
+   the <summary class="btn"> dialog toggles alike. */
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn:focus:not(:focus-visible) {
+  outline: none;
 }
 
 .btn--primary {
@@ -1433,6 +1785,13 @@ button.pill {
   filter: brightness(1.08);
 }
 
+.btn:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+}
+
+@layer pages {
 .query-group {
   padding: 16px 20px;
   margin-bottom: 16px;
@@ -1587,13 +1946,17 @@ button.pill {
   color: inherit;
 }
 
+}
+@layer components {
 .menu__panel--right {
   left: auto;
   right: 0;
   width: 380px;
   max-width: 90vw;
 }
+}
 
+@layer pages {
 .recent-item {
   display: flex;
   align-items: center;
@@ -1738,17 +2101,15 @@ button.pill {
   }
 }
 
-/* ---- Registry viewers: shared filter layout (#237/#238) ----------------- */
-
-/* These pages want the full pane width; .content keeps its dashboard cap. */
-.content--wide {
-  max-width: none;
 }
+@layer components {
+/* ---- Registry viewers: shared filter layout (#237/#238) ----------------- */
 
 .notice {
   margin: 0 0 16px;
   padding: 10px 14px;
   font-size: 13px;
+  color: var(--muted);
   border-radius: 10px;
 }
 
@@ -1758,11 +2119,24 @@ button.pill {
   border: 1px solid var(--warn);
 }
 
+/* 280px matches .nav-panel and .queries-layout's rail column (#603 follow-up):
+   one rail width across Resources, Search, Saved Queries, and Search
+   Parameters. */
 .filter-layout {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr) 360px;
   gap: 20px;
   align-items: start;
+}
+
+/* Stacked section cards keep the page's vertical rhythm. Pages that lay
+   cards out in a flex/grid column get their spacing from the gap; this
+   covers the block-flow stacks (SQL Export, Files, Capability Statement,
+   the Bulk Import detail), where .card alone sat flush against the previous
+   one. The general sibling, not the adjacent one: htmx wrapper divs sit
+   between cards on the Bulk Import detail. */
+.content > .card ~ .card {
+  margin-top: 20px;
 }
 
 .filter-layout--two {
@@ -1834,11 +2208,45 @@ button.pill {
   color: var(--muted);
 }
 
+/* Sub-group labels inside the list ("Recently used", "All types") read as
+   section labels, not a fainter echo of the panel's own heading (#603
+   follow-up: they camouflaged against the items below them). */
+.filter-rail__heading--group {
+  color: var(--text);
+  font-weight: 700;
+}
+
+/* Between the Recently used group and the general list. Hidden by default —
+   shown only when it directly follows a *populated* (non-`hidden`) recent
+   group, so there is nothing to divide from before resource-filter.js has
+   anything to render (or with JavaScript off, where the group stays
+   `hidden` forever). */
+.filter-rail__divider {
+  display: none;
+  height: 1px;
+  margin: 8px 4px;
+  background: var(--divider);
+}
+
+.filter-rail__group:not([hidden]) + .filter-rail__divider {
+  display: block;
+}
+
 .filter-rail__list {
   display: flex;
   flex-direction: column;
   gap: 2px;
   overflow-y: auto;
+  /* Breathing room between the counts and the scrollbar pill. */
+  padding-right: 6px;
+}
+
+/* The list scrolls; its children keep their natural size. Without this the
+   flex algorithm crushes shrinkable rows before overflowing — the empty
+   1px divider collapses to 0 height the moment the list becomes a
+   height-bound scroll region. */
+.filter-rail__list > * {
+  flex: none;
 }
 
 .filter-rail__group {
@@ -1854,12 +2262,25 @@ button.pill {
   align-items: center;
   gap: 8px;
   width: 100%;
+  min-width: 0;
   padding: 7px 10px;
   border-radius: 9px;
   font-size: 13px;
   font-weight: 500;
   color: var(--text);
   text-decoration: none;
+}
+
+/* Long resource type names (e.g. "MedicinalProductContraindication", 32
+   chars) truncate with an ellipsis instead of colliding with the count or
+   forcing horizontal scroll on the rail. `title` is the no-JS fallback;
+   resource-filter.js replaces it with a visible hover/keyboard tooltip when
+   the label is actually truncated (#604, #634). */
+.filter-rail__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .filter-rail__item:hover {
@@ -1873,10 +2294,35 @@ button.pill {
 }
 
 .filter-rail__item .count {
+  flex: none;
   margin-left: auto;
   font-size: 11px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* Appended to <body> and positioned from the focused/hovered rail item so the
+   full label is not clipped by the rail's scrolling overflow. One shared
+   tooltip serves both the main list and cloneNode()-based Recent items. */
+.filter-rail__tooltip {
+  position: fixed;
+  z-index: 1000;
+  max-width: min(320px, calc(100vw - 16px));
+  padding: 6px 9px;
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--surface-shadow);
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+.filter-rail__tooltip[hidden] {
+  display: none;
 }
 
 .filter-rail__note {
@@ -1997,12 +2443,27 @@ button.pill {
 .data-table td {
   padding: 9px 14px;
   border-bottom: 1px solid var(--surface-border);
+  color: var(--text);
   vertical-align: top;
+}
+
+.data-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.data-table__empty td {
+  color: var(--muted);
+  text-align: center;
+  padding: 32px 12px;
 }
 
 .data-table tbody tr:hover td,
 .data-table tbody tr[aria-selected="true"] td {
   background: var(--accent-soft);
+}
+
+.data-table[data-row-navigation] tbody tr {
+  cursor: pointer;
 }
 
 .row-link {
@@ -2053,6 +2514,8 @@ button.pill {
 
 .tag {
   display: inline-flex;
+  margin-left: 8px;
+  vertical-align: middle;
   align-items: center;
   height: 20px;
   padding: 0 8px;
@@ -2123,7 +2586,55 @@ button.pill {
   border: 1px solid var(--surface-border);
   color: var(--muted);
 }
+/* Subscription states (#580): the cards and the STATUS column share this
+   vocabulary — active delivers, idle has no listeners, error needs attention. */
+.tag--active {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
 
+.tag--idle,
+.tag--requested {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tag--error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* Bulk Export job states (#537) — the same status-pill vocabulary. */
+.tag--in-progress {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tag--complete {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.tag--failed {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.tag--cancelled {
+  background: var(--accent-soft);
+  color: var(--muted);
+}
+
+.subs-sort summary.btn {
+  list-style: none;
+}
+
+.subs-sort summary.btn::-webkit-details-marker {
+  display: none;
+}
+}
+
+@layer pages {
 /* Detail panel (right rail on the SearchParameter viewer) */
 
 .detail {
@@ -2135,6 +2646,33 @@ button.pill {
   max-height: calc(100vh - 110px);
   padding: 16px;
   overflow-y: auto;
+}
+
+/* Full-width form sections (bulk export): the flex/gap/padding of .detail
+   without its sticky sidebar behavior (#608). */
+.form-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+/* Vertical gap between the stacked .form-panel/table-card sections of the
+   bulk export form (#608). */
+.bulk-export-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* The Group ID field only applies to the Group scope; hide it otherwise.
+   Browsers without :has() keep it always visible — today's behavior. */
+.bulk-export-form .field--group-id {
+  display: none;
+}
+
+.bulk-export-form:has(input[name="scope"][value="group"]:checked) .field--group-id {
+  display: block;
 }
 
 .detail__title {
@@ -2376,26 +2914,8 @@ button.pill {
 .lint__item--warn .lint__sev { color: var(--warn); }
 .lint__item--info .lint__sev { color: var(--accent); }
 
-/* Compartment viewer: tabs, members, tester */
-
-.tabs {
-  display: flex;
-  gap: 4px;
-  padding: 8px;
-}
-
-.tab {
-  padding: 8px 16px;
-  border-radius: 9px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--muted);
-  text-decoration: none;
-}
-
-.tab:hover {
-  color: var(--text);
-}
+/* Compartment viewer: tabs, members, tester. The .tabs / .tab primitives are
+   defined once, with the history feed switcher. */
 
 .tab[aria-current="true"],
 .tab[aria-current="page"] {
@@ -2539,6 +3059,7 @@ button.pill {
 
 .builder-row__key,
 .builder-row__modifier,
+.builder-row__comparator,
 .builder-row__value {
   height: 32px;
   padding: 0 10px;
@@ -2562,6 +3083,12 @@ button.pill {
   color: var(--muted);
 }
 
+.builder-row__comparator {
+  flex-shrink: 0;
+  width: 72px;
+  color: var(--muted);
+}
+
 .builder-row__value {
   flex: 1;
   min-width: 0;
@@ -2571,6 +3098,7 @@ button.pill {
 
 .builder-row__key:focus,
 .builder-row__modifier:focus,
+.builder-row__comparator:focus,
 .builder-row__value:focus {
   border-color: var(--accent);
 }
@@ -2598,10 +3126,8 @@ button.pill {
   align-self: flex-start;
 }
 
-/* Chaining rows (#394): forward chains and _has carry extra controls, so
- * they wrap; the shared input skin comes from the selectors above. */
-.builder-row--chain,
-.builder-row--has {
+/* Condition rows can grow a full-width modifier panel. */
+#builder-conditions > .builder-row {
   flex-wrap: wrap;
 }
 
@@ -2709,7 +3235,10 @@ button.pill {
 
 .queries-layout {
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr);
+  /* Same rail width as .nav-panel and .filter-layout (#603 follow-up): one
+     rail width across Resources, Search, Saved Queries, and Search
+     Parameters. */
+  grid-template-columns: 280px minmax(0, 1fr);
   gap: 20px;
   align-items: start;
 }
@@ -2718,15 +3247,7 @@ button.pill {
   min-width: 0;
 }
 
-/* The picker rail reuses .filter-rail with <button> items. */
-button.filter-rail__item {
-  border: 0;
-  background-color: transparent;
-  font: inherit;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-}
+/* The picker rail reuses .filter-rail with real `<a>` items (#541). */
 
 @media (max-width: 1100px) {
   .queries-layout {
@@ -2822,12 +3343,10 @@ button.filter-rail__item {
   color: var(--muted);
 }
 
+/* The Ask button keeps the shared primary metrics (36px — design-system.spec
+   holds every page to one primary button); only its icon gap is local. */
 .nl-input .btn--primary {
-  display: inline-flex;
-  align-items: center;
   gap: 8px;
-  height: 44px;
-  padding: 0 20px;
   white-space: nowrap;
 }
 
@@ -3100,16 +3619,41 @@ button.filter-rail__item {
 .editor-json__act:hover { color: var(--text); }
 .editor-json__act--on { color: var(--accent); border-color: var(--accent); }
 
-.editor-tree { padding: 12px 14px; }
+/* Both panes are viewport-bound scroll containers, so a large document
+   scrolls inside its own column and the cross-highlight's reveal always has
+   a scrollbar to move — with page-level scrolling, the highlighted
+   counterpart could sit far off-screen (#573 follow-up). */
+.editor-tree {
+  padding: 12px 14px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
 
 /* ---- the foldable JSON view ---- */
 
 .json-view {
   padding: 10px 0;
   overflow-x: auto;
+  max-height: 70vh;
+  overflow-y: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* Form ↔ JSON cross-highlight (editor-sync.js): hovering or focusing a form
+   row lights the JSON lines that hold that node, and vice versa. */
+.json-line--hit {
+  background: var(--accent-soft);
+}
+
+.json-line[data-jpath] .json-line__code {
+  cursor: pointer;
+}
+
+.editor-row--hit {
+  background: var(--accent-soft);
+  border-radius: 8px;
 }
 
 .json-line {
@@ -3225,6 +3769,7 @@ button.filter-rail__item {
 .editor-row__head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   min-height: 28px;
 }
@@ -3243,7 +3788,9 @@ button.filter-rail__item {
 
 .editor-row__input {
   flex: 1;
-  min-width: 0;
+  /* Never squeezed below a usable width — the head wraps it to its own line
+     instead of eating the content. */
+  min-width: 180px;
   max-width: 420px;
   height: 28px;
   padding: 0 10px;
@@ -3468,6 +4015,50 @@ button.filter-rail__item {
   resize: vertical;
 }
 
+/* Raw-mode highlight (editor-sync.js): a mirror <pre> sits behind the
+   textarea with identical metrics; its text is invisible and only the <mark>
+   around the hovered node's range shows through the textarea, whose own
+   background goes transparent while the mirror is present. */
+.editor-json__raw {
+  position: relative;
+}
+
+.editor-json__raw--mirrored .editor__source {
+  position: relative;
+  z-index: 1;
+  background: transparent;
+}
+
+.editor__source-mirror {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  pointer-events: none;
+  padding: 12px;
+  box-sizing: border-box;
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  color: transparent;
+  background: var(--input-bg);
+  border: 1px solid transparent;
+  border-radius: 10px;
+}
+
+.editor__source-mirror mark {
+  color: transparent;
+  background: var(--accent-soft);
+  border-radius: 3px;
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
 .editor__source-hint {
   margin: 8px 2px 0;
   font-size: 12px;
@@ -3504,6 +4095,8 @@ button.filter-rail__item {
   }
 }
 
+}
+@layer components {
 /* ---------------------------------------------------------------------------
    Resources workspace (#282): the nav submenu, the Create-button page head, and
    the Edit Resource modal (shadowbox).
@@ -3521,7 +4114,9 @@ button.filter-rail__item {
   background: var(--accent-soft);
   color: var(--text-strong);
 }
+}
 
+@layer pages {
 /* ---- the Edit Resource modal (shadowbox) ---- */
 
 .modal {
@@ -3545,7 +4140,11 @@ button.filter-rail__item {
   display: flex;
   flex-direction: column;
   width: min(1200px, 100%);
-  max-height: 90vh;
+  /* A fixed height, not a ceiling (#607): the dialog occupies the same
+     rectangle whichever pane is showing, so switching Edit/History or a
+     status message appearing never moves the header. The taller pane
+     scrolls inside .modal__body. */
+  height: 90vh;
   background: var(--bg-content);
   border: 1px solid var(--surface-border);
   border-radius: 18px;
@@ -3635,6 +4234,7 @@ button.filter-rail__item {
 }
 
 .modal__body {
+  flex: 1;
   padding: 16px 18px;
   overflow-y: auto;
 }
@@ -3650,116 +4250,38 @@ button.filter-rail__item {
 }
 
 @media (max-width: 900px) {
-  .modal__box { max-height: 96vh; }
+  .modal__box { height: 96vh; }
   .modal__head { flex-wrap: wrap; }
 }
+}
 
+@layer components {
 /* ---------------------------------------------------------------------------
    Resources: the resource-type panel as part of the menu (#282, Brett's
    "Resources" frame). A secondary column flush against the sidebar — same
    surface, no card — with the search + results in the content column.
    --------------------------------------------------------------------------- */
 
-/* Three columns when a nav panel is present: sidebar, the panel, content. */
-body.has-nav-panel {
-  grid-template-columns: 76px 232px 1fr;
-}
-
-.nav-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-height: 100vh;
-  padding: 20px 16px;
-  border-right: 1px solid var(--divider);
-  box-shadow: 1px 0 0 var(--divider-glint);
-  overflow-y: auto;
-}
-
-.nav-panel__head {
-  padding: 4px 6px;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
-.nav-panel__search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 36px;
-  padding: 0 12px;
-  color: var(--muted);
-  background: var(--input-bg);
-  border: 1px solid var(--surface-border);
-  border-radius: 10px;
-}
-
-.nav-panel__search input {
-  width: 100%;
-  /* WCAG 2.2 target-size floor - font fallback must not shrink it below it. */
-  min-height: 24px;
-  border: 0;
-  background: none;
-  font: inherit;
-  font-size: 13px;
-  color: var(--text);
-  outline: none;
-}
-
-.nav-panel__list {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin-top: 4px;
-}
-
-.nav-panel__item {
-  /* WCAG 2.2 target-size floor - font fallback must not shrink rows below it. */
-  min-height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  width: 100%;
-  padding: 9px 12px;
-  font: inherit;
-  font-size: 14px;
-  text-align: left;
-  color: var(--text);
-  background: transparent;
-  border: 0;
-  border-radius: 10px;
-  cursor: pointer;
-}
-
-.nav-panel__item:hover { background: var(--input-bg); }
-
-.nav-panel__item--on {
-  background: var(--accent-soft);
-  color: var(--accent-text);
-  font-weight: 600;
-}
-
-.nav-panel__item .count {
-  font-size: 12px;
-  color: var(--muted);
-}
-.nav-panel__item--on .count { color: var(--accent-text); }
-
-/* The Create-new primary button (blue + plus), top-right of the page head. */
+/* The Create-new primary button (blue + plus), top-right of the page head.
+   The label names the selected type ("Create new Patient") and can grow long
+   (#605) — the button caps its width and truncates the label rather than
+   pushing the header row wider than the page. */
 .resources-create {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 320px;
 }
 
-@media (max-width: 1100px) {
-  body.has-nav-panel { grid-template-columns: 76px 1fr; }
-  body.has-nav-panel .pane { grid-column: 2; }
-  .nav-panel { display: none; }
+.resources-create__label {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
+}
+
+@layer pages {
 /* Saved / Recent group headings inside the Recent dropdown (#282). */
 .recent-group {
   margin: 8px 4px 4px;
@@ -3783,7 +4305,7 @@ body.has-nav-panel {
   flex-direction: column;
   gap: 6px;
   flex: 1;
-  min-width: 0;
+  min-width: 230px;
 }
 
 .builder-row__orvalue {
@@ -3841,6 +4363,8 @@ body.has-nav-panel {
 
 .builder-row__modpanel {
   flex-basis: 100%;
+  min-width: 0;
+  max-width: 100%;
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
@@ -4001,6 +4525,8 @@ body.has-nav-panel {
   white-space: nowrap;
 }
 
+}
+@layer components {
 /* Conformance CRUD (#237, #238): New in the page head, Edit/Delete in the
    detail panels. */
 .page-head__actions {
@@ -4022,15 +4548,20 @@ body.has-nav-panel {
   background: var(--danger-soft);
 }
 
+}
+@layer pages {
 /* mustSupport emphasis + human labels (#364). */
 .editor-row--must-support > .editor-row__head .editor-row__label {
   font-weight: 600;
 }
 
-.editor-row__name {
+/* The element's short description sits on its own line under the head, so it
+   can never squeeze the input out of the row. */
+.editor-row__desc {
+  margin: 2px 0 0;
   color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
+  line-height: 1.4;
 }
 
 .editor-row__ms,
@@ -4256,11 +4787,12 @@ body.has-nav-panel {
   font-weight: 500;
 }
 
-/* Live-vs-save legend (#366). */
+/* Live-vs-save legend (#366): stacked, inset from the card edge. */
 .editor-legend {
   display: flex;
-  gap: 14px;
-  margin: 4px 0 8px;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 14px 10px;
   color: var(--muted);
   font-size: 11px;
 }
@@ -4289,4 +4821,186 @@ body.has-nav-panel {
   border-radius: 5px;
   color: var(--muted);
   font-size: 9.5px;
+}
+
+/* The JSON-pane header (#548): fold controls hug the heading on the left,
+   Edit raw stays alone at the end. */
+.card-head__tools--start {
+  margin-right: auto;
+}
+
+}
+@layer components {
+/* Addbox close affordances (#545). */
+.addbox__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.menu__heading--row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.addbox__x {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.addbox__x:hover,
+.addbox__x:focus-visible {
+  color: var(--text-strong);
+  background: var(--accent-soft);
+}
+
+}
+
+@layer pages {
+/* The Recent/Saved dropdown scrolls instead of growing unbounded (#542):
+   the recents are capped at ten, but every saved query renders in the same
+   panel, and a long collection was pushing it off-screen. */
+.query-recent #recent-searches {
+  max-height: min(420px, 60vh);
+  overflow-y: auto;
+}
+
+/* Issues that have no field yet (#546): a bounded, styled panel instead of a
+   wall of bare red lines under the tree. */
+.editor__orphans {
+  margin-top: 14px;
+  padding: 12px 16px;
+  border-left: 3px solid #C0362C;
+  border-radius: 0 10px 10px 0;
+  background: rgb(192 54 44 / 8%);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.editor__orphans-title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.editor__orphans .editor__orphan {
+  margin: 2px 0;
+  font-size: 13px;
+}
+
+/* Temporal-primitive assistance (#549): the pattern attribute drives live
+   native validity — a malformed date shows before any server round trip. */
+.editor-row__input:invalid {
+  border-color: #C0362C;
+  box-shadow: 0 0 0 3px rgb(192 54 44 / 12%);
+}
+}
+
+@layer pages {
+/* Bulk Export (#537): the resource-type checkbox grid. Its job-status chips
+   are .tag variants — one status-pill vocabulary, not a second chip family. */
+.typegrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 6px 18px;
+  padding: 6px 0;
+}
+
+.typegrid__item {
+  font-size: 14px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+}
+
+@layer pages {
+/* ---------------------------------------------------------------------------
+   App-shell pages (#541): the screen itself never scrolls - the page head
+   stays put while each region below it (type rail, main panel, detail)
+   scrolls on its own. Declared last, in the pages layer, so it wins over the
+   per-page layout rules above. Reverted under 1100px, where the columns stack
+   and the page scrolls normally.
+   --------------------------------------------------------------------------- */
+
+body.app-shell {
+  height: 100dvh;
+  overflow: hidden;
+}
+
+body.app-shell .pane {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.content--app {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  max-width: none;
+}
+
+.content--app .filter-layout,
+.content--app .queries-layout {
+  flex: 1;
+  min-height: 0;
+  align-items: stretch;
+}
+
+.content--app .filter-rail {
+  position: static;
+  max-height: none;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.content--app .filter-rail__list {
+  /* min-height: 0 lets the flex item shrink below its content, so the list
+     itself scrolls instead of being clipped by the rail's hidden overflow. */
+  flex: 1;
+  min-height: 0;
+}
+
+.content--app .filter-center,
+.content--app .queries-main {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.content--app .detail {
+  position: static;
+  max-height: none;
+  min-height: 0;
+}
+
+@media (max-width: 1100px) {
+  body.app-shell {
+    height: auto;
+    overflow: visible;
+  }
+
+  body.app-shell .pane {
+    overflow: visible;
+  }
+
+  .content--app {
+    display: block;
+    overflow: visible;
+  }
+
+  .content--app .filter-center,
+  .content--app .queries-main {
+    overflow: visible;
+  }
+}
 }

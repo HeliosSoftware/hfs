@@ -26,6 +26,7 @@ fn app() -> Router {
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
     )
 }
 
@@ -121,6 +122,31 @@ async fn htmx_fragment_is_localized_too() {
     let html = body_text(response).await;
     assert!(html.contains("Última comprobación:"));
     assert!(!html.contains("<html"), "fragment, not a full page");
+}
+
+#[tokio::test]
+async fn resources_create_label_names_the_selected_type_per_locale() {
+    // #605: "Create new { $type }" carries the resource type name untranslated
+    // inside the localized sentence, in every supported locale.
+    for (lang, sentence) in [
+        ("en", "Create new Patient"),
+        ("es", "Crear Patient"),
+        ("de", "Patient erstellen"),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui/resources?lang={lang}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert!(
+            html.contains(sentence),
+            "{lang} resources page must contain {sentence:?}, got: {html}"
+        );
+    }
 }
 
 #[tokio::test]

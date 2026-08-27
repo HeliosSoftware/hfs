@@ -1,4 +1,4 @@
-//! Shard planner for `$viewdefinition-export`.
+//! Shard planner for `$sql-export`.
 //!
 //! Given a total row count and a target shard size, [`plan`] returns the
 //! row-index ranges that each shard should cover.  The caller is responsible
