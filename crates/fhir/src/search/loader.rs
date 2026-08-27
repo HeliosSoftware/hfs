@@ -676,26 +676,57 @@ impl SearchParameterLoader {
 
         // SQL-on-FHIR canonical resources: `url` and `version` are not in the
         // base FHIR R4/R4B search-parameters bundle for ViewDefinition (which
-        // first appears in R5+). The SoF `$viewdefinition-run`,
+        // first appears in R5+; its full parameter set, including these two,
+        // now ships in every `search-parameters-r*.json` file via the
+        // SQL-on-FHIR IG's own bundle, #570). Library is a core resource in
+        // every version, so its `url`/`version` parameters already ship in
+        // every spec file too. The SoF `$viewdefinition-run`,
         // `$viewdefinition-export`, and `$sqlquery-run` operations resolve
         // `viewReference`/`queryReference` canonical URLs via SearchProvider;
         // without these embedded fallbacks the resolver returns zero matches
-        // and the capability statement's `supportsCanonicalReference: true`
-        // claim isn't truthful.
+        // whenever the spec file cannot be loaded (many integration tests
+        // build a backend with no `data_dir` configured for exactly this
+        // reason — deferring canonical-reference resolution entirely to a
+        // spec file on disk would break them) and the capability statement's
+        // `supportsCanonicalReference: true` claim isn't truthful.
+        //
+        // ViewDefinition's fallback URLs deliberately match the SQL-on-FHIR
+        // IG's own canonicals exactly (`.../uv/sql-on-fhir/SearchParameter/
+        // ViewDefinition-{url,version}`), not a fabricated `hl7.org/fhir`
+        // one: this loads first (`load_embedded` runs before
+        // `load_from_spec_file` in every backend's bootstrap), so when the
+        // spec file *is* available its `ViewDefinition-url`/`-version`
+        // entries collide on the exact same canonical URL and are rejected as
+        // an exact `DuplicateUrl` — a harmless no-op, since the fallback
+        // already registered that identical `(code, type, expression, base)`
+        // definition under that same URL. Reusing the old, non-IG canonical
+        // here (as this loop did before #570) would instead win the
+        // `(base, code)` slot under the *wrong* URL and force the spec file's
+        // real entry into a same-source `DuplicateCode` rejection, leaving
+        // the IG canonical completely unregistered rather than merely
+        // shadowed.
         for rt in ["ViewDefinition", "Library"] {
-            params.push(
-                SearchParameterDefinition::new(
-                    format!("http://hl7.org/fhir/SearchParameter/{rt}-url"),
-                    "url",
-                    SearchParamType::Uri,
-                    "url",
+            let (url_canonical, version_canonical) = if rt == "ViewDefinition" {
+                (
+                    "http://hl7.org/fhir/uv/sql-on-fhir/SearchParameter/ViewDefinition-url"
+                        .to_string(),
+                    "http://hl7.org/fhir/uv/sql-on-fhir/SearchParameter/ViewDefinition-version"
+                        .to_string(),
                 )
-                .with_base(vec![rt])
-                .with_source(SearchParameterSource::Embedded),
+            } else {
+                (
+                    format!("http://hl7.org/fhir/SearchParameter/{rt}-url"),
+                    format!("http://hl7.org/fhir/SearchParameter/{rt}-version"),
+                )
+            };
+            params.push(
+                SearchParameterDefinition::new(url_canonical, "url", SearchParamType::Uri, "url")
+                    .with_base(vec![rt])
+                    .with_source(SearchParameterSource::Embedded),
             );
             params.push(
                 SearchParameterDefinition::new(
-                    format!("http://hl7.org/fhir/SearchParameter/{rt}-version"),
+                    version_canonical,
                     "version",
                     SearchParamType::Token,
                     "version",
@@ -718,6 +749,7 @@ impl Default for SearchParameterLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::registry::SearchParameterRegistry;
 
     #[test]
     fn test_load_embedded_minimal_fallback() {
@@ -772,6 +804,37 @@ mod tests {
             !has_patient_specific,
             "Minimal fallback should not have Patient-specific params"
         );
+
+        // Both Library and ViewDefinition keep a `url`/`version` fallback, so
+        // canonical-reference resolution for `$sql-run`/`$sql-export` still
+        // works when a backend has no `data_dir` configured (common in tests)
+        // and the spec file never loads.
+        for base in ["Library", "ViewDefinition"] {
+            for code in ["url", "version"] {
+                let def = params
+                    .iter()
+                    .find(|p| p.code == code && p.base.contains(&base.to_string()))
+                    .unwrap_or_else(|| panic!("{base} should have a {code} fallback"));
+                assert_eq!(def.expression, code, "{base} {code} fallback expression");
+            }
+        }
+
+        // ViewDefinition's fallback URLs must match the SQL-on-FHIR IG's own
+        // canonicals exactly — not a fabricated `hl7.org/fhir` one — so a
+        // same-source collision with the spec file's real `ViewDefinition-url`
+        // / `-version` entries (when the spec file does load) is an exact,
+        // harmless `DuplicateUrl` rather than a `DuplicateCode` that would
+        // leave the real IG canonical completely unregistered.
+        for code in ["url", "version"] {
+            let def = params
+                .iter()
+                .find(|p| p.code == code && p.base.contains(&"ViewDefinition".to_string()))
+                .unwrap();
+            assert_eq!(
+                def.url,
+                format!("http://hl7.org/fhir/uv/sql-on-fhir/SearchParameter/ViewDefinition-{code}")
+            );
+        }
     }
 
     #[test]
@@ -950,6 +1013,148 @@ mod tests {
         assert_eq!(
             transform_as_to_oftype("Observation.value.ofType(Quantity)"),
             "Observation.value.ofType(Quantity)"
+        );
+    }
+
+    // ---- ViewDefinition SearchParameters survive the real loader/registry (#570) ----
+
+    /// The 17 SQL-on-FHIR IG canonicals shipped in every
+    /// `search-parameters-r*.json` file, keyed by their `code`.
+    const VIEW_DEFINITION_PARAM_CODES: &[&str] = &[
+        "context",
+        "context-quantity",
+        "context-type",
+        "context-type-quantity",
+        "context-type-value",
+        "date",
+        "description",
+        "identifier",
+        "jurisdiction",
+        "name",
+        "profile",
+        "publisher",
+        "resource",
+        "status",
+        "title",
+        "url",
+        "version",
+    ];
+
+    /// Builds a registry the same way a storage backend does at startup:
+    /// embedded fallback first, then the version's spec file — see
+    /// `SqliteBackend::new`'s two-step load.
+    fn registry_with_spec_file(version: FhirVersion) -> SearchParameterRegistry {
+        let loader = SearchParameterLoader::new(version);
+        let mut registry = SearchParameterRegistry::new();
+        for param in loader.load_embedded().unwrap() {
+            // Ignore collisions the same way the backend does: this test
+            // cares whether the *spec file's* ViewDefinition parameters
+            // survive, not whether the minimal fallback set is collision-free.
+            let _ = registry.register(param);
+        }
+        for param in loader
+            .load_from_spec_file(&workspace_data_dir())
+            .expect("spec file should load")
+        {
+            let _ = registry.register(param);
+        }
+        registry
+    }
+
+    /// Every ViewDefinition SearchParameter from the SQL-on-FHIR IG bundle
+    /// must be registered, active, and reachable both by `(base, code)` and
+    /// by its canonical URL — for every FHIR version the spec file ships for.
+    fn assert_view_definition_params_registered(version: FhirVersion) {
+        let registry = registry_with_spec_file(version);
+
+        for code in VIEW_DEFINITION_PARAM_CODES {
+            let by_code = registry
+                .get_param("ViewDefinition", code)
+                .unwrap_or_else(|| {
+                    panic!("{version:?}: ViewDefinition-{code} not registered under its code")
+                });
+            assert!(
+                by_code.status.is_usable(),
+                "{version:?}: ViewDefinition-{code} is registered but not active"
+            );
+            assert_eq!(
+                by_code.base,
+                vec!["ViewDefinition".to_string()],
+                "{version:?}: ViewDefinition-{code} has unexpected base"
+            );
+
+            let expected_url =
+                format!("http://hl7.org/fhir/uv/sql-on-fhir/SearchParameter/ViewDefinition-{code}");
+            let by_url = registry.get_by_url(&expected_url).unwrap_or_else(|| {
+                panic!("{version:?}: {expected_url} not reachable via get_by_url")
+            });
+            // Same winning definition either way — not merely two different
+            // definitions that both happen to exist.
+            assert_eq!(
+                by_code.url, by_url.url,
+                "{version:?}: ViewDefinition-{code}"
+            );
+            assert_eq!(by_url.url, expected_url);
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn r4_registers_all_view_definition_search_params() {
+        assert_view_definition_params_registered(FhirVersion::R4);
+    }
+
+    #[cfg(feature = "R4B")]
+    #[test]
+    fn r4b_registers_all_view_definition_search_params() {
+        assert_view_definition_params_registered(FhirVersion::R4B);
+    }
+
+    #[cfg(feature = "R5")]
+    #[test]
+    fn r5_registers_all_view_definition_search_params() {
+        assert_view_definition_params_registered(FhirVersion::R5);
+    }
+
+    #[cfg(feature = "R6")]
+    #[test]
+    fn r6_registers_all_view_definition_search_params() {
+        assert_view_definition_params_registered(FhirVersion::R6);
+    }
+
+    /// The composite `context-type-quantity` / `context-type-value` params
+    /// carry their declared components through the real loader, matching the
+    /// upstream IG bundle's component wiring.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn view_definition_composite_params_carry_components() {
+        let registry = registry_with_spec_file(FhirVersion::R4);
+
+        let context_type_quantity = registry
+            .get_param("ViewDefinition", "context-type-quantity")
+            .expect("context-type-quantity registered");
+        assert!(context_type_quantity.is_composite());
+        let components = context_type_quantity.component.as_ref().unwrap();
+        assert_eq!(components.len(), 2);
+        assert!(components.iter().any(|c| c.definition
+            == "http://hl7.org/fhir/uv/sql-on-fhir/SearchParameter/ViewDefinition-context-type"));
+        assert!(components.iter().any(|c| c.definition
+            == "http://hl7.org/fhir/uv/sql-on-fhir/SearchParameter/ViewDefinition-context-quantity"));
+    }
+
+    /// The `profile` parameter is a `reference` targeting `StructureDefinition`,
+    /// carried through by the real loader — not just present, but typed right.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn view_definition_profile_param_targets_structure_definition() {
+        let registry = registry_with_spec_file(FhirVersion::R4);
+        let profile = registry
+            .get_param("ViewDefinition", "profile")
+            .expect("profile registered");
+        assert_eq!(profile.param_type, SearchParamType::Reference);
+        assert_eq!(
+            profile.target.as_deref(),
+            Some(["StructureDefinition".to_string()].as_slice())
         );
     }
 }
