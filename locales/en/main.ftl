@@ -567,7 +567,6 @@ bulk-import-title = Bulk Import
 bulk-import-new = New Submission
 bulk-import-create-title = Create Bulk Submission
 bulk-import-field-name = Submission name
-bulk-import-field-recipient = Recipient base URL
 bulk-import-auth = Authentication
 bulk-import-auth-hint = How to authenticate to the recipient server.
 bulk-import-auth-none = None
