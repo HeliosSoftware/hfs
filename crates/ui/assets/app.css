@@ -1240,7 +1240,8 @@ textarea.field__input {
   padding: 0 18px;
 }
 
-.spinner {
+.spinner,
+.btn[aria-busy="true"]::after {
   width: 14px;
   height: 14px;
   border-radius: 50%;
@@ -1252,15 +1253,43 @@ textarea.field__input {
   to { transform: rotate(360deg); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .spinner { animation: none; }
+  .spinner,
+  .btn[aria-busy="true"]::after { animation: none; }
 }
 
-/* In-table provisioning state for tenants being created in the background
-   (#581): the row polls in via the rows fragment until the job finishes. */
-.provisioning {
+/* The busy button (#679), driven by busy.js: the label yields its space to
+   the ring — width stays put, the accessible name stays in the tree. Under
+   reduced motion the ring remains as a static glyph (the animation stops
+   above); a merely-dimmed label would read as disabled, not working. */
+.btn[aria-busy="true"] {
+  position: relative;
+  color: transparent;
+  cursor: progress;
+}
+
+.btn[aria-busy="true"]::after {
+  content: "";
+  position: absolute;
+  top: calc(50% - 7px);
+  left: calc(50% - 7px);
+}
+
+/* The ring must not inherit accent-on-accent on the filled button — the
+   track all but vanishes in dark theme. Explicit white, not currentColor:
+   the button's color is transparent while busy. */
+.btn--primary[aria-busy="true"]::after {
+  border-color: rgb(255 255 255 / 45%);
+  border-top-color: #ffffff;
+}
+
+/* Inline working state (#679): spinner plus a short label, role="status" in
+   the markup so it announces. Also the tenants in-table provisioning row
+   (#581), which polls in via the rows fragment until the job finishes. */
+.busy-status {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  margin: 0;
   font-size: 13px;
   color: var(--muted);
 }
@@ -4658,6 +4687,21 @@ textarea.field__input {
   align-items: center;
   gap: 8px;
   margin-top: 14px;
+}
+
+/* #679: one busy region serves both the parse and execute phases; sticky
+   keeps it in view when a large plan pushes the bottom footer past the
+   viewport (#675's scroll problem, again). */
+.batch-busy {
+  position: sticky;
+  bottom: 12px;
+  width: fit-content;
+  margin-top: 12px;
+  padding: 6px 12px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 9px;
+  box-shadow: var(--surface-shadow);
 }
 
 .batch-footer--top {

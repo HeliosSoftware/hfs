@@ -552,6 +552,9 @@ batch-sum-updated = updated
 batch-sum-other = read/other
 batch-sum-failed = failed
 batch-request-failed = The request failed
+batch-reading = Reading bundle…
+batch-executing = Executing…
+batch-read-failed = The file could not be read
 
 ## Bulk Import workspace (#527)
 

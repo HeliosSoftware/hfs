@@ -90,12 +90,12 @@ async fn post_form(router: &Router, form: &str) -> (StatusCode, String) {
 
 /// Polls the rows fragment until no provisioning row remains (every
 /// background job settled, one way or another), or panics after ~10s. The
-/// marker is the real in-flight row class (`class="provisioning"`), not an
-/// invented one.
+/// marker is the real in-flight row class (`class="busy-status"`, the
+/// shared busy region since #679), not an invented one.
 async fn wait_settled(router: &Router) -> String {
     for _ in 0..200 {
         let (_, html) = get(router, "/ui/tenants/rows").await;
-        if !html.contains(r#"class="provisioning""#) {
+        if !html.contains(r#"class="busy-status""#) {
             return html;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -674,7 +674,7 @@ async fn create_signals_success_with_hx_trigger_and_failures_do_not() {
     );
     let ok_body = body_text(ok).await;
     assert!(
-        ok_body.contains(r#"class="provisioning""#),
+        ok_body.contains(r#"class="busy-status""#),
         "the accepted response already shows the in-flight row: {ok_body}"
     );
 
@@ -710,5 +710,5 @@ async fn a_provisioned_tenant_settles_into_a_normal_row() {
     let html = wait_settled(&router).await;
 
     assert!(html.contains(r#"hx-delete="/ui/tenants/acme""#));
-    assert!(!html.contains(r#"class="provisioning""#));
+    assert!(!html.contains(r#"class="busy-status""#));
 }

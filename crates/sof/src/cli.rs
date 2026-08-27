@@ -17,7 +17,7 @@
 //! -v, --view <VIEW>              Path to ViewDefinition JSON file (or use stdin if not provided)
 //! -b, --bundle <BUNDLE>          Path to FHIR Bundle JSON file (or use stdin if not provided)
 //! -s, --source <SOURCE>          Path or URL to FHIR data source (local paths or URLs)
-//! -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet) [default: csv]
+//! -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet, arrow) [default: csv]
 //!     --no-headers               Exclude CSV headers (only for CSV format)
 //! -o, --output <OUTPUT>          Output file path (defaults to stdout)
 //!     --since <SINCE>            Filter resources modified after this time (RFC3339 format)
@@ -165,12 +165,12 @@ struct Args {
     )]
     source: Option<String>,
 
-    /// Output format (csv, json, ndjson, parquet)
+    /// Output format (csv, json, ndjson, parquet, arrow)
     #[arg(
         long,
         short = 'f',
         default_value = "csv",
-        help = "Output format. Valid values: csv (default, includes headers), json, ndjson, parquet"
+        help = "Output format. Valid values: csv (default, includes headers), json, ndjson, parquet, arrow (Arrow IPC stream)"
     )]
     format: String,
 
@@ -442,7 +442,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Streaming is used when:
     // 1. --bundle is provided with a .ndjson file extension
     // 2. --source is not also provided (no bundle merging needed)
-    // 3. Output format is not Parquet (doesn't support streaming)
+    // 3. Output format is not columnar (Parquet/Arrow don't support streaming)
     let use_streaming = args
         .bundle
         .as_ref()
@@ -460,8 +460,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ContentType::from_string(&args.format)?
     };
 
-    // Use streaming path for NDJSON files
-    if use_streaming && content_type != ContentType::Parquet {
+    // Use streaming path for NDJSON files; the columnar formats fall through
+    // to the batch path, which they require
+    if use_streaming && !matches!(content_type, ContentType::Parquet | ContentType::ArrowIpc) {
         let bundle_path = args.bundle.as_ref().unwrap();
         let file = File::open(bundle_path)?;
         let reader = BufReader::new(file);
