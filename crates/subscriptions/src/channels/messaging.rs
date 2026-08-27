@@ -31,12 +31,15 @@ use crate::error::SubscriptionError;
 use crate::manager::{ActiveSubscription, PayloadContent};
 use crate::notification::{notification_type_from_bundle, wrap_as_message_bundle};
 
+/// Resolves the public messaging source endpoint for a tenant.
+pub type SourceEndpointResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 /// FHIR Messaging channel implementation.
 pub struct MessagingChannel {
     client: Client,
     auth_provider: Arc<dyn OutboundAuthProvider>,
     source_endpoint: String,
-    source_endpoint_resolver: Option<Arc<dyn Fn(&str) -> String + Send + Sync>>,
+    source_endpoint_resolver: Option<SourceEndpointResolver>,
     /// When `true`, dispatch to private/loopback IPs is allowed. Default
     /// `false`; tests and local dev opt in.
     private_endpoints_allowed: bool,
@@ -61,10 +64,7 @@ impl MessagingChannel {
     }
 
     /// Resolve the default source endpoint from the subscription tenant.
-    pub fn with_source_endpoint_resolver(
-        mut self,
-        resolver: Arc<dyn Fn(&str) -> String + Send + Sync>,
-    ) -> Self {
+    pub fn with_source_endpoint_resolver(mut self, resolver: SourceEndpointResolver) -> Self {
         self.source_endpoint_resolver = Some(resolver);
         self
     }

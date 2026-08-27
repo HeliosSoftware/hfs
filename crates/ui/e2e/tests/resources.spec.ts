@@ -127,9 +127,14 @@ test("a conflicting Resources bookmark uses the query URL type everywhere after 
     await expect(page.locator("#query-plain-text")).toContainText("Patient");
     await expect(page.locator("#query-plain-text")).toContainText("NavAlpha");
     await resources.results.waitShown();
-    await expect(
-      page.locator(`#query-results-body a.url[href='/Patient/${patientId}']`),
-    ).toBeVisible();
+    const resultLink = page.locator(
+      `#query-results-body a.url[data-resource-type='Patient'][data-resource-id='${patientId}']`,
+    );
+    await expect(resultLink).toBeVisible();
+    await expect(resultLink).toHaveAttribute(
+      "href",
+      new RegExp(`^https?://[^/]+/Patient/${patientId}$`),
+    );
     await expect(resources.results.openTab).toHaveAttribute("href", "/Patient?name=NavAlpha");
   };
 
@@ -372,6 +377,48 @@ test("the modal closes via the X and via Escape", async ({ resources }) => {
   await resources.openCreate();
   await resources.modal.closeWithEscape();
   await expect(resources.modal.root).toBeHidden();
+});
+
+test("a result under a public path prefix still opens in the modal", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = await createResource(request, "Patient", {
+    name: [{ family: "PublicPrefix" }],
+  });
+  const queryPath = `/Patient?_id=${id}`;
+  const publicUrl = `https://fhir.example.test/public/fhir/acme/Patient/${id}`;
+
+  await page.route(`**${queryPath}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/fhir+json",
+      body: JSON.stringify({
+        resourceType: "Bundle",
+        type: "searchset",
+        total: 1,
+        entry: [
+          {
+            fullUrl: publicUrl,
+            resource: { resourceType: "Patient", id, name: [{ family: "PublicPrefix" }] },
+          },
+        ],
+      }),
+    });
+  });
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(queryPath.slice(1));
+  await page.locator("[data-intent='run']").click();
+
+  const resultLink = page.locator("#query-results-body a.url").first();
+  await expect(resultLink).toHaveAttribute("href", publicUrl);
+  await expect(resultLink).toHaveAttribute("data-resource-type", "Patient");
+  await expect(resultLink).toHaveAttribute("data-resource-id", id);
+  await resultLink.click();
+  await resources.modal.waitOpen();
+  await expect(resources.modal.subject).toContainText(id);
 });
 
 test("a created resource can be deleted from its modal", async ({ resources, page, request }) => {

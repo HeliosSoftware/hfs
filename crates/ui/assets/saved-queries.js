@@ -1774,6 +1774,8 @@
       var link = document.createElement("a");
       link.className = "url";
       link.href = safeResourceHref(entry, context, resource);
+      link.dataset.resourceType = context.type;
+      link.dataset.resourceId = resource.id || "";
       link.target = "_blank";
       link.rel = "noopener";
       link.textContent = resource.id || "";
