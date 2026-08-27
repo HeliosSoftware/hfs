@@ -763,11 +763,34 @@ jobs:
               || echo "::warning::pg_stat_statements unavailable"
           fi
 
+          # ── Contention probe ────────────────────────────────────────────
+          # Every benchmark run shares ONE Postgres Docker host with every other
+          # testcontainers job in the repo (HFS CI, UI Tests). Neighbour load
+          # swings throughput by ~2x, and on 2026-08-27 it multiplied EVERY crud
+          # statement by 4-17x — including statements the tested commit never
+          # touched, which is how it was identified as environmental rather than
+          # a regression. Reconstructing that after the fact needed an external
+          # poller and guesswork.
+          #
+          # So each suite now records what the host looked like while it ran:
+          # load average and the container count on the DOCKER HOST (not the
+          # runner — the runner is ours alone, the host is not). A run that
+          # cannot be trusted for throughput now says so in its own artifact.
+          probe_host() {
+            local phase="$1" suite="$2"
+            local la cn
+            la=$(docker run --rm alpine:3 cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3)
+            cn=$(docker ps -q 2>/dev/null | wc -l)
+            echo "$(date -u +%H:%M:%SZ) suite=$suite phase=$phase host_loadavg=${la:-unknown} host_containers=${cn:-unknown}" \
+              >> "$RESULTS_DIR/host-contention.txt"
+          }
+
           for SUITE in $SUITES; do
             SUITE="${SUITE// /}"
             [ -z "$SUITE" ] && continue
             SCRIPT="k6/${SUITE}.js"
             SUITE_START=$(date +%s)
+            probe_host start "$SUITE"
             if [ ! -f "$SCRIPT" ]; then
               echo "Skip '$SUITE' — $SCRIPT not found"
               continue
@@ -834,6 +857,7 @@ jobs:
               $EXTRA_ARGS \
               "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
             SUITE_WALL=$(( $(date +%s) - SUITE_START ))
+            probe_host end "$SUITE"
 
             # Attribute this suite's time. `wall` is the suite's own elapsed
             # seconds; `pg_exec_total_s` is everything Postgres executed during
