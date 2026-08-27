@@ -1,6 +1,16 @@
 import { test, expect } from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
 
+function catalogHtml(
+  params: Array<{ code: string; type: string; targets?: string[] }>,
+): string {
+  const options = params.map(
+    ({ code, type, targets = [] }) =>
+      `<option value="${code}" data-type="${type}" data-targets="${targets.join(",")}"></option>`,
+  );
+  return `<datalist id="param-options">${options.join("")}</datalist>`;
+}
+
 // The Saved Queries workspace (/ui/queries): the shared query builder and the
 // in-page results table — run a query, add builder rows, page through results,
 // and see the datalist of parameters swap per type.
@@ -553,6 +563,40 @@ test.describe("query builder", () => {
     await expect(queries.builder.url).toHaveValue("GET /Patient?family=a\\\\x");
   });
 
+  test("operator cleanup keeps malformed escapes blocked until correction", async ({
+    page,
+    queries,
+  }) => {
+    const searches: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && url.pathname === "/Patient") {
+        searches.push(url.search);
+      }
+    });
+
+    await queries.builder.setUrl("Patient?name:contains=a%5Cx");
+    const row = queries.builder.conditionRows.first();
+    await row.locator(".builder-row__key").fill("gender");
+    await expect(row).toHaveAttribute("data-mod-type", "token");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(queries.builder.error).toBeVisible();
+    await expect(queries.builder.runButton).toBeDisabled();
+    await expect(queries.builder.saveButton).toBeDisabled();
+    await expect(queries.builder.copyButton).toBeDisabled();
+    await queries.builder.url.focus();
+    await page.keyboard.press("Enter");
+    expect(searches).toEqual([]);
+
+    await row.locator(".builder-row__value").fill("a\\x");
+    await expect(queries.builder.error).toBeHidden();
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender=a\\\\x");
+    await expect(queries.builder.runButton).toBeEnabled();
+    await expect(queries.builder.saveButton).toBeEnabled();
+    await expect(queries.builder.copyButton).toBeEnabled();
+    expect(searches).toEqual([]);
+  });
+
   test("the + or button stacks a value; the per-value × removes it", async ({
     queries,
   }) => {
@@ -595,15 +639,18 @@ test.describe("query builder", () => {
       "GET /Patient?name:exact=ge1981,le1990",
     );
 
+    /* Moving the same values onto a date parameter drops `:exact`, which no
+     * ordered type supports (#627); the prefixes they were hiding behind it
+     * become real comparators in the same pass. */
     await row.locator(".builder-row__key").fill("birthdate");
     await expect(row).toHaveAttribute("data-mod-type", "date");
-    await expect(row.locator(".builder-row__modifier")).toHaveValue("exact");
-    await expect(comparators.nth(0)).toHaveValue("");
-    await expect(comparators.nth(1)).toHaveValue("");
-    await expect(values.nth(0)).toHaveValue("ge1981");
-    await expect(values.nth(1)).toHaveValue("le1990");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(comparators.nth(0)).toHaveValue("ge");
+    await expect(comparators.nth(1)).toHaveValue("le");
+    await expect(values.nth(0)).toHaveValue("1981");
+    await expect(values.nth(1)).toHaveValue("1990");
     await expect(queries.builder.url).toHaveValue(
-      "GET /Patient?birthdate:exact=ge1981,le1990",
+      "GET /Patient?birthdate=ge1981,le1990",
     );
   });
 
@@ -1501,6 +1548,346 @@ test.describe("query builder", () => {
     const opts = await row.locator(".builder-row__modifier option").allTextContents();
     expect(opts).not.toContain("ge");
     expect(opts).not.toContain(":in");
+  });
+
+  test("changing a parameter removes incompatible modifiers before the query can run", async ({
+    page,
+    queries,
+  }) => {
+    const searches: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && url.pathname === "/Patient") {
+        searches.push(url.search);
+      }
+    });
+
+    await queries.builder.setUrl("Patient?name:contains=OrAlpha556");
+    const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await row.locator(".builder-row__key").fill("gender");
+
+    await expect(row).toHaveAttribute("data-mod-type", "token");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender=OrAlpha556");
+    await expect(page.locator("#query-plain-text")).toContainText(
+      "gender is “OrAlpha556”",
+    );
+    expect(searches).toEqual([]);
+
+    const sent = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === "GET" && url.pathname === "/Patient";
+    });
+    await queries.builder.runButton.click();
+    expect(new URL((await sent).url()).search).toBe("?gender=OrAlpha556");
+  });
+
+  test("known parameter types expose the complete modifier matrix", async ({ page, queries }) => {
+    const scenarios = [
+      {
+        key: "string-param",
+        type: "string",
+        modifiers: ["exact", "contains", "text", "missing"],
+      },
+      {
+        key: "token-param",
+        type: "token",
+        modifiers: ["text", "not", "above", "below", "in", "not-in", "of-type", "missing"],
+      },
+      {
+        key: "reference-param",
+        type: "reference",
+        modifiers: ["contains", "text", "above", "below", "identifier", "missing"],
+      },
+      {
+        key: "uri-param",
+        type: "uri",
+        modifiers: ["contains", "above", "below", "missing"],
+      },
+      { key: "date-param", type: "date", modifiers: ["missing"] },
+      { key: "number-param", type: "number", modifiers: ["missing"] },
+      { key: "quantity-param", type: "quantity", modifiers: ["missing"] },
+      { key: "composite-param", type: "composite", modifiers: [] },
+      { key: "special-param", type: "special", modifiers: [] },
+    ];
+    await page.route("**/ui/queries/params?type=Matrix", async (route) => {
+      await route.fulfill({
+        contentType: "text/html",
+        body: catalogHtml(
+          scenarios.map(({ key, type }) => ({ code: key, type })),
+        ),
+      });
+    });
+
+    for (const scenario of scenarios) {
+      await queries.builder.setUrl(`Matrix?${scenario.key}=x`);
+      const row = queries.builder.conditionRows.first();
+      await expect(row).toHaveAttribute("data-mod-type", scenario.type);
+      const values = await row.locator(".builder-row__modifier option").evaluateAll((options) =>
+        options.slice(1).map((option) => (option as HTMLOptionElement).value),
+      );
+      expect(values).toEqual(scenario.modifiers);
+    }
+  });
+
+  test("compatibility-only and ambiguous modifiers are preserved only where valid", async ({
+    page,
+    queries,
+  }) => {
+    const catalogs: Record<
+      string,
+      Array<{ code: string; type: string; targets?: string[] }>
+    > = {
+      Matrix: [
+        { code: "string-param", type: "string" },
+        { code: "token-param", type: "token" },
+        { code: "reference-param", type: "reference" },
+        { code: "subject", type: "reference", targets: ["Left", "Right"] },
+      ],
+      Left: [{ code: "leaf", type: "string" }],
+      Right: [{ code: "leaf", type: "token" }],
+    };
+    await page.route("**/ui/queries/params?type=*", async (route) => {
+      const type = new URL(route.request().url()).searchParams.get("type") || "";
+      await route.fulfill({
+        contentType: "text/html",
+        body: catalogHtml(catalogs[type] || []),
+      });
+    });
+
+    const transitions = [
+      { modifier: "text-advanced", from: "token-param", to: "string-param" },
+      { modifier: "code-text", from: "reference-param", to: "string-param" },
+      { modifier: "Patient", from: "reference-param", to: "token-param" },
+    ];
+    for (const transition of transitions) {
+      await queries.builder.setUrl(
+        `Matrix?${transition.from}:${transition.modifier}=x`,
+      );
+      const row = queries.builder.conditionRows.first();
+      await expect(row.locator(".builder-row__modifier")).toHaveValue(
+        transition.modifier,
+      );
+      await row.locator(".builder-row__key").fill(transition.to);
+      await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+      await expect(queries.builder.url).toHaveValue(
+        `GET /Matrix?${transition.to}=x`,
+      );
+    }
+
+    await queries.builder.setUrl("Matrix?subject.leaf:opaque=x");
+    const chain = queries.builder.chainRows.first();
+    await expect(chain).toHaveAttribute("data-compat-state", "unknown");
+    await expect(chain.locator(".builder-row__modifier")).toHaveValue("opaque");
+    await expect(queries.builder.url).toHaveValue("Matrix?subject.leaf:opaque=x");
+  });
+
+  test("removing a modifier rehydrates every ordered prefix exactly once", async ({
+    page,
+    queries,
+  }) => {
+    await page.route("**/ui/queries/params?type=Matrix", async (route) => {
+      await route.fulfill({
+        contentType: "text/html",
+        body: catalogHtml([
+          { code: "text-param", type: "string" },
+          { code: "ordered-param", type: "date" },
+        ]),
+      });
+    });
+
+    for (const prefix of ["eq", "ne", "gt", "ge", "lt", "le", "sa", "eb", "ap"]) {
+      await queries.builder.setUrl(
+        `Matrix?text-param:contains=${prefix}1980`,
+      );
+      const row = queries.builder.conditionRows.first();
+      await row.locator(".builder-row__key").fill("ordered-param");
+      await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+      await expect(row.locator(".builder-row__comparator")).toHaveValue(prefix);
+      await expect(row.locator(".builder-row__value")).toHaveValue("1980");
+      await expect(queries.builder.url).toHaveValue(
+        `GET /Matrix?ordered-param=${prefix}1980`,
+      );
+      if (prefix === "eq") {
+        await row.locator(".builder-row__comparator").selectOption("le");
+        await expect(queries.builder.url).toHaveValue(
+          "GET /Matrix?ordered-param=le1980",
+        );
+      }
+    }
+  });
+
+  test("compatible modifiers survive while incompatible value prefixes are removed", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?name:missing=true");
+    let row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await row.locator(".builder-row__key").fill("gender");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("missing");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender:missing=true");
+
+    await queries.builder.setUrl("Patient?birthdate=ge1980-01-01");
+    row = queries.builder.conditionRows.first();
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
+    await row.locator(".builder-row__key").fill("gender");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender=1980-01-01");
+  });
+
+  test("forward and reverse chain leaves reconcile their operators", async ({ queries }) => {
+    await queries.builder.setUrl("Observation?subject:Patient.name:contains=ge1980");
+    let row = queries.builder.chainRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await row.locator(".builder-row__cparam").fill("birthdate");
+    await expect(row).toHaveAttribute("data-mod-type", "date");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
+    await expect(row.locator(".builder-row__value")).toHaveValue("1980");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Observation?subject:Patient.birthdate=ge1980",
+    );
+
+    await queries.builder.setUrl("Patient?_has:Observation:patient:code:not=ge1980");
+    row = queries.builder.hasRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "token");
+    await row.locator(".builder-row__cparam").fill("date");
+    await expect(row).toHaveAttribute("data-mod-type", "date");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
+    await expect(row.locator(".builder-row__value")).toHaveValue("1980");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_has:Observation:patient:date=ge1980",
+    );
+  });
+
+  test("pending catalog metadata blocks every builder consumer and coalesces one URL update", async ({
+    page,
+    queries,
+  }) => {
+    let releaseCatalog: () => void = () => {};
+    const catalogReleased = new Promise<void>((resolve) => {
+      releaseCatalog = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await catalogReleased;
+      await route.continue();
+    });
+    const searches: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && url.pathname === "/Patient") {
+        searches.push(url.search);
+      }
+    });
+
+    await queries.builder.setUrl("Patient?name:contains=OrAlpha556");
+    const row = queries.builder.conditionRows.first();
+    await row.locator(".builder-row__key").fill("gender");
+    await expect(row).toHaveAttribute("data-compat-state", "pending");
+    await expect(queries.builder.runButton).toBeDisabled();
+    await expect(queries.builder.saveButton).toBeDisabled();
+    await expect(queries.builder.copyButton).toBeDisabled();
+    await queries.builder.url.focus();
+    await page.keyboard.press("Enter");
+    expect(searches).toEqual([]);
+
+    releaseCatalog();
+    await expect(row).toHaveAttribute("data-compat-state", "known");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender=OrAlpha556");
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(searches).toEqual([]);
+
+    const sent = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === "GET" && url.pathname === "/Patient";
+    });
+    await queries.builder.runButton.click();
+    expect(new URL((await sent).url()).search).toBe("?gender=OrAlpha556");
+  });
+
+  test("removing the last pending row immediately releases builder consumers", async ({
+    page,
+    queries,
+  }) => {
+    let releaseCatalog: () => void = () => {};
+    const catalogReleased = new Promise<void>((resolve) => {
+      releaseCatalog = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await catalogReleased;
+      await route.continue();
+    });
+
+    await queries.builder.setUrl("Patient?name=x");
+    const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-compat-state", "pending");
+    await row.locator("[data-remove-row]").click();
+    await expect(queries.builder.conditionRows).toHaveCount(0);
+    await expect(queries.builder.url).toHaveValue("GET /Patient");
+    await expect(queries.builder.runButton).toBeEnabled();
+    await expect(queries.builder.saveButton).toBeEnabled();
+    await expect(queries.builder.copyButton).toBeEnabled();
+
+    releaseCatalog();
+    await expect(queries.builder.runButton).toBeEnabled();
+    await expect(queries.builder.url).toHaveValue("GET /Patient");
+  });
+
+  test("unknown parameters and catalog failures remain permissive", async ({ page, queries }) => {
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await route.fulfill({ status: 503, body: "catalog unavailable" });
+    });
+
+    await queries.builder.setUrl("Patient?future-param:opaque=x");
+    const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-compat-state", "unknown");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("opaque");
+    await expect(queries.builder.url).toHaveValue("Patient?future-param:opaque=x");
+    await expect(queries.builder.runButton).toBeEnabled();
+  });
+
+  test("no-op catalog reconciliation preserves the exact loaded URL", async ({ queries }) => {
+    const exact = "GET /Patient?name:exact=Copy%5C%2C627";
+    await queries.builder.setUrl(exact);
+    const row = queries.builder.conditionRows.first();
+
+    await expect(row).toHaveAttribute("data-compat-state", "known");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("exact");
+    await expect(queries.builder.runButton).toBeEnabled();
+    await expect(queries.builder.url).toHaveValue(exact);
+  });
+
+  test("editing a pending deep link cancels its deferred auto-run", async ({ page, queries }) => {
+    let releaseCatalog: () => void = () => {};
+    const catalogReleased = new Promise<void>((resolve) => {
+      releaseCatalog = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await catalogReleased;
+      await route.continue();
+    });
+    const searches: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && url.pathname === "/Patient") {
+        searches.push(url.search);
+      }
+    });
+
+    const deepLink = encodeURIComponent("/Patient?name:contains=before");
+    await page.goto(`/ui/queries?url=${deepLink}`);
+    const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-compat-state", "pending");
+    await row.locator(".builder-row__value").fill("after");
+    releaseCatalog();
+
+    await expect(row).toHaveAttribute("data-compat-state", "known");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name:contains=after");
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(searches).toEqual([]);
   });
 
   test("the MODIFY panel explains its chips", async ({ queries }) => {

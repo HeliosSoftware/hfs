@@ -202,12 +202,13 @@
   }
 
   var catalogType = null;
+  var catalogLoadSeq = 0;
 
   /* Per-type parameter metadata from the catalog fragment's data attributes:
    * type -> { code: { type: "reference"|..., targets: ["Patient", ...] } }.
    * Feeds the chaining controls; promise-cached so each type is fetched once. */
   var PARAM_META = {};
-  var paramMetaPromises = {};
+  var paramCatalogPromises = {};
   function parseCatalog(html) {
     var tpl = document.createElement("template");
     tpl.innerHTML = html;
@@ -220,10 +221,10 @@
     });
     return { meta: meta, datalist: tpl.content.querySelector("datalist") };
   }
-  function fetchParams(type) {
-    if (!type) return Promise.resolve({});
-    if (paramMetaPromises[type]) return paramMetaPromises[type];
-    paramMetaPromises[type] = fetch(
+  function fetchCatalog(type) {
+    if (!type) return Promise.resolve({ meta: {}, datalist: null });
+    if (paramCatalogPromises[type]) return paramCatalogPromises[type];
+    paramCatalogPromises[type] = fetch(
       "/ui/queries/params?type=" + encodeURIComponent(type),
       { credentials: "same-origin" },
     )
@@ -231,37 +232,43 @@
         return response.ok ? response.text() : null;
       })
       .then(function (html) {
-        if (!html) return {};
-        var parsed = parseCatalog(html);
+        var parsed = html ? parseCatalog(html) : { meta: {}, datalist: null };
         PARAM_META[type] = parsed.meta;
-        return parsed.meta;
+        return parsed;
       })
       .catch(function () {
         PARAM_META[type] = {};
-        return {};
+        return { meta: {}, datalist: null };
       });
-    return paramMetaPromises[type];
+    return paramCatalogPromises[type];
+  }
+  function fetchParams(type) {
+    return fetchCatalog(type).then(function (catalog) {
+      return catalog.meta;
+    });
   }
 
-  /* Swaps the parameter datalist for the current resource type. The
-   * fragment is server-rendered from the SearchParameter registry. */
+  /* Swaps the parameter datalist for the current resource type. The fragment
+   * is server-rendered from the SearchParameter registry; a render for a
+   * newer type must not install a stale datalist. */
   function loadCatalog(type) {
-    if (!type || type === catalogType) return;
+    if (!type) return Promise.resolve({});
+    var loadSeq = ++catalogLoadSeq;
     catalogType = type;
-    fetch("/ui/queries/params?type=" + encodeURIComponent(type), {
-      credentials: "same-origin",
-    })
-      .then(function (response) {
-        return response.ok ? response.text() : null;
-      })
-      .then(function (html) {
-        if (!html) return;
-        var parsed = parseCatalog(html);
-        PARAM_META[type] = parsed.meta;
-        var current = document.getElementById("param-options");
-        if (parsed.datalist && current) current.replaceWith(parsed.datalist);
-        refreshChainAffordances();
-      });
+    return fetchCatalog(type).then(function (parsed) {
+      if (
+        loadSeq !== catalogLoadSeq ||
+        catalogType !== type ||
+        !sections ||
+        sections.dataset.type !== type
+      )
+        return parsed.meta;
+      var current = document.getElementById("param-options");
+      if (parsed.datalist && current)
+        current.replaceWith(parsed.datalist.cloneNode(true));
+      refreshChainAffordances();
+      return parsed.meta;
+    });
   }
 
   function splitQuery(query) {
@@ -444,15 +451,19 @@
    * prefixes only apply to the ordered families. Unknown or unregistered
    * params keep the full lists. */
   var MODS_BY_TYPE = {
-    string: ["exact", "contains", "missing"],
-    token: ["text", "not", "in", "not-in", "of-type", "missing"],
-    reference: ["identifier", "missing"],
-    uri: ["below", "above", "missing"],
+    string: ["exact", "contains", "text", "missing"],
+    token: [
+      "text", "not", "above", "below", "in", "not-in", "of-type", "missing",
+    ],
+    reference: [
+      "contains", "text", "above", "below", "identifier", "missing",
+    ],
+    uri: ["contains", "above", "below", "missing"],
     date: ["missing"],
     number: ["missing"],
     quantity: ["missing"],
-    composite: ["missing"],
-    special: ["missing"],
+    composite: [],
+    special: [],
   };
   var PREFIX_TYPES = ["date", "number", "quantity"];
 
@@ -462,6 +473,23 @@
   function applicablePrefixes(paramType) {
     if (!paramType) return PREFIXES;
     return PREFIX_TYPES.indexOf(paramType) >= 0 ? PREFIXES : [];
+  }
+
+  /* A parameter whose type the registry pins down; anything else (unknown
+   * code, ambiguous chain leaf, failed catalog) stays permissive. */
+  function knownParamType(paramType) {
+    return Object.prototype.hasOwnProperty.call(MODS_BY_TYPE, paramType);
+  }
+
+  /* Beyond the chips a type offers, the spec keeps two compatibility
+   * spellings and reference type modifiers legal (#627). */
+  function compatibleModifier(modifier, paramType) {
+    if (!modifier) return true;
+    if ((MODS_BY_TYPE[paramType] || []).indexOf(modifier) >= 0) return true;
+    if (modifier === "text-advanced" || modifier === "code-text") {
+      return paramType === "token" || paramType === "reference";
+    }
+    return paramType === "reference" && /^[A-Z]/.test(modifier);
   }
 
   /* Parameter types arrive asynchronously from the registry. A row whose
@@ -476,6 +504,33 @@
     );
   }
 
+  /* A row is `pending` from the moment its type resolution starts until that
+   * metadata settles it as `known` or `unknown`; a deferred consumer (a
+   * saved-query run, a deep link) may not read the builder before then. */
+  function builderCompatibilityPending() {
+    return !!(
+      sections && sections.querySelector(".builder-row[data-compat-state='pending']")
+    );
+  }
+
+  /* Run and Enter wait for the row being edited; Save and Copy additionally
+   * wait for a parameter transition, whose operators may still describe the
+   * old parameter. A malformed escape blocks all of them. */
+  function builderHasParamTransition() {
+    return !!(
+      sections &&
+      sections.querySelector(".builder-row[data-comparator-transition='true']")
+    );
+  }
+
+  function builderRunBlocked() {
+    return builderHasPendingType() || builderHasEscapeError();
+  }
+
+  function builderWriteBlocked() {
+    return builderHasParamTransition() || builderHasEscapeError();
+  }
+
   function builderHasPendingSerialization() {
     if (!sections) return false;
     return Array.prototype.some.call(
@@ -488,14 +543,58 @@
     );
   }
 
+  /* Every builder consumer reflects the blocked state, and anything that
+   * deferred until the builder settled is released here. */
+  var pendingBuilderConsumers = [];
   function refreshRunAvailability() {
-    var run = form && form.querySelector("[data-intent='run']");
-    if (run) run.disabled = builderHasPendingType();
+    var runBlocked = builderRunBlocked();
+    var writeBlocked = builderWriteBlocked();
+    if (form) {
+      form.querySelectorAll("[data-intent]").forEach(function (control) {
+        control.disabled =
+          control.dataset.intent === "run" ? runBlocked : writeBlocked;
+      });
+    }
+    var copy = document.getElementById("query-copy");
+    if (copy) copy.disabled = writeBlocked;
+    if (root) {
+      root
+        .querySelectorAll("button[data-action='run']")
+        .forEach(function (control) {
+          control.disabled = runBlocked;
+        });
+    }
+    if (runBlocked || writeBlocked || builderCompatibilityPending()) return;
+    var ready = pendingBuilderConsumers;
+    pendingBuilderConsumers = [];
+    ready.forEach(function (consumer) {
+      if (consumer.revision === builderRevision) consumer.callback();
+    });
+  }
+
+  /* Auto-runs (saved entries, deep links) are one-shot against the builder
+   * revision they were queued for: a user edit in the meantime cancels
+   * them rather than running a query nobody asked for. */
+  function consumeWhenBuilderReady(revision, callback) {
+    if (
+      !builderCompatibilityPending() &&
+      !builderRunBlocked() &&
+      !builderWriteBlocked()
+    ) {
+      if (revision === builderRevision) callback();
+      return;
+    }
+    pendingBuilderConsumers.push({ revision: revision, callback: callback });
+  }
+
+  function noteBuilderUserEdit() {
+    builderRevision += 1;
   }
 
   function beginTypeResolution(row, userTransition) {
     var token = String(++typeResolutionSeq);
     row.dataset.typeResolution = token;
+    row.dataset.compatState = "pending";
     if (!userTransition && row._hydrationPending === undefined) {
       row._hydrationPending = true;
       row._hydrationToken = token;
@@ -503,9 +602,8 @@
     if (userTransition) {
       row.dataset.paramPending = "true";
       row.dataset.comparatorTransition = "true";
-      var run = form && form.querySelector("[data-intent='run']");
-      if (run) run.disabled = true;
     }
+    refreshRunAvailability();
     return token;
   }
 
@@ -557,24 +655,31 @@
     else updatePlain();
   }
 
-  /* Rebuilds a row's modifier select and MODIFY chips for its param type. */
-  function refreshModifierControls(row, paramType) {
+  /* Rebuilds a row's modifier select and MODIFY chips for its param type.
+   * Once the registry pins the type down, a modifier it cannot support
+   * belonged to the parameter that was there before and is dropped (#627);
+   * unknown and ambiguous parameters keep pasted operators verbatim.
+   * Returns whether the selection changed, which the wire must follow. */
+  function refreshModifierControls(row, paramType, reconcile) {
     var modifier = row.querySelector(".builder-row__modifier");
-    if (!modifier) return;
-    var selected = modifier.value;
+    if (!modifier) return false;
+    var original = modifier.value;
+    var selected = original;
     var mods = applicableMods(paramType);
+    if (reconcile && !compatibleModifier(selected, paramType)) selected = "";
     modifier.textContent = "";
     option(modifier, "", sections.dataset.msgMatchIs, !selected);
     mods.forEach(function (m) {
       option(modifier, m, ":" + m, selected === m);
     });
-    /* A modifier from a pasted URL stays selectable even when the type
-     * would not offer it. */
+    /* Compatibility-only and unknown modifiers stay selectable without
+     * joining the visible modifier matrix. */
     if (selected && mods.indexOf(selected) < 0) {
       option(modifier, selected, ":" + selected, true);
     }
     var panel = row.querySelector(".builder-row__modpanel");
     if (panel) fillModPanel(panel, row, mods);
+    return original !== selected;
   }
 
   /* Re-gates the per-value comparator selects. Hydrated values keep their
@@ -619,8 +724,7 @@
     if (!row._hydrationPending) return;
     row._comparatorClassificationPending = true;
     row.dataset.paramPending = "true";
-    var run = form && form.querySelector("[data-intent='run']");
-    if (run) run.disabled = true;
+    refreshRunAvailability();
   }
 
   function cancelComparatorClassification(row) {
@@ -661,8 +765,7 @@
     if (unresolvedHydratedPrefix) {
       row._modifierPending = true;
       row.dataset.paramPending = "true";
-      var run = form && form.querySelector("[data-intent='run']");
-      if (run) run.disabled = true;
+      refreshRunAvailability();
       return false;
     }
     clearComparatorsForModifier(row);
@@ -764,14 +867,22 @@
     return (((PARAM_META[base] || {})[key.value.trim()] || {}).type) || "";
   }
 
-  /* Re-gates a row's modifier controls when its param type changed. */
+  /* Settles a row against its resolved param type: an unknown type stays
+   * permissive, a known one reconciles the key modifier before the value
+   * comparators, so a prefix freed by dropping the modifier can move into
+   * the comparator control in the same pass. */
   function regateModifiers(row, resolvedType, comparatorMode) {
     var t = arguments.length > 1 ? resolvedType : rowParamType(row);
-    if (row.dataset.modType !== t) {
+    var known = knownParamType(t);
+    var wireChanged = false;
+    if (row.dataset.modType !== t || known) {
       row.dataset.modType = t;
-      refreshModifierControls(row, t);
+      wireChanged = refreshModifierControls(row, t, known && !!comparatorMode);
     }
-    return refreshComparatorControls(row, t, comparatorMode);
+    wireChanged =
+      refreshComparatorControls(row, t, comparatorMode) || wireChanged;
+    row.dataset.compatState = known ? "known" : "unknown";
+    return wireChanged;
   }
 
   function resolveDirectParamType(row, userTransition) {
@@ -849,6 +960,9 @@
     COLON_MODIFIERS.forEach(function (m) {
       option(modifier, m, ":" + m, selectedMod === m);
     });
+    if (selectedMod && COLON_MODIFIERS.indexOf(selectedMod) < 0) {
+      option(modifier, selectedMod, ":" + selectedMod, true);
+    }
     row.appendChild(modifier);
 
     appendValues(row, value, !selectedMod);
@@ -1240,7 +1354,9 @@
    * reference, per the registry metadata for the current base type. */
   function refreshChainAffordances() {
     if (!sections) return;
-    var meta = PARAM_META[sections.dataset.type || ""] || {};
+    var type = sections.dataset.type || "";
+    var loaded = Object.prototype.hasOwnProperty.call(PARAM_META, type);
+    var meta = PARAM_META[type] || {};
     sections
       .querySelectorAll("#builder-conditions .builder-row")
       .forEach(function (row) {
@@ -1249,6 +1365,12 @@
         var key = row.querySelector(".builder-row__key");
         var drill = row.querySelector("[data-chain-from]");
         if (!key || !drill) return;
+        /* Until the catalog answers there is no basis for the affordance;
+         * the row's own type resolution reveals it. */
+        if (!loaded) {
+          drill.hidden = true;
+          return;
+        }
         var m = meta[key.value.trim()];
         drill.hidden = !(m && m.type === "reference");
       });
@@ -1309,6 +1431,9 @@
         COLON_MODIFIERS.forEach(function (m) {
           option(modifier, m, ":" + m, selectedMod === m);
         });
+        if (selectedMod && COLON_MODIFIERS.indexOf(selectedMod) < 0) {
+          option(modifier, selectedMod, ":" + selectedMod, true);
+        }
       }
       row.appendChild(modifier);
     }
@@ -1425,6 +1550,10 @@
    * match stale state. */
   var lastSerialized = null;
 
+  /* Bumped by every builder render and every user edit: a deferred auto-run
+   * only fires against the revision it was queued for. */
+  var builderRevision = 0;
+
   function builderHasEscapeError() {
     return !!(
       sections && sections.querySelector(".builder-row__value[data-fhir-escape-error]")
@@ -1433,6 +1562,7 @@
 
   function showEscapeError() {
     showError(null, messages.msgInvalidFhirEscape);
+    refreshRunAvailability();
   }
 
   function serializedConditionAlternative(input) {
@@ -1453,14 +1583,25 @@
     lastSerialized = null;
     var parsed = parseSearchUrl(urlInput.value);
     if (!parsed) {
+      builderRevision += 1;
       sections.hidden = true;
       syncTypeContext("");
+      sections
+        .querySelectorAll(".builder-row[data-compat-state='pending']")
+        .forEach(function (row) {
+          row.dataset.compatState = "unknown";
+        });
+      refreshRunAvailability();
       return;
     }
     // Context sync must precede the echo guard: even a URL whose rows are
     // already current may have arrived with conflicting Resources state (#626).
     syncTypeContext(parsed.type);
-    if (isSerializedEcho) return;
+    if (isSerializedEcho) {
+      refreshRunAvailability();
+      return;
+    }
+    builderRevision += 1;
     sections.hidden = false;
     sections.dataset.type = parsed.type;
     loadCatalog(parsed.type);
@@ -1486,9 +1627,13 @@
     /* Interactions against an unresolved hydrated prefix are transactional:
      * no edit may expose an unclassified modifier/comparator state through
      * the URL, Copy, Save, or Run. */
-    if (builderHasPendingSerialization()) return;
+    if (builderHasPendingSerialization()) {
+      refreshRunAvailability();
+      return;
+    }
     if (builderHasEscapeError()) {
       showEscapeError();
+      refreshRunAvailability();
       return;
     }
     clearError();
@@ -1560,14 +1705,17 @@
       "GET /" + type + (parts.length ? "?" + parts.join("&") : "");
     lastSerialized = urlInput.value;
     updatePlain();
+    refreshRunAvailability();
   }
 
   if (sections && urlInput) {
+    urlInput.addEventListener("input", noteBuilderUserEdit);
     urlInput.addEventListener("change", renderBuilder);
     sections.addEventListener("input", function (event) {
       var row = event.target.closest(".builder-row");
       if (row) {
         var deferUpdate = false;
+        noteBuilderUserEdit();
         var directKeyChanged =
           event.target.classList.contains("builder-row__key") &&
           !row.classList.contains("builder-row--chain") &&
@@ -1616,6 +1764,7 @@
       var toggleIterate = event.target.closest("[data-toggle-iterate]");
       var toggleMods = event.target.closest("[data-toggle-mods]");
       if (toggleIterate) {
+        noteBuilderUserEdit();
         var on = toggleIterate.getAttribute("aria-pressed") === "true";
         toggleIterate.setAttribute("aria-pressed", on ? "false" : "true");
         updateUrl();
@@ -1626,7 +1775,7 @@
       if (toggleMods) {
         var modRow = toggleMods.closest(".builder-row");
         var modPanel = modRow.querySelector(".builder-row__modpanel");
-        regateModifiers(modRow);
+        if (modRow.dataset.compatState !== "pending") regateModifiers(modRow);
         if (modPanel.hidden) {
           refreshModifierControls(modRow, modRow.dataset.modType || "");
         }
@@ -1635,6 +1784,7 @@
         return;
       }
       if (modChip) {
+        noteBuilderUserEdit();
         var chipRow = modChip.closest(".builder-row");
         var sel = chipRow.querySelector(".builder-row__modifier");
         sel.value = sel.value === modChip.dataset.modChip ? "" : modChip.dataset.modChip;
@@ -1655,6 +1805,7 @@
       var removeOr = event.target.closest("[data-remove-or]");
       var add = event.target.closest("[data-add]");
       if (addOr) {
+        noteBuilderUserEdit();
         var orRow = addOr.closest(".builder-row");
         var orHost = orRow.querySelector(".builder-row__values");
         var addedValue = orValueInput(orHost, "");
@@ -1663,6 +1814,7 @@
         return;
       }
       if (removeOr) {
+        noteBuilderUserEdit();
         var orWrap = removeOr.closest(".builder-row__orvalue");
         if (orWrap.parentElement.children.length > 1) {
           var removeOrRow = orWrap.closest(".builder-row");
@@ -1673,6 +1825,7 @@
         return;
       }
       if (remove) {
+        noteBuilderUserEdit();
         remove.closest(".builder-row").remove();
         refreshRunAvailability();
         updateUrl();
@@ -1702,6 +1855,7 @@
           value: keptValues.join(","),
         });
         from.replaceWith(chain);
+        noteBuilderUserEdit();
         chain.querySelector(".builder-row__cparam").focus();
         updateUrl();
       } else if (add) {
@@ -1713,6 +1867,7 @@
             value: "",
           });
           builderHosts().include.appendChild(inc);
+          noteBuilderUserEdit();
           inc.querySelector(kind === "include-rev" ? ".builder-row__itype" : ".builder-row__iparam").focus();
           return;
         }
@@ -1726,6 +1881,7 @@
             value: "",
           });
           builderHosts().condition.appendChild(has);
+          noteBuilderUserEdit();
           has.querySelector(".builder-row__htype").focus();
           return;
         }
@@ -1736,6 +1892,8 @@
         };
         var row = builderRow(kind, part);
         builderHosts()[kind].appendChild(row);
+        noteBuilderUserEdit();
+        if (kind === "condition") refreshChainAffordances();
         row.querySelector(kind === "condition" ? ".builder-row__key" : ".builder-row__value").focus();
       }
     });
@@ -2452,7 +2610,10 @@
     renderRecent(doc);
     /* The Search page renders the builder and the recent list but no saved
      * list; there is nothing further to draw there. */
-    if (!root) return;
+    if (!root) {
+      refreshRunAvailability();
+      return;
+    }
 
     var byType = savedQueries(doc);
     root.textContent = "";
@@ -2527,6 +2688,7 @@
       empty.textContent = messages.msgEmpty;
       root.appendChild(empty);
     }
+    refreshRunAvailability();
   }
 
   /* Errors surface next to the query strip — the control they are almost
@@ -2590,15 +2752,26 @@
 
   /* Loads a query into the builder without running it. */
   function loadIntoBuilder(path) {
-    if (!urlInput) return;
+    if (!urlInput) return builderRevision;
     urlInput.value = "GET " + path;
     renderBuilder();
+    return builderRevision;
+  }
+
+  /* Runs whatever the builder settled on, which may differ from the query
+   * that was loaded once incompatible operators were reconciled. */
+  function runCurrentBuilderSearch(record) {
+    var parsed = parseSearchUrl(urlInput && urlInput.value);
+    if (!parsed) return false;
+    runSearch(searchPath(parsed.type, parsed.query), record);
+    return true;
   }
 
   /* Copy the query exactly as shown: what gets copied is what would run. */
   var copyButton = document.getElementById("query-copy");
   if (copyButton && navigator.clipboard) {
     copyButton.addEventListener("click", function () {
+      if (builderWriteBlocked()) return;
       navigator.clipboard.writeText(urlInput.value || "");
     });
   } else if (copyButton) {
@@ -2622,11 +2795,13 @@
 
         if (target.dataset.action === "run") {
           var path = searchPath(resourceType, entry.query || "");
-          loadIntoBuilder(path);
-          runSearch(path, true);
-          mutate(resourceType, id, {
-            lastAccessedAt: new Date().toISOString(),
-            accessCount: (Number(entry.accessCount) || 0) + 1,
+          var revision = loadIntoBuilder(path);
+          consumeWhenBuilderReady(revision, function () {
+            if (!runCurrentBuilderSearch(true)) return;
+            mutate(resourceType, id, {
+              lastAccessedAt: new Date().toISOString(),
+              accessCount: (Number(entry.accessCount) || 0) + 1,
+            });
           });
         } else if (target.dataset.action === "rename") {
           var name = window.prompt(messages.msgRenamePrompt, entry.name || "");
@@ -2684,7 +2859,7 @@
       event.preventDefault();
       var intent =
         (event.submitter && event.submitter.dataset.intent) || "run";
-      if (intent === "run" && builderHasPendingType()) return;
+      if (builderRunBlocked() || builderWriteBlocked()) return;
       var parsed = parseSearchUrl(form.elements.url.value);
       if (!parsed) {
         reload().then(function () {
@@ -2735,10 +2910,10 @@
   var locationParams = new URLSearchParams(window.location.search);
   var deepLink = locationParams.get("url");
   if (locationParams.has("url") && urlInput) {
-    loadIntoBuilder(deepLink.replace(/^GET\s+/i, ""));
-    var parsedDeep = parseSearchUrl(urlInput.value);
-    if (parsedDeep)
-      runSearch(searchPath(parsedDeep.type, parsedDeep.query), true);
+    var deepRevision = loadIntoBuilder(deepLink.replace(/^GET\s+/i, ""));
+    consumeWhenBuilderReady(deepRevision, function () {
+      runCurrentBuilderSearch(true);
+    });
   } else {
     // Resources opens in Patient (or `?type=`) context (#605): the same
     // path as a rail click, so the builder and results match the type the
