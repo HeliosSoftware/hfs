@@ -64,7 +64,10 @@ test.describe("tenants", () => {
     await tenants.addForm.locator("input[name=id]").fill(id);
     await tenants.addForm.locator("input[name=display_name]").fill("Second");
     await tenants.addForm.locator("button[type=submit]").click();
-    await expect(page.locator("#tenant-rows .alert")).toContainText("already exists");
+    // The dialog's own submit error (#681 adenda): rendered inside the panel
+    // via an out-of-band swap, not the page-level #tenant-rows banner, which
+    // sits behind the modal scrim while the dialog is open.
+    await expect(page.locator("#tenant-add-error")).toContainText("already exists");
     await expect(tenants.addForm.locator("input[name=id]")).toHaveValue(id);
     await expect(tenants.addForm.locator("input[name=display_name]")).toHaveValue("Second");
   });

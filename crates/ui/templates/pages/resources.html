@@ -128,6 +128,16 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
   Edit Resource modal (shadowbox). Opened by JS when a result row is clicked, or
   by "Create new" for a fresh resource. It embeds the schema-driven editor body
   and offers Save / Delete / History with the version diff, over the FHIR API.
+
+  #681: this does not use the shared partials/dialog.html macro. That macro's
+  <details>/<summary> disclosure is the no-JS mechanism the addbox--modal
+  dialogs need; this modal is opened/closed by resources.js toggling `hidden`
+  on an always-present element (so resources.js can address #resource-modal,
+  its tabs, and its Edit/History panes directly) and has its own header
+  layout (subject line, tab switcher, Save/Delete actions) that the shared
+  head slot does not model. It still consumes the same tokens: var(--scrim)
+  and the var(--z-dialog-backdrop) band (app.css), and the same ARIA pattern
+  (role="dialog" aria-modal="true" aria-labelledby) as the shared macro.
 -->
 <div class="modal" id="resource-modal" hidden
      data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}"

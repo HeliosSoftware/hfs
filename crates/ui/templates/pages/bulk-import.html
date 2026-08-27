@@ -1,4 +1,5 @@
 {% extends "layouts/base.html" %}
+{% import "partials/dialog.html" as dialog %}
 
 {% block title %}{{ i18n.t("bulk-import-title") }} — {{ i18n.t("app-title") }}{% endblock %}
 
@@ -9,37 +10,12 @@
   <h1 class="page-head__title">{{ i18n.t("bulk-import-title") }}</h1>
 
   {% if available %}
-  <details class="addbox addbox--modal">
-    <summary class="btn btn--primary">
-      {% include "icons/plus.svg" %}
-      {{ i18n.t("bulk-import-new") }}
-    </summary>
-    <div class="addbox__panel">
-      <div class="addbox__head">
-        <div class="addbox__title">{{ i18n.t("bulk-import-create-title") }}</div>
-        <button type="button" class="addbox__x" data-addbox-close
-                aria-label="{{ i18n.t("ui-close") }}">×</button>
-      </div>
+  {% call dialog::modal(i18n.t("bulk-import-new"), "bulk-import-create-dialog-title", i18n.t("bulk-import-create-title")) %}
       <form method="post" action="/ui/bulk-import">
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-name") }}</span>
-          <input class="field__input" type="text" name="name" required autocomplete="off">
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-submitter-system") }}</span>
-          <input class="field__input" type="text" name="submitter_system" autocomplete="off"
-                 placeholder="urn:helios:hfs:bulk-submit">
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-submitter-value") }}</span>
-          <input class="field__input" type="text" name="submitter_value" autocomplete="off">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-submitter-hint") }}</span>
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-submission-id") }}</span>
-          <input class="field__input" type="text" name="submission_id" autocomplete="off">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-submission-id-hint") }}</span>
-        </label>
+        {% call dialog::field(i18n.t("bulk-import-field-name"), "name", "text", required=true) %}{% endcall %}
+        {% call dialog::field(i18n.t("bulk-import-field-submitter-system"), "submitter_system", "text", placeholder="urn:helios:hfs:bulk-submit") %}{% endcall %}
+        {% call dialog::field(i18n.t("bulk-import-field-submitter-value"), "submitter_value", "text", hint=i18n.t("bulk-import-field-submitter-hint")) %}{% endcall %}
+        {% call dialog::field(i18n.t("bulk-import-field-submission-id"), "submission_id", "text", hint=i18n.t("bulk-import-field-submission-id-hint")) %}{% endcall %}
 
         <fieldset class="field">
           <legend class="field__label">{{ i18n.t("bulk-import-auth") }}</legend>
@@ -87,8 +63,7 @@
           </button>
         </div>
       </form>
-    </div>
-  </details>
+  {% endcall %}
   {% endif %}
 </header>
 
