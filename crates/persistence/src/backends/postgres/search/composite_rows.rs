@@ -147,6 +147,9 @@ pub(crate) fn fold_composites(
             }
             // Every member of a group carries the same arity; take the first.
             arity = arity.or(member.composite_arity);
+            if is_codeless_token(&member.value) {
+                continue;
+            }
             let slot = member.composite_slot.unwrap_or(1);
             // A component of a *different* family in the same slot number is a
             // separate axis of the cross-product, so key on (slot, family) via
@@ -193,6 +196,30 @@ pub(crate) fn fold_composites(
     }
 
     (plain, rows)
+}
+
+/// Whether a token value carries no code, and so can be no composite axis.
+///
+/// `ValueConverter` indexes a `CodeableConcept.text` that no coding's `display`
+/// already carries as a token with an empty code — a row that exists purely so
+/// `:text` has something to match. `build_composite_condition` compares only
+/// `value_token_system` / `value_token_code`, never a display column, so such a
+/// value is an axis entry no composite query can name: the only search that
+/// could select it is one supplying an empty token component, and
+/// `build_composite_condition` already answers a value with the wrong number of
+/// `$`-separated parts with `1 = 0`.
+///
+/// Keeping it in the cross-product is therefore pure multiplication. On the row
+/// census for run 33029355759 a Synthea Observation carries one real coding plus
+/// one text row on both `code` and `valueCodeableConcept`, so
+/// `code-value-concept` wrote 2 x 2 = 4 rows per complete instance where 1 does
+/// the same work, and `combo-code-value-quantity` wrote 2 x 1 where 1 x 1 does.
+///
+/// A group whose *only* value on some axis was code-less loses that axis and is
+/// then dropped by the arity check below — correctly, because that instance has
+/// no code for a composite search to name.
+fn is_codeless_token(value: &IndexValue) -> bool {
+    matches!(value, IndexValue::Token { code, .. } if code.is_empty())
 }
 
 /// The column family a value lands in — the axis identity for the cross-product.
@@ -442,6 +469,115 @@ mod tests {
         .with_composite_slot(1);
         let (_, rows) = fold_composites(vec![legacy]);
         assert_eq!(rows.len(), 1);
+    }
+
+    fn text_token(text: &str) -> IndexValue {
+        IndexValue::Token {
+            system: None,
+            code: String::new(),
+            display: Some(text.to_string()),
+            identifier_type_system: None,
+            identifier_type_code: None,
+        }
+    }
+
+    #[test]
+    fn a_code_less_text_token_is_not_a_composite_axis() {
+        // The dominant Synthea shape: `code` is one LOINC coding plus a
+        // `CodeableConcept.text` whose wording differs from the coding display,
+        // so the text keeps a row of its own. Crossing it with the quantity
+        // doubled the composite for a row `build_composite_condition` can never
+        // name.
+        let (_, rows) = fold_composites(vec![
+            component(
+                "code-value-quantity",
+                SearchParamType::Token,
+                token("8480-6"),
+                0,
+                1,
+            ),
+            component(
+                "code-value-quantity",
+                SearchParamType::Token,
+                text_token("Systolic blood pressure"),
+                0,
+                1,
+            ),
+            component(
+                "code-value-quantity",
+                SearchParamType::Quantity,
+                quantity(140.0),
+                0,
+                1,
+            ),
+        ]);
+        assert_eq!(rows.len(), 1, "1 real code x 1 quantity = 1 row");
+        assert_eq!(rows[0].value_token_code.as_deref(), Some("8480-6"));
+        assert_eq!(rows[0].value_quantity_value, Some(140.0));
+    }
+
+    #[test]
+    fn both_axes_shed_their_text_tokens() {
+        // token x token: `code-value-concept` wrote 2 x 2 = 4 rows per instance
+        // on the benchmark corpus, three of them unreachable.
+        let (_, rows) = fold_composites(vec![
+            component(
+                "code-value-concept",
+                SearchParamType::Token,
+                token("8480-6"),
+                0,
+                1,
+            ),
+            component(
+                "code-value-concept",
+                SearchParamType::Token,
+                text_token("Systolic blood pressure"),
+                0,
+                1,
+            ),
+            component(
+                "code-value-concept",
+                SearchParamType::Token,
+                token("LA6699-8"),
+                0,
+                2,
+            ),
+            component(
+                "code-value-concept",
+                SearchParamType::Token,
+                text_token("Elevated"),
+                0,
+                2,
+            ),
+        ]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value_token_code.as_deref(), Some("8480-6"));
+        assert_eq!(rows[0].value_token_code_2.as_deref(), Some("LA6699-8"));
+    }
+
+    #[test]
+    fn a_group_whose_only_code_is_text_produces_no_row() {
+        // A CodeableConcept with `text` and no coding has nothing a composite
+        // search can name, so the instance is unsearchable and contributes
+        // nothing — the same conclusion the arity check reaches for a group
+        // that is missing a component outright.
+        let (_, rows) = fold_composites(vec![
+            component(
+                "code-value-quantity",
+                SearchParamType::Token,
+                text_token("Systolic blood pressure"),
+                0,
+                1,
+            ),
+            component(
+                "code-value-quantity",
+                SearchParamType::Quantity,
+                quantity(140.0),
+                0,
+                1,
+            ),
+        ]);
+        assert!(rows.is_empty());
     }
 
     #[test]
