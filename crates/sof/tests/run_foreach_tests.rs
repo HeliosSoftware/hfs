@@ -165,7 +165,7 @@ fn compare_json_values(actual: &serde_json::Value, expected: &serde_json::Value)
 #[test]
 fn test_foreach_file() {
     let mut test_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_file.push("tests/sql-on-fhir-v2/tests/foreach.json");
+    test_file.push("tests/sql-on-fhir/tests/foreach.json");
 
     if !test_file.exists() {
         println!("Test file not found: {:?}", test_file);
