@@ -28,6 +28,10 @@ language-label = Idioma
 language-en = Inglés
 language-es = Español
 language-de = Alemán
+user-menu-label = Menú de la cuenta
+user-local = Usuario local
+user-local-hint = La autenticación está deshabilitada
+user-logout = Cerrar sesión
 
 ## Página de inicio
 

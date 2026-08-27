@@ -31,10 +31,14 @@ test("the sidebar brand is an accessible native Home link", async ({ page }) => 
 
 test("the language switcher works as plain links (en → es → de)", async ({ page, chrome }) => {
   await page.goto("/ui");
+  // #725: the language options live behind the avatar's <details> menu,
+  // which opens natively — no JS involved.
+  await chrome.userMenu.locator("summary").click();
   await expect(chrome.langLink("es")).toHaveAttribute("href", /lang=es/);
   await chrome.langLink("es").click();
   await expect(page.locator("html")).toHaveAttribute("lang", "es");
 
+  await chrome.userMenu.locator("summary").click();
   await chrome.langLink("de").click();
   await expect(page.locator("html")).toHaveAttribute("lang", "de");
 });

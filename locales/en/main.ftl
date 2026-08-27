@@ -30,6 +30,10 @@ language-label = Language
 language-en = English
 language-es = Spanish
 language-de = German
+user-menu-label = Account menu
+user-local = Local user
+user-local-hint = Authentication is disabled
+user-logout = Sign out
 
 ## Home / landing page
 
