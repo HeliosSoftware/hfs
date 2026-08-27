@@ -56,7 +56,7 @@
     {% if let Some(sel) = selected %}
     <section class="page-head page-head--row">
       <h2 class="page-head__title">{% if is_new %}{{ i18n.t(new_title_key) }}{% else %}{{ sel.name }}{% endif %}</h2>
-      <div>
+      <div class="page-head__actions">
         {% if !is_new %}
         <a class="btn" href="{{ base_href }}?lib={{ sel.id }}&run=1">{{ i18n.t("vd-run") }}</a>
         <button type="submit" class="btn" form="lib-editor-form" name="action" value="duplicate">
@@ -69,7 +69,7 @@
                 data-redirect="{{ base_href }}">
           <span class="icon">{% include "icons/trash.svg" %}</span> {{ i18n.t("vd-delete") }}
         </button>
-        <a class="btn btn--primary" href="{{ base_href }}?lib=new">
+        <a class="btn btn--accent" href="{{ base_href }}?lib=new">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>
         {% endif %}

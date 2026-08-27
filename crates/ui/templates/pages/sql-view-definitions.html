@@ -60,7 +60,7 @@
          intent, so it stays inside the form via the `form` attribute. -->
     <section class="page-head page-head--row">
       <h2 class="page-head__title">{% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}</h2>
-      <div>
+      <div class="page-head__actions">
         {% if !is_new %}
         <a class="btn" href="/ui/sql/view-definitions?vd={{ sel.id }}&run=1">{{ i18n.t("vd-run") }}</a>
         <button type="submit" class="btn" form="vd-editor-form" name="action" value="duplicate">
@@ -73,7 +73,7 @@
                 data-redirect="/ui/sql/view-definitions">
           <span class="icon">{% include "icons/trash.svg" %}</span> {{ i18n.t("vd-delete") }}
         </button>
-        <a class="btn btn--primary" href="/ui/sql/view-definitions?vd=new">
+        <a class="btn btn--accent" href="/ui/sql/view-definitions?vd=new">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>
         {% endif %}
