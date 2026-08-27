@@ -15,6 +15,18 @@ test("Create new targets the resource type picked in the rail, not always Patien
   await expect(resources.modal.editor.form).toHaveAttribute("data-error-count", /[1-9]/);
 });
 
+test("an encoded HTML-like type stays text and cannot open a draft", async ({ resources, page }) => {
+  const value = "/<img src=x onerror=alert(1)>";
+  await page.goto("/ui/resources?url=" + encodeURIComponent(value), {
+    waitUntil: "networkidle",
+  });
+
+  await expect(resources.builder.url).toHaveValue("GET " + value);
+  await expect(resources.createButton).toBeDisabled();
+  await expect(page.locator("img[src='x']")).toHaveCount(0);
+  await expect(resources.modal.root).toBeHidden();
+});
+
 test("an out-of-value-set code shows a red issue inline in the editor", async ({ resources }) => {
   await resources.goto("Patient");
   await resources.openCreate();

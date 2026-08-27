@@ -4,8 +4,10 @@
 //! when using URL-based tenant routing.
 
 use axum::{extract::Request, http::Uri, middleware::Next, response::Response};
-use helios_fhir::{FhirResourceTypeProvider, FhirVersion};
+use helios_fhir::FhirVersion;
 use helios_persistence::tenant::TenantId;
+
+use crate::fhir_types::is_reserved_resource_path;
 
 /// Non-resource reserved paths (FHIR system endpoints, API prefixes).
 /// Resource types are checked dynamically via helios-fhir's FhirResourceTypeProvider.
@@ -36,8 +38,8 @@ const RESERVED_SYSTEM_PATHS: &[&str] = &[
 ///
 /// A segment is reserved if it's either:
 /// 1. A FHIR system endpoint or API prefix (from RESERVED_SYSTEM_PATHS)
-/// 2. A valid FHIR resource type for the given version
-fn is_reserved_path(segment: &str, fhir_version: &FhirVersion) -> bool {
+/// 2. A FHIR resource type in any version compiled into the server
+fn is_reserved_path(segment: &str, _fhir_version: &FhirVersion) -> bool {
     let lower = segment.to_lowercase();
 
     // Check system paths first (fast path)
@@ -45,25 +47,9 @@ fn is_reserved_path(segment: &str, fhir_version: &FhirVersion) -> bool {
         return true;
     }
 
-    // Check if it's a valid FHIR resource type for the configured version
-    is_fhir_resource_type(segment, fhir_version)
-}
-
-/// Checks if a string is a valid FHIR resource type for the given version.
-/// Uses the FhirResourceTypeProvider trait for case-insensitive matching.
-fn is_fhir_resource_type(type_name: &str, fhir_version: &FhirVersion) -> bool {
-    match fhir_version {
-        #[cfg(feature = "R4")]
-        FhirVersion::R4 => helios_fhir::r4::Resource::is_resource_type(type_name),
-        #[cfg(feature = "R4B")]
-        FhirVersion::R4B => helios_fhir::r4b::Resource::is_resource_type(type_name),
-        #[cfg(feature = "R5")]
-        FhirVersion::R5 => helios_fhir::r5::Resource::is_resource_type(type_name),
-        #[cfg(feature = "R6")]
-        FhirVersion::R6 => helios_fhir::r6::Resource::is_resource_type(type_name),
-        #[allow(unreachable_patterns)]
-        _ => false,
-    }
+    // Reserve resource paths from every version compiled into this server.
+    // The handler later applies exact admission for the negotiated version.
+    is_reserved_resource_path(segment)
 }
 
 /// Validates that a path segment could be a tenant ID.
@@ -104,7 +90,8 @@ fn is_valid_tenant_id(s: &str) -> bool {
 /// Returns `Some((tenant_id, remaining_path))` if a tenant prefix was found,
 /// or `None` if the path doesn't start with a tenant prefix.
 ///
-/// Uses the provided FHIR version for resource type detection.
+/// The version argument remains part of the public helper contract. Resource
+/// path reservation itself spans every version compiled into the server.
 pub fn extract_tenant_from_path(
     path: &str,
     fhir_version: &FhirVersion,
@@ -151,7 +138,7 @@ pub async fn strip_tenant_prefix_middleware(mut request: Request, next: Next) ->
     let original_uri = request.uri().clone();
     let path = original_uri.path();
 
-    // Use the default FHIR version for resource type checking
+    // Keep the existing helper contract; reservation spans all compiled versions.
     let fhir_version = FhirVersion::default_enabled();
 
     // Try to extract tenant from path
@@ -248,6 +235,13 @@ mod tests {
         // `console` cannot shadow / be confused with a tenant literally named
         // "console" under URL-path routing.
         assert!(extract_tenant_from_path("/console/metrics/uptime", &version).is_none());
+    }
+
+    #[cfg(all(feature = "R4", any(feature = "R5", feature = "R6")))]
+    #[test]
+    fn resource_from_later_compiled_version_is_not_a_tenant_under_r4() {
+        assert!(extract_tenant_from_path("/ActorDefinition", &FhirVersion::R4).is_none());
+        assert!(extract_tenant_from_path("/actordefinition", &FhirVersion::R4).is_none());
     }
 
     /// Regression for a break this change would otherwise have introduced.
