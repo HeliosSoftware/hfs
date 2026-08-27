@@ -1471,6 +1471,10 @@
       });
   }
 
+  function csvHas(csv, value) {
+    return !!value && (csv || "").split(",").indexOf(value) >= 0;
+  }
+
   /* Keeps every type-dependent Resources control on the type parsed from the
    * query URL. Search and Saved Queries share this script and the rail, but do
    * not render the Resources panel or Create button, so those updates are
@@ -1479,11 +1483,35 @@
     markRailType(type);
     var panel = document.getElementById("resources");
     if (!panel) return;
-    panel.dataset.selectedType = type;
+    panel.dataset.selectedType = type || "";
     var createBtn = document.getElementById("resource-create");
-    if (createBtn && createBtn.dataset.msgCreate) {
+    if (createBtn) {
       var label = createBtn.querySelector(".resources-create__label");
-      if (label) label.textContent = createBtn.dataset.msgCreate.replace("{type}", type);
+      if (label) {
+        label.textContent = type
+          ? createBtn.dataset.msgCreate.replace("{type}", type)
+          : createBtn.dataset.msgCreateGeneric;
+      }
+
+      var reason = "";
+      if (panel.dataset.createMetadata !== "available") {
+        reason = panel.dataset.msgCreateMetadataUnavailable;
+      } else if (!csvHas(panel.dataset.createResourceTypes, type)) {
+        reason = panel.dataset.msgCreateInvalid;
+      } else if (!csvHas(panel.dataset.createAdvertisedTypes, type)) {
+        reason = panel.dataset.msgCreateNotAdvertised;
+      } else if (!csvHas(panel.dataset.createSchemaTypes, type)) {
+        reason = panel.dataset.msgCreateSchemaUnavailable;
+      }
+
+      createBtn.disabled = !!reason;
+      panel.dataset.createEligible = reason ? "false" : "true";
+      panel.dataset.createTarget = reason ? "" : type;
+      var reasonEl = document.getElementById("resource-create-reason");
+      if (reasonEl) {
+        reasonEl.textContent = reason;
+        reasonEl.hidden = !reason;
+      }
     }
   }
 
@@ -1530,7 +1558,7 @@
     if (!parsed) {
       builderRevision += 1;
       sections.hidden = true;
-      markRailType(null);
+      syncTypeContext("");
       sections
         .querySelectorAll(".builder-row[data-compat-state='pending']")
         .forEach(function (row) {
@@ -1879,6 +1907,23 @@
       window.history.pushState({}, "", item.getAttribute("href"));
     });
   }
+
+  function locationSearchValue() {
+    var params = new URLSearchParams(window.location.search);
+    if (params.has("url")) return params.get("url") || "";
+    var type = params.get("type");
+    return "/" + (type || "Patient");
+  }
+
+  function restoreLocationContext() {
+    if (!urlInput || !document.getElementById("resources")) return;
+    urlInput.value = "GET " + locationSearchValue().replace(/^GET\s+/i, "");
+    renderBuilder();
+    var parsed = parseSearchUrl(urlInput.value);
+    if (parsed) runSearch(searchPath(parsed.type, parsed.query), false);
+  }
+
+  window.addEventListener("popstate", restoreLocationContext);
   if (railFilter && railList) {
     railFilter.addEventListener("input", function () {
       var needle = railFilter.value.trim().toLowerCase();
@@ -2758,8 +2803,9 @@
 
   /* Deep link: /ui/queries?url=/Patient?name=smith loads the builder and
    * runs immediately — also what saved/recent entries could link to. */
-  var deepLink = new URLSearchParams(window.location.search).get("url");
-  if (deepLink && urlInput) {
+  var locationParams = new URLSearchParams(window.location.search);
+  var deepLink = locationParams.get("url");
+  if (locationParams.has("url") && urlInput) {
     var deepRevision = loadIntoBuilder(deepLink.replace(/^GET\s+/i, ""));
     consumeWhenBuilderReady(deepRevision, function () {
       runCurrentBuilderSearch(true);
@@ -2771,7 +2817,10 @@
     // since that only fires on an actual rail click (resource-filter.js).
     var initialPanel = document.getElementById("resources");
     if (initialPanel && urlInput) {
-      selectType(initialPanel.dataset.selectedType || "Patient");
+      renderBuilder();
+      var parsedInitial = parseSearchUrl(urlInput.value);
+      if (parsedInitial)
+        runSearch(searchPath(parsedInitial.type, parsedInitial.query), false);
     } else {
       renderBuilder();
     }

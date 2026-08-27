@@ -511,7 +511,12 @@ editor-versions-none = Keine früheren Versionen.
 
 resources-heading = Ressourcen
 resources-lede = FHIR-Ressourcen durchsuchen, suchen, erstellen und bearbeiten. In natürlicher Sprache suchen oder die Abfrage selbst bauen, dann ein Ergebnis zum Bearbeiten öffnen.
+resources-create = Ressource erstellen
 resources-create-typed = { $type } erstellen
+resources-create-invalid-type = Dieser Ressourcentyp ist in der ausgewählten FHIR-Version nicht verfügbar. Korrigieren Sie die Abfrage oder wählen Sie einen Typ aus der Liste.
+resources-create-not-advertised = Dieser Server erlaubt das Erstellen dieses Ressourcentyps nicht. Sie können ihn weiterhin durchsuchen.
+resources-create-schema-unavailable = Für diesen Ressourcentyp gibt es in der ausgewählten FHIR-Version kein Editorschema. Die UI kann ihn deshalb nicht sicher erstellen.
+resources-create-metadata-unavailable = Die Serverfähigkeiten sind nicht verfügbar. Das Erstellen bleibt deaktiviert, bis die UI sie prüfen kann.
 resources-save-blocked = Beheben Sie die Validierungsprobleme vor dem Speichern.
 resources-save-invalid = Das JSON ist ungültig — beheben Sie es vor dem Speichern.
 resources-edit-title = Ressource bearbeiten
@@ -549,6 +554,9 @@ batch-sum-updated = aktualisiert
 batch-sum-other = gelesen/sonstige
 batch-sum-failed = fehlgeschlagen
 batch-request-failed = Die Anfrage ist fehlgeschlagen
+batch-reading = Bundle wird gelesen…
+batch-executing = Wird ausgeführt…
+batch-read-failed = Die Datei konnte nicht gelesen werden
 
 ## Bulk Import workspace (#527)
 
@@ -556,7 +564,6 @@ bulk-import-title = Massenimport
 bulk-import-new = Neue Submission
 bulk-import-create-title = Bulk Submission anlegen
 bulk-import-field-name = Name der Submission
-bulk-import-field-recipient = Basis-URL des Empfängers
 bulk-import-auth = Authentifizierung
 bulk-import-auth-hint = Wie gegenüber dem Empfängerserver authentifiziert wird.
 bulk-import-auth-none = Keine

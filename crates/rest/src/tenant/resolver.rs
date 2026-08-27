@@ -4,11 +4,12 @@
 //! requests using multiple configurable sources.
 
 use axum::http::request::Parts;
-use helios_fhir::{FhirResourceTypeProvider, FhirVersion};
+use helios_fhir::FhirVersion;
 use helios_persistence::tenant::{TenantId, TenantIdError};
 use tracing::{debug, warn};
 
 use crate::config::{MultitenancyConfig, TenantRoutingMode};
+use crate::fhir_types::is_reserved_resource_path;
 use crate::middleware::tenant::X_TENANT_ID;
 use crate::middleware::tenant_prefix::{ExtractedTenantFromUrl, OriginalPath};
 
@@ -393,8 +394,8 @@ impl Default for TenantResolver {
 ///
 /// A segment is reserved if it's either:
 /// 1. A FHIR system endpoint or API prefix (from RESERVED_SYSTEM_PATHS)
-/// 2. A valid FHIR resource type for the given version
-fn is_reserved_path(segment: &str, fhir_version: &FhirVersion) -> bool {
+/// 2. A FHIR resource type in any version compiled into the server
+fn is_reserved_path(segment: &str, _fhir_version: &FhirVersion) -> bool {
     let lower = segment.to_lowercase();
 
     // Check system paths first (fast path)
@@ -402,25 +403,7 @@ fn is_reserved_path(segment: &str, fhir_version: &FhirVersion) -> bool {
         return true;
     }
 
-    // Check if it's a valid FHIR resource type for the configured version
-    is_fhir_resource_type(segment, fhir_version)
-}
-
-/// Checks if a string is a valid FHIR resource type for the given version.
-/// Uses the FhirResourceTypeProvider trait for case-insensitive matching.
-fn is_fhir_resource_type(type_name: &str, fhir_version: &FhirVersion) -> bool {
-    match fhir_version {
-        #[cfg(feature = "R4")]
-        FhirVersion::R4 => helios_fhir::r4::Resource::is_resource_type(type_name),
-        #[cfg(feature = "R4B")]
-        FhirVersion::R4B => helios_fhir::r4b::Resource::is_resource_type(type_name),
-        #[cfg(feature = "R5")]
-        FhirVersion::R5 => helios_fhir::r5::Resource::is_resource_type(type_name),
-        #[cfg(feature = "R6")]
-        FhirVersion::R6 => helios_fhir::r6::Resource::is_resource_type(type_name),
-        #[allow(unreachable_patterns)]
-        _ => false,
-    }
+    is_reserved_resource_path(segment)
 }
 
 // The local `is_valid_tenant_id` that used to live here is gone: it was one of
@@ -442,6 +425,13 @@ mod tests {
 
         let request = builder.body(()).unwrap();
         request.into_parts().0
+    }
+
+    #[cfg(all(feature = "R4", any(feature = "R5", feature = "R6")))]
+    #[test]
+    fn later_version_resource_paths_are_reserved_under_r4() {
+        assert!(is_reserved_path("ActorDefinition", &FhirVersion::R4));
+        assert!(is_reserved_path("actordefinition", &FhirVersion::R4));
     }
 
     /// `Ok(Some(id))` unwrapped, for the many assertions that only care about

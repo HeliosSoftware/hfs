@@ -654,6 +654,20 @@ button.menu__option {
 
 /* ---------- Cards ---------- */
 
+/* Padded body for card content that is not a table or a card-head — form
+   panes, field lists. `.card` itself stays padding-free (tables run edge to
+   edge), which left bare content flush against the border (#649). */
+.card__body {
+  padding: 14px;
+}
+
+/* An empty-state pane: breathing room between the lede and its call to
+   action (the lede's own margin is 0 for the page head, where the section
+   gap already separates it). */
+.card__body > .page-head__lede {
+  margin-bottom: 14px;
+}
+
 .card {
   background: var(--surface);
   border: 1px solid var(--surface-border);
@@ -1219,6 +1233,18 @@ textarea.field__input {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* The native dropdown arrow hugs the border regardless of padding, so draw
+   our own chevron with the same inset the text gets. The muted gray reads on
+   both themes. */
+select.field__input {
+  appearance: none;
+  padding-right: 36px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23888888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px;
+}
+
 .field__hint {
   display: block;
   font-size: 12px;
@@ -1233,7 +1259,15 @@ textarea.field__input {
   justify-content: flex-end;
 }
 
-.spinner {
+/* Dialog feet pair a plain button with the primary; both sit on the primary's
+   metrics so the row lines up. */
+.addbox__actions .btn {
+  height: 36px;
+  padding: 0 18px;
+}
+
+.spinner,
+.btn[aria-busy="true"]::after {
   width: 14px;
   height: 14px;
   border-radius: 50%;
@@ -1245,15 +1279,43 @@ textarea.field__input {
   to { transform: rotate(360deg); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .spinner { animation: none; }
+  .spinner,
+  .btn[aria-busy="true"]::after { animation: none; }
 }
 
-/* In-table provisioning state for tenants being created in the background
-   (#581): the row polls in via the rows fragment until the job finishes. */
-.provisioning {
+/* The busy button (#679), driven by busy.js: the label yields its space to
+   the ring — width stays put, the accessible name stays in the tree. Under
+   reduced motion the ring remains as a static glyph (the animation stops
+   above); a merely-dimmed label would read as disabled, not working. */
+.btn[aria-busy="true"] {
+  position: relative;
+  color: transparent;
+  cursor: progress;
+}
+
+.btn[aria-busy="true"]::after {
+  content: "";
+  position: absolute;
+  top: calc(50% - 7px);
+  left: calc(50% - 7px);
+}
+
+/* The ring must not inherit accent-on-accent on the filled button — the
+   track all but vanishes in dark theme. Explicit white, not currentColor:
+   the button's color is transparent while busy. */
+.btn--primary[aria-busy="true"]::after {
+  border-color: rgb(255 255 255 / 45%);
+  border-top-color: #ffffff;
+}
+
+/* Inline working state (#679): spinner plus a short label, role="status" in
+   the markup so it announces. Also the tenants in-table provisioning row
+   (#581), which polls in via the rows fragment until the job finishes. */
+.busy-status {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  margin: 0;
   font-size: 13px;
   color: var(--muted);
 }
@@ -1266,6 +1328,12 @@ textarea.field__input {
   position: fixed;
   inset: 0;
   z-index: 40;
+  /* The summary doubles as the button (.btn/.btn--primary), whose fixed
+     height would beat the inset stretch and shrink the backdrop to a bar
+     across the top of the viewport. */
+  height: auto;
+  padding: 0;
+  border: 0;
   background: rgb(10 14 20 / 45%);
   border-radius: 0;
   cursor: default;
@@ -1671,6 +1739,7 @@ textarea.field__input {
 .btn {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
   height: 30px;
   padding: 0 12px;
   font: inherit;
@@ -1712,6 +1781,20 @@ textarea.field__input {
 
 .btn--primary:hover {
   background: var(--accent-strong);
+  filter: brightness(1.08);
+}
+
+/* Accent-filled at the standard .btn metrics: for buttons that sit in a row
+   with plain siblings, where the taller primary would break the line-up. */
+.btn--accent {
+  color: #ffffff;
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+.btn--accent:hover {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
   filter: brightness(1.08);
 }
 
@@ -2203,6 +2286,68 @@ textarea.field__input {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+
+/* The right-hand meta of a rail item — the resource type on the SQL rails
+   (#649, Figma 420-2): quiet right-aligned text, not a count pill. */
+.filter-rail__meta {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+/* The JSON / SQL editor pane (#649): the design's inner inset box — mono at
+   an explicit size, generous height, vertical resize only. */
+.json-editor {
+  display: block;
+  width: 100%;
+  min-height: 320px;
+  padding: 14px;
+  box-sizing: border-box;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--input-bg, var(--surface));
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+/* Right-aligned actions row at the foot of a form pane. */
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.json-editor--short {
+  min-height: 120px;
+}
+
+.json-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* The collapsible JSON fold's summary rides .card-head; the chevron flips
+   when the fold opens, like the app's other disclosures. */
+details.json-fold > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+details.json-fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.json-fold[open] > summary .icon {
+  transform: rotate(180deg);
 }
 
 .filter-rail__item:hover {
@@ -3996,6 +4141,16 @@ textarea.field__input {
   gap: 16px;
 }
 
+/* In a row head the actions sit beside the title, not under a lede: flex
+   line-up at the title's level, no conformance-page top offset. */
+.page-head--row .page-head__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 0;
+}
+
 .filter-rail__item--on {
   background: var(--accent-soft);
   color: var(--text-strong);
@@ -4152,10 +4307,16 @@ textarea.field__input {
    The label names the selected type ("Create new Patient") and can grow long
    (#605) — the button caps its width and truncates the label rather than
    pushing the header row wider than the page. */
-.resources-create {
+.resources-create-wrap {
   flex: 0 1 auto;
   min-width: 0;
   max-width: 320px;
+}
+
+.resources-create {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .resources-create__label {
@@ -4647,6 +4808,21 @@ textarea.field__input {
   margin-top: 14px;
 }
 
+/* #679: one busy region serves both the parse and execute phases; sticky
+   keeps it in view when a large plan pushes the bottom footer past the
+   viewport (#675's scroll problem, again). */
+.batch-busy {
+  position: sticky;
+  bottom: 12px;
+  width: fit-content;
+  margin-top: 12px;
+  padding: 6px 12px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 9px;
+  box-shadow: var(--surface-shadow);
+}
+
 .batch-footer--top {
   margin: 0 0 12px;
 }
@@ -4894,6 +5070,9 @@ body.app-shell .pane {
 .content--app .queries-main {
   min-height: 0;
   overflow-y: auto;
+  /* The column scrolls itself: without this the scrollbar rides flush
+     against the title-row buttons and card edges. */
+  padding-right: 10px;
 }
 
 .content--app .detail {

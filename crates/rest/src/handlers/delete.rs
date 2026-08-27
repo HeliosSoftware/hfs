@@ -245,6 +245,13 @@ pub async fn conditional_delete_handler<S>(
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "DELETE".to_string(),
+            resource_type,
+        });
+    }
+
     // Build search params string
     let search_params: String = query
         .iter()

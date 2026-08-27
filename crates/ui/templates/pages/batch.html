@@ -26,7 +26,10 @@
      data-msg-updated="{{ i18n.t("batch-sum-updated") }}"
      data-msg-other="{{ i18n.t("batch-sum-other") }}"
      data-msg-failed="{{ i18n.t("batch-sum-failed") }}"
-     data-msg-request-failed="{{ i18n.t("batch-request-failed") }}">
+     data-msg-request-failed="{{ i18n.t("batch-request-failed") }}"
+     data-msg-reading="{{ i18n.t("batch-reading") }}"
+     data-msg-executing="{{ i18n.t("batch-executing") }}"
+     data-msg-read-failed="{{ i18n.t("batch-read-failed") }}">
 
   <!-- ============ Stage 1: upload ============ -->
   <section class="card" id="batch-upload">
@@ -42,7 +45,11 @@
   </section>
 
   <!-- ============ Stage 2: preflight ============ -->
-  <section id="batch-preflight" hidden>
+  <!-- tabindex=-1: the stage receives focus when it appears — the picked
+       file's drop zone is hidden with its stage, which would strand focus
+       on <body> (#679). Not the Execute button: focusing the destructive
+       primary would arm it for a stray Enter. -->
+  <section id="batch-preflight" tabindex="-1" hidden>
     <!-- Cancel/Execute at the top as well as the bottom (#675): a large
          bundle must not push the only actions below the fold. Both copies
          drive the same handlers. -->
@@ -99,6 +106,11 @@
       <button type="button" class="btn btn--primary" id="batch-done">{{ i18n.t("batch-done") }}</button>
     </div>
   </section>
+
+  <!-- #679: the shared busy region, shipped in the shell so the live region
+       exists before it is ever labelled. One instance serves the parse and
+       execute phases; busy.js reveals it and writes [data-busy-label]. -->
+  <p class="busy-status batch-busy" id="batch-busy" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
 
   <!-- Cloned by batch.js into each row's disclosure control (#674). -->
   <template id="batch-chevron"><span class="icon">{% include "icons/chevron-down.svg" %}</span></template>

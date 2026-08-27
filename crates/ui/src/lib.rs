@@ -632,6 +632,13 @@ struct ResourcesPage {
     docs_url: &'static str,
     resource_types: Vec<String>,
     selected_type: String,
+    create_label: String,
+    create_disabled: bool,
+    create_reason: String,
+    create_resource_types: String,
+    create_advertised_types: String,
+    create_schema_types: String,
+    create_metadata_available: bool,
     /// The search-builder partial's save controls are the Saved Queries page's
     /// job, not this one's.
     show_save: bool,
@@ -1461,8 +1468,41 @@ async fn resources(
     Query(query): Query<ResourcesQuery>,
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
-    // The type the rail opens focused on (from the nav submenu deep link).
-    let selected_type = query.resource_type.unwrap_or_else(|| "Patient".to_string());
+    // `url` is the builder's actual query, so it wins over the convenience
+    // `type` bookmark. Parse it here too: Create must be safe before the
+    // deferred client script hydrates the page.
+    let (selected_type, builder_url) = resources_query_context(&query);
+    let targets = match state.conformance.metadata(rv.0, &rt.id).await {
+        Ok(statement) => {
+            match capability::CreateTargets::from_statement(&resource_types, &statement, rv.0) {
+                Ok(targets) => Some(targets),
+                Err(error) => {
+                    tracing::warn!("Resources create-target metadata rejected: {error}");
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!("Resources create-target metadata fetch failed: {error}");
+            None
+        }
+    };
+    let block = targets
+        .as_ref()
+        .map_or(
+            Err(capability::CreateTargetBlock::MetadataUnavailable),
+            |targets| targets.classify(&selected_type),
+        )
+        .err();
+    let i18n = I18n::new(locale);
+    let create_reason = block
+        .map(|block| create_target_reason(&i18n, block))
+        .unwrap_or_default();
+    let create_label = if selected_type.is_empty() {
+        i18n.t("resources-create")
+    } else {
+        i18n.t_arg("resources-create-typed", "type", selected_type.clone())
+    };
     let live =
         helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
             .await;
@@ -1472,15 +1512,30 @@ async fn resources(
         live.as_ref().map(|s| s.available.as_slice()),
         Some(selected_type.as_str()),
     );
-    let builder_url = Some(format!("/{selected_type}"));
     render(ResourcesPage {
         status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: "resources",
         nl: (*state.nl).clone(),
         docs_url: NL_SEARCH_DOCS,
         resource_types,
         selected_type,
+        create_label,
+        create_disabled: block.is_some(),
+        create_reason,
+        create_resource_types: targets
+            .as_ref()
+            .map(capability::CreateTargets::resource_types_csv)
+            .unwrap_or_default(),
+        create_advertised_types: targets
+            .as_ref()
+            .map(capability::CreateTargets::advertised_create_csv)
+            .unwrap_or_default(),
+        create_schema_types: targets
+            .as_ref()
+            .map(capability::CreateTargets::schema_resources_csv)
+            .unwrap_or_default(),
+        create_metadata_available: targets.is_some(),
         show_save: false,
         rail_entries,
         builder_url,
@@ -1508,6 +1563,61 @@ async fn terminology_page(
 struct ResourcesQuery {
     #[serde(rename = "type")]
     resource_type: Option<String>,
+    url: Option<String>,
+}
+
+fn resources_query_context(query: &ResourcesQuery) -> (String, Option<String>) {
+    if let Some(raw_url) = &query.url {
+        let visible = raw_url
+            .trim()
+            .strip_prefix("GET ")
+            .or_else(|| raw_url.trim().strip_prefix("get "))
+            .unwrap_or(raw_url.trim())
+            .to_string();
+        return (
+            resource_type_from_search_url(&visible).unwrap_or_default(),
+            Some(visible),
+        );
+    }
+
+    let selected = query
+        .resource_type
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Patient")
+        .to_string();
+    (selected.clone(), Some(format!("/{selected}")))
+}
+
+fn resource_type_from_search_url(raw: &str) -> Option<String> {
+    let mut value = raw.trim();
+    if let Some(after_scheme) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+    {
+        value = after_scheme.find('/').map(|index| &after_scheme[index..])?;
+    }
+    let path = value.split_once('?').map_or(value, |(path, _)| path);
+    let resource_type = path.strip_prefix('/').unwrap_or(path);
+    if resource_type.is_empty()
+        || resource_type.contains('/')
+        || !resource_type.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some(resource_type.to_string())
+}
+
+fn create_target_reason(i18n: &I18n, block: capability::CreateTargetBlock) -> String {
+    let key = match block {
+        capability::CreateTargetBlock::InvalidType => "resources-create-invalid-type",
+        capability::CreateTargetBlock::CreateNotAdvertised => "resources-create-not-advertised",
+        capability::CreateTargetBlock::SchemaUnavailable => "resources-create-schema-unavailable",
+        capability::CreateTargetBlock::MetadataUnavailable => {
+            "resources-create-metadata-unavailable"
+        }
+    };
+    i18n.t(key)
 }
 
 #[derive(Deserialize, Default)]

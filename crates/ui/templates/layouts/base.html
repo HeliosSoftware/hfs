@@ -12,6 +12,9 @@
   <script src="/ui/assets/theme.js"></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
+  <!-- The shared busy states (#679); ahead of every page script by defer's
+       document order, because page scripts call into window.hfsBusy. -->
+  <script src="/ui/assets/busy.js" defer></script>
   <script src="/ui/assets/addbox.js" defer></script>
   <script src="/ui/assets/dashboard.js" defer></script>
   <script src="/ui/assets/editor-sync.js" defer></script>
