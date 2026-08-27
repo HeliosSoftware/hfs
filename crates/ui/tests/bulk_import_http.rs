@@ -127,9 +127,32 @@ async fn the_list_page_renders_and_offers_creation() {
 #[tokio::test]
 async fn recipient_includes_public_prefix_and_selected_path_tenant() {
     let ctx = ctx("https://public.example/fhir/");
+
+    // The recipient is fixed server-side at create time, so a spoofed Host must
+    // not reach it: the stored value is the configured public base plus the
+    // path tenant. The detail page is where it surfaces (#721 dropped the row
+    // from the create dialog).
+    let created = app_with_path_tenant(&ctx, "acme")
+        .oneshot(
+            Request::post("/ui/bulk-import")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("host", "spoofed.example")
+                .body(Body::from("name=BrettTest&auth=none"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    let detail_path = created
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .expect("redirect to the detail page")
+        .to_string();
+
     let response = app_with_path_tenant(&ctx, "acme")
         .oneshot(
-            Request::get("/ui/bulk-import")
+            Request::get(&detail_path)
                 .header("host", "spoofed.example")
                 .body(Body::empty())
                 .unwrap(),
@@ -138,7 +161,7 @@ async fn recipient_includes_public_prefix_and_selected_path_tenant() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    assert!(html.contains("https://public.example/fhir/acme"));
+    assert!(html.contains("https://public.example/fhir/acme"), "{html}");
     assert!(!html.contains("spoofed.example"));
 }
 
