@@ -242,3 +242,120 @@ async fn two_workers_run_whole_manifests_to_completion() {
     let total = backend.count(&tenant(), Some("Patient")).await.unwrap();
     assert_eq!(total as usize, 2 * FILES * LINES);
 }
+
+/// #448's Synthea pass surfaced this: one output file whose ingestion takes
+/// longer than the lease. The worker heartbeated only *between* files, so the
+/// lease lapsed mid-stream, a rival claim succeeded, and the manifest
+/// restarted from its first file — an unbounded silent loop, invisible in the
+/// counts because the re-ingested entries upsert idempotently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_slower_than_the_lease_stays_leased_to_completion() {
+    use helios_persistence::backends::local_fs::LocalFsOutputStore;
+    use helios_persistence::core::{
+        BulkSubmitJobStore, DefaultSubmitWorker, ExportOutputStore, RemoteFile, RemoteManifest,
+        SubmitInputFetcher, WorkerId,
+    };
+    use helios_persistence::error::StorageResult;
+
+    const LINES: usize = 40;
+
+    struct SlowFetcher {
+        manifest: RemoteManifest,
+        lines: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl SubmitInputFetcher for SlowFetcher {
+        async fn fetch_manifest(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> StorageResult<RemoteManifest> {
+            Ok(self.manifest.clone())
+        }
+
+        async fn open_file_stream(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _requires_access_token: bool,
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+            // Trickle the file over ~6 seconds — three times the lease.
+            let (reader, mut writer) = tokio::io::duplex(1024);
+            let lines = self.lines.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                for line in lines.split_inclusive(|b| *b == b'\n') {
+                    if writer.write_all(line).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            });
+            Ok(Box::new(tokio::io::BufReader::new(reader)))
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = SqliteBackend::with_config(
+        tmp.path().join("submit-slow.db").to_str().unwrap(),
+        SqliteBackendConfig::default(),
+    )
+    .unwrap();
+    backend.init_schema().unwrap();
+    let backend = Arc::new(backend);
+    let _ = seed(&backend, "slow").await;
+
+    let url = "https://provider.example/slow/file-0.ndjson".to_string();
+    let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(SlowFetcher {
+        manifest: RemoteManifest {
+            output: vec![RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url,
+                count: None,
+            }],
+            ..Default::default()
+        },
+        lines: ndjson("slow-0", LINES),
+    });
+    let jobs: Arc<dyn BulkSubmitJobStore> = backend.clone();
+    let output: Arc<dyn ExportOutputStore> = Arc::new(LocalFsOutputStore::new(
+        tmp.path().join("out"),
+        "http://localhost:8080",
+    ));
+
+    let lease = Duration::from_secs(2);
+    let worker_id = WorkerId::new("slow-worker");
+    let claimed = jobs
+        .claim_next_manifest(&worker_id, lease)
+        .await
+        .unwrap()
+        .expect("a pending manifest to claim");
+    let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id);
+    let run = tokio::spawn(async move { worker.run_job(claimed).await.unwrap() });
+
+    // Well past the original expiry, mid-file: the manifest must not be
+    // reclaimable, or the ingestion restarts from the first file.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let rival = WorkerId::new("rival-worker");
+    assert!(
+        jobs.claim_next_manifest(&rival, lease)
+            .await
+            .unwrap()
+            .is_none(),
+        "the lease lapsed mid-file and a rival reclaimed the manifest"
+    );
+
+    tokio::time::timeout(Duration::from_secs(120), run)
+        .await
+        .expect("slow-file ingestion did not finish")
+        .unwrap();
+
+    use helios_persistence::core::ResourceStorage;
+    let total = backend.count(&tenant(), Some("Patient")).await.unwrap();
+    assert_eq!(total as usize, LINES);
+}

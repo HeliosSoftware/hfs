@@ -1255,6 +1255,7 @@ impl SubmitClaimStrategy for MongoBackend {
                 manifest_id: manifest_id.to_string(),
                 worker_id: worker_id.clone(),
                 lease_expiry,
+                lease_duration,
                 fencing_token: claimed.get_i64("fencing_token").unwrap_or(token + 1).max(0) as u64,
             }));
         }
@@ -1263,7 +1264,9 @@ impl SubmitClaimStrategy for MongoBackend {
     }
 
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
-        let new_expiry = now_at_bson_precision() + chrono::Duration::seconds(60);
+        let new_expiry = now_at_bson_precision()
+            + chrono::Duration::from_std(lease.lease_duration)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
         self.fenced_update(
             lease,
             doc! { "$set": { "lease_expiry": to_bson_time(new_expiry) } },
