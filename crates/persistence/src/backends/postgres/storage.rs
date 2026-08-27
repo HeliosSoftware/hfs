@@ -2811,6 +2811,15 @@ impl BundleProvider for PostgresBackend {
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
 
+        // `create` no longer sends its insert on the spot — the transaction
+        // batches consecutive creates and flushes them together, which is what
+        // takes a 1,632-entry import bundle from 3,264 statements to 26. A
+        // conflict is therefore discovered at flush time, after later entries
+        // have already been processed, so the entry index has to be recovered
+        // rather than read off the loop counter. This maps the transaction's
+        // n-th `create` call back to the entry that made it.
+        let mut create_entry_index: Vec<usize> = Vec::with_capacity(entries.len());
+
         // Build a map of fullUrl -> assigned reference for reference resolution
         let mut reference_map: HashMap<String, String> = HashMap::new();
 
@@ -2824,7 +2833,11 @@ impl BundleProvider for PostgresBackend {
                 resolve_bundle_references(resource, &reference_map);
             }
 
+            let creates_before = tx.creates_seen();
             let result = self.process_bundle_entry_tx(&mut tx, entry).await;
+            for _ in creates_before..tx.creates_seen() {
+                create_entry_index.push(idx);
+            }
 
             match result {
                 Ok(entry_result) => {
@@ -2853,9 +2866,19 @@ impl BundleProvider for PostgresBackend {
                     results.push(entry_result);
                 }
                 Err(e) => {
-                    error_info = Some((idx, format!("Entry processing failed: {}", e)));
+                    error_info = Some(attribute_entry_error(&tx, &create_entry_index, idx, &e));
                     break;
                 }
+            }
+        }
+
+        // Send whatever is still buffered before committing, so a conflict in
+        // the last batch is reported as the bundle error it is — with the
+        // offending entry's index — rather than as a bare commit failure.
+        if error_info.is_none() {
+            if let Err(e) = tx.flush().await {
+                let last = entries.len().saturating_sub(1);
+                error_info = Some(attribute_entry_error(&tx, &create_entry_index, last, &e));
             }
         }
 
@@ -2877,6 +2900,32 @@ impl BundleProvider for PostgresBackend {
             bundle_type: BundleType::Transaction,
             entries: results,
         })
+    }
+}
+
+/// Names the bundle entry responsible for a transaction error.
+///
+/// A conflict found while flushing buffered creates belongs to the entry whose
+/// `create` produced the row, not to whichever entry happened to be in flight
+/// when the flush ran. Everything else belongs to the entry that raised it.
+fn attribute_entry_error(
+    tx: &super::transaction::PostgresTransaction,
+    create_entry_index: &[usize],
+    fallback: usize,
+    error: &StorageError,
+) -> (usize, String) {
+    match tx.deferred_conflict() {
+        Some(conflict) => (
+            create_entry_index
+                .get(conflict.ordinal)
+                .copied()
+                .unwrap_or(fallback),
+            format!(
+                "Entry processing failed: {}/{} already exists",
+                conflict.resource_type, conflict.id
+            ),
+        ),
+        None => (fallback, format!("Entry processing failed: {}", error)),
     }
 }
 

@@ -62,3 +62,13 @@ pub(crate) async fn query_opt_cached(
     let statement = client.prepare_cached(sql).await?;
     client.query_opt(&statement, params).await
 }
+
+/// `Client::query` against the connection's cached prepared statement.
+pub(crate) async fn query_cached(
+    client: &Client,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<Vec<Row>, Error> {
+    let statement = client.prepare_cached(sql).await?;
+    client.query(&statement, params).await
+}

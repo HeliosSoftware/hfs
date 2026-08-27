@@ -109,7 +109,7 @@ macro_rules! column {
 /// `rows.iter().map(..).collect()` always yields `rows.len()` elements, so every
 /// array is the same length by construction and the multi-argument `unnest`
 /// below never has to NULL-pad.
-fn insert_plan(rows: &[IndexRow]) -> InsertPlan {
+fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
     let mut plan = InsertPlan {
         columns: Vec::with_capacity(28),
         casts: Vec::with_capacity(28),
@@ -117,54 +117,62 @@ fn insert_plan(rows: &[IndexRow]) -> InsertPlan {
     };
     let p = &mut plan;
 
-    column!(p, rows, "last_updated", "timestamptz[]", |r: &IndexRow| r
+    column!(p, rows, "last_updated", "timestamptz[]", |r: &&IndexRow| r
         .last_updated);
-    column!(p, rows, "param_name", "text[]", |r: &IndexRow| r
+    column!(p, rows, "param_name", "text[]", |r: &&IndexRow| r
         .param_name
         .clone());
-    column!(p, rows, "param_url", "text[]", |r: &IndexRow| r
+    column!(p, rows, "param_url", "text[]", |r: &&IndexRow| r
         .param_url
         .clone());
-    column!(p, rows, "composite_group", "int4[]", |r: &IndexRow| r
+    column!(p, rows, "composite_group", "int4[]", |r: &&IndexRow| r
         .composite_group);
-    column!(p, rows, "value_string", "text[]", |r: &IndexRow| r
+    column!(p, rows, "value_string", "text[]", |r: &&IndexRow| r
         .value_string
         .clone());
-    column!(p, rows, "value_string_folded", "text[]", |r: &IndexRow| r
+    column!(p, rows, "value_string_folded", "text[]", |r: &&IndexRow| r
         .value_string_folded
         .clone());
-    column!(p, rows, "value_token_system", "text[]", |r: &IndexRow| r
+    column!(p, rows, "value_token_system", "text[]", |r: &&IndexRow| r
         .value_token_system
         .clone());
-    column!(p, rows, "value_token_code", "text[]", |r: &IndexRow| r
+    column!(p, rows, "value_token_code", "text[]", |r: &&IndexRow| r
         .value_token_code
         .clone());
-    column!(p, rows, "value_token_display", "text[]", |r: &IndexRow| r
+    column!(p, rows, "value_token_display", "text[]", |r: &&IndexRow| r
         .value_token_display
         .clone());
-    column!(p, rows, "value_token_system_2", "text[]", |r: &IndexRow| r
-        .value_token_system_2
-        .clone());
-    column!(p, rows, "value_token_code_2", "text[]", |r: &IndexRow| r
+    column!(
+        p,
+        rows,
+        "value_token_system_2",
+        "text[]",
+        |r: &&IndexRow| r.value_token_system_2.clone()
+    );
+    column!(p, rows, "value_token_code_2", "text[]", |r: &&IndexRow| r
         .value_token_code_2
         .clone());
-    column!(p, rows, "value_date", "timestamptz[]", |r: &IndexRow| r
+    column!(p, rows, "value_date", "timestamptz[]", |r: &&IndexRow| r
         .value_date);
-    column!(p, rows, "value_date_precision", "text[]", |r: &IndexRow| r
-        .value_date_precision
-        .clone());
-    column!(p, rows, "value_number", "float8[]", |r: &IndexRow| r
+    column!(
+        p,
+        rows,
+        "value_date_precision",
+        "text[]",
+        |r: &&IndexRow| r.value_date_precision.clone()
+    );
+    column!(p, rows, "value_number", "float8[]", |r: &&IndexRow| r
         .value_number);
-    column!(p, rows, "value_number_2", "float8[]", |r: &IndexRow| r
+    column!(p, rows, "value_number_2", "float8[]", |r: &&IndexRow| r
         .value_number_2);
     column!(
         p,
         rows,
         "value_quantity_value",
         "float8[]",
-        |r: &IndexRow| r.value_quantity_value
+        |r: &&IndexRow| r.value_quantity_value
     );
-    column!(p, rows, "value_quantity_unit", "text[]", |r: &IndexRow| r
+    column!(p, rows, "value_quantity_unit", "text[]", |r: &&IndexRow| r
         .value_quantity_unit
         .clone());
     column!(
@@ -172,23 +180,23 @@ fn insert_plan(rows: &[IndexRow]) -> InsertPlan {
         rows,
         "value_quantity_system",
         "text[]",
-        |r: &IndexRow| r.value_quantity_system.clone()
+        |r: &&IndexRow| r.value_quantity_system.clone()
     );
     column!(
         p,
         rows,
         "value_quantity_canonical_value",
         "float8[]",
-        |r: &IndexRow| r.value_quantity_canonical_value
+        |r: &&IndexRow| r.value_quantity_canonical_value
     );
     column!(
         p,
         rows,
         "value_quantity_canonical_unit",
         "text[]",
-        |r: &IndexRow| r.value_quantity_canonical_unit.clone()
+        |r: &&IndexRow| r.value_quantity_canonical_unit.clone()
     );
-    column!(p, rows, "value_reference", "text[]", |r: &IndexRow| r
+    column!(p, rows, "value_reference", "text[]", |r: &&IndexRow| r
         .value_reference
         .clone());
     column!(
@@ -196,31 +204,31 @@ fn insert_plan(rows: &[IndexRow]) -> InsertPlan {
         rows,
         "value_reference_display",
         "text[]",
-        |r: &IndexRow| r.value_reference_display.clone()
+        |r: &&IndexRow| r.value_reference_display.clone()
     );
     column!(
         p,
         rows,
         "value_identifier_type_system",
         "text[]",
-        |r: &IndexRow| r.value_identifier_type_system.clone()
+        |r: &&IndexRow| r.value_identifier_type_system.clone()
     );
     column!(
         p,
         rows,
         "value_identifier_type_code",
         "text[]",
-        |r: &IndexRow| r.value_identifier_type_code.clone()
+        |r: &&IndexRow| r.value_identifier_type_code.clone()
     );
-    column!(p, rows, "value_uri", "text[]", |r: &IndexRow| r
+    column!(p, rows, "value_uri", "text[]", |r: &&IndexRow| r
         .value_uri
         .clone());
-    column!(p, rows, "is_contained", "bool[]", |r: &IndexRow| r
+    column!(p, rows, "is_contained", "bool[]", |r: &&IndexRow| r
         .is_contained);
-    column!(p, rows, "contained_type", "text[]", |r: &IndexRow| r
+    column!(p, rows, "contained_type", "text[]", |r: &&IndexRow| r
         .contained_type
         .clone());
-    column!(p, rows, "contained_local_id", "text[]", |r: &IndexRow| r
+    column!(p, rows, "contained_local_id", "text[]", |r: &&IndexRow| r
         .contained_local_id
         .clone());
 
@@ -262,6 +270,38 @@ static INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// The same statement, for rows belonging to *different* resources.
+///
+/// [`INSERT_SQL`] binds `resource_type` and `resource_id` once per statement
+/// because one resource's rows all share them. A transaction bundle does not:
+/// it writes ~1,632 resources, and sending one statement per resource costs one
+/// bind, one executor start/stop and one round trip each — 1,630,685 of them on
+/// run 33029355759's import, whose 1.6M index inserts averaged 24 rows and whose
+/// straight-line fit puts ~0.3 ms of that per-statement cost on every one.
+///
+/// So this form promotes those two to arrays and keeps only `tenant_id` scalar,
+/// which a transaction genuinely does hold constant (a `PostgresTransaction`
+/// carries exactly one `TenantContext`). Everything else — the column list, the
+/// bind order, the parameter *numbers* of the 28 value arrays — is shared with
+/// [`INSERT_SQL`] by construction, because both are built from the same
+/// [`insert_plan`].
+static INSERT_SQL_MULTI: LazyLock<String> = LazyLock::new(|| {
+    let plan = insert_plan(&[]);
+    let mut arrays = vec!["$2::text[]".to_string(), "$3::text[]".to_string()];
+    arrays.extend(
+        plan.casts
+            .iter()
+            .enumerate()
+            .map(|(i, cast)| format!("${}::{}", i + 4, cast)),
+    );
+    format!(
+        "INSERT INTO search_index (tenant_id, resource_type, resource_id, {}) \
+         SELECT $1::text, * FROM unnest({})",
+        plan.columns.join(", "),
+        arrays.join(", ")
+    )
+});
+
 /// Rows per statement.
 ///
 /// With the `unnest` form this is no longer a bind-parameter limit — 128 rows
@@ -271,6 +311,13 @@ static INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
 /// alone writes 1,626 rows for one resource, which the old 128-row cap split
 /// into 13 statements and 13 round trips.
 const BATCH_ROWS: usize = 1024;
+
+/// Rows per statement for [`PostgresSearchIndexWriter::insert_rows_multi`].
+///
+/// Sized against the transaction buffer that feeds it: 128 resources at the
+/// import corpus's 24.2 index rows per resource is ~3,100 rows, so the common
+/// flush is one statement, and the cap only splits the tail.
+const MULTI_BATCH_ROWS: usize = 4096;
 
 /// Search parameters this backend answers from `resources` rather than from
 /// `search_index`, and therefore does not index.
@@ -565,7 +612,8 @@ impl PostgresSearchIndexWriter {
         rows: &[IndexRow],
     ) -> StorageResult<()> {
         for chunk in rows.chunks(BATCH_ROWS) {
-            let plan = insert_plan(chunk);
+            let chunk: Vec<&IndexRow> = chunk.iter().collect();
+            let plan = insert_plan(&chunk);
             let mut param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
                 Vec::with_capacity(3 + plan.params.len());
             param_refs.push(&tenant_id);
@@ -578,6 +626,63 @@ impl PostgresSearchIndexWriter {
             );
 
             execute_cached(client, INSERT_SQL.as_str(), &param_refs)
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to insert search index rows: {}", e))
+                })?;
+        }
+
+        Ok(())
+    }
+
+    /// Sends the rows of *several* resources through [`INSERT_SQL_MULTI`].
+    ///
+    /// `batches` is `(resource_type, resource_id, rows)` in the order the
+    /// resources were created, and the flattened row order follows it, so the
+    /// table is appended to in exactly the order the unbatched path appended in.
+    /// `search_index` has no unique constraint and no foreign key (v22/v23), so
+    /// nothing about this insert can conflict with, or wait on, a concurrent
+    /// writer's rows: it is a pure append of rows keyed by a resource id that
+    /// only this transaction is creating.
+    ///
+    /// Chunked at [`MULTI_BATCH_ROWS`] so one caller's flush is normally one
+    /// statement, and a single pathological resource (`Provenance.target` writes
+    /// 1,626 rows) cannot make the arrays unbounded.
+    pub(crate) async fn insert_rows_multi(
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        batches: &[(&str, &str, &[IndexRow])],
+    ) -> StorageResult<()> {
+        let total: usize = batches.iter().map(|(_, _, rows)| rows.len()).sum();
+        if total == 0 {
+            return Ok(());
+        }
+
+        let mut flat: Vec<(&str, &str, &IndexRow)> = Vec::with_capacity(total);
+        for (resource_type, resource_id, rows) in batches {
+            for row in rows.iter() {
+                flat.push((resource_type, resource_id, row));
+            }
+        }
+
+        for chunk in flat.chunks(MULTI_BATCH_ROWS) {
+            let rows: Vec<&IndexRow> = chunk.iter().map(|(_, _, row)| *row).collect();
+            let resource_types: Vec<&str> = chunk.iter().map(|(t, _, _)| *t).collect();
+            let resource_ids: Vec<&str> = chunk.iter().map(|(_, i, _)| *i).collect();
+
+            let plan = insert_plan(&rows);
+            let mut param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                Vec::with_capacity(3 + plan.params.len());
+            param_refs.push(&tenant_id);
+            param_refs.push(&resource_types);
+            param_refs.push(&resource_ids);
+            param_refs.extend(
+                plan.params
+                    .iter()
+                    .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)),
+            );
+
+            execute_cached(client, INSERT_SQL_MULTI.as_str(), &param_refs)
                 .await
                 .map_err(|e| {
                     internal_error(format!("Failed to insert search index rows: {}", e))
@@ -656,6 +761,53 @@ fn normalize_date_for_pg(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two statements are built from one [`insert_plan`], and
+    /// [`PostgresSearchIndexWriter::insert_rows`] and
+    /// [`PostgresSearchIndexWriter::insert_rows_multi`] push their three scalars
+    /// or arrays in the same three slots before extending with the identical
+    /// `plan.params`. If the value arrays ever stopped starting at `$4` in both,
+    /// one of the two would bind every value one column off — a shift Postgres
+    /// accepts wherever the types line up, corrupting the index rather than
+    /// failing the write.
+    #[test]
+    fn both_statements_number_the_value_arrays_from_the_same_slot() {
+        let columns = insert_plan(&[]).columns;
+        for sql in [INSERT_SQL.as_str(), INSERT_SQL_MULTI.as_str()] {
+            assert!(
+                sql.contains("$4::timestamptz[]"),
+                "the first value array must be $4 in `{sql}`"
+            );
+            assert_eq!(
+                sql.matches("::").count(),
+                // three scalars/arrays plus one cast per value column
+                3 + columns.len(),
+                "one cast per bound parameter and no more, in `{sql}`"
+            );
+        }
+    }
+
+    /// Both write the same columns in the same order; only the way
+    /// `resource_type`/`resource_id` are supplied differs.
+    #[test]
+    fn both_statements_write_the_same_column_list() {
+        let list = format!(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, {})",
+            insert_plan(&[]).columns.join(", ")
+        );
+        assert!(INSERT_SQL.starts_with(&list));
+        assert!(INSERT_SQL_MULTI.starts_with(&list));
+    }
+
+    /// The multi form binds the tenant once and everything else per row, which
+    /// is what lets one statement carry several resources.
+    #[test]
+    fn the_multi_statement_binds_only_the_tenant_as_a_scalar() {
+        assert!(INSERT_SQL.contains("SELECT $1::text, $2::text, $3::text, * FROM unnest("));
+        assert!(
+            INSERT_SQL_MULTI.contains("SELECT $1::text, * FROM unnest($2::text[], $3::text[],")
+        );
+    }
 
     /// The defect behind #494: a negative UTC offset was not recognised as a
     /// zone, so `+00:00` was appended and the result stopped being valid
@@ -862,9 +1014,10 @@ mod tests {
     #[test]
     fn the_statement_text_does_not_depend_on_the_row_count() {
         for rows in [0usize, 1, 3, BATCH_ROWS] {
-            let chunk: Vec<IndexRow> = (0..rows)
+            let owned: Vec<IndexRow> = (0..rows)
                 .map(|_| row_of(IndexValue::String("x".to_string())))
                 .collect();
+            let chunk: Vec<&IndexRow> = owned.iter().collect();
             let plan = insert_plan(&chunk);
             assert_eq!(plan.params.len(), insert_plan(&[]).params.len());
             assert_eq!(plan.columns, insert_plan(&[]).columns);
