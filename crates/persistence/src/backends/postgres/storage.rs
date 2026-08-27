@@ -36,10 +36,14 @@ use super::search::writer::PostgresSearchIndexWriter;
 /// `DELETE` can be skipped — one round trip on paths a bulk import takes for
 /// every resource it writes. Two situations establish it:
 ///
-/// - A create that has already inserted the `resources` row. `search_index` is
-///   declared `FOREIGN KEY (tenant_id, resource_type, resource_id) REFERENCES
-///   resources ... ON DELETE CASCADE`, so an index row cannot outlive its
-///   resource; no prior row means nothing to clear.
+/// - A create that has already inserted the `resources` row — the insert
+///   succeeded, so no resource existed under this id, and an index row cannot
+///   outlive its resource. Since schema v23 that last part is upheld by the
+///   code rather than by a constraint: `purge`, `purge_all` and
+///   `purge_tenant_data` each delete the `search_index` rows explicitly before
+///   deleting from `resources`. A new deletion path that skipped that would
+///   make this assertion false and leave stale rows for a later create to
+///   inherit, which is why those call sites carry the obligation in a comment.
 /// - A caller that has just run [`PostgresBackend::delete_search_index`], which
 ///   clears `search_index` and `resource_fts` together.
 ///
@@ -902,8 +906,9 @@ impl ResourceStorage for PostgresBackend {
             .await
             .or_query_error("purge count")?
             .get(0);
-        // search_index and resource_fts cascade from resources, but delete them
-        // explicitly too, mirroring the purge/purge_all deletion order.
+        // These deletes are the only thing that removes the dependent rows:
+        // `search_index` has no foreign key to `resources` (schema v23) and
+        // nothing cascades. Same order as purge/purge_all.
         for sql in [
             "DELETE FROM search_index WHERE tenant_id = $1",
             "DELETE FROM resource_fts WHERE tenant_id = $1",
@@ -2267,7 +2272,8 @@ impl PurgableStorage for PostgresBackend {
             }
         }
 
-        // Delete from search index first (due to FK constraint)
+        // Removing the index rows is REQUIRED, not just ordering: `search_index`
+        // has no foreign key to `resources` (schema v23), so nothing cascades.
         client
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
@@ -2319,7 +2325,8 @@ impl PurgableStorage for PostgresBackend {
             .or_query_error("Failed to count resources")?;
         let count: i64 = row.get(0);
 
-        // Delete from search index first (due to FK constraint)
+        // Removing the index rows is REQUIRED, not just ordering: `search_index`
+        // has no foreign key to `resources` (schema v23), so nothing cascades.
         client
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2",

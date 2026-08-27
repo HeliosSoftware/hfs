@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 22;
+pub const SCHEMA_VERSION: i32 = 23;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -167,9 +167,12 @@ async fn create_schema_v1(client: &deadpool_postgres::Client) -> StorageResult<(
                 -- Max observed per family is 2, so one extra slot suffices.
                 value_token_system_2 TEXT,
                 value_token_code_2 TEXT,
-                value_number_2 DOUBLE PRECISION,
-                CONSTRAINT fk_search_resource FOREIGN KEY (tenant_id, resource_type, resource_id)
-                    REFERENCES resources(tenant_id, resource_type, id) ON DELETE CASCADE
+                value_number_2 DOUBLE PRECISION
+                -- NOTE: there is deliberately no FOREIGN KEY to `resources`
+                -- here. See `migrate_v22_to_v23` — every path that removes a
+                -- resource row deletes this table's rows explicitly, and the
+                -- constraint charged one extra SELECT plus a FOR KEY SHARE lock
+                -- on the parent for every one of the ~39.5M index rows written.
             )",
             &[],
         )
@@ -343,6 +346,7 @@ async fn migrate_schema(
             19 => migrate_v19_to_v20(client).await?,
             20 => migrate_v20_to_v21(client).await?,
             21 => migrate_v21_to_v22(client).await?,
+            22 => migrate_v22_to_v23(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1047,8 +1051,8 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// **`search_index.id BIGSERIAL PRIMARY KEY`.** Nothing reads it — no query in
 /// the backend selects, filters, orders by, joins on, or returns it; rows are
-/// addressed by (tenant_id, resource_type, resource_id) and the FK cascade uses
-/// that too. `ROW_COLUMNS` in the writer never mentions it. It is a surrogate
+/// addressed by (tenant_id, resource_type, resource_id), which is what the FK
+/// cascade used too (the FK itself is gone as of v23). `ROW_COLUMNS` in the writer never mentions it. It is a surrogate
 /// key that exists because the table was written with one by habit, and on run
 /// 33013229956 its index was **963 MB with 0 scans** — as it was in every run
 /// today. Each inserted row pays a sequence `nextval()`, a btree insert into
@@ -1095,6 +1099,48 @@ async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult
             .await
             .map_err(|e| pg_error(format!("Migration v21->v22 failed: {}", e)))?;
     }
+
+    Ok(())
+}
+
+/// v22 -> v23: drop `fk_search_resource`.
+///
+/// `search_index` carried a composite FK to `resources` with `ON DELETE
+/// CASCADE`. Postgres enforces that with a per-row `AFTER INSERT` trigger, and
+/// `pg_stat_statements` for the import suite shows exactly what that costs:
+///
+/// ```text
+/// exec_s  calls       query
+///  500.3  39,516,106  SELECT 1 FROM ONLY "public"."resources" x WHERE ...
+/// ```
+///
+/// 39.5M of the suite's 42.9M total statements — 92% — were this check, one per
+/// index row inserted. The 500 s of execution time understates it: each also
+/// pays trigger dispatch, its own snapshot, and a `FOR KEY SHARE` lock on the
+/// parent row, which under concurrent writers turns into lock contention and
+/// multixact WAL that this column does not attribute anywhere.
+///
+/// What the constraint bought was the guarantee that an index row cannot outlive
+/// its resource. That guarantee does not actually rest on it: every path that
+/// removes a `resources` row already deletes the matching `search_index` rows
+/// first, in the same unit of work —
+/// `purge` (one resource), `purge_all` (a type), and `purge_tenant_data` (a
+/// tenant) each issue an explicit `DELETE FROM search_index` before the delete
+/// from `resources`, and the update and soft-delete paths clear the index
+/// through `delete_search_index`. The cascade never had anything left to do.
+///
+/// The obligation this moves onto the code is therefore already met, but it is
+/// now load-bearing rather than belt-and-braces: **a new path that deletes from
+/// `resources` must delete from `search_index` too.** The comments at those
+/// call sites say so.
+async fn migrate_v22_to_v23(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "ALTER TABLE search_index DROP CONSTRAINT IF EXISTS fk_search_resource",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v22->v23 failed: {}", e)))?;
 
     Ok(())
 }
@@ -1488,8 +1534,8 @@ async fn migrate_v15_to_v16(client: &deadpool_postgres::Client) -> StorageResult
 /// Also deliberately NOT dropped: `idx_search_resource`. It reads as redundant (a
 /// column prefix of `idx_search_composite`), but it is the per-resource probe in
 /// the new plans and takes ~12M scans in a 30 s run — the hottest index in the
-/// schema. It is also the write path's `DELETE FROM search_index WHERE
-/// tenant/type/resource_id` and the FK cascade.
+/// schema. It is also what serves the write path's and every purge path's
+/// `DELETE FROM search_index WHERE tenant/type/resource_id`.
 ///
 /// Index builds take a `SHARE` lock, blocking writes for their duration — measured
 /// at ~6 s for this whole migration on 1.45M rows. Migrations run at startup before
