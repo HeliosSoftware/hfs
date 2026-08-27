@@ -1146,6 +1146,10 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
             axum::routing::post(bulk_import::delete),
         )
         .route(
+            "/ui/bulk-import/{id}/edit",
+            axum::routing::post(bulk_import::edit),
+        )
+        .route(
             "/ui/bulk-import/{id}/abort",
             axum::routing::post(bulk_import::abort),
         )

@@ -14,16 +14,16 @@
       {% include "icons/plus.svg" %}
       {{ i18n.t("bulk-import-new") }}
     </summary>
-    <div class="addbox__panel">
+    <div class="addbox__panel" role="dialog" aria-labelledby="bulk-import-create-title">
       <div class="addbox__head">
-        <div class="addbox__title">{{ i18n.t("bulk-import-create-title") }}</div>
+        <div class="addbox__title" id="bulk-import-create-title">{{ i18n.t("bulk-import-create-title") }}</div>
         <button type="button" class="addbox__x" data-addbox-close
                 aria-label="{{ i18n.t("ui-close") }}">×</button>
       </div>
       <form method="post" action="/ui/bulk-import">
         <label class="field">
           <span class="field__label">{{ i18n.t("bulk-import-field-name") }}</span>
-          <input class="field__input" type="text" name="name" required autocomplete="off">
+          <input class="field__input" type="text" name="name" required autocomplete="off" data-addbox-initial-focus>
         </label>
         <label class="field">
           <span class="field__label">{{ i18n.t("bulk-import-field-submitter-system") }}</span>
