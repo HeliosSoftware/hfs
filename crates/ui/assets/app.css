@@ -634,18 +634,32 @@ button.menu__option {
   object-fit: cover;
 }
 
+/* Account-card layout (#725, proposal B): centered identity block, the
+   language selector as a segmented row, Sign out full width. */
 .user-menu__id {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 10px;
-  padding: 4px 4px 12px;
+  gap: 6px;
+  padding: 14px 4px 12px;
+  text-align: center;
 }
 
-.user-menu__text {
-  min-width: 0;
+.user-menu__avatar {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: var(--accent-strong);
+  color: #ffffff;
+  font-weight: 600;
+  font-size: 20px;
 }
 
 .user-menu__name {
+  max-width: 100%;
   font-weight: 600;
   color: var(--text-strong);
   overflow: hidden;
@@ -654,6 +668,7 @@ button.menu__option {
 }
 
 .user-menu__hint {
+  max-width: 100%;
   font-size: 12px;
   color: var(--muted);
   overflow: hidden;
@@ -661,10 +676,49 @@ button.menu__option {
   white-space: nowrap;
 }
 
-.menu__divider {
-  height: 1px;
-  margin: 8px 0;
-  background: var(--surface-border);
+.user-menu__seg {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  margin: 2px 2px 4px;
+  background: var(--accent-soft);
+  border-radius: 999px;
+}
+
+.user-menu__seg a {
+  flex: 1;
+  padding: 6px 0;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  text-align: center;
+  text-decoration: none;
+}
+
+.user-menu__seg a[aria-current="true"] {
+  background: var(--surface);
+  color: var(--text-strong);
+  box-shadow: var(--surface-shadow);
+}
+
+.user-menu__out {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 4px 2px 2px;
+  padding: 8px 0;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  font-weight: 500;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.user-menu__out:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
 }
 
 .content {

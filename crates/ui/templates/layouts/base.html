@@ -238,36 +238,28 @@
             {% if let Some(initials) = status.user_initials() %}{{ initials }}{% else %}<span class="icon">{% include "icons/user.svg" %}</span>{% endif %}
             {% endif %}
           </summary>
+          <!-- Account-card layout (#725, proposal B): centered identity,
+               language as a segmented row, Sign out full width. -->
           <div class="menu__panel menu__panel--right">
             <div class="user-menu__id">
-              <span class="topbar__avatar" aria-hidden="true">
+              <span class="user-menu__avatar" aria-hidden="true">
                 {% if let Some(photo) = status.user_photo() %}
                 <img class="topbar__avatar-img" src="{{ photo }}" alt="">
                 {% else %}
                 {% if let Some(initials) = status.user_initials() %}{{ initials }}{% else %}<span class="icon">{% include "icons/user.svg" %}</span>{% endif %}
                 {% endif %}
               </span>
-              <div class="user-menu__text">
-                <div class="user-menu__name">{% if let Some(name) = status.user_display() %}{{ name }}{% else %}{{ i18n.t("user-local") }}{% endif %}</div>
-                <div class="user-menu__hint">{% if let Some(secondary) = status.user_secondary() %}{{ secondary }}{% else %}{{ i18n.t("user-local-hint") }}{% endif %}</div>
-              </div>
+              <div class="user-menu__name">{% if let Some(name) = status.user_display() %}{{ name }}{% else %}{{ i18n.t("user-local") }}{% endif %}</div>
+              <div class="user-menu__hint">{% if let Some(secondary) = status.user_secondary() %}{{ secondary }}{% else %}{{ i18n.t("user-local-hint") }}{% endif %}</div>
             </div>
             <div class="menu__heading">{{ i18n.t("language-label") }}</div>
-            <a class="menu__option" href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %}>
-              {{ i18n.t("language-en") }}
-              {% if i18n.lang() == "en" %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
-            </a>
-            <a class="menu__option" href="?lang=es"{% if i18n.lang() == "es" %} aria-current="true"{% endif %}>
-              {{ i18n.t("language-es") }}
-              {% if i18n.lang() == "es" %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
-            </a>
-            <a class="menu__option" href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %}>
-              {{ i18n.t("language-de") }}
-              {% if i18n.lang() == "de" %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
-            </a>
+            <div class="user-menu__seg">
+              <a href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-en") }}">EN</a>
+              <a href="?lang=es"{% if i18n.lang() == "es" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-es") }}">ES</a>
+              <a href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-de") }}">DE</a>
+            </div>
             {% if status.user_can_logout() %}
-            <div class="menu__divider"></div>
-            <a class="menu__option" href="/ui/logout">
+            <a class="user-menu__out" href="/ui/logout">
               <span class="icon">{% include "icons/logout.svg" %}</span> {{ i18n.t("user-logout") }}
             </a>
             {% endif %}
