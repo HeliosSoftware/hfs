@@ -1053,3 +1053,95 @@ SELECT 'rows in idx_search_string_folded (predicate: value_string IS NOT NULL)',
        count(*) FILTER (WHERE value_string IS NOT NULL),
        count(*) FILTER (WHERE value_string IS NOT NULL)
 FROM search_index WHERE tenant_id = 'default';
+
+-- ── Seat F: FTS/GIN verification (relabelled BE.. to avoid collision) ──
+\echo '################ FULL-TEXT WRITE PATH (resource_fts) ################'
+-- Nothing above this line looks at `resource_fts`, and it needs to: on run
+-- 33086933938 `INSERT INTO resource_fts` was 4,225.7 s of the crud suite's
+-- 17,190 s of Postgres execution time — 385,650 calls at 10.96 ms to insert ONE
+-- row. A GIN index costs roughly what its ENTRY TREE costs: a lexeme that has
+-- been seen before only appends to a posting list, while a lexeme that has not
+-- is a fresh key inserted at a random position in the tree, with the page split,
+-- the WAL and the cache miss that implies. `collect_strings` therefore stops
+-- feeding `_content` the ids and literal references that are, by construction,
+-- never seen twice (schema v27). These queries are how you check that it worked
+-- and that it is still working.
+
+\echo ''
+\echo '######## BE. resource_fts PHYSICAL SIZE ########'
+-- EXPECT `idx_fts_content` to be a small multiple of the heap, not an order of
+-- magnitude above it. Measured locally over 177,603 Synthea resources it fell
+-- from 88 MB to 30 MB when the ids and references came out.
+SELECT 'heap' AS part, pg_size_pretty(pg_relation_size('resource_fts')) AS size,
+       (SELECT count(*) FROM resource_fts) AS rows
+UNION ALL
+SELECT c.relname, pg_size_pretty(pg_relation_size(c.oid)), NULL
+FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+WHERE i.indrelid = 'resource_fts'::regclass
+ORDER BY 1;
+
+\echo ''
+\echo '######## BF. GIN ENTRY-TREE KEYS PER ROW — the number that sets the write cost ########'
+-- `ts_stat` over a bounded sample: `distinct_keys` is how many entry-tree keys
+-- those rows demand and `entries` how many posting-list slots. The ratio is the
+-- whole story. Measured over 45,000 crud-shaped resources the vectors held
+-- 224,438 distinct lexemes before the v27 writer and 333 after, at an almost
+-- unchanged 3.7M vs 3.3M entries: 99.85% of the entry tree was ids and links,
+-- and none of the actual words moved. A `distinct_keys` that grows roughly in
+-- step with `sampled_rows` means one-off lexemes are being indexed again and
+-- the filter has regressed.
+SELECT (SELECT count(*) FROM (SELECT 1 FROM resource_fts LIMIT 20000) s) AS sampled_rows,
+       count(*) AS distinct_keys, sum(nentry) AS entries
+FROM ts_stat('SELECT content_tsvector FROM resource_fts LIMIT 20000');
+
+\echo ''
+\echo '######## BG. UUID RESIDUE — where the entry tree still gets one-off keys ########'
+-- Not expected to be zero, and deliberately so. Only `id`, `reference`,
+-- `fullUrl` and `versionId` are filtered; an `Identifier.value` is kept, because
+-- that is where an MRN, an NPI or an accession number lives and searching
+-- `_content` for one is a real query — Synthea happens to make its MRNs UUIDs.
+-- Over the 177,603-resource Synthea corpus that filter takes the entry tree from
+-- 638,685 distinct keys to 174,891, and what is left is overwhelmingly those
+-- identifiers. The crud suite, which is the only workload that actually writes
+-- `resource_fts` (the bundle path does not), reuses nine fixed seed resources,
+-- so its identifiers repeat and its share falls 224,438 -> 333.
+--
+-- What this query is FOR: a sharp rise in `rows_with_a_uuid_lexeme` per sampled
+-- row, on a database imported by v27 code, means ids or references are being
+-- indexed again. Rows written before v27 also show up here; a pre-v27 vector is
+-- a superset of what the current writer produces, so it is stale rather than
+-- wrong, and `$reindex` rebuilds it.
+SELECT count(*) AS rows_with_a_uuid_lexeme
+FROM (SELECT content_tsvector FROM resource_fts LIMIT 20000) s
+WHERE EXISTS (
+  SELECT 1 FROM unnest(tsvector_to_array(s.content_tsvector)) AS lex
+  WHERE lex ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+);
+
+\echo ''
+\echo '######## BH. v27 SHAPE — the upsert needs its key, the writer needs no FK ########'
+-- `idx_fts_lookup` must be UNIQUE: it is the conflict target of
+-- `FTS_UPSERT_SQL`, which is what lets an update replace the row in place
+-- instead of DELETE-then-INSERT (227.3 s of the crud suite). `fk_fts_resource`
+-- must be absent: it charged a `SELECT 1 … FOR KEY SHARE` on `resources` per
+-- full-text write, for a guarantee `purge`/`purge_all`/`purge_tenant_data`
+-- already give explicitly (same trade as `migrate_v22_to_v23`).
+SELECT c.relname AS index_name, i.indisunique AS is_unique
+FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+WHERE i.indrelid = 'resource_fts'::regclass AND c.relname = 'idx_fts_lookup';
+SELECT count(*) AS fts_foreign_keys
+FROM pg_constraint WHERE conrelid = 'resource_fts'::regclass AND contype = 'f';
+
+\echo ''
+\echo '######## BI. _content STILL READS THROUGH THE GIN INDEX ########'
+-- The benchmark never issues `_text` or `_content`, so this is the only place
+-- the read path is looked at. EXPECT a Bitmap Index Scan on `idx_fts_content`.
+-- A Seq Scan on `resource_fts` means the narrowing broke the read side, which
+-- would be a correctness regression, not a performance one.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Patient' AND is_deleted = FALSE
+  AND id IN (SELECT resource_id FROM resource_fts
+             WHERE tenant_id = 'default' AND resource_type = 'Patient'
+               AND content_tsvector @@ plainto_tsquery('english', 'Springfield'))
+LIMIT 21;
