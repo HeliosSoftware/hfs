@@ -13,6 +13,7 @@ use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirResource, FhirVersionExtractor, TenantExtractor};
+use crate::fhir_types::admit_resource_type;
 use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
@@ -66,6 +67,15 @@ pub async fn create_handler<S>(
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
+    // Determine FHIR version from header or use server default
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
+
+    admit_resource_type(&resource_type, &resource, fhir_version).map_err(|error| {
+        RestError::BadRequest {
+            message: error.to_string(),
+        }
+    })?;
+
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {
@@ -73,9 +83,6 @@ where
             resource_type: resource_type.to_string(),
         });
     }
-
-    // Determine FHIR version from header or use server default
-    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
@@ -87,22 +94,6 @@ where
         conditional = ?conditional.if_none_exist(),
         "Processing create request"
     );
-
-    // Validate resourceType in body matches URL
-    if let Some(body_type) = resource.get("resourceType").and_then(|v| v.as_str()) {
-        if body_type != resource_type {
-            return Err(RestError::BadRequest {
-                message: format!(
-                    "Resource type in body ({}) does not match URL ({})",
-                    body_type, resource_type
-                ),
-            });
-        }
-    } else {
-        return Err(RestError::BadRequest {
-            message: "Resource must contain resourceType".to_string(),
-        });
-    }
 
     // Per http.html#create "the server ignores the id provided in the
     // resource" — a create always assigns a fresh server id. Honoring a
@@ -150,7 +141,8 @@ where
                     );
                 }
                 let headers = ResourceHeaders::from_stored(&stored, &state);
-                let location = format!("{}/{}/{}", state.base_url(), resource_type, stored.id());
+                let location =
+                    state.public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);
 
                 debug!(
                     resource_type = %resource_type,
@@ -229,7 +221,7 @@ where
     }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
-    let location = format!("{}/{}/{}", state.base_url(), resource_type, stored.id());
+    let location = state.public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);
 
     debug!(
         resource_type = %resource_type,

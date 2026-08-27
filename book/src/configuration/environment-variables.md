@@ -9,9 +9,16 @@ All server behavior is controlled through environment variables. No configuratio
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `HFS_LOG_LEVEL` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
-| `HFS_BASE_URL` | `http://localhost:8080` | Base URL for Location headers and Bundle links |
+| `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base for Location headers and Bundle links |
 | `HFS_DATA_DIR` | `./data` | Path to FHIR data directory (search parameters) |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage. In a cluster, a SearchParameter POSTed to one node becomes visible to the others within this interval. `0` disables the periodic refresh. |
+
+`HFS_BASE_URL` must be an absolute `http` or `https` URL with a host. It may
+include a deployment path prefix, such as `https://example.com/fhir`, but it
+must not include credentials, a query string, or a fragment. HFS normalizes a
+trailing slash and rejects invalid values before it starts. Configure the
+public address explicitly behind a proxy. Request `Host`, `Forwarded`, and
+`X-Forwarded-*` headers do not change advertised URLs.
 
 ## Limits
 

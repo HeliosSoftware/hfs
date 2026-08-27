@@ -28,6 +28,10 @@ language-label = Idioma
 language-en = Inglés
 language-es = Español
 language-de = Alemán
+user-menu-label = Menú de la cuenta
+user-local = Usuario local
+user-local-hint = La autenticación está deshabilitada
+user-logout = Cerrar sesión
 
 ## Página de inicio
 
@@ -422,6 +426,7 @@ queries-open-tab = Abrir en pestaña nueva
 queries-col-updated = Actualizado
 queries-prev = Anterior
 queries-next = Siguiente
+queries-results-fetch-error = No se pudieron cargar los resultados desde { $origin }. Revise HFS_BASE_URL e inténtelo de nuevo.
 
 queries-rail-heading = Tipos de recurso
 queries-rail-filter = Filtrar tipos
@@ -511,7 +516,12 @@ editor-versions-none = Sin versiones anteriores.
 
 resources-heading = Recursos
 resources-lede = Explora, busca, crea y edita recursos FHIR. Busca en lenguaje natural o arma la consulta a mano, y abre cualquier resultado para editarlo.
+resources-create = Crear recurso
 resources-create-typed = Crear { $type }
+resources-create-invalid-type = Este tipo de recurso no está disponible en la versión FHIR seleccionada. Corrige la consulta o elige un tipo de la lista.
+resources-create-not-advertised = Este servidor no permite crear este tipo de recurso. Aún puedes buscarlo.
+resources-create-schema-unavailable = Este tipo de recurso no tiene un esquema de edición en la versión FHIR seleccionada, por lo que la UI no puede crearlo de forma segura.
+resources-create-metadata-unavailable = Las capacidades del servidor no están disponibles. La creación seguirá desactivada hasta que la UI pueda verificarlas.
 resources-save-blocked = Corrige los problemas de validación antes de guardar.
 resources-save-invalid = El JSON no es válido — corrígelo antes de guardar.
 resources-edit-title = Editar recurso
@@ -549,6 +559,9 @@ batch-sum-updated = actualizados
 batch-sum-other = lecturas/otros
 batch-sum-failed = fallidos
 batch-request-failed = La petición falló
+batch-reading = Leyendo el bundle…
+batch-executing = Ejecutando…
+batch-read-failed = No se pudo leer el archivo
 
 ## Bulk Import workspace (#527)
 
@@ -556,7 +569,6 @@ bulk-import-title = Importación masiva
 bulk-import-new = Nueva submission
 bulk-import-create-title = Crear Bulk Submission
 bulk-import-field-name = Nombre de la submission
-bulk-import-field-recipient = URL base del receptor
 bulk-import-auth = Autenticación
 bulk-import-auth-hint = Cómo autenticarse ante el servidor receptor.
 bulk-import-auth-none = Ninguna

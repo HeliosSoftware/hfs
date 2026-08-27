@@ -247,5 +247,11 @@ pub trait ExportJobController: Send + Sync + 'static {
     ///
     /// Returns `None` if `tenant_id` does not match the submitting tenant, or if
     /// the sink fails to produce a URL (e.g. an S3 pre-signing error).
-    fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String>;
+    fn download_url(
+        &self,
+        tenant_id: &str,
+        public_base_url: &str,
+        job_id: &str,
+        filename: &str,
+    ) -> Option<String>;
 }

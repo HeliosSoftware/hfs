@@ -53,6 +53,24 @@ fn app(ctx: &Ctx) -> Router {
     )
 }
 
+fn app_with_path_tenant(ctx: &Ctx, tenant: &str) -> Router {
+    helios_ui::mount_with_conformance_source_and_body_limit_and_tenant_routing(
+        Router::new(),
+        "9.9.9",
+        None,
+        helios_ui::NlSearch::default(),
+        None,
+        Some(Arc::clone(&ctx.settings)),
+        tenant.to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::empty()),
+        FhirVersion::R4,
+        None,
+        ctx.recipient.clone(),
+        10 * 1024 * 1024,
+        true,
+    )
+}
+
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -104,6 +122,47 @@ async fn the_list_page_renders_and_offers_creation() {
     assert!(html.contains("Bulk Import"));
     assert!(html.contains("New Submission"));
     assert!(html.contains("No submissions yet"));
+}
+
+#[tokio::test]
+async fn recipient_includes_public_prefix_and_selected_path_tenant() {
+    let ctx = ctx("https://public.example/fhir/");
+
+    // The recipient is fixed server-side at create time, so a spoofed Host must
+    // not reach it: the stored value is the configured public base plus the
+    // path tenant. The detail page is where it surfaces (#721 dropped the row
+    // from the create dialog).
+    let created = app_with_path_tenant(&ctx, "acme")
+        .oneshot(
+            Request::post("/ui/bulk-import")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("host", "spoofed.example")
+                .body(Body::from("name=BrettTest&auth=none"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    let detail_path = created
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .expect("redirect to the detail page")
+        .to_string();
+
+    let response = app_with_path_tenant(&ctx, "acme")
+        .oneshot(
+            Request::get(&detail_path)
+                .header("host", "spoofed.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("https://public.example/fhir/acme"), "{html}");
+    assert!(!html.contains("spoofed.example"));
 }
 
 #[tokio::test]

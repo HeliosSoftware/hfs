@@ -7,6 +7,8 @@
 //! the cached `&'static [&'static str]`.
 
 use helios_fhir::{FhirResourceTypeProvider, FhirVersion};
+use serde_json::Value;
+use std::fmt;
 use std::sync::OnceLock;
 
 #[cfg(feature = "R4")]
@@ -127,6 +129,34 @@ pub fn is_valid_resource_type(type_name: &str) -> bool {
     false
 }
 
+/// Checks whether a path segment names a resource type in any FHIR version
+/// compiled into this server.
+///
+/// Route reservation is deliberately broader than request admission. It is
+/// case-insensitive so a misspelled resource path such as `/patient` reaches
+/// the FHIR router and gets a client error instead of being reinterpreted as a
+/// tenant prefix. Write handlers still require the exact, case-sensitive name
+/// for the request's effective FHIR version through [`admit_resource_type`].
+pub fn is_reserved_resource_path(type_name: &str) -> bool {
+    #[cfg(feature = "R4")]
+    if helios_fhir::r4::Resource::is_resource_type(type_name) {
+        return true;
+    }
+    #[cfg(feature = "R4B")]
+    if helios_fhir::r4b::Resource::is_resource_type(type_name) {
+        return true;
+    }
+    #[cfg(feature = "R5")]
+    if helios_fhir::r5::Resource::is_resource_type(type_name) {
+        return true;
+    }
+    #[cfg(feature = "R6")]
+    if helios_fhir::r6::Resource::is_resource_type(type_name) {
+        return true;
+    }
+    false
+}
+
 /// Returns the FHIR version string for the enabled version.
 ///
 /// This is useful for including in CapabilityStatements and other metadata.
@@ -182,6 +212,82 @@ pub fn is_valid_resource_type_for_version(type_name: &str, version: FhirVersion)
     get_resource_type_names_for_version(version).contains(&type_name)
 }
 
+/// A failure at the resource-type admission gate for a create or update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceTypeAdmissionError {
+    /// The URL type is not an exact core resource name in the effective version.
+    UnsupportedForVersion {
+        /// Resource type taken from the request URL.
+        resource_type: String,
+        /// Effective FHIR version for this write.
+        version: FhirVersion,
+    },
+    /// The request body has no string-valued `resourceType`.
+    MissingBodyType,
+    /// The body names a different resource type than the request URL.
+    UrlBodyMismatch {
+        /// Resource type taken from the request URL.
+        url_type: String,
+        /// Resource type declared in the request body.
+        body_type: String,
+    },
+}
+
+impl fmt::Display for ResourceTypeAdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedForVersion {
+                resource_type,
+                version,
+            } => write!(
+                f,
+                "Resource type '{}' is not supported for FHIR {}",
+                resource_type, version
+            ),
+            Self::MissingBodyType => write!(f, "Resource must contain resourceType"),
+            Self::UrlBodyMismatch {
+                url_type,
+                body_type,
+            } => write!(
+                f,
+                "Resource type in body ({}) does not match URL ({})",
+                body_type, url_type
+            ),
+        }
+    }
+}
+
+/// Admits a resource to a create or update path.
+///
+/// This check is independent of configurable profile validation. It prevents
+/// unknown, wrong-case, and wrong-version types, then requires the body type to
+/// match the URL exactly. Callers must run it before persistence.
+pub fn admit_resource_type(
+    url_type: &str,
+    resource: &Value,
+    version: FhirVersion,
+) -> Result<(), ResourceTypeAdmissionError> {
+    if !is_valid_resource_type_for_version(url_type, version) {
+        return Err(ResourceTypeAdmissionError::UnsupportedForVersion {
+            resource_type: url_type.to_string(),
+            version,
+        });
+    }
+
+    let body_type = resource
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .ok_or(ResourceTypeAdmissionError::MissingBodyType)?;
+    if body_type != url_type {
+        return Err(ResourceTypeAdmissionError::UrlBodyMismatch {
+            url_type: url_type.to_string(),
+            body_type: body_type.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +317,120 @@ mod tests {
         assert!(!is_valid_resource_type("InvalidType"));
         assert!(!is_valid_resource_type(""));
         assert!(!is_valid_resource_type("patient")); // Case-sensitive
+    }
+
+    #[test]
+    fn route_reservation_spans_enabled_versions_and_is_case_insensitive() {
+        assert!(is_reserved_resource_path("Patient"));
+        assert!(is_reserved_resource_path("patient"));
+        assert!(!is_reserved_resource_path("NoSuchResource"));
+
+        #[cfg(any(feature = "R5", feature = "R6"))]
+        assert!(is_reserved_resource_path("ActorDefinition"));
+    }
+
+    #[test]
+    fn admission_requires_exact_type_and_matching_body() {
+        let patient = serde_json::json!({ "resourceType": "Patient" });
+        assert!(admit_resource_type("Patient", &patient, FhirVersion::default_enabled()).is_ok());
+        assert!(matches!(
+            admit_resource_type("patient", &patient, FhirVersion::default_enabled()),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+        assert!(matches!(
+            admit_resource_type(
+                "Patient",
+                &serde_json::json!({ "resourceType": "Observation" }),
+                FhirVersion::default_enabled()
+            ),
+            Err(ResourceTypeAdmissionError::UrlBodyMismatch { .. })
+        ));
+        assert!(matches!(
+            admit_resource_type(
+                "Patient",
+                &serde_json::json!({}),
+                FhirVersion::default_enabled()
+            ),
+            Err(ResourceTypeAdmissionError::MissingBodyType)
+        ));
+    }
+
+    #[test]
+    fn patient_is_admitted_in_every_enabled_version() {
+        let patient = serde_json::json!({ "resourceType": "Patient" });
+        #[cfg(feature = "R4")]
+        assert!(admit_resource_type("Patient", &patient, FhirVersion::R4).is_ok());
+        #[cfg(feature = "R4B")]
+        assert!(admit_resource_type("Patient", &patient, FhirVersion::R4B).is_ok());
+        #[cfg(feature = "R5")]
+        assert!(admit_resource_type("Patient", &patient, FhirVersion::R5).is_ok());
+        #[cfg(feature = "R6")]
+        assert!(admit_resource_type("Patient", &patient, FhirVersion::R6).is_ok());
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn r4_admits_document_manifest_but_not_subscription_topic() {
+        let manifest = serde_json::json!({ "resourceType": "DocumentManifest" });
+        assert!(admit_resource_type("DocumentManifest", &manifest, FhirVersion::R4).is_ok());
+        let topic = serde_json::json!({ "resourceType": "SubscriptionTopic" });
+        assert!(matches!(
+            admit_resource_type("SubscriptionTopic", &topic, FhirVersion::R4),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+    }
+
+    #[cfg(feature = "R4B")]
+    #[test]
+    fn r4b_admits_subscription_topic_and_document_manifest() {
+        let topic = serde_json::json!({ "resourceType": "SubscriptionTopic" });
+        let manifest = serde_json::json!({ "resourceType": "DocumentManifest" });
+        assert!(admit_resource_type("SubscriptionTopic", &topic, FhirVersion::R4B).is_ok());
+        assert!(admit_resource_type("DocumentManifest", &manifest, FhirVersion::R4B).is_ok());
+    }
+
+    #[cfg(all(feature = "R4", any(feature = "R5", feature = "R6")))]
+    #[test]
+    fn admission_rejects_version_specific_type_under_r4() {
+        let actor = serde_json::json!({ "resourceType": "ActorDefinition" });
+        assert!(is_reserved_resource_path("ActorDefinition"));
+        assert!(matches!(
+            admit_resource_type("ActorDefinition", &actor, FhirVersion::R4),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+    }
+
+    #[cfg(feature = "R5")]
+    #[test]
+    fn r5_admits_actor_definition_but_not_document_manifest() {
+        let actor = serde_json::json!({ "resourceType": "ActorDefinition" });
+        assert!(admit_resource_type("ActorDefinition", &actor, FhirVersion::R5).is_ok());
+        let topic = serde_json::json!({ "resourceType": "SubscriptionTopic" });
+        assert!(admit_resource_type("SubscriptionTopic", &topic, FhirVersion::R5).is_ok());
+        let manifest = serde_json::json!({ "resourceType": "DocumentManifest" });
+        assert!(matches!(
+            admit_resource_type("DocumentManifest", &manifest, FhirVersion::R5),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+    }
+
+    #[cfg(feature = "R6")]
+    #[test]
+    fn r6_admits_actor_definition_and_rejects_removed_types() {
+        let actor = serde_json::json!({ "resourceType": "ActorDefinition" });
+        assert!(admit_resource_type("ActorDefinition", &actor, FhirVersion::R6).is_ok());
+        let topic = serde_json::json!({ "resourceType": "SubscriptionTopic" });
+        assert!(admit_resource_type("SubscriptionTopic", &topic, FhirVersion::R6).is_ok());
+        let media = serde_json::json!({ "resourceType": "Media" });
+        let manifest = serde_json::json!({ "resourceType": "DocumentManifest" });
+        assert!(matches!(
+            admit_resource_type("Media", &media, FhirVersion::R6),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+        assert!(matches!(
+            admit_resource_type("DocumentManifest", &manifest, FhirVersion::R6),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
     }
 
     #[test]

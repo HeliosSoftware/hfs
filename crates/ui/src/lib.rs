@@ -133,6 +133,8 @@ struct WebState {
     /// submissions target as their recipient (#689). Distinct from the
     /// loopback self-call base the conformance source uses.
     public_base_url: String,
+    /// Whether canonical tenant URLs include the selected tenant as a path.
+    tenant_path_routing: bool,
     /// The server's default FHIR version, used when seeding a new tenant.
     fhir_version: helios_fhir::FhirVersion,
     /// The server's default tenant id â€” the fallback when no stored choice
@@ -390,6 +392,34 @@ impl Status {
         self.subscriptions_enabled
     }
 
+    /// The topbar avatar menu's identity (#725). `/ui` sits outside the auth
+    /// layer today (#320), so no request carries a signed-in principal — every
+    /// accessor returns the signed-out shape and the menu renders its
+    /// local-operator state. When the browser login flow lands, these become
+    /// the seam where the IdP's profile claims (#724) surface: display name,
+    /// secondary line (email or subject), initials, photo URL.
+    pub(crate) fn user_display(&self) -> Option<&str> {
+        None
+    }
+
+    pub(crate) fn user_secondary(&self) -> Option<&str> {
+        None
+    }
+
+    pub(crate) fn user_initials(&self) -> Option<&str> {
+        None
+    }
+
+    pub(crate) fn user_photo(&self) -> Option<&str> {
+        None
+    }
+
+    /// Whether the menu offers Sign out — requires an interactive session,
+    /// which does not exist yet (#320).
+    pub(crate) fn user_can_logout(&self) -> bool {
+        false
+    }
+
     /// A browser-safe terminology destination, when the configured value is a
     /// valid absolute HTTP(S) URL (#611).
     pub(crate) fn terminology_url(&self) -> Option<&str> {
@@ -632,6 +662,13 @@ struct ResourcesPage {
     docs_url: &'static str,
     resource_types: Vec<String>,
     selected_type: String,
+    create_label: String,
+    create_disabled: bool,
+    create_reason: String,
+    create_resource_types: String,
+    create_advertised_types: String,
+    create_schema_types: String,
+    create_metadata_available: bool,
     /// The search-builder partial's save controls are the Saved Queries page's
     /// job, not this one's.
     show_save: bool,
@@ -848,13 +885,49 @@ pub fn mount_with_body_limit(
     public_base_url: String,
     max_body_size: usize,
 ) -> Router {
+    mount_with_body_limit_and_tenant_routing(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        self_base_url,
+        outbound_auth,
+        fhir_version,
+        terminology,
+        public_base_url,
+        max_body_size,
+        false,
+    )
+}
+
+/// Mounts the UI with explicit tenant-path routing behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_body_limit_and_tenant_routing(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    max_body_size: usize,
+    tenant_path_routing: bool,
+) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url,
         outbound_auth,
         fhir_version,
         data_dir.clone(),
     ));
-    mount_with_conformance_source_and_body_limit(
+    mount_with_conformance_source_and_body_limit_and_tenant_routing(
         fhir_app,
         hfs_version,
         data_dir,
@@ -867,6 +940,7 @@ pub fn mount_with_body_limit(
         terminology,
         public_base_url,
         max_body_size,
+        tenant_path_routing,
     )
 }
 
@@ -922,7 +996,50 @@ pub fn mount_with_conformance_source_and_body_limit(
     public_base_url: String,
     max_body_size: usize,
 ) -> Router {
+    mount_with_conformance_source_and_body_limit_and_tenant_routing(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        source,
+        fhir_version,
+        terminology,
+        public_base_url,
+        max_body_size,
+        false,
+    )
+}
+
+/// Testable UI mount with explicit tenant-path routing behavior.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    max_body_size: usize,
+    tenant_path_routing: bool,
+) -> Router {
     let nl_enabled = nl.enabled;
+    let mut parsed_public_base = reqwest::Url::parse(&public_base_url)
+        .expect("UI mount requires a valid HTTP(S) public base URL");
+    let trimmed_path = parsed_public_base.path().trim_end_matches('/').to_string();
+    parsed_public_base.set_path(&trimmed_path);
+    let public_base_url = parsed_public_base
+        .to_string()
+        .trim_end_matches('/')
+        .to_string();
 
     // Embedded, pinned htmx + CSS/JS + fonts, served with br/gzip/deflate
     // negotiation. `Cache-Control: no-cache` forces the browser to revalidate
@@ -1080,6 +1197,7 @@ pub fn mount_with_conformance_source_and_body_limit(
         default_tenant,
         terminology,
         public_base_url,
+        tenant_path_routing,
     };
 
     router
@@ -1461,8 +1579,41 @@ async fn resources(
     Query(query): Query<ResourcesQuery>,
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
-    // The type the rail opens focused on (from the nav submenu deep link).
-    let selected_type = query.resource_type.unwrap_or_else(|| "Patient".to_string());
+    // `url` is the builder's actual query, so it wins over the convenience
+    // `type` bookmark. Parse it here too: Create must be safe before the
+    // deferred client script hydrates the page.
+    let (selected_type, builder_url) = resources_query_context(&query);
+    let targets = match state.conformance.metadata(rv.0, &rt.id).await {
+        Ok(statement) => {
+            match capability::CreateTargets::from_statement(&resource_types, &statement, rv.0) {
+                Ok(targets) => Some(targets),
+                Err(error) => {
+                    tracing::warn!("Resources create-target metadata rejected: {error}");
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!("Resources create-target metadata fetch failed: {error}");
+            None
+        }
+    };
+    let block = targets
+        .as_ref()
+        .map_or(
+            Err(capability::CreateTargetBlock::MetadataUnavailable),
+            |targets| targets.classify(&selected_type),
+        )
+        .err();
+    let i18n = I18n::new(locale);
+    let create_reason = block
+        .map(|block| create_target_reason(&i18n, block))
+        .unwrap_or_default();
+    let create_label = if selected_type.is_empty() {
+        i18n.t("resources-create")
+    } else {
+        i18n.t_arg("resources-create-typed", "type", selected_type.clone())
+    };
     let live =
         helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
             .await;
@@ -1472,15 +1623,30 @@ async fn resources(
         live.as_ref().map(|s| s.available.as_slice()),
         Some(selected_type.as_str()),
     );
-    let builder_url = Some(format!("/{selected_type}"));
     render(ResourcesPage {
         status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: "resources",
         nl: (*state.nl).clone(),
         docs_url: NL_SEARCH_DOCS,
         resource_types,
         selected_type,
+        create_label,
+        create_disabled: block.is_some(),
+        create_reason,
+        create_resource_types: targets
+            .as_ref()
+            .map(capability::CreateTargets::resource_types_csv)
+            .unwrap_or_default(),
+        create_advertised_types: targets
+            .as_ref()
+            .map(capability::CreateTargets::advertised_create_csv)
+            .unwrap_or_default(),
+        create_schema_types: targets
+            .as_ref()
+            .map(capability::CreateTargets::schema_resources_csv)
+            .unwrap_or_default(),
+        create_metadata_available: targets.is_some(),
         show_save: false,
         rail_entries,
         builder_url,
@@ -1508,6 +1674,61 @@ async fn terminology_page(
 struct ResourcesQuery {
     #[serde(rename = "type")]
     resource_type: Option<String>,
+    url: Option<String>,
+}
+
+fn resources_query_context(query: &ResourcesQuery) -> (String, Option<String>) {
+    if let Some(raw_url) = &query.url {
+        let visible = raw_url
+            .trim()
+            .strip_prefix("GET ")
+            .or_else(|| raw_url.trim().strip_prefix("get "))
+            .unwrap_or(raw_url.trim())
+            .to_string();
+        return (
+            resource_type_from_search_url(&visible).unwrap_or_default(),
+            Some(visible),
+        );
+    }
+
+    let selected = query
+        .resource_type
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Patient")
+        .to_string();
+    (selected.clone(), Some(format!("/{selected}")))
+}
+
+fn resource_type_from_search_url(raw: &str) -> Option<String> {
+    let mut value = raw.trim();
+    if let Some(after_scheme) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+    {
+        value = after_scheme.find('/').map(|index| &after_scheme[index..])?;
+    }
+    let path = value.split_once('?').map_or(value, |(path, _)| path);
+    let resource_type = path.strip_prefix('/').unwrap_or(path);
+    if resource_type.is_empty()
+        || resource_type.contains('/')
+        || !resource_type.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some(resource_type.to_string())
+}
+
+fn create_target_reason(i18n: &I18n, block: capability::CreateTargetBlock) -> String {
+    let key = match block {
+        capability::CreateTargetBlock::InvalidType => "resources-create-invalid-type",
+        capability::CreateTargetBlock::CreateNotAdvertised => "resources-create-not-advertised",
+        capability::CreateTargetBlock::SchemaUnavailable => "resources-create-schema-unavailable",
+        capability::CreateTargetBlock::MetadataUnavailable => {
+            "resources-create-metadata-unavailable"
+        }
+    };
+    i18n.t(key)
 }
 
 #[derive(Deserialize, Default)]

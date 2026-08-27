@@ -42,7 +42,10 @@ mod sof_export_graph_tests {
         let sink = InMemorySink::new("http://localhost");
         let controller = InMemoryController::new(runner, sink, None);
 
-        let config = ServerConfig::for_testing();
+        let config = ServerConfig {
+            base_url: "http://localhost".to_string(),
+            ..ServerConfig::for_testing()
+        };
         let state = helios_rest::AppState::new(Arc::clone(&backend), config)
             .with_export_controller(Arc::new(controller));
         let app = helios_rest::routing::fhir_routes::create_routes(state);

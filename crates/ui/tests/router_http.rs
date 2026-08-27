@@ -86,6 +86,46 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
     )
 }
 
+fn resources_app_with_metadata(resources: &[(&str, bool)]) -> Router {
+    let rows: Vec<Value> = resources
+        .iter()
+        .map(|(resource_type, create)| {
+            serde_json::json!({
+                "type": resource_type,
+                "interaction": if *create {
+                    serde_json::json!([{"code": "read"}, {"code": "create"}])
+                } else {
+                    serde_json::json!([{"code": "read"}])
+                }
+            })
+        })
+        .collect();
+    resources_app_with_statement(serde_json::json!({
+        "resourceType": "CapabilityStatement",
+        "fhirVersion": "4.0.1",
+        "rest": [{"mode": "server", "resource": rows}]
+    }))
+}
+
+fn resources_app_with_statement(statement: Value) -> Router {
+    let source =
+        helios_ui::StaticConformanceSource::from_data_dir(std::path::Path::new("../../data"))
+            .with_metadata(statement);
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+    )
+}
+
 fn app_with_body_limit(max_body_size: usize) -> Router {
     helios_ui::mount_with_conformance_source_and_body_limit(
         Router::new(),
@@ -362,6 +402,7 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         "format": ["application/fhir+json"],
         "implementation": {"description": "Helios FHIR Server", "url": "http://t/"},
         "rest": [{
+            "mode": "server",
             "interaction": [{"code": "batch"}, {"code": "transaction"}],
             "operation": [{"name": "export", "definition": "http://t/OperationDefinition/export"}],
             "resource": [
@@ -1072,7 +1113,7 @@ async fn unparseable_versions_report_an_error_not_an_empty_diff() {
 
 #[tokio::test]
 async fn resources_page_has_the_filter_search_and_create_button() {
-    let response = app()
+    let response = resources_app_with_metadata(&[("Patient", true), ("Observation", true)])
         .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -1083,6 +1124,7 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     assert!(html.contains(r#"id="type-rail-list""#));
     assert!(html.contains(r#"id="saved-query-form""#));
     assert!(html.contains(r#"id="resource-create""#));
+    assert!(html.contains(r#"data-create-eligible="true""#));
     // The Create button names the selected type (#605), defaulting to
     // Patient, and the builder's URL is pre-filled so the no-JS form already
     // shows the query the client also runs on load.
@@ -1119,7 +1161,7 @@ async fn resources_page_has_the_filter_search_and_create_button() {
 
 #[tokio::test]
 async fn resources_deep_links_focus_the_selected_type() {
-    let response = app()
+    let response = resources_app_with_metadata(&[("Patient", true), ("Observation", true)])
         .oneshot(
             Request::get("/ui/resources?type=Observation")
                 .body(Body::empty())
@@ -1149,6 +1191,110 @@ async fn resources_deep_links_focus_the_selected_type() {
     // Create and the builder prefill both follow the deep-linked type.
     assert!(html.contains("Create new Observation"));
     assert!(html.contains(r#"value="GET /Observation""#));
+}
+
+#[tokio::test]
+async fn resources_fail_closed_for_metadata_and_non_create_capabilities() {
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="resource-create""#));
+    assert!(html.contains("Server capabilities are unavailable"));
+    assert!(html.contains(r#"data-create-metadata="unavailable""#));
+    assert!(html.contains(r#"data-create-eligible="false""#));
+
+    let response = resources_app_with_metadata(&[("Patient", false)])
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("does not allow creating this resource type"));
+    assert!(html.contains(r#"data-create-eligible="false""#));
+
+    for statement in [
+        serde_json::json!({"resourceType": "CapabilityStatement"}),
+        serde_json::json!({
+            "resourceType": "CapabilityStatement",
+            "fhirVersion": "5.0.0",
+            "rest": [{"mode": "server", "resource": [{
+                "type": "Patient", "interaction": [{"code": "create"}]
+            }]}]
+        }),
+        serde_json::json!({
+            "resourceType": "CapabilityStatement",
+            "fhirVersion": "4.0.1",
+            "rest": [{"mode": "client", "resource": [{
+                "type": "Patient", "interaction": [{"code": "create"}]
+            }]}]
+        }),
+    ] {
+        let response = resources_app_with_statement(statement)
+            .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert!(html.contains("Server capabilities are unavailable"));
+        assert!(html.contains(r#"data-create-metadata="unavailable""#));
+        assert!(html.contains(r#"data-create-eligible="false""#));
+    }
+}
+
+#[tokio::test]
+async fn resources_preserve_invalid_inputs_and_url_wins_over_type() {
+    let app = resources_app_with_metadata(&[("Patient", true), ("Observation", true)]);
+
+    for path in [
+        "/ui/resources?type=patient",
+        "/ui/resources?type=NoLongerValid",
+        "/ui/resources?type=",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        if path.ends_with("type=") {
+            assert!(html.contains(r#"data-selected-type="Patient""#));
+            assert!(html.contains(r#"data-create-eligible="true""#));
+        } else {
+            assert!(html.contains("not available in the selected FHIR version"));
+            assert!(html.contains(r#"data-create-eligible="false""#));
+        }
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/resources?type=Observation&url=%2FPatient%3Fname%3DSmith")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-selected-type="Patient""#));
+    assert!(html.contains(r#"value="GET /Patient?name=Smith""#));
+    assert!(html.contains(r#"data-create-target="Patient""#));
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/resources?url=%2F%3Cimg%20src%3Dx%20onerror%3Dalert%281%29%3E")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains("onerror"),
+        "the editable value must remain visible"
+    );
+    assert!(!html.contains("<img src=x"), "the value must stay escaped");
+    assert!(html.contains(r#"data-selected-type="""#));
+    assert!(html.contains(r#"data-create-eligible="false""#));
 }
 
 #[tokio::test]
@@ -1420,6 +1566,57 @@ async fn batch_page_serves_the_workspace_shell() {
     assert!(html.contains("data-msg-semantics-transaction"));
     assert!(html.contains(r#"src="/ui/assets/batch.js""#));
     assert!(html.contains(r#"src="/ui/assets/json-view.js""#));
+}
+
+/// #679: the shared busy convention. The helper is a global asset loaded from
+/// the layout before any page script, and the batch page pre-renders the
+/// status region — a live region injected at busy time is not reliably
+/// announced — with its labels riding on `data-msg-*` like the rest of the
+/// page copy.
+#[tokio::test]
+async fn batch_page_carries_the_shared_busy_affordances() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/busy.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("hfsBusy"));
+
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    // The status region ships in the shell with its full shape pinned:
+    // hidden, empty, role="status", the shared region class, and the spinner
+    // + label pair the helper drives.
+    assert!(
+        html.contains(r#"<p class="busy-status batch-busy" id="batch-busy" role="status" hidden>"#)
+    );
+    assert!(html.contains(
+        r#"<span class="spinner" aria-hidden="true"></span><span data-busy-label></span>"#
+    ));
+    // The rendered copy, not just the attribute name: a missing Fluent key
+    // falls back to the key itself and would still carry the attribute.
+    assert!(html.contains(r#"data-msg-reading="Reading bundle…""#));
+    assert!(html.contains(r#"data-msg-executing="Executing…""#));
+    assert!(html.contains(r#"data-msg-read-failed="The file could not be read""#));
+    // The stage that receives focus when the preflight appears (#679).
+    assert!(html.contains(r#"<section id="batch-preflight" tabindex="-1" hidden>"#));
+    // The helper loads from the shared layout, before the page script (both
+    // defer, so document order is execution order).
+    let busy = html
+        .find(r#"src="/ui/assets/busy.js""#)
+        .expect("busy.js in the layout");
+    let batch = html
+        .find(r#"src="/ui/assets/batch.js""#)
+        .expect("batch.js in the page");
+    assert!(busy < batch);
 }
 
 /* #546: creating a resource with required elements must not dump duplicated,
@@ -1894,4 +2091,33 @@ async fn view_definitions_save_roundtrips_and_rejects_bad_json() {
     let html = body_text(response).await;
     assert!(html.contains("invalid JSON"));
     assert!(html.contains("{nope"));
+}
+
+#[tokio::test]
+async fn user_menu_carries_language_and_the_signed_out_state() {
+    // #725: the avatar is a <details> menu holding the language selector and
+    // the identity block; the inline lang-switcher nav is gone. /ui has no
+    // signed-in principal (#320), so the local-operator state renders and no
+    // Sign out row exists.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("menu--user"));
+    assert!(!html.contains("lang-switcher"));
+    for lang in ["en", "es", "de"] {
+        assert!(
+            html.contains(&format!("?lang={lang}")),
+            "missing ?lang={lang}"
+        );
+    }
+    // English is the negotiated default: its option is current, once.
+    assert!(html.contains(r#"href="?lang=en" aria-current="true""#));
+    assert!(!html.contains(r#"href="?lang=es" aria-current="true""#));
+    assert!(html.contains("Local user"));
+    assert!(html.contains("Authentication is disabled"));
+    assert!(!html.contains("/ui/logout"));
 }

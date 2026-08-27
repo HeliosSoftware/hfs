@@ -18,12 +18,12 @@
   <div class="card-head">
     <h3>{{ i18n.t("files-job-heading") }}</h3>
   </div>
-  <form method="get" action="/ui/sql/files">
+  <form method="get" action="/ui/sql/files" class="card__body">
     <div class="detail__field">
       <span><label for="files-job">{{ i18n.t("export-job-id") }}</label></span>
       <div><input id="files-job" class="field__input" type="text" name="job" value="{{ job }}"></div>
     </div>
-    <div class="card-head">
+    <div class="form-actions">
       <button type="submit" class="btn btn--primary">{{ i18n.t("files-load") }}</button>
     </div>
   </form>

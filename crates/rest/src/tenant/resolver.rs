@@ -4,39 +4,15 @@
 //! requests using multiple configurable sources.
 
 use axum::http::request::Parts;
-use helios_fhir::{FhirResourceTypeProvider, FhirVersion};
+use helios_fhir::FhirVersion;
 use helios_persistence::tenant::{TenantId, TenantIdError};
 use tracing::{debug, warn};
 
 use crate::config::{MultitenancyConfig, TenantRoutingMode};
 use crate::middleware::tenant::X_TENANT_ID;
-use crate::middleware::tenant_prefix::{ExtractedTenantFromUrl, OriginalPath};
+use crate::middleware::tenant_prefix::{ExtractedTenantFromUrl, OriginalPath, is_reserved_path};
 
 use super::source::TenantSource;
-
-/// Non-resource reserved paths (FHIR system endpoints, API prefixes).
-/// Resource types are checked dynamically via helios-fhir's FhirResourceTypeProvider.
-const RESERVED_SYSTEM_PATHS: &[&str] = &[
-    "metadata",
-    "health",
-    "_history",
-    "_liveness",
-    "_readiness",
-    "$versions",
-    "api",
-    "v1",
-    "v2",
-    "fhir",
-    // Management-console namespace (`/console/metrics/*`). Kept in sync with
-    // `middleware::tenant_prefix::RESERVED_SYSTEM_PATHS` so a tenant can never be
-    // named `console` and strict-validation never mis-resolves the console path
-    // to a `console` tenant under URL-path routing.
-    "console",
-    // SMART discovery. Same rationale as `console`, and newly load-bearing since
-    // issue #385 widened the tenant charset to include `.` — see the twin list
-    // in `middleware::tenant_prefix`.
-    ".well-known",
-];
 
 /// Result of resolving a tenant from a request.
 #[derive(Debug, Clone)]
@@ -389,40 +365,6 @@ impl Default for TenantResolver {
     }
 }
 
-/// Checks if a path segment is reserved (not a tenant identifier).
-///
-/// A segment is reserved if it's either:
-/// 1. A FHIR system endpoint or API prefix (from RESERVED_SYSTEM_PATHS)
-/// 2. A valid FHIR resource type for the given version
-fn is_reserved_path(segment: &str, fhir_version: &FhirVersion) -> bool {
-    let lower = segment.to_lowercase();
-
-    // Check system paths first (fast path)
-    if RESERVED_SYSTEM_PATHS.iter().any(|&r| r == lower) {
-        return true;
-    }
-
-    // Check if it's a valid FHIR resource type for the configured version
-    is_fhir_resource_type(segment, fhir_version)
-}
-
-/// Checks if a string is a valid FHIR resource type for the given version.
-/// Uses the FhirResourceTypeProvider trait for case-insensitive matching.
-fn is_fhir_resource_type(type_name: &str, fhir_version: &FhirVersion) -> bool {
-    match fhir_version {
-        #[cfg(feature = "R4")]
-        FhirVersion::R4 => helios_fhir::r4::Resource::is_resource_type(type_name),
-        #[cfg(feature = "R4B")]
-        FhirVersion::R4B => helios_fhir::r4b::Resource::is_resource_type(type_name),
-        #[cfg(feature = "R5")]
-        FhirVersion::R5 => helios_fhir::r5::Resource::is_resource_type(type_name),
-        #[cfg(feature = "R6")]
-        FhirVersion::R6 => helios_fhir::r6::Resource::is_resource_type(type_name),
-        #[allow(unreachable_patterns)]
-        _ => false,
-    }
-}
-
 // The local `is_valid_tenant_id` that used to live here is gone: it was one of
 // three divergent charsets (issue #385). Validation is now `TenantId::parse`,
 // the single canonical definition in `helios-persistence`.
@@ -442,6 +384,13 @@ mod tests {
 
         let request = builder.body(()).unwrap();
         request.into_parts().0
+    }
+
+    #[cfg(all(feature = "R4", any(feature = "R5", feature = "R6")))]
+    #[test]
+    fn later_version_resource_paths_are_reserved_under_r4() {
+        assert!(is_reserved_path("ActorDefinition", &FhirVersion::R4));
+        assert!(is_reserved_path("actordefinition", &FhirVersion::R4));
     }
 
     /// `Ok(Some(id))` unwrapped, for the many assertions that only care about

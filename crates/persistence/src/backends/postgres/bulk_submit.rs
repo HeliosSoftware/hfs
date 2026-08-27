@@ -504,6 +504,7 @@ impl BulkSubmitProvider for PostgresBackend {
             total_entries: 0,
             processed_entries: 0,
             failed_entries: 0,
+            lease_expiry: None,
         })
     }
 
@@ -518,7 +519,7 @@ impl BulkSubmitProvider for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries
+                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry
                  FROM bulk_manifests
                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
                 &[
@@ -543,6 +544,7 @@ impl BulkSubmitProvider for PostgresBackend {
         let total: i32 = row.get(4);
         let processed: i32 = row.get(5);
         let failed: i32 = row.get(6);
+        let lease_expiry: Option<chrono::DateTime<Utc>> = row.get(7);
 
         let status: ManifestStatus = status_str
             .parse()
@@ -557,6 +559,7 @@ impl BulkSubmitProvider for PostgresBackend {
             total_entries: total as u64,
             processed_entries: processed as u64,
             failed_entries: failed as u64,
+            lease_expiry,
         }))
     }
 
@@ -697,8 +700,9 @@ impl BulkSubmitProvider for PostgresBackend {
             results.push(entry_result);
         }
 
-        // Update manifest counts
+        // Update manifest counts, on a fresh client for the tail statements.
         let now = Utc::now();
+        let client = self.get_client().await?;
         client
             .execute(
                 "UPDATE bulk_manifests SET

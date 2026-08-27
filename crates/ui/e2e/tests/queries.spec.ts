@@ -1,6 +1,16 @@
 import { test, expect } from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
 
+function catalogHtml(
+  params: Array<{ code: string; type: string; targets?: string[] }>,
+): string {
+  const options = params.map(
+    ({ code, type, targets = [] }) =>
+      `<option value="${code}" data-type="${type}" data-targets="${targets.join(",")}"></option>`,
+  );
+  return `<datalist id="param-options">${options.join("")}</datalist>`;
+}
+
 // The Saved Queries workspace (/ui/queries): the shared query builder and the
 // in-page results table — run a query, add builder rows, page through results,
 // and see the datalist of parameters swap per type.
@@ -47,6 +57,219 @@ test.describe("query builder", () => {
     await expect
       .poll(async () => (await queries.results.rows.allInnerTexts()).join())
       .not.toBe(firstPage.join());
+  });
+
+  test("failed pagination preserves the visible page and can be retried", async ({
+    queries,
+  }) => {
+    const pageOrigin = new URL(queries.page.url()).origin;
+    const initialPath = "/Patient?_count=1&_sort=_id";
+    const paginationOrigin = "http://127.0.0.1:1";
+    const paginationPath =
+      "/public/fhir/acme/_paging/opaque-token?_getpages=opaque%2Ftoken&_count=1";
+    const paginationUrl = paginationOrigin + paginationPath;
+    let initialRequests = 0;
+    let paginationAttempts = 0;
+
+    const firstPage = {
+      resourceType: "Bundle",
+      type: "searchset",
+      total: 2,
+      entry: [
+        {
+          fullUrl: `${pageOrigin}/Patient/patient-page-one`,
+          resource: {
+            resourceType: "Patient",
+            id: "patient-page-one",
+            name: [{ family: "First page" }],
+          },
+        },
+      ],
+      link: [
+        { relation: "self", url: pageOrigin + initialPath },
+        { relation: "next", url: paginationUrl },
+      ],
+    };
+    const secondPage = {
+      resourceType: "Bundle",
+      type: "searchset",
+      total: 2,
+      entry: [
+        {
+          fullUrl: `${paginationOrigin}/public/fhir/acme/Patient/patient-page-two`,
+          resource: {
+            resourceType: "Patient",
+            id: "patient-page-two",
+            name: [{ family: "Second page" }],
+          },
+        },
+      ],
+      link: [{ relation: "previous", url: pageOrigin + initialPath }],
+    };
+
+    await queries.page.route("**/*", async (route) => {
+      const request = route.request();
+      const url = request.url();
+      if (request.method() === "GET" && url === pageOrigin + initialPath) {
+        initialRequests += 1;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/fhir+json",
+          body: JSON.stringify(firstPage),
+        });
+        return;
+      }
+      if (url !== paginationUrl) {
+        await route.continue();
+        return;
+      }
+      if (request.method() === "OPTIONS") {
+        await route.fulfill({
+          status: 204,
+          headers: {
+            "Access-Control-Allow-Origin": pageOrigin,
+            "Access-Control-Allow-Methods": "GET",
+            "Access-Control-Allow-Headers": "Accept, X-Tenant-ID",
+          },
+        });
+        return;
+      }
+
+      paginationAttempts += 1;
+      const corsHeaders = {
+        "Access-Control-Allow-Origin": pageOrigin,
+        "Content-Type": "application/fhir+json",
+      };
+      if (paginationAttempts === 1) {
+        await route.abort("failed");
+      } else if (paginationAttempts === 2) {
+        await route.fulfill({
+          status: 502,
+          headers: corsHeaders,
+          body: JSON.stringify({
+            resourceType: "OperationOutcome",
+            issue: [{ diagnostics: "sensitive upstream response" }],
+          }),
+        });
+      } else if (paginationAttempts === 3) {
+        await route.fulfill({
+          status: 200,
+          headers: corsHeaders,
+          body: "not-json",
+        });
+      } else {
+        await route.fulfill({
+          status: 200,
+          headers: corsHeaders,
+          body: JSON.stringify(secondPage),
+        });
+      }
+    });
+
+    await queries.page.evaluate(() => {
+      const trackedWindow = window as typeof window & {
+        __hfsDataChangedFailures?: number;
+        __hfsFetchInputs?: string[];
+      };
+      const nativeFetch = window.fetch.bind(window);
+      trackedWindow.__hfsDataChangedFailures = 0;
+      trackedWindow.__hfsFetchInputs = [];
+      window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        trackedWindow.__hfsFetchInputs?.push(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        );
+        return nativeFetch(input, init);
+      }) as typeof window.fetch;
+      document.addEventListener("hfs:data-changed", (event) => {
+        const detail = (event as CustomEvent).detail;
+        if (detail && detail.source === "query-results") {
+          trackedWindow.__hfsDataChangedFailures =
+            (trackedWindow.__hfsDataChangedFailures || 0) + 1;
+        }
+      });
+    });
+
+    await queries.builder.run(initialPath);
+    await queries.results.waitShown();
+    await expect(queries.results.next).toBeVisible();
+    await expect(queries.results.error).toBeHidden();
+    const visiblePage = await queries.results.visibleState();
+
+    // A network failure leaves every visible result field and pager URL alone.
+    await queries.results.next.click();
+    await expect(queries.results.error).toBeVisible();
+    await expect(queries.results.error).toContainText(paginationOrigin);
+    await expect(queries.results.error).toContainText("HFS_BASE_URL");
+    await expect(queries.results.error).not.toContainText("opaque");
+    await expect.poll(() => paginationAttempts).toBe(1);
+    expect(await queries.results.visibleState()).toEqual(visiblePage);
+    await expect
+      .poll(() =>
+        queries.page.evaluate(
+          () =>
+            (window as typeof window & { __hfsDataChangedFailures?: number })
+              .__hfsDataChangedFailures,
+        ),
+      )
+      .toBe(1);
+    expect(initialRequests).toBe(1);
+
+    // The failure event does not recurse. A real data change repeats the last
+    // successful relative path, not the failed absolute pagination URL.
+    await queries.page.evaluate(() => {
+      document.dispatchEvent(
+        new CustomEvent("hfs:data-changed", { detail: { type: "Patient" } }),
+      );
+    });
+    await expect.poll(() => initialRequests).toBe(2);
+    await expect(queries.results.error).toBeHidden();
+    expect(await queries.results.visibleState()).toEqual(visiblePage);
+
+    // Non-2xx and malformed JSON failures are equally non-destructive. The
+    // server response body and opaque query token never enter the alert.
+    await queries.results.next.click();
+    await expect
+      .poll(() =>
+        queries.page.evaluate(
+          () =>
+            (window as typeof window & { __hfsDataChangedFailures?: number })
+              .__hfsDataChangedFailures,
+        ),
+      )
+      .toBe(2);
+    await expect(queries.results.error).not.toContainText("sensitive upstream response");
+    expect(await queries.results.visibleState()).toEqual(visiblePage);
+
+    await queries.results.next.click();
+    await expect
+      .poll(() =>
+        queries.page.evaluate(
+          () =>
+            (window as typeof window & { __hfsDataChangedFailures?: number })
+              .__hfsDataChangedFailures,
+        ),
+      )
+      .toBe(3);
+    expect(await queries.results.visibleState()).toEqual(visiblePage);
+
+    // The fourth click retries the server-provided URL byte for byte. A valid
+    // Bundle under a public path prefix replaces the page and clears the alert.
+    await queries.results.next.click();
+    await expect(queries.results.rows).toHaveCount(1);
+    await expect(queries.results.rows.first()).toContainText("patient-page-two");
+    await expect(queries.results.rows.first().locator("a.url")).toHaveAttribute(
+      "href",
+      `${paginationOrigin}/public/fhir/acme/Patient/patient-page-two`,
+    );
+    await expect(queries.results.openTab).toHaveAttribute("href", paginationUrl);
+    await expect(queries.results.prev).toBeVisible();
+    await expect(queries.results.error).toBeHidden();
+
+    const fetchInputs = await queries.page.evaluate(
+      () =>
+        (window as typeof window & { __hfsFetchInputs?: string[] }).__hfsFetchInputs || [],
+    );
+    expect(fetchInputs.filter((input) => input === paginationUrl)).toHaveLength(4);
   });
 
   /// Chained search end to end (#406): the two chain directions meet on the
@@ -340,6 +563,40 @@ test.describe("query builder", () => {
     await expect(queries.builder.url).toHaveValue("GET /Patient?family=a\\\\x");
   });
 
+  test("operator cleanup keeps malformed escapes blocked until correction", async ({
+    page,
+    queries,
+  }) => {
+    const searches: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && url.pathname === "/Patient") {
+        searches.push(url.search);
+      }
+    });
+
+    await queries.builder.setUrl("Patient?name:contains=a%5Cx");
+    const row = queries.builder.conditionRows.first();
+    await row.locator(".builder-row__key").fill("gender");
+    await expect(row).toHaveAttribute("data-mod-type", "token");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(queries.builder.error).toBeVisible();
+    await expect(queries.builder.runButton).toBeDisabled();
+    await expect(queries.builder.saveButton).toBeDisabled();
+    await expect(queries.builder.copyButton).toBeDisabled();
+    await queries.builder.url.focus();
+    await page.keyboard.press("Enter");
+    expect(searches).toEqual([]);
+
+    await row.locator(".builder-row__value").fill("a\\x");
+    await expect(queries.builder.error).toBeHidden();
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender=a\\\\x");
+    await expect(queries.builder.runButton).toBeEnabled();
+    await expect(queries.builder.saveButton).toBeEnabled();
+    await expect(queries.builder.copyButton).toBeEnabled();
+    expect(searches).toEqual([]);
+  });
+
   test("the + or button stacks a value; the per-value × removes it", async ({
     queries,
   }) => {
@@ -381,7 +638,540 @@ test.describe("query builder", () => {
     await expect(queries.builder.url).toHaveValue(
       "GET /Patient?name:exact=ge1981,le1990",
     );
+
+    /* Moving the same values onto a date parameter drops `:exact`, which no
+     * ordered type supports (#627); the prefixes they were hiding behind it
+     * become real comparators in the same pass. */
+    await row.locator(".builder-row__key").fill("birthdate");
+    await expect(row).toHaveAttribute("data-mod-type", "date");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(comparators.nth(0)).toHaveValue("ge");
+    await expect(comparators.nth(1)).toHaveValue("le");
+    await expect(values.nth(0)).toHaveValue("1981");
+    await expect(values.nth(1)).toHaveValue("1990");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?birthdate=ge1981,le1990",
+    );
   });
+
+  for (const activationPath of ["select", "chip"] as const) {
+    test(`an unresolved hydrated string stays literal when :exact is activated by ${activationPath}`, async ({
+      page,
+      queries,
+    }) => {
+      let releaseParams!: () => void;
+      const paramsGate = new Promise<void>((resolve) => {
+        releaseParams = resolve;
+      });
+      await page.route("**/ui/queries/params?type=Patient", async (route) => {
+        await paramsGate;
+        await route.continue();
+      });
+      const patientRequests: string[] = [];
+      page.on("request", (request) => {
+        const url = new URL(request.url());
+        if (url.pathname === "/Patient") patientRequests.push(url.search);
+      });
+
+      await queries.builder.setUrl("Patient?name=ge1980");
+      const row = queries.builder.conditionRows.first();
+      if (activationPath === "select") {
+        await row.locator(".builder-row__modifier").selectOption("exact");
+      } else {
+        await row.locator("[data-toggle-mods]").click();
+        await row.locator("[data-mod-chip=exact]").click();
+      }
+
+      await expect(row.locator(".builder-row__modifier")).toHaveValue("exact");
+      await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
+      await expect(row.locator(".builder-row__value")).toHaveValue("1980");
+      await expect(queries.builder.url).toHaveValue("Patient?name=ge1980");
+      await expect(queries.builder.runButton).toBeDisabled();
+      await queries.builder.runButton.evaluate((button: HTMLButtonElement) => button.click());
+      expect(patientRequests).toEqual([]);
+
+      releaseParams();
+      await expect(row).toHaveAttribute("data-mod-type", "string");
+      await expect(row.locator(".builder-row__modifier")).toHaveValue("exact");
+      await expect(row.locator(".builder-row__comparator")).toHaveValue("");
+      await expect(row.locator(".builder-row__comparator")).toBeHidden();
+      await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
+      await expect(queries.builder.url).toHaveValue("GET /Patient?name:exact=ge1980");
+      await expect(page.locator("#query-plain-text")).toContainText(
+        "name is exactly “ge1980”",
+      );
+      await expect(queries.builder.runButton).toBeEnabled();
+      expect(patientRequests).toEqual([]);
+    });
+  }
+
+  for (const activationPath of ["select", "chip"] as const) {
+    test(`delayed and resolved date hydration agree when :missing is activated by ${activationPath}`, async ({
+      page,
+      queries,
+    }) => {
+      let releaseParams!: () => void;
+      const paramsGate = new Promise<void>((resolve) => {
+        releaseParams = resolve;
+      });
+      const paramsRoute = "**/ui/queries/params?type=Patient";
+      await page.route(paramsRoute, async (route) => {
+        await paramsGate;
+        await route.continue();
+      });
+      const patientRequests: string[] = [];
+      page.on("request", (request) => {
+        const url = new URL(request.url());
+        if (url.pathname === "/Patient") patientRequests.push(url.search);
+      });
+
+      await queries.builder.setUrl("Patient?birthdate=ge1980-01-01");
+      let row = queries.builder.conditionRows.first();
+      if (activationPath === "select") {
+        await row.locator(".builder-row__modifier").selectOption("missing");
+      } else {
+        await row.locator("[data-toggle-mods]").click();
+        await row.locator("[data-mod-chip=missing]").click();
+      }
+      await expect(queries.builder.runButton).toBeDisabled();
+      await expect(queries.builder.url).toHaveValue(
+        "Patient?birthdate=ge1980-01-01",
+      );
+      await queries.builder.runButton.evaluate((button: HTMLButtonElement) => button.click());
+      expect(patientRequests).toEqual([]);
+
+      releaseParams();
+      await expect(row).toHaveAttribute("data-mod-type", "date");
+      await expect(queries.builder.runButton).toBeEnabled();
+      const delayed = {
+        value: await row.locator(".builder-row__value").inputValue(),
+        comparator: await row.locator(".builder-row__comparator").inputValue(),
+        modifier: await row.locator(".builder-row__modifier").inputValue(),
+        url: await queries.builder.url.inputValue(),
+        narration: await page.locator("#query-plain-text").innerText(),
+      };
+
+      await page.unroute(paramsRoute);
+      await page.reload({ waitUntil: "networkidle" });
+      await queries.builder.setUrl("Patient?birthdate=ge1980-01-01");
+      row = queries.builder.conditionRows.first();
+      await expect(row).toHaveAttribute("data-mod-type", "date");
+      if (activationPath === "select") {
+        await row.locator(".builder-row__modifier").selectOption("missing");
+      } else {
+        await row.locator("[data-toggle-mods]").click();
+        await row.locator("[data-mod-chip=missing]").click();
+      }
+      const resolved = {
+        value: await row.locator(".builder-row__value").inputValue(),
+        comparator: await row.locator(".builder-row__comparator").inputValue(),
+        modifier: await row.locator(".builder-row__modifier").inputValue(),
+        url: await queries.builder.url.inputValue(),
+        narration: await page.locator("#query-plain-text").innerText(),
+      };
+
+      expect(delayed).toEqual(resolved);
+      expect(delayed).toMatchObject({
+        value: "1980-01-01",
+        comparator: "",
+        modifier: "missing",
+        url: "GET /Patient?birthdate:missing=1980-01-01",
+      });
+      expect(delayed.narration).toContain(
+        "birthdate is present/absent “1980-01-01”",
+      );
+      await expect(queries.builder.runButton).toBeEnabled();
+      expect(patientRequests).toEqual([]);
+    });
+  }
+
+  const pendingComparatorSources = [
+    {
+      name: "ordered date",
+      query: "Patient?birthdate=ge1980-01-01",
+      modifier: "missing",
+      resolvedType: "date",
+      finalComparator: "le",
+      finalValue: "1980-01-01",
+      finalUrl: "GET /Patient?birthdate=le1980-01-01",
+      narration: "birthdate is on or before “1980-01-01”",
+      comparatorHidden: false,
+    },
+    {
+      name: "non-ordered string",
+      query: "Patient?name=ge1980",
+      modifier: "exact",
+      resolvedType: "string",
+      finalComparator: "",
+      finalValue: "le1980",
+      finalUrl: "GET /Patient?name=le1980",
+      narration: "name is “le1980”",
+      comparatorHidden: true,
+    },
+  ] as const;
+
+  for (const source of pendingComparatorSources) {
+    for (const activationPath of ["select", "chip"] as const) {
+      test(`a comparator chosen after pending ${activationPath} modifier waits for ${source.name} classification`, async ({
+        context,
+        page,
+        queries,
+      }) => {
+        let releaseParams!: () => void;
+        const paramsGate = new Promise<void>((resolve) => {
+          releaseParams = resolve;
+        });
+        await page.route("**/ui/queries/params?type=Patient", async (route) => {
+          await paramsGate;
+          await route.continue();
+        });
+        await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+        const patientRequests: string[] = [];
+        page.on("request", (request) => {
+          const url = new URL(request.url());
+          if (url.pathname === "/Patient") patientRequests.push(url.search);
+        });
+
+        await queries.builder.setUrl(source.query);
+        const row = queries.builder.conditionRows.first();
+        if (activationPath === "select") {
+          await row.locator(".builder-row__modifier").selectOption(source.modifier);
+        } else {
+          await row.locator("[data-toggle-mods]").click();
+          await row.locator(`[data-mod-chip=${source.modifier}]`).click();
+        }
+        await expect(queries.builder.runButton).toBeDisabled();
+
+        await row.locator(".builder-row__comparator").selectOption("le");
+        await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+        await expect(row.locator(".builder-row__comparator")).toHaveValue("le");
+        await expect(queries.builder.url).toHaveValue(source.query);
+        await queries.builder.copyButton.click();
+        await expect
+          .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+          .toBe(source.query);
+        await expect(queries.builder.runButton).toBeDisabled();
+        await queries.builder.runButton.evaluate((button: HTMLButtonElement) => button.click());
+        expect(patientRequests).toEqual([]);
+
+        releaseParams();
+        await expect(row).toHaveAttribute("data-mod-type", source.resolvedType);
+        await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+        await expect(row.locator(".builder-row__comparator")).toHaveValue(
+          source.finalComparator,
+        );
+        await expect(row.locator(".builder-row__value")).toHaveValue(
+          source.finalValue,
+        );
+        await expect(queries.builder.url).toHaveValue(source.finalUrl);
+        await expect(page.locator("#query-plain-text")).toContainText(
+          source.narration,
+        );
+        if (source.comparatorHidden) {
+          await expect(row.locator(".builder-row__comparator")).toBeHidden();
+        } else {
+          await expect(row.locator(".builder-row__comparator")).toBeVisible();
+        }
+        await expect(queries.builder.runButton).toBeEnabled();
+        expect(patientRequests).toEqual([]);
+      });
+    }
+  }
+
+  for (const source of pendingComparatorSources) {
+    test(`a direct delayed ${source.name} comparator edit waits for classification`, async ({
+      context,
+      page,
+      queries,
+    }) => {
+      let releaseParams!: () => void;
+      const paramsGate = new Promise<void>((resolve) => {
+        releaseParams = resolve;
+      });
+      await page.route("**/ui/queries/params?type=Patient", async (route) => {
+        await paramsGate;
+        await route.continue();
+      });
+      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+      const patientRequests: string[] = [];
+      page.on("request", (request) => {
+        const url = new URL(request.url());
+        if (url.pathname === "/Patient") patientRequests.push(url.search);
+      });
+
+      await queries.builder.setUrl(source.query);
+      const row = queries.builder.conditionRows.first();
+      await row.locator(".builder-row__comparator").selectOption("le");
+
+      await expect(queries.builder.url).toHaveValue(source.query);
+      await queries.builder.copyButton.click();
+      await expect
+        .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(source.query);
+      await expect(queries.builder.runButton).toBeDisabled();
+      await queries.builder.runButton.evaluate((button: HTMLButtonElement) => button.click());
+      expect(patientRequests).toEqual([]);
+
+      releaseParams();
+      await expect(row).toHaveAttribute("data-mod-type", source.resolvedType);
+      await expect(row.locator(".builder-row__comparator")).toHaveValue(
+        source.finalComparator,
+      );
+      await expect(row.locator(".builder-row__value")).toHaveValue(
+        source.finalValue,
+      );
+      await expect(queries.builder.url).toHaveValue(source.finalUrl);
+      await expect(page.locator("#query-plain-text")).toContainText(
+        source.narration,
+      );
+      await expect(queries.builder.runButton).toBeEnabled();
+      expect(patientRequests).toEqual([]);
+    });
+  }
+
+  test("a comparator on a newly added OR alternative waits for source classification", async ({
+    context,
+    page,
+    queries,
+  }) => {
+    let releaseParams!: () => void;
+    const paramsGate = new Promise<void>((resolve) => {
+      releaseParams = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await paramsGate;
+      await route.continue();
+    });
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const patientRequests: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/Patient") patientRequests.push(url.search);
+    });
+
+    await queries.builder.setUrl("Patient?name=alpha");
+    const row = queries.builder.conditionRows.first();
+    await row.locator("[data-add-or]").click();
+    const values = row.locator(".builder-row__value");
+    const comparators = row.locator(".builder-row__comparator");
+    await values.nth(1).fill("1980");
+    const stable = "GET /Patient?name=alpha,1980";
+    await expect(queries.builder.url).toHaveValue(stable);
+
+    await comparators.nth(1).selectOption("le");
+    await expect(queries.builder.url).toHaveValue(stable);
+    await queries.builder.copyButton.click();
+    await expect
+      .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(stable);
+    await expect(queries.builder.runButton).toBeDisabled();
+    await queries.builder.runButton.evaluate((button: HTMLButtonElement) => button.click());
+    expect(patientRequests).toEqual([]);
+
+    releaseParams();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await expect(comparators.nth(0)).toHaveValue("");
+    await expect(comparators.nth(1)).toHaveValue("");
+    await expect(comparators.nth(0)).toBeHidden();
+    await expect(comparators.nth(1)).toBeHidden();
+    await expect(values.nth(0)).toHaveValue("alpha");
+    await expect(values.nth(1)).toHaveValue("le1980");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?name=alpha,le1980",
+    );
+    await expect(page.locator("#query-plain-text")).toContainText(
+      "name is “alpha” or “le1980”",
+    );
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(patientRequests).toEqual([]);
+  });
+
+  test("clearing the last unresolved comparator cancels classification", async ({
+    context,
+    page,
+    queries,
+  }) => {
+    let releaseParams!: () => void;
+    const paramsGate = new Promise<void>((resolve) => {
+      releaseParams = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await paramsGate;
+      await route.continue();
+    });
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const patientRequests: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/Patient") patientRequests.push(url.search);
+    });
+
+    const original = "Patient?name=ge1980";
+    await queries.builder.setUrl(original);
+    const row = queries.builder.conditionRows.first();
+    const comparator = row.locator(".builder-row__comparator");
+    await comparator.selectOption("le");
+    await expect(queries.builder.url).toHaveValue(original);
+    await queries.builder.copyButton.click();
+    await expect
+      .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(original);
+    await expect(queries.builder.runButton).toBeDisabled();
+
+    await comparator.selectOption("");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name=1980");
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(patientRequests).toEqual([]);
+
+    releaseParams();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await expect(comparator).toHaveValue("");
+    await expect(comparator).toBeHidden();
+    await expect(row.locator(".builder-row__value")).toHaveValue("1980");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name=1980");
+    await expect(page.locator("#query-plain-text")).toContainText(
+      "name is “1980”",
+    );
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(patientRequests).toEqual([]);
+  });
+
+  test("pending comparator classification survives modifier toggles and a parameter transition", async ({
+    page,
+    queries,
+  }) => {
+    let releaseParams!: () => void;
+    const paramsGate = new Promise<void>((resolve) => {
+      releaseParams = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await paramsGate;
+      await route.continue();
+    });
+    const patientRequests: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/Patient") patientRequests.push(url.search);
+    });
+
+    const original = "Patient?name=ge1980";
+    await queries.builder.setUrl(original);
+    const row = queries.builder.conditionRows.first();
+    const modifier = row.locator(".builder-row__modifier");
+    await modifier.selectOption("exact");
+    await row.locator(".builder-row__comparator").selectOption("le");
+    await modifier.selectOption("exact");
+    await modifier.selectOption("");
+    await row.locator(".builder-row__key").fill("birthdate");
+
+    await expect(queries.builder.url).toHaveValue(original);
+    await expect(queries.builder.runButton).toBeDisabled();
+    expect(patientRequests).toEqual([]);
+
+    releaseParams();
+    await expect(row).toHaveAttribute("data-mod-type", "date");
+    await expect(modifier).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("le");
+    await expect(row.locator(".builder-row__value")).toHaveValue("1980");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?birthdate=le1980",
+    );
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(patientRequests).toEqual([]);
+  });
+
+  test("removing a row releases pending comparator classification", async ({
+    page,
+    queries,
+  }) => {
+    let releaseParams!: () => void;
+    const paramsGate = new Promise<void>((resolve) => {
+      releaseParams = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await paramsGate;
+      await route.continue();
+    });
+    const patientRequests: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/Patient") patientRequests.push(url.search);
+    });
+
+    await queries.builder.setUrl("Patient?name=ge1980");
+    const row = queries.builder.conditionRows.first();
+    await row.locator(".builder-row__modifier").selectOption("exact");
+    await row.locator(".builder-row__comparator").selectOption("le");
+    await expect(queries.builder.runButton).toBeDisabled();
+
+    await row.locator("[data-remove-row]").click();
+    await expect(queries.builder.conditionRows).toHaveCount(0);
+    await expect(queries.builder.url).toHaveValue("GET /Patient");
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(patientRequests).toEqual([]);
+
+    releaseParams();
+    await expect(queries.builder.conditionRows).toHaveCount(0);
+    await expect(queries.builder.url).toHaveValue("GET /Patient");
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(patientRequests).toEqual([]);
+  });
+
+  for (const activationPath of ["select", "chip"] as const) {
+    test(`value edits stay transactional during pending ${activationPath} modifier activation`, async ({
+      context,
+      page,
+      queries,
+    }) => {
+      let releaseParams!: () => void;
+      const paramsGate = new Promise<void>((resolve) => {
+        releaseParams = resolve;
+      });
+      await page.route("**/ui/queries/params?type=Patient", async (route) => {
+        await paramsGate;
+        await route.continue();
+      });
+      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+      const patientRequests: string[] = [];
+      page.on("request", (request) => {
+        const url = new URL(request.url());
+        if (url.pathname === "/Patient") patientRequests.push(url.search);
+      });
+
+      const original = "Patient?name=ge1980";
+      await queries.builder.setUrl(original);
+      const row = queries.builder.conditionRows.first();
+      if (activationPath === "select") {
+        await row.locator(".builder-row__modifier").selectOption("exact");
+      } else {
+        await row.locator("[data-toggle-mods]").click();
+        await row.locator("[data-mod-chip=exact]").click();
+      }
+      await row.locator(".builder-row__value").fill("1981");
+
+      await expect(queries.builder.url).toHaveValue(original);
+      await queries.builder.copyButton.click();
+      await expect
+        .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(original);
+      await expect(queries.builder.runButton).toBeDisabled();
+      await queries.builder.runButton.evaluate((button: HTMLButtonElement) => button.click());
+      expect(patientRequests).toEqual([]);
+
+      releaseParams();
+      await expect(row).toHaveAttribute("data-mod-type", "string");
+      await expect(row.locator(".builder-row__modifier")).toHaveValue("exact");
+      await expect(row.locator(".builder-row__comparator")).toHaveValue("");
+      await expect(row.locator(".builder-row__comparator")).toBeHidden();
+      await expect(row.locator(".builder-row__value")).toHaveValue("ge1981");
+      await expect(queries.builder.url).toHaveValue("GET /Patient?name:exact=ge1981");
+      await expect(page.locator("#query-plain-text")).toContainText(
+        "name is exactly “ge1981”",
+      );
+      await expect(queries.builder.runButton).toBeEnabled();
+      expect(patientRequests).toEqual([]);
+    });
+  }
 
   const mixedComparatorOrders = [
     {
@@ -474,6 +1264,254 @@ test.describe("query builder", () => {
     await expect(queries.builder.url).toHaveValue("GET /Patient?birthdate=ge1980-01-02");
   });
 
+  test("changing a date parameter clears every incompatible OR comparator before Run", async ({
+    page,
+    queries,
+  }) => {
+    const patientRequests: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/Patient") patientRequests.push(url.search);
+    });
+
+    await queries.builder.setUrl(
+      "Patient?birthdate=ge1980-01-02,le1990-12-31",
+    );
+    const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "date");
+
+    await row.locator(".builder-row__key").fill("name");
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await expect(row.locator(".builder-row__comparator").nth(0)).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator").nth(1)).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator").nth(0)).toBeHidden();
+    await expect(row.locator(".builder-row__comparator").nth(1)).toBeHidden();
+    await expect(row.locator(".builder-row__value").nth(0)).toHaveValue("1980-01-02");
+    await expect(row.locator(".builder-row__value").nth(1)).toHaveValue("1990-12-31");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?name=1980-01-02,1990-12-31",
+    );
+    await expect(page.locator("#query-plain-text")).toContainText(
+      "name is “1980-01-02” or “1990-12-31”",
+    );
+    expect(patientRequests).toEqual([]);
+
+    const sentRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return url.pathname === "/Patient" && url.searchParams.has("name");
+    });
+    await queries.builder.runButton.click();
+    const sent = new URL((await sentRequest).url());
+    expect(sent.searchParams.get("name")).toBe("1980-01-02,1990-12-31");
+    expect(patientRequests).toHaveLength(1);
+  });
+
+  test("known string prefix-lookalikes hydrate literally while unknown parameters stay permissive", async ({
+    page,
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?name=ge1980,le1990");
+    let row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await expect(row.locator(".builder-row__comparator").nth(0)).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator").nth(1)).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator").nth(0)).toBeHidden();
+    await expect(row.locator(".builder-row__value").nth(0)).toHaveValue("ge1980");
+    await expect(row.locator(".builder-row__value").nth(1)).toHaveValue("le1990");
+    await expect(queries.builder.url).toHaveValue("Patient?name=ge1980,le1990");
+    await expect(page.locator("#query-plain-text")).toContainText(
+      "name is “ge1980” or “le1990”",
+    );
+
+    await queries.builder.setUrl("Patient?unregistered=ge1980");
+    row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
+    await expect(row.locator(".builder-row__comparator")).toBeVisible();
+    await expect(row.locator(".builder-row__value")).toHaveValue("1980");
+    await expect(queries.builder.url).toHaveValue("Patient?unregistered=ge1980");
+
+    await queries.builder.setUrl("Patient?link:Patient.name=ge1980");
+    row = queries.builder.chainRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
+    await expect(page.locator("#query-plain-text")).toContainText("name is “ge1980”");
+    await expect(page.locator("#query-plain-text")).not.toContainText("on or after");
+
+    await queries.builder.setUrl("Patient?_has:Observation:patient:code=ge1980");
+    row = queries.builder.hasRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "token");
+    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
+    await expect(page.locator("#query-plain-text")).toContainText("code is “ge1980”");
+    await expect(page.locator("#query-plain-text")).not.toContainText("on or after");
+  });
+
+  test("forward and reverse chain leaf changes clear incompatible comparators", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?link:Patient.birthdate=ge1980-01-02");
+    let row = queries.builder.chainRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "date");
+    await row.locator(".builder-row__cparam").fill("name");
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?link:Patient.name=1980-01-02",
+    );
+
+    await queries.builder.setUrl(
+      "Patient?_has:Observation:patient:date=le2020-01-01",
+    );
+    row = queries.builder.hasRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "date");
+    await row.locator(".builder-row__cparam").fill("code");
+    await expect(row).toHaveAttribute("data-mod-type", "token");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_has:Observation:patient:code=2020-01-01",
+    );
+  });
+
+  test("Run stays blocked while a parameter transition awaits metadata", async ({
+    page,
+    queries,
+  }) => {
+    let releaseParams!: () => void;
+    let delayed = true;
+    const paramsGate = new Promise<void>((resolve) => {
+      releaseParams = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      if (delayed) await paramsGate;
+      await route.continue();
+    });
+    const patientRequests: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/Patient") patientRequests.push(url.search);
+    });
+
+    await queries.builder.setUrl("Patient?birthdate=ge1980-01-02");
+    const row = queries.builder.conditionRows.first();
+    await row.locator(".builder-row__key").fill("name");
+    await expect(queries.builder.runButton).toBeDisabled();
+    await queries.builder.runButton.evaluate((button: HTMLButtonElement) => button.click());
+    expect(patientRequests).toEqual([]);
+
+    delayed = false;
+    releaseParams();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name=1980-01-02");
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(patientRequests).toEqual([]);
+  });
+
+  test("a delayed known-string hydration stays literal across a direct parameter edit", async ({
+    page,
+    queries,
+  }) => {
+    let releaseParams!: () => void;
+    const paramsGate = new Promise<void>((resolve) => {
+      releaseParams = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await paramsGate;
+      await route.continue();
+    });
+
+    await queries.builder.setUrl("Patient?name=ge1980");
+    const row = queries.builder.conditionRows.first();
+    await row.locator(".builder-row__key").fill("family");
+    await expect(queries.builder.runButton).toBeDisabled();
+
+    releaseParams();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?family=ge1980");
+    await expect(page.locator("#query-plain-text")).toContainText("family is “ge1980”");
+    await expect(queries.builder.runButton).toBeEnabled();
+  });
+
+  test("delayed known-string hydration stays literal across chain leaf edits", async ({
+    page,
+    queries,
+  }) => {
+    let releasePatient!: () => void;
+    const patientGate = new Promise<void>((resolve) => {
+      releasePatient = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await patientGate;
+      await route.continue();
+    });
+
+    await queries.builder.setUrl("Patient?link:Patient.name=ge1980");
+    let row = queries.builder.chainRows.first();
+    await row.locator(".builder-row__cparam").fill("family");
+    await expect(queries.builder.runButton).toBeDisabled();
+    releasePatient();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?link:Patient.family=ge1980",
+    );
+
+    await page.reload({ waitUntil: "networkidle" });
+    let releaseObservation!: () => void;
+    const observationGate = new Promise<void>((resolve) => {
+      releaseObservation = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Observation", async (route) => {
+      await observationGate;
+      await route.continue();
+    });
+
+    await queries.builder.setUrl("Patient?_has:Observation:patient:code=ge1980");
+    row = queries.builder.hasRows.first();
+    await row.locator(".builder-row__cparam").fill("category");
+    await expect(queries.builder.runButton).toBeDisabled();
+    releaseObservation();
+    await expect(row).toHaveAttribute("data-mod-type", "token");
+    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_has:Observation:patient:category=ge1980",
+    );
+  });
+
+  test("number and quantity parameters retain ordered comparator controls", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("RiskAssessment?probability=ge0.5");
+    let row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "number");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
+    await expect(row.locator(".builder-row__comparator")).toBeVisible();
+    await expect(row.locator(".builder-row__value")).toHaveValue("0.5");
+    await row.locator(".builder-row__comparator").selectOption("gt");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /RiskAssessment?probability=gt0.5",
+    );
+
+    await queries.builder.setUrl("Observation?value-quantity=le5");
+    row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "quantity");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("le");
+    await expect(row.locator(".builder-row__comparator")).toBeVisible();
+    await expect(row.locator(".builder-row__value")).toHaveValue("5");
+    await row.locator(".builder-row__comparator").selectOption("ge");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Observation?value-quantity=ge5",
+    );
+  });
+
   test("date comparators stay available in forward and reverse chains", async ({
     queries,
   }) => {
@@ -510,6 +1548,346 @@ test.describe("query builder", () => {
     const opts = await row.locator(".builder-row__modifier option").allTextContents();
     expect(opts).not.toContain("ge");
     expect(opts).not.toContain(":in");
+  });
+
+  test("changing a parameter removes incompatible modifiers before the query can run", async ({
+    page,
+    queries,
+  }) => {
+    const searches: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && url.pathname === "/Patient") {
+        searches.push(url.search);
+      }
+    });
+
+    await queries.builder.setUrl("Patient?name:contains=OrAlpha556");
+    const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await row.locator(".builder-row__key").fill("gender");
+
+    await expect(row).toHaveAttribute("data-mod-type", "token");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender=OrAlpha556");
+    await expect(page.locator("#query-plain-text")).toContainText(
+      "gender is “OrAlpha556”",
+    );
+    expect(searches).toEqual([]);
+
+    const sent = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === "GET" && url.pathname === "/Patient";
+    });
+    await queries.builder.runButton.click();
+    expect(new URL((await sent).url()).search).toBe("?gender=OrAlpha556");
+  });
+
+  test("known parameter types expose the complete modifier matrix", async ({ page, queries }) => {
+    const scenarios = [
+      {
+        key: "string-param",
+        type: "string",
+        modifiers: ["exact", "contains", "text", "missing"],
+      },
+      {
+        key: "token-param",
+        type: "token",
+        modifiers: ["text", "not", "above", "below", "in", "not-in", "of-type", "missing"],
+      },
+      {
+        key: "reference-param",
+        type: "reference",
+        modifiers: ["contains", "text", "above", "below", "identifier", "missing"],
+      },
+      {
+        key: "uri-param",
+        type: "uri",
+        modifiers: ["contains", "above", "below", "missing"],
+      },
+      { key: "date-param", type: "date", modifiers: ["missing"] },
+      { key: "number-param", type: "number", modifiers: ["missing"] },
+      { key: "quantity-param", type: "quantity", modifiers: ["missing"] },
+      { key: "composite-param", type: "composite", modifiers: [] },
+      { key: "special-param", type: "special", modifiers: [] },
+    ];
+    await page.route("**/ui/queries/params?type=Matrix", async (route) => {
+      await route.fulfill({
+        contentType: "text/html",
+        body: catalogHtml(
+          scenarios.map(({ key, type }) => ({ code: key, type })),
+        ),
+      });
+    });
+
+    for (const scenario of scenarios) {
+      await queries.builder.setUrl(`Matrix?${scenario.key}=x`);
+      const row = queries.builder.conditionRows.first();
+      await expect(row).toHaveAttribute("data-mod-type", scenario.type);
+      const values = await row.locator(".builder-row__modifier option").evaluateAll((options) =>
+        options.slice(1).map((option) => (option as HTMLOptionElement).value),
+      );
+      expect(values).toEqual(scenario.modifiers);
+    }
+  });
+
+  test("compatibility-only and ambiguous modifiers are preserved only where valid", async ({
+    page,
+    queries,
+  }) => {
+    const catalogs: Record<
+      string,
+      Array<{ code: string; type: string; targets?: string[] }>
+    > = {
+      Matrix: [
+        { code: "string-param", type: "string" },
+        { code: "token-param", type: "token" },
+        { code: "reference-param", type: "reference" },
+        { code: "subject", type: "reference", targets: ["Left", "Right"] },
+      ],
+      Left: [{ code: "leaf", type: "string" }],
+      Right: [{ code: "leaf", type: "token" }],
+    };
+    await page.route("**/ui/queries/params?type=*", async (route) => {
+      const type = new URL(route.request().url()).searchParams.get("type") || "";
+      await route.fulfill({
+        contentType: "text/html",
+        body: catalogHtml(catalogs[type] || []),
+      });
+    });
+
+    const transitions = [
+      { modifier: "text-advanced", from: "token-param", to: "string-param" },
+      { modifier: "code-text", from: "reference-param", to: "string-param" },
+      { modifier: "Patient", from: "reference-param", to: "token-param" },
+    ];
+    for (const transition of transitions) {
+      await queries.builder.setUrl(
+        `Matrix?${transition.from}:${transition.modifier}=x`,
+      );
+      const row = queries.builder.conditionRows.first();
+      await expect(row.locator(".builder-row__modifier")).toHaveValue(
+        transition.modifier,
+      );
+      await row.locator(".builder-row__key").fill(transition.to);
+      await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+      await expect(queries.builder.url).toHaveValue(
+        `GET /Matrix?${transition.to}=x`,
+      );
+    }
+
+    await queries.builder.setUrl("Matrix?subject.leaf:opaque=x");
+    const chain = queries.builder.chainRows.first();
+    await expect(chain).toHaveAttribute("data-compat-state", "unknown");
+    await expect(chain.locator(".builder-row__modifier")).toHaveValue("opaque");
+    await expect(queries.builder.url).toHaveValue("Matrix?subject.leaf:opaque=x");
+  });
+
+  test("removing a modifier rehydrates every ordered prefix exactly once", async ({
+    page,
+    queries,
+  }) => {
+    await page.route("**/ui/queries/params?type=Matrix", async (route) => {
+      await route.fulfill({
+        contentType: "text/html",
+        body: catalogHtml([
+          { code: "text-param", type: "string" },
+          { code: "ordered-param", type: "date" },
+        ]),
+      });
+    });
+
+    for (const prefix of ["eq", "ne", "gt", "ge", "lt", "le", "sa", "eb", "ap"]) {
+      await queries.builder.setUrl(
+        `Matrix?text-param:contains=${prefix}1980`,
+      );
+      const row = queries.builder.conditionRows.first();
+      await row.locator(".builder-row__key").fill("ordered-param");
+      await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+      await expect(row.locator(".builder-row__comparator")).toHaveValue(prefix);
+      await expect(row.locator(".builder-row__value")).toHaveValue("1980");
+      await expect(queries.builder.url).toHaveValue(
+        `GET /Matrix?ordered-param=${prefix}1980`,
+      );
+      if (prefix === "eq") {
+        await row.locator(".builder-row__comparator").selectOption("le");
+        await expect(queries.builder.url).toHaveValue(
+          "GET /Matrix?ordered-param=le1980",
+        );
+      }
+    }
+  });
+
+  test("compatible modifiers survive while incompatible value prefixes are removed", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?name:missing=true");
+    let row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await row.locator(".builder-row__key").fill("gender");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("missing");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender:missing=true");
+
+    await queries.builder.setUrl("Patient?birthdate=ge1980-01-01");
+    row = queries.builder.conditionRows.first();
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
+    await row.locator(".builder-row__key").fill("gender");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender=1980-01-01");
+  });
+
+  test("forward and reverse chain leaves reconcile their operators", async ({ queries }) => {
+    await queries.builder.setUrl("Observation?subject:Patient.name:contains=ge1980");
+    let row = queries.builder.chainRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    await row.locator(".builder-row__cparam").fill("birthdate");
+    await expect(row).toHaveAttribute("data-mod-type", "date");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
+    await expect(row.locator(".builder-row__value")).toHaveValue("1980");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Observation?subject:Patient.birthdate=ge1980",
+    );
+
+    await queries.builder.setUrl("Patient?_has:Observation:patient:code:not=ge1980");
+    row = queries.builder.hasRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "token");
+    await row.locator(".builder-row__cparam").fill("date");
+    await expect(row).toHaveAttribute("data-mod-type", "date");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("");
+    await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
+    await expect(row.locator(".builder-row__value")).toHaveValue("1980");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_has:Observation:patient:date=ge1980",
+    );
+  });
+
+  test("pending catalog metadata blocks every builder consumer and coalesces one URL update", async ({
+    page,
+    queries,
+  }) => {
+    let releaseCatalog: () => void = () => {};
+    const catalogReleased = new Promise<void>((resolve) => {
+      releaseCatalog = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await catalogReleased;
+      await route.continue();
+    });
+    const searches: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && url.pathname === "/Patient") {
+        searches.push(url.search);
+      }
+    });
+
+    await queries.builder.setUrl("Patient?name:contains=OrAlpha556");
+    const row = queries.builder.conditionRows.first();
+    await row.locator(".builder-row__key").fill("gender");
+    await expect(row).toHaveAttribute("data-compat-state", "pending");
+    await expect(queries.builder.runButton).toBeDisabled();
+    await expect(queries.builder.saveButton).toBeDisabled();
+    await expect(queries.builder.copyButton).toBeDisabled();
+    await queries.builder.url.focus();
+    await page.keyboard.press("Enter");
+    expect(searches).toEqual([]);
+
+    releaseCatalog();
+    await expect(row).toHaveAttribute("data-compat-state", "known");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?gender=OrAlpha556");
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(searches).toEqual([]);
+
+    const sent = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === "GET" && url.pathname === "/Patient";
+    });
+    await queries.builder.runButton.click();
+    expect(new URL((await sent).url()).search).toBe("?gender=OrAlpha556");
+  });
+
+  test("removing the last pending row immediately releases builder consumers", async ({
+    page,
+    queries,
+  }) => {
+    let releaseCatalog: () => void = () => {};
+    const catalogReleased = new Promise<void>((resolve) => {
+      releaseCatalog = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await catalogReleased;
+      await route.continue();
+    });
+
+    await queries.builder.setUrl("Patient?name=x");
+    const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-compat-state", "pending");
+    await row.locator("[data-remove-row]").click();
+    await expect(queries.builder.conditionRows).toHaveCount(0);
+    await expect(queries.builder.url).toHaveValue("GET /Patient");
+    await expect(queries.builder.runButton).toBeEnabled();
+    await expect(queries.builder.saveButton).toBeEnabled();
+    await expect(queries.builder.copyButton).toBeEnabled();
+
+    releaseCatalog();
+    await expect(queries.builder.runButton).toBeEnabled();
+    await expect(queries.builder.url).toHaveValue("GET /Patient");
+  });
+
+  test("unknown parameters and catalog failures remain permissive", async ({ page, queries }) => {
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await route.fulfill({ status: 503, body: "catalog unavailable" });
+    });
+
+    await queries.builder.setUrl("Patient?future-param:opaque=x");
+    const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-compat-state", "unknown");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("opaque");
+    await expect(queries.builder.url).toHaveValue("Patient?future-param:opaque=x");
+    await expect(queries.builder.runButton).toBeEnabled();
+  });
+
+  test("no-op catalog reconciliation preserves the exact loaded URL", async ({ queries }) => {
+    const exact = "GET /Patient?name:exact=Copy%5C%2C627";
+    await queries.builder.setUrl(exact);
+    const row = queries.builder.conditionRows.first();
+
+    await expect(row).toHaveAttribute("data-compat-state", "known");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("exact");
+    await expect(queries.builder.runButton).toBeEnabled();
+    await expect(queries.builder.url).toHaveValue(exact);
+  });
+
+  test("editing a pending deep link cancels its deferred auto-run", async ({ page, queries }) => {
+    let releaseCatalog: () => void = () => {};
+    const catalogReleased = new Promise<void>((resolve) => {
+      releaseCatalog = resolve;
+    });
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await catalogReleased;
+      await route.continue();
+    });
+    const searches: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && url.pathname === "/Patient") {
+        searches.push(url.search);
+      }
+    });
+
+    const deepLink = encodeURIComponent("/Patient?name:contains=before");
+    await page.goto(`/ui/queries?url=${deepLink}`);
+    const row = queries.builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-compat-state", "pending");
+    await row.locator(".builder-row__value").fill("after");
+    releaseCatalog();
+
+    await expect(row).toHaveAttribute("data-compat-state", "known");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name:contains=after");
+    await expect(queries.builder.runButton).toBeEnabled();
+    expect(searches).toEqual([]);
   });
 
   test("the MODIFY panel explains its chips", async ({ queries }) => {
