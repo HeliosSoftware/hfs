@@ -783,3 +783,52 @@ UNION ALL
 SELECT 'idx_search_composite (dropped entirely)',
        0, count(*)
 FROM search_index WHERE tenant_id = 'default' AND composite_group IS NOT NULL;
+
+\echo '######## AM. BASE quantity Observation?value-quantity — the shape nothing modelled ########'
+-- Added 2026-08-27 after run 33077075313. Normalising that run's per-shape p99
+-- against the median shape ratio — the estimator for the neighbour-load factor
+-- that multiplied every statement, since a tight IQR means one common cause —
+-- left most shapes at 0.93-1.04x (unchanged, as expected) but put
+-- `quantity Observation value-quantity` at 0.20x: five times worse than the
+-- environment explains.
+--
+-- Nothing in that commit touched base quantity rows. The census confirms it:
+-- `value-quantity` held 512,311 rows over 512,311 resources before and after.
+-- What DID change is the table around it — the commit removed 8.55M rows
+-- (-21.6%), so `value-quantity` is now a materially larger fraction of
+-- `search_index`, and per-`param_name` selectivity is what the planner uses to
+-- choose between the value-first and recent-first indexes. A statistics-driven
+-- plan flip on an untouched shape is the hypothesis; this section is what can
+-- confirm or kill it.
+--
+-- Three values spanning the selectivity range the benchmark actually sends
+-- (k6/searchConfig.js: value-quantity uses gt/lt over 0-200 plus a no-match
+-- sentinel), because a plan that is right for one end can be wrong for the
+-- other — the exact way the v20 regression hid from a single-value capture.
+\echo '-- AM1: broad (most Observations match) — early termination expected'
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'value-quantity' AND value_quantity_value > 0
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) s
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = s.resource_id AND NOT r.is_deleted;
+
+\echo '-- AM2: selective (few match) — value-first index must still win'
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'value-quantity' AND value_quantity_value > 900000
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) s
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = s.resource_id AND NOT r.is_deleted;
+
+\echo '-- AM3: what the planner believes about this parameter'
+SELECT n_distinct, most_common_freqs[1:3] AS top_freqs
+FROM pg_stats WHERE tablename = 'search_index' AND attname = 'param_name';
+SELECT count(*) AS value_quantity_rows,
+       (SELECT count(*) FROM search_index WHERE tenant_id = 'default') AS table_rows
+FROM search_index
+WHERE tenant_id = 'default' AND resource_type = 'Observation' AND param_name = 'value-quantity';
