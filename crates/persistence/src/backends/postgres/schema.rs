@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 26;
+pub const SCHEMA_VERSION: i32 = 27;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -329,6 +329,7 @@ async fn migrate_schema(
             23 => migrate_v23_to_v24(client).await?,
             24 => migrate_v24_to_v25(client).await?,
             25 => migrate_v25_to_v26(client).await?,
+            26 => migrate_v26_to_v27(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1474,6 +1475,199 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v25->v26 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v26 -> v27: give the composite covering indexes the fast path's sort key —
+/// as KEY columns — and give them back the payload v26 took away.
+///
+/// ## The regression this repairs
+///
+/// Composite is the search suite's remaining outlier. On run 33086933938
+/// `pg_stat_statements` puts the two composite statements at 396.2 s / 22,190
+/// calls (17.85 ms mean) and 116.4 s / 7,767 calls (14.99 ms) — a mean ~3x the
+/// next shape and ~14x the reference shape. The two entries are the two
+/// spellings `build_composite_component` emits for the token component:
+/// `value_token_code = $n` for a bare code, and
+/// `value_token_system = $n AND value_token_code = $m` for the `system|code`
+/// form, which is why they are separate texts with a ~3:1 call split — exactly
+/// the 21:6 bare:qualified split of the composite values in
+/// `k6/searchConfig.js`.
+///
+/// Worse, `composite Observation combo-code-value-quantity` p99 went **88 ms ->
+/// 114 ms** between runs 33029355759 (v25) and 33086933938 (v26), in absolute
+/// terms, against an environment 1.58x friendlier. v26 is the only schema
+/// change between them, and the cause is in its diff rather than its reasoning:
+///
+/// ```text
+/// v17:  INCLUDE (resource_id, last_updated)   WHERE composite_group IS NOT NULL
+/// v26:  INCLUDE (resource_id)                 WHERE composite_group IS NOT NULL
+///                                               AND value_quantity_value IS NOT NULL
+/// ```
+///
+/// v26's docstring argues only about the predicate; it never mentions the
+/// payload. The `INCLUDE (resource_id)` text was copied from `create_indexes`
+/// (the v1 shape) instead of from `migrate_v16_to_v17` (the shape actually in
+/// the database), so `last_updated` was dropped silently. A single-parameter
+/// composite search takes the v17 fast path —
+/// `build_composite_condition` emits exactly one `id IN (SELECT resource_id
+/// FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND …)`, which
+/// `single_index_predicate` extracts (pinned by
+/// `the_composite_fast_path_predicate_is_extractable`) — and that path runs
+///
+/// ```sql
+/// SELECT DISTINCT resource_id, last_updated FROM search_index
+/// WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '…'
+///   AND composite_group IS NOT NULL
+///   AND (value_token_code = $3) AND (value_quantity_value > $4)
+/// ORDER BY last_updated DESC, resource_id ASC LIMIT 21
+/// ```
+///
+/// `last_updated` is in that target list. Without it in the index the scan
+/// cannot be index-only, so every matching row costs a heap fetch into the
+/// ~6 GB heap — and a composite parameter's rows are scattered across a 22.6M
+/// row table, so that is close to one random page per row. That is the 88 ->
+/// 114 ms.
+///
+/// **So round 2 was half wrong, and only half.** Its predicate argument holds
+/// and is kept verbatim below: `build_composite_component` emits
+/// `value_quantity_value <op> $n` for every quantity spelling it has —
+/// including the three-part `value|unit` form, which only adds a conjunct — and
+/// `<op>` is always strict, so `predtest.c` proves `value_quantity_value IS NOT
+/// NULL`; the token+token predicate is the disjunction of the two slot-2
+/// spellings, and an OR predicate is proven from either arm. Verified for
+/// `combo-code-value-quantity` specifically: all seven of its benchmark values
+/// are `code$<op><number>`, so all seven emit a strict quantity operator. The
+/// payload change that rode along with it is what regressed, and it is undone
+/// here.
+///
+/// ## The general fix: stop sorting the match set
+///
+/// Restoring `last_updated` to `INCLUDE` would undo the regression and leave
+/// the shape where v25 had it — still 17.85 ms, because payload is not
+/// ordering. This is trap 6 and v19's own finding: **`INCLUDE` columns are
+/// payload, not key columns, and cannot satisfy an `ORDER BY`.** With the sort
+/// key only in the payload the plan must read *every* matching index row and
+/// sort it to find 21. `code-value-quantity=8302-2$gt170` (body height over
+/// 170 cm) matches a large fraction of a code slice that is tens of thousands
+/// of rows; the LIMIT buys nothing.
+///
+/// v20 settled how to fix that for an equality predicate: put the value ahead
+/// of the sort key and you get both — the scan seeks straight to the one value,
+/// and *within* that value the rows are already in `last_updated DESC,
+/// resource_id ASC` order, so `DISTINCT` becomes a streaming `Unique` and the
+/// `LIMIT` stops the scan whatever the value's selectivity. A composite
+/// token+quantity search is an equality on the token component and a range on
+/// the quantity component, so the token component leads the key and the
+/// quantity column moves to the payload, where the scan filters it without
+/// touching the heap — the identical trade v20 made for `value_token_system` on
+/// `idx_search_token_code`, and the reason that column is proven to work as an
+/// index-only filter here.
+///
+/// `value_token_system` joins it in the payload, which is what fixes the second
+/// statement (7,767 calls): the `system|code` form adds
+/// `value_token_system = $n`, and with the column in the index that stays
+/// index-only instead of falling back to a heap fetch per candidate row.
+///
+/// token+token gets the same treatment with *both* equality columns ahead of
+/// the sort key. The benchmark never issues that family — 20 of the 46 R4
+/// composites are in it and real callers do — so this is not measured here; it
+/// is the same defect (v26 dropped its `last_updated` too) and the same repair.
+///
+/// ## The trade, stated plainly
+///
+/// Keying on the token value instead of on `(value_token_code,
+/// value_quantity_value)` gives up the ability to seek past rows the quantity
+/// range excludes. A value that matches a *large* code slice but almost none of
+/// its rows — `29463-7$lt5` (body weight under 5 kg) or `2339-0$gt140` — now
+/// walks that code's slice index-only rather than seeking to an empty range.
+/// That is bounded: a code slice here is tens of thousands of entries, an
+/// index-only walk of which is milliseconds, and it is bounded *better* than
+/// what it replaces, because the value-first index sorts its whole match set on
+/// every broad value — which is the common case and the measured 17.85 ms. The
+/// worst case of the new shape is cheaper than the typical case of the old one,
+/// which is why this replaces the index rather than adding a second one
+/// alongside it.
+///
+/// Keeping both was considered and rejected on that arithmetic plus the write
+/// side. It would also not work as intended: `value_quantity_value`'s histogram
+/// is pooled across every parameter and every code in the table, so the planner
+/// estimates `> 100` identically for every composite value and would pick one
+/// plan for all of them regardless. There is no per-code selectivity for it to
+/// choose on. Plan sections AM-AQ measure both regimes so the next round has
+/// the numbers rather than this argument.
+///
+/// ## Write-side cost
+///
+/// **No new index and no new index insert.** Both indexes keep exactly the row
+/// set v26 gave them — the same partial predicates, unchanged — so the number
+/// of btree insertions per imported row is identical. What changes is the width
+/// of an entry in two indexes that between them hold roughly 2.3M of the 22.6M
+/// index rows (`combo-code-value-quantity` alone is 1,149,190):
+///
+/// - token+quantity: `+last_updated` 8 bytes as a key column, `resource_id`
+///   moves from payload to key at the same width, `+value_quantity_value` 8
+///   bytes and `+value_token_system` ~16 bytes of payload. ~+32 bytes on an
+///   entry of ~100, so that index grows by roughly a third — tens of megabytes
+///   against a 20 GB index set.
+/// - token+token: `+last_updated` 8 bytes, `+value_token_system_2` payload,
+///   `value_token_code_2` promoted from key position 5 to the same key at the
+///   same width.
+///
+/// Neither index deduplicates today (btree deduplication is disabled for any
+/// index with `INCLUDE` columns), so no compression is lost either. For scale,
+/// v24 accepted +83 MB for the same shape of change on the token index and v21
+/// re-added 5.6 GB.
+///
+/// The migration cost on a real database is two `CREATE INDEX`es over the
+/// partial row sets, holding a `SHARE` lock on `search_index` — writes block
+/// for their duration, at startup, under `initialize_schema`'s advisory lock.
+/// That is smaller than v26's three full-heap builds because both are partial
+/// over a ~10% slice, but it is an outage window and is stated rather than
+/// hidden. `CREATE INDEX CONCURRENTLY` is not used, for v15's reason: a process
+/// death mid-build leaves an INVALID index that a later `IF NOT EXISTS` skips
+/// forever.
+///
+/// A pre-v17 database is left alone, exactly as v26 leaves it: every predicate
+/// here is stated in terms of the denormalized one-row-per-composite-instance
+/// layout, and `build_composite_condition_legacy` reads columns of rows these
+/// predicates exclude.
+async fn migrate_v26_to_v27(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    if read_index_layout(client).await != IndexLayout::Denormalized {
+        tracing::info!(
+            "search_index predates v17; keeping the v26 index set. The composite \
+             fast path does not run against a legacy layout."
+        );
+        return Ok(());
+    }
+
+    let stmts = [
+        // Equality on the token component leads; the fast path's sort key
+        // follows as KEY columns so the scan terminates at the LIMIT; the range
+        // column and the system column are payload the same scan filters on.
+        "DROP INDEX IF EXISTS idx_search_composite_token_quantity",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_token_quantity
+         ON search_index (tenant_id, resource_type, param_name, value_token_code,
+                          last_updated DESC, resource_id ASC)
+         INCLUDE (value_quantity_value, value_token_system)
+         WHERE composite_group IS NOT NULL AND value_quantity_value IS NOT NULL",
+        // Both components are equalities here, so both lead the sort key.
+        "DROP INDEX IF EXISTS idx_search_composite_token_token",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_token_token
+         ON search_index (tenant_id, resource_type, param_name, value_token_code,
+                          value_token_code_2, last_updated DESC, resource_id ASC)
+         INCLUDE (value_token_system, value_token_system_2)
+         WHERE composite_group IS NOT NULL
+           AND (value_token_code_2 IS NOT NULL OR value_token_system_2 IS NOT NULL)",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v26->v27 failed: {}", e)))?;
     }
 
     Ok(())

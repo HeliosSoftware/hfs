@@ -2149,6 +2149,140 @@ mod tests {
         assert_eq!(frag.params.len(), 3);
     }
 
+    /// The two composite spellings, pinned. These are the exact texts the v27
+    /// composite indexes are shaped for, and the exact texts whose partial
+    /// predicates `predtest.c` has to prove:
+    ///
+    /// - `composite_group IS NOT NULL` appears literally, so
+    ///   `WHERE composite_group IS NOT NULL` is provable;
+    /// - the quantity component is a strict operator over
+    ///   `value_quantity_value`, so `WHERE value_quantity_value IS NOT NULL` is
+    ///   provable;
+    /// - the token component is an equality on `value_token_code`, which is why
+    ///   that column leads the index key ahead of the sort key (v20's rule).
+    ///
+    /// If any of these change, the v27 indexes silently stop being reachable
+    /// and composite search falls back to a full sort. Reachability is not
+    /// something a `#[test]` can observe, so it is pinned here instead.
+    fn composite_param(name: &str, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, value)],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn composite_bare_code_emits_what_the_v27_index_is_keyed_for() {
+        // `combo-code-value-quantity=8867-4$gt100` — 21 of the 27 composite
+        // values in `k6/searchConfig.js` are this spelling.
+        let query = SearchQuery::new("Observation")
+            .with_parameter(composite_param("combo-code-value-quantity", "8867-4$gt100"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert_eq!(
+            frag.sql,
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 \
+             AND resource_type = $2 AND param_name = 'combo-code-value-quantity' \
+             AND composite_group IS NOT NULL \
+             AND (value_token_code = $3) AND (value_quantity_value > $4))",
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 2);
+    }
+
+    #[test]
+    fn composite_system_qualified_code_keeps_the_system_in_the_predicate() {
+        // The other 6 values, and the second `pg_stat_statements` entry (7,767
+        // calls). `value_token_system` is payload on the v27 index so this
+        // stays index-only rather than fetching the heap per candidate.
+        let query = SearchQuery::new("Observation").with_parameter(composite_param(
+            "combo-code-value-quantity",
+            "http://loinc.org|8480-6$gt140",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert_eq!(
+            frag.sql,
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 \
+             AND resource_type = $2 AND param_name = 'combo-code-value-quantity' \
+             AND composite_group IS NOT NULL \
+             AND (value_token_system = $3 AND value_token_code = $4) \
+             AND (value_quantity_value > $5))",
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 3);
+    }
+
+    #[test]
+    fn every_composite_quantity_prefix_is_a_strict_operator() {
+        // `WHERE value_quantity_value IS NOT NULL` on the composite index is
+        // only provable from a STRICT operator over that column. Every prefix
+        // the benchmark can send — and every prefix `parse_component_value`
+        // recognises — must therefore emit one. `IS DISTINCT FROM` or a
+        // `COALESCE` here would strand the index without any test failing.
+        for (spelling, op) in [
+            ("gt100", ">"),
+            ("lt100", "<"),
+            ("ge100", ">="),
+            ("le100", "<="),
+            ("ne100", "!="),
+            ("sa100", ">"),
+            ("eb100", "<"),
+            ("ap100", "="),
+            ("100", "="),
+        ] {
+            let query = SearchQuery::new("Observation").with_parameter(composite_param(
+                "combo-code-value-quantity",
+                &format!("8867-4${spelling}"),
+            ));
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+            assert!(
+                frag.sql
+                    .contains(&format!("(value_quantity_value {op} $4)")),
+                "{spelling} must emit a strict operator: {}",
+                frag.sql
+            );
+        }
+    }
+
+    #[test]
+    fn the_composite_fast_path_predicate_is_extractable() {
+        // The whole point of keying the composite index on the fast path's sort
+        // key is that composite search TAKES the fast path. It does, because a
+        // lone composite parameter is exactly one membership test — this is the
+        // gate, and it is the reason `ORDER BY last_updated DESC, resource_id
+        // ASC` is what the index has to serve.
+        let query = SearchQuery::new("Observation")
+            .with_parameter(composite_param("combo-code-value-quantity", "8867-4$gt100"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone composite test is extractable");
+
+        assert_eq!(
+            pred,
+            "param_name = 'combo-code-value-quantity' AND composite_group IS NOT NULL \
+             AND (value_token_code = $3) AND (value_quantity_value > $4)"
+        );
+        // It has to stand alone against `search_index`.
+        assert!(!pred.contains("resources"));
+        assert!(!pred.contains("SELECT"));
+    }
+
     fn special_param(name: &str, values: Vec<SearchValue>) -> SearchParameter {
         SearchParameter {
             name: name.to_string(),

@@ -783,3 +783,125 @@ UNION ALL
 SELECT 'idx_search_composite (dropped entirely)',
        0, count(*)
 FROM search_index WHERE tenant_id = 'default' AND composite_group IS NOT NULL;
+
+\echo ''
+\echo '######## AM. COMPOSITE FAST PATH — the SQL that actually ships (broad value) ########'
+-- Sections A0-E and T all measure `SELECT … FROM resources WHERE id IN (…)`.
+-- That is NOT what a composite search runs. A lone composite parameter is a
+-- single membership test, so `single_index_predicate` extracts it and
+-- `search()` takes the v17 fast path — the form below. Every earlier composite
+-- section measured a plan the server does not execute, which is why the
+-- 88 -> 114 ms regression was invisible to this capture.
+--
+-- v27 keys `idx_search_composite_token_quantity` on
+-- (tenant_id, resource_type, param_name, value_token_code,
+--  last_updated DESC, resource_id ASC) INCLUDE (value_quantity_value,
+--  value_token_system), so EXPECT: `Index Only Scan using
+-- idx_search_composite_token_quantity`, **no Sort node**, `Filter:
+-- (value_quantity_value > 100)` on the scan itself, and `rows` on the Unique
+-- capped near 21 with far fewer index tuples read than the code slice holds.
+--
+-- A `Sort` node here, or `Heap Fetches` in the thousands, means the index is
+-- not being used as intended and section AQ will say which index was.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'combo-code-value-quantity'
+         AND composite_group IS NOT NULL
+         AND (value_token_code = '8867-4') AND (value_quantity_value > 100)
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 21 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AN. COMPOSITE FAST PATH — system|code form (the 7,767-call statement) ########'
+-- Same index, one extra qual. `value_token_system` is INCLUDE payload, so this
+-- must stay an Index Only Scan with the system test in `Filter`. If it shows
+-- an Index Scan with heap fetches, the payload is not being used and the
+-- second composite statement is paying a random page per candidate row.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'combo-code-value-quantity'
+         AND composite_group IS NOT NULL
+         AND (value_token_system = 'http://loinc.org' AND value_token_code = '8480-6')
+         AND (value_quantity_value > 140)
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 21 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AO. COMPOSITE FAST PATH — sparse regime, the trade v27 accepts ########'
+-- `code-value-quantity=29463-7$lt5` is body weight under 5 kg: a code slice of
+-- tens of thousands of rows of which almost none pass the quantity filter. The
+-- v26 index could seek straight to an empty range; v27 walks the code slice in
+-- `last_updated` order instead. THIS IS THE COST OF THE CHANGE and this section
+-- is how much it is. It should be single-digit milliseconds and index-only —
+-- read `Index Only Scan … rows removed by filter` for the walk length.
+--
+-- If this comes back at tens of milliseconds while AM is fast, the right answer
+-- is to re-add a value-first `(…, value_token_code, value_quantity_value)
+-- INCLUDE (resource_id, last_updated)` index ALONGSIDE this one and let the
+-- planner choose (v19's two-shapes doctrine) — at the price of one more btree
+-- insert per composite token+quantity row.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT DISTINCT resource_id, last_updated FROM search_index
+WHERE tenant_id = 'default' AND resource_type = 'Observation'
+  AND param_name = 'code-value-quantity'
+  AND composite_group IS NOT NULL
+  AND (value_token_code = '29463-7') AND (value_quantity_value < 5)
+ORDER BY last_updated DESC, resource_id ASC LIMIT 21;
+
+\echo ''
+\echo '######## AP. COMPOSITE FAST PATH — zero-match code (must stay instant) ########'
+-- `non-existent-code$gt0`. The token equality finds nothing, so neither index
+-- shape can walk anything. A control: if this is slow the leading key columns
+-- are not being seeked at all.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT DISTINCT resource_id, last_updated FROM search_index
+WHERE tenant_id = 'default' AND resource_type = 'Observation'
+  AND param_name = 'code-value-quantity'
+  AND composite_group IS NOT NULL
+  AND (value_token_code = 'non-existent-code') AND (value_quantity_value > 0)
+ORDER BY last_updated DESC, resource_id ASC LIMIT 21;
+
+\echo ''
+\echo '######## AQ. WHICH INDEX SERVED THE COMPOSITE SECTIONS ########'
+-- Scans and tuples read for every index that can hold a composite row. The
+-- number to watch is tuples-per-scan on `idx_search_composite_token_quantity`:
+-- v27 exists to make it ~21 for a broad value instead of the whole match set.
+-- `idx_search_token_code` also covers composite rows (it is partial on
+-- `value_token_code IS NOT NULL` only) but has no quantity column, so if IT is
+-- taking the composite scans the composite index is being rejected and the
+-- quantity filter is costing a heap fetch per row.
+SELECT s.indexrelname,
+       s.idx_scan,
+       s.idx_tup_read,
+       CASE WHEN s.idx_scan > 0 THEN s.idx_tup_read / s.idx_scan END AS tuples_per_scan,
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS size
+FROM pg_stat_user_indexes s
+WHERE s.relname = 'search_index'
+  AND s.indexrelname IN ('idx_search_composite_token_quantity',
+                         'idx_search_composite_token_token',
+                         'idx_search_token_code',
+                         'idx_search_quantity_recent',
+                         'idx_search_resource')
+ORDER BY s.idx_scan DESC;
+
+\echo ''
+\echo '######## AR. v27 INDEX DEFINITIONS — the sort key must be KEY, not INCLUDE ########'
+-- Trap 6, made checkable. `indexdef` must show `last_updated DESC, resource_id`
+-- BEFORE the `INCLUDE (` on both composite indexes. v26 regressed by putting
+-- `last_updated` nowhere at all; v17 regressed by putting it in `INCLUDE`.
+SELECT indexname, indexdef FROM pg_indexes
+WHERE tablename = 'search_index'
+  AND indexname LIKE 'idx_search_composite%'
+ORDER BY indexname;
