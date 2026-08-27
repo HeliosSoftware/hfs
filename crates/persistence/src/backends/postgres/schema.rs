@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 26;
+pub const SCHEMA_VERSION: i32 = 27;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -246,9 +246,13 @@ async fn create_fts_tables(client: &deadpool_postgres::Client) -> StorageResult<
                 narrative_text TEXT,
                 full_content TEXT,
                 narrative_tsvector TSVECTOR,
-                content_tsvector TSVECTOR,
-                CONSTRAINT fk_fts_resource FOREIGN KEY (tenant_id, resource_type, resource_id)
-                    REFERENCES resources(tenant_id, resource_type, id) ON DELETE CASCADE
+                content_tsvector TSVECTOR
+                -- NOTE: there is deliberately no FOREIGN KEY to `resources`
+                -- here. See `migrate_v26_to_v27`, and `migrate_v22_to_v23`
+                -- for the same decision on `search_index`: every path that
+                -- removes a resource row deletes this table's row explicitly,
+                -- and the constraint charged one extra SELECT plus a
+                -- `FOR KEY SHARE` lock on the parent for every full-text write.
             )",
             &[],
         )
@@ -272,9 +276,14 @@ async fn create_fts_tables(client: &deadpool_postgres::Client) -> StorageResult<
         .await
         .map_err(|e| pg_error(format!("Failed to create content GIN index: {}", e)))?;
 
+    // UNIQUE, not just an index: one resource has one full-text row. The write
+    // path upserts on exactly these columns (`FTS_UPSERT_SQL`), which needs the
+    // uniqueness to have somewhere to conflict, and `search_text` /
+    // `search_content` join `resources` to this table, where a duplicate row
+    // would return the same resource twice in a `_text` / `_content` page.
     client
         .execute(
-            "CREATE INDEX IF NOT EXISTS idx_fts_lookup ON resource_fts(tenant_id, resource_type, resource_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fts_lookup ON resource_fts(tenant_id, resource_type, resource_id)",
             &[],
         )
         .await
@@ -329,6 +338,7 @@ async fn migrate_schema(
             23 => migrate_v23_to_v24(client).await?,
             24 => migrate_v24_to_v25(client).await?,
             25 => migrate_v25_to_v26(client).await?,
+            26 => migrate_v26_to_v27(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1474,6 +1484,94 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v25->v26 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v26 -> v27: make one resource's full-text row unique, and stop charging a
+/// foreign-key check for writing it.
+///
+/// `INSERT INTO resource_fts` was the second-largest statement in the crud
+/// suite on run 33086933938 — 4,225.7 s of Postgres execution time over 385,650
+/// calls, **10.96 ms to insert a single row** — and it was preceded on every
+/// update by a `DELETE FROM resource_fts` costing another 227.3 s. Neither the
+/// delete nor the constraint has to be there.
+///
+/// ## `idx_fts_lookup` becomes UNIQUE
+///
+/// The table had no key, so a rewrite had to clear the old row before inserting
+/// the new one. With a unique key the write becomes
+/// `INSERT … ON CONFLICT (tenant_id, resource_type, resource_id) DO UPDATE`,
+/// which replaces the row in place: one statement and one round trip instead of
+/// two, on all 192,825 updates a 5-minute crud run performs. Measured locally
+/// against Postgres 18 over 20,000 update-shaped operations on a preloaded
+/// table, delete-then-insert took 2,947 ms and the upsert 2,158 ms — 27% less.
+///
+/// The index already existed on exactly these three columns, so uniqueness adds
+/// no maintenance: the same b-tree, the same size, plus a check the insert's own
+/// descent already pays for. It also closes a real hole. `search_text` and
+/// `search_content` (`search_impl.rs`) `INNER JOIN resources` to
+/// `resource_fts`, so a duplicated row returned the same resource twice in a
+/// `_text` / `_content` page; nothing prevented one, because nothing ever
+/// asserted a resource has one full-text row.
+///
+/// Duplicates are therefore deleted first — a database that has any cannot get
+/// the unique index built otherwise. `ctid` picks the survivor: it is the
+/// physical row identity, so `a.ctid < b.ctid` keeps exactly one row per key
+/// without needing a column to order by.
+///
+/// ## `fk_fts_resource` goes
+///
+/// The same trade `migrate_v22_to_v23` made for `search_index`, for the same
+/// reason: Postgres enforces a FK with a per-row `AFTER INSERT` trigger that
+/// runs `SELECT 1 FROM ONLY resources … FOR KEY SHARE`, so every full-text write
+/// paid an extra index probe, a `FOR KEY SHARE` lock on the parent row, and the
+/// WAL record that lock writes. Measured locally, dropping it took 20,000
+/// update-shaped operations from 6.5 to 5.5 WAL records each.
+///
+/// What the constraint bought — a full-text row cannot outlive its resource —
+/// is upheld by code, exactly as `search_index`'s is. `resources` rows are hard
+/// deleted in precisely three places (`purge`, `purge_all`,
+/// `purge_tenant_data`), and all three already delete this table's rows first;
+/// the `ON DELETE CASCADE` never had anything left to cascade to. A new deletion
+/// path that skipped it would leave stale rows, which is why those call sites
+/// carry the obligation in a comment.
+///
+/// ## What this costs a real database
+///
+/// A `DELETE` of duplicate rows (normally none), then a `DROP INDEX` and a
+/// `CREATE UNIQUE INDEX` over one row per resource — a fraction of the
+/// `search_index` rebuilds v26 performs — and a catalog-only
+/// `ALTER TABLE … DROP CONSTRAINT`. It runs at startup under
+/// `initialize_schema`'s advisory lock.
+///
+/// Rows written before v27 keep the lexemes they were built with, including the
+/// ids and references `collect_strings` no longer indexes. That is a superset of
+/// what the new writer produces, so nothing that used to be findable stops being
+/// findable without a rewrite; `$reindex` rebuilds them on the narrower rule.
+async fn migrate_v26_to_v27(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        // 1. One row per resource, so the unique index can be built.
+        "DELETE FROM resource_fts a
+           USING resource_fts b
+          WHERE a.ctid < b.ctid
+            AND a.tenant_id = b.tenant_id
+            AND a.resource_type = b.resource_type
+            AND a.resource_id = b.resource_id",
+        // 2. The upsert's conflict target.
+        "DROP INDEX IF EXISTS idx_fts_lookup",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fts_lookup
+         ON resource_fts (tenant_id, resource_type, resource_id)",
+        // 3. A per-row trigger for a guarantee the deletion paths already give.
+        "ALTER TABLE resource_fts DROP CONSTRAINT IF EXISTS fk_fts_resource",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v26->v27 failed: {}", e)))?;
     }
 
     Ok(())

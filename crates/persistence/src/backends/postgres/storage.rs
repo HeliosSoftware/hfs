@@ -46,7 +46,8 @@ use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 ///   make this assertion false and leave stale rows for a later create to
 ///   inherit, which is why those call sites carry the obligation in a comment.
 /// - A caller that has just run [`PostgresBackend::delete_search_index`], which
-///   clears `search_index` and `resource_fts` together.
+///   clears the `search_index` rows (and, with [`FtsRow::Drop`], the
+///   `resource_fts` row too).
 ///
 /// Claiming `Fresh` wrongly leaves stale index rows behind — a resource that
 /// still matches searches for values it no longer has — so it is an explicit
@@ -57,6 +58,66 @@ pub(crate) enum IndexWrite {
     Fresh,
     /// The resource may already be indexed; clear it first.
     Replace,
+}
+
+/// Whether [`PostgresBackend::delete_search_index`] must also drop the
+/// `resource_fts` row.
+///
+/// The full-text write is an upsert against a UNIQUE `idx_fts_lookup` (schema
+/// v27), so a caller that re-indexes immediately afterwards does not need the
+/// row deleted first — the upsert replaces it. Every one of the 192,825 updates
+/// in a 5-minute crud run used to pay a `DELETE FROM resource_fts` (227.3 s of
+/// Postgres execution time, measured on run 33086933938) purely to make room
+/// for an insert that now writes over the row itself.
+///
+/// A caller that is *not* going to re-index must still pass [`FtsRow::Drop`],
+/// or the resource stays matchable by `_text` / `_content`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FtsRow {
+    /// Delete the `resource_fts` row: the caller is removing this resource's
+    /// index entries and nothing will put the row back.
+    Drop,
+    /// Leave the `resource_fts` row in place: the caller re-indexes
+    /// immediately and the upsert replaces it.
+    Keep,
+}
+
+/// The full-text upsert, shared by the first attempt and the truncating retry.
+///
+/// `ON CONFLICT` names the columns of the UNIQUE `idx_fts_lookup` created in
+/// schema v27. Column order in the target list is the table's, not the index's.
+const FTS_UPSERT_SQL: &str = "\
+INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_tsvector, content_tsvector) \
+VALUES ($1, $2, $3, to_tsvector('english', $4), to_tsvector('english', $5)) \
+ON CONFLICT (tenant_id, resource_type, resource_id) DO UPDATE \
+SET narrative_tsvector = EXCLUDED.narrative_tsvector, content_tsvector = EXCLUDED.content_tsvector";
+
+/// How much text a single retry hands `to_tsvector` after it has refused the
+/// whole thing.
+///
+/// Postgres caps a `tsvector` at 1 MB. The worst *observed* expansion on real
+/// data is 1.74x (a Synthea `Provenance`: 751,802 input bytes, a 1,308,960-byte
+/// vector). The worst the default parser can produce is bounded at 5x: a
+/// hyphenated run yields the compound plus each of its parts, so at most 2x in
+/// lexeme bytes, and a lexeme costs a further 4-byte entry plus 2 bytes per
+/// position over an input that must spend at least two bytes per lexeme, so at
+/// most 3x again. 128 KiB therefore cannot reach the limit even adversarially,
+/// and it is far more text than a resource whose `_content` someone searches.
+///
+/// This is a retry bound, not a cap on indexing: a resource is truncated only
+/// after Postgres has already refused the whole thing.
+const FTS_MAX_INPUT_BYTES: usize = 128 * 1024;
+
+/// `s` cut to at most `max` bytes, never mid-character.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn internal_error(message: String) -> StorageError {
@@ -405,11 +466,12 @@ impl ResourceStorage for PostgresBackend {
             };
         }
 
-        // Re-index the resource. `delete_search_index` clears `search_index` AND
-        // `resource_fts`, so it stays — but it leaves nothing for the indexing
-        // write to clear, and `Replace` would have issued a second identical
-        // DELETE against the same rows.
-        self.delete_search_index(&client, tenant_id, resource_type, id)
+        // Re-index the resource. The `search_index` rows have to go first, and
+        // clearing them here leaves nothing for the indexing write to clear —
+        // `Replace` would have issued a second identical DELETE against the
+        // same rows. The `resource_fts` row stays: `index_fts_content` upserts
+        // over it, which is one statement and one round trip less per update.
+        self.delete_search_index(&client, tenant_id, resource_type, id, FtsRow::Keep)
             .await?;
         self.index_resource(
             &client,
@@ -1028,9 +1090,9 @@ impl PostgresBackend {
 
         // The delete dropped the search index entries; rebuild them for the
         // resource that is live again. As in `update`, the preceding
-        // `delete_search_index` is what clears both tables, so the indexing write
-        // has nothing left to clear.
-        self.delete_search_index(&client, tenant_id, resource_type, id)
+        // `delete_search_index` is what clears `search_index`, so the indexing
+        // write has nothing left to clear; the full-text row is upserted over.
+        self.delete_search_index(&client, tenant_id, resource_type, id, FtsRow::Keep)
             .await?;
         self.index_resource(
             &client,
@@ -1155,15 +1217,8 @@ impl PostgresBackend {
         );
 
         // Index FTS content for _text and _content searches
-        self.index_fts_content(
-            client,
-            tenant_id,
-            resource_type,
-            resource_id,
-            mode,
-            resource,
-        )
-        .await?;
+        self.index_fts_content(client, tenant_id, resource_type, resource_id, resource)
+            .await?;
 
         Ok(())
     }
@@ -1223,13 +1278,21 @@ impl PostgresBackend {
     /// Index full-text search content for _text and _content searches.
     ///
     /// Populates the resource_fts table using PostgreSQL tsvector/tsquery.
+    ///
+    /// The write is an upsert keyed on `idx_fts_lookup`, which schema v27 makes
+    /// UNIQUE. Two things follow from that. A rewrite no longer needs its own
+    /// `DELETE` — `update` and `restore` ask `delete_search_index` to leave the
+    /// row alone (`FtsRow::Keep`) and this statement replaces it in place, which
+    /// removes one statement and one round trip from every update. And a
+    /// duplicate `resource_fts` row is now impossible: `search_text` /
+    /// `search_content` join `resources` to `resource_fts`, so a duplicate used
+    /// to return the same resource twice in a `_text` / `_content` page.
     async fn index_fts_content(
         &self,
         client: &deadpool_postgres::Client,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        mode: IndexWrite,
         resource: &Value,
     ) -> StorageResult<()> {
         if !self.fts_table_exists(client).await? {
@@ -1240,21 +1303,17 @@ impl PostgresBackend {
         let content = extract_searchable_content(resource);
 
         if content.is_empty() {
-            return Ok(());
-        }
-
-        // `resource_fts` has no unique key, so a rewrite has to clear the old
-        // row first. A `Fresh` write asserts nothing is indexed under this id —
-        // the same assertion that lets the `search_index` clearing DELETE be
-        // skipped above — so on the create path this statement only ever
-        // deleted zero rows.
-        if mode == IndexWrite::Replace {
+            // Nothing to index. A stored resource always carries at least its
+            // `resourceType`, so this is unreachable in practice, but if a
+            // rewrite ever did empty a resource out, the previous row has to go
+            // rather than survive as a stale match.
             let _ = execute_cached(
                     client,
                     "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                     &[&tenant_id, &resource_type, &resource_id],
                 )
                 .await;
+            return Ok(());
         }
 
         // Store the vectors, not their input. `narrative_text` and
@@ -1265,20 +1324,66 @@ impl PostgresBackend {
         // instead of in a `BEFORE INSERT` trigger; the trigger is dropped in
         // schema v25 because it would otherwise overwrite these vectors with
         // the tsvector of an empty string.
+        let result = execute_cached(
+            client,
+            FTS_UPSERT_SQL,
+            &[
+                &resource_id,
+                &resource_type,
+                &tenant_id,
+                &content.narrative,
+                &content.full_content,
+            ],
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+
+        // `to_tsvector` refuses to build a vector larger than 1 MB and raises
+        // `program_limit_exceeded` when the input demands one. That is not
+        // hypothetical: a Synthea `Provenance` lists every resource in the
+        // patient's bundle, and two of the 177,612 resources in 150 of the
+        // benchmark corpus's patients exceed the limit — 751,802 bytes of
+        // content becoming a 1,308,960-byte vector. Before this branch the
+        // error surfaced as a 500 and the whole `POST` failed, so an entirely
+        // valid resource could not be created at all.
+        //
+        // Retry once against a truncated input instead. Nothing here runs
+        // inside an explicit transaction — the bundle path
+        // (`PostgresTransaction`) does not write `resource_fts` at all — so the
+        // failed statement leaves the session usable.
+        if err.code() != Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
+            return Err(internal_error(format!(
+                "Failed to insert FTS content: {}",
+                err
+            )));
+        }
+
+        let narrative = truncate_on_char_boundary(&content.narrative, FTS_MAX_INPUT_BYTES);
+        let full_content = truncate_on_char_boundary(&content.full_content, FTS_MAX_INPUT_BYTES);
+        tracing::warn!(
+            "FTS content for {}/{} exceeds PostgreSQL's 1 MB tsvector limit; \
+             indexing the first {} bytes of narrative and content only",
+            resource_type,
+            resource_id,
+            FTS_MAX_INPUT_BYTES,
+        );
         execute_cached(
-                client,
-                "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_tsvector, content_tsvector)
-                 VALUES ($1, $2, $3, to_tsvector('english', $4), to_tsvector('english', $5))",
-                &[
-                    &resource_id,
-                    &resource_type,
-                    &tenant_id,
-                    &content.narrative,
-                    &content.full_content,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
+            client,
+            FTS_UPSERT_SQL,
+            &[
+                &resource_id,
+                &resource_type,
+                &tenant_id,
+                &narrative,
+                &full_content,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
 
         Ok(())
     }
@@ -1286,12 +1391,16 @@ impl PostgresBackend {
     /// Delete search index entries for a resource.
     /// Removes a resource's search entries, returning how many `search_index`
     /// rows were deleted.
+    ///
+    /// `fts` says whether the `resource_fts` row goes with them; see
+    /// [`FtsRow`].
     pub(crate) async fn delete_search_index(
         &self,
         client: &deadpool_postgres::Client,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        fts: FtsRow,
     ) -> StorageResult<u64> {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
@@ -1308,12 +1417,14 @@ impl PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
 
         // Delete from FTS table if it exists
-        let _ = execute_cached(
-                client,
-                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await;
+        if fts == FtsRow::Drop {
+            let _ = execute_cached(
+                    client,
+                    "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                    &[&tenant_id, &resource_type, &resource_id],
+                )
+                .await;
+        }
 
         Ok(deleted)
     }
@@ -3238,11 +3349,14 @@ impl ReindexTarget for PostgresBackend {
         resource_id: &str,
     ) -> StorageResult<u64> {
         let client = self.get_client().await?;
+        // `$reindex` may clear without rewriting, so the full-text row goes
+        // too; `write_search_entries` puts it back when the rewrite follows.
         self.delete_search_index(
             &client,
             tenant.tenant_id().as_str(),
             resource_type,
             resource_id,
+            FtsRow::Drop,
         )
         .await
     }
@@ -3294,17 +3408,10 @@ impl ReindexTarget for PostgresBackend {
         // Same defect as the SQLite side — this is not PostgreSQL-specific.
         //
         // Not counted in `count`, which reports `search_index` entries only.
-        // Passed `Replace` so it stays DELETE-then-INSERT here and is idempotent
-        // regardless of what ran before it — a reindex can find a row present.
-        self.index_fts_content(
-            &client,
-            tenant_id,
-            resource_type,
-            resource_id,
-            IndexWrite::Replace,
-            content,
-        )
-        .await?;
+        // The write is an upsert, so it is idempotent regardless of what ran
+        // before it — a reindex can find a row present.
+        self.index_fts_content(&client, tenant_id, resource_type, resource_id, content)
+            .await?;
 
         Ok(count)
     }
@@ -3413,32 +3520,122 @@ fn strip_html_tags(html: &str) -> String {
 /// Extracts all string values from a JSON value recursively.
 fn extract_all_strings(value: &Value) -> String {
     let mut parts = Vec::new();
-    collect_strings(value, &mut parts);
+    collect_strings(value, None, &mut parts);
     parts.join(" ")
 }
 
-fn collect_strings(value: &Value, parts: &mut Vec<String>) {
+/// The keys whose value is a machine identifier or a link rather than text.
+///
+/// `id` is the resource's (or an element's) identity, `reference` a link to
+/// another resource, `fullUrl` the same link in a Bundle entry, and
+/// `versionId` the row's version. FHIR answers all four with dedicated,
+/// exactly-matching search machinery — `_id`, reference-typed parameters,
+/// `_include` / `_revinclude`, chaining — none of which goes anywhere near
+/// `resource_fts`.
+const OPAQUE_ID_KEYS: [&str; 4] = ["id", "reference", "fullUrl", "versionId"];
+
+/// Collects the strings that make up `_content`.
+///
+/// `key` is the JSON object key the value hangs off (inherited through arrays,
+/// so `Provenance.target[].reference` is still seen as a `reference`).
+///
+/// A value at one of [`OPAQUE_ID_KEYS`] that contains a canonical UUID is left
+/// out. That is a deliberate narrowing of `_content`, and it is what makes the
+/// full-text write path cheap: a GIN index costs roughly what its *entry tree*
+/// costs, and a UUID never seen before is a brand-new key inserted at a random
+/// position in that tree — page split, WAL, cache miss — whereas an ordinary
+/// word only appends to a posting list that already exists. Measured over
+/// 45,000 crud-shaped resources (the benchmark's own nine seed resources with
+/// server-assigned ids and cross-references), the vectors held **224,438**
+/// distinct lexemes before this filter and **333** after: 99.85% of the entry
+/// tree was ids and links. Over 177,603 resources of the Synthea corpus the
+/// content GIN index falls from 88 MB to 30 MB, index buffer touches per
+/// insert from 27.8 to 9.1, and WAL records per insert from 11.1 to 5.2.
+///
+/// What can no longer be found: `_content=<a uuid>` and
+/// `_content=Patient/<a uuid>` — searching the free-text index for a resource
+/// id or a literal reference. `_id`, `subject=Patient/<id>`, `_include` and
+/// reverse chaining all still answer those, exactly rather than through a
+/// stemming text query. What is still found: everything a person wrote or a
+/// terminology defines — names, addresses, narrative, codes, display strings,
+/// `text` elements, and `Identifier.value`, which is where an MRN, an NPI or an
+/// accession number lives. Only the four keys above are touched, and only when
+/// the value is UUID-shaped, so a server that assigns readable ids
+/// (`Patient/patient-smith`) keeps indexing them.
+///
+/// The SQLite backend has always excluded `id`, `reference`, `meta`,
+/// `extension`, `url` and every `http(s)://` string from `_content`
+/// (`sqlite/search/fts.rs`). This narrows the *existing* divergence rather than
+/// creating one: PostgreSQL's `_content` remains a strict superset of
+/// SQLite's.
+fn collect_strings(value: &Value, key: Option<&str>, parts: &mut Vec<String>) {
     match value {
         Value::String(s) => {
-            if !s.is_empty() {
-                parts.push(s.clone());
+            if s.is_empty() {
+                return;
             }
+            if key.is_some_and(|k| OPAQUE_ID_KEYS.contains(&k)) && contains_uuid(s) {
+                return;
+            }
+            parts.push(s.clone());
         }
         Value::Object(map) => {
             for (key, val) in map {
                 if key == "div" || key == "data" {
                     continue;
                 }
-                collect_strings(val, parts);
+                collect_strings(val, Some(key.as_str()), parts);
             }
         }
         Value::Array(arr) => {
             for val in arr {
-                collect_strings(val, parts);
+                collect_strings(val, key, parts);
             }
         }
         _ => {}
     }
+}
+
+/// Whether `s` contains a canonical UUID: 8-4-4-4-12 hexadecimal digits.
+///
+/// The match has to be delimited on both sides — the byte before and the byte
+/// after may not be a hex digit or a hyphen — so a longer hexadecimal run is
+/// never mistaken for a UUID it happens to contain.
+fn contains_uuid(s: &str) -> bool {
+    const UUID_LEN: usize = 36;
+    let b = s.as_bytes();
+    if b.len() < UUID_LEN {
+        return false;
+    }
+    for i in 0..=(b.len() - UUID_LEN) {
+        if i > 0 && (b[i - 1].is_ascii_hexdigit() || b[i - 1] == b'-') {
+            continue;
+        }
+        let end = i + UUID_LEN;
+        if end < b.len() && (b[end].is_ascii_hexdigit() || b[end] == b'-') {
+            continue;
+        }
+        if is_uuid(&b[i..end]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether exactly these 36 bytes are `8-4-4-4-12` hexadecimal digits.
+fn is_uuid(b: &[u8]) -> bool {
+    debug_assert_eq!(b.len(), 36);
+    for (i, byte) in b.iter().enumerate() {
+        let expect_hyphen = matches!(i, 8 | 13 | 18 | 23);
+        if expect_hyphen {
+            if *byte != b'-' {
+                return false;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -3520,5 +3717,129 @@ mod fts_extraction_tests {
 
         assert!(!content.is_empty());
         assert!(content.full_content.contains("Solitary"));
+    }
+
+    #[test]
+    fn uuid_shapes_are_recognised_only_when_delimited() {
+        let u = "a424cdce-e753-faae-a2c4-9fe945223809";
+        assert!(contains_uuid(u));
+        assert!(contains_uuid(&format!("Patient/{u}")));
+        assert!(contains_uuid(&format!("urn:uuid:{u}")));
+        assert!(contains_uuid(&format!("Patient/{u}/_history/3")));
+        assert!(contains_uuid(&format!(
+            "https://example.org/fhir/Patient/{u}"
+        )));
+
+        // Not a UUID: wrong group lengths, a non-hex digit, and a longer
+        // hexadecimal run that merely contains 36 matching bytes.
+        assert!(!contains_uuid("a424cdce-e753-faae-a2c4-9fe94522380"));
+        assert!(!contains_uuid("a424cdce-e753-faae-a2c4-9fe9452238zz"));
+        assert!(!contains_uuid(&format!("ff{u}")));
+        assert!(!contains_uuid(&format!("{u}ff")));
+        assert!(!contains_uuid(&format!("{u}-0000")));
+        assert!(!contains_uuid("patient-smith-1"));
+        assert!(!contains_uuid(""));
+    }
+
+    #[test]
+    fn content_drops_ids_and_references_but_keeps_identifier_values() {
+        // The narrowing this makes to `_content`: the resource's own id and the
+        // links it holds are not text, and indexing them is what made the
+        // full-text write path expensive. Everything a person wrote — including
+        // an `Identifier.value`, which is where an MRN lives even when the MRN
+        // happens to be a UUID — stays.
+        let id = "a424cdce-e753-faae-a2c4-9fe945223809";
+        let mrn = "7ec34f99-4ae7-bb4c-cc1c-4ab0bc19784f";
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Observation",
+            "id": id,
+            "meta": {"versionId": "550e8400-e29b-41d4-a716-446655440000"},
+            "subject": {"reference": format!("Patient/{id}"), "display": "Pok428 Metz686"},
+            "identifier": [{"system": "http://hospital.example.org", "value": mrn}],
+            "code": {"text": "Pain severity"}
+        }));
+
+        assert!(
+            !content.full_content.contains(id),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("550e8400"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            content.full_content.contains(mrn),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            content.full_content.contains("Pok428 Metz686"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            content.full_content.contains("Pain severity"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            content.full_content.contains("http://hospital.example.org"),
+            "{}",
+            content.full_content
+        );
+    }
+
+    #[test]
+    fn readable_ids_and_references_are_still_indexed() {
+        // Only UUID-shaped values are dropped, so a server that assigns
+        // human-readable ids keeps `_content` finding them.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Observation",
+            "id": "obs-smith-2024",
+            "subject": {"reference": "Patient/patient-smith"}
+        }));
+
+        assert!(content.full_content.contains("obs-smith-2024"));
+        assert!(content.full_content.contains("Patient/patient-smith"));
+    }
+
+    #[test]
+    fn references_inside_arrays_are_dropped_too() {
+        // `collect_strings` inherits the key through arrays, which is what makes
+        // `Provenance.target[].reference` — the single largest producer of
+        // one-off GIN keys in the corpus — take the same path.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Provenance",
+            "target": [
+                {"reference": "Encounter/834823d5-da27-4685-ba3b-5bd316e92682"},
+                {"reference": "Claim/9fe94522-e753-faae-a2c4-3809a424cdce"}
+            ],
+            "activity": {"text": "Record authoring"}
+        }));
+
+        assert!(
+            !content.full_content.contains("834823d5"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("9fe94522"),
+            "{}",
+            content.full_content
+        );
+        assert!(content.full_content.contains("Record authoring"));
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        let s = "ä".repeat(100);
+        for max in 0..s.len() + 2 {
+            let cut = truncate_on_char_boundary(&s, max);
+            assert!(cut.len() <= max.min(s.len()));
+            assert!(s.starts_with(cut));
+        }
+        assert_eq!(truncate_on_char_boundary("abc", 10), "abc");
     }
 }
