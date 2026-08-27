@@ -486,3 +486,82 @@ fn scalar_operations_treat_an_extension_only_primitive_as_empty() {
         );
     }
 }
+
+/// Negative control for the rule above: the fix must make the *valueless*
+/// element behave as empty without touching its valued siblings. `given[1]`
+/// is an ordinary primitive, so value-consuming functions still see its value.
+#[test]
+fn valued_sibling_of_a_valueless_primitive_still_has_its_value() {
+    let ctx = patient_with_valueless_given();
+
+    assert_eq!(
+        eval("Patient.name.given.last().hasValue()", &ctx),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        eval("Patient.name.given.last().length()", &ctx),
+        EvaluationResult::integer(5)
+    );
+    assert_string_result("Patient.name.given.last().upper()", &ctx, "JAMES");
+    assert_eq!(
+        eval("Patient.name.given.last() > 'A'", &ctx),
+        EvaluationResult::boolean(true)
+    );
+}
+
+/// The fixtures above build the valueless element programmatically. This one
+/// arrives the way a real request does — through serde, from the FHIR JSON
+/// `given: [null, "James"]` / `_given: [{extension: [...]}]` pairing — to pin
+/// that deserialization actually produces the extension-only element the
+/// evaluator treats as empty.
+#[test]
+fn valueless_primitive_deserialized_from_fhir_json_is_empty() {
+    let patient: r4::Patient = serde_json::from_value(serde_json::json!({
+        "resourceType": "Patient",
+        "id": "p1",
+        "name": [{
+            "given": [null, "James"],
+            "_given": [{
+                "extension": [{
+                    "url": "https://example.org/syllable-count",
+                    "valueString": "five"
+                }]
+            }]
+        }]
+    }))
+    .expect("patient with _given metadata should deserialize");
+    let ctx = ctx_with_patient(patient);
+
+    // The `_given[0]` metadata survived deserialization onto a value-less element.
+    assert_eq!(
+        eval("Patient.name.given.first().exists()", &ctx),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        eval("Patient.name.given.first().hasValue()", &ctx),
+        EvaluationResult::boolean(false)
+    );
+    assert_eq!(
+        eval("Patient.name.given.first().extension.count()", &ctx),
+        EvaluationResult::integer(1)
+    );
+
+    // ...and it consumes as empty, exactly like the programmatic fixture.
+    for expression in [
+        "Patient.name.given.first().length()",
+        "Patient.name.given.first().upper()",
+        "Patient.name.given.first() < 'x'",
+    ] {
+        assert_eq!(
+            eval(expression, &ctx),
+            EvaluationResult::Empty,
+            "{expression}"
+        );
+    }
+
+    // The valued sibling came through the same array untouched.
+    assert_eq!(
+        eval("Patient.name.given.last().length()", &ctx),
+        EvaluationResult::integer(5)
+    );
+}
