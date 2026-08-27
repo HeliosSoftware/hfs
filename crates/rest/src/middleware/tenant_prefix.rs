@@ -22,6 +22,16 @@ const RESERVED_SYSTEM_PATHS: &[&str] = &[
     "v1",
     "v2",
     "fhir",
+    // Server-level asynchronous route namespaces. In `both` mode these paths
+    // are also valid without a tenant prefix when the request carries
+    // `X-Tenant-ID`; treating their first segment as a tenant would strip the
+    // namespace before route matching and make advertised links unusable.
+    "export-status",
+    "export-file",
+    "bulk-submit-status",
+    "bulk-submit-file",
+    "export",
+    "ws",
     // Management-console namespace (`/console/metrics/*`). Reserved so a tenant
     // can never be named `console` under URL-path routing, keeping the console
     // paths unambiguous with the authz console guard (see `middleware::auth`).
@@ -39,7 +49,7 @@ const RESERVED_SYSTEM_PATHS: &[&str] = &[
 /// A segment is reserved if it's either:
 /// 1. A FHIR system endpoint or API prefix (from RESERVED_SYSTEM_PATHS)
 /// 2. A FHIR resource type in any version compiled into the server
-fn is_reserved_path(segment: &str, _fhir_version: &FhirVersion) -> bool {
+pub(crate) fn is_reserved_path(segment: &str, _fhir_version: &FhirVersion) -> bool {
     let lower = segment.to_lowercase();
 
     // Check system paths first (fast path)
@@ -226,6 +236,20 @@ mod tests {
         assert!(extract_tenant_from_path("/health", &version).is_none());
         assert!(extract_tenant_from_path("/_history", &version).is_none());
 
+        for namespace in [
+            "export-status",
+            "export-file",
+            "bulk-submit-status",
+            "bulk-submit-file",
+            "export",
+            "ws",
+        ] {
+            assert!(
+                extract_tenant_from_path(&format!("/{namespace}/job"), &version).is_none(),
+                "server-level namespace {namespace} must not be parsed as a tenant"
+            );
+        }
+
         // Previously missing resource types should also be reserved
         assert!(extract_tenant_from_path("/Provenance/123", &version).is_none());
         assert!(extract_tenant_from_path("/AuditEvent/456", &version).is_none());
@@ -272,6 +296,17 @@ mod tests {
         // System paths
         assert!(is_reserved_path("metadata", &version));
         assert!(is_reserved_path("health", &version));
+
+        for namespace in [
+            "export-status",
+            "export-file",
+            "bulk-submit-status",
+            "bulk-submit-file",
+            "export",
+            "ws",
+        ] {
+            assert!(is_reserved_path(namespace, &version), "{namespace}");
+        }
 
         // Management-console namespace is reserved (case-insensitive), so a
         // tenant named "console" cannot exist under URL-path routing.

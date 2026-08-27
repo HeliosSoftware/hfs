@@ -20,6 +20,7 @@ use crate::bulk_export_auth::ExportFileAuth;
 use crate::config::{BulkExportConfig, BulkSubmitConfig, ServerConfig};
 use crate::export::ExportJobController;
 use crate::middleware::auth::AuthMiddlewareState;
+use crate::public_url::PublicUrl;
 
 /// Shared application state for the REST API.
 ///
@@ -47,6 +48,9 @@ pub struct AppState<S> {
 
     /// Server configuration.
     config: Arc<ServerConfig>,
+
+    /// Validated public URL used by response builders.
+    public_url: PublicUrl,
 
     /// Authentication configuration (always present, may be disabled).
     auth_config: Arc<AuthConfig>,
@@ -128,6 +132,7 @@ impl<S> Clone for AppState<S> {
         Self {
             storage: Arc::clone(&self.storage),
             config: Arc::clone(&self.config),
+            public_url: self.public_url.clone(),
             auth_config: Arc::clone(&self.auth_config),
             auth: self.auth.clone(),
             sof_runner: self.sof_runner.clone(),
@@ -160,7 +165,10 @@ impl<S: ResourceStorage> AppState<S> {
     ///
     /// * `storage` - The storage backend (wrapped in Arc)
     /// * `config` - Server configuration
-    pub fn new(storage: Arc<S>, config: ServerConfig) -> Self {
+    pub fn new(storage: Arc<S>, mut config: ServerConfig) -> Self {
+        let public_url = PublicUrl::parse(&config.base_url)
+            .expect("AppState requires a valid HTTP(S) ServerConfig.base_url");
+        config.base_url = public_url.as_str().to_string();
         let bulk_export_config = Arc::new(config.bulk_export.clone());
         let bulk_submit_config = Arc::new(config.bulk_submit.clone());
         let validation = Arc::new(crate::validation::ValidationService::from_config(
@@ -171,6 +179,7 @@ impl<S: ResourceStorage> AppState<S> {
         Self {
             storage,
             config: Arc::new(config),
+            public_url,
             auth_config: Arc::new(AuthConfig::default()),
             auth: None,
             sof_runner: None,
@@ -208,12 +217,15 @@ impl<S: ResourceStorage> AppState<S> {
     /// Creates a new AppState with auth and audit configuration.
     pub fn with_auth_and_audit(
         storage: Arc<S>,
-        config: ServerConfig,
+        mut config: ServerConfig,
         auth_config: AuthConfig,
         auth_state: Option<Arc<AuthMiddlewareState>>,
         audit_sink: Option<Arc<dyn AuditSink>>,
         audit_source_observer: impl Into<String>,
     ) -> Self {
+        let public_url = PublicUrl::parse(&config.base_url)
+            .expect("AppState requires a valid HTTP(S) ServerConfig.base_url");
+        config.base_url = public_url.as_str().to_string();
         let bulk_export_config = Arc::new(config.bulk_export.clone());
         let bulk_submit_config = Arc::new(config.bulk_submit.clone());
         let validation = Arc::new(crate::validation::ValidationService::from_config(
@@ -224,6 +236,7 @@ impl<S: ResourceStorage> AppState<S> {
         Self {
             storage,
             config: Arc::new(config),
+            public_url,
             auth_config: Arc::new(auth_config),
             auth: auth_state,
             sof_runner: None,
@@ -433,6 +446,48 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns the base URL for the server.
     pub fn base_url(&self) -> &str {
         &self.config.base_url
+    }
+
+    /// Returns the public base for the way this request selected its tenant.
+    pub(crate) fn public_base_url_for_request(
+        &self,
+        tenant: &crate::extractors::TenantExtractor,
+    ) -> String {
+        if tenant.is_url_based() {
+            self.public_url.with_segments([tenant.tenant_id()])
+        } else {
+            self.public_url.as_str().to_string()
+        }
+    }
+
+    /// Builds a public URL for the way this request selected its tenant.
+    pub(crate) fn public_url_for_request<'a>(
+        &self,
+        tenant: &crate::extractors::TenantExtractor,
+        segments: impl IntoIterator<Item = &'a str>,
+    ) -> String {
+        let mut all_segments: Vec<String> = Vec::new();
+        if tenant.is_url_based() {
+            all_segments.push(tenant.tenant_id().to_string());
+        }
+        all_segments.extend(segments.into_iter().map(str::to_string));
+        self.public_url.with_segments(all_segments)
+    }
+
+    /// Builds a request-bound public URL and retains an encoded query string.
+    pub(crate) fn public_url_for_request_with_query<'a>(
+        &self,
+        tenant: &crate::extractors::TenantExtractor,
+        segments: impl IntoIterator<Item = &'a str>,
+        query: Option<&str>,
+    ) -> String {
+        let mut all_segments: Vec<String> = Vec::new();
+        if tenant.is_url_based() {
+            all_segments.push(tenant.tenant_id().to_string());
+        }
+        all_segments.extend(segments.into_iter().map(str::to_string));
+        self.public_url
+            .with_segments_and_query(all_segments, query.unwrap_or_default())
     }
 
     /// Returns whether versioning is enabled.

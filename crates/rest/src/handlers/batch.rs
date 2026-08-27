@@ -274,7 +274,8 @@ where
         .cloned()
         .unwrap_or_default();
 
-    let base_url = state.base_url();
+    let public_base = state.public_base_url_for_request(&tenant);
+    let base_url = public_base.as_str();
     let concurrency = batch_concurrency(state, &entries);
     let mut progress = BatchProgress::new(entries.len(), correlation.bundle_id.clone());
 
@@ -667,10 +668,10 @@ where
                 );
             }
 
-            let base_url = state.base_url();
+            let public_base = state.public_base_url_for_request(&tenant);
             let response_entries: Vec<Value> = ordered_results
                 .into_iter()
-                .map(|(_, _, result)| bundle_entry_result_to_json(result, base_url, prefer))
+                .map(|(_, _, result)| bundle_entry_result_to_json(result, &public_base, prefer))
                 .collect();
 
             let response_bundle = serde_json::json!({
@@ -1976,6 +1977,8 @@ fn bundle_entry_result_to_json(
 /// Uses the location (stripping the _history suffix) or falls back to
 /// extracting resourceType/id from the resource content.
 fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> {
+    let public_url = crate::public_url::PublicUrl::parse(base_url)
+        .expect("request public base was built from validated configuration");
     // Try to derive from location (e.g., "Patient/123/_history/1" -> base_url/Patient/123)
     if let Some(ref location) = result.location {
         let resource_url = if let Some(idx) = location.find("/_history/") {
@@ -1983,11 +1986,7 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
         } else {
             location.as_str()
         };
-        return Some(format!(
-            "{}/{}",
-            base_url.trim_end_matches('/'),
-            resource_url
-        ));
+        return Some(public_url.with_segments(resource_url.split('/').filter(|s| !s.is_empty())));
     }
 
     // Fall back to resource content
@@ -1995,7 +1994,7 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
         let resource_type = resource.get("resourceType").and_then(|v| v.as_str());
         let id = resource.get("id").and_then(|v| v.as_str());
         if let (Some(rt), Some(id)) = (resource_type, id) {
-            return Some(format!("{}/{}/{}", base_url.trim_end_matches('/'), rt, id));
+            return Some(public_url.with_segments([rt, id]));
         }
     }
 

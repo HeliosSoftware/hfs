@@ -87,16 +87,7 @@ where
         "Processing capabilities request"
     );
 
-    // Build tenant-aware base URL
-    let base_url = if tenant.is_url_based() {
-        format!(
-            "{}/{}",
-            state.base_url().trim_end_matches('/'),
-            tenant.tenant_id()
-        )
-    } else {
-        state.base_url().to_string()
-    };
+    let base_url = state.public_base_url_for_request(&tenant);
 
     let capability_statement =
         build_capability_statement(&state, tenant.context(), fhir_version, &base_url);

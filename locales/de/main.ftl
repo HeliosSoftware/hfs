@@ -422,6 +422,7 @@ queries-open-tab = In neuem Tab öffnen
 queries-col-updated = Aktualisiert
 queries-prev = Zurück
 queries-next = Weiter
+queries-results-fetch-error = Ergebnisse von { $origin } konnten nicht geladen werden. Prüfen Sie HFS_BASE_URL und versuchen Sie es erneut.
 
 queries-rail-heading = Ressourcentypen
 queries-rail-filter = Typen filtern

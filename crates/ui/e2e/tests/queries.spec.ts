@@ -49,6 +49,219 @@ test.describe("query builder", () => {
       .not.toBe(firstPage.join());
   });
 
+  test("failed pagination preserves the visible page and can be retried", async ({
+    queries,
+  }) => {
+    const pageOrigin = new URL(queries.page.url()).origin;
+    const initialPath = "/Patient?_count=1&_sort=_id";
+    const paginationOrigin = "http://127.0.0.1:1";
+    const paginationPath =
+      "/public/fhir/acme/_paging/opaque-token?_getpages=opaque%2Ftoken&_count=1";
+    const paginationUrl = paginationOrigin + paginationPath;
+    let initialRequests = 0;
+    let paginationAttempts = 0;
+
+    const firstPage = {
+      resourceType: "Bundle",
+      type: "searchset",
+      total: 2,
+      entry: [
+        {
+          fullUrl: `${pageOrigin}/Patient/patient-page-one`,
+          resource: {
+            resourceType: "Patient",
+            id: "patient-page-one",
+            name: [{ family: "First page" }],
+          },
+        },
+      ],
+      link: [
+        { relation: "self", url: pageOrigin + initialPath },
+        { relation: "next", url: paginationUrl },
+      ],
+    };
+    const secondPage = {
+      resourceType: "Bundle",
+      type: "searchset",
+      total: 2,
+      entry: [
+        {
+          fullUrl: `${paginationOrigin}/public/fhir/acme/Patient/patient-page-two`,
+          resource: {
+            resourceType: "Patient",
+            id: "patient-page-two",
+            name: [{ family: "Second page" }],
+          },
+        },
+      ],
+      link: [{ relation: "previous", url: pageOrigin + initialPath }],
+    };
+
+    await queries.page.route("**/*", async (route) => {
+      const request = route.request();
+      const url = request.url();
+      if (request.method() === "GET" && url === pageOrigin + initialPath) {
+        initialRequests += 1;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/fhir+json",
+          body: JSON.stringify(firstPage),
+        });
+        return;
+      }
+      if (url !== paginationUrl) {
+        await route.continue();
+        return;
+      }
+      if (request.method() === "OPTIONS") {
+        await route.fulfill({
+          status: 204,
+          headers: {
+            "Access-Control-Allow-Origin": pageOrigin,
+            "Access-Control-Allow-Methods": "GET",
+            "Access-Control-Allow-Headers": "Accept, X-Tenant-ID",
+          },
+        });
+        return;
+      }
+
+      paginationAttempts += 1;
+      const corsHeaders = {
+        "Access-Control-Allow-Origin": pageOrigin,
+        "Content-Type": "application/fhir+json",
+      };
+      if (paginationAttempts === 1) {
+        await route.abort("failed");
+      } else if (paginationAttempts === 2) {
+        await route.fulfill({
+          status: 502,
+          headers: corsHeaders,
+          body: JSON.stringify({
+            resourceType: "OperationOutcome",
+            issue: [{ diagnostics: "sensitive upstream response" }],
+          }),
+        });
+      } else if (paginationAttempts === 3) {
+        await route.fulfill({
+          status: 200,
+          headers: corsHeaders,
+          body: "not-json",
+        });
+      } else {
+        await route.fulfill({
+          status: 200,
+          headers: corsHeaders,
+          body: JSON.stringify(secondPage),
+        });
+      }
+    });
+
+    await queries.page.evaluate(() => {
+      const trackedWindow = window as typeof window & {
+        __hfsDataChangedFailures?: number;
+        __hfsFetchInputs?: string[];
+      };
+      const nativeFetch = window.fetch.bind(window);
+      trackedWindow.__hfsDataChangedFailures = 0;
+      trackedWindow.__hfsFetchInputs = [];
+      window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        trackedWindow.__hfsFetchInputs?.push(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        );
+        return nativeFetch(input, init);
+      }) as typeof window.fetch;
+      document.addEventListener("hfs:data-changed", (event) => {
+        const detail = (event as CustomEvent).detail;
+        if (detail && detail.source === "query-results") {
+          trackedWindow.__hfsDataChangedFailures =
+            (trackedWindow.__hfsDataChangedFailures || 0) + 1;
+        }
+      });
+    });
+
+    await queries.builder.run(initialPath);
+    await queries.results.waitShown();
+    await expect(queries.results.next).toBeVisible();
+    await expect(queries.results.error).toBeHidden();
+    const visiblePage = await queries.results.visibleState();
+
+    // A network failure leaves every visible result field and pager URL alone.
+    await queries.results.next.click();
+    await expect(queries.results.error).toBeVisible();
+    await expect(queries.results.error).toContainText(paginationOrigin);
+    await expect(queries.results.error).toContainText("HFS_BASE_URL");
+    await expect(queries.results.error).not.toContainText("opaque");
+    await expect.poll(() => paginationAttempts).toBe(1);
+    expect(await queries.results.visibleState()).toEqual(visiblePage);
+    await expect
+      .poll(() =>
+        queries.page.evaluate(
+          () =>
+            (window as typeof window & { __hfsDataChangedFailures?: number })
+              .__hfsDataChangedFailures,
+        ),
+      )
+      .toBe(1);
+    expect(initialRequests).toBe(1);
+
+    // The failure event does not recurse. A real data change repeats the last
+    // successful relative path, not the failed absolute pagination URL.
+    await queries.page.evaluate(() => {
+      document.dispatchEvent(
+        new CustomEvent("hfs:data-changed", { detail: { type: "Patient" } }),
+      );
+    });
+    await expect.poll(() => initialRequests).toBe(2);
+    await expect(queries.results.error).toBeHidden();
+    expect(await queries.results.visibleState()).toEqual(visiblePage);
+
+    // Non-2xx and malformed JSON failures are equally non-destructive. The
+    // server response body and opaque query token never enter the alert.
+    await queries.results.next.click();
+    await expect
+      .poll(() =>
+        queries.page.evaluate(
+          () =>
+            (window as typeof window & { __hfsDataChangedFailures?: number })
+              .__hfsDataChangedFailures,
+        ),
+      )
+      .toBe(2);
+    await expect(queries.results.error).not.toContainText("sensitive upstream response");
+    expect(await queries.results.visibleState()).toEqual(visiblePage);
+
+    await queries.results.next.click();
+    await expect
+      .poll(() =>
+        queries.page.evaluate(
+          () =>
+            (window as typeof window & { __hfsDataChangedFailures?: number })
+              .__hfsDataChangedFailures,
+        ),
+      )
+      .toBe(3);
+    expect(await queries.results.visibleState()).toEqual(visiblePage);
+
+    // The fourth click retries the server-provided URL byte for byte. A valid
+    // Bundle under a public path prefix replaces the page and clears the alert.
+    await queries.results.next.click();
+    await expect(queries.results.rows).toHaveCount(1);
+    await expect(queries.results.rows.first()).toContainText("patient-page-two");
+    await expect(queries.results.rows.first().locator("a.url")).toHaveAttribute(
+      "href",
+      `${paginationOrigin}/public/fhir/acme/Patient/patient-page-two`,
+    );
+    await expect(queries.results.openTab).toHaveAttribute("href", paginationUrl);
+    await expect(queries.results.prev).toBeVisible();
+    await expect(queries.results.error).toBeHidden();
+
+    const fetchInputs = await queries.page.evaluate(
+      () =>
+        (window as typeof window & { __hfsFetchInputs?: string[] }).__hfsFetchInputs || [],
+    );
+    expect(fetchInputs.filter((input) => input === paginationUrl)).toHaveLength(4);
+  });
+
   /// Chained search end to end (#406): the two chain directions meet on the
   /// patient in the middle — Practitioner <- Patient (generalPractitioner)
   /// <- Observation (subject) — and the combined query returns exactly it.

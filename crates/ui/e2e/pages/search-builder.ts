@@ -87,6 +87,12 @@ export class SearchResults {
   get rows(): Locator {
     return this.page.locator("#query-results-body tr");
   }
+  get note(): Locator {
+    return this.page.locator("#query-results-note");
+  }
+  get error(): Locator {
+    return this.page.locator("#query-results-error");
+  }
   get prev(): Locator {
     return this.page.locator("#query-results-prev");
   }
@@ -96,5 +102,27 @@ export class SearchResults {
 
   async waitShown(): Promise<void> {
     await this.card.waitFor({ state: "visible" });
+  }
+
+  async visibleState(): Promise<{
+    rows: string[];
+    meta: string;
+    openHref: string | null;
+    note: string;
+    prevVisible: boolean;
+    prevUrl: string | null;
+    nextVisible: boolean;
+    nextUrl: string | null;
+  }> {
+    return {
+      rows: await this.rows.allInnerTexts(),
+      meta: await this.meta.innerText(),
+      openHref: await this.openTab.getAttribute("href"),
+      note: await this.note.innerText(),
+      prevVisible: await this.prev.isVisible(),
+      prevUrl: await this.prev.getAttribute("data-url"),
+      nextVisible: await this.next.isVisible(),
+      nextUrl: await this.next.getAttribute("data-url"),
+    };
   }
 }

@@ -301,19 +301,21 @@
     renderEditor({ resourceType: type });
   }
 
-  /* Clicking a result row opens it. The results table (from saved-queries.js)
-   * renders id links as `/{type}/{id}`; intercept them into the modal. The
-   * results live in the content column, not under `root` (the type panel), so
-   * the listener is on the document. */
+  /* Clicking a result row opens it. The href remains the server-provided
+   * public URL, which may include a path prefix or tenant segment. Use the
+   * trusted resource identity attached by saved-queries.js instead of parsing
+   * that deployment-specific URL. The results live in the content column, not
+   * under `root` (the type panel), so the listener is on the document. */
   document.addEventListener(
     "click",
     function (event) {
       var link = event.target.closest("#query-results-body a.url");
       if (!link) return;
-      var m = /^\/([A-Za-z]+)\/([^/?]+)/.exec(link.getAttribute("href") || "");
-      if (!m) return;
+      var type = link.dataset.resourceType || "";
+      var id = link.dataset.resourceId || "";
+      if (!/^[A-Za-z]+$/.test(type) || !/^[A-Za-z0-9.-]{1,64}$/.test(id)) return;
       event.preventDefault();
-      openResource(m[1], m[2]);
+      openResource(type, id);
     },
     true
   );

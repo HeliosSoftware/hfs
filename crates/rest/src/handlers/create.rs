@@ -141,7 +141,8 @@ where
                     );
                 }
                 let headers = ResourceHeaders::from_stored(&stored, &state);
-                let location = format!("{}/{}/{}", state.base_url(), resource_type, stored.id());
+                let location =
+                    state.public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);
 
                 debug!(
                     resource_type = %resource_type,
@@ -220,7 +221,7 @@ where
     }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
-    let location = format!("{}/{}/{}", state.base_url(), resource_type, stored.id());
+    let location = state.public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);
 
     debug!(
         resource_type = %resource_type,

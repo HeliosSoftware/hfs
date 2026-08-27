@@ -178,6 +178,38 @@ async fn resources_create_label_names_the_selected_type_per_locale() {
 }
 
 #[tokio::test]
+async fn pagination_failure_message_is_localized_with_the_public_origin_slot() {
+    for (lang, sentence) in [
+        (
+            "en",
+            "Could not load results from {origin}. Check HFS_BASE_URL and try again.",
+        ),
+        (
+            "es",
+            "No se pudieron cargar los resultados desde {origin}. Revise HFS_BASE_URL e inténtelo de nuevo.",
+        ),
+        (
+            "de",
+            "Ergebnisse von {origin} konnten nicht geladen werden. Prüfen Sie HFS_BASE_URL und versuchen Sie es erneut.",
+        ),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui/search?lang={lang}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert!(
+            html.contains(sentence),
+            "{lang} search page must expose the localized pagination error"
+        );
+    }
+}
+
+#[tokio::test]
 async fn resources_create_block_reason_is_localized() {
     for (lang, sentence) in [
         ("en", "not available in the selected FHIR version"),

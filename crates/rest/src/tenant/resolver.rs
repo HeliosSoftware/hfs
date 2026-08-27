@@ -9,35 +9,10 @@ use helios_persistence::tenant::{TenantId, TenantIdError};
 use tracing::{debug, warn};
 
 use crate::config::{MultitenancyConfig, TenantRoutingMode};
-use crate::fhir_types::is_reserved_resource_path;
 use crate::middleware::tenant::X_TENANT_ID;
-use crate::middleware::tenant_prefix::{ExtractedTenantFromUrl, OriginalPath};
+use crate::middleware::tenant_prefix::{ExtractedTenantFromUrl, OriginalPath, is_reserved_path};
 
 use super::source::TenantSource;
-
-/// Non-resource reserved paths (FHIR system endpoints, API prefixes).
-/// Resource types are checked dynamically via helios-fhir's FhirResourceTypeProvider.
-const RESERVED_SYSTEM_PATHS: &[&str] = &[
-    "metadata",
-    "health",
-    "_history",
-    "_liveness",
-    "_readiness",
-    "$versions",
-    "api",
-    "v1",
-    "v2",
-    "fhir",
-    // Management-console namespace (`/console/metrics/*`). Kept in sync with
-    // `middleware::tenant_prefix::RESERVED_SYSTEM_PATHS` so a tenant can never be
-    // named `console` and strict-validation never mis-resolves the console path
-    // to a `console` tenant under URL-path routing.
-    "console",
-    // SMART discovery. Same rationale as `console`, and newly load-bearing since
-    // issue #385 widened the tenant charset to include `.` — see the twin list
-    // in `middleware::tenant_prefix`.
-    ".well-known",
-];
 
 /// Result of resolving a tenant from a request.
 #[derive(Debug, Clone)]
@@ -388,22 +363,6 @@ impl Default for TenantResolver {
     fn default() -> Self {
         Self::new(&MultitenancyConfig::default())
     }
-}
-
-/// Checks if a path segment is reserved (not a tenant identifier).
-///
-/// A segment is reserved if it's either:
-/// 1. A FHIR system endpoint or API prefix (from RESERVED_SYSTEM_PATHS)
-/// 2. A FHIR resource type in any version compiled into the server
-fn is_reserved_path(segment: &str, _fhir_version: &FhirVersion) -> bool {
-    let lower = segment.to_lowercase();
-
-    // Check system paths first (fast path)
-    if RESERVED_SYSTEM_PATHS.iter().any(|&r| r == lower) {
-        return true;
-    }
-
-    is_reserved_resource_path(segment)
 }
 
 // The local `is_valid_tenant_id` that used to live here is gone: it was one of

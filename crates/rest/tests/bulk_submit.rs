@@ -141,6 +141,29 @@ async fn create_submit_server_with(
     Arc<LocalFsOutputStore>,
     tempfile::TempDir,
 ) {
+    create_submit_server_with_routing(
+        fetcher,
+        bulk_submit,
+        TenantRoutingMode::HeaderOnly,
+        "http://localhost:8080",
+        "test-tenant",
+    )
+    .await
+}
+
+async fn create_submit_server_with_routing(
+    fetcher: Arc<MockFetcher>,
+    bulk_submit: BulkSubmitConfig,
+    routing_mode: TenantRoutingMode,
+    base_url: &str,
+    default_tenant: &str,
+) -> (
+    TestServer,
+    Arc<SqliteBackend>,
+    Arc<MockFetcher>,
+    Arc<LocalFsOutputStore>,
+    tempfile::TempDir,
+) {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -159,15 +182,18 @@ async fn create_submit_server_with(
     backend.init_schema().expect("init schema");
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+    let output = Arc::new(LocalFsOutputStore::new(
+        tmp.path(),
+        "https://wrong-internal.example",
+    ));
 
     let config = ServerConfig {
         multitenancy: MultitenancyConfig {
-            routing_mode: TenantRoutingMode::HeaderOnly,
+            routing_mode,
             ..Default::default()
         },
-        base_url: "http://localhost:8080".to_string(),
-        default_tenant: "test-tenant".to_string(),
+        base_url: base_url.to_string(),
+        default_tenant: default_tenant.to_string(),
         bulk_submit,
         ..ServerConfig::for_testing()
     };
@@ -782,6 +808,154 @@ async fn test_full_lifecycle_ingests_and_polls() {
     assert_eq!(
         server.get(poll_path).await.status_code(),
         StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn path_tenant_and_public_prefix_flow_through_bulk_submit_urls() {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server_with_routing(
+        multi_artifact_fetcher(),
+        BulkSubmitConfig {
+            manifest_page_size: 1,
+            ..Default::default()
+        },
+        TenantRoutingMode::Both,
+        "https://public.example/fhir/",
+        "default",
+    )
+    .await;
+
+    assert_eq!(
+        server
+            .post("/acme/$bulk-submit")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let status = server
+        .post("/acme/$bulk-submit-status")
+        .json(&status_body())
+        .await;
+    assert_eq!(status.status_code(), StatusCode::ACCEPTED);
+    let status_url = status
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(status_url.starts_with("https://public.example/fhir/acme/bulk-submit-status/"));
+    let poll_path = status_url
+        .strip_prefix("https://public.example/fhir")
+        .unwrap();
+    let wrong_tenant_path = poll_path.replacen("/acme/", "/other/", 1);
+    assert_eq!(
+        server.get(&wrong_tenant_path).await.status_code(),
+        StatusCode::NOT_FOUND
+    );
+
+    drain_submit(&backend, &fetcher, &output).await;
+    let done = server.get(poll_path).await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    let artifact_url = ["output", "outcome", "deleted"]
+        .into_iter()
+        .find_map(|kind| manifest[kind][0]["url"].as_str())
+        .expect("first page has an artifact URL");
+    assert!(artifact_url.starts_with("https://public.example/fhir/acme/bulk-submit-file/"));
+    assert!(
+        manifest["link"][0]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(status_url)
+    );
+}
+
+#[tokio::test]
+async fn both_mode_header_tenant_can_follow_unprefixed_bulk_submit_urls() {
+    let public_base = "https://public.example/fhir";
+    let (server, backend, fetcher, output, _tmp) = create_submit_server_with_routing(
+        mock_fetcher(),
+        BulkSubmitConfig::default(),
+        TenantRoutingMode::Both,
+        public_base,
+        "default",
+    )
+    .await;
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .add_header("x-tenant-id", "acme")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let status = server
+        .post("/$bulk-submit-status")
+        .add_header("x-tenant-id", "acme")
+        .json(&status_body())
+        .await;
+    assert_eq!(status.status_code(), StatusCode::ACCEPTED);
+    let status_url = status
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(status_url.starts_with("https://public.example/fhir/bulk-submit-status/"));
+    assert!(!status_url.contains("/acme/"));
+    let poll_path = status_url.strip_prefix(public_base).unwrap();
+
+    assert_eq!(
+        server
+            .get(poll_path)
+            .add_header("x-tenant-id", "acme")
+            .await
+            .status_code(),
+        StatusCode::ACCEPTED
+    );
+    drain_submit(&backend, &fetcher, &output).await;
+
+    let done = server
+        .get(poll_path)
+        .add_header("x-tenant-id", "acme")
+        .await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    let artifact_url = manifest["output"][0]["url"].as_str().unwrap();
+    assert!(artifact_url.starts_with("https://public.example/fhir/bulk-submit-file/"));
+    let artifact_path = artifact_url.strip_prefix(public_base).unwrap();
+    assert_eq!(
+        server
+            .get(artifact_path)
+            .add_header("x-tenant-id", "other")
+            .await
+            .status_code(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        server
+            .delete(poll_path)
+            .add_header("x-tenant-id", "other")
+            .await
+            .status_code(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        server
+            .get(artifact_path)
+            .add_header("x-tenant-id", "acme")
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    // The URL-path form remains available in `both` mode.
+    assert_eq!(
+        server.get(&format!("/acme{poll_path}")).await.status_code(),
+        StatusCode::OK
     );
 }
 

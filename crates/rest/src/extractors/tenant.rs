@@ -70,6 +70,7 @@ fn source_error_to_rejection(err: TenantSourceError) -> (StatusCode, String) {
 pub struct TenantExtractor {
     context: TenantContext,
     source: TenantSource,
+    url_routed: bool,
     resolved: ResolvedTenant,
 }
 
@@ -80,6 +81,7 @@ impl TenantExtractor {
         Self {
             context: TenantContext::new(tenant_id_obj.clone(), TenantPermissions::full_access()),
             source,
+            url_routed: source.is_url_based(),
             resolved: ResolvedTenant {
                 tenant_id: tenant_id_obj.clone(),
                 source,
@@ -90,14 +92,27 @@ impl TenantExtractor {
 
     /// Creates a TenantExtractor from a resolved tenant.
     pub fn from_resolved(resolved: ResolvedTenant) -> Self {
+        let url_routed = resolved
+            .all_sources
+            .iter()
+            .any(|(source, _)| source.is_url_based());
         Self {
             context: TenantContext::new(
                 resolved.tenant_id.clone(),
                 TenantPermissions::full_access(),
             ),
             source: resolved.source,
+            url_routed,
             resolved,
         }
+    }
+
+    /// Creates an extractor while preserving how the request was routed
+    /// independently from which source authoritatively selected the tenant.
+    fn new_with_url_route(tenant_id: &str, source: TenantSource, url_routed: bool) -> Self {
+        let mut extractor = Self::new(tenant_id, source);
+        extractor.url_routed = url_routed;
+        extractor
     }
 
     /// Creates a TenantExtractor with the default tenant.
@@ -120,9 +135,13 @@ impl TenantExtractor {
         self.source
     }
 
-    /// Returns true if the tenant was resolved from a URL path.
+    /// Returns true if this request was routed through a tenant URL prefix.
+    ///
+    /// This is intentionally independent from [`Self::source`]: an
+    /// authenticated request keeps `JwtClaim` as its authoritative tenant
+    /// source even when it arrived through `/{tenant}/...`.
     pub fn is_url_based(&self) -> bool {
-        self.source.is_url_based()
+        self.url_routed
     }
 
     /// Returns true if the tenant is the default fallback.
@@ -209,6 +228,10 @@ impl TenantExtractor {
         S: helios_persistence::core::ResourceStorage + Send + Sync,
     {
         let config = state.config();
+        let url_routed = parts
+            .extensions
+            .get::<crate::middleware::tenant_prefix::ExtractedTenantFromUrl>()
+            .is_some();
 
         // If auth is enabled and a Principal with a tenant_id is present,
         // use the JWT tenant authoritatively. When strict validation is enabled,
@@ -254,9 +277,10 @@ impl TenantExtractor {
                 // whether that tenant may be addressed at all. An issuer able to
                 // set the tenant claim would otherwise reach the shared tenant.
                 reject_reserved_tenant(jwt_tenant.as_str(), TenantSource::JwtClaim)?;
-                return Ok(TenantExtractor::new(
+                return Ok(TenantExtractor::new_with_url_route(
                     jwt_tenant.as_str(),
                     crate::tenant::TenantSource::JwtClaim,
+                    url_routed,
                 ));
             }
 
@@ -301,9 +325,10 @@ impl TenantExtractor {
             // never calls `validate()`, and collapsing to a reserved default
             // would put every unauthenticated request in the shared tenant.
             reject_reserved_tenant(&config.default_tenant, TenantSource::Default)?;
-            return Ok(TenantExtractor::new(
+            return Ok(TenantExtractor::new_with_url_route(
                 &config.default_tenant,
                 TenantSource::Default,
+                url_routed,
             ));
         }
 
@@ -483,6 +508,24 @@ mod tests {
                 .expect("should resolve to JWT tenant");
             assert_eq!(extractor.tenant_id(), "acme");
             assert_eq!(extractor.source(), TenantSource::JwtClaim);
+        }
+
+        #[tokio::test]
+        async fn test_jwt_tenant_preserves_url_route_provenance() {
+            use crate::middleware::tenant_prefix::ExtractedTenantFromUrl;
+
+            let state = make_state(false, "test-tenant");
+            let mut parts = make_parts(None, Some(make_principal(Some("acme"))));
+            parts
+                .extensions
+                .insert(ExtractedTenantFromUrl("acme".to_string()));
+
+            let extractor = TenantExtractor::from_request_parts(&mut parts, &state)
+                .await
+                .expect("JWT tenant should remain authoritative on a URL-routed request");
+            assert_eq!(extractor.tenant_id(), "acme");
+            assert_eq!(extractor.source(), TenantSource::JwtClaim);
+            assert!(extractor.is_url_based());
         }
 
         #[tokio::test]

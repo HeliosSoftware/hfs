@@ -79,6 +79,7 @@ Options:
 |----------|---------|-------------|
 | `HFS_SERVER_PORT` | 8080 | Server port |
 | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
+| `HFS_BASE_URL` | http://localhost:8080 | Public HTTP(S) base for response links and `Location` headers |
 | `HFS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
 | `DATABASE_URL` | fhir.db | Database connection string |
 | `HFS_DATA_DIR` | ./data | Path to FHIR data directory (search parameters) |
@@ -92,6 +93,11 @@ Options:
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
 | `HFS_TERMINOLOGY_SERVER` | (none) | Terminology server URL for `:in`/`:not-in` modifiers and FHIRPath `memberOf()`/`subsumes()` |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | Composite-store write sync mode for ES-backed backends (`sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb-elasticsearch`, `s3-elasticsearch`). One of `asynchronous`, `synchronous`, `hybrid`. With `asynchronous` (default) the write returns as soon as the primary commits and the search backend is updated on a background worker — lowest latency, but a follow-up search can race the indexing. Use `synchronous` when callers need read-your-write semantics (e.g. integration tests, bulk-load flows that immediately search). Ignored when the storage backend has no search secondary. |
+
+Set `HFS_BASE_URL` to the public address clients can reach. The value may
+contain a path prefix. It must be an absolute `http` or `https` URL without
+credentials, a query string, or a fragment. HFS rejects invalid values and
+does not infer the public address from request forwarding headers.
 
 ## FHIR Version Support
 

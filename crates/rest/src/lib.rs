@@ -158,6 +158,7 @@ pub mod fhir_types;
 pub mod handlers;
 pub mod jwe;
 pub mod middleware;
+pub(crate) mod public_url;
 pub(crate) mod rate_limit;
 pub mod responses;
 pub mod routing;
@@ -175,6 +176,8 @@ pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
 
 use std::sync::Arc;
 
+#[cfg(feature = "subscriptions")]
+use crate::public_url::PublicUrl;
 use axum::{Router, extract::DefaultBodyLimit};
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, IncludeProvider, InstanceHistoryProvider, ResourceStorage,
@@ -774,7 +777,10 @@ where
             .unwrap_or(false);
         if subscriptions_enabled {
             let smtp = build_smtp_settings_from_env();
-            let messaging = build_messaging_settings_from_env(&config.base_url);
+            let (messaging, resolve_default_message_source) =
+                build_messaging_settings_from_env(&config.base_url)
+                    .map(|(settings, is_explicit)| (Some(settings), !is_explicit))
+                    .unwrap_or((None, false));
             let mut supported = vec!["rest-hook".to_string(), "websocket".to_string()];
             if smtp.is_some() {
                 supported.push("email".to_string());
@@ -818,11 +824,24 @@ where
             };
             // Outbound auth provider was built above (static bearer when
             // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
-            let engine = helios_subscriptions::SubscriptionEngine::with_outbound_auth(
-                sub_config,
-                config.base_url.clone(),
-                outbound_auth_provider,
-            );
+            let public_url = PublicUrl::parse(&config.base_url)
+                .expect("validated ServerConfig has a valid public base URL");
+            let tenant_path_routing = config.multitenancy.routing_mode.supports_url_path();
+            let public_base_url_for_tenant: Arc<dyn Fn(&str) -> String + Send + Sync> =
+                Arc::new(move |tenant_id| {
+                    if tenant_path_routing {
+                        public_url.with_segments([tenant_id])
+                    } else {
+                        public_url.as_str().to_string()
+                    }
+                });
+            let engine =
+                helios_subscriptions::SubscriptionEngine::with_outbound_auth_and_url_resolver(
+                    sub_config,
+                    public_base_url_for_tenant,
+                    resolve_default_message_source,
+                    outbound_auth_provider,
+                );
             // Server-driven status transitions are written back into the stored
             // `Subscription` (issue #357), so the engine's own decisions survive
             // a restart and `GET /Subscription/{id}` stops contradicting
@@ -1231,7 +1250,7 @@ fn build_smtp_settings_from_env() -> Option<helios_subscriptions::config::SmtpSe
 #[cfg(feature = "subscriptions")]
 fn build_messaging_settings_from_env(
     base_url: &str,
-) -> Option<helios_subscriptions::config::MessagingSettings> {
+) -> Option<(helios_subscriptions::config::MessagingSettings, bool)> {
     use helios_subscriptions::config::MessagingSettings;
 
     let enabled = std::env::var("HFS_SUBSCRIPTION_MESSAGING_ENABLED")
@@ -1241,19 +1260,23 @@ fn build_messaging_settings_from_env(
         return None;
     }
 
-    let source_endpoint = std::env::var("HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT")
+    let configured_source_endpoint = std::env::var("HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT")
         .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| base_url.to_string());
+        .filter(|s| !s.trim().is_empty());
+    let source_endpoint_is_explicit = configured_source_endpoint.is_some();
+    let source_endpoint = configured_source_endpoint.unwrap_or_else(|| base_url.to_string());
 
     let allow_private_endpoints = std::env::var("HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
         .unwrap_or(false);
 
-    Some(MessagingSettings {
-        source_endpoint,
-        allow_private_endpoints,
-    })
+    Some((
+        MessagingSettings {
+            source_endpoint,
+            allow_private_endpoints,
+        },
+        source_endpoint_is_explicit,
+    ))
 }
 
 /// Builds the CORS layer based on configuration.
