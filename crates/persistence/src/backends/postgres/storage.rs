@@ -1141,8 +1141,15 @@ impl PostgresBackend {
             .await?;
 
         // Index FTS content for _text and _content searches
-        self.index_fts_content(client, tenant_id, resource_type, resource_id, mode, resource)
-            .await?;
+        self.index_fts_content(
+            client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            mode,
+            resource,
+        )
+        .await?;
 
         Ok(())
     }

@@ -963,11 +963,7 @@ mod tests {
             "{}",
             frag.sql
         );
-        assert!(
-            !frag.sql.contains("param_name = '_id'"),
-            "{}",
-            frag.sql
-        );
+        assert!(!frag.sql.contains("param_name = '_id'"), "{}", frag.sql);
     }
 
     #[test]

@@ -1185,12 +1185,10 @@ async fn migrate_v22_to_v23(client: &deadpool_postgres::Client) -> StorageResult
 /// 11 GB host and the reason v20 was worth trying; the measurement says search
 /// buys more than the write path loses.
 async fn migrate_v20_to_v21(client: &deadpool_postgres::Client) -> StorageResult<()> {
-    let index_stmts = [
-        "CREATE INDEX IF NOT EXISTS idx_search_token_code_recent
+    let index_stmts = ["CREATE INDEX IF NOT EXISTS idx_search_token_code_recent
          ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
          INCLUDE (value_token_code)
-         WHERE value_token_code IS NOT NULL",
-    ];
+         WHERE value_token_code IS NOT NULL"];
 
     for sql in index_stmts {
         client
