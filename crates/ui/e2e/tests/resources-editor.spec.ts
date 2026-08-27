@@ -1,4 +1,8 @@
 import { test, expect } from "../pages/fixtures";
+import {
+  CANONICAL_BUTTON_GEOMETRY,
+  readButtonGeometry,
+} from "../pages/button-geometry";
 
 // Regression cover for the Resources workspace edit flows — each of these was a
 // real bug fixed by hand; the browser is the only place they're observable.
@@ -13,6 +17,14 @@ test("Create new targets the resource type picked in the rail, not always Patien
   expect((await resources.modal.editor.currentDoc()).resourceType).toBe("Observation");
   // The editor projects the picked type's schema: Observation requires status + code.
   await expect(resources.modal.editor.form).toHaveAttribute("data-error-count", /[1-9]/);
+
+  const actionMetrics = await Promise.all(
+    [resources.modal.deleteButton, resources.modal.saveButton].map((button) =>
+      readButtonGeometry(button),
+    ),
+  );
+  expect(actionMetrics[0]).toEqual(actionMetrics[1]);
+  expect(actionMetrics[0]).toEqual(CANONICAL_BUTTON_GEOMETRY);
 });
 
 test("an encoded HTML-like type stays text and cannot open a draft", async ({ resources, page }) => {

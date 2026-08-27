@@ -25,6 +25,12 @@ test("a stored ViewDefinition lists, edits, and previews rows", async ({ page, r
   );
   await expect(page.locator("textarea[name='json']")).toContainText("e2e_patients");
 
+  const createNew = page.locator("a[href$='?vd=new']");
+  await expect(createNew).toHaveClass(/\bbtn--primary\b/);
+  await expect(createNew).not.toHaveClass(/\bbtn--accent\b/);
+  await expect(createNew).toHaveCSS("height", "30px");
+  await expect(createNew).toHaveCSS("padding-left", "12px");
+
   // Run previews the output; the seeded patient's key is among the rows.
   await page.locator("a[href*='run=1']").click();
   await expect(page.locator(".data-table")).toBeVisible();

@@ -1,6 +1,10 @@
 import { test, expect } from "../pages/fixtures";
 import type { Locator } from "@playwright/test";
 import { seedBulkImportDetail } from "../pages/routes";
+import {
+  CANONICAL_BUTTON_GEOMETRY,
+  readButtonGeometries,
+} from "../pages/button-geometry";
 
 function contrastRatio(foreground: string, background: string): number {
   const luminance = (cssColor: string): number => {
@@ -211,6 +215,29 @@ test("the Add Manifest dialog labels Format and sizes its textarea", async ({
   expect(styles.resize).toBe("vertical");
   expect(styles.boxSizing).toBe("border-box");
   expect(styles.fontFamily.toLowerCase()).not.toContain("monospace");
+});
+
+test("manifest-row actions use the canonical scale across emphasis variants", async ({
+  page,
+  request,
+  bulkImport,
+}) => {
+  const detail = await bulkImport.seedAndGoto(request, `button-scale-${Date.now()}`);
+  const response = await request.post(`${detail}/manifests`, {
+    form: {
+      manifest_url: "https://example.test/manifest.json",
+      fhir_base_url: "https://example.test/fhir",
+      output_format: "application/fhir+ndjson",
+    },
+    maxRedirects: 0,
+  });
+  expect(response.status()).toBeGreaterThanOrEqual(300);
+  expect(response.status()).toBeLessThan(400);
+  await page.goto(detail, { waitUntil: "networkidle" });
+
+  const metrics = await readButtonGeometries(bulkImport.manifestsCard.locator("tbody .btn"));
+  expect(metrics.length).toBeGreaterThanOrEqual(3);
+  for (const geometry of metrics) expect(geometry).toEqual(CANONICAL_BUTTON_GEOMETRY);
 });
 
 // #721: the New Submission summary doubles as the modal backdrop; the

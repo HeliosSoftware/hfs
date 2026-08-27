@@ -4,6 +4,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
+import {
+  CANONICAL_BUTTON_GEOMETRY,
+  readButtonGeometry,
+} from "../pages/button-geometry";
 
 // The Batch/Transaction workspace (#476): upload → preflight → execute →
 // response, entirely against the ordinary FHIR API.
@@ -94,6 +98,25 @@ test("a transaction bundle uploads, previews, executes, and reports", async ({ p
   await expect(page.locator("#batch-preflight")).toBeHidden();
   await expect(page.locator("#batch-drop")).toBeFocused();
 });
+
+for (const type of ["batch", "transaction"] as const) {
+  test(`${type} preflight keeps Cancel/Execute on the canonical scale`, async ({ page }) => {
+    test.skip(
+      type === "transaction" && process.env.HFS_E2E_NO_TRANSACTIONS === "1",
+      "transactions refused on this backend",
+    );
+    await page.goto("/ui/batch", { waitUntil: "networkidle" });
+    await page.locator("#batch-file").setInputFiles(bundleFile(type));
+    await expect(page.locator("#batch-preflight")).toBeVisible();
+
+    const controls = ["#batch-cancel-top", "#batch-execute-top"];
+    const geometries = await Promise.all(
+      controls.map((selector) => readButtonGeometry(page.locator(selector))),
+    );
+    expect(new Set(geometries.map((geometry) => JSON.stringify(geometry))).size).toBe(1);
+    expect(geometries[0]).toEqual(CANONICAL_BUTTON_GEOMETRY);
+  });
+}
 
 test("JSON previews are lazy, cached, compact, accessible, and isolated per view", async ({ page }) => {
   const previews: { contentType: string | undefined; body: string | null }[] = [];
@@ -376,14 +399,16 @@ test("execute busies the whole footer, ignores re-entrant clicks, and lands focu
   await page.goto("/ui/batch", { waitUntil: "networkidle" });
   await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
   await expect(page.locator("#batch-preflight")).toBeVisible();
+  const geometryBefore = await readButtonGeometry(page.locator("#batch-execute-top"));
   await page.locator("#batch-execute-top").click();
 
-  // Both Execute copies spin, and the Cancels go inert with them: a
+  // Execute spins and Cancel goes inert with it: a
   // mid-flight Cancel raced the settling response and crashed on the nulled
   // bundle before #679.
   await expect(page.locator("#batch-execute-top")).toHaveAttribute("aria-busy", "true");
-  await expect(page.locator("#batch-execute-top")).toHaveAttribute("aria-busy", "true");
   for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeDisabled();
+  expect(await readButtonGeometry(page.locator("#batch-execute-top"))).toEqual(geometryBefore);
+  expect(await readButtonGeometry(page.locator("#batch-cancel-top"))).toEqual(geometryBefore);
   await expect(page.locator("#batch-busy")).toBeVisible();
   await expect(page.locator("#batch-busy")).toContainText("Executing");
 

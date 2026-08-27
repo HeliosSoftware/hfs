@@ -1338,13 +1338,6 @@ select.field__input {
   justify-content: flex-end;
 }
 
-/* Dialog feet pair a plain button with the primary; both sit on the primary's
-   metrics so the row lines up. */
-.addbox__actions .btn {
-  height: 36px;
-  padding: 0 18px;
-}
-
 .spinner,
 .btn[aria-busy="true"]::after {
   width: 14px;
@@ -1403,7 +1396,7 @@ select.field__input {
    same no-JS <details> mechanics, presented as a modal. While open, the
    summary itself stretches over the viewport as the backdrop, so clicking
    outside the panel closes the dialog without any script. */
-.addbox--modal[open] > summary {
+.addbox--modal[open] > summary.btn {
   position: fixed;
   inset: 0;
   z-index: 40;
@@ -1510,10 +1503,11 @@ select.field__input {
 .icon-button {
   display: inline-grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
   border: 0;
-  border-radius: 8px;
+  border-radius: 9px;
   background: transparent;
   color: var(--muted);
   cursor: pointer;
@@ -1851,8 +1845,6 @@ select.field__input {
 }
 
 .btn--primary {
-  height: 36px;
-  padding: 0 18px;
   color: #ffffff;
   background: var(--accent-strong);
   border-color: var(--accent-strong);
@@ -1863,18 +1855,10 @@ select.field__input {
   filter: brightness(1.08);
 }
 
-/* Accent-filled at the standard .btn metrics: for buttons that sit in a row
-   with plain siblings, where the taller primary would break the line-up. */
-.btn--accent {
-  color: #ffffff;
-  background: var(--accent-strong);
-  border-color: var(--accent-strong);
-}
-
-.btn--accent:hover {
-  background: var(--accent-strong);
-  border-color: var(--accent-strong);
-  filter: brightness(1.08);
+.btn--icon {
+  width: 30px;
+  padding: 0;
+  justify-content: center;
 }
 
 .btn:disabled {
@@ -2020,8 +2004,6 @@ select.field__input {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 38px;
-  padding: 0 14px;
   white-space: nowrap;
 }
 
@@ -2151,10 +2133,6 @@ select.field__input {
 
 .query-builder__name {
   flex: 0 1 280px;
-}
-
-.query-builder__save .btn {
-  height: 36px;
 }
 
 .query-builder__hint {
@@ -3452,10 +3430,8 @@ details.json-fold[open] > summary .icon {
   color: var(--muted);
 }
 
-/* The Ask button keeps the shared primary metrics (36px — design-system.spec
-   holds every page to one primary button); only its icon gap is local. */
-.nl-input .btn--primary {
-  gap: 8px;
+/* The Ask button keeps the shared action-button scale. */
+.nl-input .btn {
   white-space: nowrap;
 }
 
@@ -3596,12 +3572,6 @@ details.json-fold[open] > summary .icon {
 }
 
 .query-builder__copy {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 38px;
-  height: 38px;
-  padding: 0;
   color: var(--muted);
 }
 
