@@ -2092,3 +2092,32 @@ async fn view_definitions_save_roundtrips_and_rejects_bad_json() {
     assert!(html.contains("invalid JSON"));
     assert!(html.contains("{nope"));
 }
+
+#[tokio::test]
+async fn user_menu_carries_language_and_the_signed_out_state() {
+    // #725: the avatar is a <details> menu holding the language selector and
+    // the identity block; the inline lang-switcher nav is gone. /ui has no
+    // signed-in principal (#320), so the local-operator state renders and no
+    // Sign out row exists.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("menu--user"));
+    assert!(!html.contains("lang-switcher"));
+    for lang in ["en", "es", "de"] {
+        assert!(
+            html.contains(&format!("?lang={lang}")),
+            "missing ?lang={lang}"
+        );
+    }
+    // English is the negotiated default: its option is current, once.
+    assert!(html.contains(r#"href="?lang=en" aria-current="true""#));
+    assert!(!html.contains(r#"href="?lang=es" aria-current="true""#));
+    assert!(html.contains("Local user"));
+    assert!(html.contains("Authentication is disabled"));
+    assert!(!html.contains("/ui/logout"));
+}

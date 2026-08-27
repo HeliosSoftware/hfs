@@ -28,6 +28,10 @@ language-label = Sprache
 language-en = Englisch
 language-es = Spanisch
 language-de = Deutsch
+user-menu-label = Kontomenü
+user-local = Lokaler Benutzer
+user-local-hint = Authentifizierung ist deaktiviert
+user-logout = Abmelden
 
 ## Startseite
 

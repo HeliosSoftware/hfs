@@ -205,16 +205,9 @@
   <div class="pane">
     <header class="topbar">
       <div class="topbar__tools">
-        <!--
-          Language switcher: real links, so it works without JavaScript. ?lang=
-          overrides the negotiated locale and the middleware persists the choice
-          in the hfs_lang cookie (see crates/ui/src/i18n.rs).
-        -->
-        <nav class="lang-switcher" aria-label="{{ i18n.t("language-label") }}">
-          <a href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %}>{{ i18n.t("language-en") }}</a>
-          <a href="?lang=es"{% if i18n.lang() == "es" %} aria-current="true"{% endif %}>{{ i18n.t("language-es") }}</a>
-          <a href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %}>{{ i18n.t("language-de") }}</a>
-        </nav>
+        <!-- The theme toggle stays in the topbar (#725): it is a one-click,
+             instant-feedback control, and a click deeper behind the menu
+             would slow the most common visit-time adjustment. -->
         <div class="theme-toggle" role="group" aria-label="{{ i18n.t("theme-label") }}">
           <button type="button" data-set-theme="light" aria-label="{{ i18n.t("theme-light") }}">
             {% include "icons/sun.svg" %}
@@ -223,7 +216,63 @@
             {% include "icons/moon.svg" %}
           </button>
         </div>
-        <span class="topbar__avatar">K</span>
+
+        <!--
+          The user menu (#725): identity, language, and session actions behind
+          the avatar — a <details> disclosure like the tenant (#344) and
+          version (#343) selectors, so it works without JavaScript. The
+          language options are real ?lang= links; the middleware persists the
+          choice in the hfs_lang cookie (see crates/ui/src/i18n.rs).
+
+          Avatar fallback chain: IdP photo → initials → generic user icon.
+          /ui has no signed-in principal yet (#320), so today the icon and
+          the local-operator row render; the other states are wired to
+          Status::user_* and light up when the login flow and the claim
+          inventory (#724) land.
+        -->
+        <details class="menu menu--user">
+          <summary class="topbar__avatar" aria-label="{{ i18n.t("user-menu-label") }}">
+            {% if let Some(photo) = status.user_photo() %}
+            <img class="topbar__avatar-img" src="{{ photo }}" alt="">
+            {% else %}
+            {% if let Some(initials) = status.user_initials() %}{{ initials }}{% else %}<span class="icon">{% include "icons/user.svg" %}</span>{% endif %}
+            {% endif %}
+          </summary>
+          <div class="menu__panel menu__panel--right">
+            <div class="user-menu__id">
+              <span class="topbar__avatar" aria-hidden="true">
+                {% if let Some(photo) = status.user_photo() %}
+                <img class="topbar__avatar-img" src="{{ photo }}" alt="">
+                {% else %}
+                {% if let Some(initials) = status.user_initials() %}{{ initials }}{% else %}<span class="icon">{% include "icons/user.svg" %}</span>{% endif %}
+                {% endif %}
+              </span>
+              <div class="user-menu__text">
+                <div class="user-menu__name">{% if let Some(name) = status.user_display() %}{{ name }}{% else %}{{ i18n.t("user-local") }}{% endif %}</div>
+                <div class="user-menu__hint">{% if let Some(secondary) = status.user_secondary() %}{{ secondary }}{% else %}{{ i18n.t("user-local-hint") }}{% endif %}</div>
+              </div>
+            </div>
+            <div class="menu__heading">{{ i18n.t("language-label") }}</div>
+            <a class="menu__option" href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %}>
+              {{ i18n.t("language-en") }}
+              {% if i18n.lang() == "en" %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
+            </a>
+            <a class="menu__option" href="?lang=es"{% if i18n.lang() == "es" %} aria-current="true"{% endif %}>
+              {{ i18n.t("language-es") }}
+              {% if i18n.lang() == "es" %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
+            </a>
+            <a class="menu__option" href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %}>
+              {{ i18n.t("language-de") }}
+              {% if i18n.lang() == "de" %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
+            </a>
+            {% if status.user_can_logout() %}
+            <div class="menu__divider"></div>
+            <a class="menu__option" href="/ui/logout">
+              <span class="icon">{% include "icons/logout.svg" %}</span> {{ i18n.t("user-logout") }}
+            </a>
+            {% endif %}
+          </div>
+        </details>
       </div>
     </header>
     <main class="content{% block content_class %}{% endblock %}">

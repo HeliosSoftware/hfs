@@ -574,27 +574,6 @@ button.menu__option {
   gap: 16px;
 }
 
-.lang-switcher {
-  display: flex;
-  gap: 4px;
-}
-
-.lang-switcher a {
-  padding: 4px 8px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--muted);
-  text-decoration: none;
-}
-
-.lang-switcher a[aria-current="true"] {
-  background: var(--surface);
-  border: 1px solid var(--surface-border);
-  color: var(--text-strong);
-}
-
 .theme-toggle {
   display: flex;
   align-items: center;
@@ -640,6 +619,52 @@ button.menu__option {
   box-shadow: var(--surface-shadow);
   font-weight: 500;
   color: var(--muted);
+  overflow: hidden;
+}
+
+/* The user menu (#725): the avatar doubles as the disclosure summary; the
+   panel hangs off the topbar's right edge at a width for a name + email. */
+.menu--user .menu__panel {
+  width: 264px;
+}
+
+.topbar__avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.user-menu__id {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 4px 12px;
+}
+
+.user-menu__text {
+  min-width: 0;
+}
+
+.user-menu__name {
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-menu__hint {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu__divider {
+  height: 1px;
+  margin: 8px 0;
+  background: var(--surface-border);
 }
 
 .content {
