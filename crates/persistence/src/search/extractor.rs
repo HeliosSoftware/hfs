@@ -497,11 +497,7 @@ impl SearchParameterExtractor {
     /// Returns `None` — meaning "do not filter" — unless EVERY retained union
     /// member carries a `resolve() is` clause; a member without one contributes
     /// unrestricted references, and dropping those would lose real index rows.
-    fn resolve_target_types(
-        &self,
-        expression: &str,
-        resource_type: &str,
-    ) -> Option<Vec<String>> {
+    fn resolve_target_types(&self, expression: &str, resource_type: &str) -> Option<Vec<String>> {
         let parts = self.retained_parts(expression, resource_type)?;
         let mut types = Vec::new();
         for part in &parts {

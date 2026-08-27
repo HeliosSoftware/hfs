@@ -28,7 +28,8 @@ use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
 use super::PostgresBackend;
-use super::search::writer::PostgresSearchIndexWriter;
+use super::cached::{execute_cached, query_opt_cached};
+use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 
 /// Whether a resource being indexed can already have `search_index` rows.
 ///
@@ -158,8 +159,8 @@ impl ResourceStorage for PostgresBackend {
         // nothing and the statement reports zero rows affected — one signal for
         // both writes. A soft-deleted resource still occupies its primary key, so
         // it conflicts too, exactly as the old check treated it.
-        let inserted = client
-            .execute(
+        let inserted = execute_cached(
+                &client,
                 "WITH ins AS (
                      INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -266,15 +267,15 @@ impl ResourceStorage for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let row = client
-            .query_opt(
-                "SELECT version_id, data, last_updated, is_deleted, deleted_at, fhir_version
+        let row = query_opt_cached(
+            &client,
+            "SELECT version_id, data, last_updated, is_deleted, deleted_at, fhir_version
                  FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
 
         match row {
             Some(row) => {
@@ -354,8 +355,8 @@ impl ResourceStorage for PostgresBackend {
         //
         // Zero rows means the update matched nothing; which of the two reasons it
         // was costs a query, but only on the path that is already failing.
-        let updated = client
-            .execute(
+        let updated = execute_cached(
+                &client,
                 "WITH upd AS (
                      UPDATE resources SET version_id = $1, data = $2, last_updated = $3
                      WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
@@ -453,14 +454,14 @@ impl ResourceStorage for PostgresBackend {
         let tenant_id = tenant.tenant_id().as_str();
 
         // Check if resource exists and get its fhir_version
-        let row = client
-            .query_opt(
-                "SELECT version_id, data, fhir_version FROM resources
+        let row = query_opt_cached(
+            &client,
+            "SELECT version_id, data, fhir_version FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to check resource: {}", e)))?;
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to check resource: {}", e)))?;
 
         let (current_version, data, fhir_version_str) = match row {
             Some(row) => {
@@ -502,8 +503,8 @@ impl ResourceStorage for PostgresBackend {
         // respectively); this brings PostgreSQL to parity. Losing the race is
         // reported as `NotFound`, which is what a caller racing a concurrent
         // delete would have seen anyway.
-        let updated = client
-            .execute(
+        let updated = execute_cached(
+                &client,
                 "UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1
                  WHERE tenant_id = $3 AND resource_type = $4 AND id = $5
                    AND version_id = $6 AND is_deleted = FALSE",
@@ -527,8 +528,8 @@ impl ResourceStorage for PostgresBackend {
         }
 
         // Insert deletion record into history (preserve fhir_version)
-        client
-            .execute(
+        execute_cached(
+                &client,
                 "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[&tenant_id, &resource_type, &id, &new_version_str, &data, &now, &is_deleted, &fhir_version_str],
@@ -538,8 +539,8 @@ impl ResourceStorage for PostgresBackend {
 
         // Delete search index entries (skip when search is offloaded)
         if !self.is_search_offloaded() {
-            client
-                .execute(
+            execute_cached(
+                    &client,
                     "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                     &[&tenant_id, &resource_type, &id],
                 )
@@ -999,8 +1000,8 @@ impl PostgresBackend {
         let now = Utc::now();
         let is_deleted = false;
 
-        client
-            .execute(
+        execute_cached(
+                &client,
                 "UPDATE resources
                  SET version_id = $1, data = $2, last_updated = $3, is_deleted = FALSE, deleted_at = NULL
                  WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
@@ -1016,8 +1017,8 @@ impl PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
 
-        client
-            .execute(
+        execute_cached(
+                &client,
                 "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[&tenant_id, &resource_type, &id, &new_version_str, &resource, &now, &is_deleted, &fhir_version_str],
@@ -1085,38 +1086,27 @@ impl PostgresBackend {
         }
 
         if mode == IndexWrite::Replace {
-            client
-                .execute(
-                    "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                    &[&tenant_id, &resource_type, &resource_id],
-                )
-                .await
-                .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
+            execute_cached(
+                client,
+                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                &[&tenant_id, &resource_type, &resource_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
         }
 
         // Extract values using the registry-driven extractor
-        match self
+        let mut rows: Vec<IndexRow> = match self
             .tenant_extractor(tenant_id)
             .extract(resource, resource_type)
         {
-            Ok(values) => {
-                let count = PostgresSearchIndexWriter::write_values(
-                    client,
-                    tenant_id,
-                    resource_type,
-                    resource_id,
-                    last_updated,
-                    self.index_layout(),
-                    values,
-                )
-                .await?;
-                tracing::debug!(
-                    "Dynamically indexed {} values for {}/{}",
-                    count,
-                    resource_type,
-                    resource_id
-                );
-            }
+            Ok(values) => PostgresSearchIndexWriter::build_rows(
+                resource_type,
+                resource_id,
+                last_updated,
+                self.index_layout(),
+                values,
+            ),
             Err(e) => {
                 tracing::warn!(
                     "Dynamic extraction failed for {}/{}: {}. Using minimal fallback (_id, _lastUpdated only).",
@@ -1124,7 +1114,10 @@ impl PostgresBackend {
                     resource_id,
                     e
                 );
-                // Fall back to minimal extraction (just _id and _lastUpdated)
+                // Fall back to minimal extraction (just _id and _lastUpdated).
+                // It writes its own rows — they carry a different column set
+                // (no `last_updated`) and this path is rare enough that folding
+                // it in would only put an untested shape on the hot statement.
                 self.index_minimal_fallback(
                     client,
                     tenant_id,
@@ -1133,48 +1126,73 @@ impl PostgresBackend {
                     resource,
                 )
                 .await?;
+                Vec::new()
             }
-        }
+        };
 
-        // Index any contained resources for `_contained` search.
-        self.index_contained_resources(client, tenant_id, resource_type, resource_id, resource)
-            .await?;
+        // Rows for any `contained[]` entries ride along in the same statement.
+        // They used to be one single-row `INSERT` per extracted value — 311,630
+        // statements and 311,630 round trips in one 5-minute crud run, 6% of
+        // that run's Postgres execution time — even though they are written
+        // under the same tenant, type and id as the rows above.
+        rows.extend(self.contained_index_rows(tenant_id, resource_type, resource_id, resource));
+
+        let count = rows.len();
+        PostgresSearchIndexWriter::insert_rows(
+            client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            &rows,
+        )
+        .await?;
+        tracing::debug!(
+            "Dynamically indexed {} values for {}/{}",
+            count,
+            resource_type,
+            resource_id
+        );
 
         // Index FTS content for _text and _content searches
-        self.index_fts_content(client, tenant_id, resource_type, resource_id, mode, resource)
-            .await?;
+        self.index_fts_content(
+            client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            mode,
+            resource,
+        )
+        .await?;
 
         Ok(())
     }
 
-    /// Extracts and indexes a container's `contained[]` resources for
-    /// `_contained` search. Each contained resource's search values are written
-    /// as `is_contained = TRUE` rows whose `resource_type` / `resource_id`
-    /// identify the container. Returns the number of entries written.
-    async fn index_contained_resources(
+    /// Flattens a container's `contained[]` resources into `is_contained = TRUE`
+    /// index rows, whose `resource_type` / `resource_id` identify the container.
+    ///
+    /// Builds rows rather than writing them, so the caller can send them in the
+    /// same statement as the container's own rows. A value whose date does not
+    /// parse yields no row, exactly as the single-row insert refused to store
+    /// one (#494) — so the caller's `$reindex` count now reports rows written
+    /// rather than values visited, which is what the container's own rows have
+    /// always reported.
+    fn contained_index_rows(
         &self,
-        client: &deadpool_postgres::Client,
         tenant_id: &str,
         container_type: &str,
         container_id: &str,
         resource: &Value,
-    ) -> StorageResult<usize> {
-        let mut count = 0;
+    ) -> Vec<IndexRow> {
         let container = (container_type, container_id);
+        let mut rows = Vec::new();
         for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
-            for value in &contained.values {
-                PostgresSearchIndexWriter::write_contained_entry(
-                    client,
-                    tenant_id,
-                    container,
-                    (&contained.contained_type, &contained.local_id),
-                    value,
-                )
-                .await?;
-                count += 1;
-            }
+            rows.extend(PostgresSearchIndexWriter::build_contained_rows(
+                container,
+                (&contained.contained_type, &contained.local_id),
+                &contained.values,
+            ));
         }
-        Ok(count)
+        rows
     }
 
     /// Whether `resource_fts` exists, asked of the catalog at most once.
@@ -1230,8 +1248,8 @@ impl PostgresBackend {
         // skipped above — so on the create path this statement only ever
         // deleted zero rows.
         if mode == IndexWrite::Replace {
-            let _ = client
-                .execute(
+            let _ = execute_cached(
+                    client,
                     "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                     &[&tenant_id, &resource_type, &resource_id],
                 )
@@ -1239,8 +1257,8 @@ impl PostgresBackend {
         }
 
         // Insert into FTS table (the trigger will populate tsvector columns)
-        client
-            .execute(
+        execute_cached(
+                client,
                 "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content)
                  VALUES ($1, $2, $3, $4, $5)",
                 &[
@@ -1270,8 +1288,8 @@ impl PostgresBackend {
     ) -> StorageResult<()> {
         // _id - always available from resource.id
         if let Some(id) = resource.get("id").and_then(|v| v.as_str()) {
-            client
-                .execute(
+            execute_cached(
+                    client,
                     "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code)
                      VALUES ($1, $2, $3, '_id', $4)",
                     &[&tenant_id, &resource_type, &resource_id, &id],
@@ -1287,8 +1305,8 @@ impl PostgresBackend {
             .and_then(|v| v.as_str())
         {
             let normalized = normalize_date_for_pg(last_updated);
-            client
-                .execute(
+            execute_cached(
+                    client,
                     "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_date)
                      VALUES ($1, $2, $3, '_lastUpdated', $4::timestamptz)",
                     &[&tenant_id, &resource_type, &resource_id, &normalized],
@@ -1318,8 +1336,8 @@ impl PostgresBackend {
         }
 
         // Delete from main search index
-        let deleted = client
-            .execute(
+        let deleted = execute_cached(
+                client,
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                 &[&tenant_id, &resource_type, &resource_id],
             )
@@ -1327,8 +1345,8 @@ impl PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
 
         // Delete from FTS table if it exists
-        let _ = client
-            .execute(
+        let _ = execute_cached(
+                client,
                 "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                 &[&tenant_id, &resource_type, &resource_id],
             )
@@ -3234,22 +3252,27 @@ impl ReindexTarget for PostgresBackend {
             .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
-        let mut count = PostgresSearchIndexWriter::write_values(
-            &client,
-            tenant_id,
+        let mut rows = PostgresSearchIndexWriter::build_rows(
             resource_type,
             resource_id,
             resource.last_modified(),
             self.index_layout(),
             values,
-        )
-        .await?;
+        );
 
         // Re-index contained resources too, so `$reindex` rebuilds `_contained`
-        // search entries.
-        count += self
-            .index_contained_resources(&client, tenant_id, resource_type, resource_id, content)
-            .await?;
+        // search entries — in the same statement as the resource's own rows.
+        rows.extend(self.contained_index_rows(tenant_id, resource_type, resource_id, content));
+
+        let count = rows.len();
+        PostgresSearchIndexWriter::insert_rows(
+            &client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            &rows,
+        )
+        .await?;
 
         // Rebuild the full-text row as well. `run_reindex` deletes each
         // resource's search entries first (`delete_search_entries` ->
