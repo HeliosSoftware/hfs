@@ -1219,6 +1219,27 @@ button.pill {
   margin-bottom: 6px;
 }
 
+/* Required-field marker (#680): the `required` attribute on the input is the
+   single source of truth, and this is the single point of flip. It reaches
+   every dialog field (present and future) without touching a template —
+   `.field` wraps `label > span.field__label + input.field__input`, and the
+   search builder's URL input has no visible label of its own, so its marker
+   lands on the query-builder tag chip instead. Empty alt text (the `/ ""`
+   in `content`) keeps this purely visual: assistive tech already announces
+   "required" from the input's `required` attribute, which stays in the
+   markup. To change the convention later (e.g. an `(optional)` suffix
+   instead of an accent asterisk on required fields), edit only this rule —
+   swap `:required` for `:optional` and change `content` — never the
+   templates. Child combinator (`> :required`) keeps bulk-import's
+   `fieldset.field` (which nests its own `label.field` fields) from matching
+   on a nested required input and marking the fieldset's legend instead. */
+.field:has(> :required) > .field__label::after,
+.query-builder__row:has(> .query-builder__url:required) > .query-builder__tag::after {
+  content: " *" / "";
+  color: var(--accent);
+  font-style: normal;
+}
+
 .field__input {
   width: 100%;
   height: 40px;

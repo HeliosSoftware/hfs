@@ -142,6 +142,20 @@ Spanish and German keep their own capitalization norms (both languages use
 sentence case where English uses Title Case); the convention above is for
 `en` only.
 
+## Required-field marker (#680)
+
+Required fields get an accent-colored asterisk, matching the marker already
+used by the resource editor's add-picker (`.editor-add__name em`). This is
+implemented as a single CSS `:has()` rule next to `.field__label` in
+`assets/app.css`, not per-field markup: the `required` attribute on the input
+is the source of truth, and the rule appends `*` after the field's visible
+label whenever it wraps a required input. The one field without a visible
+label — the search builder's query URL — is marked on its `query-builder__tag`
+chip instead. No template renders `*` for this; the only literal `<em>*</em>`
+in the codebase is the editor's own (unrelated) marker. Changing the
+convention later (e.g. an `(optional)` suffix instead) means editing only
+that one CSS rule.
+
 ## Rules of the road — where things go
 
 - `crates/ui/src/` — Axum handlers/routers returning `impl IntoResponse`
