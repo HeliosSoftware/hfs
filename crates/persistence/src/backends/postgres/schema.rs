@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 24;
+pub const SCHEMA_VERSION: i32 = 25;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -280,38 +280,17 @@ async fn create_fts_tables(client: &deadpool_postgres::Client) -> StorageResult<
         .await
         .map_err(|e| pg_error(format!("Failed to create FTS lookup index: {}", e)))?;
 
-    // Create trigger function to automatically update tsvector columns
-    client
-        .execute(
-            "CREATE OR REPLACE FUNCTION update_fts_vectors() RETURNS TRIGGER AS $$
-            BEGIN
-                NEW.narrative_tsvector := to_tsvector('english', COALESCE(NEW.narrative_text, ''));
-                NEW.content_tsvector := to_tsvector('english', COALESCE(NEW.full_content, ''));
-                RETURN NEW;
-            END;
-            $$ LANGUAGE plpgsql",
-            &[],
-        )
-        .await
-        .map_err(|e| pg_error(format!("Failed to create FTS trigger function: {}", e)))?;
-
-    // Create trigger (DROP first for idempotency)
+    // No `BEFORE INSERT` trigger derives the tsvectors here any more, and none
+    // may be added back: the writer supplies them directly and leaves
+    // `narrative_text` / `full_content` unbound, so a trigger reading those
+    // columns would overwrite both vectors with the tsvector of an empty
+    // string. See `migrate_v24_to_v25`.
     let _ = client
         .execute(
             "DROP TRIGGER IF EXISTS trg_update_fts_vectors ON resource_fts",
             &[],
         )
         .await;
-
-    client
-        .execute(
-            "CREATE TRIGGER trg_update_fts_vectors
-             BEFORE INSERT OR UPDATE ON resource_fts
-             FOR EACH ROW EXECUTE FUNCTION update_fts_vectors()",
-            &[],
-        )
-        .await
-        .map_err(|e| pg_error(format!("Failed to create FTS trigger: {}", e)))?;
 
     Ok(())
 }
@@ -348,6 +327,7 @@ async fn migrate_schema(
             21 => migrate_v21_to_v22(client).await?,
             22 => migrate_v22_to_v23(client).await?,
             23 => migrate_v23_to_v24(client).await?,
+            24 => migrate_v24_to_v25(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1270,6 +1250,52 @@ async fn migrate_v23_to_v24(client: &deadpool_postgres::Client) -> StorageResult
             .await
             .map_err(|e| pg_error(format!("Migration v23->v24 failed: {}", e)))?;
     }
+
+    Ok(())
+}
+
+/// v24 -> v25: stop storing the text `resource_fts` only ever indexed.
+///
+/// `resource_fts` held four columns for two questions. `narrative_text` and
+/// `full_content` carried the raw strings — the latter being every string value
+/// in the resource, concatenated — and a `BEFORE INSERT` trigger derived
+/// `narrative_tsvector` and `content_tsvector` from them. Only the two vectors
+/// are ever read: `_text` and `_content` compile to
+/// `narrative_tsvector @@ plainto_tsquery(...)` and `content_tsvector @@ ...`,
+/// and nothing anywhere selects, filters or returns the text columns.
+///
+/// So every write stored the resource's text a second time — heap, TOAST
+/// compression and WAL for it — purely to hand it to a trigger in the same
+/// statement. `pg_stat_statements` for the crud suite of run 33029355759 puts
+/// that insert at 793 s over 254,970 calls (2.8 ms mean), 11.5% of the suite's
+/// entire Postgres time, second only to the search index inserts themselves.
+///
+/// The writer now computes both vectors inline —
+/// `to_tsvector('english', $4)` — and binds nothing to the text columns. The
+/// tokenising work is unchanged, and so is everything `_text` and `_content`
+/// can find; what goes away is storing the input to it.
+///
+/// The trigger has to go with it, not merely become redundant: it assigns
+/// `to_tsvector('english', COALESCE(NEW.full_content, ''))`, so left in place
+/// against an unbound `full_content` it would overwrite the supplied vector
+/// with the tsvector of an empty string and silently empty out `_content`
+/// search.
+///
+/// The columns themselves are deliberately left in the table, on the same
+/// reasoning as `param_url` in v22: `DROP COLUMN` runs against real databases
+/// and cannot be undone, and unbound they cost one bit each in the null bitmap.
+/// Rows written before this keep their text; nothing reads it either way.
+async fn migrate_v24_to_v25(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "DROP TRIGGER IF EXISTS trg_update_fts_vectors ON resource_fts",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v24->v25 failed: {}", e)))?;
+    let _ = client
+        .execute("DROP FUNCTION IF EXISTS update_fts_vectors()", &[])
+        .await;
 
     Ok(())
 }

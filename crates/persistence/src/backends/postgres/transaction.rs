@@ -17,6 +17,7 @@ use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
 use super::PostgresBackend;
+use super::cached::{execute_cached, query_opt_cached};
 use super::search::writer::PostgresSearchIndexWriter;
 
 fn internal_error(message: String) -> StorageError {
@@ -115,8 +116,8 @@ impl PostgresTransaction {
         let client = self.client()?;
 
         if mode == super::storage::IndexWrite::Replace {
-            client
-                .execute(
+            execute_cached(
+                    client,
                     "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                     &[&tenant_id, &resource_type, &resource_id],
                 )
@@ -203,8 +204,8 @@ impl Transaction for PostgresTransaction {
         // form: a losing race used to raise a primary-key violation, which aborts
         // the whole transaction and takes every other entry in the bundle with
         // it. `ON CONFLICT DO NOTHING` reports it as a value instead.
-        let inserted = client
-            .execute(
+        let inserted = execute_cached(
+                client,
                 "WITH ins AS (
                      INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -263,15 +264,15 @@ impl Transaction for PostgresTransaction {
         let client = self.client()?;
         let tenant_id = self.tenant.tenant_id().as_str();
 
-        let row = client
-            .query_opt(
-                "SELECT version_id, data, last_updated, is_deleted, fhir_version
+        let row = query_opt_cached(
+            client,
+            "SELECT version_id, data, last_updated, is_deleted, fhir_version
                  FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
 
         match row {
             Some(row) => {
@@ -324,14 +325,14 @@ impl Transaction for PostgresTransaction {
         let id = current.id();
 
         // Verify current version still matches (optimistic locking)
-        let row = client
-            .query_opt(
-                "SELECT version_id FROM resources
+        let row = query_opt_cached(
+            client,
+            "SELECT version_id FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
 
         let db_version = match row {
             Some(row) => row.get::<_, String>(0),
@@ -374,25 +375,25 @@ impl Transaction for PostgresTransaction {
         let is_deleted = false;
 
         // Update the resource
-        client
-            .execute(
-                "UPDATE resources SET version_id = $1, data = $2, last_updated = $3
+        execute_cached(
+            client,
+            "UPDATE resources SET version_id = $1, data = $2, last_updated = $3
                  WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
-                &[
-                    &new_version_str,
-                    &data,
-                    &now,
-                    &tenant_id,
-                    &resource_type,
-                    &id,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+            &[
+                &new_version_str,
+                &data,
+                &now,
+                &tenant_id,
+                &resource_type,
+                &id,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
 
         // Insert into history
-        client
-            .execute(
+        execute_cached(
+                client,
                 "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[&tenant_id, &resource_type, &id, &new_version_str, &data, &now, &is_deleted, &fhir_version_str],
@@ -438,14 +439,14 @@ impl Transaction for PostgresTransaction {
         let tenant_id = self.tenant.tenant_id().as_str();
 
         // Check if resource exists
-        let row = client
-            .query_opt(
-                "SELECT version_id, data, fhir_version FROM resources
+        let row = query_opt_cached(
+            client,
+            "SELECT version_id, data, fhir_version FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to check resource: {}", e)))?;
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to check resource: {}", e)))?;
 
         let (current_version, data, fhir_version_str) = match row {
             Some(row) => {
@@ -468,8 +469,8 @@ impl Transaction for PostgresTransaction {
         let is_deleted = true;
 
         // Soft delete the resource
-        client
-            .execute(
+        execute_cached(
+                client,
                 "UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1
                  WHERE tenant_id = $3 AND resource_type = $4 AND id = $5",
                 &[&now, &new_version_str, &tenant_id, &resource_type, &id],
@@ -478,8 +479,8 @@ impl Transaction for PostgresTransaction {
             .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
 
         // Insert deletion record into history
-        client
-            .execute(
+        execute_cached(
+                client,
                 "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[&tenant_id, &resource_type, &id, &new_version_str, &data, &now, &is_deleted, &fhir_version_str],

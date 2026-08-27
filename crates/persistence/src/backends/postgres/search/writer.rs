@@ -1,7 +1,10 @@
 //! PostgreSQL search index writer implementation.
 
+use std::sync::LazyLock;
+
 use chrono::{DateTime, Utc};
 
+use crate::backends::postgres::cached::execute_cached;
 use crate::backends::postgres::schema::IndexLayout;
 use crate::error::{BackendError, StorageResult};
 use crate::search::{converters::IndexValue, extractor::ExtractedValue};
@@ -34,21 +37,23 @@ fn parse_index_date(value: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
-/// One `search_index` row, flattened to every column the non-contained write
-/// paths can set.
+/// One `search_index` row, flattened to every column any write path can set.
 ///
-/// The per-value `write_entry` path issues one `INSERT` per extracted value,
-/// which costs a network round trip per row. A Synthea import writes ~113 index
-/// rows per resource, so a 1,000-bundle import spends most of its wall clock in
-/// round trips rather than in Postgres. Flattening every value to a common row
-/// shape lets `write_values` send them as multi-row `INSERT`s instead.
+/// The three columns that identify the resource — `tenant_id`, `resource_type`,
+/// `resource_id` — are deliberately absent: they are constant across every row
+/// one write produces (a contained entry is stored under its *container*'s type
+/// and id), so [`INSERT_SQL`] binds them once per statement rather than once per
+/// row.
 ///
-/// Columns not listed here (`is_contained`, `contained_type`,
-/// `contained_local_id`) are left to their table defaults, exactly as the
-/// per-value inserts left them.
+/// `param_url` and the `is_contained` / `contained_*` trio are here so that the
+/// rows extracted from `contained[]` share this shape and this statement.
+/// Before, they had a single-row `INSERT` of their own: 311,630 of them in one
+/// 5-minute crud run, 419 s of Postgres execution time and a round trip each.
 #[derive(Default)]
-struct IndexRow {
+pub(crate) struct IndexRow {
+    last_updated: Option<DateTime<Utc>>,
     param_name: String,
+    param_url: Option<String>,
     composite_group: Option<i32>,
     value_string: Option<String>,
     value_string_folded: Option<String>,
@@ -71,61 +76,201 @@ struct IndexRow {
     value_identifier_type_system: Option<String>,
     value_identifier_type_code: Option<String>,
     value_uri: Option<String>,
+    is_contained: bool,
+    contained_type: Option<String>,
+    contained_local_id: Option<String>,
 }
 
-/// Column list for the batched insert, in bind order. `COLUMNS.len() + 3`
-/// (tenant/type/resource id are bound once per row too) must stay under
-/// Postgres' 65535-parameter ceiling for `BATCH_ROWS` rows — see `BATCH_ROWS`.
-///
-/// `param_url` is deliberately absent. The column still exists and existing rows
-/// keep their values, but nothing in the workspace ever reads it — there is no
-/// SELECT, WHERE, or join on it in any backend, and `ReindexOptions`'
-/// `search_param_urls` (the one plausible consumer) has no consumers of its own.
-/// It held the SearchParameter's canonical URL, ~50-60 bytes, on every one of
-/// ~60M index rows: roughly 3 GB of an 8.5 GB heap, plus the WAL to write it,
-/// on an 11 GB Docker host. Left unbound it is NULL, which costs one bit in the
-/// null bitmap.
-///
-/// The contained-resource path below still binds it. That path inserts one row
-/// per value for `contained[]` entries only — under 5 MB of index across the
-/// whole corpus — so it is left alone rather than churned for no measurable
-/// gain.
-///
-/// Not dropped from the table: that DDL would run against real databases and
-/// cannot be undone, and it buys nothing over simply not writing the column.
-const ROW_COLUMNS: &[&str] = &[
-    "tenant_id",
-    "resource_type",
-    "resource_id",
-    "last_updated",
-    "param_name",
-    "composite_group",
-    "value_string",
-    "value_string_folded",
-    "value_token_system",
-    "value_token_code",
-    "value_token_display",
-    "value_token_system_2",
-    "value_token_code_2",
-    "value_date",
-    "value_date_precision",
-    "value_number",
-    "value_number_2",
-    "value_quantity_value",
-    "value_quantity_unit",
-    "value_quantity_system",
-    "value_quantity_canonical_value",
-    "value_quantity_canonical_unit",
-    "value_reference",
-    "value_reference_display",
-    "value_identifier_type_system",
-    "value_identifier_type_code",
-    "value_uri",
-];
+/// One column of the insert: its name, the array type it is bound as, and the
+/// column's value for every row of the chunk.
+struct InsertPlan {
+    columns: Vec<&'static str>,
+    casts: Vec<&'static str>,
+    params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+}
 
-/// Rows per `INSERT`. 28 columns x 128 rows = 3,584 bind parameters, well under
-/// Postgres' 65535 ceiling, and roughly one statement per imported resource.
-const BATCH_ROWS: usize = 128;
+/// Declares one column. Name, bind type and value extractor are written on a
+/// single line and pushed together, so the column list and the bind order
+/// cannot drift apart — the failure this replaces was silent, because Postgres
+/// accepts a shifted value wherever the types happen to line up and the index
+/// is then corrupted rather than the write rejected.
+macro_rules! column {
+    ($plan:expr, $rows:expr, $name:literal, $cast:literal, $value:expr) => {{
+        $plan.columns.push($name);
+        $plan.casts.push($cast);
+        $plan
+            .params
+            .push(Box::new($rows.iter().map($value).collect::<Vec<_>>()));
+    }};
+}
+
+/// Builds the column list and one array parameter per column for `rows`.
+///
+/// `rows.iter().map(..).collect()` always yields `rows.len()` elements, so every
+/// array is the same length by construction and the multi-argument `unnest`
+/// below never has to NULL-pad.
+fn insert_plan(rows: &[IndexRow]) -> InsertPlan {
+    let mut plan = InsertPlan {
+        columns: Vec::with_capacity(28),
+        casts: Vec::with_capacity(28),
+        params: Vec::with_capacity(28),
+    };
+    let p = &mut plan;
+
+    column!(p, rows, "last_updated", "timestamptz[]", |r: &IndexRow| r
+        .last_updated);
+    column!(p, rows, "param_name", "text[]", |r: &IndexRow| r
+        .param_name
+        .clone());
+    column!(p, rows, "param_url", "text[]", |r: &IndexRow| r
+        .param_url
+        .clone());
+    column!(p, rows, "composite_group", "int4[]", |r: &IndexRow| r
+        .composite_group);
+    column!(p, rows, "value_string", "text[]", |r: &IndexRow| r
+        .value_string
+        .clone());
+    column!(p, rows, "value_string_folded", "text[]", |r: &IndexRow| r
+        .value_string_folded
+        .clone());
+    column!(p, rows, "value_token_system", "text[]", |r: &IndexRow| r
+        .value_token_system
+        .clone());
+    column!(p, rows, "value_token_code", "text[]", |r: &IndexRow| r
+        .value_token_code
+        .clone());
+    column!(p, rows, "value_token_display", "text[]", |r: &IndexRow| r
+        .value_token_display
+        .clone());
+    column!(p, rows, "value_token_system_2", "text[]", |r: &IndexRow| r
+        .value_token_system_2
+        .clone());
+    column!(p, rows, "value_token_code_2", "text[]", |r: &IndexRow| r
+        .value_token_code_2
+        .clone());
+    column!(p, rows, "value_date", "timestamptz[]", |r: &IndexRow| r
+        .value_date);
+    column!(p, rows, "value_date_precision", "text[]", |r: &IndexRow| r
+        .value_date_precision
+        .clone());
+    column!(p, rows, "value_number", "float8[]", |r: &IndexRow| r
+        .value_number);
+    column!(p, rows, "value_number_2", "float8[]", |r: &IndexRow| r
+        .value_number_2);
+    column!(
+        p,
+        rows,
+        "value_quantity_value",
+        "float8[]",
+        |r: &IndexRow| r.value_quantity_value
+    );
+    column!(p, rows, "value_quantity_unit", "text[]", |r: &IndexRow| r
+        .value_quantity_unit
+        .clone());
+    column!(
+        p,
+        rows,
+        "value_quantity_system",
+        "text[]",
+        |r: &IndexRow| r.value_quantity_system.clone()
+    );
+    column!(
+        p,
+        rows,
+        "value_quantity_canonical_value",
+        "float8[]",
+        |r: &IndexRow| r.value_quantity_canonical_value
+    );
+    column!(
+        p,
+        rows,
+        "value_quantity_canonical_unit",
+        "text[]",
+        |r: &IndexRow| r.value_quantity_canonical_unit.clone()
+    );
+    column!(p, rows, "value_reference", "text[]", |r: &IndexRow| r
+        .value_reference
+        .clone());
+    column!(
+        p,
+        rows,
+        "value_reference_display",
+        "text[]",
+        |r: &IndexRow| r.value_reference_display.clone()
+    );
+    column!(
+        p,
+        rows,
+        "value_identifier_type_system",
+        "text[]",
+        |r: &IndexRow| r.value_identifier_type_system.clone()
+    );
+    column!(
+        p,
+        rows,
+        "value_identifier_type_code",
+        "text[]",
+        |r: &IndexRow| r.value_identifier_type_code.clone()
+    );
+    column!(p, rows, "value_uri", "text[]", |r: &IndexRow| r
+        .value_uri
+        .clone());
+    column!(p, rows, "is_contained", "bool[]", |r: &IndexRow| r
+        .is_contained);
+    column!(p, rows, "contained_type", "text[]", |r: &IndexRow| r
+        .contained_type
+        .clone());
+    column!(p, rows, "contained_local_id", "text[]", |r: &IndexRow| r
+        .contained_local_id
+        .clone());
+
+    plan
+}
+
+/// The one and only statement the index writer sends.
+///
+/// It is a `SELECT` over the multi-argument form of `unnest`, not a multi-row
+/// `VALUES` list, and that is the point: **its text does not depend on how many
+/// rows are being written**. The previous form emitted
+/// `VALUES ($1,…,$28), ($29,…,$56), …` — a different query string for every
+/// batch width, averaging 26 rows and therefore ~728 placeholders, sent
+/// unprepared. Postgres raw-parsed those ~5 KB, ran parse analysis over 728
+/// `Param` nodes coercing each to its target column, and planned a `Values` scan
+/// of 728 expressions — 1.5M times over an import, 256k times over a 5-minute
+/// crud run, and never once re-used, because the text changed with the row
+/// count and `execute(&str)` prepares a throwaway statement each call.
+///
+/// Now there is a single text with 31 parameters — three scalars and 28 arrays —
+/// whatever the row count, so it is prepared once per connection and every
+/// execution after the fifth runs on a cached generic plan.
+///
+/// `unnest(a, b, c, …)` in `FROM` expands the arrays side by side into one row
+/// per element, which is exactly the row set the `VALUES` list spelled out.
+static INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
+    let plan = insert_plan(&[]);
+    let arrays: Vec<String> = plan
+        .casts
+        .iter()
+        .enumerate()
+        .map(|(i, cast)| format!("${}::{}", i + 4, cast))
+        .collect();
+    format!(
+        "INSERT INTO search_index (tenant_id, resource_type, resource_id, {}) \
+         SELECT $1::text, $2::text, $3::text, * FROM unnest({})",
+        plan.columns.join(", "),
+        arrays.join(", ")
+    )
+});
+
+/// Rows per statement.
+///
+/// With the `unnest` form this is no longer a bind-parameter limit — 128 rows
+/// cost the same 31 parameters as one row does — so it exists only to bound the
+/// array a single statement has to marshal. It is well above the 24.2 index rows
+/// an average resource produces; what it changes is the tail. `Provenance.target`
+/// alone writes 1,626 rows for one resource, which the old 128-row cap split
+/// into 13 statements and 13 round trips.
+const BATCH_ROWS: usize = 1024;
 
 /// Search parameters this backend answers from `resources` rather than from
 /// `search_index`, and therefore does not index.
@@ -167,8 +312,10 @@ impl IndexRow {
         extracted: &ExtractedValue,
         resource_type: &str,
         resource_id: &str,
+        last_updated: Option<DateTime<Utc>>,
     ) -> Option<Self> {
         let mut row = IndexRow {
+            last_updated,
             param_name: extracted.param_name.to_string(),
             composite_group: extracted.composite_group.map(|g| g as i32),
             ..Default::default()
@@ -193,6 +340,7 @@ impl IndexRow {
                 row.value_identifier_type_code = identifier_type_code.clone();
             }
             IndexValue::Date { value, precision } => {
+                row.value_date_precision = Some(precision.to_string());
                 let Some(timestamp) = parse_index_date(value) else {
                     tracing::warn!(
                         param_name = %extracted.param_name,
@@ -204,7 +352,6 @@ impl IndexRow {
                     return None;
                 };
                 row.value_date = Some(timestamp);
-                row.value_date_precision = Some(precision.to_string());
             }
             IndexValue::Number(n) => {
                 row.value_number = Some(*n);
@@ -246,14 +393,43 @@ impl IndexRow {
         Some(row)
     }
 
+    /// Flattens one value extracted from a `contained[]` entry.
+    ///
+    /// The row is stored under the *container*'s type and id — which is what
+    /// [`PostgresSearchIndexWriter::insert_rows`] binds as the statement's
+    /// scalars — and flagged with the contained resource's type and local id.
+    ///
+    /// `last_updated` stays NULL and `param_url` is populated, both exactly as
+    /// the single-row insert this replaces left them. They are the only two
+    /// columns where a contained row differs from a plain one, and getting
+    /// either wrong would change `_contained` result ordering or a stored value.
+    fn from_contained(
+        extracted: &ExtractedValue,
+        container: (&str, &str),
+        contained: (&str, &str),
+    ) -> Option<Self> {
+        let (container_type, container_id) = container;
+        let (contained_type, contained_local_id) = contained;
+        let mut row = Self::from_extracted(extracted, container_type, container_id, None)?;
+        row.param_url = Some(extracted.param_url.clone());
+        row.is_contained = true;
+        row.contained_type = Some(contained_type.to_string());
+        row.contained_local_id = Some(contained_local_id.to_string());
+        Some(row)
+    }
+
     /// Flattens one denormalized composite row (#279).
     ///
     /// Deliberately does not populate `value_string_folded`, `value_token_display`,
     /// the identifier-type columns or the canonical quantity columns: the
     /// composite insert never set them either, and a composite search reads none
     /// of them.
-    fn from_composite(row: &super::composite_rows::CompositeRow) -> Self {
+    fn from_composite(
+        row: &super::composite_rows::CompositeRow,
+        last_updated: Option<DateTime<Utc>>,
+    ) -> Self {
         IndexRow {
+            last_updated,
             param_name: row.param_name.clone(),
             composite_group: Some(row.composite_group),
             value_token_system: row.value_token_system.clone(),
@@ -295,29 +471,52 @@ impl PostgresSearchIndexWriter {
         layout: IndexLayout,
         values: Vec<ExtractedValue>,
     ) -> StorageResult<usize> {
+        let rows = Self::build_rows(resource_type, resource_id, last_updated, layout, values);
+        Self::insert_rows(client, tenant_id, resource_type, resource_id, &rows).await?;
+        Ok(rows.len())
+    }
+
+    /// Flattens a resource's extracted values into rows, without touching the
+    /// database.
+    ///
+    /// Split out from [`Self::write_values`] so a caller that also has contained
+    /// rows can append them and send everything as one statement.
+    pub(crate) fn build_rows(
+        resource_type: &str,
+        resource_id: &str,
+        last_updated: DateTime<Utc>,
+        layout: IndexLayout,
+        values: Vec<ExtractedValue>,
+    ) -> Vec<IndexRow> {
+        // `drop_resources_backed` first: `_id`/`_lastUpdated` restate columns on
+        // `resources` and are answered from there, so they never become rows.
         let (plain, composites) =
             Self::split_for_layout(Self::drop_resources_backed(values), layout);
 
         let mut rows: Vec<IndexRow> = Vec::with_capacity(plain.len() + composites.len());
         for value in &plain {
-            if let Some(row) = IndexRow::from_extracted(value, resource_type, resource_id) {
+            if let Some(row) =
+                IndexRow::from_extracted(value, resource_type, resource_id, Some(last_updated))
+            {
                 rows.push(row);
             }
         }
         for row in &composites {
-            rows.push(IndexRow::from_composite(row));
+            rows.push(IndexRow::from_composite(row, Some(last_updated)));
         }
+        rows
+    }
 
-        Self::insert_rows(
-            client,
-            tenant_id,
-            resource_type,
-            resource_id,
-            last_updated,
-            &rows,
-        )
-        .await?;
-        Ok(rows.len())
+    /// Flattens the values extracted from one `contained[]` entry into rows.
+    pub(crate) fn build_contained_rows(
+        container: (&str, &str),
+        contained: (&str, &str),
+        values: &[ExtractedValue],
+    ) -> Vec<IndexRow> {
+        values
+            .iter()
+            .filter_map(|value| IndexRow::from_contained(value, container, contained))
+            .collect()
     }
 
     /// Drops the values this backend answers from `resources` columns.
@@ -351,95 +550,34 @@ impl PostgresSearchIndexWriter {
         }
     }
 
-    /// Builds one multi-row `INSERT` and its bind parameters.
+    /// Sends flattened rows through [`INSERT_SQL`], at most [`BATCH_ROWS`] per
+    /// statement.
     ///
-    /// Split out so the correspondence between [`ROW_COLUMNS`] and the push
-    /// order below is assertable without a database: a column added to one and
-    /// not the other shifts every later value into the wrong column, which
-    /// Postgres accepts silently wherever the types happen to line up.
-    fn build_insert(
-        tenant_id: &str,
-        resource_type: &str,
-        resource_id: &str,
-        last_updated: DateTime<Utc>,
-        chunk: &[IndexRow],
-    ) -> (
-        String,
-        Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
-    ) {
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            Vec::with_capacity(chunk.len() * ROW_COLUMNS.len());
-        let mut tuples: Vec<String> = Vec::with_capacity(chunk.len());
-
-        for row in chunk {
-            let base = params.len();
-            let placeholders: Vec<String> = (1..=ROW_COLUMNS.len())
-                .map(|i| format!("${}", base + i))
-                .collect();
-            tuples.push(format!("({})", placeholders.join(", ")));
-
-            // Push order must match ROW_COLUMNS exactly.
-            params.push(Box::new(tenant_id.to_string()));
-            params.push(Box::new(resource_type.to_string()));
-            params.push(Box::new(resource_id.to_string()));
-            params.push(Box::new(last_updated));
-            params.push(Box::new(row.param_name.clone()));
-            params.push(Box::new(row.composite_group));
-            params.push(Box::new(row.value_string.clone()));
-            params.push(Box::new(row.value_string_folded.clone()));
-            params.push(Box::new(row.value_token_system.clone()));
-            params.push(Box::new(row.value_token_code.clone()));
-            params.push(Box::new(row.value_token_display.clone()));
-            params.push(Box::new(row.value_token_system_2.clone()));
-            params.push(Box::new(row.value_token_code_2.clone()));
-            params.push(Box::new(row.value_date));
-            params.push(Box::new(row.value_date_precision.clone()));
-            params.push(Box::new(row.value_number));
-            params.push(Box::new(row.value_number_2));
-            params.push(Box::new(row.value_quantity_value));
-            params.push(Box::new(row.value_quantity_unit.clone()));
-            params.push(Box::new(row.value_quantity_system.clone()));
-            params.push(Box::new(row.value_quantity_canonical_value));
-            params.push(Box::new(row.value_quantity_canonical_unit.clone()));
-            params.push(Box::new(row.value_reference.clone()));
-            params.push(Box::new(row.value_reference_display.clone()));
-            params.push(Box::new(row.value_identifier_type_system.clone()));
-            params.push(Box::new(row.value_identifier_type_code.clone()));
-            params.push(Box::new(row.value_uri.clone()));
-        }
-
-        let sql = format!(
-            "INSERT INTO search_index ({}) VALUES {}",
-            ROW_COLUMNS.join(", "),
-            tuples.join(", ")
-        );
-        (sql, params)
-    }
-
-    /// Sends flattened rows as multi-row `INSERT`s of at most [`BATCH_ROWS`].
-    ///
-    /// One statement per 128 rows instead of one per row. Postgres commonly runs
-    /// on a different host from the server, so the per-row form paid a network
-    /// round trip for every extracted value; this is what made bulk import
-    /// round-trip-bound rather than disk-bound.
-    async fn insert_rows(
+    /// `tenant_id`, `resource_type` and `resource_id` are the same for every row
+    /// of one write, so they are bound once per statement instead of once per
+    /// row — 3 fewer values on the wire for each of the ~39.5M index rows an
+    /// import writes.
+    pub(crate) async fn insert_rows(
         client: &deadpool_postgres::Client,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        last_updated: DateTime<Utc>,
         rows: &[IndexRow],
     ) -> StorageResult<()> {
         for chunk in rows.chunks(BATCH_ROWS) {
-            let (sql, params) =
-                Self::build_insert(tenant_id, resource_type, resource_id, last_updated, chunk);
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
+            let plan = insert_plan(chunk);
+            let mut param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                Vec::with_capacity(3 + plan.params.len());
+            param_refs.push(&tenant_id);
+            param_refs.push(&resource_type);
+            param_refs.push(&resource_id);
+            param_refs.extend(
+                plan.params
+                    .iter()
+                    .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)),
+            );
 
-            client
-                .execute(sql.as_str(), &param_refs)
+            execute_cached(client, INSERT_SQL.as_str(), &param_refs)
                 .await
                 .map_err(|e| {
                     internal_error(format!("Failed to insert search index rows: {}", e))
@@ -464,177 +602,14 @@ impl PostgresSearchIndexWriter {
         if answered_from_resources(&extracted.param_name) {
             return Ok(());
         }
-        let Some(row) = IndexRow::from_extracted(extracted, resource_type, resource_id) else {
+        let Some(row) =
+            IndexRow::from_extracted(extracted, resource_type, resource_id, Some(last_updated))
+        else {
             return Ok(());
         };
-        Self::insert_rows(
-            client,
-            tenant_id,
-            resource_type,
-            resource_id,
-            last_updated,
-            &[row],
-        )
-        .await
-    }
-
-    /// Writes a single contained `ExtractedValue` for `_contained` search. The
-    /// row's `resource_type` / `resource_id` identify the container; the entry is
-    /// flagged `is_contained = TRUE` and carries the contained resource's type
-    /// and local id. Uses one full-column INSERT (rather than the per-type
-    /// inserts above) so all value variants share a single statement.
-    pub async fn write_contained_entry(
-        client: &deadpool_postgres::Client,
-        tenant_id: &str,
-        container: (&str, &str),
-        contained: (&str, &str),
-        extracted: &ExtractedValue,
-    ) -> StorageResult<()> {
-        let (container_type, container_id) = container;
-        let (contained_type, contained_local_id) = contained;
-
-        let mut value_string: Option<String> = None;
-        let mut value_string_folded: Option<String> = None;
-        let mut token_system: Option<String> = None;
-        let mut token_code: Option<String> = None;
-        let mut token_display: Option<String> = None;
-        let mut value_date: Option<DateTime<Utc>> = None;
-        let mut date_precision: Option<String> = None;
-        let mut value_number: Option<f64> = None;
-        let mut q_value: Option<f64> = None;
-        let mut q_unit: Option<String> = None;
-        let mut q_system: Option<String> = None;
-        let mut q_canonical_value: Option<f64> = None;
-        let mut q_canonical_unit: Option<String> = None;
-        let mut value_reference: Option<String> = None;
-        let mut reference_display: Option<String> = None;
-        let mut value_uri: Option<String> = None;
-        let mut id_type_system: Option<String> = None;
-        let mut id_type_code: Option<String> = None;
-        let composite_group = extracted.composite_group.map(|g| g as i32);
-
-        match &extracted.value {
-            IndexValue::String(s) => {
-                value_string = Some(s.clone());
-                value_string_folded = Some(crate::search::fold_text(s));
-            }
-            IndexValue::Token {
-                system,
-                code,
-                display,
-                identifier_type_system,
-                identifier_type_code,
-            } => {
-                token_system = system.clone();
-                token_code = Some(code.clone());
-                token_display = display.clone();
-                id_type_system = identifier_type_system.clone();
-                id_type_code = identifier_type_code.clone();
-            }
-            IndexValue::Date { value, precision } => {
-                date_precision = Some(precision.to_string());
-                let Some(timestamp) = parse_index_date(value) else {
-                    tracing::warn!(
-                        param_name = %extracted.param_name,
-                        container_type = %container_type,
-                        container_id = %container_id,
-                        contained_type = %contained_type,
-                        value = %value,
-                        "skipping contained date search index entry: unparseable date value"
-                    );
-                    return Ok(());
-                };
-                value_date = Some(timestamp);
-            }
-            IndexValue::Number(n) => value_number = Some(*n),
-            IndexValue::Quantity {
-                value,
-                unit,
-                system,
-                code,
-            } => {
-                q_value = Some(*value);
-                q_unit = unit.clone();
-                q_system = system.clone();
-                if let Some((cv, cu)) = code
-                    .as_deref()
-                    .or(unit.as_deref())
-                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
-                {
-                    q_canonical_value = Some(cv);
-                    q_canonical_unit = Some(cu);
-                }
-            }
-            IndexValue::Reference {
-                reference, display, ..
-            } => {
-                value_reference = Some(reference.clone());
-                reference_display = display.clone();
-            }
-            IndexValue::Uri(uri) => value_uri = Some(uri.clone()),
-        }
-
-        let is_contained = true;
-        let contained_type = contained_type.to_string();
-        let contained_local_id = contained_local_id.to_string();
-
-        client
-            .execute(
-                "INSERT INTO search_index (
-                    tenant_id, resource_type, resource_id, param_name, param_url,
-                    value_string, value_token_system, value_token_code, value_token_display,
-                    value_date, value_date_precision, value_number,
-                    value_quantity_value, value_quantity_unit, value_quantity_system,
-                    value_reference, value_uri, composite_group,
-                    value_identifier_type_system, value_identifier_type_code, value_reference_display,
-                    value_quantity_canonical_value, value_quantity_canonical_unit, value_string_folded,
-                    is_contained, contained_type, contained_local_id
-                ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
-                )",
-                &[
-                    &tenant_id,
-                    &container_type,
-                    &container_id,
-                    &extracted.param_name.as_str(),
-                    &extracted.param_url.as_str(),
-                    &value_string,
-                    &token_system,
-                    &token_code,
-                    &token_display,
-                    &value_date,
-                    &date_precision,
-                    &value_number,
-                    &q_value,
-                    &q_unit,
-                    &q_system,
-                    &value_reference,
-                    &value_uri,
-                    &composite_group,
-                    &id_type_system,
-                    &id_type_code,
-                    &reference_display,
-                    &q_canonical_value,
-                    &q_canonical_unit,
-                    &value_string_folded,
-                    &is_contained,
-                    &contained_type,
-                    &contained_local_id,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to insert contained search index entry: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
+        Self::insert_rows(client, tenant_id, resource_type, resource_id, &[row]).await
     }
 }
-
 /// Normalize a date string for PostgreSQL TIMESTAMPTZ.
 ///
 /// Converts partial dates to full timestamps:
@@ -773,7 +748,7 @@ mod tests {
     }
 
     fn row_of(value: IndexValue) -> IndexRow {
-        IndexRow::from_extracted(&extracted(value), "Observation", "abc")
+        IndexRow::from_extracted(&extracted(value), "Observation", "abc", Some(Utc::now()))
             .expect("value should map to a row")
     }
 
@@ -839,32 +814,60 @@ mod tests {
         assert_eq!(names, vec!["code", "_profile", "_tag"]);
     }
 
-    /// The push order in `build_insert` and `ROW_COLUMNS` are maintained by
-    /// hand. If they drift, every value after the divergence lands in the wrong
-    /// column — and Postgres accepts that silently wherever the types line up,
-    /// so the index is corrupted rather than the write rejected.
+    /// The column list and the bind order are now produced by one `column!` per
+    /// column, so a name can no longer drift away from the value bound under it.
+    /// What is still worth pinning is that nothing else creeps in between: the
+    /// statement must bind exactly three scalars plus one array per column, and
+    /// its placeholders must run `$1..=$n` with no gap or repeat. A drift here
+    /// used to shift every later value into the wrong column, which Postgres
+    /// accepts silently wherever the types line up — the index is corrupted
+    /// rather than the write rejected.
     #[test]
-    fn bind_count_matches_the_column_list() {
-        let now = Utc::now();
-        for rows in [1usize, 3, BATCH_ROWS] {
+    fn the_statement_binds_three_scalars_and_one_array_per_column() {
+        let plan = insert_plan(&[]);
+        let expected = 3 + plan.columns.len();
+
+        assert_eq!(plan.casts.len(), plan.columns.len());
+        assert_eq!(plan.params.len(), plan.columns.len());
+
+        let sql = INSERT_SQL.as_str();
+        assert_eq!(
+            sql.matches('$').count(),
+            expected,
+            "every bind needs exactly one placeholder"
+        );
+        for n in 1..=expected {
+            assert!(sql.contains(&format!("${}", n)), "missing ${}", n);
+        }
+        assert!(
+            !sql.contains(&format!("${}", expected + 1)),
+            "no placeholder beyond the last bind"
+        );
+
+        // The INSERT column list is the three scalars plus every planned column,
+        // in order.
+        let column_list = sql
+            .split_once("(tenant_id, resource_type, resource_id, ")
+            .expect("insert names its columns")
+            .1
+            .split_once(") SELECT ")
+            .expect("column list is closed")
+            .0;
+        assert_eq!(column_list, plan.columns.join(", "));
+    }
+
+    /// The row count is a property of the arrays, not of the SQL: the same
+    /// statement text has to serve one row and a full batch, or the
+    /// prepared-statement cache buys nothing.
+    #[test]
+    fn the_statement_text_does_not_depend_on_the_row_count() {
+        for rows in [0usize, 1, 3, BATCH_ROWS] {
             let chunk: Vec<IndexRow> = (0..rows)
                 .map(|_| row_of(IndexValue::String("x".to_string())))
                 .collect();
-            let (sql, params) =
-                PostgresSearchIndexWriter::build_insert("t", "Observation", "abc", now, &chunk);
-            assert_eq!(
-                params.len(),
-                rows * ROW_COLUMNS.len(),
-                "bind count must equal columns x rows"
-            );
-            assert_eq!(
-                sql.matches('$').count(),
-                rows * ROW_COLUMNS.len(),
-                "every bind needs a placeholder"
-            );
-            // Placeholders must run 1..=n with no gap or repeat.
-            assert!(sql.contains(&format!("${}", rows * ROW_COLUMNS.len())));
-            assert!(!sql.contains(&format!("${}", rows * ROW_COLUMNS.len() + 1)));
+            let plan = insert_plan(&chunk);
+            assert_eq!(plan.params.len(), insert_plan(&[]).params.len());
+            assert_eq!(plan.columns, insert_plan(&[]).columns);
         }
     }
 
@@ -911,14 +914,62 @@ mod tests {
         assert!(number.value_quantity_value.is_none());
     }
 
+    /// A plain row and a contained row now travel in the same statement, so the
+    /// four columns that tell them apart have to be set per row. Getting
+    /// `last_updated` wrong would reorder `_contained` results (the search key is
+    /// `last_updated DESC`, and NULLs sort first under `DESC`); getting
+    /// `is_contained` wrong would make a contained value answer an ordinary
+    /// search.
+    #[test]
+    fn a_contained_row_differs_from_a_plain_row_in_exactly_four_columns() {
+        let value = extracted(IndexValue::String("Smith".to_string()));
+
+        let plain =
+            IndexRow::from_extracted(&value, "Patient", "p1", Some(Utc::now())).expect("row");
+        assert!(!plain.is_contained);
+        assert!(plain.param_url.is_none(), "the batched path leaves it NULL");
+        assert!(plain.contained_type.is_none());
+        assert!(plain.contained_local_id.is_none());
+        assert!(plain.last_updated.is_some());
+
+        let contained =
+            IndexRow::from_contained(&value, ("Patient", "p1"), ("Practitioner", "prac1"))
+                .expect("row");
+        assert!(contained.is_contained);
+        assert_eq!(
+            contained.param_url.as_deref(),
+            Some("http://example.org/p"),
+            "the contained path has always stored param_url"
+        );
+        assert_eq!(contained.contained_type.as_deref(), Some("Practitioner"));
+        assert_eq!(contained.contained_local_id.as_deref(), Some("prac1"));
+        assert!(
+            contained.last_updated.is_none(),
+            "the single-row insert never bound last_updated for contained rows"
+        );
+
+        // Everything else is the value, and the value is flattened identically.
+        assert_eq!(plain.value_string, contained.value_string);
+        assert_eq!(plain.value_string_folded, contained.value_string_folded);
+        assert_eq!(plain.param_name, contained.param_name);
+    }
+
     /// An unparseable date skips its row rather than being stored at ingestion
-    /// time, which would make `date=gt<any past date>` match it (#494).
+    /// time, which would make `date=gt<any past date>` match it (#494) — on the
+    /// contained path too.
     #[test]
     fn an_unparseable_date_yields_no_row() {
-        let bad = IndexValue::Date {
+        let bad = || IndexValue::Date {
             value: "not-a-date".to_string(),
             precision: DatePrecision::Day,
         };
-        assert!(IndexRow::from_extracted(&extracted(bad), "Observation", "abc").is_none());
+        assert!(
+            IndexRow::from_extracted(&extracted(bad()), "Observation", "abc", Some(Utc::now()))
+                .is_none()
+        );
+        assert!(
+            IndexRow::from_contained(&extracted(bad()), ("Observation", "abc"), ("Patient", "p1"))
+                .is_none()
+        );
     }
 }
