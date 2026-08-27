@@ -722,6 +722,7 @@ mod tests {
             value,
             composite_group: None,
             composite_slot: None,
+            composite_arity: None,
         }
     }
 

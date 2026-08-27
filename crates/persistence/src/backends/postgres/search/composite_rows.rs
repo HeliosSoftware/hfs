@@ -93,6 +93,27 @@ impl CompositeRow {
 /// Composite values are keyed by `(param_name, composite_group)`; within a group
 /// they are bucketed by slot and crossed, so every combination of component
 /// values becomes one row.
+///
+/// ## Incomplete groups are dropped
+///
+/// A composite search is a conjunction over ALL of the parameter's components —
+/// `code-value-quantity=8480-6$gt90` constrains both. A group that produced
+/// fewer axes than the definition declares is therefore unreachable: no
+/// well-formed composite query can match it. Such groups used to be written
+/// anyway, and they dominate the table on real data — an Observation with a
+/// `code` and a `valueQuantity` still got a `code-value-date` row and a
+/// `code-value-string` row, one per code, purely because `code` was present.
+/// On the benchmark corpus that was ~5M of 39.5M index rows, every one of them
+/// paying an insert, an index maintenance cost and a referential-integrity
+/// check on write.
+///
+/// These rows are unreachable by construction on this backend, not merely by
+/// the spec's reading: `build_composite_condition` splits the supplied value on
+/// `$` and emits `1 = 0` when the part count does not equal the definition's
+/// component count, so a query naming fewer components than the parameter has
+/// already returns nothing. A partial row can therefore never be the reason a
+/// search does or does not match. (The SQLite backend agrees from the other
+/// direction — its grouped `HAVING` requires every queried component present.)
 pub(crate) fn fold_composites(
     values: Vec<ExtractedValue>,
 ) -> (Vec<ExtractedValue>, Vec<CompositeRow>) {
@@ -119,10 +140,13 @@ pub(crate) fn fold_composites(
         // Bucket by slot, keeping component order.
         let mut slots: Vec<(u8, Vec<ExtractedValue>)> = Vec::new();
         let mut param_url = String::new();
+        let mut arity: Option<u8> = None;
         for member in members {
             if param_url.is_empty() {
                 param_url = member.param_url.clone();
             }
+            // Every member of a group carries the same arity; take the first.
+            arity = arity.or(member.composite_arity);
             let slot = member.composite_slot.unwrap_or(1);
             // A component of a *different* family in the same slot number is a
             // separate axis of the cross-product, so key on (slot, family) via
@@ -137,7 +161,13 @@ pub(crate) fn fold_composites(
             }
         }
 
-        if slots.is_empty() {
+        // An instance that is missing a component can never satisfy a composite
+        // search, so it contributes no rows. `arity` is the number of axes a
+        // complete instance has; `slots` is how many this one actually produced.
+        // Values that predate the arity field (or come from a backend that does
+        // not set it) fall back to the old "any non-empty group" rule.
+        let required = arity.map(usize::from).unwrap_or(1);
+        if slots.len() < required {
             continue;
         }
 
@@ -209,9 +239,12 @@ mod tests {
         group: u32,
         slot: u8,
     ) -> ExtractedValue {
+        // Every composite exercised here is two-component, which is also the
+        // arity the extractor would record for them.
         ExtractedValue::new(param, "http://example.org/sp", ty, value)
             .with_composite_group(group)
             .with_composite_slot(slot)
+            .with_composite_arity(2)
     }
 
     #[test]
@@ -344,6 +377,71 @@ mod tests {
             .collect();
         codes.sort();
         assert_eq!(codes, vec!["271649006", "8480-6"]);
+    }
+
+    #[test]
+    fn a_group_missing_a_component_produces_no_row() {
+        // The dominant shape on real data: an Observation carries a `code` but
+        // no `valueDateTime`, so `code-value-date` has only its token axis. No
+        // well-formed `code-value-date=<token>$<date>` query can match it, and
+        // on the benchmark corpus these were ~5M unreachable rows.
+        let (_, rows) = fold_composites(vec![component(
+            "code-value-date",
+            SearchParamType::Token,
+            token("8480-6"),
+            0,
+            1,
+        )]);
+        assert!(rows.is_empty(), "an incomplete instance is unsearchable");
+    }
+
+    #[test]
+    fn one_incomplete_group_does_not_suppress_a_complete_one() {
+        // Two component groups on one Observation: the first has both axes, the
+        // second only its code. Dropping is per-group, not per-parameter.
+        let (_, rows) = fold_composites(vec![
+            component(
+                "component-code-value-quantity",
+                SearchParamType::Token,
+                token("8480-6"),
+                0,
+                1,
+            ),
+            component(
+                "component-code-value-quantity",
+                SearchParamType::Quantity,
+                quantity(140.0),
+                0,
+                1,
+            ),
+            component(
+                "component-code-value-quantity",
+                SearchParamType::Token,
+                token("8462-4"),
+                1,
+                1,
+            ),
+        ]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].composite_group, 0);
+        assert_eq!(rows[0].value_quantity_value, Some(140.0));
+    }
+
+    #[test]
+    fn values_without_a_recorded_arity_keep_the_old_rule() {
+        // Backends and call sites that never set `composite_arity` must not
+        // silently lose rows; the fallback is the previous "any non-empty
+        // group" behaviour.
+        let legacy = ExtractedValue::new(
+            "code-value-quantity",
+            "http://example.org/sp",
+            SearchParamType::Token,
+            token("8480-6"),
+        )
+        .with_composite_group(0)
+        .with_composite_slot(1);
+        let (_, rows) = fold_composites(vec![legacy]);
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]

@@ -326,6 +326,7 @@ mod tests {
             value: IndexValue::String("Smith".to_string()),
             composite_group: None,
             composite_slot: None,
+            composite_arity: None,
         };
 
         let params =
@@ -351,6 +352,7 @@ mod tests {
             },
             composite_group: None,
             composite_slot: None,
+            composite_arity: None,
         };
 
         let params =
@@ -376,6 +378,7 @@ mod tests {
             },
             composite_group: None,
             composite_slot: None,
+            composite_arity: None,
         };
 
         let params =
@@ -402,6 +405,7 @@ mod tests {
             },
             composite_group: None,
             composite_slot: None,
+            composite_arity: None,
         };
 
         let params =
@@ -428,6 +432,7 @@ mod tests {
             },
             composite_group: None,
             composite_slot: None,
+            composite_arity: None,
         };
 
         let params =
@@ -450,6 +455,7 @@ mod tests {
             },
             composite_group: None,
             composite_slot: None,
+            composite_arity: None,
         };
 
         let params =

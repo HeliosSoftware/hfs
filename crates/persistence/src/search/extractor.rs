@@ -54,6 +54,21 @@ pub struct ExtractedValue {
     /// component ignore it; the Postgres writer uses it to fold a group's
     /// components into a single row (issue #279).
     pub composite_slot: Option<u8>,
+
+    /// How many components the composite parameter's definition declares that
+    /// this extractor can actually index — i.e. how many distinct axes a
+    /// *complete* instance of this composite contributes.
+    ///
+    /// A composite search matches only when EVERY component matches, so a group
+    /// that is missing a component can never satisfy one. Postgres stores a
+    /// composite instance as one denormalized row, and without this the writer
+    /// cannot tell a complete row from a partial one — it emitted both. On the
+    /// benchmark corpus that was ~5M rows (of 39.5M) that no query can reach:
+    /// every Observation with a `code` but no `valueDateTime` still got a
+    /// `code-value-date` row.
+    ///
+    /// `None` for non-composite values.
+    pub composite_arity: Option<u8>,
 }
 
 impl ExtractedValue {
@@ -71,6 +86,7 @@ impl ExtractedValue {
             value,
             composite_group: None,
             composite_slot: None,
+            composite_arity: None,
         }
     }
 
@@ -83,6 +99,12 @@ impl ExtractedValue {
     /// Sets the composite component's slot within its column family.
     pub fn with_composite_slot(mut self, slot: u8) -> Self {
         self.composite_slot = Some(slot);
+        self
+    }
+
+    /// Sets how many components a complete instance of this composite has.
+    pub fn with_composite_arity(mut self, arity: u8) -> Self {
+        self.composite_arity = Some(arity);
         self
     }
 }
@@ -347,6 +369,18 @@ impl SearchParameterExtractor {
                 .collect()
         };
 
+        // A composite search matches only when every component matches, so the
+        // number of components this extractor can index is the arity a complete
+        // instance must reach. Components with an unresolvable definition or an
+        // empty expression are skipped below and can never contribute an axis,
+        // so they do not count toward it.
+        let arity = components
+            .iter()
+            .zip(component_types.iter())
+            .filter(|(c, t)| t.is_some() && !c.expression.is_empty())
+            .count()
+            .min(u8::MAX as usize) as u8;
+
         // Each base instance becomes a composite group.
         let base_nodes = self.evaluate_fhirpath(resource, &base_expr)?;
 
@@ -373,7 +407,8 @@ impl SearchParameterExtractor {
                         results.push(
                             ExtractedValue::new(&param.code, &param.url, sub_type, idx_value)
                                 .with_composite_group(group)
-                                .with_composite_slot(*slot),
+                                .with_composite_slot(*slot)
+                                .with_composite_arity(arity),
                         );
                     }
                 }
@@ -503,6 +538,7 @@ const NON_INDEXABLE_PARAM_CODES: [&str; 1] = ["_in"];
 /// `x.where(v = 'a`, whose parse error aborts extraction for *every* member of
 /// that parameter, concrete ones included.
 ///
+
 /// A `|` inside `(...)`, `[...]`, `'...'` (with `\'` escapes) or a backtick
 /// delimited identifier therefore stays part of its member. Members are
 /// returned trimmed.
