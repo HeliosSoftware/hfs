@@ -7,3 +7,10 @@ crates/ui/templates/** text eol=lf
 crates/ui/assets/**/*.js text eol=lf
 crates/ui/assets/**/*.css text eol=lf
 locales/** text eol=lf
+
+# The SQL-on-FHIR conformance fixtures are kept as a byte-verbatim mirror of
+# upstream (see crates/sof/tests/sql-on-fhir-v2/README.md re-sync policy). A
+# CRLF-converting Windows checkout would make `git diff` against a freshly
+# re-synced upstream copy noisy with spurious line-ending churn, defeating the
+# byte-verbatim comparison the re-sync workflow depends on.
+crates/sof/tests/sql-on-fhir-v2/tests/*.json text eol=lf
