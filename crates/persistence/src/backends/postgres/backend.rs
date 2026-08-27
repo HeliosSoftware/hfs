@@ -45,7 +45,7 @@ pub struct PostgresBackend {
     /// single resource write — 254,970 catalog queries in one 5-minute crud
     /// run. The answer only changes when the schema is created or migrated,
     /// both of which happen before the instance serves traffic.
-    fts_table_exists: Arc<std::sync::OnceLock<bool>>,
+    pub(super) fts_table_exists: Arc<std::sync::OnceLock<bool>>,
 }
 
 impl Debug for PostgresBackend {

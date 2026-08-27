@@ -750,6 +750,9 @@ mod tests {
             },
             composite_group: Some(1),
             composite_slot: Some(slot),
+            // `code-value-quantity` is two-component; a group that reaches that
+            // arity is what the fold keeps.
+            composite_arity: Some(2),
         };
         let values = vec![component("8480-6", 1), component("8462-4", 2)];
 
