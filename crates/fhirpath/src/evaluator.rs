@@ -1371,6 +1371,21 @@ fn primitive_member_access(
     }
 }
 
+/// Returns true for a FHIR primitive element that has metadata but no system value.
+///
+/// These elements remain present for tree operations such as `exists()` and
+/// `.extension`, but functions and operators that consume the primitive value must
+/// treat them like an empty collection.
+fn is_primitive_without_value(result: &EvaluationResult) -> bool {
+    matches!(
+        result,
+        EvaluationResult::Object {
+            type_info: Some(type_info),
+            ..
+        } if type_info.namespace == "FHIR" && type_info.name == "Element"
+    )
+}
+
 fn evaluate_with_context(
     expr: &Expression,
     context: EvaluationContext,
@@ -4244,6 +4259,7 @@ fn call_function(
                     EvaluationResult::integer(s.chars().count() as i64)
                 } // Use chars().count() for correct length
                 EvaluationResult::Empty => EvaluationResult::Empty,
+                value if is_primitive_without_value(value) => EvaluationResult::Empty,
                 // Collections handled by initial check
                 EvaluationResult::Collection { .. } => unreachable!(),
                 _ => {
@@ -4424,6 +4440,7 @@ fn call_function(
                     }
                 }
                 EvaluationResult::Empty => EvaluationResult::Empty, // substring on {} is {}
+                value if is_primitive_without_value(value) => EvaluationResult::Empty,
                 // Collections handled by initial check
                 EvaluationResult::Collection { .. } => unreachable!(), // Should have been caught by singleton check
                 _ => {
@@ -4503,6 +4520,7 @@ fn call_function(
                 // Wrap in Ok
                 EvaluationResult::String(s, _, _) => EvaluationResult::string(s.to_uppercase()),
                 EvaluationResult::Empty => EvaluationResult::Empty,
+                value if is_primitive_without_value(value) => EvaluationResult::Empty,
                 _ => {
                     return Err(EvaluationError::TypeError(
                         "upper requires a String input".to_string(),
@@ -6155,6 +6173,7 @@ fn call_function(
                     }
                 }
                 EvaluationResult::Empty => EvaluationResult::Empty,
+                value if is_primitive_without_value(value) => EvaluationResult::Empty,
                 // Collections handled by initial check
                 EvaluationResult::Collection { .. } => unreachable!(),
                 _ => {
@@ -6333,14 +6352,7 @@ fn call_function(
             // Returns false if element is empty or is a primitive with extensions but no value
             match invocation_base {
                 EvaluationResult::Empty => Ok(EvaluationResult::boolean(false)),
-                EvaluationResult::Object { type_info, .. } => {
-                    // Check if this is an Element (primitive with extensions but no value)
-                    let is_element = type_info
-                        .as_ref()
-                        .map(|ti| ti.name == "Element")
-                        .unwrap_or(false);
-                    Ok(EvaluationResult::boolean(!is_element))
-                }
+                value if is_primitive_without_value(value) => Ok(EvaluationResult::boolean(false)),
                 _ => Ok(EvaluationResult::boolean(true)),
             }
         }
@@ -8086,7 +8098,11 @@ fn compare_inequality(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Changed return type
     // Handle empty operands: comparison with empty returns empty
-    if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+    if left == &EvaluationResult::Empty
+        || right == &EvaluationResult::Empty
+        || is_primitive_without_value(left)
+        || is_primitive_without_value(right)
+    {
         return Ok(EvaluationResult::Empty); // Return Ok(Empty)
     }
 
