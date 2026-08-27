@@ -723,3 +723,63 @@ JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Patient'
                 AND r.id = c.resource_id
 WHERE r.is_deleted = FALSE
 ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AK. COMPOSITE code-value-date — the family with NO covering index ########'
+-- v26 narrowed `idx_search_composite_token_quantity` to
+-- `value_quantity_value IS NOT NULL` and `idx_search_composite_token_token` to
+-- its slot-2 token, so a composite row now inserts into ONE family index
+-- instead of both. 19 of the 46 R4 composites are token+quantity and 20 are
+-- token+token; this shape is in NEITHER group, and it is the one the narrowing
+-- could plausibly have stranded.
+--
+-- It should not be stranded, and this section is how you check. Nothing was
+-- taken away from `idx_search_token_code` — it stays partial on
+-- `value_token_code IS NOT NULL` only, so it still holds composite rows and is
+-- the catch-all for every composite family without one of its own. EXPECT an
+-- index scan on `idx_search_token_code`, seeking (tenant_id, resource_type,
+-- param_name, value_token_code) and filtering `value_date` from the payload or
+-- the heap. A Seq Scan or a scan of `idx_search_resource` here means the
+-- narrowing DID strand this family and section 2 of migrate_v25_to_v26 needs a
+-- token+date covering index of its own.
+--
+-- (This may legitimately return no rows: `fold_composites` drops incomplete
+-- groups, so a `code-value-date` row exists only where the Observation actually
+-- carries a dateTime value. An empty result still shows the plan, which is what
+-- is being checked.)
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                AND param_name = 'code-value-date'
+                AND composite_group IS NOT NULL
+                AND (value_token_code = '8302-2') AND (value_date >= '2010-01-01')))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## AL. v26 PREDICATE REACH — rows an index holds vs rows it could hold ########'
+-- Each v26 predicate is only worth what it excludes, and it is only SAFE if the
+-- query builder's SQL implies it (predtest.c proves `x IS NOT NULL` from any
+-- strict operator over x, and an OR predicate from either arm). The plans above
+-- are the safety check; this is the size check. `kept` is what the narrowed
+-- index now indexes, `dropped` is the insert every row of that kind no longer
+-- pays, once per row per import.
+SELECT 'idx_search_string_folded' AS index_name,
+       count(*) FILTER (WHERE value_string IS NOT NULL) AS kept,
+       count(*) FILTER (WHERE value_string IS NULL)     AS dropped
+FROM search_index WHERE tenant_id = 'default'
+UNION ALL
+SELECT 'idx_search_composite_token_quantity',
+       count(*) FILTER (WHERE value_quantity_value IS NOT NULL),
+       count(*) FILTER (WHERE value_quantity_value IS NULL)
+FROM search_index WHERE tenant_id = 'default' AND composite_group IS NOT NULL
+UNION ALL
+SELECT 'idx_search_composite_token_token',
+       count(*) FILTER (WHERE value_token_code_2 IS NOT NULL OR value_token_system_2 IS NOT NULL),
+       count(*) FILTER (WHERE value_token_code_2 IS NULL AND value_token_system_2 IS NULL)
+FROM search_index WHERE tenant_id = 'default' AND composite_group IS NOT NULL
+UNION ALL
+SELECT 'idx_search_composite (dropped entirely)',
+       0, count(*)
+FROM search_index WHERE tenant_id = 'default' AND composite_group IS NOT NULL;

@@ -853,6 +853,18 @@ jobs:
             # only part that differs — begins. Note also that pg_stat_statements
             # normalises the inlined `param_name` literal, so shapes that share a
             # predicate shape share one row regardless of parameter.
+            #
+            # The last query is table-level and CUMULATIVE — `pg_stat_statements`
+            # is reset per suite, `pg_stat_user_tables` is not — so read it by
+            # differencing consecutive suites. It exists because nothing above can
+            # see autovacuum or autoanalyze: neither is a statement, so neither
+            # appears in `pg_stat_statements`, yet both compete for the same 4
+            # CPUs as the inserts. `search_index` carries a statistics target of
+            # 4000 on `value_token_code` (v15/v16, issue #281), which makes one
+            # ANALYZE of it a full read of the table; `autoanalyze_count` is how
+            # you tell whether v26's `autovacuum_analyze_scale_factor = 0.4`
+            # actually cut the number of those, and `n_tup_ins` is the row count
+            # every index-insertion estimate is scaled from.
             if [ "${{ matrix.backend }}" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
               {
                 echo "suite=$SUITE wall_seconds=$SUITE_WALL"
@@ -871,7 +883,13 @@ jobs:
                   -c "SELECT round(100.0 * sum(blks_hit) / NULLIF(sum(blks_hit) + sum(blks_read), 0), 2)
                              AS cache_hit_pct,
                              sum(blks_read) AS blks_read, sum(xact_commit) AS commits
-                      FROM pg_stat_database WHERE datname = 'postgres'"
+                      FROM pg_stat_database WHERE datname = 'postgres'" \
+                  -c "SELECT relname, n_live_tup, n_tup_ins, n_tup_del, n_dead_tup,
+                             autovacuum_count, autoanalyze_count
+                      FROM pg_stat_user_tables
+                      WHERE relname IN ('search_index', 'resources', 'resource_fts',
+                                        'resource_history')
+                      ORDER BY relname"
               } > "$RESULTS_DIR/${SUITE}-pgstat.txt" 2>&1 || \
                 echo "::warning::pgstat capture failed for $SUITE"
               docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \

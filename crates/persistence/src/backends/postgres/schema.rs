@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 25;
+pub const SCHEMA_VERSION: i32 = 26;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -328,6 +328,7 @@ async fn migrate_schema(
             22 => migrate_v22_to_v23(client).await?,
             23 => migrate_v23_to_v24(client).await?,
             24 => migrate_v24_to_v25(client).await?,
+            25 => migrate_v25_to_v26(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1296,6 +1297,184 @@ async fn migrate_v24_to_v25(client: &deadpool_postgres::Client) -> StorageResult
     let _ = client
         .execute("DROP FUNCTION IF EXISTS update_fts_vectors()", &[])
         .await;
+
+    Ok(())
+}
+
+/// v25 -> v26: stop indexing rows the index in question can never answer for.
+///
+/// `search_index` is one wide table holding every parameter of every resource
+/// type, and the write path is where the whole benchmark lives: 79% of the
+/// import suite's Postgres time and 63% of crud's is `INSERT INTO search_index`
+/// (run 33029355759). That cost is per row, not per statement — the 13 batch
+/// widths in that capture range from 12 to 128 rows per call and all land
+/// between 130 and 210 µs per row — and `pg_stat_database` says where it goes:
+/// 1.55 billion buffer hits for 39.5M inserted rows, **~39 buffer accesses per
+/// row**, which is a heap insert plus roughly five btree descents. The lever is
+/// therefore the *number of index insertions per row*, and the three indexes
+/// below take one from rows they can never be read for.
+///
+/// ## Why not `PARTITION BY LIST (resource_type)`
+///
+/// Considered and rejected. It would remove no index insertion at all: a row
+/// still enters the same number of indexes, each merely one or two levels
+/// shallower, and the upper levels are the pages that are always cached. It also
+/// does not hold up on its own premise —
+/// `build_contained_condition` filters `contained_type`, not `resource_type`,
+/// and the `:identifier` chain's inner `EXISTS` binds only `tenant_id` and
+/// `param_name` — so those shapes would fan out to every partition. The main
+/// path binds `resource_type = $2`, which prunes at execution time but still
+/// takes a lock on every partition of the cached plan; ~150 R4 types times the
+/// ~20 indexes here is ~3,000 relations per statement against a default
+/// `max_locks_per_transaction` of 64. And converting a populated table is a
+/// rewrite: 6 GB of heap plus 20 GB of index rebuilt inside
+/// `initialize_schema`'s advisory lock, at startup, with every instance sharing
+/// the database blocked behind it. Partial indexes get the same "one query
+/// never sees the other population's rows" effect with no rewrite, no lock, and
+/// no policy for resource types that appear at runtime.
+///
+/// ## 1. `idx_search_string_folded` becomes partial
+///
+/// It and `idx_search_resource` were the only two indexes on `search_index`
+/// with no predicate, so all ~32M rows insert into it — while its
+/// `text_pattern_ops` sibling, `idx_search_string_folded_pattern`, is partial on
+/// `value_string IS NOT NULL` and measured **25 MB**. That is the size of the
+/// set that actually has a value; the rest is ~32M index entries for rows whose
+/// `value_string_folded` is NULL, one insert each, so that a string search on
+/// `Patient.name` can find the ~250k that are not.
+///
+/// The predicate is reachable because v24 already made it so: it changed
+/// `build_string_condition` to emit `value_string IS NOT NULL AND …` explicitly
+/// (for the pattern index's benefit), and every remaining site that touches the
+/// folded column does the same or uses a strict operator on `value_string`
+/// (`:exact` is `value_string = $n`). Composite rows are the one case where
+/// `value_string` is set and `value_string_folded` is not — `IndexRow::from_composite`
+/// deliberately skips the folded column — and they stay in the index under this
+/// predicate, exactly as they are today.
+///
+/// ## 2. The two composite covering indexes get their family's predicate
+///
+/// `idx_search_composite_token_quantity` and `idx_search_composite_token_token`
+/// are partial on `composite_group IS NOT NULL` alone, so **every** composite
+/// row inserts into **both** — 1738 MB and 1596 MB — although each serves one
+/// family. 19 of the 46 R4 composites are token+quantity and 20 are token+token;
+/// no row is both, so one of the two inserts each composite row pays is for an
+/// index that cannot match it.
+///
+/// Adding the family column's `IS NOT NULL` keeps each index reachable without
+/// touching the query builder, because `build_composite_component` already emits
+/// predicates that imply it. A quantity component is always
+/// `value_quantity_value <op> $n` and `<op>` is strict, and `predtest.c` proves
+/// `x IS NOT NULL` from any strict operator clause over `x`. A token component
+/// in slot 2 is `value_token_code_2 = $n`, or `value_token_system_2 = $n` for
+/// the `system|` form, so that index's predicate is the disjunction of the two —
+/// an OR predicate is proven when the clause implies either arm. The
+/// disjunction selects the same rows as `value_token_code_2 IS NOT NULL` would
+/// (`CompositeRow::place` never sets the system without the code); it is written
+/// as an OR only so the `system|` spelling keeps the index.
+///
+/// The composite families with no covering index of their own — token+date,
+/// token+string, token+number — are unaffected: they are served by
+/// `idx_search_token_code`, which is partial on `value_token_code IS NOT NULL`
+/// and is deliberately *not* narrowed here, so it remains the catch-all for
+/// every composite shape as well as every plain token shape.
+///
+/// ## 3. `idx_search_composite` is dropped
+///
+/// v22 made it partial on `composite_group IS NOT NULL` and recorded the reason
+/// it could be: anything probing it without constraining `composite_group`
+/// "falls back to `idx_search_resource` (tenant_id, resource_type,
+/// resource_id), a column prefix of it". That fallback is the whole story. After
+/// v22 the index holds only composite rows, and its key still leads
+/// `(tenant_id, resource_type, resource_id, …)`, so the only predicate that can
+/// seek it is one that seeks `idx_search_resource` too — which is smaller, has
+/// no predicate to prove, and is already the hottest index in the schema.
+/// `build_composite_condition` seeks on `param_name`, the *fourth* column here,
+/// so the composite search this index is named for cannot use it either. It has
+/// **0 scans in every run on record** and 945 MB, and every composite row pays
+/// an insert into it.
+///
+/// ## 4. `search_index` stops being auto-analyzed on every 10% of growth
+///
+/// v15 set `value_token_code`'s statistics target to 4000 (v16 raised it there
+/// from 2000) to fix the token misestimate in #281. `ANALYZE` samples
+/// `300 × statistics_target` rows, so 1.2M — more than the table has *blocks*,
+/// which makes every analyze of `search_index` a full read of it. At the default
+/// `autovacuum_analyze_scale_factor = 0.1` that fires on every 10% of growth, so
+/// an import that grows the table from empty to 32M rows triggers on the order
+/// of a hundred of them, each one reading a table that is on average a third of
+/// its final size — an amount of buffer traffic comparable to the import's whole
+/// 10.9M-block `blks_read`, on a 4 CPU / 11 GB host, competing with the inserts
+/// that are the point of the exercise.
+///
+/// 0.4 keeps automatic statistics maintenance and cuts that to a handful. It
+/// cannot affect plan quality for the measured suites: the benchmark runs an
+/// explicit `VACUUM (ANALYZE)` after the load and before any search, and crud
+/// changes 0.4% of a 32M-row table, which is under the threshold either way. The
+/// statistics target itself is deliberately left at 4000 — lowering it is a
+/// planner change, not a physical-design one, and #281 is why it is high.
+///
+/// ## What this costs a real database
+///
+/// Three of the four statements below are `DROP INDEX` and one `ALTER TABLE …
+/// SET`, all catalog-only. The cost is the three `CREATE INDEX`es, each a full
+/// scan of the ~6 GB heap holding a `SHARE` lock, so writes to `search_index`
+/// block for the duration — minutes on a 32M-row table, and it happens at
+/// startup under `initialize_schema`'s advisory lock. That is a real outage
+/// window and is stated here rather than hidden; it is also the reason the
+/// partitioned layout was rejected, since that variant is the same outage with a
+/// 26 GB rewrite inside it instead of three scans. `CREATE INDEX CONCURRENTLY`
+/// is not used, for the reason v15 gives: a process death mid-build leaves an
+/// INVALID index that a later `IF NOT EXISTS` skips forever.
+///
+/// A pre-v17 database is left completely alone. Every predicate above is stated
+/// in terms of the denormalized composite layout — one row per composite
+/// instance — and a legacy database stores one row per *component*, where
+/// `build_composite_condition_legacy` reads the base value columns of rows that
+/// these predicates would exclude. Such a database keeps the v25 index set and
+/// behaves exactly as before.
+async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    if read_index_layout(client).await != IndexLayout::Denormalized {
+        tracing::info!(
+            "search_index predates v17; keeping the v25 index set. Existing \
+             deployments are unaffected and see no change in behaviour."
+        );
+        return Ok(());
+    }
+
+    let stmts = [
+        // 1. Only rows that have a string value can answer a string search.
+        //    v24 made `build_string_condition` emit `value_string IS NOT NULL`.
+        "DROP INDEX IF EXISTS idx_search_string_folded",
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded
+         ON search_index (tenant_id, resource_type, param_name, value_string_folded)
+         WHERE value_string IS NOT NULL",
+        // 2. One composite row belongs to one family; it should insert into one
+        //    family's index.
+        "DROP INDEX IF EXISTS idx_search_composite_token_quantity",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_token_quantity ON search_index
+         (tenant_id, resource_type, param_name, value_token_code, value_quantity_value)
+         INCLUDE (resource_id)
+         WHERE composite_group IS NOT NULL AND value_quantity_value IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_composite_token_token",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_token_token ON search_index
+         (tenant_id, resource_type, param_name, value_token_code, value_token_code_2)
+         INCLUDE (resource_id)
+         WHERE composite_group IS NOT NULL
+           AND (value_token_code_2 IS NOT NULL OR value_token_system_2 IS NOT NULL)",
+        // 3. Superseded by its own column prefix, `idx_search_resource`.
+        "DROP INDEX IF EXISTS idx_search_composite",
+        // 4. A full-table ANALYZE per 10% of growth is not statistics
+        //    maintenance, it is a second workload.
+        "ALTER TABLE search_index SET (autovacuum_analyze_scale_factor = 0.4)",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v25->v26 failed: {}", e)))?;
+    }
 
     Ok(())
 }
