@@ -504,3 +504,222 @@ JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
                 AND r.id = c.resource_id
 WHERE r.is_deleted = FALSE
 ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SCHEMA v24 — the `system|code` token form and the folded-string prefix.
+--
+-- Sections W-Z above model only BARE token codes. `k6/searchConfig.js` also
+-- sends system-qualified values, and only those build
+-- `value_token_system = $n AND value_token_code = $m` — the one predicate shape
+-- in the benchmark that is strict in `value_token_system` and can therefore
+-- reach the partial `idx_search_token`. Run 33029355759 measured that form as
+-- the single most expensive statement of the whole search suite (314.5 s over
+-- 6254 calls, 50.286 ms mean) and no section here modelled it. That omission is
+-- the same class of mistake as v20's: a capture that models only one value form
+-- ranks an index that the other form is what actually hurts on.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+\echo ''
+\echo '######## AA. FAST PATH token Encounter?class=v3-ActCode|AMB — the 462ms p99 shape ########'
+-- WHAT TO LOOK FOR: `Index Only Scan using idx_search_token`, `Heap Fetches: 0`,
+-- rows=22 out of the Limit, and NO Sort node. v24 added
+-- `last_updated DESC, resource_id ASC` as key columns after the two equality
+-- columns, so the index supplies the required order and the LIMIT stops at 22.
+-- A `Sort`, a `Bitmap Heap Scan`, or a non-zero `Heap Fetches` means the change
+-- did not take and this shape is still materialising ~40,000 rows to return 22.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+         AND param_name = 'class'
+         AND (value_token_system = 'http://terminology.hl7.org/CodeSystem/v3-ActCode'
+              AND value_token_code = 'AMB')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Encounter'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AB. AA COUNTERFACTUAL — same query against the pre-v24 index shape ########'
+-- The paired "before" for AA, in the same pass and against the same cache, so
+-- the comparison is not a cross-run one (see the header: only a changed plan or
+-- a changed hit+read counts).
+--
+-- DDL is transactional in Postgres, so dropping the v24 index and rebuilding the
+-- v23 definition inside a transaction that ROLLBACKs leaves the database exactly
+-- as it was. The rebuild is partial on `value_token_system IS NOT NULL`
+-- (~1.6M of 39.5M rows), so it costs seconds, and it runs before the k6 load
+-- starts. If any statement in this block fails, psql's session ends the
+-- transaction and the v24 index is still there.
+--
+-- EXPECTED, if the diagnosis is right: `Index Scan using idx_search_token_v23`
+-- (not Index Only), tens of thousands of rows fetched from the heap, a Sort or
+-- HashAggregate over the whole match set, and hit+read one to two orders of
+-- magnitude above AA.
+BEGIN;
+-- Bound the blast radius: if anything else holds a lock on search_index we abort
+-- rather than hang the whole capture, and the ROLLBACK below still restores the
+-- v24 index.
+SET LOCAL lock_timeout = '30s';
+SET LOCAL statement_timeout = '300s';
+DROP INDEX idx_search_token;
+CREATE INDEX idx_search_token_v23
+  ON search_index (tenant_id, resource_type, param_name, value_token_system, value_token_code)
+  WHERE value_token_system IS NOT NULL;
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+         AND param_name = 'class'
+         AND (value_token_system = 'http://terminology.hl7.org/CodeSystem/v3-ActCode'
+              AND value_token_code = 'AMB')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Encounter'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+ROLLBACK;
+
+\echo ''
+\echo '######## AC. v24 index is back (must print idx_search_token, one row) ########'
+SELECT indexname, indexdef FROM pg_indexes
+WHERE tablename = 'search_index' AND indexname LIKE 'idx_search_token%'
+ORDER BY indexname;
+
+\echo ''
+\echo '######## AD. FAST PATH token Encounter?class=missing|class-code — zero-match system|code ########'
+-- The sibling value: same predicate shape, no matching row. Under the v23 index
+-- it still had to walk the parameter slice; under v24 the equality seek finds
+-- nothing and returns immediately. Expect rows=0 and single-digit buffers.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+         AND param_name = 'class'
+         AND (value_token_system = 'missing' AND value_token_code = 'class-code')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Encounter'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AE. FAST PATH token Observation?category=<system>|laboratory — MUST STAY FAST ########'
+-- The control. This one was already fast (the `category` slice is 689,080 rows,
+-- 11x the `class` slice, which pushed the planner off idx_search_token and onto
+-- idx_search_token_code_recent). v24 makes idx_search_token cheap enough that
+-- the planner may now prefer it here too — which is fine only if the plan stays
+-- index-only with rows=22. A regression here would cancel the AA win.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'category'
+         AND (value_token_system = 'http://terminology.hl7.org/CodeSystem/observation-category'
+              AND value_token_code = 'laboratory')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AF. FAST PATH token Observation?code=http://loinc.org|8302-2 — selective system|code ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'code'
+         AND (value_token_system = 'http://loinc.org' AND value_token_code = '8302-2')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AG. STRING Patient?name=Emilia — v24 form (implies the partial index predicate) ########'
+-- `idx_search_string_folded_pattern` is partial on `value_string IS NOT NULL`
+-- and had **0 scans** in run 33029355759, because `COALESCE(a, b) LIKE …` does
+-- not imply that predicate (COALESCE is not strict). The whole load fell to
+-- `idx_search_string_folded`, which is keyed on the bare column and so can only
+-- supply the (tenant, type, param) prefix before filtering: 38,694 scans,
+-- 142,058,567 tuples, 3,671 tuples read per query.
+--
+-- WHAT TO LOOK FOR: `Index Only Scan using idx_search_string_folded_pattern`
+-- with an Index Cond containing `~>=~`/`~<~` (the text_pattern_ops range LIKE
+-- rewrites into) rather than a Filter, and `Heap Fetches: 0` from the v24
+-- INCLUDE (resource_id, last_updated).
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Patient'
+         AND param_name = 'name' AND value_string IS NOT NULL
+         AND COALESCE(value_string_folded, lower(value_string)) LIKE 'emilia%' ESCAPE '\'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Patient'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AH. AG COUNTERFACTUAL — pre-v24 form, no IS NOT NULL conjunct ########'
+-- Identical query minus the one conjunct. Same pass, same cache, so this is a
+-- true paired control: if AG and AH produce the same plan then the conjunct did
+-- not unlock the pattern index and the string half of v24 is a no-op (it is
+-- still not a regression — idx_search_string_folded is deliberately kept).
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Patient'
+         AND param_name = 'name'
+         AND COALESCE(value_string_folded, lower(value_string)) LIKE 'emilia%' ESCAPE '\'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Patient'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AI. STRING Patient?address=Springfield — v24 form, larger slice ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Patient'
+         AND param_name = 'address' AND value_string IS NOT NULL
+         AND COALESCE(value_string_folded, lower(value_string)) LIKE 'springfield%' ESCAPE '\'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Patient'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AJ. STRING Patient?address:contains=Springfield — leading % is not sargable ########'
+-- Half of the benchmark's string requests carry `:contains`, whose leading `%`
+-- no btree can seek. The conjunct still helps: the pattern index is partial and
+-- covering, so the unavoidable scan runs over ~250k entries index-only instead
+-- of over the parameter slice of a 372 MB non-partial index with a heap fetch
+-- per candidate. Expect a scan, not a seek — but check which index and whether
+-- Heap Fetches is 0.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Patient'
+         AND param_name = 'address' AND value_string IS NOT NULL
+         AND COALESCE(value_string_folded, lower(value_string)) LIKE '%springfield%' ESCAPE '\'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Patient'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;

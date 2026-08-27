@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 23;
+pub const SCHEMA_VERSION: i32 = 24;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -347,6 +347,7 @@ async fn migrate_schema(
             20 => migrate_v20_to_v21(client).await?,
             21 => migrate_v21_to_v22(client).await?,
             22 => migrate_v22_to_v23(client).await?,
+            23 => migrate_v23_to_v24(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1103,6 +1104,176 @@ async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
+/// v23 -> v24: give `idx_search_token` the payload and the sort key that every
+/// other token index already has, and make the folded-string pattern index
+/// reachable.
+///
+/// ## The `system|code` token form is 22% of all Postgres execution in search
+///
+/// Run 33029355759, per-shape client latency (`search-points.json`, n=9707 each):
+///
+/// ```text
+/// shape                        total     p50    p90     p99      max
+/// token Encounter class        426.7s   10.9   75.4   461.8   3600.8
+/// token Encounter status       104.6s    7.7   24.2    41.5     80.7
+/// ```
+///
+/// `class` is 11.9% of the whole suite's latency against a 4.2% fair share, and
+/// its distribution is not a shifted copy of `status`'s — it is bimodal.
+/// **9.43% of `class` requests exceed 100 ms; 0.30% of `status` requests exceed
+/// 50 ms and none exceeds 100.** 9.43% is 1/10.6, and `class` has 11 values in
+/// `k6/searchConfig.js`: exactly one value is pathological, uniformly across the
+/// whole two-minute window (the per-10s buckets are flat, so this is not a plan
+/// flip part-way through the run).
+///
+/// The two parameters live in the same table, with the same slice shape and the
+/// same index family. The only difference between them is the values the
+/// benchmark sends:
+///
+/// ```text
+/// status: finished | in-progress | planned | arrived | cancelled | ...  (all bare codes)
+/// class:  AMB | EMER | ... | http://terminology.hl7.org/CodeSystem/v3-ActCode|AMB
+///                          | http://terminology.hl7.org/CodeSystem/v3-ActCode|EMER
+///                          | missing|class-code
+/// ```
+///
+/// `status` has no system-qualified value. `class` has three, and one of them —
+/// `v3-ActCode|AMB` — matches roughly two thirds of all Encounters.
+///
+/// A `system|code` value builds `value_token_system = $n AND value_token_code = $m`
+/// (see `build_token_condition`), and that is the only predicate shape in the
+/// benchmark strict in `value_token_system`, so it is the only one that can
+/// reach this index. `pg_stat_statements` and `pg_stat_user_indexes` from the
+/// same run agree on the consequence:
+///
+/// ```text
+/// exec_s  calls   mean_ms   rows     (the top statement of the search suite)
+///  314.5   6254    50.286   90027
+///
+/// index                          scans   tuples_read
+/// idx_search_token                4321    58,376,095   -> 13,510 tuples per scan
+/// idx_search_token_code          33325       332,061   ->     10 tuples per scan
+/// idx_search_token_code_recent   12175     4,055,875   ->    333 tuples per scan
+/// ```
+///
+/// 6254 calls is the expected count of every `system|code` request in the run
+/// (`category` 2157 + `code` 1494 + `class` 2647 = 6298; pg_stat_statements
+/// normalises the inlined `param_name` literal, so all three share one entry).
+/// 4321 scans is the subset of those that reached this index, and 58.4M tuples
+/// over 4321 scans reconciles to within 2% as `class|AMB` (~40k rows) +
+/// `class|EMER` + the two `code|<loinc>` values, with `class|AMB` alone
+/// contributing ~35M.
+///
+/// ## Why it costs ~330 ms
+///
+/// `idx_search_token` is `(tenant_id, resource_type, param_name,
+/// value_token_system, value_token_code)` with **no payload and no sort key** —
+/// the one token index v19 never rebuilt. So the fast path's
+///
+/// ```sql
+/// SELECT DISTINCT resource_id, last_updated FROM search_index
+/// WHERE ... AND (value_token_system = $3 AND value_token_code = $4)
+/// ORDER BY last_updated DESC, resource_id ASC LIMIT 22
+/// ```
+///
+/// cannot be index-only: `resource_id` and `last_updated` are not in the index,
+/// so every matching row costs a heap fetch into a 6 GB heap, and the whole
+/// match set must be sorted before the LIMIT can take 22. For `class|AMB` that
+/// is ~40,000 random heap fetches and a 40,000-row sort to return 22 rows.
+///
+/// The planner chooses it because it believes the conjunction is selective:
+/// `value_token_system` and `value_token_code` are estimated independently, and
+/// a code all but determines its system, so `sel(code='AMB') *
+/// sel(system='…v3-ActCode')` under-estimates by orders of magnitude, after
+/// which a 40,000-row scan is costed as a handful of rows. The same arithmetic
+/// explains why `Observation?category=<system>|laboratory` is *fast*: its slice
+/// is 689,080 rows rather than 61,751, the same under-estimate still lands above
+/// the crossover, and the planner picks `idx_search_token_code_recent` instead.
+///
+/// ## The fix, and why it does not depend on the planner
+///
+/// Add `last_updated DESC, resource_id ASC` as **key** columns — not `INCLUDE`,
+/// which is payload and cannot satisfy an ORDER BY (v19). Every column ahead of
+/// them is bound by equality in this predicate, so the remaining key order is
+/// exactly the order the fast path asks for: the scan becomes index-only,
+/// `DISTINCT` becomes a streaming `Unique`, and the LIMIT stops it at 22
+/// however many rows the value actually matches. `class|AMB` goes from ~40,000
+/// index tuples + ~40,000 heap fetches + a 40,000-row sort to ~22 index tuples
+/// and no heap fetch.
+///
+/// This is deliberately *not* a statistics fix. An extended statistic on
+/// (value_token_system, value_token_code) would correct the estimate and let the
+/// planner move to `idx_search_token_code`, but it would leave the cliff in
+/// place for every value whose estimate is still wrong. Making the index the
+/// planner already prefers cheap removes the cliff instead of steering around
+/// it.
+///
+/// **Write-side cost.** The row set is unchanged — the index stays partial on
+/// `value_token_system IS NOT NULL`, ~1.6M of the 39.5M index rows (157 MB at
+/// ~92 bytes per entry). Import already pays one insert per such row; what
+/// changes is the entry width, +8 bytes for `last_updated` and ~40 for
+/// `resource_id`, so ~157 MB -> ~240 MB. That is +83 MB against 20 GB of
+/// indexes and no new index insert for the other ~37.9M rows. For scale, v21
+/// re-added 5.6 GB.
+///
+/// ## Second change: the folded-string pattern index was unreachable
+///
+/// From the same run:
+///
+/// ```text
+/// idx_search_string_folded          38694 scans   142,058,567 tuples   372 MB
+/// idx_search_string_folded_pattern      0 scans             0 tuples    25 MB
+/// ```
+///
+/// 3,671 tuples read per scan, and the statement they belong to is the second
+/// most expensive in the suite (199.7 s over 29,121 calls, 14% of search
+/// execution). String search matches
+/// `COALESCE(value_string_folded, lower(value_string)) LIKE 'x%'`, and only
+/// `idx_search_string_folded_pattern` can serve that as a range — the other
+/// index is keyed on the bare column, so it can supply the
+/// `(tenant_id, resource_type, param_name)` prefix and nothing more, then filter
+/// the whole slice.
+///
+/// The pattern index went unused because it is partial on
+/// `WHERE value_string IS NOT NULL` and nothing in the query implied that
+/// predicate — the exact hazard v22's docstring flags as the reason *not* to put
+/// a predicate on `idx_search_string_folded`. `build_string_condition` now emits
+/// `value_string IS NOT NULL AND …` explicitly, which is sound because the
+/// writer only ever sets `value_string_folded` alongside `value_string`
+/// (`writer.rs`), so the added conjunct excludes no row the COALESCE could have
+/// matched. `INCLUDE (resource_id, last_updated)` keeps the fast path's scan
+/// index-only once it can seek.
+///
+/// `idx_search_string_folded` is **kept**: if the planner declines the pattern
+/// index this change is a no-op rather than a collapse, and it is the only index
+/// that can serve an ORDER BY on a string parameter. The wider payload is paid
+/// on ~250k rows — the size of the partial set, inferred from the 25 MB
+/// footprint — i.e. tens of megabytes.
+async fn migrate_v23_to_v24(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let index_stmts = [
+        "DROP INDEX IF EXISTS idx_search_token",
+        "CREATE INDEX IF NOT EXISTS idx_search_token
+         ON search_index (tenant_id, resource_type, param_name, value_token_system,
+                          value_token_code, last_updated DESC, resource_id ASC)
+         WHERE value_token_system IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_string_folded_pattern",
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded_pattern
+         ON search_index (tenant_id, resource_type, param_name,
+                          (COALESCE(value_string_folded, lower(value_string))) text_pattern_ops)
+         INCLUDE (resource_id, last_updated)
+         WHERE value_string IS NOT NULL",
+    ];
+
+    for sql in index_stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v23->v24 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
 /// v22 -> v23: drop `fk_search_resource`.
 ///
 /// `search_index` carried a composite FK to `resources` with `ON DELETE
@@ -1185,12 +1356,10 @@ async fn migrate_v22_to_v23(client: &deadpool_postgres::Client) -> StorageResult
 /// 11 GB host and the reason v20 was worth trying; the measurement says search
 /// buys more than the write path loses.
 async fn migrate_v20_to_v21(client: &deadpool_postgres::Client) -> StorageResult<()> {
-    let index_stmts = [
-        "CREATE INDEX IF NOT EXISTS idx_search_token_code_recent
+    let index_stmts = ["CREATE INDEX IF NOT EXISTS idx_search_token_code_recent
          ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
          INCLUDE (value_token_code)
-         WHERE value_token_code IS NOT NULL",
-    ];
+         WHERE value_token_code IS NOT NULL"];
 
     for sql in index_stmts {
         client
@@ -1407,6 +1576,11 @@ async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult
          ON search_index (tenant_id, resource_type, param_name, value_reference)
          WHERE value_reference IS NOT NULL",
         // The `system|` form binds the system alone; this index is what serves it.
+        //
+        // SUPERSEDED BY v24, which appends `last_updated DESC, resource_id ASC`
+        // as key columns. As written here the index has neither payload nor sort
+        // key, so the `system|code` form — the top statement of the search suite
+        // — heap-fetched every matching row and sorted the whole match set.
         "DROP INDEX IF EXISTS idx_search_token",
         "CREATE INDEX IF NOT EXISTS idx_search_token
          ON search_index (tenant_id, resource_type, param_name, value_token_system, value_token_code)
@@ -1592,6 +1766,14 @@ async fn migrate_v14_to_v15(client: &deadpool_postgres::Client) -> StorageResult
         // `:exact` shape is served by `idx_search_string` — which is why that
         // index is load-bearing rather than the redundant duplicate it appears
         // to be next to this one. Do not prune it.
+        //
+        // SUPERSEDED BY v24. As written here the index is unreachable: it is
+        // partial on `value_string IS NOT NULL`, and `COALESCE(a, b) LIKE $n`
+        // does not imply that (COALESCE is not strict), so Postgres may not use
+        // it — 0 scans in run 33029355759 while the whole string load fell to
+        // `idx_search_string_folded`. v24 rebuilds it with a covering payload,
+        // and `build_string_condition` now emits the conjunct that makes the
+        // predicate provable.
         "CREATE INDEX IF NOT EXISTS idx_search_string_folded_pattern
          ON search_index (tenant_id, resource_type, param_name,
                           (COALESCE(value_string_folded, lower(value_string))) text_pattern_ops)

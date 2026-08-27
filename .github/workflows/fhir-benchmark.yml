@@ -840,6 +840,19 @@ jobs:
             # it. The ratio is the point: a small ratio means the database was
             # idle waiting on us, and no amount of index tuning will move the
             # number.
+            #
+            # The per-statement table shows a HEAD and a WINDOW rather than
+            # `left(query, 110)`. Every search statement is the #279 fast path,
+            # whose first 209 characters are byte-identical
+            # ("SELECT r.id, … FROM ( SELECT DISTINCT resource_id, last_updated
+            # FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND
+            # "), so a 110-character prefix printed the same string for all of
+            # them and the top-15 table could not be attributed to a shape at
+            # all — run 33029355759's had to be reconstructed from call counts.
+            # The window starts at 209 because that is where the predicate — the
+            # only part that differs — begins. Note also that pg_stat_statements
+            # normalises the inlined `param_name` literal, so shapes that share a
+            # predicate shape share one row regardless of parameter.
             if [ "${{ matrix.backend }}" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
               {
                 echo "suite=$SUITE wall_seconds=$SUITE_WALL"
@@ -850,7 +863,9 @@ jobs:
                       FROM pg_stat_statements" \
                   -c "SELECT round((total_exec_time/1000.0)::numeric, 1) AS exec_s, calls,
                              round(mean_exec_time::numeric, 3) AS mean_ms, rows,
-                             left(regexp_replace(query, '\s+', ' ', 'g'), 110) AS query
+                             left(regexp_replace(query, '\s+', ' ', 'g'), 55)
+                               || ' … ' ||
+                             substr(regexp_replace(query, '\s+', ' ', 'g'), 210, 200) AS query
                       FROM pg_stat_statements
                       ORDER BY total_exec_time DESC LIMIT 15" \
                   -c "SELECT round(100.0 * sum(blks_hit) / NULLIF(sum(blks_hit) + sum(blks_read), 0), 2)

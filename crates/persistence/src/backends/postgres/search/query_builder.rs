@@ -42,7 +42,21 @@ fn like_escape(value: &str) -> String {
 /// `idx_search_string_folded_pattern` under `text_pattern_ops`, can.
 ///
 /// Must stay character-for-character identical to the index definition in
-/// `schema.rs::migrate_v13_to_v14`, or Postgres will not use the index.
+/// `schema.rs::migrate_v23_to_v24`, or Postgres will not use the index.
+///
+/// Every predicate built from this expression is emitted with a leading
+/// `value_string IS NOT NULL` conjunct. `idx_search_string_folded_pattern` is
+/// partial on exactly that, and a partial index is only usable when the query
+/// *implies* its predicate — which `COALESCE(a, b) LIKE …` does not, COALESCE
+/// not being strict. Run 33029355759 measured the consequence: the pattern index
+/// had 0 scans while `idx_search_string_folded`, which can only supply the
+/// `(tenant_id, resource_type, param_name)` prefix and then filter, took 38,694
+/// scans for 142,058,567 tuples — 3,671 tuples read per query.
+///
+/// The conjunct loses no row. `writer.rs` sets `value_string_folded` only
+/// together with `value_string` (and the contained-row path sets `value_string`
+/// alone), so `COALESCE(value_string_folded, lower(value_string)) IS NOT NULL`
+/// and `value_string IS NOT NULL` select the same rows.
 const FOLDED_STRING_EXPR: &str = "COALESCE(value_string_folded, lower(value_string))";
 
 /// Builds the numeric comparison SQL for `col` against the implicit-precision
@@ -764,7 +778,7 @@ impl PostgresQueryBuilder {
                 // one parameter's slice of the index rather than the whole table.
                 Some(SearchModifier::Contains | SearchModifier::Text) => SqlFragment::with_params(
                     format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
+                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string IS NOT NULL AND {} LIKE ${} ESCAPE '\\')",
                         param.name, FOLDED_STRING_EXPR, param_num
                     ),
                     vec![SqlParam::text(&format!(
@@ -780,7 +794,7 @@ impl PostgresQueryBuilder {
                     // that `LIKE` doesn't — but it made the predicate unindexable.
                     SqlFragment::with_params(
                         format!(
-                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
+                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string IS NOT NULL AND {} LIKE ${} ESCAPE '\\')",
                             param.name, FOLDED_STRING_EXPR, param_num
                         ),
                         vec![SqlParam::text(&format!(
@@ -2477,6 +2491,127 @@ mod tests {
             ),
             other => panic!("expected a text param, got {:?}", other),
         }
+    }
+
+    /// Builds a string `SearchParameter` with an optional modifier.
+    fn string_param(name: &str, modifier: Option<SearchModifier>, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::String,
+            modifier,
+            values: vec![SearchValue::new(SearchPrefix::Eq, value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    #[test]
+    fn folded_string_search_implies_the_partial_index_predicate() {
+        // `idx_search_string_folded_pattern` is partial on `value_string IS NOT
+        // NULL`, and Postgres only uses a partial index when the query implies
+        // its predicate. `COALESCE(a, b) LIKE …` does not imply it — COALESCE is
+        // not strict — so without this conjunct the index is unreachable and the
+        // scan degrades to a filter over the whole parameter slice (measured:
+        // 0 scans on the pattern index, 3,671 tuples read per scan on the other
+        // one). See `migrate_v23_to_v24`.
+        for modifier in [
+            None,
+            Some(SearchModifier::Contains),
+            Some(SearchModifier::Text),
+        ] {
+            let query = SearchQuery::new("Patient").with_parameter(string_param(
+                "name",
+                modifier.clone(),
+                "Emilia",
+            ));
+            let frag =
+                PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+            assert!(
+                frag.sql.contains(
+                    "value_string IS NOT NULL AND \
+                     COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"
+                ),
+                "modifier {:?} must imply the partial index predicate: {}",
+                modifier,
+                frag.sql
+            );
+        }
+    }
+
+    #[test]
+    fn exact_string_search_keeps_the_bare_column_predicate() {
+        // `:exact` reads `value_string` directly, which is already strict, so it
+        // must not acquire the redundant conjunct — `idx_search_string` serves it.
+        let query = SearchQuery::new("Patient").with_parameter(string_param(
+            "name",
+            Some(SearchModifier::Exact),
+            "Emilia",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+
+        assert!(frag.sql.contains("value_string = $3"), "{}", frag.sql);
+        assert!(!frag.sql.contains("IS NOT NULL"), "{}", frag.sql);
+        assert!(!frag.sql.contains("COALESCE"), "{}", frag.sql);
+    }
+
+    #[test]
+    fn system_qualified_token_is_one_extractable_equality_conjunction() {
+        // `Encounter?class=http://…v3-ActCode|AMB`. This is the shape v24's
+        // `idx_search_token` is keyed for: every column ahead of the sort key is
+        // bound by equality, so the index can return the fast path's rows already
+        // ordered. If this ever became a range, an OR, or a second sublink, that
+        // index could no longer stream and the LIMIT would stop terminating early.
+        let param = SearchParameter {
+            name: "class".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "http://terminology.hl7.org/CodeSystem/v3-ActCode|AMB",
+            )],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(
+            pred,
+            "param_name = 'class' AND ((value_token_system = $3 AND value_token_code = $4))"
+        );
+        assert_eq!(frag.params.len(), 2);
+        match (&frag.params[0], &frag.params[1]) {
+            (SqlParam::Text(system), SqlParam::Text(code)) => {
+                assert_eq!(system, "http://terminology.hl7.org/CodeSystem/v3-ActCode");
+                assert_eq!(code, "AMB");
+            }
+            other => panic!("expected two text params, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bare_token_predicate_never_mentions_the_system_column() {
+        // The counterpart to the test above, and the reason `Encounter?status` is
+        // 4x cheaper than `Encounter?class` on identical data: a bare code is not
+        // strict in `value_token_system`, so it cannot reach the partial
+        // `idx_search_token` at all and is served by the code-first indexes.
+        let param = SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "finished")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(pred, "param_name = 'status' AND (value_token_code = $3)");
+        assert!(!pred.contains("value_token_system"));
     }
 
     #[test]
