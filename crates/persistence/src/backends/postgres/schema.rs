@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 26;
+pub const SCHEMA_VERSION: i32 = 27;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -189,6 +189,14 @@ async fn create_schema_v1(client: &deadpool_postgres::Client) -> StorageResult<(
 }
 
 /// Create indexes for efficient queries.
+///
+/// This is the version-1 index set, and it is deliberately left as written:
+/// `create_schema_v1` is always followed by the whole migration chain, which
+/// rebuilds, narrows or drops most of these against an empty table at no cost.
+/// The chain is the single source of truth for the live index set — several
+/// indexes named below (`idx_search_composite` in v26; `idx_search_reference`,
+/// `idx_search_token_display` in v27) no longer exist by the time the schema is
+/// current.
 async fn create_indexes(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let indexes = [
         // Resources table indexes
@@ -329,6 +337,7 @@ async fn migrate_schema(
             23 => migrate_v23_to_v24(client).await?,
             24 => migrate_v24_to_v25(client).await?,
             25 => migrate_v25_to_v26(client).await?,
+            26 => migrate_v26_to_v27(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1474,6 +1483,194 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v25->v26 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v26 -> v27: four indexes on `search_index` that no predicate the query
+/// builder emits can seek, and that a surviving index already covers.
+///
+/// After v26 the write path is still 85% of the import suite's Postgres time —
+/// 2,603.6 s of 3,063.8 s over 22,565,546 rows, 0.115 ms per row (run
+/// 33086933938). Batching is finished (1,679 rows per statement; statement
+/// count fell 42,875,393 -> 56,610), and rows per resource already fell
+/// 24.2 -> 13.9. What is left is arithmetic: rows x indexes-each-row-enters x
+/// cost per btree insert. v26 attacked the middle factor with partial
+/// predicates. This attacks it again, by removing indexes outright — and
+/// unlike v26 it is a catalog-only migration, because every drop is proved
+/// against a surviving index rather than replaced by a rebuilt one.
+///
+/// The standard used here is the one v18 and v22 set and v26 restated: a
+/// zero-scan index in this benchmark means the benchmark misses that shape,
+/// not that nobody needs it. So none of the four below is dropped for being
+/// cold. Each is dropped because the SQL this backend emits **cannot seek
+/// it**, and the (tenant_id, resource_type, param_name) slice it would still
+/// be scanned for is served by another index over a superset of its rows.
+///
+/// ## Index entries per row, before and after
+///
+/// Derived from `IndexRow::from_extracted` / `from_composite` (which columns a
+/// row of each kind populates) crossed with every surviving index predicate.
+///
+/// ```text
+/// row kind                     v26  v27
+/// reference, with display        4    2
+/// reference, no display          3    2
+/// string                         4    3
+/// token, with display            4    3
+/// token, no display              3    3
+/// composite token+string         6    5
+/// date / quantity / uri / number      unchanged
+/// composite token+token / +quantity   unchanged
+/// ```
+///
+/// Reference rows are the largest single class left. The two changes that
+/// deflated the table between them — dropping the duplicated
+/// `CodeableConcept.text` row and keeping code-less text tokens out of the
+/// composite cross-product — cut token and composite rows by a factor of two
+/// to four and left reference rows untouched, and `_id` / `_lastUpdated` went
+/// to zero. On the last full census `Provenance | target` alone is 1,626,336
+/// rows, 1,626 per resource, all of them reference rows that carry no display:
+/// 3 index entries each today, 2 after this.
+///
+/// ## 1. `idx_search_reference` — subsumed by `idx_search_reference_pattern`
+///
+/// The two indexes are the same key columns
+/// (tenant_id, resource_type, param_name, value_reference) over the same
+/// partial predicate (`value_reference IS NOT NULL`). The *only* difference is
+/// the operator class on the last column: default `text_ops` here,
+/// `text_pattern_ops` on the pattern index.
+///
+/// `text_pattern_ops` carries `=` at BTEqualStrategyNumber — text equality is
+/// `texteq`, which is byte equality for any deterministic collation and is
+/// therefore shared by both families. So every equality this backend emits on
+/// `value_reference` (`value_reference = $n`, the `IN (subquery)` of
+/// `_revinclude` and of `ChainQueryBuilder`'s links) seeks the pattern index
+/// exactly as it seeks this one.
+///
+/// The converse does not hold, which is why the pattern index is the survivor:
+/// `build_reference_condition` emits `value_reference LIKE $n || '/_history/%'`
+/// and `ChainQueryBuilder` emits `value_reference LIKE 'Patient/%'`, and
+/// Postgres can only turn a prefix `LIKE` into index bounds (`~>=~` / `~<~`)
+/// inside the `text_pattern_ops` family. Dropping the pattern index instead
+/// would strand those; dropping this one strands nothing.
+///
+/// What is genuinely given up is the collation ordering, which only a
+/// MIN/MAX-to-index transform could have used — `sort_expression` emits
+/// `(SELECT MIN(value_reference) … WHERE si.resource_id = resources.id AND
+/// si.param_name = '…')`. That transform is a plan we do not want: the
+/// correlated `resource_id` is not a key column here, so taking the minimum in
+/// value order means walking the parameter's whole slice per outer row, where
+/// `idx_search_resource` (tenant_id, resource_type, resource_id) answers the
+/// same subquery with a three-column equality seek. Nothing else compares
+/// `value_reference` with an ordering operator: there is no `ORDER BY`, no
+/// range predicate and no merge condition on it anywhere in the backend.
+///
+/// ## 2. `idx_search_reference_display` and 3. `idx_search_token_display`
+///
+/// Every predicate this backend emits on either display column is `ILIKE`:
+/// `value_reference_display ILIKE $n || '%'` and `… ILIKE '%' || $n || '%'`
+/// (`build_reference_condition`), `value_token_display ILIKE $n` for `:text`
+/// and `:code-text` (`build_token_condition`). A btree in the default operator
+/// class cannot serve `ILIKE` at all — `match_pattern_prefix` derives bounds
+/// for a case-insensitive pattern only when the fixed prefix contains no
+/// letter, and even then only into a `text_pattern_ops` family, which neither
+/// of these indexes has. Two of the three call sites additionally build the
+/// pattern as `$n || '%'`, an `OpExpr` rather than a `Const`, so no prefix can
+/// be read off them at all. These indexes have never been seekable and cannot
+/// become so without a code change.
+///
+/// That leaves them as scanners of their leading (tenant_id, resource_type,
+/// param_name) slice with the `ILIKE` as a filter, and for that the writer
+/// gives a strict superset to scan instead:
+///
+/// - `IndexValue::Reference` sets `value_reference` whenever it sets
+///   `value_reference_display`, and `from_composite` sets the reference without
+///   a display, so every row of the display index is a row of
+///   `idx_search_reference_pattern`, which shares its first three key columns.
+/// - `IndexValue::Token` sets `value_token_code` unconditionally
+///   (`Some(code.clone())`) and `from_composite` never sets a display, so every
+///   row of the token-display index is a row of `idx_search_token_code`
+///   (partial on `value_token_code IS NOT NULL`), which shares its first three
+///   key columns.
+///
+/// So the `:text` / `:code-text` and reference-display shapes keep an index
+/// scan over the same parameter slice; what they lose is one candidate for it.
+///
+/// ## 4. `idx_search_string_folded` — a key column nothing reads
+///
+/// `value_string_folded` appears in exactly one place in the emitted SQL:
+/// inside `FOLDED_STRING_EXPR`, `COALESCE(value_string_folded,
+/// lower(value_string))`. There is no bare predicate on the column anywhere —
+/// not in the query builder, the chain builder, the contained path or
+/// `sort_value_column`, which maps `String` to `value_string`. An index keyed
+/// on the bare column cannot match a predicate on that COALESCE (v15 says so
+/// about the reverse direction), so its fourth key column is unreachable by
+/// construction.
+///
+/// Its first three key columns and its v26 predicate (`value_string IS NOT
+/// NULL`) are identical to `idx_search_string_folded_pattern`'s, and that index
+/// is both the one the string predicate actually seeks — v24 made it reachable
+/// by having `build_string_condition` emit the `value_string IS NOT NULL`
+/// conjunct — and strictly better for the scan, since v24 gave it
+/// `INCLUDE (resource_id, last_updated)` and the fast path needs exactly those
+/// two columns. `:exact` is unaffected: it emits `value_string = $n` against
+/// the bare column and is served by `idx_search_string`, which v18 kept for
+/// that reason and this does not touch.
+///
+/// ## Read-side risk, and how it is bounded
+///
+/// The one shape that changes plan rather than merely losing a redundant
+/// candidate is a `_sort` on a reference parameter, discussed above, where the
+/// alternative is the better plan. Everything else keeps an index whose leading
+/// columns and population are a superset. No query loses a seek; no query falls
+/// back to a sequential scan of `search_index`.
+///
+/// `.github/scripts/pg-search-plans.sql` proves this on real data rather than
+/// on this argument: section S drops each index inside a transaction and
+/// re-EXPLAINs the shape it served, so a run shows the actual plan with and
+/// without it, and rolls back.
+///
+/// ## What this costs a real database
+///
+/// Four `DROP INDEX`, no `CREATE INDEX`. This is the first index migration
+/// here that builds nothing: it is catalog-only, so there is no `SHARE` lock
+/// held for the minutes a 22M-row index build takes and no full heap scan. Each
+/// `DROP INDEX` does take a brief `ACCESS EXCLUSIVE` lock on `search_index`,
+/// which waits behind any query already scanning the table and blocks new ones
+/// while it waits — but it runs at startup under `initialize_schema`'s advisory
+/// lock, before this instance serves traffic, and completes in milliseconds
+/// once it has the lock. The space the four indexes occupied is returned to the
+/// filesystem immediately rather than left as bloat.
+///
+/// Unlike v26 this is applied to a legacy (pre-v17) `search_index` too. Every
+/// argument above is about which operator classes and which columns the emitted
+/// SQL can use, and `build_composite_condition_legacy` shares
+/// `build_composite_component` with the denormalized form — its string
+/// component is the same non-sargable `value_string ILIKE $n`, and it reads no
+/// display column and no folded column. Nothing here depends on the row layout.
+async fn migrate_v26_to_v27(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        // 1. Same key columns, same predicate, and `text_pattern_ops` carries
+        //    `=`. The pattern index additionally serves the prefix `LIKE`s that
+        //    this one never could.
+        "DROP INDEX IF EXISTS idx_search_reference",
+        // 2-3. `ILIKE` against a default-opclass btree is not sargable; the
+        //    populations are strict subsets of indexes with identical leading
+        //    columns.
+        "DROP INDEX IF EXISTS idx_search_reference_display",
+        "DROP INDEX IF EXISTS idx_search_token_display",
+        // 4. Its fourth key column appears in no emitted predicate outside the
+        //    COALESCE that only its `text_pattern_ops` sibling can match.
+        "DROP INDEX IF EXISTS idx_search_string_folded",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v26->v27 failed: {}", e)))?;
     }
 
     Ok(())
