@@ -4700,6 +4700,9 @@ details.json-fold[open] > summary .icon {
 }
 
 .batch-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   padding: 8px 14px;
   border: 1px solid var(--divider);
   border-radius: 999px;
@@ -4845,6 +4848,27 @@ details.json-fold[open] > summary .icon {
 .batch-summary {
   margin: 4px 0 10px;
   color: var(--muted);
+}
+
+/* The card head's right-hand cluster (#729): created count beside the
+   status badge. */
+.card-head__meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.batch-created {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The stage takes programmatic focus when revealed (#679); it is not
+   keyboard-reachable, so the browser's default ring around the whole
+   section is noise (#726). */
+#batch-preflight:focus {
+  outline: none;
 }
 
 
