@@ -162,6 +162,38 @@ async fn url_path_requests_advertise_prefix_and_tenant() {
         &format!("/Patient/{id}"),
     );
 
+    let conditional_body = json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "https://example.test/mrn", "value": "public-url-conditional"}],
+        "name": [{"family": "Conditional URL"}]
+    });
+    let conditional_created = server
+        .put("/acme/Patient?identifier=public-url-conditional")
+        .add_header(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/fhir+json"),
+        )
+        .json(&conditional_body)
+        .await;
+    conditional_created.assert_status(StatusCode::CREATED);
+    assert!(
+        conditional_created.headers()["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("https://public.example/fhir/acme/Patient/")
+    );
+
+    let conditional_updated = server
+        .put("/acme/Patient?identifier=public-url-conditional")
+        .add_header(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/fhir+json"),
+        )
+        .json(&conditional_body)
+        .await;
+    conditional_updated.assert_status_ok();
+    assert!(conditional_updated.headers().get("location").is_none());
+
     let compartment = server
         .get(&format!("/acme/Patient/{id}/Observation?_count=1"))
         .await;

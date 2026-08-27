@@ -139,7 +139,9 @@ where
 
     // Convert result to FHIR Bundle
     let mut bundle = result.to_bundle(&public_base, &self_link);
-    rewrite_bundle_full_urls(&mut bundle, &state, &tenant);
+    crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+        state.public_url_for_request(&tenant, [resource_type, id])
+    });
 
     debug!(
         compartment_type = %compartment_type,
@@ -272,7 +274,9 @@ where
         &search_params,
     );
     let mut bundle = result.to_bundle(&public_base, &self_link);
-    rewrite_bundle_full_urls(&mut bundle, &state, &tenant);
+    crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+        state.public_url_for_request(&tenant, [resource_type, id])
+    });
 
     debug!(
         compartment_type = %compartment_type,
@@ -300,27 +304,6 @@ fn build_compartment_search_url(
     crate::public_url::PublicUrl::parse(base_url)
         .expect("request public base was built from validated configuration")
         .with_segments_and_query([compartment_type, compartment_id, target_type], &query)
-}
-
-fn rewrite_bundle_full_urls<S>(
-    bundle: &mut helios_persistence::types::SearchBundle,
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-) where
-    S: ResourceStorage,
-{
-    for entry in &mut bundle.entry {
-        let Some(resource) = entry.resource.as_ref() else {
-            continue;
-        };
-        let Some(resource_type) = resource.get("resourceType").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(id) = resource.get("id").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        entry.full_url = Some(state.public_url_for_request(tenant, [resource_type, id]));
-    }
 }
 
 /// Converts a SearchBundle to a serde_json::Value for response.

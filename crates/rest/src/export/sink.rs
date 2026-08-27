@@ -212,6 +212,25 @@ impl ExportSink for InMemorySink {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filesystem_download_url_uses_the_current_public_base() {
+        let sink = FilesystemSink::new("unused", "https://stale.example");
+        assert_eq!(
+            sink.download_url(
+                "https://public.example/fhir",
+                "job with space",
+                "shard/0.ndjson",
+            )
+            .unwrap(),
+            "https://public.example/fhir/export/job%20with%20space/shard%2F0.ndjson"
+        );
+    }
+}
+
 // ============================================================================
 // S3Sink
 // ============================================================================

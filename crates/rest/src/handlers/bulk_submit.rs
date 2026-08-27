@@ -42,6 +42,10 @@ fn external_download_url(download: &DownloadUrl) -> Option<String> {
     (!download.requires_access_token).then(|| download.url.clone())
 }
 
+fn advertised_download_url(download: &DownloadUrl, fallback: impl FnOnce() -> String) -> String {
+    external_download_url(download).unwrap_or_else(fallback)
+}
+
 /// The code system for the `submissionStatus` Coding (per the IG).
 const SUBMISSION_STATUS_SYSTEM: &str = "http://hl7.org/fhir/event-status";
 /// The pre-STU4 draft's status system, still sent by providers tracking the
@@ -837,15 +841,13 @@ where
         // submit ownership + `system/bulk-submit` — never the export-file surface.
         // Pre-signed URLs (S3) are capability URLs and are used as-is.
         requires_token |= dl.requires_access_token;
-        let url = if let Some(external) = external_download_url(&dl) {
-            external
-        } else {
+        let url = advertised_download_url(&dl, || {
             let part = format!("{resource_type}-{}", f.part_index);
             state.public_url_for_request(
                 &tenant,
                 ["bulk-submit-file", token.as_str(), part.as_str()],
             )
-        };
+        });
         let url = serde_json::Value::String(url);
         match f.file_type.as_str() {
             "output" => {
@@ -1107,6 +1109,19 @@ mod tests {
             requires_access_token: false,
         };
         assert_eq!(external_download_url(&download).as_deref(), Some(url));
+        assert_eq!(
+            advertised_download_url(&download, || "https://fallback.example".to_string()),
+            url
+        );
+
+        let protected = DownloadUrl {
+            url: "internal://artifact".to_string(),
+            requires_access_token: true,
+        };
+        assert_eq!(
+            advertised_download_url(&protected, || "https://public.example/artifact".to_string()),
+            "https://public.example/artifact"
+        );
     }
 
     fn param(name: &str, key: &str, val: Value) -> Value {

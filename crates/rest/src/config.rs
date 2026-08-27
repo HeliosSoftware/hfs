@@ -1171,7 +1171,10 @@ impl ServerConfig {
     /// Loads configuration for the HFS binary and reports command-line,
     /// environment, and validation errors to the caller.
     pub fn try_from_env() -> Result<Self, clap::Error> {
-        let mut config = Self::try_parse()?;
+        Self::finish_parsed(Self::try_parse()?)
+    }
+
+    fn finish_parsed(mut config: Self) -> Result<Self, clap::Error> {
         config.multitenancy = MultitenancyConfig::from_env();
         config.bulk_export = BulkExportConfig::from_env();
         config.bulk_submit = BulkSubmitConfig::from_env();
@@ -1958,15 +1961,41 @@ mod tests {
     }
 
     #[test]
+    fn test_finish_parsed_normalizes_and_validates() {
+        let config = ServerConfig {
+            base_url: "https://fhir.example.test/root/".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ServerConfig::finish_parsed(config).unwrap().base_url,
+            "https://fhir.example.test/root"
+        );
+
+        let invalid_url = ServerConfig {
+            base_url: "not-a-url".to_string(),
+            ..Default::default()
+        };
+        assert!(ServerConfig::finish_parsed(invalid_url).is_err());
+
+        let invalid_config = ServerConfig {
+            port: 0,
+            ..Default::default()
+        };
+        assert!(ServerConfig::finish_parsed(invalid_config).is_err());
+    }
+
+    #[test]
     fn test_loopback_public_base_warning() {
         let cases = [
             ("127.0.0.1", 8080, "http://localhost:8080", false),
+            ("localhost", 8080, "http://localhost:8080", false),
             ("::1", 8080, "http://[::1]:8080", false),
             ("[::1]", 8080, "http://[::1]:8080", false),
             ("0.0.0.0", 8080, "http://localhost:8080", true),
             ("::", 8080, "http://127.0.0.1:8080", true),
             ("192.0.2.10", 8080, "http://[::1]:8080", true),
             ("127.0.0.1", 18080, "http://localhost:8080", true),
+            ("0.0.0.0", 18080, "http://localhost:8080", true),
         ];
 
         for (host, port, base_url, warns) in cases {

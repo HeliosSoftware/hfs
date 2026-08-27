@@ -2,6 +2,8 @@
 
 use url::{Host, Url};
 
+use helios_persistence::types::SearchBundle;
+
 /// A validated public base URL.
 ///
 /// Path components are appended through [`Url::path_segments_mut`] so tenant,
@@ -11,6 +13,27 @@ use url::{Host, Url};
 pub(crate) struct PublicUrl {
     url: Url,
     normalized: String,
+}
+
+pub(crate) fn rewrite_bundle_full_urls(
+    bundle: &mut SearchBundle,
+    mut public_url: impl FnMut(&str, &str) -> String,
+) {
+    for entry in &mut bundle.entry {
+        let Some(resource) = entry.resource.as_ref() else {
+            continue;
+        };
+        let Some(resource_type) = resource
+            .get("resourceType")
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        let Some(id) = resource.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        entry.full_url = Some(public_url(resource_type, id));
+    }
 }
 
 impl PublicUrl {
@@ -30,17 +53,13 @@ impl PublicUrl {
         {
             return Err("HFS_BASE_URL must not include user information".to_string());
         }
-        let mut url = Url::parse(value)
-            .map_err(|error| format!("HFS_BASE_URL must be an absolute URL: {error}"))?;
+        let mut url = Url::parse(value).map_err(|error| match error {
+            url::ParseError::EmptyHost => "HFS_BASE_URL must include a host".to_string(),
+            _ => format!("HFS_BASE_URL must be an absolute URL: {error}"),
+        })?;
 
         if !matches!(url.scheme(), "http" | "https") {
             return Err("HFS_BASE_URL must use the http or https scheme".to_string());
-        }
-        if url.host().is_none() {
-            return Err("HFS_BASE_URL must include a host".to_string());
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err("HFS_BASE_URL must not include user information".to_string());
         }
         if url.query().is_some() {
             return Err("HFS_BASE_URL must not include a query string".to_string());
@@ -97,12 +116,11 @@ impl PublicUrl {
 
     /// Returns whether the advertised host resolves syntactically to loopback.
     pub(crate) fn is_loopback(&self) -> bool {
-        match self.url.host() {
-            Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-            Some(Host::Ipv4(address)) => address.is_loopback(),
-            Some(Host::Ipv6(address)) => address.is_loopback(),
-            None => false,
-        }
+        self.url.host().is_some_and(|host| match host {
+            Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+            Host::Ipv4(address) => address.is_loopback(),
+            Host::Ipv6(address) => address.is_loopback(),
+        })
     }
 
     /// Returns the effective port, including the scheme default.
@@ -114,6 +132,8 @@ impl PublicUrl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_persistence::types::BundleEntry;
+    use serde_json::json;
 
     #[test]
     fn preserves_prefix_and_encodes_appended_segments() {
@@ -144,6 +164,56 @@ mod tests {
             !PublicUrl::parse("https://fhir.example.test")
                 .unwrap()
                 .is_loopback()
+        );
+    }
+
+    #[test]
+    fn rejects_an_absolute_http_url_without_a_host() {
+        assert_eq!(
+            PublicUrl::parse("http://?tenant=acme").unwrap_err(),
+            "HFS_BASE_URL must include a host"
+        );
+    }
+
+    #[test]
+    fn rejects_user_information() {
+        assert_eq!(
+            PublicUrl::parse("https://user:password@example.test/fhir").unwrap_err(),
+            "HFS_BASE_URL must not include user information"
+        );
+    }
+
+    #[test]
+    fn rewrites_only_entries_with_a_resource_type_and_id() {
+        let mut bundle = SearchBundle::new()
+            .with_entry(BundleEntry {
+                full_url: Some("unchanged-empty".to_string()),
+                resource: None,
+                search: None,
+            })
+            .with_entry(BundleEntry::match_entry(
+                "unchanged-type",
+                json!({"id": "patient-1"}),
+            ))
+            .with_entry(BundleEntry::match_entry(
+                "unchanged-id",
+                json!({"resourceType": "Patient"}),
+            ))
+            .with_entry(BundleEntry::match_entry(
+                "old",
+                json!({"resourceType": "Patient", "id": "patient-1"}),
+            ));
+
+        rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+            format!("https://public.example/fhir/{resource_type}/{id}")
+        });
+
+        assert_eq!(bundle.entry[0].full_url.as_deref(), Some("unchanged-empty"));
+        assert_eq!(bundle.entry[1].full_url.as_deref(), Some("unchanged-type"));
+        assert_eq!(bundle.entry[2].full_url.as_deref(), Some("unchanged-id"));
+        assert_eq!(
+            bundle.entry[3].full_url.as_deref(),
+            Some("https://public.example/fhir/Patient/patient-1")
         );
     }
 }

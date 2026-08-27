@@ -930,6 +930,22 @@ async fn both_mode_header_tenant_can_follow_unprefixed_bulk_submit_urls() {
     assert_eq!(
         server
             .get(artifact_path)
+            .add_header("x-tenant-id", "other")
+            .await
+            .status_code(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        server
+            .delete(poll_path)
+            .add_header("x-tenant-id", "other")
+            .await
+            .status_code(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        server
+            .get(artifact_path)
             .add_header("x-tenant-id", "acme")
             .await
             .status_code(),

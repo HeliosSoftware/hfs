@@ -428,7 +428,9 @@ where
 
     // Convert result to FHIR Bundle
     let mut bundle = result.to_bundle(&public_base, &self_link);
-    rewrite_bundle_full_urls(&mut bundle, state, tenant);
+    crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+        state.public_url_for_request(tenant, [resource_type, id])
+    });
 
     // Parse subsetting parameters
     let summary_mode = search_params
@@ -544,7 +546,9 @@ where
 
     // Convert result to FHIR Bundle
     let mut bundle = result.to_bundle(&public_base, &self_link);
-    rewrite_bundle_full_urls(&mut bundle, state, &tenant);
+    crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+        state.public_url_for_request(&tenant, [resource_type, id])
+    });
 
     // Parse subsetting parameters
     let summary_mode = search_params
@@ -588,27 +592,6 @@ fn build_system_search_url(base_url: &str, params: &SearchParams) -> String {
     crate::public_url::PublicUrl::parse(base_url)
         .expect("request public base was built from validated configuration")
         .with_segments_and_query(std::iter::empty::<&str>(), &query)
-}
-
-fn rewrite_bundle_full_urls<S>(
-    bundle: &mut SearchBundle,
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-) where
-    S: ResourceStorage,
-{
-    for entry in &mut bundle.entry {
-        let Some(resource) = entry.resource.as_ref() else {
-            continue;
-        };
-        let Some(resource_type) = resource.get("resourceType").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(id) = resource.get("id").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        entry.full_url = Some(state.public_url_for_request(tenant, [resource_type, id]));
-    }
 }
 
 /// Encodes search params back into a query string, preserving repeated keys.
@@ -882,6 +865,13 @@ async fn expand_subsumption_into(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+
+    use crate::config::ServerConfig;
+    use crate::tenant::TenantSource;
 
     /// Collapses result pairs into a last-wins map for assertions.
     fn as_map(pairs: &[(String, String)]) -> HashMap<String, String> {
@@ -895,6 +885,51 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         )
+    }
+
+    #[tokio::test]
+    async fn system_search_uses_the_tenant_aware_public_base() {
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| path.join("data"));
+        let backend = Arc::new(
+            SqliteBackend::with_config(
+                ":memory:",
+                SqliteBackendConfig {
+                    data_dir,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        backend.init_schema().unwrap();
+        let state = AppState::new(
+            backend,
+            ServerConfig {
+                base_url: "https://public.example/fhir".to_string(),
+                ..ServerConfig::for_testing()
+            },
+        );
+        let tenant = TenantExtractor::new("acme", TenantSource::UrlPath);
+
+        let response = execute_system_search(
+            &state,
+            tenant,
+            vec![("_type".to_string(), "Patient".to_string())],
+            FhirFormat::Json,
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            bundle["link"][0]["url"],
+            "https://public.example/fhir/acme?_type=Patient"
+        );
     }
 
     #[test]

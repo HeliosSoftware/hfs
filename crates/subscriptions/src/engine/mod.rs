@@ -1164,6 +1164,23 @@ mod tests {
             (engine.public_base_url_for_tenant)("acme"),
             "https://public.example/fhir/acme"
         );
+
+        let config = SubscriptionConfig {
+            messaging: Some(crate::config::MessagingSettings {
+                source_endpoint: "https://fallback.example/fhir".to_string(),
+                allow_private_endpoints: false,
+            }),
+            ..Default::default()
+        };
+        let resolver: Arc<dyn Fn(&str) -> String + Send + Sync> =
+            Arc::new(|tenant| format!("https://public.example/fhir/{tenant}"));
+        let engine = SubscriptionEngine::with_outbound_auth_and_url_resolver(
+            config,
+            resolver,
+            true,
+            Arc::new(NoOpOutboundAuthProvider),
+        );
+        assert!(engine.messaging_channel.is_some());
     }
 
     fn encounter_topic() -> TopicDefinition {
