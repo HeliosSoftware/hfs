@@ -1124,3 +1124,90 @@ async fn test_pre_ballot_capabilities_endpoint_is_gone() {
         .await;
     assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
 }
+
+/// The Parameters body used by the Arrow IPC negotiation tests below.
+fn arrow_test_request_body() -> serde_json::Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "subjectResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            { "name": "id", "path": "id" },
+                            { "name": "gender", "path": "gender" }
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "example",
+                    "gender": "male"
+                }
+            }
+        ]
+    })
+}
+
+fn assert_arrow_ipc_response(bytes: &[u8]) {
+    use arrow::array::StringArray;
+    use arrow::ipc::reader::StreamReader;
+
+    let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)
+        .expect("Response body is not a valid Arrow IPC stream");
+    let batches: Vec<_> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("Failed to read Arrow IPC batches");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1);
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("id column should be Utf8");
+    assert_eq!(ids.value(0), "example");
+}
+
+#[tokio::test]
+async fn test_run_view_definition_arrow_ipc_via_accept_header() {
+    let server = common::test_server().await;
+
+    let response = server
+        .post("/$sql-run")
+        .add_header("Accept", "application/vnd.apache.arrow.stream")
+        .json(&arrow_test_request_body())
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let content_type = response.header("content-type");
+    assert_eq!(
+        content_type.to_str().unwrap(),
+        "application/vnd.apache.arrow.stream"
+    );
+    assert_arrow_ipc_response(response.as_bytes());
+}
+
+#[tokio::test]
+async fn test_run_view_definition_arrow_ipc_via_format_param() {
+    let server = common::test_server().await;
+
+    let response = server
+        .post("/$sql-run?_format=arrow")
+        .json(&arrow_test_request_body())
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let content_type = response.header("content-type");
+    assert_eq!(
+        content_type.to_str().unwrap(),
+        "application/vnd.apache.arrow.stream"
+    );
+    assert_arrow_ipc_response(response.as_bytes());
+}

@@ -327,6 +327,7 @@ fn py_parse_content_type(mime_type: &str) -> PyResult<String> {
         ContentType::Json => "json",
         ContentType::NdJson => "ndjson",
         ContentType::Parquet => "parquet",
+        ContentType::ArrowIpc => "arrow",
     };
 
     Ok(format_str.to_string())
