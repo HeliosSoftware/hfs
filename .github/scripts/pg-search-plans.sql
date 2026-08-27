@@ -972,6 +972,12 @@ SET LOCAL statement_timeout = '600s';
 CREATE INDEX idx_search_reference_v26
   ON search_index (tenant_id, resource_type, param_name, value_reference)
   WHERE value_reference IS NOT NULL;
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated
+       FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
          AND param_name = 'subject'
          AND (value_reference = :'ref'
               OR value_reference LIKE :'ref' || '/\_history/%' ESCAPE '\')
