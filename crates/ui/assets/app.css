@@ -5007,6 +5007,9 @@ body.app-shell .pane {
 .content--app .queries-main {
   min-height: 0;
   overflow-y: auto;
+  /* The column scrolls itself: without this the scrollbar rides flush
+     against the title-row buttons and card edges. */
+  padding-right: 10px;
 }
 
 .content--app .detail {
