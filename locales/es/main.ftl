@@ -56,7 +56,7 @@ terminology-lede = Conecta HFS con un servidor de terminología FHIR.
 terminology-configured-heading = Servidor de terminología configurado
 terminology-configured-body = HFS_TERMINOLOGY_SERVER apunta a una URL válida.
 terminology-configured-open = Abrir servidor de terminología
-terminology-invalid-heading = HFS_TERMINOLOGY_SERVER no es válida
+terminology-invalid-heading = HFS_TERMINOLOGY_SERVER no es válida.
 terminology-invalid-body = Usa una URL HTTP o HTTPS absoluta con un host. Se permiten rutas y una barra final. No incluyas credenciales, parámetros de consulta ni fragmentos.
 terminology-invalid-note = Actualiza la variable de entorno y luego reinicia HFS.
 terminology-setup-heading = Conectar un servidor de terminología
@@ -134,7 +134,7 @@ tenants-unregistered = sin registrar
 tenants-delete = Eliminar tenant
 tenants-delete-confirm = ¿Dar de baja el tenant «{ $id }»? Sus datos se conservan salvo que se purguen vía API.
 tenants-row-provisioning = Aprovisionando… puede tardar un momento.
-tenants-row-failed = El aprovisionamiento falló
+tenants-row-failed = No se pudo aprovisionar el tenant.
 tenants-dismiss = Descartar
 
 tenant-heading = Tenants
@@ -286,7 +286,7 @@ cmp-new = Nueva definición de compartimento
 cmp-edit = Editar
 cmp-delete = Eliminar
 cmp-delete-confirm = ¿Eliminar esta definición de compartimento? Sus rutas de compartimento dejarán de resolverse.
-crud-delete-failed = Error al eliminar
+crud-delete-failed = No se pudo eliminar el elemento.
 
 ## Visor y probador de compartments (#237)
 
@@ -535,9 +535,9 @@ batch-lede = Sube un Bundle FHIR, revisa las acciones que va a ejecutar, ejecút
 batch-upload = Subir
 batch-drop-hint = Suelta aquí un fichero JSON de bundle
 batch-drop-browse = o haz clic para explorar
-batch-invalid-json = Ese fichero no es JSON válido
-batch-not-a-bundle = Ese JSON no es un Bundle FHIR
-batch-bad-type = Aquí solo se ejecutan Bundles de tipo batch o transaction
+batch-invalid-json = Ese fichero no es JSON válido.
+batch-not-a-bundle = Ese JSON no es un Bundle FHIR.
+batch-bad-type = Aquí solo se ejecutan Bundles de tipo batch o transaction.
 batch-request = Petición
 batch-entries = entradas
 batch-semantics-batch = Batch: las entradas se ejecutan de forma independiente — una entrada fallida no detiene ni deshace las demás.
@@ -554,10 +554,10 @@ batch-sum-created = creados
 batch-sum-updated = actualizados
 batch-sum-other = lecturas/otros
 batch-sum-failed = fallidos
-batch-request-failed = La petición falló
+batch-request-failed = La petición falló.
 batch-reading = Leyendo el bundle…
 batch-executing = Ejecutando…
-batch-read-failed = No se pudo leer el archivo
+batch-read-failed = No se pudo leer el archivo.
 
 ## Bulk Import workspace (#527)
 
@@ -780,7 +780,7 @@ vd-empty-lede = Crea tu primera ViewDefinition con «Crear nueva».
 vd-degraded = No se pudo cargar la lista de definiciones de vistas.
 vd-saved = Guardado.
 vd-run = Ejecutar
-vd-run-failed = La ejecución de la vista falló.
+vd-run-failed = No se pudo ejecutar la vista.
 vd-save = Guardar
 vd-duplicate = Duplicar
 vd-delete = Eliminar

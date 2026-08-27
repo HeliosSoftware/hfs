@@ -1605,7 +1605,7 @@ async fn batch_page_carries_the_shared_busy_affordances() {
     // falls back to the key itself and would still carry the attribute.
     assert!(html.contains(r#"data-msg-reading="Reading bundle…""#));
     assert!(html.contains(r#"data-msg-executing="Executing…""#));
-    assert!(html.contains(r#"data-msg-read-failed="The file could not be read""#));
+    assert!(html.contains(r#"data-msg-read-failed="The file could not be read.""#));
     // The stage that receives focus when the preflight appears (#679).
     assert!(html.contains(r#"<section id="batch-preflight" tabindex="-1" hidden>"#));
     // The helper loads from the shared layout, before the page script (both

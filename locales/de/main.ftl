@@ -56,7 +56,7 @@ terminology-lede = Verbinden Sie HFS mit einem FHIR-Terminologieserver.
 terminology-configured-heading = Terminologieserver konfiguriert
 terminology-configured-body = HFS_TERMINOLOGY_SERVER verweist auf eine gültige Server-URL.
 terminology-configured-open = Terminologieserver öffnen
-terminology-invalid-heading = HFS_TERMINOLOGY_SERVER ist ungültig
+terminology-invalid-heading = HFS_TERMINOLOGY_SERVER ist ungültig.
 terminology-invalid-body = Verwenden Sie eine absolute HTTP- oder HTTPS-URL mit einem Host. Pfade und ein abschließender Schrägstrich sind zulässig. Fügen Sie keine Zugangsdaten, Abfrageparameter oder Fragmente ein.
 terminology-invalid-note = Aktualisieren Sie die Umgebungsvariable und starten Sie HFS neu.
 terminology-setup-heading = Terminologieserver verbinden
@@ -78,7 +78,7 @@ action-retry = Erneut versuchen
 
 error-not-found = Die angeforderte Ressource wurde nicht gefunden.
 error-unauthorized = Sie sind nicht berechtigt, diese Aktion auszuführen.
-error-generic = Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.
+error-generic = Etwas ist schiefgelaufen. Versuchen Sie es erneut.
 
 ## Dashboard-Gerüst (Figma „Dashboard V1.1“)
 
@@ -134,7 +134,7 @@ tenants-unregistered = nicht registriert
 tenants-delete = Mandant löschen
 tenants-delete-confirm = Mandant „{ $id }" abmelden? Die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
 tenants-row-provisioning = Wird bereitgestellt … das kann einen Moment dauern.
-tenants-row-failed = Bereitstellung fehlgeschlagen
+tenants-row-failed = Der Mandant konnte nicht bereitgestellt werden.
 tenants-dismiss = Verwerfen
 
 tenant-heading = Tenants
@@ -286,7 +286,7 @@ cmp-new = Neue Compartment-Definition
 cmp-edit = Bearbeiten
 cmp-delete = Löschen
 cmp-delete-confirm = Diese Compartment-Definition löschen? Ihre Compartment-Routen funktionieren dann nicht mehr.
-crud-delete-failed = Löschen fehlgeschlagen
+crud-delete-failed = Das Element konnte nicht gelöscht werden.
 
 ## Compartment-Ansicht & Tester (#237)
 
@@ -535,9 +535,9 @@ batch-lede = Lade ein FHIR-Bundle hoch, prüfe die auszuführenden Aktionen, fü
 batch-upload = Hochladen
 batch-drop-hint = Bundle-JSON-Datei hier ablegen
 batch-drop-browse = oder klicken zum Durchsuchen
-batch-invalid-json = Diese Datei ist kein gültiges JSON
-batch-not-a-bundle = Dieses JSON ist kein FHIR-Bundle
-batch-bad-type = Hier lassen sich nur Bundles vom Typ batch oder transaction ausführen
+batch-invalid-json = Diese Datei ist kein gültiges JSON.
+batch-not-a-bundle = Dieses JSON ist kein FHIR-Bundle.
+batch-bad-type = Hier lassen sich nur Bundles vom Typ batch oder transaction ausführen.
 batch-request = Anfrage
 batch-entries = Einträge
 batch-semantics-batch = Batch: Einträge laufen unabhängig — ein fehlgeschlagener Eintrag stoppt die anderen nicht und macht sie nicht rückgängig.
@@ -554,10 +554,10 @@ batch-sum-created = erstellt
 batch-sum-updated = aktualisiert
 batch-sum-other = gelesen/sonstige
 batch-sum-failed = fehlgeschlagen
-batch-request-failed = Die Anfrage ist fehlgeschlagen
+batch-request-failed = Die Anfrage ist fehlgeschlagen.
 batch-reading = Bundle wird gelesen…
 batch-executing = Wird ausgeführt…
-batch-read-failed = Die Datei konnte nicht gelesen werden
+batch-read-failed = Die Datei konnte nicht gelesen werden.
 
 ## Bulk Import workspace (#527)
 
@@ -780,7 +780,7 @@ vd-empty-lede = Lege mit „Neu erstellen" die erste ViewDefinition an.
 vd-degraded = Die Liste der View-Definitionen konnte nicht geladen werden.
 vd-saved = Gespeichert.
 vd-run = Ausführen
-vd-run-failed = Die Ausführung der View ist fehlgeschlagen.
+vd-run-failed = Die View konnte nicht ausgeführt werden.
 vd-save = Speichern
 vd-duplicate = Duplizieren
 vd-delete = Löschen
