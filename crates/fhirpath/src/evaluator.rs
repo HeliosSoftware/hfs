@@ -1371,6 +1371,19 @@ fn primitive_member_access(
     }
 }
 
+/// A FHIR primitive may have id/extension children without carrying a scalar
+/// value. It still exists as an Element for navigation, but its implicit
+/// System primitive conversion is the empty collection.
+fn is_fhir_primitive_without_value(result: &EvaluationResult) -> bool {
+    matches!(
+        result,
+        EvaluationResult::Object {
+            type_info: Some(type_info),
+            ..
+        } if type_info.namespace == "FHIR" && type_info.name == "Element"
+    )
+}
+
 fn evaluate_with_context(
     expr: &Expression,
     context: EvaluationContext,
@@ -4231,6 +4244,9 @@ fn call_function(
             })
         }
         "length" => {
+            if is_fhir_primitive_without_value(invocation_base) {
+                return Ok(EvaluationResult::Empty);
+            }
             // Returns the length of a string
             // Check for singleton first
             if invocation_base.count() > 1 {
@@ -4345,6 +4361,9 @@ fn call_function(
             })
         }
         "substring" => {
+            if is_fhir_primitive_without_value(invocation_base) {
+                return Ok(EvaluationResult::Empty);
+            }
             // Returns a part of the string
             if args.is_empty() || args.len() > 2 {
                 return Err(EvaluationError::InvalidArity(
@@ -4493,6 +4512,9 @@ fn call_function(
             })
         }
         "upper" => {
+            if is_fhir_primitive_without_value(invocation_base) {
+                return Ok(EvaluationResult::Empty);
+            }
             // Check for singleton base
             if invocation_base.count() > 1 {
                 return Err(EvaluationError::SingletonEvaluationError(
@@ -6134,6 +6156,9 @@ fn call_function(
             }
         }
         "toChars" => {
+            if is_fhir_primitive_without_value(invocation_base) {
+                return Ok(EvaluationResult::Empty);
+            }
             // Check for singleton base
             if invocation_base.count() > 1 {
                 return Err(EvaluationError::SingletonEvaluationError(
@@ -8086,7 +8111,11 @@ fn compare_inequality(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Changed return type
     // Handle empty operands: comparison with empty returns empty
-    if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+    if left == &EvaluationResult::Empty
+        || right == &EvaluationResult::Empty
+        || is_fhir_primitive_without_value(left)
+        || is_fhir_primitive_without_value(right)
+    {
         return Ok(EvaluationResult::Empty); // Return Ok(Empty)
     }
 
