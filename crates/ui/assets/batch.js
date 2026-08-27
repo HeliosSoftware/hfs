@@ -8,8 +8,9 @@
   "use strict";
 
   var root = document.getElementById("batch");
-  if (!root || !window.fetch) return;
+  if (!root || !window.fetch || !window.hfsBusy) return;
   var messages = root.dataset;
+  var hfsBusy = window.hfsBusy;
 
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
@@ -42,6 +43,12 @@
   var outcomes = document.getElementById("batch-outcomes");
   var overall = document.getElementById("batch-overall");
   var summary = document.getElementById("batch-summary");
+  var executeBtn = document.getElementById("batch-execute");
+  var executeTopBtn = document.getElementById("batch-execute-top");
+  var cancelBtn = document.getElementById("batch-cancel");
+  var cancelTopBtn = document.getElementById("batch-cancel-top");
+  var doneBtn = document.getElementById("batch-done");
+  var busyRegion = document.getElementById("batch-busy");
 
   var bundle = null;
   var bundleJsonRenderer = null;
@@ -130,26 +137,69 @@
     bundleJsonRenderer = null;
   }
 
+  /* Yield so the busy region paints before a heavy parse blocks the main
+     thread; rAF never fires in a hidden tab, hence the timeout lane. */
+  function afterPaint(fn) {
+    if (document.hidden) {
+      setTimeout(fn, 0);
+      return;
+    }
+    requestAnimationFrame(function () {
+      setTimeout(fn, 0);
+    });
+  }
+
   function readFile(file) {
     var generation = resetJsonRendering();
     bundle = null;
     clearPreflight();
     show("upload");
     uploadError.hidden = true;
+    /* Busy is up before the file is even read (#679): the region reveal is
+       synchronous, FileReader delivery is already async. */
+    var busy = hfsBusy.region(busyRegion, messages.msgReading);
     var reader = new FileReader();
+    /* A folder drop or a file that vanished between pick and read fires
+       error/abort, never load — the region must clear and say something. */
+    reader.onerror = reader.onabort = function () {
+      if (generation !== renderGeneration) return;
+      try {
+        fail(messages.msgReadFailed);
+      } finally {
+        busy.done();
+      }
+    };
     reader.onload = function () {
       if (generation !== renderGeneration) return;
-      var parsed;
-      try {
-        parsed = JSON.parse(reader.result);
-      } catch (e) {
-        return fail(messages.msgInvalidJson + " (" + e.message + ")");
-      }
-      if (!parsed || parsed.resourceType !== "Bundle") return fail(messages.msgNotABundle);
-      if (parsed.type !== "batch" && parsed.type !== "transaction") return fail(messages.msgBadType);
-      bundle = parsed;
-      renderPreflight(generation);
-      show("preflight");
+      afterPaint(function () {
+        /* Re-checked here, not just above: a second pick during this
+           deferred window owns the stage now. */
+        if (generation !== renderGeneration) return;
+        try {
+          var parsed;
+          try {
+            parsed = JSON.parse(reader.result);
+          } catch (e) {
+            return fail(messages.msgInvalidJson + " (" + e.message + ")");
+          }
+          if (!parsed || parsed.resourceType !== "Bundle") return fail(messages.msgNotABundle);
+          if (parsed.type !== "batch" && parsed.type !== "transaction") return fail(messages.msgBadType);
+          bundle = parsed;
+          renderPreflight(generation);
+          show("preflight");
+          /* The drop zone was hidden with its stage, stranding focus.
+             Checked by containment, not activeElement === body: the focus
+             fixup for a hidden element runs at the next render update, so
+             the hidden trigger can still read as active here. Land on the
+             revealed stage, not its primary action. */
+          var active = document.activeElement;
+          if (active === document.body || stages.upload.contains(active)) {
+            stages.preflight.focus();
+          }
+        } finally {
+          busy.done();
+        }
+      });
     };
     reader.readAsText(file);
   }
@@ -252,9 +302,20 @@
     fileInput.value = "";
     clearPreflight();
     show("upload");
+    /* Done/Cancel hid the stage that held focus; land on the one action
+       the upload stage offers (#679). Containment, not body: the focus
+       fixup for the hidden trigger runs at the next render update. */
+    var active = document.activeElement;
+    if (
+      active === document.body ||
+      stages.preflight.contains(active) ||
+      stages.response.contains(active)
+    ) {
+      drop.focus();
+    }
   }
-  document.getElementById("batch-cancel").addEventListener("click", reset);
-  document.getElementById("batch-cancel-top").addEventListener("click", reset);
+  cancelBtn.addEventListener("click", reset);
+  cancelTopBtn.addEventListener("click", reset);
 
   /* ---- stage 3: execute and report ------------------------------------ */
 
@@ -265,28 +326,38 @@
       show("upload");
       return;
     }
-    fetch("/", {
-      method: "POST",
-      headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
-      credentials: "same-origin",
-      body: JSON.stringify(bundle),
-    })
-      .then(function (response) {
-        return response
-          .json()
-          .catch(function () { return null; })
-          .then(function (body) { renderResponse(response, body); });
-      })
-      .catch(function (e) {
-        executeError.textContent = messages.msgRequestFailed + " (" + e.message + ")";
-        executeError.hidden = false;
-      });
+    /* The whole footer goes inert (#679): both Execute copies spin, and the
+       Cancels disable with them — a mid-flight Cancel nulled `bundle` and
+       crashed the settling renderResponse. Busy holds until the outcome is
+       rendered, not merely until response headers arrive. */
+    hfsBusy.during(
+      [executeBtn, executeTopBtn],
+      function () {
+        return fetch("/", {
+          method: "POST",
+          headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
+          credentials: "same-origin",
+          body: JSON.stringify(bundle),
+        })
+          .then(function (response) {
+            return response
+              .json()
+              .catch(function () { return null; })
+              .then(function (body) { renderResponse(response, body); });
+          })
+          .catch(function (e) {
+            executeError.textContent = messages.msgRequestFailed + " (" + e.message + ")";
+            executeError.hidden = false;
+          });
+      },
+      { alsoDisable: [cancelBtn, cancelTopBtn], region: busyRegion, label: messages.msgExecuting }
+    );
   }
-  document.getElementById("batch-execute").addEventListener("click", execute);
-  document.getElementById("batch-execute-top").addEventListener("click", execute);
+  executeBtn.addEventListener("click", execute);
+  executeTopBtn.addEventListener("click", execute);
   /* The run already happened: Done lands back on a clean upload stage
      rather than offering to re-run a mutation that succeeded (#675). */
-  document.getElementById("batch-done").addEventListener("click", reset);
+  doneBtn.addEventListener("click", reset);
 
   function renderResponse(response, body) {
     overall.textContent = String(response.status);
@@ -353,5 +424,8 @@
     summary.textContent = parts.join(" · ");
 
     show("response");
+    /* The disabled trigger was hidden with its stage; land on the one
+       action this stage offers (#679). */
+    doneBtn.focus();
   }
 })();

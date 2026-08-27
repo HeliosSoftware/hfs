@@ -81,12 +81,16 @@ through to the normal REST surface.
 - `templates/partials/` — htmx-swappable fragments, no `<html>` wrapper;
   `{% include %}`d into pages so the first render and the swap emit identical markup.
 - `templates/icons/*.svg` — Figma exports, fills normalized to `currentColor`, inlined.
-- `assets/` — `htmx.min.js` (pinned), `app.css`, `fonts/`, `logo.png`, and the
-  per-page scripts: `theme.js`, `editor.js`, `resources.js`, `saved-queries.js`,
-  `batch.js`, `history.js`, `nl-search.js`, `resource-filter.js`, `conformance-crud.js`.
+- `assets/` — `htmx.min.js` (pinned), `app.css`, `fonts/`, `logo.png`, the
+  shared `busy.js` (#679, the crate's one exported global `window.hfsBusy`),
+  and the per-page scripts: `theme.js`, `editor.js`, `resources.js`,
+  `saved-queries.js`, `batch.js`, `history.js`, `nl-search.js`,
+  `resource-filter.js`, `conformance-crud.js`.
 
 `theme.js` loads **without `defer`**, before first paint, to avoid a FOUC; every
-other script is `defer`.
+other script is `defer`. Busy/working states go through `hfsBusy` for
+fetch-driven code and `hx-disabled-elt` for htmx controls — see
+`crates/ui/README.md` § Busy states.
 
 ## Rules of the road
 

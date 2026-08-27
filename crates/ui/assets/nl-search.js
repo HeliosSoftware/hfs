@@ -20,7 +20,8 @@
   var pane = document.getElementById("nl-pane");
   var form = document.getElementById("saved-query-form");
   var urlInput = form && form.elements.url;
-  if (!page || !pane || !urlInput || !window.fetch) return;
+  if (!page || !pane || !urlInput || !window.fetch || !window.hfsBusy) return;
+  var hfsBusy = window.hfsBusy;
 
   var text = document.getElementById("nl-text");
   var submit = document.getElementById("nl-submit");
@@ -125,47 +126,48 @@
       return;
     }
 
-    submit.disabled = true;
-    showMessage("nl-answer--working", messages.msgWorking);
+    /* The shared busy state (#679). The guard inside `during` is what gates
+       re-entry: Enter and the example chips reach translate() while the
+       submit button is disabled, so the button alone never could. */
+    hfsBusy.during([submit], function () {
+      showMessage("nl-answer--working", messages.msgWorking);
 
-    fetch("/$nl-search", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({ text: value }),
-    })
-      .then(function (response) {
-        return response
-          .json()
-          .catch(function () {
-            return null;
-          })
-          .then(function (body) {
-            return { ok: response.ok, body: body };
-          });
+      return fetch("/$nl-search", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ text: value }),
       })
-      .then(function (result) {
-        if (!result.ok) {
-          showMessage("nl-answer--error", outcomeText(result.body));
-          return;
-        }
-        if (!result.body || !result.body.supported) {
-          showMessage(
-            "nl-answer--unsupported",
-            (result.body && result.body.reason) || messages.msgUnsupported
-          );
-          return;
-        }
-        showTranslation(result.body);
-      })
-      .catch(function () {
-        showMessage("nl-answer--error", messages.msgError);
-      })
-      .then(function () {
-        submit.disabled = false;
-      });
+        .then(function (response) {
+          return response
+            .json()
+            .catch(function () {
+              return null;
+            })
+            .then(function (body) {
+              return { ok: response.ok, body: body };
+            });
+        })
+        .then(function (result) {
+          if (!result.ok) {
+            showMessage("nl-answer--error", outcomeText(result.body));
+            return;
+          }
+          if (!result.body || !result.body.supported) {
+            showMessage(
+              "nl-answer--unsupported",
+              (result.body && result.body.reason) || messages.msgUnsupported
+            );
+            return;
+          }
+          showTranslation(result.body);
+        })
+        .catch(function () {
+          showMessage("nl-answer--error", messages.msgError);
+        });
+    });
   }
 
   submit.addEventListener("click", translate);
