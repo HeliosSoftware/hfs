@@ -957,8 +957,8 @@ mod tests {
 
     // ---- ViewDefinition SearchParameters survive the real loader/registry (#570) ----
 
-    /// The 17 SQL-on-FHIR IG canonicals shipped in every
-    /// `search-parameters-r*.json` file, keyed by their `code`.
+    /// The 17 SQL-on-FHIR IG canonicals shipped in the custom
+    /// `sql-on-fhir-search-parameters.json` file, keyed by their `code`.
     const VIEW_DEFINITION_PARAM_CODES: &[&str] = &[
         "context",
         "context-quantity",

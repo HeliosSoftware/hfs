@@ -7,7 +7,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-context",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -49,7 +48,7 @@
         "name": "ViewDefinitionContextSearchParam",
         "title": "ViewDefinition Context Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -75,7 +74,9 @@
           }
         ],
         "code": "context",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "token",
         "expression": "(ViewDefinition.useContext.value.ofType(CodeableConcept))",
         "processingMode": "normal"
@@ -85,7 +86,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-context-quantity",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -127,7 +127,7 @@
         "name": "ViewDefinitionContextQuantitySearchParam",
         "title": "ViewDefinition Context-quantity Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -153,7 +153,9 @@
           }
         ],
         "code": "context-quantity",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "quantity",
         "expression": "(ViewDefinition.useContext.value.ofType(Quantity)) | (ViewDefinition.useContext.value.ofType(Range))",
         "processingMode": "normal"
@@ -163,7 +165,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-context-type",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -205,7 +206,7 @@
         "name": "ViewDefinitionContextTypeSearchParam",
         "title": "ViewDefinition Context-type Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -231,7 +232,9 @@
           }
         ],
         "code": "context-type",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "token",
         "expression": "ViewDefinition.useContext.code",
         "processingMode": "normal"
@@ -241,7 +244,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-context-type-quantity",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -283,7 +285,7 @@
         "name": "ViewDefinitionContextTypeQuantitySearchParam",
         "title": "ViewDefinition Context-type-quantity Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -309,7 +311,9 @@
           }
         ],
         "code": "context-type-quantity",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "composite",
         "expression": "ViewDefinition.useContext",
         "processingMode": "normal",
@@ -329,7 +333,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-context-type-value",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -371,7 +374,7 @@
         "name": "ViewDefinitionContextTypeValueSearchParam",
         "title": "ViewDefinition Context-type-value Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -397,7 +400,9 @@
           }
         ],
         "code": "context-type-value",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "composite",
         "expression": "ViewDefinition.useContext",
         "processingMode": "normal",
@@ -417,7 +422,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-date",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -459,7 +463,7 @@
         "name": "ViewDefinitionDateSearchParam",
         "title": "ViewDefinition Date Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -485,7 +489,9 @@
           }
         ],
         "code": "date",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "date",
         "expression": "ViewDefinition.date",
         "processingMode": "normal"
@@ -495,7 +501,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-description",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -537,7 +542,7 @@
         "name": "ViewDefinitionDescriptionSearchParam",
         "title": "ViewDefinition Description Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -563,7 +568,9 @@
           }
         ],
         "code": "description",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "string",
         "expression": "ViewDefinition.description",
         "processingMode": "normal"
@@ -573,7 +580,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-identifier",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -615,7 +621,7 @@
         "name": "ViewDefinitionIdentifierSearchParam",
         "title": "ViewDefinition Identifier Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -641,7 +647,9 @@
           }
         ],
         "code": "identifier",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "token",
         "expression": "ViewDefinition.identifier",
         "processingMode": "normal"
@@ -651,7 +659,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-jurisdiction",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -693,7 +700,7 @@
         "name": "ViewDefinitionJurisdictionSearchParam",
         "title": "ViewDefinition Jurisdiction Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -719,7 +726,9 @@
           }
         ],
         "code": "jurisdiction",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "token",
         "expression": "ViewDefinition.jurisdiction",
         "processingMode": "normal"
@@ -729,7 +738,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-name",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -771,7 +779,7 @@
         "name": "ViewDefinitionNameSearchParam",
         "title": "ViewDefinition Name Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -797,7 +805,9 @@
           }
         ],
         "code": "name",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "string",
         "expression": "ViewDefinition.name",
         "processingMode": "normal"
@@ -807,7 +817,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-profile",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -849,7 +858,7 @@
         "name": "ViewDefinitionProfileSearchParam",
         "title": "ViewDefinition Profile Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -875,18 +884,21 @@
           }
         ],
         "code": "profile",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "reference",
         "expression": "ViewDefinition.profile",
         "processingMode": "normal",
-        "target": ["StructureDefinition"]
+        "target": [
+          "StructureDefinition"
+        ]
       }
     },
     {
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-publisher",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -928,7 +940,7 @@
         "name": "ViewDefinitionPublisherSearchParam",
         "title": "ViewDefinition Publisher Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -954,7 +966,9 @@
           }
         ],
         "code": "publisher",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "string",
         "expression": "ViewDefinition.publisher",
         "processingMode": "normal"
@@ -964,7 +978,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-resource",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -1006,7 +1019,7 @@
         "name": "ViewDefinitionResourceSearchParam",
         "title": "ViewDefinition Resource Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -1032,7 +1045,9 @@
           }
         ],
         "code": "resource",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "token",
         "expression": "ViewDefinition.resource",
         "processingMode": "normal"
@@ -1042,7 +1057,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-status",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -1084,7 +1098,7 @@
         "name": "ViewDefinitionStatusSearchParam",
         "title": "ViewDefinition Status Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -1110,7 +1124,9 @@
           }
         ],
         "code": "status",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "token",
         "expression": "ViewDefinition.status",
         "processingMode": "normal"
@@ -1120,7 +1136,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-title",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -1162,7 +1177,7 @@
         "name": "ViewDefinitionTitleSearchParam",
         "title": "ViewDefinition Title Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -1188,7 +1203,9 @@
           }
         ],
         "code": "title",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "string",
         "expression": "ViewDefinition.title",
         "processingMode": "normal"
@@ -1198,7 +1215,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-url",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -1240,7 +1256,7 @@
         "name": "ViewDefinitionUrlSearchParam",
         "title": "ViewDefinition Url Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -1266,7 +1282,9 @@
           }
         ],
         "code": "url",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "uri",
         "expression": "ViewDefinition.url",
         "processingMode": "normal"
@@ -1276,7 +1294,6 @@
       "resource": {
         "resourceType": "SearchParameter",
         "id": "ViewDefinition-version",
-        "language": "en",
         "extension": [
           {
             "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
@@ -1318,7 +1335,7 @@
         "name": "ViewDefinitionVersionSearchParam",
         "title": "ViewDefinition Version Search Parameter",
         "status": "active",
-        "date": "2026-08-13T15:42:34+00:00",
+        "date": "2026-08-14T02:49:31+10:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -1344,7 +1361,9 @@
           }
         ],
         "code": "version",
-        "base": ["ViewDefinition"],
+        "base": [
+          "ViewDefinition"
+        ],
         "type": "token",
         "expression": "ViewDefinition.version",
         "processingMode": "normal"
