@@ -349,15 +349,20 @@ impl PostgresQueryBuilder {
 
         let base = strip_reference_version(&comp.reference).to_string();
         let p1 = param_offset + 1;
-        let p2 = param_offset + 2;
 
+        // A plain equality. `value_reference` holds the version-agnostic base
+        // (schema v31), so the `LIKE $n || '/_history/%'` arm this used to carry
+        // could match nothing — and it was the worst-shaped predicate in the
+        // backend: the pattern is an `OpExpr` built in SQL rather than a `Const`,
+        // so no fixed prefix could be derived from it under *any* plan, and an OR
+        // is index-usable only when every arm is.
         Some(SqlFragment::with_params(
             format!(
                 "id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name IN ({in_list}) \
-                 AND (value_reference = ${p1} OR value_reference LIKE ${p2} || '/_history/%'))"
+                 AND value_reference = ${p1})"
             ),
-            vec![SqlParam::text(&base), SqlParam::text(&base)],
+            vec![SqlParam::text(&base)],
         ))
     }
 
@@ -1660,8 +1665,64 @@ impl PostgresQueryBuilder {
     }
 
     /// Builds the `:identifier` condition: match references whose target
-    /// resource has an identifier equal to the supplied `system|value`. Mirrors
-    /// the SQLite implementation using PG's `SUBSTRING`/`POSITION`.
+    /// resource has an identifier equal to the supplied `system|value`.
+    ///
+    /// # Direction
+    ///
+    /// The identifier lookup **drives**; the reference index is seeked with what
+    /// it produces. The sub-select yields the target's `Type/id` — the exact
+    /// form the writer stores (schema v31 also strips any `/_history/<vid>`, so
+    /// there is no other stored form to consider) — and the enclosing
+    /// `value_reference` is compared against that set. This is the shape the
+    /// SQLite backend has always used (`build_identifier_condition`), reached
+    /// there for a correctness reason rather than a performance one.
+    ///
+    /// It used to be written the other way round: a correlated `EXISTS` that
+    /// pulled the target id out of each reference row with
+    /// `SUBSTRING(ref.value_reference FROM POSITION('/' IN …) + 1)` and looked
+    /// it up. That form has no seekable predicate on `ref` at all, so the whole
+    /// parameter slice has to be materialized before anything can be discarded,
+    /// and the inner lookup bound only `tenant_id` and `param_name` — never
+    /// `resource_type` — so it could not seek any index on `search_index` past
+    /// its first key column either.
+    ///
+    /// Measured on a 3.4M-row replica (PostgreSQL 18.6, warm), one
+    /// `Observation.subject` identifier search against a 1.34M-row slice and
+    /// 490,000 `identifier` rows:
+    ///
+    /// ```text
+    /// correlated EXISTS (before)          Parallel Seq Scan, 80,393 buffers   285.6 ms
+    ///   + resource_type bound in EXISTS   Parallel Seq Scan, 81,069 buffers   338.2 ms
+    /// identifier drives (this)            Index Scan,           845 buffers     1.4 ms
+    /// ```
+    ///
+    /// The middle row is the point. Binding `resource_type` inside the
+    /// correlated `EXISTS` — the obvious repair, and the one the missing bind
+    /// invites — makes it **slower**: the inner lookup was never the cost, and
+    /// the extra join key only widens the hash. The cost is that the outer
+    /// `ref` scan cannot be restricted at all, and only reversing the direction
+    /// removes it. 209x, and 95x fewer buffers.
+    ///
+    /// # What changes semantically
+    ///
+    /// Nothing that a valid FHIR reference can express. `Reference.reference` is
+    /// a relative `Type/id`, an absolute URL, or a `#fragment`. The old
+    /// `SUBSTRING` never resolved an absolute URL either — it splits on the
+    /// *first* `/`, so `http://ex.org/fhir/Patient/1` yielded
+    /// `/ex.org/fhir/Patient/1` and matched no resource id — and a `#fragment`
+    /// resolved to itself, which is not a resource id. Both are unmatched before
+    /// and after. The one input that behaved differently is a bare stored id
+    /// (`"reference": "123"`), which the old form matched against **any**
+    /// resource type's identifier rows in the tenant; that is invalid FHIR and
+    /// was a cross-type collision rather than a feature.
+    ///
+    /// # The inner lookup still does not bind `resource_type`
+    ///
+    /// It cannot: the target's type is what the sub-select is discovering. On
+    /// PostgreSQL 18 the btree skip scan handles the gap (`Index Searches: 9` in
+    /// the measurement above). On 13-17 it degrades to scanning the tenant's
+    /// slice of `idx_search_token_code` with the type filtered — but that is now
+    /// **one** scan feeding a seek, not a scan per row of the reference slice.
     fn build_reference_identifier_condition(
         param: &SearchParameter,
         offset: usize,
@@ -1670,9 +1731,6 @@ impl PostgresQueryBuilder {
         let mut next = offset; // running 0-based param offset
 
         for value in &param.values {
-            // Correlate the target resource id (the part after '/') with an
-            // 'identifier' index row for that resource.
-            let target = "idx.resource_id = SUBSTRING(ref.value_reference FROM POSITION('/' IN ref.value_reference) + 1)";
             let (filter, params): (String, Vec<SqlParam>) = match value.value.split_once('|') {
                 Some(("", code)) => {
                     next += 1;
@@ -1707,13 +1765,19 @@ impl PostgresQueryBuilder {
                     )
                 }
             };
+            // The target's `Type/id`, compared against the stored reference.
+            // `idx.tenant_id = $1` is load-bearing, not defensive: without it the
+            // sub-select yields any tenant's target, and this tenant's rows match
+            // on the strength of another tenant's identifiers.
             conditions.push(SqlFragment::with_params(
                 format!(
                     "id IN (SELECT ref.resource_id FROM search_index ref \
                      WHERE ref.tenant_id = $1 AND ref.resource_type = $2 AND ref.param_name = '{}' \
-                     AND EXISTS (SELECT 1 FROM search_index idx \
-                       WHERE idx.tenant_id = $1 AND idx.param_name = 'identifier' \
-                       AND {target} AND {filter}))",
+                     AND ref.value_reference IN \
+                       (SELECT idx.resource_type || '/' || idx.resource_id \
+                          FROM search_index idx \
+                         WHERE idx.tenant_id = $1 AND idx.param_name = 'identifier' \
+                           AND {filter}))",
                     param.name
                 ),
                 params,
@@ -1748,8 +1812,32 @@ impl PostgresQueryBuilder {
     /// is normalized to `Patient/<id>` and matched as a type-prefixed reference,
     /// mirroring the SQLite handler.
     ///
-    /// Matching stays version-agnostic throughout: the search value is stripped of
-    /// any `/_history/<vid>`, and a stored versioned reference still matches.
+    /// Matching stays version-agnostic throughout, but from **both** ends now:
+    /// the search value is stripped of any `/_history/<vid>` here, and the stored
+    /// value was stripped by the writer (schema v31). The `OR value_reference
+    /// LIKE '<base>/\_history/%'` arm this used to carry is therefore gone —
+    /// there is no longer a stored form for it to find. That arm was the second
+    /// index probe of every reference search in the benchmark and it forced the
+    /// whole predicate into a `BitmapOr`, which costs a bitmap build and a
+    /// re-check of the full disjunction (a `LIKE` per row) on every matching
+    /// heap tuple. Measured on a 3.4M-row replica over 300 searches, warm:
+    /// **1.50 ms/call -> 0.47 ms/call**.
+    ///
+    /// # The bare-id form is still not sargable, and that is not fixed here
+    ///
+    /// `Observation?patient=<id>` emits `value_reference = $n OR value_reference
+    /// LIKE '%/<id>'`. A leading-wildcard `LIKE` cannot be turned into index
+    /// bounds in any operator class, and an OR is index-usable only when every
+    /// arm is — so the planner has no index for the value at all. Measured on
+    /// the same replica against a 1.34M-row `Observation.subject` slice: a
+    /// **parallel Seq Scan of the whole `search_index`**, 259 ms and 71,943
+    /// buffers, against 0.47 ms for the `Type/id` form. The benchmark only ever
+    /// sends `Type/id`, which is why this has never shown up in a run.
+    ///
+    /// Making it sargable needs a stored bare target id — a column plus an index,
+    /// i.e. one more btree insert per reference row on the write path v27 spent
+    /// a whole migration reducing. It is a separate change with its own
+    /// arithmetic; it is written down here rather than guessed at.
     ///
     /// # LIKE escaping
     ///
@@ -1824,32 +1912,27 @@ impl PostgresQueryBuilder {
                 };
                 let escaped = like_escape(&base);
 
-                // `\_history` — the escape keeps the underscore literal.
                 if base.contains('/') {
-                    // `Type/id` or an absolute URL: match the base reference, or
-                    // the same reference carrying any `_history` version.
+                    // `Type/id` or an absolute URL. One equality: the stored
+                    // value is the version-agnostic base (schema v31), so a
+                    // stored version cannot hide a match from it.
                     let exact = param_num + 1;
-                    let versioned = param_num + 2;
-                    param_num += 2;
+                    param_num += 1;
                     params.push(SqlParam::text(&base));
-                    params.push(SqlParam::text(&format!("{}/\\_history/%", escaped)));
-                    format!(
-                        "(value_reference = ${exact} OR value_reference LIKE ${versioned} ESCAPE '\\')"
-                    )
+                    format!("value_reference = ${exact}")
                 } else {
-                    // Bare logical id: also match any reference ending in `/id`,
-                    // with or without a trailing `_history` version.
+                    // Bare logical id: also match any reference ending in `/id`.
+                    // The suffix arm is a leading-wildcard `LIKE` and is not
+                    // sargable in any operator class — see the note on this
+                    // function about what that costs.
                     let exact = param_num + 1;
                     let suffix = param_num + 2;
-                    let versioned = param_num + 3;
-                    param_num += 3;
+                    param_num += 2;
                     params.push(SqlParam::text(&base));
                     params.push(SqlParam::text(&format!("%/{}", escaped)));
-                    params.push(SqlParam::text(&format!("%/{}/\\_history/%", escaped)));
                     format!(
                         "(value_reference = ${exact} \
-                          OR value_reference LIKE ${suffix} ESCAPE '\\' \
-                          OR value_reference LIKE ${versioned} ESCAPE '\\')"
+                          OR value_reference LIKE ${suffix} ESCAPE '\\')"
                     )
                 }
             };
@@ -3030,10 +3113,14 @@ mod tests {
             "reference OR-list must be one sublink: {}",
             frag.sql
         );
-        // Two params per type-prefixed value: the exact base and the
-        // `/_history/%` pattern (the pattern is built in Rust so the value can be
-        // LIKE-escaped, rather than concatenated onto the raw bind in SQL).
-        assert_eq!(frag.params.len(), 4);
+        // One param per type-prefixed value since v31: the base. The stored
+        // value is the base too, so there is no second form to match.
+        assert_eq!(frag.params.len(), 2);
+        assert!(
+            !frag.sql.contains("LIKE"),
+            "the OR-list must be pure equalities: {}",
+            frag.sql
+        );
     }
 
     /// A bare logical id is the primary form of a reference search
@@ -3063,8 +3150,8 @@ mod tests {
             .collect();
         assert_eq!(
             params,
-            vec!["patient-1", "%/patient-1", "%/patient-1/\\_history/%"],
-            "a bare id must match exactly, as a `/id` suffix, and versioned: {}",
+            vec!["patient-1", "%/patient-1"],
+            "a bare id must match exactly and as a `/id` suffix: {}",
             frag.sql
         );
         assert_eq!(
@@ -3100,10 +3187,134 @@ mod tests {
             .collect();
         assert_eq!(
             params,
-            vec!["Patient/patient-1", "Patient/patient-1/\\_history/%"],
-            "the type modifier pins the reference, so no `/id` suffix match: {}",
+            vec!["Patient/patient-1"],
+            "the type modifier pins the reference to one equality: {}",
             frag.sql
         );
+    }
+
+    /// v31's read-side claim, pinned. The `Type/id` form — every reference
+    /// search the benchmark sends, and 18% of the search suite's Postgres time —
+    /// must emit ONE equality. A disjunction here forces a `BitmapOr` and a
+    /// `Bitmap Heap Scan` whose `Filter` re-evaluates the whole predicate on
+    /// every matching heap tuple: measured 1.50 ms/call against 0.47 ms.
+    #[test]
+    fn reference_type_prefixed_emits_one_sargable_equality() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "Patient/patient-1")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("Type/id reference");
+
+        assert!(
+            frag.sql.contains("value_reference = $3"),
+            "must be an equality on the bound base: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("LIKE") && !frag.sql.contains(" OR "),
+            "no disjunction: an OR is index-usable only when every arm is, and \
+             the `/_history/%` arm was the one that never matched: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    /// A versioned SEARCH value is still stripped, and now meets a stored value
+    /// that was stripped by the writer — so the two ends agree without a
+    /// pattern.
+    #[test]
+    fn reference_type_prefixed_version_is_stripped_from_the_search_value() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "Patient/patient-1/_history/7",
+            )],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("versioned Type/id");
+        match &frag.params[0] {
+            SqlParam::Text(t) => assert_eq!(t, "Patient/patient-1"),
+            other => panic!("expected a text param, got {:?}", other),
+        }
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    /// The compartment predicate carried the worst-shaped arm in the backend:
+    /// `LIKE $n || '/_history/%'` builds the pattern in SQL, so it is an
+    /// `OpExpr` rather than a `Const` and no fixed prefix can be derived from it
+    /// under *any* plan — while still costing the whole predicate its index,
+    /// because an OR needs every arm indexable.
+    #[test]
+    fn compartment_membership_is_one_equality_per_param_set() {
+        let mut query = SearchQuery::new("Observation");
+        query.compartment = Some(CompartmentMembership {
+            reference: "Patient/patient-1/_history/3".to_string(),
+            params: vec!["subject".to_string(), "performer".to_string()],
+        });
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("compartment");
+        assert!(
+            !frag.sql.contains("LIKE"),
+            "no pattern arm survives: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1, "one bind, not two: {}", frag.sql);
+        match &frag.params[0] {
+            SqlParam::Text(t) => assert_eq!(t, "Patient/patient-1"),
+            other => panic!("expected a text param, got {:?}", other),
+        }
+    }
+
+    /// `:identifier` must be driven by the identifier lookup, not by a
+    /// correlated `EXISTS` over the reference slice. The old form measured
+    /// 285.6 ms / 80,393 buffers against 1.4 ms / 845 on the same replica, and
+    /// binding `resource_type` into it — the repair the missing bind invites —
+    /// measured 338.2 ms, i.e. slower still.
+    #[test]
+    fn reference_identifier_is_driven_by_the_identifier_lookup() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: Some(SearchModifier::Identifier),
+            values: vec![SearchValue::new(SearchPrefix::Eq, "http://ex.org/mrn|A1")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect(":identifier");
+
+        assert!(
+            !frag.sql.contains("SUBSTRING") && !frag.sql.contains("EXISTS"),
+            "the correlated form must be gone: {}",
+            frag.sql
+        );
+        assert!(
+            frag.sql
+                .contains("ref.value_reference IN") &&
+            frag.sql
+                .contains("idx.resource_type || '/' || idx.resource_id"),
+            "the sub-select must yield the target's Type/id: {}",
+            frag.sql
+        );
+        // Both levels stay tenant-scoped. Dropping `idx.tenant_id` would let
+        // another tenant's identifier select this tenant's rows.
+        assert_eq!(
+            frag.sql.matches("tenant_id = $1").count(),
+            2,
+            "both levels scoped: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 2);
     }
 
     /// A versioned search value is stripped before the bare-id suffix match, so
@@ -3126,7 +3337,7 @@ mod tests {
             SqlParam::Text(t) => assert_eq!(t, "patient-1"),
             other => panic!("expected a text param, got {:?}", other),
         }
-        assert_eq!(frag.params.len(), 3, "version-stripped back to a bare id");
+        assert_eq!(frag.params.len(), 2, "version-stripped back to a bare id");
     }
 
     /// The suffix match makes LIKE escaping load-bearing: unescaped, `patient=%`

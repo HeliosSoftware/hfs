@@ -8,6 +8,7 @@ use crate::backends::postgres::cached::execute_cached;
 use crate::backends::postgres::schema::IndexLayout;
 use crate::error::{BackendError, StorageResult};
 use crate::search::{converters::IndexValue, extractor::ExtractedValue};
+use crate::types::strip_reference_version;
 
 fn internal_error(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(BackendError::Internal {
@@ -429,7 +430,12 @@ impl IndexRow {
                 resource_id: _,
                 display,
             } => {
-                row.value_reference = Some(reference.clone());
+                // Stored in its version-agnostic base form. See
+                // `migrate_v30_to_v31`: no reader of this column has ever been
+                // able to use a `/_history/<vid>` suffix, and three of them are
+                // silently broken by one.
+                row.value_reference =
+                    Some(strip_reference_version(reference).to_string());
                 row.value_reference_display = display.clone();
             }
             IndexValue::Uri(uri) => {
@@ -1102,6 +1108,39 @@ mod tests {
         assert_eq!(number.value_number, Some(4.0));
         assert!(number.value_quantity_value.is_none());
     }
+
+    /// The whole of schema v31 rests on this: `value_reference` holds the
+    /// version-agnostic base, so `build_reference_condition` can emit one
+    /// equality instead of `= OR LIKE '<base>/\_history/%'`, and so the three
+    /// readers that split the column on `/` (`_revinclude`, `ChainQueryBuilder`,
+    /// `:identifier`) see a `Type/id` they can resolve. A later change that
+    /// stored `Reference.reference` verbatim again would not fail anywhere
+    /// except in results — a versioned reference would simply stop matching —
+    /// so it fails here instead.
+    #[test]
+    fn a_stored_reference_is_normalized_to_its_version_agnostic_base() {
+        for (stored, expected) in [
+            ("Patient/1/_history/4", "Patient/1"),
+            ("Patient/1", "Patient/1"),
+            ("http://ex.org/fhir/Patient/1/_history/2", "http://ex.org/fhir/Patient/1"),
+            // No suffix to strip, and nothing that merely contains the text.
+            ("Patient/_history-is-not-a-version", "Patient/_history-is-not-a-version"),
+            ("#contained-1", "#contained-1"),
+        ] {
+            let row = row_of(IndexValue::Reference {
+                reference: stored.to_string(),
+                resource_type: None,
+                resource_id: None,
+                display: None,
+            });
+            assert_eq!(
+                row.value_reference.as_deref(),
+                Some(expected),
+                "stored reference {stored:?}"
+            );
+        }
+    }
+
 
     /// A plain row and a contained row now travel in the same statement, so the
     /// four columns that tell them apart have to be set per row. Getting

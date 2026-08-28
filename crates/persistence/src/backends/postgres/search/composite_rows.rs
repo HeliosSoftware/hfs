@@ -80,7 +80,10 @@ impl CompositeRow {
             IndexValue::String(s) => self.value_string = Some(s.clone()),
             IndexValue::Date { value, .. } => self.value_date = Some(value.clone()),
             IndexValue::Reference { reference, .. } => {
-                self.value_reference = Some(reference.clone())
+                // Same normalization as `IndexRow::from_extracted` — a composite
+                // reference component is read by the same predicates.
+                self.value_reference =
+                    Some(crate::types::strip_reference_version(reference).to_string())
             }
             IndexValue::Uri(u) => self.value_uri = Some(u.clone()),
         }
@@ -592,5 +595,23 @@ mod tests {
         assert!(rows.is_empty());
         assert_eq!(plain.len(), 1);
         assert_eq!(plain[0].param_name, plain_in.param_name);
+    }
+
+    /// A composite component carrying a reference is read by exactly the
+    /// predicates a plain reference row is, so it is normalized on the same
+    /// terms as `IndexRow::from_extracted` — see schema v31.
+    #[test]
+    fn a_composite_reference_component_is_version_stripped() {
+        let mut row = CompositeRow::default();
+        row.place(
+            1,
+            &IndexValue::Reference {
+                reference: "Patient/1/_history/9".to_string(),
+                resource_type: None,
+                resource_id: None,
+                display: None,
+            },
+        );
+        assert_eq!(row.value_reference.as_deref(), Some("Patient/1"));
     }
 }
