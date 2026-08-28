@@ -1,0 +1,342 @@
+<!doctype html>
+<!--
+  HFS issue #650 - Stage-2 client-side analytics POC
+  ============================================================================
+  DuckDB-WASM ingests a $sql-run Arrow IPC stream IN THE BROWSER, runs a
+  GROUP BY, and charts the result. No server round-trip for the aggregation.
+
+  SELF-HOSTED / NO CDN: every asset is loaded from ./vendor/ or ./sample.arrow.
+  Nothing is fetched from jsdelivr/unpkg/cdnjs at runtime. DuckDB-WASM's
+  default loader would pull its wasm+worker from jsdelivr; we override that by
+  passing selectBundle() EXPLICIT local URLs (see MANUAL_BUNDLES below).
+
+  THREADS / HEADERS: DuckDB-WASM's multi-threaded "coi" build needs the page to
+  be cross-origin isolated (COOP: same-origin + COEP: require-corp response
+  headers). `python -m http.server` sends no such headers, so we deliberately
+  vendor and select the single-threaded "eh" (exception-handling, non-coi)
+  build, which runs fine WITHOUT COOP/COEP. That is the only reason this POC
+  works from a plain static file server.
+
+  Serve over HTTP (see README) - ES module + Worker + WASM will not load from a
+  file:// URL.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DuckDB-WASM Arrow Analytics POC</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --panel-2: #273449;
+      --ink: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-2: #818cf8;
+      --bar: #38bdf8;
+      --ok: #34d399;
+      --err: #f87171;
+      --border: #334155;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 32px 20px 64px; }
+    h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+    h1 .tag { color: var(--accent); }
+    .sub { color: var(--muted); margin: 0 0 24px; font-size: 14px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px 20px;
+      margin: 16px 0;
+    }
+    .card h2 {
+      font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--muted); margin: 0 0 12px; font-weight: 600;
+    }
+    #status { font-size: 14px; }
+    #status .step { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; }
+    #status .step .dot { color: var(--muted); }
+    #status .step.done .dot { color: var(--ok); }
+    #status .step.err .dot { color: var(--err); }
+    #status .step.err { color: var(--err); }
+    code, pre { font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace; }
+    pre.sql {
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px 14px; margin: 0; font-size: 13.5px; color: var(--accent);
+      overflow-x: auto; white-space: pre;
+    }
+    .metrics { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+    .metric {
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 14px; min-width: 120px;
+    }
+    .metric .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .metric .v { font-size: 22px; font-weight: 700; margin-top: 2px; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .chart-wrap { overflow-x: auto; }
+    svg { display: block; max-width: 100%; height: auto; }
+    .foot { color: var(--muted); font-size: 12.5px; margin-top: 28px; }
+    .pill {
+      display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+      background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+    }
+    a { color: var(--accent-2); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>DuckDB-WASM <span class="tag">&times;</span> Arrow IPC &mdash; client-side analytics</h1>
+    <p class="sub">
+      HFS #650 Stage-2 proof-of-concept &middot;
+      <span class="pill">all assets local &middot; no CDN</span>
+    </p>
+
+    <div class="card">
+      <h2>Pipeline</h2>
+      <div id="status"></div>
+    </div>
+
+    <div class="card">
+      <h2>SQL running in the browser (DuckDB-WASM)</h2>
+      <pre class="sql" id="sql"></pre>
+      <div class="metrics">
+        <div class="metric"><div class="k">Source rows in <code>t</code></div><div class="v" id="m-rows">&mdash;</div></div>
+        <div class="metric"><div class="k">Groups returned</div><div class="v" id="m-groups">&mdash;</div></div>
+        <div class="metric"><div class="k">DuckDB build</div><div class="v" id="m-build" style="font-size:16px">&mdash;</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Result &mdash; count of patients by gender</h2>
+      <div class="chart-wrap"><svg id="chart" width="640" height="260" role="img" aria-label="Bar chart of patient counts by gender"></svg></div>
+      <table id="results" style="margin-top:14px">
+        <thead><tr><th>gender</th><th class="num">n</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <p class="foot">
+      Source table <code>t</code> is a real Arrow IPC stream produced by
+      <code>sof-cli --format arrow</code> from a 500-patient Patient
+      ViewDefinition (columns <code>id, gender, birth_date, active, city</code>) &mdash;
+      the exact wire format a live <code>$sql-run</code> endpoint would stream.
+      The <code>GROUP BY</code> and the chart are computed entirely in the browser;
+      the server never aggregates.
+    </p>
+  </div>
+
+  <!-- apache-arrow UMD (vendored, no CDN) exposes window.Arrow. Used here to
+       parse the raw IPC bytes client-side and report the source row count,
+       proving the Arrow lib round-trips the same stream DuckDB ingests. -->
+  <script src="vendor/Arrow.es2015.min.js"></script>
+
+  <!-- The vendored DuckDB ESM does `import ... from "apache-arrow"` (a bare
+       specifier). This import map resolves it to the locally-vendored Arrow
+       ESM build - no CDN, no bundler. Must precede the module script below. -->
+  <script type="importmap">
+  { "imports": {
+      "apache-arrow": "./vendor/arrow/Arrow.dom.mjs",
+      "tslib": "./vendor/tslib.es6.mjs",
+      "flatbuffers": "./vendor/flatbuffers/flatbuffers.js"
+  } }
+  </script>
+
+  <script type="module">
+    // NOTE: served as ".js" (not ".mjs") on purpose - Windows Python's
+    // http.server sends ".mjs" as text/plain, which browsers refuse to run as
+    // an ES module. ".js" is served as text/javascript. The browser keys off
+    // MIME + type="module" here, not the file extension.
+    import * as duckdb from "./vendor/duckdb-browser.js";
+
+    const SQL = "SELECT gender, count(*) n FROM t GROUP BY gender ORDER BY n DESC";
+
+    // ---- tiny status log ----------------------------------------------------
+    const statusEl = document.getElementById("status");
+    function step(label) {
+      const row = document.createElement("div");
+      row.className = "step";
+      row.innerHTML = '<span class="dot">&#9679;</span><span class="txt"></span>';
+      row.querySelector(".txt").textContent = label;
+      statusEl.appendChild(row);
+      return {
+        done(extra) { row.className = "step done"; if (extra) row.querySelector(".txt").textContent = label + " " + extra; },
+        fail(msg) { row.className = "step err"; row.querySelector(".txt").textContent = label + " - " + msg; },
+      };
+    }
+
+    document.getElementById("sql").textContent = SQL;
+
+    // ---- EXPLICIT local bundle: never touch jsdelivr ------------------------
+    // Both slots point at the vendored single-threaded "eh" build. selectBundle()
+    // inspects the browser's WASM features and returns this bundle with explicit
+    // local URLs; because we never provide a "coi" slot it never asks for the
+    // cross-origin-isolated (threaded) build that would require COOP/COEP.
+    // Absolute URLs: the worker resolves mainModule relative to ITSELF (it lives
+    // in vendor/), so a bare "vendor/..." path would double to vendor/vendor/...
+    // Anchor both to the document base so the worker fetches the right file.
+    const base = new URL(".", document.baseURI).href;
+    const MANUAL_BUNDLES = {
+      mvp: {
+        mainModule: base + "vendor/duckdb-eh.wasm",
+        mainWorker: base + "vendor/duckdb-browser-eh.worker.js",
+      },
+      eh: {
+        mainModule: base + "vendor/duckdb-eh.wasm",
+        mainWorker: base + "vendor/duckdb-browser-eh.worker.js",
+      },
+    };
+
+    async function main() {
+      // 1. Fetch the Arrow IPC stream ($sql-run output) as raw bytes.
+      const s1 = step("Fetching sample.arrow ($sql-run Arrow IPC stream)");
+      const resp = await fetch("sample.arrow");
+      if (!resp.ok) throw new Error("HTTP " + resp.status + " fetching sample.arrow (serve over http, not file://)");
+      const arrayBuffer = await resp.arrayBuffer();
+      const ipcBytes = new Uint8Array(arrayBuffer);
+      s1.done("(" + ipcBytes.length.toLocaleString() + " bytes)");
+
+      // 2. Parse it client-side with apache-arrow to report the source row count.
+      const s2 = step("Parsing IPC with apache-arrow (window.Arrow)");
+      const arrowTable = window.Arrow.tableFromIPC(ipcBytes);
+      const sourceRows = arrowTable.numRows;
+      document.getElementById("m-rows").textContent = sourceRows.toLocaleString();
+      s2.done("v" + (window.Arrow.PACKAGE_VERSION || "21") + " - " + sourceRows + " rows");
+
+      // 3. Boot DuckDB-WASM from the explicit local bundle.
+      const s3 = step("Selecting local DuckDB-WASM bundle (no jsdelivr)");
+      const bundle = await duckdb.selectBundle(MANUAL_BUNDLES);
+      const buildName = bundle.mainModule.split("/").pop();
+      document.getElementById("m-build").textContent = buildName;
+      s3.done("- " + buildName + (bundle.pthreadWorker ? " (threaded)" : " (single-thread, no COOP/COEP needed)"));
+
+      const s4 = step("Instantiating DuckDB-WASM in a Web Worker");
+      const worker = new Worker(bundle.mainWorker);
+      const logger = new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING);
+      const db = new duckdb.AsyncDuckDB(logger, worker);
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      s4.done("v" + duckdb.PACKAGE_VERSION);
+
+      // 4. Ingest the Arrow IPC stream straight into an in-memory table `t`.
+      const s5 = step('Ingesting Arrow stream -> table "t" (insertArrowFromIPCStream)');
+      const conn = await db.connect();
+      await conn.insertArrowFromIPCStream(ipcBytes, { name: "t", create: true });
+      s5.done();
+
+      // 5. Run the GROUP BY entirely in the browser.
+      const s6 = step("Running GROUP BY in DuckDB-WASM");
+      const result = await conn.query(SQL);
+      const rows = result.toArray().map((r) => ({
+        gender: String(r.gender),
+        n: Number(r.n), // count(*) comes back as BigInt; charts want Number
+      }));
+      s6.done("- " + rows.length + " groups");
+
+      document.getElementById("m-groups").textContent = rows.length;
+      renderTable(rows);
+      renderChart(rows);
+
+      await conn.close();
+      step("Done - aggregation computed client-side, no server round-trip").done();
+    }
+
+    // ---- render: results table ---------------------------------------------
+    function renderTable(rows) {
+      const tbody = document.querySelector("#results tbody");
+      tbody.innerHTML = "";
+      for (const r of rows) {
+        const tr = document.createElement("tr");
+        const td1 = document.createElement("td");
+        td1.textContent = r.gender;
+        const td2 = document.createElement("td");
+        td2.className = "num";
+        td2.textContent = r.n.toLocaleString();
+        tr.append(td1, td2);
+        tbody.appendChild(tr);
+      }
+    }
+
+    // ---- render: inline SVG bar chart --------------------------------------
+    function renderChart(rows) {
+      const svg = document.getElementById("chart");
+      const NS = "http://www.w3.org/2000/svg";
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+      const W = 640, H = 260, padL = 48, padR = 16, padT = 16, padB = 44;
+      const plotW = W - padL - padR, plotH = H - padT - padB;
+      const maxN = Math.max(1, ...rows.map((r) => r.n));
+      const n = rows.length;
+      const gap = 0.35;
+      const band = plotW / n;
+      const barW = band * (1 - gap);
+
+      // y axis ticks (0, mid, max)
+      const ticks = [0, Math.round(maxN / 2), maxN];
+      for (const tv of ticks) {
+        const y = padT + plotH - (tv / maxN) * plotH;
+        const line = document.createElementNS(NS, "line");
+        line.setAttribute("x1", padL); line.setAttribute("x2", W - padR);
+        line.setAttribute("y1", y); line.setAttribute("y2", y);
+        line.setAttribute("stroke", "#334155"); line.setAttribute("stroke-width", "1");
+        svg.appendChild(line);
+        const lab = document.createElementNS(NS, "text");
+        lab.setAttribute("x", padL - 8); lab.setAttribute("y", y + 4);
+        lab.setAttribute("text-anchor", "end");
+        lab.setAttribute("fill", "#94a3b8"); lab.setAttribute("font-size", "11");
+        lab.textContent = tv;
+        svg.appendChild(lab);
+      }
+
+      rows.forEach((r, i) => {
+        const x = padL + i * band + (band - barW) / 2;
+        const h = (r.n / maxN) * plotH;
+        const y = padT + plotH - h;
+
+        const rect = document.createElementNS(NS, "rect");
+        rect.setAttribute("x", x); rect.setAttribute("y", y);
+        rect.setAttribute("width", barW); rect.setAttribute("height", h);
+        rect.setAttribute("rx", "4"); rect.setAttribute("fill", "#38bdf8");
+        svg.appendChild(rect);
+
+        const cnt = document.createElementNS(NS, "text");
+        cnt.setAttribute("x", x + barW / 2); cnt.setAttribute("y", y - 6);
+        cnt.setAttribute("text-anchor", "middle");
+        cnt.setAttribute("fill", "#e2e8f0"); cnt.setAttribute("font-size", "12");
+        cnt.setAttribute("font-weight", "700");
+        cnt.textContent = r.n;
+        svg.appendChild(cnt);
+
+        const cat = document.createElementNS(NS, "text");
+        cat.setAttribute("x", x + barW / 2); cat.setAttribute("y", H - padB + 18);
+        cat.setAttribute("text-anchor", "middle");
+        cat.setAttribute("fill", "#94a3b8"); cat.setAttribute("font-size", "12");
+        cat.textContent = r.gender;
+        svg.appendChild(cat);
+      });
+
+      // baseline
+      const base = document.createElementNS(NS, "line");
+      base.setAttribute("x1", padL); base.setAttribute("x2", W - padR);
+      base.setAttribute("y1", padT + plotH); base.setAttribute("y2", padT + plotH);
+      base.setAttribute("stroke", "#64748b"); base.setAttribute("stroke-width", "1.5");
+      svg.appendChild(base);
+    }
+
+    main().catch((err) => {
+      console.error(err);
+      const s = step("Failed");
+      s.fail(err && err.message ? err.message : String(err));
+    });
+  </script>
+</body>
+</html>
