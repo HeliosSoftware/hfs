@@ -285,6 +285,7 @@ data/
 ├── search-parameters-r4b.json  # FHIR R4B SearchParameters (HL7 spec)
 ├── search-parameters-r5.json   # FHIR R5 SearchParameters (HL7 spec)
 ├── search-parameters-r6.json   # FHIR R6 SearchParameters (auto-downloaded at build time)
+├── sql-on-fhir-search-parameters.json  # SQL-on-FHIR IG ViewDefinition search params (custom file)
 └── *.json                      # Custom SearchParameter files (see below)
 ```
 
@@ -334,6 +335,17 @@ Or as a Bundle:
   ]
 }
 ```
+
+### SQL-on-FHIR ViewDefinition Search Parameters
+
+`data/sql-on-fhir-search-parameters.json` ships the 17 `ViewDefinition` SearchParameters from the [SQL-on-FHIR IG](http://hl7.org/fhir/uv/sql-on-fhir) as one of these custom Bundle files. Do not edit it by hand — regenerate it from the official IG package with:
+
+```bash
+scripts/sync-sof-search-params.py            # pinned IG release
+scripts/sync-sof-search-params.py --ci-build # preview the IG CI build
+```
+
+The script strips generated narratives and rewrites the composite parameters' legacy `component.definition` canonicals to the core-namespace canonicals the parameters actually declare (an upstream IG inconsistency, reported as [HL7/sql-on-fhir#403](https://github.com/HL7/sql-on-fhir/issues/403); the rewrite becomes a no-op once fixed upstream). Bump `DEFAULT_PACKAGE_URL` in the script when a new IG ballot/release ships.
 
 ### Custom Data Directory
 

@@ -9,9 +9,6 @@ implementation and its test suite stayed with the FHIR Foundation under MIT,
 and one package could not carry both licenses. The suite is now versioned with
 the reference implementation, which is where the sync command below points.
 
-(The directory is still named `sql-on-fhir-v2` for path stability; the fixtures
-themselves track the current reference implementation.)
-
 - **Upstream source:** <https://github.com/FHIR/sql-on-fhir.js/tree/main/tests>
   (raw: `https://raw.githubusercontent.com/FHIR/sql-on-fhir.js/main/tests/<file>.json`)
 - **Policy:** files are copied byte-for-byte. Do not hand-edit them — re-sync from
@@ -20,7 +17,7 @@ themselves track the current reference implementation.)
 To re-sync:
 
 ```sh
-dir=crates/sof/tests/sql-on-fhir-v2/tests
+dir=crates/sof/tests/sql-on-fhir/tests
 for f in "$dir"/*.json; do
   name=$(basename "$f")
   curl -fsS "https://raw.githubusercontent.com/FHIR/sql-on-fhir.js/main/tests/$name" -o "$f"

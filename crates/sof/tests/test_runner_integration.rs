@@ -286,7 +286,7 @@ const MIN_TEST_CASES: usize = 144;
 #[test]
 fn run_comprehensive_test_suite() {
     let mut test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests/sql-on-fhir-v2/tests");
+    test_dir.push("tests/sql-on-fhir/tests");
 
     // Previously an early `return`, i.e. a silent pass. The fixtures are tracked
     // in git, so a missing directory means a broken checkout, not an optional
