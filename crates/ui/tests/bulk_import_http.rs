@@ -296,7 +296,7 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
         cursor += offset + action.len();
     }
     assert!(!html.contains(r#"<th scope="col">"#));
-    assert!(html.contains("bulk-import-manifest-empty"));
+    assert!(html.contains("data-bulk-import-manifest-empty"));
     assert!(html.contains(r#"class="empty-state""#));
 
     // The initial HTMX load is owned directly by the fragment host, so its
