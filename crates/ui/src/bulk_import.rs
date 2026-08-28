@@ -103,7 +103,9 @@ pub struct Submission {
     pub client_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token_url: String,
-    /// `not-started` | `in-progress` | `stopped` | `completed`.
+    /// `not-started` | `in-progress` | `failed` | `stopped` | `completed`.
+    /// `failed` is resolvable: a new submit returns it to `in-progress`, and
+    /// Abort/Complete can close it out.
     #[serde(default)]
     pub status: String,
     #[serde(default)]
@@ -181,21 +183,92 @@ async fn patch_submission(
         .map_err(|e| e.to_string())
 }
 
-/// Replaces one submission wholesale. RFC 7386 merges objects key-by-key, so a
-/// plain patch cannot *remove* a manifest or trim the log; writing the full
-/// serialized submission under its id does, without touching siblings.
+/// Every field of the serialized `Submission`, and of a serialized `Manifest`
+/// inside its map. `store_submission` forces each one to be present in the
+/// patch (absent → explicit null) so a cleared skip-serialized field deletes
+/// its stored value instead of silently surviving the merge.
+const SUBMISSION_FIELDS: &[&str] = &[
+    "name",
+    "recipientBaseUrl",
+    "auth",
+    "submitterSystem",
+    "submitterValue",
+    "pollUrl",
+    "progress",
+    "result",
+    "clientId",
+    "tokenUrl",
+    "status",
+    "createdAt",
+    "manifests",
+    "log",
+];
+const MANIFEST_FIELDS: &[&str] = &[
+    "manifestUrl",
+    "fhirBaseUrl",
+    "outputFormat",
+    "fileRequestHeaders",
+    "createdAt",
+    "lastSubmittedAt",
+    "abortedAt",
+];
+
+/// Persists one submission as a **single** merge patch.
+///
+/// The prior shape deleted the entry and wrote it back in two patches; between
+/// them the submission did not exist, so a failed second patch — or a
+/// concurrent handler's write landing in the gap — destroyed it outright
+/// (#766). One patch has no gap. What the two-step bought is reproduced
+/// inside the single patch instead: RFC 7386 replaces arrays (the log)
+/// wholesale but merges maps key-by-key, so a manifest removed from the map
+/// rides along as an explicit null, and every skip-serialized field that is
+/// currently empty is forced to null so its stored value is deleted rather
+/// than left behind.
 async fn store_submission(
     state: &WebState,
     user_key: &str,
     tenant: &str,
     id: &str,
     submission: &Submission,
+    removed_manifests: &[String],
 ) -> Result<(), String> {
-    // Null out the entry first so nested leftovers (deleted manifests, dropped
-    // log lines) don't survive the merge.
-    patch_submission(state, user_key, tenant, id, Value::Null).await?;
-    let value = serde_json::to_value(submission).map_err(|e| e.to_string())?;
+    let mut value = serde_json::to_value(submission).map_err(|e| e.to_string())?;
+    if let Some(entry) = value.as_object_mut() {
+        for field in SUBMISSION_FIELDS {
+            entry.entry(*field).or_insert(Value::Null);
+        }
+        if let Some(manifests) = entry.get_mut("manifests").and_then(|m| m.as_object_mut()) {
+            for manifest in manifests.values_mut() {
+                if let Some(m) = manifest.as_object_mut() {
+                    for field in MANIFEST_FIELDS {
+                        m.entry(*field).or_insert(Value::Null);
+                    }
+                }
+            }
+            for mid in removed_manifests {
+                manifests.insert(mid.clone(), Value::Null);
+            }
+        }
+    }
     patch_submission(state, user_key, tenant, id, value).await
+}
+
+/// Stores and, on failure, logs — for the paths whose response is a redirect
+/// either way. The write failing must at least reach the server log; it used
+/// to be discarded at nine of ten call sites (#766).
+async fn store_or_warn(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    id: &str,
+    submission: &Submission,
+    removed_manifests: &[String],
+) {
+    if let Err(e) =
+        store_submission(state, user_key, tenant, id, submission, removed_manifests).await
+    {
+        tracing::warn!(submission = %id, error = %e, "failed to persist bulk-import submission");
+    }
 }
 
 fn now_stamp() -> String {
@@ -402,7 +475,7 @@ pub async fn create(
         manifests: serde_json::Map::new(),
         log: Vec::new(),
     };
-    match store_submission(&state, &user_key, &rt.id, &id, &submission).await {
+    match store_submission(&state, &user_key, &rt.id, &id, &submission, &[]).await {
         Ok(()) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
@@ -522,7 +595,7 @@ fn render_detail_page(
         auth: s.auth.clone(),
         client_id: s.client_id,
         token_url: s.token_url,
-        can_finalize: s.status == "in-progress",
+        can_finalize: matches!(s.status.as_str(), "in-progress" | "failed"),
         terminal,
         sort,
         manifests,
@@ -658,7 +731,7 @@ pub async fn add_manifest(
     let mid = uuid::Uuid::new_v4().to_string();
     s.manifests
         .insert(mid, serde_json::to_value(&manifest).unwrap_or(Value::Null));
-    let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+    store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
@@ -672,7 +745,7 @@ pub async fn delete_manifest(
     let user_key = settings_user_key(principal.as_deref());
     if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
         s.manifests.remove(&mid);
-        let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+        store_or_warn(&state, &user_key, &rt.id, &id, &s, &[mid.clone()]).await;
     }
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
@@ -995,12 +1068,28 @@ async fn poll_status(submission: &mut Submission) {
             });
             submission.progress = String::new();
             submission.poll_url = String::new();
-            push_log(
-                submission,
-                format!(
-                    "Status: got 200 OK — processing finished ({outputs} outputs, {errors} error files)."
-                ),
-            );
+            // The recipient's status manifest is submission-scoped, so its
+            // verdict is the submission's (#764, #765): errors mark it
+            // failed; a clean completion completes it. Complete remains
+            // available for closing out early by hand, and a later submit
+            // returns a failed submission to in-progress.
+            if errors > 0 {
+                submission.status = "failed".to_string();
+                push_log(
+                    submission,
+                    format!(
+                        "Status: got 200 OK — processing finished with {errors} error file(s) ({outputs} outputs); submission marked failed."
+                    ),
+                );
+            } else {
+                submission.status = "completed".to_string();
+                push_log(
+                    submission,
+                    format!(
+                        "Status: got 200 OK — processing finished cleanly ({outputs} outputs); submission completed."
+                    ),
+                );
+            }
         }
         429 => {
             push_log(
@@ -1009,11 +1098,23 @@ async fn poll_status(submission: &mut Submission) {
             );
         }
         other => {
+            // Polling can never resume (the URL is dropped), so the submission
+            // must not keep reading In Progress (#764). completedAt keeps the
+            // status card rendered; the log carries the diagnosis.
+            submission.status = "failed".to_string();
+            submission.result = json!({
+                "completedAt": now_stamp(),
+                "outputs": 0,
+                "errors": 0,
+            });
+            submission.progress = String::new();
+            submission.poll_url = String::new();
             push_log(
                 submission,
-                format!("Status poll answered {other}; polling stopped."),
+                format!(
+                    "Status poll answered {other}; polling stopped and the submission is marked failed."
+                ),
             );
-            submission.poll_url = String::new();
         }
     }
 }
@@ -1033,7 +1134,7 @@ pub async fn submit_manifest(
         return conflict("manifest is not eligible for submission");
     }
     submit_with_id(&mut s, &id, Some(&mid)).await;
-    let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+    store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
@@ -1052,7 +1153,7 @@ pub async fn submit_all(
         return conflict("submission has no eligible manifests");
     }
     submit_with_id(&mut s, &id, None).await;
-    let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+    store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
@@ -1184,8 +1285,8 @@ async fn set_status(
     let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
-    if s.status != "in-progress" {
-        return conflict("only in-progress submissions can change terminal status");
+    if !matches!(s.status.as_str(), "in-progress" | "failed") {
+        return conflict("only in-progress or failed submissions can change terminal status");
     }
     push_log(&mut s, format!("Marking submission {status}..."));
     let parameters = kickoff_parameters(&s, &id, status, None, None);
@@ -1207,7 +1308,7 @@ async fn set_status(
             push_log(&mut s, format!("Status change failed: {e}"));
         }
     }
-    let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+    store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
@@ -1241,7 +1342,7 @@ pub async fn status_fragment(
     };
     if !s.poll_url.is_empty() {
         poll_status(&mut s).await;
-        let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+        store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
     }
     render(StatusCard {
         i18n,
@@ -1346,7 +1447,7 @@ pub async fn replace_manifest(
                 push_log(&mut s, format!("Replacement failed: {e}"));
             }
         }
-        let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+        store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
     }
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
@@ -1395,7 +1496,7 @@ pub async fn abort_manifest(
                 push_log(&mut s, format!("Abort failed: {e}"));
             }
         }
-        let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+        store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
     }
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }

@@ -1462,3 +1462,115 @@ async fn a_non_fhir_recipient_error_is_summarized_not_pasted() {
     assert!(!html.contains("Error code: 501"), "markup is not pasted");
     assert!(html.contains("Failed"));
 }
+
+/// A recipient whose poll URL answers `200` with the given status manifest
+/// body on the first poll (no 202 phase), or `500` when `body` is `None`.
+async fn mock_recipient_finishing_with(body: Option<serde_json::Value>) -> String {
+    use axum::extract::State as AxState;
+    #[derive(Clone)]
+    struct S {
+        base: Arc<std::sync::Mutex<String>>,
+        body: Arc<Option<serde_json::Value>>,
+    }
+    let state = S {
+        base: Arc::new(std::sync::Mutex::new(String::new())),
+        body: Arc::new(body),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    *state.base.lock().unwrap() = format!("http://{addr}");
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"resourceType": "OperationOutcome"}))
+            }),
+        )
+        .route(
+            "/$bulk-submit-status",
+            axum::routing::post(|AxState(s): AxState<S>| async move {
+                let base = s.base.lock().unwrap().clone();
+                (
+                    StatusCode::ACCEPTED,
+                    [("content-location", format!("{base}/poll"))],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/poll",
+            axum::routing::get(|AxState(s): AxState<S>| async move {
+                match s.body.as_ref() {
+                    Some(manifest) => axum::Json(manifest.clone()).into_response(),
+                    None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }),
+        )
+        .with_state(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// Drives create → add manifest → submit-all, then one status fetch; returns
+/// the detail page HTML afterwards.
+async fn run_one_manifest_to_poll(recipient_url: &str) -> (Ctx, String, String) {
+    let ctx = ctx(recipient_url);
+    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Outcome&auth=none").await;
+    post_form(
+        &ctx,
+        &format!("{detail_path}/manifests"),
+        "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
+    )
+    .await;
+    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
+    let _ = get(&ctx, &format!("{detail_path}/status")).await;
+    let (_, detail) = get(&ctx, &detail_path).await;
+    (ctx, detail_path, detail)
+}
+
+/// #765: a clean `200` status manifest completes the submission by itself —
+/// no manual Complete press required.
+#[tokio::test]
+async fn a_clean_completion_manifest_completes_the_submission() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "error": []
+    })))
+    .await;
+    let (_ctx, _path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(detail.contains("Completed"), "{detail}");
+    assert!(!detail.contains("In Progress"), "{detail}");
+    assert!(detail.contains("submission completed"), "{detail}");
+}
+
+/// #764: a completion manifest carrying `error[]` entries fails the
+/// submission, and a failed submission can still be finalized.
+#[tokio::test]
+async fn a_completion_manifest_with_errors_fails_the_submission() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "error": [{"type": "OperationOutcome", "url": "http://x/e.ndjson"}]
+    })))
+    .await;
+    let (_ctx, _path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(detail.contains("Failed"), "{detail}");
+    assert!(!detail.contains("In Progress"), "{detail}");
+    assert!(detail.contains("marked failed"), "{detail}");
+}
+
+/// #764: a poll answering `5xx` stops polling, fails the submission, and the
+/// status card stays on screen instead of vanishing.
+#[tokio::test]
+async fn a_poll_server_error_fails_the_submission_and_keeps_the_card() {
+    let recipient = mock_recipient_finishing_with(None).await;
+    let (ctx, detail_path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(detail.contains("Failed"), "{detail}");
+    assert!(detail.contains("polling stopped"), "{detail}");
+    // The status fragment still renders the result card, and no longer polls.
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(
+        fragment.contains("Processing finished at <code>"),
+        "{fragment}"
+    );
+    assert!(!fragment.contains("every 5s"), "{fragment}");
+}
