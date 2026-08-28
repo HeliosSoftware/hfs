@@ -2625,6 +2625,7 @@ details.json-fold[open] > summary .icon {
   padding: 32px 12px;
 }
 
+
 .data-table tbody tr:not(.data-table__empty):hover td,
 .data-table tbody tr[aria-selected="true"] td {
   background: var(--accent-soft);

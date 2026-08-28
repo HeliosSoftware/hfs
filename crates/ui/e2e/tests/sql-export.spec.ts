@@ -2,16 +2,21 @@
 // ViewDefinition from the form, follow the job to Finished, and land on the
 // Files page with the manifest's download links.
 import { expect, test } from "../pages/fixtures";
-import { createResource } from "../pages/api";
+import { createResource, waitSearchable } from "../pages/api";
 
 test("an export runs through to downloadable manifest files", async ({ page, request }) => {
-  await createResource(request, "Patient", { name: [{ family: "ExportE2E" }] });
+  const patientId = await createResource(request, "Patient", { name: [{ family: "ExportE2E" }] });
   const vdId = await createResource(request, "ViewDefinition", {
     name: "e2e_export_patients",
     status: "active",
     resource: "Patient",
     select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
   });
+
+  // ES composites index asynchronously: the form lists subjects and the
+  // job reads its rows through search (#596).
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await waitSearchable(request, "Patient", patientId);
 
   await page.goto("/ui/sql/export");
   await page.locator(`input[value='ViewDefinition/${vdId}']`).check();
