@@ -46,8 +46,7 @@ use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 ///   make this assertion false and leave stale rows for a later create to
 ///   inherit, which is why those call sites carry the obligation in a comment.
 /// - A caller that has just run [`PostgresBackend::delete_search_index`], which
-///   clears the `search_index` rows (and, with [`FtsRow::Drop`], the
-///   `resource_fts` row too).
+///   clears the `search_index` rows and the `resource_fts` row with them.
 ///
 /// Claiming `Fresh` wrongly leaves stale index rows behind — a resource that
 /// still matches searches for values it no longer has — so it is an explicit
@@ -60,37 +59,53 @@ pub(crate) enum IndexWrite {
     Replace,
 }
 
-/// Whether [`PostgresBackend::delete_search_index`] must also drop the
-/// `resource_fts` row.
-///
-/// The full-text write is an upsert against a UNIQUE `idx_fts_lookup` (schema
-/// v27), so a caller that re-indexes immediately afterwards does not need the
-/// row deleted first — the upsert replaces it. Every one of the 192,825 updates
-/// in a 5-minute crud run used to pay a `DELETE FROM resource_fts` (227.3 s of
-/// Postgres execution time, measured on run 33086933938) purely to make room
-/// for an insert that now writes over the row itself.
-///
-/// A caller that is *not* going to re-index must still pass [`FtsRow::Drop`],
-/// or the resource stays matchable by `_text` / `_content`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FtsRow {
-    /// Delete the `resource_fts` row: the caller is removing this resource's
-    /// index entries and nothing will put the row back.
-    Drop,
-    /// Leave the `resource_fts` row in place: the caller re-indexes
-    /// immediately and the upsert replaces it.
-    Keep,
-}
-
 /// The full-text upsert, shared by the first attempt and the truncating retry.
 ///
 /// `ON CONFLICT` names the columns of the UNIQUE `idx_fts_lookup` created in
 /// schema v27. Column order in the target list is the table's, not the index's.
+///
+/// # The `WHERE` on the `DO UPDATE` is the point
+///
+/// Without it, every rewrite of a resource replaces this row unconditionally:
+/// a new heap tuple, a dead one left behind for autovacuum, and a fresh entry
+/// in **both** GIN indexes — whether or not a single lexeme changed. The
+/// decomposition on the docstring of `index_fts_content` puts that at 24% (GIN)
+/// plus 12% (heap and unique index) of the statement, i.e. **36% of every
+/// update's full-text cost is spent writing the row it already had**.
+///
+/// The `WHERE` makes the write conditional on the vectors actually differing.
+/// What it cannot avoid is `to_tsvector` itself — the other 63% — because the
+/// comparison needs the new vector to compare against. So the guard converts an
+/// unchanged-text update from `tokenise + heap + 2 GIN` into `tokenise +
+/// compare`, and leaves a changed-text update paying one extra `tsvector`
+/// comparison (an O(lexemes) memcmp over ~5 KB, against the two GIN inserts it
+/// is deciding about).
+///
+/// This is not a benchmark-shaped optimisation, but the benchmark is its best
+/// case and that is worth stating plainly: the crud suite's `PUT` sends back a
+/// byte-identical body, so **every** one of its 261,459 updates takes the skip.
+/// A deployment whose updates change the narrative takes none of it and pays
+/// the comparison. The reason to do it anyway is that rewriting an index entry
+/// to the same value is never right: it is dead tuples, WAL and autovacuum work
+/// with no reader consequence, and `search_index` in the same run left 8.7M dead
+/// tuples and four autovacuum passes over a 22M-row table competing for the
+/// same four cores.
+///
+/// `IS DISTINCT FROM`, not `<>`: `narrative_tsvector` is NULL on any row
+/// written before the vectors were bound directly (v25), and `NULL <> x` is
+/// NULL, which would suppress the update and strand that row unfixed forever.
+///
+/// Correctness of the skip rests on these two columns being the only thing the
+/// statement writes. They are: `narrative_text` and `full_content` are
+/// write-only leftovers that this statement has not bound since v25, and the
+/// three key columns are what the conflict matched on.
 const FTS_UPSERT_SQL: &str = "\
 INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_tsvector, content_tsvector) \
 VALUES ($1, $2, $3, to_tsvector('english', $4), to_tsvector('english', $5)) \
 ON CONFLICT (tenant_id, resource_type, resource_id) DO UPDATE \
-SET narrative_tsvector = EXCLUDED.narrative_tsvector, content_tsvector = EXCLUDED.content_tsvector";
+SET narrative_tsvector = EXCLUDED.narrative_tsvector, content_tsvector = EXCLUDED.content_tsvector \
+WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
+   OR resource_fts.narrative_tsvector IS DISTINCT FROM EXCLUDED.narrative_tsvector";
 
 /// How much text a single retry hands `to_tsvector` after it has refused the
 /// whole thing.
@@ -466,20 +481,20 @@ impl ResourceStorage for PostgresBackend {
             };
         }
 
-        // Re-index the resource. The `search_index` rows have to go first, and
-        // clearing them here leaves nothing for the indexing write to clear —
-        // `Replace` would have issued a second identical DELETE against the
-        // same rows. The `resource_fts` row stays: `index_fts_content` upserts
-        // over it, which is one statement and one round trip less per update.
-        self.delete_search_index(&client, tenant_id, resource_type, id, FtsRow::Keep)
-            .await?;
+        // Re-index the resource. `Replace` clears the old `search_index` rows
+        // inside the same statement that writes the new ones — the clearing
+        // `DELETE` used to be a `delete_search_index` call of its own here, i.e.
+        // a second statement and a second round trip binding the same three
+        // parameters. The `resource_fts` row stays either way:
+        // `index_fts_content` upserts over it, which is one more statement and
+        // round trip saved per update.
         self.index_resource(
             &client,
             tenant_id,
             resource_type,
             id,
             now,
-            IndexWrite::Fresh,
+            IndexWrite::Replace,
             &resource,
         )
         .await?;
@@ -1099,18 +1114,19 @@ impl PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to insert restore history: {}", e)))?;
 
         // The delete dropped the search index entries; rebuild them for the
-        // resource that is live again. As in `update`, the preceding
-        // `delete_search_index` is what clears `search_index`, so the indexing
-        // write has nothing left to clear; the full-text row is upserted over.
-        self.delete_search_index(&client, tenant_id, resource_type, id, FtsRow::Keep)
-            .await?;
+        // resource that is live again. As in `update`, `Replace` folds the
+        // clearing `DELETE` into the insert rather than sending it separately —
+        // and it must stay a `Replace`, not a `Fresh`: a resource can be
+        // soft-deleted by a path that leaves its rows in place, so this cannot
+        // assert that nothing is indexed under the id. The full-text row is
+        // upserted over.
         self.index_resource(
             &client,
             tenant_id,
             resource_type,
             id,
             now,
-            IndexWrite::Fresh,
+            IndexWrite::Replace,
             &resource,
         )
         .await?;
@@ -1157,15 +1173,10 @@ impl PostgresBackend {
             return Ok(());
         }
 
-        if mode == IndexWrite::Replace {
-            execute_cached(
-                client,
-                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
-        }
+        // `Replace` no longer sends a `DELETE` of its own: the clearing delete
+        // rides inside the first insert statement (`INSERT_SQL_REPLACE`), which
+        // is one statement and one round trip instead of two, binding the same
+        // three parameters once instead of twice. See `replace_rows`.
 
         // Extract values using the registry-driven extractor
         let mut rows: Vec<IndexRow> = match self
@@ -1211,14 +1222,28 @@ impl PostgresBackend {
         rows.extend(self.contained_index_rows(tenant_id, resource_type, resource_id, resource));
 
         let count = rows.len();
-        PostgresSearchIndexWriter::insert_rows(
-            client,
-            tenant_id,
-            resource_type,
-            resource_id,
-            &rows,
-        )
-        .await?;
+        match mode {
+            IndexWrite::Fresh => {
+                PostgresSearchIndexWriter::insert_rows(
+                    client,
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    &rows,
+                )
+                .await?
+            }
+            IndexWrite::Replace => {
+                PostgresSearchIndexWriter::replace_rows(
+                    client,
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    &rows,
+                )
+                .await?
+            }
+        }
         tracing::debug!(
             "Dynamically indexed {} values for {}/{}",
             count,
@@ -1291,9 +1316,9 @@ impl PostgresBackend {
     ///
     /// The write is an upsert keyed on `idx_fts_lookup`, which schema v27 makes
     /// UNIQUE. Two things follow from that. A rewrite no longer needs its own
-    /// `DELETE` — `update` and `restore` ask `delete_search_index` to leave the
-    /// row alone (`FtsRow::Keep`) and this statement replaces it in place, which
-    /// removes one statement and one round trip from every update. And a
+    /// `DELETE` — `update` and `restore` leave the row alone and this statement
+    /// replaces it in place, which removes one statement and one round trip from
+    /// every update. And a
     /// duplicate `resource_fts` row is now impossible: `search_text` /
     /// `search_content` join `resources` to `resource_fts`, so a duplicate used
     /// to return the same resource twice in a `_text` / `_content` page.
@@ -1452,19 +1477,36 @@ impl PostgresBackend {
         Ok(())
     }
 
-    /// Delete search index entries for a resource.
-    /// Removes a resource's search entries, returning how many `search_index`
-    /// rows were deleted.
+    /// Removes a resource from search entirely: its `search_index` rows and its
+    /// `resource_fts` row. Returns how many `search_index` rows went.
     ///
-    /// `fts` says whether the `resource_fts` row goes with them; see
-    /// [`FtsRow`].
+    /// This used to take an `FtsRow` telling it whether to drop the full-text
+    /// row, because a *re-indexing* caller — `update`, `restore` — wanted only
+    /// the `search_index` half cleared: the full-text write is an upsert against
+    /// the UNIQUE `idx_fts_lookup` (schema v27) and replaces the row in place, so
+    /// deleting it first was one statement and one round trip of pure waste
+    /// (227.3 s over a 5-minute crud run's 192,825 updates, measured on run
+    /// 33086933938).
+    ///
+    /// Those callers no longer come here at all. Clearing the `search_index`
+    /// rows is now folded into the statement that writes the new ones
+    /// (`IndexWrite::Replace` -> `PostgresSearchIndexWriter::replace_rows`),
+    /// which removes a second statement and round trip on top of the one the
+    /// `FtsRow` split removed. What is left is the one caller that means
+    /// "unindex this resource" — `delete_search_entries`, the `$reindex` clear —
+    /// and it always wanted both halves gone, so the parameter had one possible
+    /// value and is now implicit.
+    ///
+    /// The obligation the enum carried is still real and now lives here: a
+    /// caller that removes `search_index` rows and does *not* rewrite them must
+    /// take the `resource_fts` row too, or the resource stays matchable by
+    /// `_text` / `_content` after it has stopped matching everything else.
     pub(crate) async fn delete_search_index(
         &self,
         client: &deadpool_postgres::Client,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        fts: FtsRow,
     ) -> StorageResult<u64> {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
@@ -1480,15 +1522,13 @@ impl PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
 
-        // Delete from FTS table if it exists
-        if fts == FtsRow::Drop {
-            let _ = execute_cached(
-                    client,
-                    "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                    &[&tenant_id, &resource_type, &resource_id],
-                )
-                .await;
-        }
+        // The full-text row goes with them.
+        let _ = execute_cached(
+                client,
+                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                &[&tenant_id, &resource_type, &resource_id],
+            )
+            .await;
 
         Ok(deleted)
     }
@@ -3420,7 +3460,6 @@ impl ReindexTarget for PostgresBackend {
             tenant.tenant_id().as_str(),
             resource_type,
             resource_id,
-            FtsRow::Drop,
         )
         .await
     }
@@ -3632,6 +3671,70 @@ const OPAQUE_ID_KEYS: [&str; 4] = ["id", "reference", "fullUrl", "versionId"];
 /// (`sqlite/search/fts.rs`). This narrows the *existing* divergence rather than
 /// creating one: PostgreSQL's `_content` remains a strict superset of
 /// SQLite's.
+///
+/// # An absolute `http(s)` URL is not text either
+///
+/// The UUID rule above removed the *entry tree* cost — the one-off keys that a
+/// GIN index pays a page split for. It did not remove the **tokeniser** cost,
+/// and that is where what is left of this write path lives: an earlier seat
+/// decomposed `INSERT INTO resource_fts` on this corpus and found **63% of the
+/// statement is `to_tsvector` running in the Postgres backend**, 24% GIN, 12%
+/// heap and unique index. The tokeniser is linear in input *bytes*, so the only
+/// lever on that 63% is fewer bytes.
+///
+/// A FHIR resource's bytes are not evenly split between prose and machinery. In
+/// the benchmark's nine crud seed resources, `_content` is 6,114 bytes, of which
+/// **2,899 (47%) are absolute `http(s)` URLs** — `system` values, profile
+/// canonicals, `CodeSystem` URLs. They are terminology addresses, not words, and
+/// Postgres's default parser is unusually expensive on them: it recognises
+/// `protocol`, `url`, `host` and `url_path` tokens, so one 54-byte system URL
+/// costs several tokens and several stemmer calls to produce lexemes nobody
+/// types into a `_content` query.
+///
+/// Measured on PostgreSQL 18.6 over exactly those nine resources, 2,000
+/// repetitions × 3 interleaved rounds, arms differing only in whether
+/// `http(s)`-prefixed strings are collected:
+///
+/// ```text
+/// arm                     us/resource   lexemes   tsvector bytes
+/// with URLs (before)         209.45         416          9,594
+/// without URLs (this)        119.07         307          4,972
+///                            -43.1%       -26.2%         -48.2%
+/// ```
+///
+/// All three columns matter and they hit different thirds of the statement:
+/// −43% of the tokeniser's 63%, −26% of the GIN's 24% (GIN cost is per entry),
+/// and −48% of the vector that the heap and the unique index have to carry.
+///
+/// The two right-hand columns are counts and are load-independent. The
+/// microseconds are not: the box was carrying another seat's release build at
+/// the time and every absolute figure on it is inflated by roughly 2-3x against
+/// the ~0.11 us/byte an earlier seat measured on a quiet one. What transfers is
+/// the **ratio**, which is what the arms were interleaved to isolate.
+///
+/// What can no longer be found: `_content=http://loinc.org`, i.e. asking the
+/// free-text index for a code system's *address*. `system` is still indexed
+/// exactly by every token parameter (`code=http://loinc.org|8302-2`,
+/// `code:in=…`), which is the machinery FHIR provides for that question and
+/// which answers it without stemming. The `Identifier.value`, the display, the
+/// `text` and the narrative that sit next to the URL are all untouched.
+///
+/// This is the *same* rule SQLite has always applied, so it removes a
+/// divergence: `_content` on the two backends now agrees about URLs. PostgreSQL
+/// still indexes `meta`, `extension` and `url`-keyed non-URL strings that SQLite
+/// drops, so it remains the superset.
+///
+/// # It needs no migration, and deliberately does not get one
+///
+/// `resource_fts` stores the vectors, not their input (`narrative_text` and
+/// `full_content` have been write-only since v25 and are left unbound), so no
+/// SQL migration can recompute a row: the extraction is Rust-side. Rows written
+/// before this change keep their URL lexemes. That direction is safe — a wider
+/// vector *over*-matches, so an old row answers `_content=http://loinc.org` and
+/// a new one does not, and no query that used to return a resource stops
+/// returning it for any other term. `$reindex` regenerates the rows for a
+/// deployment that wants them uniform. Bumping the schema version would not
+/// help, because there is nothing the migration could execute.
 fn collect_strings(value: &Value, key: Option<&str>, parts: &mut Vec<String>) {
     match value {
         Value::String(s) => {
@@ -3639,6 +3742,9 @@ fn collect_strings(value: &Value, key: Option<&str>, parts: &mut Vec<String>) {
                 return;
             }
             if key.is_some_and(|k| OPAQUE_ID_KEYS.contains(&k)) && contains_uuid(s) {
+                return;
+            }
+            if is_absolute_http_url(s) {
                 return;
             }
             parts.push(s.clone());
@@ -3658,6 +3764,22 @@ fn collect_strings(value: &Value, key: Option<&str>, parts: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// Whether `s` *is* an absolute `http` or `https` URL.
+///
+/// Prefix-anchored, not "contains": a sentence that mentions a link — a
+/// narrative, a `text` element, an `Identifier.value` that happens to embed one
+/// — is prose and stays in `_content`. Only a value whose entire content is the
+/// URL is dropped, which is the shape a `system`, a `profile` canonical or a
+/// `CodeSystem.url` takes.
+///
+/// `urn:` is deliberately *not* included even though `urn:oid:` and `urn:uuid:`
+/// systems are just as machine-shaped. It is only 80 bytes of the crud corpus's
+/// 6,114 (1.3%), SQLite does not drop it, and adding it would re-open the
+/// divergence this closes for no measurable gain.
+fn is_absolute_http_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://")
 }
 
 /// Whether `s` contains a canonical UUID: 8-4-4-4-12 hexadecimal digits.
@@ -3848,11 +3970,65 @@ mod fts_extraction_tests {
             "{}",
             content.full_content
         );
+        // The `system` URL next to the MRN is now dropped as well — see
+        // `is_absolute_http_url`. `identifier=http://hospital.example.org|<mrn>`
+        // still answers exactly for it; the MRN itself, above, stays in
+        // `_content`.
         assert!(
-            content.full_content.contains("http://hospital.example.org"),
+            !content.full_content.contains("http://hospital.example.org"),
             "{}",
             content.full_content
         );
+    }
+
+    #[test]
+    fn content_drops_whole_urls_but_keeps_prose_that_mentions_one() {
+        // The rule is prefix-anchored on purpose: a `system` or a profile
+        // canonical is a machine address and goes, but a narrative or a `text`
+        // that happens to quote a link is prose and stays. Dropping on
+        // "contains" would silently take the sentence with it.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Observation",
+            "meta": {"profile": ["http://hl7.org/fhir/StructureDefinition/vitalsigns"]},
+            "code": {
+                "coding": [{"system": "http://loinc.org", "code": "8302-2",
+                            "display": "Body Height"}],
+                "text": "Body Height"
+            },
+            "note": [{"text": "Method described at https://example.org/protocols/height"}]
+        }));
+
+        assert!(
+            !content.full_content.contains("http://loinc.org"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("StructureDefinition/vitalsigns"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            content
+                .full_content
+                .contains("Method described at https://example.org/protocols/height"),
+            "{}",
+            content.full_content
+        );
+        assert!(content.full_content.contains("Body Height"));
+        assert!(content.full_content.contains("8302-2"));
+    }
+
+    #[test]
+    fn urn_systems_are_still_indexed() {
+        // `urn:` is deliberately outside the rule; see `is_absolute_http_url`.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "urn:oid:2.16.840.1.113883.4.1", "value": "999-11-2222"}]
+        }));
+
+        assert!(content.full_content.contains("urn:oid:2.16.840.1.113883.4.1"));
+        assert!(content.full_content.contains("999-11-2222"));
     }
 
     #[test]

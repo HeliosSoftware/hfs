@@ -271,6 +271,59 @@ static INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// [`INSERT_SQL`] with the re-index `DELETE` folded in front of it.
+///
+/// A rewrite — `update`, `restore`, `$reindex` — has to clear the resource's
+/// existing rows before writing the new ones, and did that with a statement of
+/// its own:
+///
+/// ```text
+/// DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3
+/// INSERT INTO search_index (…) SELECT $1, $2, $3, * FROM unnest(…)
+/// ```
+///
+/// Two statements, two round trips, and **the same three parameters bound
+/// twice**. On run 33176893776's crud suite that `DELETE` ran 592,650 times for
+/// 384.6 s; half of those (296,325) are the update path's, and they are the ones
+/// that have an `INSERT` immediately behind them on the same connection. Per
+/// crud iteration it is one of ~15 statements, so folding it removes ~7% of the
+/// round trips the suite makes at Postgres.
+///
+/// The `DELETE` keeps doing the same work — it is the same index seek on
+/// `idx_search_resource` over the same rows — so what is saved is the fixed cost
+/// of a second statement: a bind, an executor start and stop, and a network
+/// round trip whose latency is paid at 300 VUs against a pool of 32.
+///
+/// The two halves cannot interfere. `search_index` has no unique constraint and
+/// no foreign key (v22/v23), and a data-modifying CTE and the outer statement
+/// see the *same* snapshot: the `INSERT` neither sees the deleted rows nor is
+/// blocked by them, and it is an append of new tuples either way. The ordering
+/// that mattered — old rows gone before the new ones are visible — is a property
+/// of the single statement's atomicity, which is stronger than what two
+/// statements without a transaction gave.
+///
+/// The parameter *numbers* are shared with [`INSERT_SQL`] by construction, so a
+/// caller binds the identical list for either text.
+static INSERT_SQL_REPLACE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH cleared AS (\
+             DELETE FROM search_index \
+             WHERE tenant_id = $1::text AND resource_type = $2::text AND resource_id = $3::text\
+         ) {}",
+        INSERT_SQL.as_str()
+    )
+});
+
+/// The clearing `DELETE` on its own, for a rewrite that has no rows to write.
+///
+/// [`INSERT_SQL_REPLACE`] carries the `DELETE` inside an `INSERT`, so it does
+/// nothing at all when there are no rows — and a rewrite whose extraction
+/// produced nothing is exactly the case where the old rows *must* still go, or
+/// the resource keeps matching values it no longer has. Rare (the extractor has
+/// to fail, which is logged) but not impossible, and silent if got wrong.
+const CLEAR_SQL: &str = "DELETE FROM search_index \
+                         WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3";
+
 /// The same statement, for rows belonging to *different* resources.
 ///
 /// [`INSERT_SQL`] binds `resource_type` and `resource_id` once per statement
@@ -561,6 +614,36 @@ impl PostgresSearchIndexWriter {
     }
 
     /// Flattens the values extracted from one `contained[]` entry into rows.
+    ///
+    /// [`Self::drop_resources_backed`] applies here too, and did not before.
+    /// `build_contained` (`search/query_builder.rs`) skips every parameter whose
+    /// name `starts_with('_')` outright, so a contained `_id` or `_lastUpdated`
+    /// row has no reader at all — not "answered from `resources`" as on the
+    /// plain path, but genuinely unreachable.
+    ///
+    /// The `_id` row is worse than merely unread: it is a byte-for-byte
+    /// restatement of a column the same row already carries. On the benchmark's
+    /// `ExplanationOfBenefit` seed, whose two `contained[]` entries are a
+    /// `ServiceRequest` with `id: "referral"` and a `Coverage` with
+    /// `id: "coverage"`:
+    ///
+    /// ```text
+    /// param_name | value_token_code | contained_type  | contained_local_id
+    /// _id        | referral         | ServiceRequest  | referral
+    /// _id        | coverage         | Coverage        | coverage
+    /// ```
+    ///
+    /// Each costs a heap tuple plus three index entries — `idx_search_resource`,
+    /// and both token indexes, whose predicate is `value_token_code IS NOT NULL`
+    /// and so admits them despite their NULL `last_updated`. Two of the 132 rows
+    /// the nine crud seed resources produce, i.e. **1.5% of the crud suite's
+    /// `search_index` write**, and they are the only `_`-prefixed rows the
+    /// corpus produces.
+    ///
+    /// Write-side only and one-directional, exactly as
+    /// [`PARAMS_ANSWERED_FROM_RESOURCES`] is: a database written by an older
+    /// build still holds the rows, nothing reads them, and both shapes answer
+    /// identically. No schema version, no migration.
     pub(crate) fn build_contained_rows(
         container: (&str, &str),
         contained: (&str, &str),
@@ -568,6 +651,7 @@ impl PostgresSearchIndexWriter {
     ) -> Vec<IndexRow> {
         values
             .iter()
+            .filter(|value| !answered_from_resources(&value.param_name))
             .filter_map(|value| IndexRow::from_contained(value, container, contained))
             .collect()
     }
@@ -617,7 +701,53 @@ impl PostgresSearchIndexWriter {
         resource_id: &str,
         rows: &[IndexRow],
     ) -> StorageResult<()> {
+        Self::write_rows(client, tenant_id, resource_type, resource_id, rows, false).await
+    }
+
+    /// [`Self::insert_rows`], but clearing whatever this resource already has.
+    ///
+    /// The `DELETE` rides inside the first statement ([`INSERT_SQL_REPLACE`])
+    /// rather than being one of its own. Only the *first* chunk carries it: a
+    /// resource whose rows exceed [`BATCH_ROWS`] must not have chunk 2 delete
+    /// what chunk 1 just wrote.
+    pub(crate) async fn replace_rows(
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        rows: &[IndexRow],
+    ) -> StorageResult<()> {
+        Self::write_rows(client, tenant_id, resource_type, resource_id, rows, true).await
+    }
+
+    async fn write_rows(
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        rows: &[IndexRow],
+        clear_first: bool,
+    ) -> StorageResult<()> {
+        if clear_first && rows.is_empty() {
+            // Nothing to fold the `DELETE` into, and it still has to happen.
+            execute_cached(
+                client,
+                CLEAR_SQL,
+                &[&tenant_id, &resource_type, &resource_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to clear search index rows: {}", e)))?;
+            return Ok(());
+        }
+
+        let mut first = true;
         for chunk in rows.chunks(BATCH_ROWS) {
+            let sql = if clear_first && first {
+                INSERT_SQL_REPLACE.as_str()
+            } else {
+                INSERT_SQL.as_str()
+            };
+            first = false;
             let chunk: Vec<&IndexRow> = chunk.iter().collect();
             let plan = insert_plan(&chunk);
             let mut param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -631,11 +761,9 @@ impl PostgresSearchIndexWriter {
                     .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)),
             );
 
-            execute_cached(client, INSERT_SQL.as_str(), &param_refs)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to insert search index rows: {}", e))
-                })?;
+            execute_cached(client, sql, &param_refs).await.map_err(|e| {
+                internal_error(format!("Failed to insert search index rows: {}", e))
+            })?;
         }
 
         Ok(())
@@ -1180,6 +1308,64 @@ mod tests {
         assert_eq!(plain.value_string, contained.value_string);
         assert_eq!(plain.value_string_folded, contained.value_string_folded);
         assert_eq!(plain.param_name, contained.param_name);
+    }
+
+    /// `build_contained` (`query_builder.rs`) skips every `_`-prefixed
+    /// parameter, so a contained `_id` row is not "answered elsewhere" — it is
+    /// unreachable. The plain path has dropped these since
+    /// `PARAMS_ANSWERED_FROM_RESOURCES`; the contained path did not, and wrote
+    /// two per `ExplanationOfBenefit` whose value duplicated
+    /// `contained_local_id` exactly.
+    #[test]
+    fn contained_rows_drop_the_parameters_answered_from_resources() {
+        let mut id_value = extracted(IndexValue::Token {
+            system: None,
+            code: "referral".to_string(),
+            display: None,
+            identifier_type_system: None,
+            identifier_type_code: None,
+        });
+        id_value.param_name = "_id".to_string();
+        let mut kept = extracted(IndexValue::String("Smith".to_string()));
+        kept.param_name = "family".to_string();
+
+        let rows = PostgresSearchIndexWriter::build_contained_rows(
+            ("ExplanationOfBenefit", "eob1"),
+            ("ServiceRequest", "referral"),
+            &[id_value, kept],
+        );
+
+        let names: Vec<&str> = rows.iter().map(|r| r.param_name.as_str()).collect();
+        assert_eq!(names, vec!["family"], "contained rows: {names:?}");
+    }
+
+    /// The re-index `DELETE` is folded into the insert, so the two texts have to
+    /// agree about parameter numbering: a caller binds one list and picks the
+    /// text. If the fold ever stopped being a pure prefix, the bind order would
+    /// drift silently and Postgres would accept whatever lined up by type.
+    #[test]
+    fn the_replacing_insert_is_the_plain_insert_behind_a_delete_cte() {
+        let plain = INSERT_SQL.as_str();
+        let replacing = INSERT_SQL_REPLACE.as_str();
+
+        assert!(
+            replacing.ends_with(plain),
+            "replacing form must be the plain INSERT verbatim: {replacing}"
+        );
+        assert!(replacing.starts_with("WITH cleared AS (DELETE FROM search_index "));
+        for placeholder in ["$1::text", "$2::text", "$3::text"] {
+            assert!(
+                replacing
+                    .split_once(plain)
+                    .expect("prefix")
+                    .0
+                    .contains(placeholder),
+                "the DELETE reuses the INSERT's own scalars: {replacing}"
+            );
+        }
+        // Nothing between $1..$3 and the value arrays: the DELETE introduces no
+        // parameter of its own, so `$4` is still the first array either way.
+        assert!(replacing.contains("$4::timestamptz[]"));
     }
 
     /// An unparseable date skips its row rather than being stored at ingestion
