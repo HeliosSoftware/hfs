@@ -62,6 +62,19 @@
   --divider-glint: #ffffff;
   /* Outline-only pills (version selector) */
   --outline: #e4e4e4;
+  /* Dialogs (#681): one scrim for every modal treatment (Edit Resource's
+     .modal__backdrop and the addbox--modal disclosures' summary-as-backdrop)
+     so a future change to the darken amount is a single edit. Black at 45%
+     is the value Edit Resource shipped with; re-declared (same value, for
+     now) under [data-theme="dark"] below as the point to retune it — flat
+     black reads differently over a dark page, but that tuning is out of
+     scope here. One shared z-index band keeps both parts of every dialog
+     above the rest of the page (sidebar, dropdown menus) without the
+     per-dialog 20/40/50/100 spread this replaces; .menu__panel dropdowns are
+     not dialogs and keep their own stacking. */
+  --scrim: rgb(0 0 0 / 45%);
+  --z-dialog-backdrop: 100;
+  --z-dialog-panel: 110;
   /* Chart */
   --grid-line: #dcdcdc;
   /* Series palette (#555): six distinguishable strokes, legible on both
@@ -122,6 +135,9 @@
   /* Theme-specific destructive pair: 7.6:1 on the card and 5.6:1 on soft. */
   --danger: #ff9a90;
   --danger-soft: #453534;
+  /* Same value as light for now (#681) — the point to adjust from if flat
+     black at 45% is later found to read too heavy/light over the dark bg. */
+  --scrim: rgb(0 0 0 / 45%);
   --divider: #000000;
   --divider-glint: rgb(255 255 255 / 12%);
   --outline: #353535;
@@ -1255,7 +1271,7 @@ button.pill {
   position: absolute;
   right: 0;
   top: 50px;
-  z-index: 20;
+  z-index: var(--z-dialog-panel);
   width: 340px;
   padding: 20px;
   background: var(--surface);
@@ -1280,6 +1296,27 @@ button.pill {
   font-weight: 500;
   color: var(--muted);
   margin-bottom: 6px;
+}
+
+/* Required-field marker (#680): the `required` attribute on the input is the
+   single source of truth, and this is the single point of flip. It reaches
+   every dialog field (present and future) without touching a template —
+   `.field` wraps `label > span.field__label + input.field__input`, and the
+   search builder's URL input has no visible label of its own, so its marker
+   lands on the query-builder tag chip instead. Empty alt text (the `/ ""`
+   in `content`) keeps this purely visual: assistive tech already announces
+   "required" from the input's `required` attribute, which stays in the
+   markup. To change the convention later (e.g. an `(optional)` suffix
+   instead of an accent asterisk on required fields), edit only this rule —
+   swap `:required` for `:optional` and change `content` — never the
+   templates. Child combinator (`> :required`) keeps bulk-import's
+   `fieldset.field` (which nests its own `label.field` fields) from matching
+   on a nested required input and marking the fieldset's legend instead. */
+.field:has(> :required) > .field__label::after,
+.query-builder__row:has(> .query-builder__url:required) > .query-builder__tag::after {
+  content: " *" / "";
+  color: var(--accent);
+  font-style: normal;
 }
 
 .field__input {
@@ -1336,6 +1373,17 @@ select.field__input {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
+}
+
+/* Add Tenant dialog's own submit-error slot (#681 adenda): sits below the
+   fields, above the action row (see #tenant-add-error in tenants.html and
+   partials/tenant_add_error.html). `.alert`'s own margin is bottom-only
+   (sized for a banner that precedes content, tenant_rows.html); scoped here
+   by id, not on `.alert` itself, so this does not add a gap under every
+   other alert use. The `.alert` selector, not the bare id, keeps the empty
+   (no-error) container from reserving this space. */
+#tenant-add-error.alert {
+  margin-top: 16px;
 }
 
 .spinner,
@@ -1399,14 +1447,14 @@ select.field__input {
 .addbox--modal[open] > summary.btn {
   position: fixed;
   inset: 0;
-  z-index: 40;
+  z-index: var(--z-dialog-backdrop);
   /* The summary doubles as the button (.btn/.btn--primary), whose fixed
      height would beat the inset stretch and shrink the backdrop to a bar
      across the top of the viewport. */
   height: auto;
   padding: 0;
   border: 0;
-  background: rgb(10 14 20 / 45%);
+  background: var(--scrim);
   border-radius: 0;
   cursor: default;
   /* The summary's label is a text node, which `> *` cannot hide. */
@@ -1422,7 +1470,7 @@ select.field__input {
   top: 50%;
   left: 50%;
   right: auto;
-  z-index: 50;
+  z-index: var(--z-dialog-panel);
   width: min(460px, calc(100vw - 40px));
   max-height: calc(100vh - 80px);
   overflow-y: auto;
@@ -4411,7 +4459,7 @@ details.json-fold[open] > summary .icon {
 .modal {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: var(--z-dialog-backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4421,7 +4469,7 @@ details.json-fold[open] > summary .icon {
 .modal__backdrop {
   position: absolute;
   inset: 0;
-  background: rgb(0 0 0 / 45%);
+  background: var(--scrim);
 }
 
 .modal__box {
@@ -4900,6 +4948,15 @@ details.json-fold[open] > summary .icon {
 .batch-drop:hover {
   border-color: var(--accent-strong);
   color: var(--text);
+}
+
+/* Spacing between the dropzone and its error banner (pre-existing gap,
+   fixed per user QA on #681): `.alert`'s own margin is bottom-only, sized
+   for a banner that precedes content elsewhere, so it leaves no gap above
+   `.batch-drop`. Scoped by id, not on `.alert` itself, to avoid affecting
+   any other `.alert` use on the page. */
+#batch-upload-error.alert {
+  margin-top: 16px;
 }
 
 .request-strip {

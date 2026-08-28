@@ -368,12 +368,19 @@ impl RestError {
     /// backend/driver/SQL detail — table and column names, connection strings,
     /// query fragments — never leaks; safe classes (not-found, conflict,
     /// validation, gone, …) keep their specific, actionable message.
+    ///
+    /// Wording duality: the messages returned here become the `diagnostics`
+    /// of the response's `OperationOutcome` and are shown to end users
+    /// verbatim (see `crates/ui/README.md` §"Error wording"), so — where a
+    /// variant has one — they intentionally differ in grammar from
+    /// [`fmt::Display`]'s `Label: value` form, which stays a terse,
+    /// technical string meant for logs and traces, not the UI.
     pub(crate) fn client_response(&self) -> (StatusCode, &'static str, String) {
         match self {
             RestError::NotFound { resource_type, id } => (
                 StatusCode::NOT_FOUND,
                 "not-found",
-                format!("Resource {}/{} not found", resource_type, id),
+                format!("Could not find the resource '{}/{}'.", resource_type, id),
             ),
             RestError::Gone { resource_type, id } => (
                 StatusCode::GONE,
@@ -388,7 +395,7 @@ impl RestError {
                 StatusCode::NOT_FOUND,
                 "not-found",
                 format!(
-                    "Version {} of {}/{} not found",
+                    "Could not find version '{}' of the resource '{}/{}'.",
                     version_id, resource_type, id
                 ),
             ),
@@ -402,7 +409,7 @@ impl RestError {
                 StatusCode::PRECONDITION_FAILED,
                 "multiple-matches",
                 format!(
-                    "Conditional {} matched {} resources, expected at most 1",
+                    "The conditional '{}' matched {} resources — expected at most one.",
                     operation, count
                 ),
             ),
@@ -412,7 +419,7 @@ impl RestError {
             RestError::UnsupportedMediaType { content_type } => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "not-supported",
-                format!("Content type '{}' is not supported", content_type),
+                format!("Content type '{}' is not supported.", content_type),
             ),
             RestError::PayloadTooLarge { message } => {
                 (StatusCode::PAYLOAD_TOO_LARGE, "too-long", message.clone())
@@ -477,7 +484,7 @@ impl RestError {
             RestError::NotImplemented { feature } => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",
-                format!("Feature '{}' is not implemented", feature),
+                format!("Feature '{}' is not implemented.", feature),
             ),
             RestError::NotSupported { feature } => {
                 (StatusCode::BAD_REQUEST, "not-supported", feature.clone())
@@ -499,7 +506,7 @@ impl RestError {
             RestError::InvalidParameter { param, message } => (
                 StatusCode::BAD_REQUEST,
                 "invalid",
-                format!("Invalid parameter '{}': {}", param, message),
+                format!("The parameter '{}' is invalid: {}.", param, message),
             ),
             RestError::MultiIssue { .. } => (
                 StatusCode::BAD_REQUEST,
@@ -787,7 +794,10 @@ impl From<ValidationError> for RestError {
             ValidationError::InvalidResource { message, .. } => RestError::BadRequest { message },
             ValidationError::InvalidSearchParameter { parameter, message } => {
                 RestError::BadRequest {
-                    message: format!("Invalid search parameter '{}': {}", parameter, message),
+                    message: format!(
+                        "The search parameter '{}' is invalid: {}.",
+                        parameter, message
+                    ),
                 }
             }
             ValidationError::UnsupportedResourceType { resource_type } => RestError::BadRequest {
@@ -797,7 +807,7 @@ impl From<ValidationError> for RestError {
                 message: format!("Missing required field: {}", field),
             },
             ValidationError::InvalidReference { reference, message } => RestError::BadRequest {
-                message: format!("Invalid reference '{}': {}", reference, message),
+                message: format!("The reference '{}' is invalid: {}.", reference, message),
             },
         }
     }
