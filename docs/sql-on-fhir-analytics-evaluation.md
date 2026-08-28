@@ -57,7 +57,8 @@ document is the evidence for that conclusion and the staged plan that follows fr
 - Server-side limits, enforced where the data lives: `HFS_SOF_SQLQUERY_MAX_ROWS` 100,000;
   max source rows per ViewDefinition 1,000,000; max dependent ViewDefinitions 16; SQL timeout 30 s
   (`crates/rest/src/config.rs:1113-1134,1247-1250`). Any BI surface should lean on these, not invent
-  browser-side duplicates.
+  browser-side duplicates. Note the row cap is a **silent truncation**, not an error
+  (`crates/sof/src/sqlquery/engine.rs:277`) — which is why aggregation must run server-side (§5 Stage 2).
 - Client-parse benchmark in-repo: Arrow IPC vs CSV for `$sql-run` consumption, ~114× faster to a usable
   DataFrame ([measured], `crates/sof/scripts/bench_arrow_client.py`). The interactive run→see loop is therefore
   cheap over Arrow.
@@ -140,11 +141,17 @@ mostly an extension of the run-preview and SQL Library that already exist. Serve
 runtime. *Maps to acceptance criteria 6, 7.*
 
 **Stage 2 — Visualization on a result.** Add to each cell: sort/filter, **group-by with count/sum/avg**, KPI /
-BigValue tiles, and bar/line/scatter charts — rendered native as SVG. For interactive pivoting/aggregation
-*without* re-querying the server, optionally vendor **DuckDB-WASM** (~8 MB gz [measured]) to re-aggregate the
-Arrow result in the browser, and **Perspective** or Arrow JS (51 KB gz) to read it. All MIT/Apache, all
-self-hostable, all pass the no-CDN guard [measured]. This is the bridge from notebook to BI. The component set
-and the "chart hint from the query" idea are copied from Evidence and Graphene (§7).
+BigValue tiles, and bar/line/scatter charts — rendered native as SVG. **Aggregation must run server-side** —
+computed as the SQLView's SQL, where every row lives — not in the browser over the returned rows: `$sql-run`
+**silently truncates** at `HFS_SOF_SQLQUERY_MAX_ROWS` (100,000) rather than erroring
+(`crates/sof/src/sqlquery/engine.rs:277`), so a browser-side `count/sum/avg` over a ViewDefinition whose flat
+output exceeds the cap would aggregate a truncated sample and chart a silently-wrong number (one row per
+observation/encounter across a real population is routinely millions). Client-side pivoting is therefore an
+optimization only for a result **known to fit under the cap**: within that bound, optionally vendor
+**DuckDB-WASM** (~8 MB gz [measured]) to re-pivot the Arrow result in the browser without re-querying, with
+**Perspective** or Arrow JS (51 KB gz) to read it — all MIT/Apache, all self-hostable, all pass the no-CDN guard
+[measured]. This is the bridge from notebook to BI; the component set and the "chart hint from the query" idea
+are copied from Evidence and Graphene (§7).
 
 **Stage 3 — Scale to BI.** Compose saved query+chart cells into **dashboards**; add a **semantic layer** — define
 a metric once, reuse it everywhere — with **row-level access** enforced through HFS's existing tenant/auth. This
@@ -281,8 +288,8 @@ HFS ui feature (Askama/HTMX, no inline scripts)          ← Stage 1: query note
 POST {base}/$sql-run?_format=json|arrow&_limit=N          ← auth + tenant + row/timeout limits (§2, §3)
       │
       ├── Stage 1  server renders the result table
-      ├── Stage 2  native SVG charts / group-by / KPIs; optional vendored DuckDB-WASM + Arrow JS
-      │            re-aggregate the Arrow result client-side (same-origin, no re-query)
+      ├── Stage 2  native SVG charts; group-by / KPIs computed server-side (SQLView SQL, all rows);
+      │            optional vendored DuckDB-WASM re-pivots a sub-cap result client-side (no re-query)
       ├── Stage 3  compose cells → dashboards; semantic layer + row-level access via tenant/auth
       └── Stage 4  large/advanced → $sql-export Parquet / Arrow-over-HTTP → companion service / external
 ```
