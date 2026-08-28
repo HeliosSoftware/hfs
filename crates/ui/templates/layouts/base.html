@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ i18n.t("app-title") }}{% endblock %}</title>
+  <link rel="icon" type="image/png" href="/ui/assets/logo.png">
   <link rel="stylesheet" href="/ui/assets/app.css">
   <!-- The effective tenant for browser-issued FHIR calls (#344). -->
   <meta name="hfs-tenant" content="{{ status.tenant_id() }}">

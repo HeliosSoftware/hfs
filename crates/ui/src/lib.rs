@@ -3619,6 +3619,7 @@ mod tests {
 
         assert!(html.contains("Helios FHIR Server"));
         assert!(html.contains("1.2.3"));
+        assert!(html.contains(r#"<link rel="icon" type="image/png" href="/ui/assets/logo.png">"#));
         assert!(html.contains("/ui/assets/htmx.min.js"));
         // No runtime CDN dependency.
         assert!(!html.contains("unpkg.com"));
