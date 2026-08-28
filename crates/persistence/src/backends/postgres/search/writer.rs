@@ -1,5 +1,155 @@
 //! PostgreSQL search index writer implementation.
+//!
+//! # Where `search_index` rows come from, and what each one costs
+//!
+//! `INSERT INTO search_index` is the largest statement in the benchmark on both
+//! write suites — **86% of import's Postgres execution time** and 4,906.5 s of
+//! crud's 10,935 s (45%). Its cost is arithmetic:
+//!
+//! ```text
+//! rows  x  indexes each row enters  x  cost per btree insert
+//! ```
+//!
+//! Earlier rounds attacked the second and third factors (partial predicates,
+//! index replacement, batching the wire form). This is a census of the first,
+//! plus a measured cost for the other two, so a future round can price a change
+//! before making it.
+//!
+//! ## The census
+//!
+//! Measured on a locally reproduced slice of the benchmark's Synthea corpus —
+//! `bulk_1k`, the two `*Information` seed bundles plus the first 40 patient
+//! bundles, imported through the ordinary transaction path into PostgreSQL 18.6
+//! at schema v34. **59,167 resources, 822,992 index rows, 13.91 rows per
+//! resource**, which is the same 13.9 the full 1,632,067-resource corpus
+//! reports, so the shape carries.
+//!
+//! By row kind:
+//!
+//! ```text
+//! kind        rows      share   indexes entered
+//! reference   289,225   35.1%   2   (resource, reference_pattern)
+//! token       274,654   33.4%   3   (resource, token_code, token_code_recent)
+//! date         75,068    9.1%   3   (resource, date, date_recent)
+//! composite    66,186    8.0%   5   (resource, token_code, token_code_recent, composite_*)
+//! uri          42,353    5.2%   2   (resource, uri)
+//! quantity     39,576    4.8%   4   (resource, quantity, quantity_recent, quantity_canonical)
+//! string       35,930    4.4%   4   (resource, string, string_folded_pattern, string_trgm)
+//! contained         0    0.0%
+//! ```
+//!
+//! By resource type (rows / share / rows per resource):
+//!
+//! ```text
+//! Observation      365,220  44.4%  15.5      Practitioner      19,251   2.3%  23.0
+//! DiagnosticReport  69,447   8.4%  13.5      Condition         18,682   2.3%  10.8
+//! EOB               64,999   7.9%  11.0      Organization      12,555   1.5%  15.0
+//! Provenance        56,058   6.8%  1401.5    Location          10,883   1.3%  13.0
+//! Claim             43,808   5.3%   7.4      PractitionerRole   9,207   1.1%  11.0
+//! DocumentReference 39,120   4.8%  16.0      Immunization       3,948   0.5%   6.0
+//! Procedure         34,925   4.2%   9.2      CarePlan           1,606   0.2%  13.4
+//! Encounter         34,734   4.2%  14.2      Patient            1,314   0.2%  32.9
+//! MedicationRequest 34,640   4.2%  10.0      (24 types in all)
+//! ```
+//!
+//! The ten largest single `(resource_type, param_name)` cells:
+//!
+//! ```text
+//! Provenance  target                   55,778  6.78%   1,394 per resource
+//! Observation combo-code               34,683  4.21%
+//! Observation code                     23,624  2.87%
+//! Observation patient                  23,586  2.87%
+//! Observation category                 23,586  2.87%
+//! Observation subject                  23,586  2.87%
+//! Observation encounter                23,586  2.87%
+//! Observation date                     23,586  2.87%
+//! Observation status                   23,586  2.87%
+//! Observation _profile                 20,188  2.45%
+//! ```
+//!
+//! ## What the census says
+//!
+//! Nearly all of it is load-bearing, and the reason is that this backend reads
+//! `search_index` by `param_name` string equality taken straight from the query
+//! string. Every row whose `param_name` a client can type is reachable by
+//! construction, so "unreachable rows" is a much smaller category than the
+//! `13.9` invites one to assume. The three things that are *not* load-bearing,
+//! all removed:
+//!
+//! - `_id` / `_lastUpdated`, restatements of `resources` columns — removed
+//!   earlier, see [`PARAMS_ANSWERED_FROM_RESOURCES`]; ~1.63M rows on the full
+//!   corpus, and none remain in the census above.
+//! - Rows a resource repeats verbatim — 8,265 rows, **1.00%**. See
+//!   [`dedup_rows`].
+//! - `phonetic`, which stored the same strings as `name` and matched them the
+//!   same way — 2,649 rows, **0.32%** here (Patient 138, Practitioner 1,674,
+//!   Organization 837), but 5 of the 132 rows the crud suite's nine seed
+//!   resources produce, i.e. **3.8% of that suite's index write**. See
+//!   `helios_fhir::search::loader::UNIMPLEMENTED_SPEC_PARAM_CODES`.
+//!
+//! Everything else in the table is a parameter a search can name. `combo-code`
+//! duplicates `code` for a component-less Observation and `patient` duplicates
+//! `subject` when the subject is a Patient, but each is separately queryable, so
+//! collapsing them is a read-path change (rewriting `combo-code=X` into a union
+//! over `code` and `component-code`), not a write-path one.
+//!
+//! ## What a row costs
+//!
+//! Measured on the same database, inserting 35,000 real rows of each kind into a
+//! copy of `search_index` carrying the exact v34 index set dumped from
+//! `pg_indexes`, five interleaved rounds, medians:
+//!
+//! ```text
+//! kind        indexed    heap-only   index-only   us/row   indexes   us/index
+//! uri          221.7 ms    31.6 ms     190.1 ms     5.43       2       2.72
+//! reference    229.0       31.2        197.8        5.65       2       2.83
+//! date         354.4       27.6        326.8        9.34       3       3.11
+//! token        376.8       32.3        344.5        9.84       3       3.28
+//! quantity     513.9       30.9        483.0       13.80       4       3.45
+//! string       530.7       28.5        502.2       14.35       4       3.59
+//! composite    767.9       34.7        733.2       20.95       5       4.19
+//! ```
+//!
+//! So: **~0.85 us of heap per row, and ~3.2 us per index entry**. The corpus mix
+//! above averages 2.85 index entries per row, predicting 10.0 us/row; a mixed
+//! 200,000-row sample measures 10.3. A removed row is worth its own kind's
+//! number, which is why a `string` row is worth 2.5 `reference` rows.
+//!
+//! ## The predicate floor is not a lever — measured
+//!
+//! `search_index` carries 18 indexes, 17 of them partial, so every inserted row
+//! evaluates 17 predicates it will usually fail. Inserting 200,000 rows whose
+//! value columns are all NULL — rows that enter `idx_search_resource` and
+//! nothing else — into three arms, five interleaved rounds, medians:
+//!
+//! ```text
+//! arm                                     total     delta      per row
+//! heap only (0 indexes)                   120.5 ms
+//! + idx_search_resource only              643.6 ms  +523.1 ms   2.62 us
+//! + the other 17 partial indexes          673.4 ms   +29.8 ms   0.15 us
+//! ```
+//!
+//! **0.15 us per row for all 17 predicates** — 8.8 ns each, and 1.5% of the
+//! 10.3 us a real row costs. Dropping an index to save its predicate evaluation
+//! is not worth doing; dropping one is worth doing only for the ~3.2 us of entry
+//! it charges the rows that actually enter it. That includes the two indexes
+//! whose expression is `COALESCE(value_string_folded, lower(value_string))`:
+//! `lower()` is strict, so a row with no string never calls it, and a row
+//! written by any build since v24 has `value_string_folded` populated and never
+//! reaches the second `COALESCE` arm.
+//!
+//! The one index every row enters, `idx_search_resource`, is therefore 2.62 of
+//! the 10.3 us — 25% of the whole statement, more than any other single index.
+//! It is not removable: it is the seek for the re-index `DELETE`
+//! (`INSERT_SQL_REPLACE`), `delete_search_index` and the purge paths, and no
+//! other index leads with `(tenant_id, resource_type, resource_id)`.
+//!
+//! All figures above are from a 4-core WSL2 box shared with other builds. The
+//! per-index and per-kind *ratios* are what transfer; the absolute microseconds
+//! are not, and a same-binary noise floor of ~13% has been measured on this
+//! statement elsewhere.
 
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
@@ -555,6 +705,211 @@ impl IndexRow {
     }
 }
 
+
+/// The identity of a `search_index` row, for the de-duplication in
+/// [`dedup_rows`].
+///
+/// Every column the table has, in borrowed form: the three that identify the
+/// resource (bound once per statement, so they are passed in rather than read
+/// off the row) plus all 28 of [`IndexRow`]'s. Two rows with equal keys are the
+/// same tuple, byte for byte, and Postgres would store both.
+///
+/// `f64` is not `Eq`/`Hash`, so the five float columns are keyed on their IEEE
+/// bit patterns. That is *stricter* than `==`: `0.0` and `-0.0` compare equal as
+/// floats but have different bits, and two NaNs compare unequal but may share
+/// bits. Stricter is the safe direction here — the only consequence is keeping a
+/// row that could have been dropped.
+#[derive(PartialEq, Eq, Hash)]
+struct RowKey<'a> {
+    resource_type: &'a str,
+    resource_id: &'a str,
+    last_updated: Option<&'a DateTime<Utc>>,
+    param_name: &'a str,
+    param_url: Option<&'a String>,
+    composite_group: Option<&'a i32>,
+    value_string: Option<&'a String>,
+    value_string_folded: Option<&'a String>,
+    value_token_system: Option<&'a String>,
+    value_token_code: Option<&'a String>,
+    value_token_display: Option<&'a String>,
+    value_token_system_2: Option<&'a String>,
+    value_token_code_2: Option<&'a String>,
+    value_date: Option<&'a DateTime<Utc>>,
+    value_date_precision: Option<&'a String>,
+    value_number: Option<u64>,
+    value_number_2: Option<u64>,
+    value_quantity_value: Option<u64>,
+    value_quantity_unit: Option<&'a String>,
+    value_quantity_system: Option<&'a String>,
+    value_quantity_canonical_value: Option<u64>,
+    value_quantity_canonical_unit: Option<&'a String>,
+    value_reference: Option<&'a String>,
+    value_reference_display: Option<&'a String>,
+    value_identifier_type_system: Option<&'a String>,
+    value_identifier_type_code: Option<&'a String>,
+    value_uri: Option<&'a String>,
+    is_contained: bool,
+    contained_type: Option<&'a String>,
+    contained_local_id: Option<&'a String>,
+}
+
+impl IndexRow {
+    /// This row's [`RowKey`], under the resource the statement will bind.
+    ///
+    /// The body destructures `IndexRow` with an exhaustive pattern and **no**
+    /// `..` rest. A column added to the row and not added here therefore fails
+    /// to compile, rather than silently dropping a row that differs only in the
+    /// new column — the same device [`insert_plan`]'s `column!` macro uses for
+    /// the bind order, and for the same reason: the failure it replaces is
+    /// silent and corrupts the index rather than erroring.
+    fn key<'a>(&'a self, resource_type: &'a str, resource_id: &'a str) -> RowKey<'a> {
+        let IndexRow {
+            last_updated,
+            param_name,
+            param_url,
+            composite_group,
+            value_string,
+            value_string_folded,
+            value_token_system,
+            value_token_code,
+            value_token_display,
+            value_token_system_2,
+            value_token_code_2,
+            value_date,
+            value_date_precision,
+            value_number,
+            value_number_2,
+            value_quantity_value,
+            value_quantity_unit,
+            value_quantity_system,
+            value_quantity_canonical_value,
+            value_quantity_canonical_unit,
+            value_reference,
+            value_reference_display,
+            value_identifier_type_system,
+            value_identifier_type_code,
+            value_uri,
+            is_contained,
+            contained_type,
+            contained_local_id,
+        } = self;
+
+        RowKey {
+            resource_type,
+            resource_id,
+            last_updated: last_updated.as_ref(),
+            param_name: param_name.as_str(),
+            param_url: param_url.as_ref(),
+            composite_group: composite_group.as_ref(),
+            value_string: value_string.as_ref(),
+            value_string_folded: value_string_folded.as_ref(),
+            value_token_system: value_token_system.as_ref(),
+            value_token_code: value_token_code.as_ref(),
+            value_token_display: value_token_display.as_ref(),
+            value_token_system_2: value_token_system_2.as_ref(),
+            value_token_code_2: value_token_code_2.as_ref(),
+            value_date: value_date.as_ref(),
+            value_date_precision: value_date_precision.as_ref(),
+            value_number: value_number.map(f64::to_bits),
+            value_number_2: value_number_2.map(f64::to_bits),
+            value_quantity_value: value_quantity_value.map(f64::to_bits),
+            value_quantity_unit: value_quantity_unit.as_ref(),
+            value_quantity_system: value_quantity_system.as_ref(),
+            value_quantity_canonical_value: value_quantity_canonical_value.map(f64::to_bits),
+            value_quantity_canonical_unit: value_quantity_canonical_unit.as_ref(),
+            value_reference: value_reference.as_ref(),
+            value_reference_display: value_reference_display.as_ref(),
+            value_identifier_type_system: value_identifier_type_system.as_ref(),
+            value_identifier_type_code: value_identifier_type_code.as_ref(),
+            value_uri: value_uri.as_ref(),
+            is_contained: *is_contained,
+            contained_type: contained_type.as_ref(),
+            contained_local_id: contained_local_id.as_ref(),
+        }
+    }
+}
+
+/// Drops rows that repeat a row already in the list, preserving order.
+///
+/// ## The rows this removes
+///
+/// One resource can extract the same value twice under the same parameter, and
+/// every one of those became its own `search_index` row. Measured on a 40-bundle
+/// slice of the benchmark's Synthea corpus (59,167 resources, 822,992 index
+/// rows, 13.91 rows per resource — the same ratio the full corpus shows),
+/// **8,265 rows, 1.00% of the table, are byte-for-byte repeats of a row the same
+/// resource already has**:
+///
+/// ```text
+/// resource_type      param_name               rows   repeats
+/// Observation        component-value-concept  8352      3060
+/// PractitionerRole   telecom                  3348      1674
+/// Practitioner       email                    1674       837
+/// Practitioner       telecom                  1674       837
+/// PractitionerRole   phone                    1674       837
+/// PractitionerRole   email                    1674       837
+/// Provenance         agent                      80        40
+/// Patient            phone                      80        40
+/// Patient            telecom                    80        40
+/// Patient            name / phonetic / given   365        51
+/// AllergyIntolerance severity                   28        11
+/// ```
+///
+/// They are not a bug in any one parameter. `Practitioner.telecom` is a `token`
+/// parameter over `ContactPoint`, and a Synthea practitioner carries the same
+/// address in two entries; `email` is `telecom.where(system='email')` over the
+/// same two. `Observation.component-value-concept` is
+/// `Observation.component.value as CodeableConcept`, and a panel whose
+/// components share an interpretation code repeats it once per component. FHIR
+/// has no rule against any of this — the resources are valid, and the second
+/// value is genuinely present in them.
+///
+/// ## Why removing them cannot change a search result
+///
+/// Because no reader of `search_index` on this backend counts rows. Every one of
+/// them is a set operation:
+///
+/// - `build_*_condition` (`search/query_builder.rs`) emits
+///   `id IN (SELECT resource_id FROM search_index WHERE …)` for every parameter
+///   type — a sublink whose result is a set. A second identical row cannot
+///   change whether `id` is in it.
+/// - `build_missing_condition` tests presence/absence of *any* row for the
+///   parameter. De-duplication never removes the last row of a group, so
+///   presence is preserved exactly.
+/// - The #279 composite fast path (`search_impl.rs`) is
+///   `SELECT DISTINCT resource_id, last_updated … ORDER BY … LIMIT n`. `DISTINCT`
+///   runs before `LIMIT`, so duplicates could never even consume its budget —
+///   they only cost it scan work.
+/// - `sort_expression` correlates `(SELECT MIN(col) …)` / `MAX`. Aggregates over
+///   a multiset with a repeated element give the same answer.
+/// - `ChainQueryBuilder` nests the same `IN (SELECT …)` sublinks at every depth.
+/// - `resolve_revincludes` is `SELECT DISTINCT` behind a `seen_ids` set;
+///   `resolve_includes` reads the resource JSON and never touches this table.
+///
+/// What does change is [`SearchIndexWriter::count_entries`] and the
+/// `$reindex` "entries" tally, which now report rows written rather than values
+/// visited. That is a reporting number, and the more accurate of the two.
+///
+/// ## Cost
+///
+/// One `HashSet` insert per row, against ~3.2 us of btree maintenance per index
+/// entry and 2.85 index entries per row (see the module docstring). The trade is
+/// deliberate: Postgres is the wall on both write suites and the HFS process is
+/// not. The rows removed here are mostly `token` and `string` — 9.8 and 14.4 us
+/// respectively, the expensive half of the table.
+fn dedup_rows<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a str, &'a IndexRow)>,
+) -> Vec<(&'a str, &'a str, &'a IndexRow)> {
+    let mut seen: HashSet<RowKey<'a>> = HashSet::new();
+    let mut kept = Vec::new();
+    for (resource_type, resource_id, row) in rows {
+        if seen.insert(row.key(resource_type, resource_id)) {
+            kept.push((resource_type, resource_id, row));
+        }
+    }
+    kept
+}
+
 /// PostgreSQL implementation of SearchIndexWriter.
 pub struct PostgresSearchIndexWriter;
 
@@ -739,15 +1094,19 @@ impl PostgresSearchIndexWriter {
             return Ok(());
         }
 
+        // One choke point for the de-duplication: every row this backend writes
+        // for a single resource passes through here. See [`dedup_rows`].
+        let kept = dedup_rows(rows.iter().map(|row| (resource_type, resource_id, row)));
+
         let mut first = true;
-        for chunk in rows.chunks(BATCH_ROWS) {
+        for chunk in kept.chunks(BATCH_ROWS) {
             let sql = if clear_first && first {
                 INSERT_SQL_REPLACE.as_str()
             } else {
                 INSERT_SQL.as_str()
             };
             first = false;
-            let chunk: Vec<&IndexRow> = chunk.iter().collect();
+            let chunk: Vec<&IndexRow> = chunk.iter().map(|(_, _, row)| *row).collect();
             let plan = insert_plan(&chunk);
             let mut param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
                 Vec::with_capacity(3 + plan.params.len());
@@ -799,6 +1158,12 @@ impl PostgresSearchIndexWriter {
                 flat.push((resource_type, resource_id, row));
             }
         }
+
+        // The other choke point. Here the key's `resource_type` / `resource_id`
+        // are load-bearing rather than constant: this flush carries several
+        // resources, and two of them may legitimately hold the identical value
+        // under the identical parameter. See [`dedup_rows`].
+        let flat = dedup_rows(flat);
 
         for chunk in flat.chunks(MULTI_BATCH_ROWS) {
             let rows: Vec<&IndexRow> = chunk.iter().map(|(_, _, row)| *row).collect();
@@ -942,6 +1307,142 @@ mod tests {
         assert!(
             INSERT_SQL_MULTI.contains("SELECT $1::text, * FROM unnest($2::text[], $3::text[],")
         );
+    }
+
+
+    /// A row that repeats one already in the list is dropped, and the survivors
+    /// keep their original order — the order the unbatched path appended in.
+    #[test]
+    fn an_identical_row_is_written_once() {
+        let row = |code: &str| IndexRow {
+            param_name: "code".to_string(),
+            value_token_code: Some(code.to_string()),
+            ..Default::default()
+        };
+        let rows = vec![row("a"), row("b"), row("a"), row("c"), row("b")];
+        let kept = dedup_rows(rows.iter().map(|r| ("Observation", "obs1", r)));
+        let codes: Vec<&str> = kept
+            .iter()
+            .map(|(_, _, r)| r.value_token_code.as_deref().unwrap())
+            .collect();
+        assert_eq!(codes, ["a", "b", "c"]);
+    }
+
+    /// The last row of a group is never removed, so `:missing` — which tests
+    /// presence of *any* row for the parameter — answers identically.
+    #[test]
+    fn a_repeated_value_still_leaves_one_row() {
+        let row = || IndexRow {
+            param_name: "telecom".to_string(),
+            value_token_code: Some("mailto:x@example.org".to_string()),
+            ..Default::default()
+        };
+        let rows = vec![row(), row(), row()];
+        let kept = dedup_rows(rows.iter().map(|r| ("Practitioner", "p1", r)));
+        assert_eq!(kept.len(), 1);
+    }
+
+    /// Two resources may legitimately hold the same value under the same
+    /// parameter. The multi-resource flush keys on the resource as well, so one
+    /// of them is not silently dropped — which would make the *other* resource
+    /// unfindable by that value.
+    #[test]
+    fn the_same_value_on_two_resources_is_kept_twice() {
+        let row = IndexRow {
+            param_name: "code".to_string(),
+            value_token_code: Some("8302-2".to_string()),
+            ..Default::default()
+        };
+        let kept = dedup_rows([
+            ("Observation", "obs1", &row),
+            ("Observation", "obs2", &row),
+            ("DiagnosticReport", "dr1", &row),
+        ]);
+        assert_eq!(kept.len(), 3);
+    }
+
+    /// Every column participates in the key. A pair of rows differing in
+    /// exactly one column is two rows, not one — including the columns a search
+    /// never reads (`param_url`, `value_reference_display`), because they are
+    /// still stored values and dropping one would change what is in the table.
+    ///
+    /// The key itself is built by destructuring `IndexRow` exhaustively, so a
+    /// new column that is not added to it fails to compile; this covers the
+    /// columns that exist today.
+    #[test]
+    fn every_column_distinguishes_two_rows() {
+        let base = IndexRow::default();
+        let mutators: Vec<(&str, fn(&mut IndexRow))> = vec![
+            ("last_updated", |r| r.last_updated = Some(Utc::now())),
+            ("param_name", |r| r.param_name = "x".into()),
+            ("param_url", |r| r.param_url = Some("u".into())),
+            ("composite_group", |r| r.composite_group = Some(1)),
+            ("value_string", |r| r.value_string = Some("s".into())),
+            ("value_string_folded", |r| {
+                r.value_string_folded = Some("s".into())
+            }),
+            ("value_token_system", |r| {
+                r.value_token_system = Some("s".into())
+            }),
+            ("value_token_code", |r| r.value_token_code = Some("c".into())),
+            ("value_token_display", |r| {
+                r.value_token_display = Some("d".into())
+            }),
+            ("value_token_system_2", |r| {
+                r.value_token_system_2 = Some("s".into())
+            }),
+            ("value_token_code_2", |r| {
+                r.value_token_code_2 = Some("c".into())
+            }),
+            ("value_date", |r| r.value_date = Some(Utc::now())),
+            ("value_date_precision", |r| {
+                r.value_date_precision = Some("day".into())
+            }),
+            ("value_number", |r| r.value_number = Some(1.0)),
+            ("value_number_2", |r| r.value_number_2 = Some(1.0)),
+            ("value_quantity_value", |r| {
+                r.value_quantity_value = Some(1.0)
+            }),
+            ("value_quantity_unit", |r| {
+                r.value_quantity_unit = Some("mg".into())
+            }),
+            ("value_quantity_system", |r| {
+                r.value_quantity_system = Some("ucum".into())
+            }),
+            ("value_quantity_canonical_value", |r| {
+                r.value_quantity_canonical_value = Some(1.0)
+            }),
+            ("value_quantity_canonical_unit", |r| {
+                r.value_quantity_canonical_unit = Some("g".into())
+            }),
+            ("value_reference", |r| r.value_reference = Some("P/1".into())),
+            ("value_reference_display", |r| {
+                r.value_reference_display = Some("d".into())
+            }),
+            ("value_identifier_type_system", |r| {
+                r.value_identifier_type_system = Some("s".into())
+            }),
+            ("value_identifier_type_code", |r| {
+                r.value_identifier_type_code = Some("MR".into())
+            }),
+            ("value_uri", |r| r.value_uri = Some("http://x".into())),
+            ("is_contained", |r| r.is_contained = true),
+            ("contained_type", |r| r.contained_type = Some("Coverage".into())),
+            ("contained_local_id", |r| {
+                r.contained_local_id = Some("cov".into())
+            }),
+        ];
+        assert_eq!(
+            mutators.len(),
+            insert_plan(&[]).columns.len(),
+            "one mutator per inserted column"
+        );
+        for (name, mutate) in mutators {
+            let mut other = IndexRow::default();
+            mutate(&mut other);
+            let kept = dedup_rows([("Patient", "p1", &base), ("Patient", "p1", &other)]);
+            assert_eq!(kept.len(), 2, "`{name}` must distinguish two rows");
+        }
     }
 
     /// The defect behind #494: a negative UTC offset was not recognised as a

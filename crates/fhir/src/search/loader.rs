@@ -56,6 +56,61 @@ pub struct SearchParameterLoader {
     fhir_version: FhirVersion,
 }
 
+/// Spec search parameters this server does not implement, and therefore does
+/// not load from the spec bundle.
+///
+/// ## `phonetic`
+///
+/// R4 defines four of them — `individual-phonetic` (Patient, Person,
+/// Practitioner, RelatedPerson), `Organization-phonetic`,
+/// `InsurancePlan-phonetic` — and every one is declared `type: string` over the
+/// *same* `X.name` element the plain `name` parameter already indexes. What
+/// makes them a distinct parameter is not the element they read but the
+/// matching: the spec's own description is "a portion of either family or given
+/// name **using some kind of phonetic matching algorithm**".
+///
+/// This server has no such algorithm. It ran the identical extraction as `name`
+/// and stored the identical raw strings, so `phonetic` was `name` under a second
+/// name: on a 40-bundle slice of the benchmark's Synthea corpus the two produce
+/// byte-for-byte equal rows, 2,649 of them (Patient 138, Practitioner 1,674,
+/// Organization 837 — `Organization.name`, a strict subset of that resource's
+/// `name`, which also indexes `alias`).
+///
+/// So `phonetic=Jon` did not match "John" and never could. It matched exactly
+/// what `name=Jon` matches, which means the parameter was **silently wrong**: a
+/// caller asking for fuzzy matching got an exact prefix match and no indication
+/// that they had.
+///
+/// Two honest fixes exist. Implementing Soundex or Metaphone would make the
+/// parameter correct, and it *adds* cost — an encoder per value, and the rows
+/// stay. Declaring it unimplemented removes both the cost and the wrongness, and
+/// that is what this does.
+///
+/// **Not loading it is what makes the removal safe.** Dropping only the index
+/// rows would leave the parameter in the registry, and `phonetic=Smith` would
+/// then return an empty bundle — a silent *under*-match, strictly worse than
+/// what it replaced. Removing the definition instead routes the query through
+/// the unknown-parameter path FHIR already specifies: under `Prefer:
+/// handling=strict` the server answers `400` naming the parameter, and under the
+/// default lenient handling it drops the parameter from the filter, omits it
+/// from the self link, and reports it as an `OperationOutcome` entry on the
+/// bundle (`handlers/search.rs`). Either way the caller is told. The
+/// CapabilityStatement is generated from the same registry, so the server also
+/// stops advertising a parameter it does not implement.
+///
+/// This applies to the **spec bundle only**. A `SearchParameter` resource POSTed
+/// to the server with `code: "phonetic"` is a deliberate, site-defined parameter
+/// with its own expression, and is loaded and indexed exactly as before.
+pub const UNIMPLEMENTED_SPEC_PARAM_CODES: [&str; 1] = ["phonetic"];
+
+/// Whether [`UNIMPLEMENTED_SPEC_PARAM_CODES`] covers this spec parameter.
+fn is_unimplemented_spec_param(resource: &Value) -> bool {
+    resource
+        .get("code")
+        .and_then(|c| c.as_str())
+        .is_some_and(|code| UNIMPLEMENTED_SPEC_PARAM_CODES.contains(&code))
+}
+
 impl SearchParameterLoader {
     /// Creates a new loader for the specified FHIR version.
     pub fn new(fhir_version: FhirVersion) -> Self {
@@ -121,6 +176,7 @@ impl SearchParameterLoader {
                 if let Some(resource) = entry.get("resource") {
                     if resource.get("resourceType").and_then(|t| t.as_str())
                         == Some("SearchParameter")
+                        && !is_unimplemented_spec_param(resource)
                     {
                         match self.parse_resource(resource) {
                             Ok(mut param) => {
@@ -187,6 +243,7 @@ impl SearchParameterLoader {
                 if let Some(resource) = entry.get("resource")
                     && resource.get("resourceType").and_then(|t| t.as_str())
                         == Some("SearchParameter")
+                    && !is_unimplemented_spec_param(resource)
                     && self.parse_resource(resource).is_ok()
                 {
                     resources.push(resource.clone());
@@ -772,6 +829,73 @@ mod tests {
             !has_patient_specific,
             "Minimal fallback should not have Patient-specific params"
         );
+    }
+
+
+    /// The spec bundle really is the source of the `phonetic` parameters, and
+    /// after the exclusion neither the registry nor the seeder sees one.
+    ///
+    /// Reads the checked-in bundle rather than a fixture, because what is being
+    /// asserted is a property of the shipped data: R4 declares four `phonetic`
+    /// parameters and their expressions are the same `X.name` the plain `name`
+    /// parameter reads. See [`UNIMPLEMENTED_SPEC_PARAM_CODES`].
+    #[test]
+    fn phonetic_is_not_loaded_from_the_spec_bundle() {
+        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .join("data");
+        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let Ok(params) = loader.load_from_spec_file(&data_dir) else {
+            // A minimal checkout without the bundle is a supported deployment.
+            return;
+        };
+        assert!(
+            params.len() > 1000,
+            "expected the full spec bundle, got {}",
+            params.len()
+        );
+        assert!(
+            !params.iter().any(|p| p.code == "phonetic"),
+            "`phonetic` must not reach the registry"
+        );
+        // The parameter it duplicated is untouched.
+        assert!(
+            params
+                .iter()
+                .any(|p| p.code == "name" && p.base.contains(&"Patient".to_string())),
+            "`Patient.name` must still be loaded"
+        );
+
+        // The seeding companion agrees, or storage would hold a SearchParameter
+        // resource the registry refuses — the divergence its docstring warns of.
+        let resources = loader.load_spec_resources(&data_dir).unwrap();
+        assert!(
+            !resources
+                .iter()
+                .any(|r| r.get("code").and_then(|c| c.as_str()) == Some("phonetic")),
+            "`phonetic` must not be seeded either"
+        );
+    }
+
+    /// A site that defines its own `phonetic` — with its own expression, and
+    /// presumably its own encoding — is not affected: the exclusion is scoped to
+    /// the spec bundle, and a POSTed parameter comes through `parse_resource`.
+    #[test]
+    fn a_custom_phonetic_parameter_still_parses() {
+        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let json = serde_json::json!({
+            "resourceType": "SearchParameter",
+            "url": "http://example.org/sp/soundex",
+            "code": "phonetic",
+            "type": "string",
+            "expression": "Patient.extension.where(url='http://example.org/soundex').value",
+            "base": ["Patient"],
+            "status": "active"
+        });
+        let param = loader.parse_resource(&json).unwrap();
+        assert_eq!(param.code, "phonetic");
     }
 
     #[test]
