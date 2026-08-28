@@ -102,6 +102,14 @@
   /* Destructive text clears 7:1 on the light card surface; the soft hover
      fill keeps 5.8:1 contrast with the same foreground. */
   --danger: #a61b12;
+  /* Positive / caution pairs, mirroring the danger pair: referenced by the
+     stored/member and warn tag variants and the progress track since the
+     SearchParameter viewer landed, but never defined - they rendered
+     transparent. */
+  --ok: #1e7d46;
+  --ok-soft: #e4f6ec;
+  --warn: #8a5a00;
+  --warn-soft: #fdf2dd;
   --danger-soft: #f0dfde;
   /* Menu panel input */
   --input-bg: #f5f5f5;
@@ -143,6 +151,10 @@
   --json-literal: #d2a8ff;
   /* Theme-specific destructive pair: 7.6:1 on the card and 5.6:1 on soft. */
   --danger: #ff9a90;
+  --ok: #7fd8a5;
+  --ok-soft: #14301f;
+  --warn: #e8c07a;
+  --warn-soft: #2f2410;
   --danger-soft: #453534;
   /* Same value as light for now (#681) — the point to adjust from if flat
      black at 45% is later found to read too heavy/light over the dark bg. */
@@ -1862,6 +1874,32 @@ select.field__input {
   margin-bottom: 20px;
 }
 
+.page-head--back-link {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "back-link ."
+    "copy action";
+  column-gap: 16px;
+  align-items: start;
+}
+
+.page-head--back-link > .back-link {
+  grid-area: back-link;
+  justify-self: start;
+}
+
+.page-head--back-link > .page-head__copy {
+  grid-area: copy;
+  min-width: 0;
+}
+
+.page-head--back-link > .page-head__action {
+  grid-area: action;
+  min-width: 0;
+  align-self: start;
+}
+
 .page-head__title {
   margin: 0 0 4px;
   font-size: 24px;
@@ -1877,6 +1915,11 @@ select.field__input {
 
 .back-link,
 .back-link:visited {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 24px;
+  font-size: 13px;
   color: var(--accent-text);
   text-decoration: none;
 }

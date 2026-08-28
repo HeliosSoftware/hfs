@@ -220,6 +220,135 @@ test("shared query-builder actions stay 30px while their inputs keep the field s
   }
 });
 
+test("shared back links match the Figma geometry on both consumers", async ({
+  page,
+  request,
+}) => {
+  const css = postcss.parse(await stylesheet(request));
+  let sourceRule:
+    | { selectors: string[]; declarations: Record<string, string> }
+    | undefined;
+  css.walkRules((rule) => {
+    if (!rule.selectors.includes(".back-link") || !rule.selectors.includes(".back-link:visited")) {
+      return;
+    }
+    const declarations: Record<string, string> = {};
+    rule.walkDecls((declaration) => {
+      declarations[declaration.prop] = declaration.value;
+    });
+    sourceRule = { selectors: rule.selectors, declarations };
+  });
+  expect(sourceRule?.selectors).toEqual(
+    expect.arrayContaining([".back-link", ".back-link:visited"]),
+  );
+  expect(sourceRule?.declarations).toMatchObject({
+    display: "inline-flex",
+    "align-items": "center",
+    gap: "7px",
+    "margin-bottom": "24px",
+    "font-size": "13px",
+    color: "var(--accent-text)",
+    "text-decoration": "none",
+  });
+  let headerRule: Record<string, string> | undefined;
+  css.walkRules((rule) => {
+    if (!rule.selectors.includes(".page-head--back-link")) return;
+    const declarations: Record<string, string> = {};
+    rule.walkDecls((declaration) => {
+      declarations[declaration.prop] = declaration.value;
+    });
+    headerRule = declarations;
+  });
+  expect(headerRule).toMatchObject({
+    display: "grid",
+    "grid-template-columns": "minmax(0, 1fr) auto",
+    "column-gap": "16px",
+    "align-items": "start",
+  });
+  expect(headerRule?.["grid-template-areas"]).toContain('"back-link ."');
+  expect(headerRule?.["grid-template-areas"]).toContain('"copy action"');
+
+  const consumers = [
+    { name: "bulk import detail", route: await seedBulkImportDetail(request) },
+    { name: "active bulk exports", route: "/ui/bulk-export/active" },
+  ];
+  for (const theme of ["light", "dark"] as const) {
+    await page.goto("/ui");
+    await page.evaluate((selected) => localStorage.setItem("hfs-theme", selected), theme);
+    for (const viewport of [
+      { name: "wide", width: 1440, height: 900 },
+      { name: "narrow", width: 390, height: 844 },
+    ] as const) {
+      await page.setViewportSize(viewport);
+      for (const consumer of consumers) {
+        await page.goto(consumer.route, { waitUntil: "networkidle" });
+        await expect(page.locator("html"), `${consumer.name} should use ${theme} theme`).toHaveAttribute(
+          "data-theme",
+          theme,
+        );
+
+        const link = page.locator("a.back-link");
+        const icon = link.locator("svg");
+        const label = link.locator(":scope > span").last();
+        const title = page.locator(".page-head__title");
+        const action = page.locator(".page-head--back-link > .page-head__action");
+        const actionControl = action.locator(
+          ":scope > a.btn, :scope > details > summary.btn",
+        );
+        await expect(action).toHaveCount(1);
+        await expect(actionControl).toHaveCount(1);
+        await expect(actionControl).toBeVisible();
+        // Grid items are blockified, so the authored inline-flex computes to
+        // flex here. The source-rule assertion above guards the shared value.
+        await expect(link).toHaveCSS("display", "flex");
+        await expect(link).toHaveCSS("font-size", "13px");
+        await expect(link).toHaveCSS("gap", "7px");
+        await expect(link).toHaveCSS("margin-bottom", "24px");
+        await expect(icon).toHaveAttribute("width", "5");
+        await expect(icon).toHaveAttribute("height", "8");
+
+        const [linkBox, iconBox, labelBox, titleBox, actionBox] = await Promise.all([
+          link.boundingBox(),
+          icon.boundingBox(),
+          label.boundingBox(),
+          title.boundingBox(),
+          action.boundingBox(),
+        ]);
+        expect(linkBox).not.toBeNull();
+        expect(iconBox).not.toBeNull();
+        expect(labelBox).not.toBeNull();
+        expect(titleBox).not.toBeNull();
+        expect(actionBox).not.toBeNull();
+        expect(Math.abs(labelBox!.x - (iconBox!.x + iconBox!.width) - 7)).toBeLessThanOrEqual(1);
+        expect(Math.abs(titleBox!.y - (linkBox!.y + linkBox!.height) - 24)).toBeLessThanOrEqual(1);
+        expect(actionBox!.y).toBeGreaterThan(linkBox!.y + linkBox!.height);
+        expect(Math.abs(actionBox!.y - titleBox!.y)).toBeLessThanOrEqual(1);
+
+        const normal = await link.evaluate((element) => {
+          const style = getComputedStyle(element);
+          return { color: style.color, decoration: style.textDecorationLine };
+        });
+        expect(normal.decoration).toBe("none");
+        await link.hover();
+        await expect(link).toHaveCSS("color", normal.color);
+        await expect(link).toHaveCSS("text-decoration-line", /underline/);
+        await link.focus();
+        await expect(link).toHaveCSS("outline-style", "solid");
+        await expect(link).toHaveCSS("outline-width", "2px");
+        await expect(link).toHaveCSS("outline-color", normal.color);
+
+        if (viewport.name === "narrow") {
+          expect(
+            await page.evaluate(
+              () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+            ),
+          ).toBe(true);
+        }
+      }
+    }
+  }
+});
+
 test("icon-only action shapes compute to the shared 30px square", async ({ page }) => {
   await page.goto("/ui");
   const metrics = await page.evaluate(() => {

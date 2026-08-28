@@ -179,7 +179,47 @@ async fn the_active_exports_page_uses_the_shared_back_link() {
     let (base, _) = serve().await;
     let (status, html) = get_text(&base, "/ui/bulk-export/active").await;
     assert_eq!(status, 200);
-    assert!(html.contains(r#"<a class="back-link" href="/ui/bulk-export">"#));
+
+    let assert_back_link =
+        |localized_html: &str, label: &str| {
+            let marker = r#"<a class="back-link" href="/ui/bulk-export">"#;
+            let start = localized_html.find(marker).expect("shared back link");
+            let end = start
+                + localized_html[start..]
+                    .find("</a>")
+                    .expect("back link closing tag")
+                + "</a>".len();
+            let back_link = &localized_html[start..end];
+
+            assert!(back_link.contains(
+                r#"<span aria-hidden="true"><svg width="5" height="8" viewBox="0 0 5 8""#
+            ));
+            assert!(back_link.contains(&format!("<span>{label}</span>")));
+            assert_eq!(back_link.matches("<span").count(), 2);
+            assert!(
+                !back_link.contains('‹'),
+                "spacing must come from CSS, not the former literal chevron and space"
+            );
+        };
+    assert_back_link(&html, "Bulk Export");
+    let header_start = html
+        .find(r#"<header class="page-head page-head--back-link">"#)
+        .expect("shared back-link header");
+    let header_end = header_start
+        + html[header_start..]
+            .find("</header>")
+            .expect("page header closing tag");
+    let header = &html[header_start..header_end];
+    let back_link_position = header.find(r#"class="back-link""#).unwrap();
+    let copy_position = header.find(r#"class="page-head__copy""#).unwrap();
+    let action_position = header.find(r#"class="page-head__action""#).unwrap();
+    assert!(back_link_position < copy_position && copy_position < action_position);
+    for (lang, label) in [("es", "Exportación masiva"), ("de", "Massenexport")] {
+        let (status, localized_html) =
+            get_text(&base, &format!("/ui/bulk-export/active?lang={lang}")).await;
+        assert_eq!(status, 200);
+        assert_back_link(&localized_html, label);
+    }
 }
 
 #[tokio::test]
