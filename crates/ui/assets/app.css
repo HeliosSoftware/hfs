@@ -5119,6 +5119,162 @@ details.json-fold[open] > summary .icon {
   gap: 8px;
   align-items: center;
 }
+
+/* ---- Bulk Export against the Figma frame (#735) ---------------------- */
+
+.bulk-export-form__name {
+  max-width: 420px;
+}
+
+/* A small standalone section heading between cards. */
+.form-legend {
+  margin: 4px 2px -8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+/* The app's radio-group treatment: one selectable card per choice. */
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+}
+
+.choice-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.choice-card:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.choice-card:has(input:focus-visible) {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.choice-card input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.choice-card__title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.choice-card__hint {
+  margin-left: 26px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* Uppercase-labelled filter fields side by side. */
+.field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+.field-row .field__label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ---- Active Exports job cards (#735) --------------------------------- */
+
+.job-card {
+  padding: 14px;
+}
+
+.job-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.job-card__name {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.job-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.progress {
+  height: 8px;
+  margin: 12px 0 10px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  overflow: hidden;
+}
+
+.progress__bar {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.progress--complete .progress__bar {
+  background: var(--ok);
+}
+
+.progress--failed .progress__bar,
+.progress--cancelled .progress__bar {
+  background: var(--danger);
+}
+
+.job-card__meta {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.job-card__files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.job-card__files a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.job-card__files a:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
 }
 
 @layer pages {
