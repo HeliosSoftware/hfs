@@ -192,6 +192,18 @@ impl SearchProvider for PostgresBackend {
         let (sql, has_previous) = if let Some(pred) = &fast_index_pred {
             // `keyset` is always `Some` here: the fast path requires the default
             // sort, which yields the `last_updated` keyset.
+            //
+            // `resource_id` is the tie-break, and it is not free to change. This
+            // statement serves page 1 only; page 2 is the keyset branch below,
+            // which breaks `last_updated` ties on `resources.id` because that is
+            // what the cursor carries (`PageCursor::resource_id`). The two agree
+            // only because `search_index.resource_id` *is* `resources.id`. Order
+            // this by anything else — a `bigint` surrogate is the standing
+            // proposal — and a page boundary that falls inside a group of tied
+            // `last_updated` values drops the rows the other statement would
+            // have ordered differently: five tied resources at `_count=2` return
+            // three of five, one of them twice. Measured, with both statements
+            // run verbatim; see the module header of `schema.rs`.
             let sql = format!(
                 "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
                         r.last_updated AS sort_key \

@@ -1,4 +1,303 @@
 //! PostgreSQL schema definitions and migrations.
+//!
+//! # The `search_index.resource_id` -> `bigint` surrogate: costed, and not done
+//!
+//! `search_index.resource_id` is TEXT holding a 36-character logical FHIR id,
+//! repeated in every one of ~22.6M rows and in every entry of the nine v34
+//! indexes that carry it. Three separate rounds converged on replacing it with a
+//! `bigint` surrogate on `resources` — from footprint, from write cost, and from
+//! the #279 fast path's join — and `migrate_v29_to_v30` deferred it for scope.
+//! This block is the round that costed it properly. **It is still not done, and
+//! the reason is no longer scope: two of the call sites cannot be made to fail
+//! loudly, and one of them is a paging defect that loses rows.** Everything
+//! below is measured, so the next round can act on evidence rather than redo it.
+//!
+//! All measurements are on PostgreSQL 18.6, `C.UTF-8` locale with the `c`
+//! provider (so TEXT comparison is `memcmp`, which *understates* the surrogate's
+//! advantage on any deployment using an ICU or glibc collation), against a
+//! synthetic replica of the benchmark corpus: 1,630,000 resources and
+//! **22,599,950 `search_index` rows** in the row-kind proportions of the census
+//! in `search/writer.rs` (reference 35.1%, token 33.4%, date 9.1%, composite
+//! 8.0%, uri 5.2%, quantity 4.8%, string 4.4%). Index definitions were dumped
+//! from `pg_indexes` on a database driven through the whole v1 -> v34 chain, not
+//! copied from `create_indexes` — see TRAP 15 below.
+//!
+//! ## Footprint — measured, both arms, same rows
+//!
+//! Each index built twice, once with `resource_id` and once with a `bigint`
+//! `resource_key` in the identical position, on the identical 22.6M rows:
+//!
+//! ```text
+//! index                              TEXT      BIGINT     delta
+//! idx_search_token_code            1424.1 MB  1154.3 MB  -18.9%
+//! idx_search_token_code_recent     1436.8     1142.5     -20.5%
+//! idx_search_quantity_recent        259.0      189.4     -26.9%
+//! idx_search_quantity               249.6      189.6     -24.0%
+//! idx_search_date_recent            225.2      153.0     -32.1%
+//! idx_search_date                   224.5      152.9     -31.9%
+//! idx_search_composite_token_token  181.4      153.1     -15.6%
+//! idx_search_composite_token_qty    164.3      132.0     -19.6%
+//!                                  -------    -------
+//! subtotal (8)                     4164.9     3266.8    -898.1 MB (-21.6%)
+//!
+//! idx_search_resource               280.8      185.9    -33.8%   (bare `(resource_key)`)
+//!                                              230.6    -17.9%   (`(tenant_id, resource_type, resource_key)`)
+//!
+//! nine-index total                 4445.7     3452.7    -993.0 MB (-22.3%)
+//! ```
+//!
+//! And the heap, same 22.6M rows, the two columns being the only difference:
+//!
+//! ```text
+//! heap with TEXT resource_id       3540 MB
+//! heap with BIGINT resource_key    2998 MB    -542 MB  (-15.3%)
+//! ```
+//!
+//! So **-1,535 MB of the ~7,986 MB these two objects occupy here, -19.2%**.
+//!
+//! Two corrections to the estimate in `migrate_v29_to_v30`, which put the prize
+//! at "~2.1 GB of index plus ~530 MB of heap":
+//!
+//! * Its list of ten indexes carrying `resource_id` includes
+//!   `idx_search_string_folded_pattern` (495 MB). **At v34 that index does not
+//!   carry `resource_id`** — v33 rebuilt it as `(tenant_id, resource_type,
+//!   param_name, COALESCE(value_string_folded, lower(value_string))
+//!   text_pattern_ops)` with no `INCLUDE`. The list is nine indexes and ~8,008
+//!   MB, not ten and 8,503 MB. This is TRAP 15 in its usual costume: the shape
+//!   was taken from an earlier definition rather than from the catalog.
+//! * The saving is **-22.3%**, not the ~25% extrapolated from two token indexes.
+//!   Applied to the live 8,008 MB that is ~1.79 GB of index, not 2.1 GB. The
+//!   heap number was right: -542 MB measured against ~530 MB predicted.
+//!
+//! The absolute megabytes above are *fresh builds*. The benchmark's indexes are
+//! grown incrementally and are correspondingly larger; the ratio is what
+//! transfers, which is why it is the ratio that is quoted.
+//!
+//! ## Write cost — measured
+//!
+//! `idx_search_resource` is the one index every row enters and, at 2.62 us of a
+//! 10.3 us row, the largest single component of `INSERT INTO search_index` —
+//! itself 45% of the crud suite's and 86% of import's Postgres time. Narrowing
+//! its key is the only thing that can make it cheaper. 200,000 real rows per
+//! arm, five interleaved rounds, a no-index control arm to normalise drift,
+//! medians:
+//!
+//! ```text
+//! arm                                       total     index delta    per row
+//! heap only (control)                       139 ms
+//! + (tenant_id, resource_type, resource_id) 583 ms     444 ms         2.22 us
+//! + (resource_key)                          298 ms     159 ms         0.80 us
+//! ```
+//!
+//! **-64% on the index's own cost, -1.42 us per row.** The control arm spans
+//! 137-142 ms across the five rounds (3.6%), so this is far outside the ~13%
+//! same-binary noise floor measured on this statement elsewhere. It also
+//! cross-validates the earlier 2.62 us on a different box (2.22 us here).
+//! Against the 10.3 us a mixed row costs, 1.42 us is ~14% of the whole
+//! statement, i.e. ~6% of the crud suite's and ~12% of import's Postgres time.
+//! The build times say the same thing from another direction: the same 22.6M
+//! entries take 18,905 ms to sort and pack as a TEXT triple and 2,852 ms as a
+//! bare `bigint`.
+//!
+//! ## Why it is not here: two call sites that cannot be made to fail loudly
+//!
+//! The gate on doing this at all is that a missed call site must not return a
+//! wrong answer. `search_index.resource_id` is never a Rust value on the read
+//! path — it is a column name inside `format!` literals in `query_builder.rs`,
+//! `chain_builder.rs`, `search_impl.rs` and `sof/postgres.rs` — so **no Rust
+//! newtype can turn a missed site into a compile error.** The strongest property
+//! available is fail-loud at first execution, obtained by *dropping* the TEXT
+//! column rather than keeping it beside the surrogate. Verified against a real
+//! server:
+//!
+//! ```text
+//! SELECT id FROM res WHERE id IN (SELECT resource_id FROM si …)
+//!   ERROR: column "resource_id" does not exist                     (42703)
+//! SELECT id FROM res WHERE id IN (SELECT resource_key FROM si …)
+//!   ERROR: operator does not exist: text = bigint                  (42883)
+//! ```
+//!
+//! That covers 16 of the 19 read constructs. It does not cover these three,
+//! which is the reason this migration is not in this release.
+//!
+//! ### 1. The paging tie-break — demonstrated to lose rows
+//!
+//! The #279 fast path resolves page 1 from `search_index` alone
+//! (`search_impl.rs`):
+//!
+//! ```text
+//! SELECT DISTINCT resource_id, last_updated FROM search_index
+//! WHERE … ORDER BY last_updated DESC, resource_id ASC LIMIT n+1
+//! ```
+//!
+//! Page 2 is a different statement — the keyset path — and breaks `last_updated`
+//! ties on `resources.id`, because that is what the cursor carries
+//! (`PageCursor::resource_id: String`, `types/pagination.rs`):
+//!
+//! ```text
+//! AND (last_updated < $3 OR (last_updated = $3 AND id > $4))
+//! ORDER BY last_updated DESC, id ASC
+//! ```
+//!
+//! The two agree today only because `search_index.resource_id` *is*
+//! `resources.id`. Put a surrogate in the fast path's `ORDER BY` — which is the
+//! whole point, since it is the trailing key column of six of the nine indexes —
+//! and they stop agreeing. Five resources sharing one `last_updated` (an
+//! ordinary transaction bundle: `Utc::now()` is per resource, but Postgres
+//! stores microseconds), `_count=2`, both statements run verbatim:
+//!
+//! ```text
+//! today          page 1: a-eeee, b-dddd      page 2: c-cccc, d-bbbb   (all 5, in order)
+//! with surrogate page 1: e-aaaa, d-bbbb      page 2: e-aaaa           (1 row)
+//! ```
+//!
+//! Three of the five resources are never returned and one is returned twice.
+//! This is not a hazard to be careful about; it is what the change does unless
+//! the cursor is migrated to carry the surrogate too — which changes a
+//! serialized wire format shared with the other backends and invalidates every
+//! cursor in flight across the upgrade. That is a decision for the council, not
+//! something to fold into a perf commit.
+//!
+//! ### 2. `text || bigint` is legal, so the concatenation sites fail silently
+//!
+//! Three sites build a FHIR reference string out of the column and compare it to
+//! `value_reference`: `build_reference_identifier_condition`
+//! (`idx.resource_type || '/' || idx.resource_id`) and two links of the forward
+//! chain builder. Postgres accepts `text || bigint` and returns `text`:
+//!
+//! ```text
+//! resource_type || '/' || resource_id   ->  Observation/a1b2c3d4-0000-…-0001
+//! resource_type || '/' || resource_key  ->  Observation/4711        (no error)
+//! ```
+//!
+//! A missed rename here produces a well-formed reference that matches nothing,
+//! so `_has`, forward chaining and `:identifier` return an **empty bundle**
+//! rather than an error. Under a surrogate these three sites need a join back to
+//! `resources` to recover the logical id — which is extra work inside the
+//! innermost subquery of the most expensive shape the backend has, and needs its
+//! own plan review before anyone claims it is free.
+//!
+//! ### 3. `single_index_predicate` is a byte-exact prefix match
+//!
+//! `INDEX_MEMBERSHIP_PREFIX` is the literal text
+//! `"id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND
+//! resource_type = $2 AND "`, and `single_index_predicate` recognises a
+//! fast-path-eligible filter by `strip_prefix` on it. It must stay byte-identical
+//! to seventeen separate `format!` strings. A mismatch is silent and *correct* —
+//! the fast path simply disengages — so it costs performance, not rows; but the
+//! fast path is the thing this change exists to make cheaper, so a silent
+//! disengagement would hide the entire benefit behind a regression.
+//!
+//! Note also `build_fts_condition`, which emits
+//! `id IN (SELECT resource_id FROM resource_fts …)` — the same shape over a
+//! *different* table whose `resource_id` stays TEXT. Any mechanical rewrite must
+//! discriminate on the table name, not on the column name.
+//!
+//! ## The call-site inventory
+//!
+//! Nineteen read constructs, thirteen writes/deletes, nine index definitions.
+//! Reads: the compartment sublink and `build_contained`'s standalone
+//! `SELECT resource_type, resource_id, contained_local_id … GROUP BY` (the only
+//! `row.get` of the column in the backend — consumed as a logical id and fed
+//! straight to `read()`); `INDEX_MEMBERSHIP_PREFIX`; `sort_expression`'s
+//! correlated `si.resource_id = resources.id` (which reaches a statement up to
+//! four times, via the SELECT list, the ORDER BY, and both keyset comparisons);
+//! `:missing` in both polarities; four string forms; two token forms;
+//! `:of-type`; both composite layouts; date, number, quantity; the
+//! `:identifier` self-join; reference; four uri forms; the #279 fast path;
+//! `resolve_revincludes`' `INNER JOIN … r.id = si.resource_id`; three forward
+//! chain links and three reverse `_has` links; and
+//! `sof/postgres.rs`'s compartment `EXISTS (… si.resource_id = r.id)`, which is
+//! **absent from the checklist in `migrate_v29_to_v30`**.
+//!
+//! Two of those deserve separate mention because they are not in that checklist
+//! either and are fast-path-eligible, so they are the shapes most likely to be
+//! measured and least likely to be tested: `build_compartment_condition`
+//! (`GET /Patient/123/Observation`) and `:missing=false`.
+//!
+//! On the write side the surrogate has to reach the writer before it can insert,
+//! and the paths differ in how hard that is. `flush_pending` is nearly free — it
+//! already runs `query_cached` over `INSERT_RESOURCES_SQL` and parses
+//! `(resource_type, id)` per returned row, so the surrogate is one more column,
+//! though `ON CONFLICT DO NOTHING` makes the result a subset that has to be
+//! joined back by logical key. `storage.rs::create` is the awkward one: its
+//! `RETURNING` is consumed by the nested `resource_history` insert and never
+//! reaches Rust at all (`execute_cached` returns a count, and `inserted == 0` is
+//! the AlreadyExists signal), so it must become a `query` and grow a conflict
+//! path that returns no row. `restore_deleted`, `transaction.rs::update` and the
+//! reindex path have no surrogate available at all: the first two have no
+//! `RETURNING`, and `write_search_entries` works from a `StoredResource` that
+//! would have to carry the key through `fetch_resources_page`.
+//!
+//! Deletes key on the triple at seven sites (`CLEAR_SQL`, the `cleared` CTE in
+//! `INSERT_SQL_REPLACE`, the FHIR delete, `delete_search_index`, the instance
+//! purge, and the transaction-path replace); `purge_all` and the two tenant-wide
+//! clears key on prefixes and are unaffected.
+//!
+//! Do not name the new column `id`. `search_index` had an `id BIGSERIAL PRIMARY
+//! KEY` until v22 dropped it, and every `id IN (SELECT …)` sublink in
+//! `query_builder.rs` relies on the bare `id` resolving to `resources`.
+//!
+//! ## Migration cost on a real 22.6M-row table
+//!
+//! The catalog change is free and the data change is not. `ADD COLUMN … bigint`
+//! with no default is catalog-only. The backfill is an `UPDATE` of every row,
+//! which writes 22.6M new heap tuples, re-enters each of them into every index
+//! it belongs to, and leaves 22.6M dead tuples behind:
+//!
+//! ```text
+//! ALTER TABLE … ADD COLUMN backfill_key bigint            8 ms
+//! UPDATE … SET backfill_key = r.resource_key FROM …  1,200,590 ms  (20 min 1 s)
+//! ALTER TABLE … SET NOT NULL                            17,266 ms
+//! VACUUM FULL search_index                             153,427 ms  (2 min 33 s)
+//!                                                    ------------
+//! total                                              1,371,291 ms  (22 min 51 s)
+//!
+//! heap     3,769 MB -> 7,708 MB during the UPDATE -> 3,945 MB after
+//! indexes  5,297 MB ->  11.0 GB during the UPDATE -> 5,297 MB after
+//! dead tuples left behind: 22,599,950
+//! ```
+//!
+//! Then the nine index rebuilds, which with `maintenance_work_mem = 4GB` and
+//! four parallel workers total a further **46.3 s**. So ~24 minutes end to end
+//! — on sixteen cores and 31 GB of RAM, with the data hot, and with seventeen
+//! of the eighteen indexes present (`pg_trgm` was unavailable, so this is an
+//! underestimate). The benchmark host has four cores and 11 GB against a ~29 GB
+//! working set; there the `UPDATE` is disk-bound and the number is not
+//! comparable. Peak on-disk footprint during the operation is 18.7 GB against a
+//! 9.1 GB steady state, so the upgrade also needs 2x headroom.
+//!
+//! `resources` needs its own surrogate too, and `GENERATED … AS IDENTITY` uses a
+//! volatile default, so adding it rewrites that table — the one carrying the
+//! JSONB payload — as well. Not measured here; it is the larger of the two.
+//!
+//! **This cannot be done online as written.** The `UPDATE` is one statement and
+//! therefore one transaction: it holds row locks on the whole table for its
+//! duration, and no write to any indexed resource can proceed. Nine index
+//! rebuilds follow, and `CREATE INDEX CONCURRENTLY` is unavailable for the
+//! reason v15 gives — a process death mid-build leaves an INVALID index that a
+//! later `IF NOT EXISTS` skips forever. A staged rewrite (build the new table
+//! beside the old, swap) trades the lock for 2x the disk and a cutover.
+//!
+//! ## If the next round takes this on
+//!
+//! Split it. The write-side half and the read-side half are almost independent:
+//!
+//! * **`idx_search_resource` alone** is `-1.42 us` per row (~14% of the insert
+//!   statement) and `-95 MB` of the 280 MB index here. It has no ordering
+//!   semantics, no concatenation site and no fast-path coupling — its only
+//!   readers are four equality-seek DELETEs and `sort_expression`. It needs the
+//!   writer work, and it needs the surrogate to be `NOT NULL` so that a path
+//!   that cannot obtain a key errors instead of writing a row the DELETE will
+//!   later miss.
+//! * **The eight sort-key indexes** are the -898 MB and the RAM regime change,
+//!   and they are the half entangled with the cursor. They should not move until
+//!   the council has decided what the paging tie-break is.
+//!
+//! And build the guard first, not last: a test that enumerates every
+//! `build_*_condition` and asserts that no emitted fragment mentions
+//! `resource_id`. That is total over the generator surface, which integration
+//! coverage of individual search shapes is not.
 
 use crate::error::{BackendError, StorageResult};
 
@@ -2205,6 +2504,17 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 /// different class of migration from the two catalog statements below. It is
 /// written down here with its arithmetic so the next round can cost it honestly
 /// instead of re-deriving it.
+///
+/// **Superseded in two places by the module header's costing of the same
+/// change.** The ten-index list above includes `idx_search_string_folded_pattern`
+/// (495 MB), which does *not* carry `resource_id` at v34 — v33 rebuilt it
+/// without an `INCLUDE`, so the set is nine indexes and ~8,008 MB. And the
+/// saving measured across all nine on 22.6M rows is **-22.3%**, not the ~25%
+/// extrapolated from the two token indexes here, i.e. ~1.79 GB rather than
+/// ~2.1 GB. The heap figure was right (-542 MB measured). The header also
+/// records why "scope rather than doubt" is no longer the reason it is
+/// deferred: the fast path's `ORDER BY` tie-break and the keyset cursor's
+/// disagree under a surrogate, which loses rows across a page boundary.
 /// ## What this costs a real database
 ///
 /// One `DROP INDEX` (catalog-only, returning 2,283 MB to the filesystem
