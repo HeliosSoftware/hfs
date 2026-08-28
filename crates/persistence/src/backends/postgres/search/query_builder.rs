@@ -2759,6 +2759,63 @@ mod tests {
         assert_eq!(prefix_upper_bound(""), None);
     }
 
+    /// Every value the FHIR benchmark's `searchConfig.js` sends for a `string`
+    /// parameter must take the seeking path, not the `LIKE` fallback.
+    ///
+    /// Run 33179839720 left 24,865 calls on the `LIKE` statement, and the first
+    /// hypothesis was that `prefix_upper_bound` was returning `None` more often
+    /// than expected. It was not — the remainder is `:contains`, which the
+    /// script sends for half of every string request — but the question is
+    /// worth closing permanently rather than re-deriving.
+    #[test]
+    fn every_benchmark_search_term_gets_a_bound() {
+        // Verbatim from HealthSamurai/fhir-server-performance-benchmark,
+        // k6/searchConfig.js, the "string" block.
+        let terms = [
+            "NON-EXISTS",
+            "Emilia", "Carolynn", "Stefan", "Linh", "Harold",
+            "Pilar", "Ron", "Garfield", "Margaretta", "Giovanna",
+            "Dione", "Arron", "Lanny", "Harvey", "Beatriz",
+            "Donovan", "Reyes", "Santiago", "Kyong", "Curtis",
+            "Raynham", "Springfield", "Lowell", "Southwick", "Mashpee",
+            "Holbrook", "Falmouth", "Revere", "Sturbridge", "Blackstone",
+            "Westport", "Walpole", "Northampton", "Fall River", "Waltham",
+            "Acushnet Center", "Newton", "Winchester", "Maynard",
+            "ORLEANS MEDICAL CENTER, P.C.",
+            "ENCOMPASS HEALTH BRAINTREE HOSPITAL OF BRAINTREE",
+            "STEWARD HOLY FAMILY HOSPITAL INC",
+            "THE NORTHEAST HEALTH GROUP, INC",
+            "PLYMOUTH BAY INTERNAL MEDICINE",
+            "ART OF CARE INC",
+            "T MASSACHUSETTS, LLC",
+            "RIVERBEND OF SOUTH NATICK",
+            "NEW ENGLAND PROFESSIONAL HOME HEALTH CARE LLC",
+            "HDH CORPORATION",
+            // The script escapes `\ , $ |` before sending; if any survives to
+            // here it is still a literal prefix character, in the range exactly
+            // as it was in the `LIKE` pattern after `like_escape`.
+            "ORLEANS MEDICAL CENTER\\, P.C.",
+        ];
+        for term in terms {
+            let query =
+                SearchQuery::new("Patient").with_parameter(string_param("name", None, term));
+            let frag =
+                PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+            assert!(
+                frag.sql.contains("~>=~ $3 AND") && frag.sql.contains("~<~ $4)"),
+                "{:?} fell back to the LIKE form: {}",
+                term,
+                frag.sql
+            );
+            assert!(
+                !frag.sql.contains("IS NOT NULL"),
+                "{:?} kept the conjunct: {}",
+                term,
+                frag.sql
+            );
+        }
+    }
+
     #[test]
     fn empty_string_value_falls_back_to_the_like_form() {
         // `name=` matches every indexed value; there is no prefix to bound, so

@@ -718,13 +718,19 @@ ORDER BY c.last_updated DESC, c.resource_id ASC;
 
 \echo ''
 \echo '######## AJ. STRING Patient?address:contains=Springfield — leading % is not sargable ########'
--- Half of the benchmark's string requests carry `:contains`, whose leading `%`
--- no btree can seek. v30 deliberately leaves this shape on the v24 form,
--- conjunct and all: measured locally, dropping the conjunct here only moves an
--- unavoidable full-slice scan off the 50 MB `idx_search_string` onto the wide
--- covering index, 1,709 -> 2,169 buffers. Expect a scan, not a seek, and expect
--- it on `idx_search_string`. A trigram GIN is the only real answer, and does
--- not fit an 11 GB host.
+-- Exactly half, and it is not an estimate: `k6/searchConfig.js` in the pinned
+-- benchmark repo declares `"modifiers": ["", ":contains"]` for all three string
+-- shapes and `search.js` picks one per request with `pickRand`. Run
+-- 33179839720: 50,112 string iterations, 25,056 expected `:contains`, 24,865
+-- observed. This shape therefore sets the whole `string` p99 no matter how fast
+-- the other half gets.
+--
+-- v30 deliberately leaves it on the v24 form, conjunct and all: dropping the
+-- conjunct here only moves an unavoidable full-slice scan off the 47 MB
+-- `idx_search_string` onto the wider one, 1,709 -> 2,169 buffers measured. A
+-- leading `%` cannot seek a btree; a trigram GIN is the only real answer and
+-- does not fit an 11 GB host against a 15.7 GB working set. Expect a scan, not
+-- a seek, and expect it on `idx_search_string`.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        r.last_updated AS sort_key

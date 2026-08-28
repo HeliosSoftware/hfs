@@ -2122,6 +2122,79 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 /// been read and so has never had a scan clean anything up. The rebuild returns
 /// that to the filesystem.
 ///
+/// ## Measured on the real dataset: run 33179839720
+///
+/// The index is alive for the first time since v24 built it:
+///
+/// ```text
+///                                    scans    tuples_read  tuples/scan
+/// idx_search_string_folded_pattern  25,111         65,742          2.6   (was 0 / 0)
+/// idx_search_string                 24,731     77,515,711        3,135   (was 44,931 / 140,153,204)
+/// ```
+///
+/// `search-plans.txt` section AG went from 3,118 buffers / 35.5 ms to **4
+/// buffers / 0.80 ms**; AI from 5,025 to 26 buffers. The `LIKE` statement fell
+/// from 268.2 s over 45,150 calls to 101.2 s over 24,865, and the range
+/// statement that replaced it does not appear in the top 15 at all.
+///
+/// ## The half that remains is `:contains`, and it is irreducible here
+///
+/// `idx_search_string` still took 24,731 scans at 3,135 tuples each, and the
+/// shape p99 did not move (address 52 vs 51 ms). That is not a fallback and not
+/// a missed case. `searchConfig.js` in the pinned benchmark repo
+/// (HealthSamurai/fhir-server-performance-benchmark) declares
+/// `"modifiers": ["", ":contains"]` for all three string shapes — `Patient.name`,
+/// `Patient.address`, `Organization.name` — and `search.js` picks one per
+/// request with `pickRand`. So **half of every string request is `:contains`**:
+/// 50,112 string iterations x 0.5 = 25,056 expected, 24,865 observed, 0.8%
+/// apart. p99 over a population that is half substring search is set entirely
+/// by the substring half.
+///
+/// A leading `%` cannot seek a btree, so nothing in this migration or the next
+/// one changes that. The real answer is a trigram GIN, and it does not fit: the
+/// benchmark host has 11 GB of RAM against a 15.7 GB working set, and a
+/// `gin_trgm_ops` index over 205,918 folded strings would be tens to hundreds
+/// of megabytes of *additional* resident index competing with the working set
+/// this change just relieved. Not worth it for a benchmark shape.
+///
+/// ## Why the v24 `INCLUDE (resource_id, last_updated)` is dropped
+///
+/// v24 added it to keep "the fast path's scan index-only once it can seek". It
+/// can now seek, and the scan is still not index-only — in run 33179839720
+/// (sections AG and AI), and locally on a table whose visibility map is 100%
+/// all-visible. It is not a costing preference: with `enable_indexscan`,
+/// `enable_bitmapscan` and `enable_seqscan` all off, so an index-only scan
+/// would win by default, the planner still emits a plain `Index Scan` marked
+/// `Disabled: true`.
+///
+/// The reason is structural. `check_index_only` collects the table attributes
+/// the query needs with `pull_varattnos`, and a restriction clause on
+/// `COALESCE(value_string_folded, lower(value_string))` pulls **both underlying
+/// columns**. An expression index column contributes nothing to the set of
+/// attributes an index can return (`indexkeys[i] == 0`), so the needed set can
+/// never be a subset of the returnable set. Any expression index whose
+/// expression appears in a `WHERE` clause is disqualified from index-only scans
+/// by construction — which is exactly this index's only job.
+///
+/// So the payload is unreachable, and it is not free. `INCLUDE` columns disable
+/// btree deduplication outright. Measured on a 205,918-row table shaped like the
+/// real string population (half repetitive given/family/city values, half
+/// near-unique street addresses and organization names):
+///
+/// ```text
+/// with INCLUDE (resource_id, last_updated)   17 MB
+/// without                                  8200 kB
+/// idx_search_string, same rows             8200 kB
+/// ```
+///
+/// 2.1x, and without it the index lands exactly at its sibling's size. On the
+/// 22.6M-row reproduction the seek is unaffected: 31 vs 25 buffers on the narrow
+/// shape, 3 vs 4 on the zero-match shape, 719 vs 733 on the whole-slice shape —
+/// the difference is heap fetches the plan was already paying. The run measured
+/// this index at 467 MB against `idx_search_string`'s 47 MB for the same
+/// 205,918 rows, so most of that 467 MB is churn bloat rather than payload; but
+/// bloat is proportional to the pages there are to bloat, and this halves them.
+///
 /// Rolling deploys are safe in both directions. An old binary's SQL —
 /// `value_string IS NOT NULL AND COALESCE(…) LIKE $n` — still proves the new
 /// predicate, via the strict `~~`, so it keeps working against the new index
@@ -2130,15 +2203,18 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 /// under the advisory lock before the instance serves.
 async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = [
-        // Same key columns, same `INCLUDE`, same population as v24 built. The
-        // predicate is reworded onto the expression the query actually compares,
-        // so a strict operator on it — `~>=~`, `~<~`, `~~` — proves the index
-        // usable with no help from a separate conjunct.
+        // Same key columns and same population as v24 built. Two things
+        // change: the predicate is reworded onto the expression the query
+        // actually compares, so a strict operator on it — `~>=~`, `~<~`, `~~` —
+        // proves the index usable with no help from a separate conjunct; and
+        // v24's `INCLUDE (resource_id, last_updated)` goes, because an
+        // index-only scan over this index is impossible by construction (see
+        // the docstring) and the payload's real cost is that it disables btree
+        // deduplication.
         "DROP INDEX IF EXISTS idx_search_string_folded_pattern",
         "CREATE INDEX IF NOT EXISTS idx_search_string_folded_pattern
          ON search_index (tenant_id, resource_type, param_name,
                           (COALESCE(value_string_folded, lower(value_string))) text_pattern_ops)
-         INCLUDE (resource_id, last_updated)
          WHERE COALESCE(value_string_folded, lower(value_string)) IS NOT NULL",
     ];
 
