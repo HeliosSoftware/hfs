@@ -1790,6 +1790,32 @@ select.field__input {
   margin-bottom: 20px;
 }
 
+.page-head--back-link {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "back-link ."
+    "copy action";
+  column-gap: 16px;
+  align-items: start;
+}
+
+.page-head--back-link > .back-link {
+  grid-area: back-link;
+  justify-self: start;
+}
+
+.page-head--back-link > .page-head__copy {
+  grid-area: copy;
+  min-width: 0;
+}
+
+.page-head--back-link > .page-head__action {
+  grid-area: action;
+  min-width: 0;
+  align-self: start;
+}
+
 .page-head__title {
   margin: 0 0 4px;
   font-size: 24px;
@@ -1805,6 +1831,11 @@ select.field__input {
 
 .back-link,
 .back-link:visited {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 24px;
+  font-size: 13px;
   color: var(--accent-text);
   text-decoration: none;
 }
