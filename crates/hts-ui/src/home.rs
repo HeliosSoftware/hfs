@@ -33,9 +33,7 @@ use crate::chart::{self, ChartView};
 use crate::i18n::{I18n, RequestLocale};
 use crate::metrics_parse::{self, StatusCounts};
 use crate::metrics_ring::{self, MetricsSample};
-use crate::upstream::{
-    UpstreamError, UpstreamHealth, UpstreamTerminologyCapabilities,
-};
+use crate::upstream::{UpstreamError, UpstreamHealth, UpstreamTerminologyCapabilities};
 use crate::{Chrome, HtsUiState};
 
 // ── Chart selectors ─────────────────────────────────────────────────────────
@@ -237,11 +235,7 @@ impl HomeQuery {
 /// options are real `<a href>`s pointing here, so both work with JavaScript
 /// off — a plain navigation re-renders the page with the new selection.
 fn page_href(window: ChartWindow, series: SeriesFilter) -> String {
-    format!(
-        "/ui/hts?window={}&series={}",
-        window.code(),
-        series.code()
-    )
+    format!("/ui/hts?window={}&series={}", window.code(), series.code())
 }
 
 /// The URL the cards region polls itself from.
@@ -404,8 +398,10 @@ impl HomeCards {
                 // ring can detect an upstream restart; a missing gauge is
                 // treated as 0, which never looks like a regression against
                 // a real uptime and so never spuriously clears the ring.
-                let counts =
-                    metrics_parse::request_counts_by_status_class(&map, &metrics_parse::SELF_ROUTES);
+                let counts = metrics_parse::request_counts_by_status_class(
+                    &map,
+                    &metrics_parse::SELF_ROUTES,
+                );
                 let uptime_secs = metrics_parse::gauge(&map, "uptime_seconds").unwrap_or(0.0);
                 // Synchronous, allocation-free critical section — no `.await`
                 // is reachable from here while the ring's guard is held.
@@ -673,7 +669,13 @@ mod tests {
     /// unless it says otherwise.
     async fn default_cards(state: &Arc<HtsUiState>) -> HomeCards {
         let i18n = I18n::new(RequestLocale::default());
-        HomeCards::fetch(state, ChartWindow::default(), SeriesFilter::default(), &i18n).await
+        HomeCards::fetch(
+            state,
+            ChartWindow::default(),
+            SeriesFilter::default(),
+            &i18n,
+        )
+        .await
     }
 
     /// The test client points at a URL that will refuse to connect (port 1
@@ -805,13 +807,7 @@ mod tests {
 
     fn ring_chart(ring: &metrics_ring::MetricsRing, metrics_ok: bool) -> HomeChart {
         let i18n = I18n::new(RequestLocale::default());
-        build_home_chart(
-            ring,
-            ChartWindow::M15,
-            SeriesFilter::All,
-            metrics_ok,
-            &i18n,
-        )
+        build_home_chart(ring, ChartWindow::M15, SeriesFilter::All, metrics_ok, &i18n)
     }
 
     fn sample(at: f64, all: u64) -> MetricsSample {

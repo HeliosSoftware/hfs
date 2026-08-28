@@ -23,8 +23,8 @@ const LOCALES: [&str; 3] = ["en", "es", "de"];
 /// Message and term identifiers defined by one catalog.
 fn key_set(locale: &str) -> BTreeSet<String> {
     let path = format!("../../locales/{locale}/main.ftl");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
     // A `.ftl` with syntax errors still yields the entries it managed to
     // parse; treat any error as fatal so a malformed catalog cannot quietly
     // pass as a smaller one.

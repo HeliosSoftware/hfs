@@ -33,8 +33,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::upstream::{
-    ExpandParams, ExpansionResult, OutcomeView, UpstreamError, ValueSetSummary, VsBrowserFilters,
-    VsBrowserPage, HTS_UI_MAX_EXPANSION_SIZE_HINT,
+    ExpandParams, ExpansionResult, HTS_UI_MAX_EXPANSION_SIZE_HINT, OutcomeView, UpstreamError,
+    ValueSetSummary, VsBrowserFilters, VsBrowserPage,
 };
 use crate::{Chrome, HtsUiState};
 
@@ -176,7 +176,7 @@ impl BrowserRowsView {
             )));
         }
         match &self.result {
-            Err(UpstreamError::Outcome { outcome, .. }) => Some(outcome.clone()),
+            Err(UpstreamError::Outcome { outcome, .. }) => Some((**outcome).clone()),
             Err(UpstreamError::HttpStatus { status, .. }) => Some(OutcomeView {
                 severity: "error".to_owned(),
                 code: match *status {
@@ -330,7 +330,7 @@ impl<'a> DetailPageTemplate<'a> {
                 code: "not-found".to_owned(),
                 ..OutcomeView::default()
             }),
-            Err(UpstreamError::Outcome { outcome, .. }) => Some(outcome.clone()),
+            Err(UpstreamError::Outcome { outcome, .. }) => Some((**outcome).clone()),
             Err(UpstreamError::HttpStatus { status, .. }) => Some(OutcomeView {
                 severity: "error".to_owned(),
                 code: match *status {
@@ -463,7 +463,7 @@ impl ExpandResultView {
         let mut view = Self::empty();
         view.request_url = request_url;
         match err {
-            UpstreamError::Outcome { outcome, .. } => view.outcome = Some(outcome.clone()),
+            UpstreamError::Outcome { outcome, .. } => view.outcome = Some((**outcome).clone()),
             UpstreamError::NotFound { .. } => {
                 view.outcome = Some(OutcomeView {
                     severity: "error".to_owned(),

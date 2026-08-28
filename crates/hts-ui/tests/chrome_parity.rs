@@ -209,8 +209,7 @@ fn cs_detail_template_carries_backlink_to_code_systems_browser() {
     // `{% if let Some(summary) = self.summary() %}` and closed-loopback
     // summaries are `None`; a source check is both stricter and cheaper
     // than standing up a per-resource mock upstream.
-    let needle =
-        "<a class=\"row-link\" href=\"/ui/hts/code-systems\">\u{2039} {{ chrome.i18n.t(\"hts-cs-browser-title\") }}</a>";
+    let needle = "<a class=\"row-link\" href=\"/ui/hts/code-systems\">\u{2039} {{ chrome.i18n.t(\"hts-cs-browser-title\") }}</a>";
     assert!(
         CS_DETAIL.contains(needle),
         "cs-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
@@ -219,8 +218,7 @@ fn cs_detail_template_carries_backlink_to_code_systems_browser() {
 
 #[test]
 fn vs_detail_template_carries_backlink_to_value_sets_browser() {
-    let needle =
-        "<a class=\"row-link\" href=\"/ui/hts/value-sets\">\u{2039} {{ chrome.i18n.t(\"hts-vs-browser-title\") }}</a>";
+    let needle = "<a class=\"row-link\" href=\"/ui/hts/value-sets\">\u{2039} {{ chrome.i18n.t(\"hts-vs-browser-title\") }}</a>";
     assert!(
         VS_DETAIL.contains(needle),
         "vs-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
@@ -229,8 +227,7 @@ fn vs_detail_template_carries_backlink_to_value_sets_browser() {
 
 #[test]
 fn cm_detail_template_carries_backlink_to_concept_maps_browser() {
-    let needle =
-        "<a class=\"row-link\" href=\"/ui/hts/concept-maps\">\u{2039} {{ chrome.i18n.t(\"hts-cm-browser-title\") }}</a>";
+    let needle = "<a class=\"row-link\" href=\"/ui/hts/concept-maps\">\u{2039} {{ chrome.i18n.t(\"hts-cm-browser-title\") }}</a>";
     assert!(
         CM_DETAIL.contains(needle),
         "cm-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
@@ -265,7 +262,9 @@ fn view_box_width(template: &str) -> i64 {
         + needle.len();
     let rest = &template[start..];
     let end = rest.find(' ').expect("viewBox must have four components");
-    rest[..end].parse().expect("viewBox width must be an integer")
+    rest[..end]
+        .parse()
+        .expect("viewBox width must be an integer")
 }
 
 #[test]
@@ -306,11 +305,14 @@ fn chart_geometry_matches_hfs() {
             .expect("HFS build_chart must still derive plot_bottom from height")
             + needle.len();
         let rest = &hfs_lib[start..];
-        let end = rest.find(';').expect("plot_bottom expression must end in `;`");
+        let end = rest
+            .find(';')
+            .expect("plot_bottom expression must end in `;`");
         rest[..end].trim().parse::<i64>().expect("integer offset")
     };
     assert_eq!(
-        hfs_height, rust_const(hts_chart, "CHART_HEIGHT"),
+        hfs_height,
+        rust_const(hts_chart, "CHART_HEIGHT"),
         "CHART_HEIGHT drifted between HFS and HTS",
     );
     assert_eq!(
@@ -365,9 +367,7 @@ fn home_chart_uses_only_classes_that_exist_in_the_shared_stylesheet() {
     // Strip `{# … #}` template comments first: this file documents *why* two
     // HFS classes are omitted, and naming them in prose must not read as
     // emitting them.
-    let template = strip_askama_comments(include_str!(
-        "../templates/partials/hts-home-chart.html"
-    ));
+    let template = strip_askama_comments(include_str!("../templates/partials/hts-home-chart.html"));
     let template = template.as_str();
     for class in [
         "chart-card",
@@ -441,13 +441,17 @@ async fn import_form_enables_file_radio_and_input() {
     // Simplest heuristic: locate the `<input id="hts-import-file"` slice
     // and confirm the containing tag has no `disabled` attribute.
     let anchor = "id=\"hts-import-file\"";
-    let start = html.find(anchor).expect("id=hts-import-file must be present");
+    let start = html
+        .find(anchor)
+        .expect("id=hts-import-file must be present");
     // Walk back from the anchor to the enclosing `<input` and forward to
     // the closing `>`. A file input tag never spans more than ~500 chars.
     let window_start = start.saturating_sub(200);
     let window_end = (start + 500).min(html.len());
     let window = &html[window_start..window_end];
-    let tag_open = window.rfind("<input").expect("file input must be an <input tag");
+    let tag_open = window
+        .rfind("<input")
+        .expect("file input must be an <input tag");
     let tag_end_rel = window[tag_open..]
         .find('>')
         .expect("<input tag must be closed");

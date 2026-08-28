@@ -300,10 +300,7 @@ mod tests {
             xs.iter().all(|x| *x > 1_000),
             "recent samples must cluster at the right edge, got {xs:?}",
         );
-        assert!(
-            xs[0] < xs[2],
-            "x must still increase with time, got {xs:?}",
-        );
+        assert!(xs[0] < xs[2], "x must still increase with time, got {xs:?}",);
     }
 
     #[test]
@@ -350,10 +347,7 @@ mod tests {
         // Its predecessor scrolled out of the window, so there is nothing to
         // connect it back to; it must not be dropped for lack of a segment.
         let now = 10_000.0;
-        let points = [
-            point(now - 2_000.0, 5, true),
-            point(now - 100.0, 8, false),
-        ];
+        let points = [point(now - 2_000.0, 5, true), point(now - 100.0, 8, false)];
         let view = build_chart(&points, now, 900.0, 6, 1, label);
         assert_eq!(view.polylines.len(), 1);
         assert_eq!(view.latest, "8");
@@ -379,8 +373,14 @@ mod tests {
         for pair in view.polylines.join(" ").split(' ') {
             let (x, y) = pair.split_once(',').expect("coordinate pair");
             let (x, y): (i64, i64) = (x.parse().unwrap(), y.parse().unwrap());
-            assert!((PLOT_LEFT..=PLOT_RIGHT).contains(&x), "x out of plot box: {x}");
-            assert!((PLOT_TOP..=PLOT_BOTTOM).contains(&y), "y out of plot box: {y}");
+            assert!(
+                (PLOT_LEFT..=PLOT_RIGHT).contains(&x),
+                "x out of plot box: {x}"
+            );
+            assert!(
+                (PLOT_TOP..=PLOT_BOTTOM).contains(&y),
+                "y out of plot box: {y}"
+            );
         }
     }
 }

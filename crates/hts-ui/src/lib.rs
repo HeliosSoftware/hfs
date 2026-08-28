@@ -60,7 +60,7 @@ use i18n::I18n;
 use rust_embed::RustEmbed;
 use std::sync::Arc;
 
-pub use i18n::{negotiate_locale, RequestLocale};
+pub use i18n::{RequestLocale, negotiate_locale};
 // Home request-rate chart (§7.1): the sample ring lives on `HtsUiState`, so
 // its type must be nameable by the `hts` binary and by the test rings.
 // `MetricsSample`/`StatusCounts` come with it — `MetricsRing::push` takes a
@@ -71,13 +71,13 @@ pub use upstream::{
     ClosureConcept, ClosureEdge, ClosureParams, ClosureResult, CmBrowserFilters, CmBrowserPage,
     CmBrowserRow, CodeSystemSummary, ConceptMapSummary, CsBrowserFilters, CsBrowserPage,
     CsBrowserRow, ExpandParams, ExpansionConcept, ExpansionDesignation, ExpansionResult,
-    ImportCounts, ImportResult, ImportStatus, LookupDesignation, LookupParams, LookupProperty,
-    LookupResult, MappingKind, OutcomeView, SubsumesParams, SubsumesResult, TranslateDirection,
-    TranslateMatch, TranslateParams, TranslateResult, UpstreamCapabilitiesCodeSystem,
-    UpstreamClient, UpstreamError, UpstreamHealth, UpstreamTerminologyCapabilities,
-    ValidateCodeParams, ValidateCodeResult, ValidateInputMode, ValueSetSummary, VsBrowserFilters,
-    VsBrowserPage, VsBrowserRow, VsValidateMode, VsValidateParams, VsValidateResult,
-    VsValidateSource, HTS_UI_BATCH_FANOUT_CONCURRENCY, HTS_UI_MAX_EXPANSION_SIZE_HINT,
+    HTS_UI_BATCH_FANOUT_CONCURRENCY, HTS_UI_MAX_EXPANSION_SIZE_HINT, ImportCounts, ImportResult,
+    ImportStatus, LookupDesignation, LookupParams, LookupProperty, LookupResult, MappingKind,
+    OutcomeView, SubsumesParams, SubsumesResult, TranslateDirection, TranslateMatch,
+    TranslateParams, TranslateResult, UpstreamCapabilitiesCodeSystem, UpstreamClient,
+    UpstreamError, UpstreamHealth, UpstreamTerminologyCapabilities, ValidateCodeParams,
+    ValidateCodeResult, ValidateInputMode, ValueSetSummary, VsBrowserFilters, VsBrowserPage,
+    VsBrowserRow, VsValidateMode, VsValidateParams, VsValidateResult, VsValidateSource,
 };
 // Capability & Conformance page projections. Appended below Slice F's
 // block to avoid touching the alphabetized list.

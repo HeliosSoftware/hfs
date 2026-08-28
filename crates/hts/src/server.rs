@@ -268,9 +268,7 @@ where
     // is unaffected because axum's `Router::route` merges compatible method
     // routers on the same path.
     let router = if let Some(ui) = hts_ui {
-        router
-            .route("/", get(root_redirect))
-            .nest("/ui", ui)
+        router.route("/", get(root_redirect)).nest("/ui", ui)
     } else {
         router
     };

@@ -177,7 +177,14 @@ struct BrowserRowsView {
 impl BrowserRowsView {
     fn degraded_reason(&self) -> Option<&'static str> {
         match &self.result {
-            Err(e) if matches!(e, UpstreamError::Connect { .. } | UpstreamError::Timeout { .. } | UpstreamError::ClientBuild { .. }) => {
+            Err(e)
+                if matches!(
+                    e,
+                    UpstreamError::Connect { .. }
+                        | UpstreamError::Timeout { .. }
+                        | UpstreamError::ClientBuild { .. }
+                ) =>
+            {
                 Some(e.degraded_reason())
             }
             _ => None,
@@ -192,7 +199,7 @@ impl BrowserRowsView {
             )));
         }
         match &self.result {
-            Err(UpstreamError::Outcome { outcome, .. }) => Some(outcome.clone()),
+            Err(UpstreamError::Outcome { outcome, .. }) => Some((**outcome).clone()),
             Err(UpstreamError::HttpStatus { status, .. }) => Some(OutcomeView {
                 severity: "error".to_owned(),
                 code: match *status {
@@ -330,10 +337,16 @@ struct DetailPageTemplate<'a> {
 impl<'a> DetailPageTemplate<'a> {
     fn degraded_reason(&self) -> Option<&'static str> {
         match &self.detail {
-            Err(e) if matches!(
-                e,
-                UpstreamError::Connect { .. } | UpstreamError::Timeout { .. } | UpstreamError::ClientBuild { .. }
-            ) => Some(e.degraded_reason()),
+            Err(e)
+                if matches!(
+                    e,
+                    UpstreamError::Connect { .. }
+                        | UpstreamError::Timeout { .. }
+                        | UpstreamError::ClientBuild { .. }
+                ) =>
+            {
+                Some(e.degraded_reason())
+            }
             _ => None,
         }
     }
@@ -345,7 +358,7 @@ impl<'a> DetailPageTemplate<'a> {
                 code: "not-found".to_owned(),
                 ..OutcomeView::default()
             }),
-            Err(UpstreamError::Outcome { outcome, .. }) => Some(outcome.clone()),
+            Err(UpstreamError::Outcome { outcome, .. }) => Some((**outcome).clone()),
             Err(UpstreamError::HttpStatus { status, .. }) => Some(OutcomeView {
                 severity: "error".to_owned(),
                 code: match *status {
@@ -502,7 +515,7 @@ impl WorkbenchResultView {
         let mut view = Self::empty(op);
         view.request_url = request_url;
         match err {
-            UpstreamError::Outcome { outcome, .. } => view.outcome = Some(outcome.clone()),
+            UpstreamError::Outcome { outcome, .. } => view.outcome = Some((**outcome).clone()),
             UpstreamError::NotFound { .. } => {
                 view.outcome = Some(OutcomeView {
                     severity: "error".to_owned(),
@@ -575,7 +588,10 @@ async fn lookup_run(
         }
     } else {
         let result = if !canonical.is_empty() {
-            state.upstream.cs_lookup_type_level(&canonical, params).await
+            state
+                .upstream
+                .cs_lookup_type_level(&canonical, params)
+                .await
         } else {
             state.upstream.cs_lookup(&id, params).await
         };
@@ -612,7 +628,9 @@ async fn validate_run(
 ) -> Response {
     let form = parse_form(&body);
     let params = ValidateCodeParams {
-        mode: ValidateInputMode::from_form(form.get("mode").and_then(|v| v.first()).map(String::as_str)),
+        mode: ValidateInputMode::from_form(
+            form.get("mode").and_then(|v| v.first()).map(String::as_str),
+        ),
         code: single(&form, "code"),
         display: opt(&form, "display"),
         coding_system: single(&form, "coding.system"),
@@ -665,10 +683,8 @@ async fn validate_run(
                 degraded_reason: None,
             },
             Err(err) => {
-                let request_url = format!(
-                    "{}/CodeSystem/$validate-code",
-                    state.upstream.base_url()
-                );
+                let request_url =
+                    format!("{}/CodeSystem/$validate-code", state.upstream.base_url());
                 WorkbenchResultView::from_error(CsTab::Validate, request_url, &err)
             }
         }
