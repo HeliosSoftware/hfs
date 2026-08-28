@@ -1,0 +1,15 @@
+# POC dependencies for the pysof / SQL-on-FHIR analytics notebook (#650).
+#   uv venv .venv --python 3.12
+#   uv pip install --python .venv/Scripts/python.exe -r requirements.txt
+pyarrow>=17
+pandas>=2
+matplotlib>=3.8
+requests>=2.31
+jupyterlab>=4
+marimo>=0.9
+
+# pysof provides the offline (no-server) path. Install the published wheel:
+#   uv pip install pysof
+# or build it from this repo:
+#   cd crates/pysof && maturin develop --release
+pysof

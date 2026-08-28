@@ -1,0 +1,11 @@
+{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    { "resource": { "resourceType": "Patient", "id": "p1", "gender": "female", "birthDate": "1985-03-12", "active": true } },
+    { "resource": { "resourceType": "Patient", "id": "p2", "gender": "female", "birthDate": "1990-07-22", "active": true } },
+    { "resource": { "resourceType": "Patient", "id": "p3", "gender": "male", "birthDate": "1978-11-02", "active": true } },
+    { "resource": { "resourceType": "Patient", "id": "p4", "gender": "male", "birthDate": "2001-01-30", "active": false } },
+    { "resource": { "resourceType": "Patient", "id": "p5", "gender": "other", "birthDate": "1995-09-09", "active": true } }
+  ]
+}

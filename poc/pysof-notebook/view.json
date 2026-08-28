@@ -1,0 +1,15 @@
+{
+  "resourceType": "ViewDefinition",
+  "status": "active",
+  "resource": "Patient",
+  "select": [
+    {
+      "column": [
+        { "name": "id", "path": "id" },
+        { "name": "gender", "path": "gender" },
+        { "name": "birth_date", "path": "birthDate" },
+        { "name": "active", "path": "active" }
+      ]
+    }
+  ]
+}
