@@ -1,74 +1,128 @@
 {#-
-  Import upload form (design doc §7.7).
+  Import steps 1 and 2 of the V3 "stepped" layout (design doc §7.7).
 
-  Rules of the road:
+  Step 1 — "Choose source" — IS the `<form>` element: making the form the
+  `.card` keeps every step a direct child of `<main class="content">`, which
+  is what `.content > .card ~ .card { margin-top: 20px }` in app.css needs in
+  order to space the steps. Nothing here introduces a new class.
+
+  Step 2 — "Review" — is a sibling card holding the submit. The button is
+  associated back to step 1 with the HTML `form="hts-import-form"` attribute,
+  so the no-JS contract is untouched (a native submit still POSTs the whole
+  form) and htmx still intercepts the form's `submit` event.
+
+  Rules of the road (unchanged from Slice F):
     - Real <form action= method=POST> so the page works without JS.
-    - `hx-post` targets `#hts-import-status` for htmx clients; the
-      hard-nav response re-renders the whole page with the status
-      partial embedded inline (design doc §7.10 row 7.7 nojs).
-    - Source selector is a radio group; paste is the required v1 path,
-      file is disabled and carries a `# TODO(F)` note in the module
-      docs for a Phase-3 follow-up.
+    - `hx-post` targets `#hts-import-status`; the hard-nav response
+      re-renders the whole page with the status partial embedded inline
+      (design doc §7.10 row 7.7 nojs).
+    - Source selector is a radio group. `assets/import.js` toggles the two
+      `.field` wrappers by `closest(".field")` and FileReaders the picked
+      file into `#hts-import-bundle`, so BOTH inputs must stay wrapped in a
+      `.field` and keep their ids/names.
     - Submit is disabled when the shared degraded banner is showing
       (design doc §7 preamble degraded state).
 
-  Post form-polish (design doc §9): shared HFS primitives — the paste
-  textarea uses `.editor__source` (mono, min-height 460px, 12px line
-  height) so long Bundles get real scroll room instead of the 16-row
-  UA default; the submit is `.btn .btn--primary`; the source radios
-  are stacked in a bare fieldset so they read as a group above the
-  editor rather than crowding it inline.
+  Step 2 deliberately shows no entry counts: HTS reports counts only in the
+  `POST /import` *response*, and the server cannot know them before writing.
+  It is a genuine confirm step describing where the Bundle is going and what
+  the write does, not a fabricated pre-flight summary.
 -#}
-<form class="hts-import__form"
+<form class="card"
+      id="hts-import-form"
       action="/ui/hts/import"
       method="post"
       hx-post="/ui/hts/import"
       hx-target="#hts-import-status"
       hx-swap="innerHTML"
       enctype="application/x-www-form-urlencoded">
-  <fieldset>
-    <legend>{{ chrome.i18n.t("hts-import-source-legend") }}</legend>
-    <label>
-      <input type="radio" name="source" value="paste" checked>
-      <span>{{ chrome.i18n.t("hts-import-source-paste") }}</span>
-    </label>
-    <label>
-      <input type="radio" name="source" value="file">
-      <span>{{ chrome.i18n.t("hts-import-source-file") }}</span>
-    </label>
-  </fieldset>
-
-  <div class="field">
-    <label class="field__label" for="hts-import-bundle">
-      {{ chrome.i18n.t("hts-import-bundle-textarea-label") }}
-    </label>
-    <textarea id="hts-import-bundle"
-              class="editor__source"
-              name="bundle"
-              rows="16"
-              aria-label="{{ chrome.i18n.t("hts-import-bundle-textarea-label") }}"
-              spellcheck="false"
-              autocorrect="off"
-              autocapitalize="off"></textarea>
+  <div class="card-head">
+    <h3>1 &middot; {{ chrome.i18n.t("hts-import-step-source") }}</h3>
   </div>
+  <div class="panel">
+    {#-
+      Source selector. Same `.field` + `.facets--bare` + `.chip` idiom as
+      `hts-cm-translate-input.html`'s direction radios — a bare `<fieldset>`
+      would draw the UA's border/legend chrome, which app.css never styles.
+      `role="radiogroup"` + `aria-labelledby` keeps the grouping a `<legend>`
+      would have provided. `assets/import.js` binds `input[name="source"]`,
+      so the names and values must not change.
+    -#}
+    <div class="field" role="radiogroup" aria-labelledby="hts-import-source-label">
+      <span class="field__label" id="hts-import-source-label">{{ chrome.i18n.t("hts-import-source-legend") }}</span>
+      <div class="facets facets--bare">
+        <label class="chip">
+          <input type="radio" name="source" value="paste" checked>
+          {{ chrome.i18n.t("hts-import-source-paste") }}
+        </label>
+        <label class="chip">
+          <input type="radio" name="source" value="file">
+          {{ chrome.i18n.t("hts-import-source-file") }}
+        </label>
+      </div>
+    </div>
 
-  <div class="field">
-    <label class="field__label" for="hts-import-file">
-      {{ chrome.i18n.t("hts-import-bundle-file-label") }}
-    </label>
-    <input id="hts-import-file"
-           class="field__input"
-           name="bundle_file"
-           type="file"
-           accept="application/json,application/fhir+json,.json">
-  </div>
+    <div class="field">
+      <label class="field__label" for="hts-import-file">
+        {{ chrome.i18n.t("hts-import-bundle-file-label") }}
+      </label>
+      <input id="hts-import-file"
+             class="field__input"
+             name="bundle_file"
+             type="file"
+             accept="application/json,application/fhir+json,.json">
+      <span class="field__hint">{{ chrome.i18n.t("hts-import-file-hint") }}</span>
+    </div>
 
-  <div class="form-actions">
-    <button id="hts-import-submit"
-            class="btn btn--primary"
-            type="submit"
-            {% if degraded_reason.is_some() %}disabled{% endif %}>
-      {{ chrome.i18n.t("hts-import-submit") }}
-    </button>
+    <div class="field">
+      <label class="field__label" for="hts-import-bundle">
+        {{ chrome.i18n.t("hts-import-bundle-textarea-label") }}
+      </label>
+      <textarea id="hts-import-bundle"
+                class="editor__source"
+                name="bundle"
+                rows="16"
+                aria-label="{{ chrome.i18n.t("hts-import-bundle-textarea-label") }}"
+                spellcheck="false"
+                autocorrect="off"
+                autocapitalize="off"></textarea>
+      <p class="editor__source-hint">{{ chrome.i18n.t("hts-import-bundle-hint") }}</p>
+    </div>
   </div>
 </form>
+
+<section class="card">
+  <div class="card-head">
+    <h3>2 &middot; {{ chrome.i18n.t("hts-import-step-review") }}</h3>
+  </div>
+  <div class="panel">
+    <div class="kv-grid">
+      <div class="detail__field detail__field--wide">
+        <span>{{ chrome.i18n.t("hts-import-review-target") }}</span>
+        <code>{{ target_url }}</code>
+      </div>
+      <div class="detail__field">
+        <span>{{ chrome.i18n.t("hts-import-review-request") }}</span>
+        <code>POST application/fhir+json</code>
+      </div>
+      <div class="detail__field">
+        <span>{{ chrome.i18n.t("hts-import-review-accepted") }}</span>
+        <div>{{ chrome.i18n.t("hts-import-review-accepted-value") }}</div>
+      </div>
+      <div class="detail__field detail__field--wide">
+        <span>{{ chrome.i18n.t("hts-import-review-existing") }}</span>
+        <div>{{ chrome.i18n.t("hts-import-review-existing-value") }}</div>
+      </div>
+    </div>
+    <p class="query-empty">{{ chrome.i18n.t("hts-import-review-note") }}</p>
+    <div class="form-actions">
+      <button id="hts-import-submit"
+              class="btn btn--primary"
+              type="submit"
+              form="hts-import-form"
+              {% if degraded_reason.is_some() %}disabled{% endif %}>
+        {{ chrome.i18n.t("hts-import-submit") }}
+      </button>
+    </div>
+  </div>
+</section>

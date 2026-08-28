@@ -836,7 +836,6 @@ hts-nav-value-sets = Wertemengen
 hts-nav-concept-maps = Konzeptzuordnungen
 hts-nav-operations = Operationen
 hts-nav-import = Import
-hts-nav-diagnostics = Diagnose
 
 hts-fhir-version-heading = FHIR-Version
 hts-fhir-version = FHIR { $version }
@@ -847,25 +846,38 @@ hts-home-subtitle = Zustand des Terminologieservers, Katalogbestand und Schnella
 ## Dashboard-Zeilen (visuell verborgen, nur für Screenreader).
 
 hts-home-row-status = Serverstatus
-hts-home-row-inventory = Geladener Bestand
-hts-home-row-metrics = Verkehrsmetriken
-hts-home-quick-links = Schnelllinks
 
 ## Dashboard-Kacheln.
 
 hts-home-tile-status = Status
-hts-home-tile-backend = Backend
 hts-home-tile-uptime = Laufzeit
-hts-home-tile-fhir-version = FHIR-Version
-hts-home-tile-loaded-systems = Geladene Systeme
+hts-home-tile-loaded-systems = Geladene Codesysteme
 hts-home-tile-loaded-systems-hint = Aus TerminologyCapabilities.codeSystem[]
-hts-home-tile-bundled-data = Gebündelte Daten
-hts-home-tile-bundled-data-value = { $mib } MiB
-hts-home-tile-bundled-data-hint = Aus dem HTS_BOOTSTRAP_DIR-Umfang
 hts-home-tile-requests = Anfragen
-hts-home-tile-avg-latency = Durchschn. Latenz
-hts-home-tile-avg-latency-value = { $ms } ms
 hts-home-tile-metrics-hint = Seit Serverstart
+
+## Anfragerate-Diagramm der Startseite (Design-Dokument §7.1). Zeigt eine aus
+## den kumulativen `/metrics`-Zählern gebildete Rate, die nur erfasst wird,
+## solange diese Seite geöffnet ist — daher braucht jeder „nichts zu
+## zeichnen“-Zustand einen eigenen Text.
+
+hts-home-chart-title = Anfragen pro Minute
+hts-home-chart-window = Zeitfenster des Diagramms
+hts-home-chart-series = Statusklasse
+hts-home-chart-window-15m = 15 Min.
+hts-home-chart-window-1h = 1 Std.
+hts-home-chart-window-6h = 6 Std.
+hts-home-chart-series-all = Alle
+hts-home-chart-series-2xx = 2xx
+hts-home-chart-series-4xx = 4xx
+hts-home-chart-series-5xx = 5xx
+hts-home-chart-empty-unreachable = /metrics ist nicht erreichbar – es kommen keine neuen Messwerte an.
+hts-home-chart-empty-none = Noch keine Messwerte erfasst.
+hts-home-chart-empty-first = Erstes Intervall wird erfasst — eine Rate benötigt zwei Messwerte.
+hts-home-chart-empty-window = Keine Messwerte in diesem Zeitfenster. Die Erfassung läuft nur, solange diese Seite geöffnet ist.
+hts-home-chart-axis-now = jetzt
+hts-home-chart-axis-minutes = -{ $n } Min.
+hts-home-chart-axis-hours = -{ $n } Std.
 
 ## `status`-Werte aus /health, per Schlüssel übersetzbar.
 
@@ -885,10 +897,6 @@ hts-degraded-reason-unknown = Der Terminologieserver ist vorübergehend nicht ve
 
 ## Dialekt-Chip (Topbar, sitzungsweiter displayLanguage / Accept-Language — §7.1).
 
-hts-dialect-label = Dialekt
-hts-dialect-prefix = Dialekt:
-hts-dialect-heading = Sitzungsdialekt
-hts-dialect-hint = Steuert displayLanguage bei Expansionen und Accept-Language bei Lesevorgängen. Feldwerte auf der Operationen-Seite haben Vorrang.
 
 ## OperationOutcome-Partial (gemeinsam — §7 / §11).
 
@@ -933,7 +941,6 @@ hts-cs-browser-column-url = URL
 hts-cs-browser-column-version = Version
 hts-cs-browser-column-title = Titel
 hts-cs-browser-column-status = Status
-hts-cs-browser-error-title = CodeSysteme konnten nicht aufgelistet werden
 hts-cs-browser-column-name = Name
 
 ## Phase 5 — HTS-Suchformular: gemeinsame Zeichenketten (CS / VS / CM).
@@ -956,11 +963,9 @@ hts-cs-detail-jurisdiction = Zuständigkeit
 hts-cs-detail-supersedes = Ersetzt
 hts-cs-detail-superseded-by = Ersetzt durch
 hts-cs-detail-tabs-label = CodeSystem-Workbench-Abschnitte
-hts-cs-detail-tab-metadata = Metadaten
 hts-cs-detail-tab-lookup = Nachschlagen
 hts-cs-detail-tab-validate = Validieren
 hts-cs-detail-tab-subsumes = Subsumption
-hts-cs-detail-workbench-hint = Wähle eine Operation, die gegen dieses CodeSystem laufen soll.
 hts-cs-detail-result-empty = Führe die Operation aus, um das Ergebnis hier zu sehen.
 
 ## $lookup-Formular + Ergebnisbeschriftungen.
@@ -1007,8 +1012,6 @@ hts-cs-subsumes-outcome-not-subsumed = Keiner der Codes subsumiert den anderen.
 hts-workbench-run = Ausführen
 hts-workbench-raw-response = Rohanfrage und -antwort
 hts-workbench-copy-url = Anfrage-URL
-hts-workbench-format-json = JSON
-hts-workbench-format-xml = XML
 
 ## Zusätzlicher Degradiert-Grund für 404 beim CodeSystem-Read (§7.3).
 
@@ -1064,9 +1067,7 @@ hts-vs-detail-immutable-no = nein
 hts-vs-detail-purpose = Zweck
 hts-vs-detail-copyright = Urheberrecht
 hts-vs-detail-tabs-label = ValueSet-Werkbank-Abschnitte
-hts-vs-detail-tab-metadata = Metadaten
 hts-vs-detail-tab-expand = Expandieren
-hts-vs-detail-workbench-hint = Wähle eine Operation, die auf diesem ValueSet laufen soll.
 hts-vs-detail-result-empty = Führe die Operation aus, um das Ergebnis hier zu sehen.
 
 ## $expand — Formular und Ergebnisse.
@@ -1143,9 +1144,8 @@ hts-cm-browser-filter-legend = ConceptMaps filtern
 hts-cm-browser-filter-url = Kanonische URL
 hts-cm-browser-filter-name = Name
 hts-cm-browser-filter-title = Titel
-hts-cm-browser-filter-source = Quellsystem
-hts-cm-browser-filter-target = Zielsystem
 hts-cm-browser-filter-status = Status
+hts-cm-browser-filter-hint = Quell- und Ziel-Canonicals stehen nicht als Filter zur Verfügung: HTS akzeptiert bei der ConceptMap-Suche nur url, version, name, title und status und ignoriert alles andere. Filtern Sie nach URL oder Name und lesen Sie dann die Spalte Zuordnung.
 hts-cm-browser-filter-search = Suchen
 hts-cm-browser-filter-reset = Zurücksetzen
 hts-cm-browser-empty = Keine ConceptMaps entsprechen diesen Filtern.
@@ -1156,7 +1156,6 @@ hts-cm-browser-showing-count = { $count ->
 }
 hts-cm-browser-table-caption = ConceptMaps, die den aktiven Filtern entsprechen.
 hts-cm-browser-column-url = URL
-hts-cm-browser-column-version = Version
 hts-cm-browser-column-title = Titel
 hts-cm-browser-column-status = Status
 hts-cm-browser-column-name = Name
@@ -1180,9 +1179,7 @@ hts-cm-detail-source-uri = Quelle
 hts-cm-detail-target-uri = Ziel
 hts-cm-detail-group-count = Gruppen
 hts-cm-detail-tabs-label = Workbench-Bereiche der ConceptMap
-hts-cm-detail-tab-metadata = Metadaten
 hts-cm-detail-tab-translate = Übersetzen
-hts-cm-detail-workbench-hint = Wähle eine Operation, um sie für diese ConceptMap auszuführen.
 hts-cm-detail-result-empty = Führe die Operation aus, um das Ergebnis hier zu sehen.
 
 ## $translate-Formular und -Ergebnisse.
@@ -1211,7 +1208,6 @@ hts-cm-translate-target-url-placeholder = kanonische URL (optional)
 hts-cm-translate-date = Datum
 hts-cm-translate-date-placeholder = ISO 8601 (z. B. 2025-06-01)
 hts-cm-translate-submit = Übersetzen
-hts-cm-translate-matches-heading = Treffer
 hts-cm-translate-matches-count = { $count ->
     [one] { $count } Treffer
    *[other] { $count } Treffer
@@ -1226,156 +1222,20 @@ hts-cm-translate-column-mapping = { $kind ->
    *[other] Mapping
 }
 hts-cm-translate-column-origin = Ursprung
-hts-cm-translate-column-mapping-equivalence = Äquivalenz
-hts-cm-translate-column-mapping-relationship = Beziehung
-hts-cm-translate-validate-forward-missing = Vorwärtsübersetzung benötigt sowohl `code` als auch `system`.
-hts-cm-translate-validate-reverse-missing-target-code = Rückwärtsübersetzung benötigt `targetCode`.
 
 ## HTS Slice E -- Standalone-Operations-Workbench (design doc s7.6).
 
-hts-operations-title = Operationen-Workbench
-hts-operations-eyebrow = Terminologie
-hts-operations-subtitle = Terminologieoperationen gegen den verbundenen Server ausfuehren. Jede Operation geht als POST, unabhaengig vom Verb des Formulars.
-hts-operations-selector-label = Operation
-hts-operations-resource-tabs-label = Ressourcenfamilie
-hts-operations-resource-code-system = CodeSystem
-hts-operations-resource-value-set = ValueSet
-hts-operations-result-empty = Fuehre die Operation aus, um das Ergebnis hier zu sehen.
-hts-operations-scope-legend = Bereich
-hts-operations-scope-system = Kanonische URL des CodeSystems
-hts-operations-scope-instance = Instanz-ID
-hts-operations-scope-instance-placeholder = Instanz-ID
-hts-operations-scope-canonical = Kanonische URL
-hts-operations-not-implemented = Diese Operation kommt in Slice E2.
-hts-operations-closure-stateless-warning = Der Closure-Zustand lebt auf dem Server unter dem angegebenen `name`. Die UI speichert ihn nicht zwischen Anfragen.
-hts-operations-closure-empty-graph = Noch keine Kanten -- sende mindestens ein Coding, um Knoten hinzuzufuegen.
 
-hts-operations-op-lookup = $lookup
-hts-operations-op-validate-code = $validate-code
-hts-operations-op-subsumes = $subsumes
-hts-operations-op-expand = $expand
-hts-operations-op-translate = $translate
-hts-operations-op-closure = $closure
-hts-operations-op-batch-validate = batch-validate
 
-hts-cs-lookup-useSupplement = Ergaenzung
-hts-cs-lookup-useSupplement-hint = Optionale kanonische URL einer CodeSystem-Ergaenzung, die ueber das Basis-System gelegt wird.
-hts-cs-lookup-result-heading = Lookup-Ergebnis
-hts-cs-lookup-fact-name = Name
-hts-cs-lookup-fact-version = Version
-hts-cs-lookup-fact-display = Anzeige
-hts-cs-lookup-fact-definition = Definition
 
-hts-cs-validate-version = CodeSystem-Version
-hts-cs-validate-systemVersion = System-Version ueberschreiben
-hts-cs-validate-mode-CodeableConcept = CodeableConcept
-hts-cs-validate-displayLanguage = Anzeigesprache
-hts-cs-validate-advanced = Erweiterte Parameter
-hts-cs-validate-date = Datum
-hts-cs-validate-activeOnly = Nur aktive Codes
-hts-cs-validate-abstract = Abstrakte Codes zulassen
-hts-cs-validate-lenient-display-validation = Weiche Display-Validierung
-hts-cs-validate-useSupplement = Ergaenzungs-URL
-hts-cs-validate-system-version = System-Version fixieren
-hts-cs-validate-check-system-version = System-Version pruefen
-hts-cs-validate-force-system-version = System-Version erzwingen
-hts-cs-validate-result-heading = Validate-Ergebnis
-hts-cs-validate-result-badge-true = Gueltig
-hts-cs-validate-result-badge-false = Nicht gueltig
-hts-cs-validate-fact-code = Code
-hts-cs-validate-fact-display = Anzeige
-hts-cs-validate-fact-message = Nachricht
 
-hts-cs-subsumes-version = Version
-hts-cs-subsumes-codeA = Code A
-hts-cs-subsumes-codeB = Code B
-hts-cs-subsumes-result-heading = Subsumtionsergebnis
 
-hts-vs-expand-displayLanguage = Anzeigesprache
-hts-vs-expand-activeOnly = Nur aktive
-hts-vs-expand-includeDesignations = Designationen einbeziehen
-hts-vs-expand-designation = Designation
-hts-vs-expand-designation-hint = Chip-Filter -- ein `use|value`-Paar pro Zeile (wiederholbar).
 hts-vs-expand-advanced = Erweiterte Parameter
-hts-vs-expand-threshold-hint = HTS lehnt Expansionen ueber dem Schwellenwert ab. UI-Obergrenze: { $ceiling }.
-hts-vs-expand-result-heading = Expansion
 hts-vs-expand-total = Gesamt { $n }
-hts-vs-expand-count-shown = angezeigt { $n }
 
-hts-vs-validate-heading = Code gegen ein ValueSet validieren
-hts-vs-validate-source-legend = ValueSet-Quelle
-hts-vs-validate-source-canonical = Kanonische URL
-hts-vs-validate-source-instance = Instanz-ID
-hts-vs-validate-source-inline = Inline-JSON
-hts-vs-validate-mode-legend = Eingabeform
-hts-vs-validate-mode-code = Code
-hts-vs-validate-mode-coding = Coding
-hts-vs-validate-mode-CodeableConcept = CodeableConcept
-hts-vs-validate-code = Code
-hts-vs-validate-system = System
-hts-vs-validate-systemVersion = System-Version
-hts-vs-validate-display = Anzeige
-hts-vs-validate-coding-legend = Coding
-hts-vs-validate-coding-system = System
-hts-vs-validate-coding-code = Code
-hts-vs-validate-coding-display = Display
-hts-vs-validate-displayLanguage = Anzeigesprache
-hts-vs-validate-valueSetVersion = ValueSet-Version
-hts-vs-validate-advanced = Erweiterte Parameter
-hts-vs-validate-date = Datum
-hts-vs-validate-activeOnly = Nur aktive
-hts-vs-validate-abstract = Abstrakte Codes zulassen
-hts-vs-validate-lenient-display-validation = Weiche Display-Validierung
-hts-vs-validate-useSupplement = Ergaenzungs-URL
-hts-vs-validate-tx-resource = Extra tx-resource
-hts-vs-validate-default-valueset-version = Standard-ValueSet-Version
-hts-vs-validate-no-membership = Der Code ist kein Mitglied des ValueSets.
-hts-vs-validate-result-heading = Validate-Ergebnis
-hts-vs-validate-result-badge-true = Gueltig
-hts-vs-validate-result-badge-false = Nicht gueltig
-hts-vs-validate-fact-code = Code
-hts-vs-validate-fact-system = System
-hts-vs-validate-fact-display = Anzeige
-hts-vs-validate-fact-message = Nachricht
 
-hts-cm-translate-code = Code
-hts-cm-translate-system = System
-hts-cm-translate-display = Anzeige
-hts-cm-translate-targetCode = Ziel-Code
-hts-cm-translate-targetSystem = Ziel-System
-hts-cm-translate-result-heading = Translate-Ergebnis
-hts-cm-translate-result-badge-true = Uebereinstimmung
-hts-cm-translate-result-badge-false = Keine Uebereinstimmung
 
-hts-cm-closure-heading = Closure-Graph
-hts-cm-closure-name = Closure-Name
-hts-cm-closure-name-hint = Vom Client vergebener Name, der die Closure-Tabelle auf dem Server ueber Anfragen hinweg identifiziert.
-hts-cm-closure-concepts-legend = Konzepte
-hts-cm-closure-concepts-hint = Bis zu drei Ausgangs-Codings hinzufuegen; jede Zeile ist ein System-Code-Paar.
-hts-cm-closure-concept-system = System
-hts-cm-closure-concept-code = Code
-hts-cm-closure-result-heading = Closure-Kanten
-hts-cm-closure-edge-source = Quelle
-hts-cm-closure-edge-equivalence = Aequivalenz
-hts-cm-closure-edge-target = Ziel
 
-hts-vs-batch-heading = Codes gegen ein ValueSet als Batch validieren
-hts-vs-batch-target-value-set-label = Ziel-ValueSet
-hts-vs-batch-rows-legend = Zeilen
-hts-vs-batch-rows-hint = Einen Code pro Zeile eingeben; leere Zeilen werden verworfen.
-hts-vs-batch-row-code = Code
-hts-vs-batch-row-system = System
-hts-vs-batch-row-display = Anzeige
-hts-vs-batch-row-timeout = Zeitueberschreitung
-hts-vs-batch-row-placeholder = --
-hts-vs-batch-result-heading = Batch-Ergebnis
-hts-vs-batch-target-hint = Ziel-ValueSet: { $target }
-hts-vs-batch-column-code = Code
-hts-vs-batch-column-system = System
-hts-vs-batch-column-display = Anzeige
-hts-vs-batch-column-result = Ergebnis
-hts-vs-batch-progress = { $n } von { $m } abgeschlossen
-hts-vs-batch-progress-final = { $m } abgeschlossen
 
 ## Slice F — Import (§7.7). Erste Uebersetzung; im i18n-Review pruefen
 ## (# TODO(F): review de).
@@ -1396,13 +1256,10 @@ hts-import-status-rejected = Import abgelehnt
 hts-import-status-too-large = Bundle zu gross
 hts-import-counts-heading = Anzahl pro Ressource
 hts-import-counts-created = Erstellt / aktualisiert
-hts-import-counts-updated = Aktualisiert
-hts-import-counts-errors = Fehler
 hts-import-resource-code-system = CodeSystem
 hts-import-resource-value-set = ValueSet
 hts-import-resource-concept-map = ConceptMap
 hts-import-resource-concept = Eingefuegte Konzepte
-hts-import-duration = { $seconds } s
 hts-import-issues-heading = { $n ->
     [one] { $n } Hinweis
    *[other] { $n } Hinweise
@@ -1411,32 +1268,164 @@ hts-import-too-large-hint = Die Anfrage hat das Serverlimit ueberschritten. Teil
 hts-import-empty-bundle-error = Bitte ein JSON-Bundle einfuegen, bevor du absendest.
 hts-import-invalid-json-error = Der uebermittelte Inhalt ist kein gueltiges JSON.
 
+# Import in Schritten (V3, #551): Quelle waehlen, pruefen, Ergebnis.
+# Schritt 2 zeigt bewusst keine Anzahlen: HTS liefert sie erst in der
+# Antwort auf POST /import.
+hts-import-step-source = Quelle waehlen
+hts-import-step-review = Pruefen
+hts-import-step-result = Ergebnis
+hts-import-file-hint = Nur JSON. Die Datei wird im Browser gelesen und in das Bundle-Feld unten kopiert; gesendet wird erst beim Absenden.
+hts-import-bundle-hint = Das Bundle wird an POST /import auf dem Terminologieserver gesendet. Vorhandene Ressourcen werden ueber url + version zugeordnet.
+hts-import-review-target = Zielserver
+hts-import-review-request = Anfrage
+hts-import-review-accepted = Akzeptierte Ressourcen
+hts-import-review-accepted-value = CodeSystem, ValueSet, ConceptMap
+hts-import-review-existing = Vorhandene Ressourcen
+hts-import-review-existing-value = Werden an Ort und Stelle aktualisiert, wenn url und version uebereinstimmen.
+hts-import-review-note = Vor dem Absenden wird nichts geschrieben. Wie viele Ressourcen tatsaechlich angelegt wurden, meldet der Server im Ergebnis unten.
+hts-import-counts-resource = Ressource
+hts-import-raw-toggle = Rohantwort
+hts-import-rejected-note = Es wurde nichts in den Terminologiespeicher geschrieben.
+hts-import-tag-success = Erfolg
+hts-import-tag-partial = Teilweise
+hts-import-tag-error = Fehler
+
 ## Slice G — Diagnose (§7.9). Erste Uebersetzung; im i18n-Review pruefen
 ## (# TODO(G): review de).
 
-hts-diagnostics-title = Diagnose
-hts-diagnostics-heading = Diagnose
-hts-diagnostics-nav-label = Diagnose
-hts-diagnostics-fhir-version-chip = FHIR { $version }
-hts-diagnostics-tab-capability = Capability
-hts-diagnostics-tab-terminology-capabilities = TerminologyCapabilities
-hts-diagnostics-tab-health = /health
-hts-diagnostics-tab-metrics = /metrics
-hts-diagnostics-capability-heading = CapabilityStatement
-hts-diagnostics-terminology-capabilities-heading = TerminologyCapabilities
-hts-diagnostics-health-heading = Gesundheit
-hts-diagnostics-metrics-heading = Prometheus-Metriken
-hts-diagnostics-property-url = URL
-hts-diagnostics-property-version = Version
-hts-diagnostics-property-name = Name
-hts-diagnostics-property-title = Titel
-hts-diagnostics-property-status = Status
-hts-diagnostics-property-date = Datum
-hts-diagnostics-capability-rest-heading = REST-Ressourcen
-hts-diagnostics-terminology-code-systems-heading = Code Systems
-hts-diagnostics-terminology-code-systems-empty = Keine Systeme geladen
-hts-diagnostics-health-status-label = Status
-hts-diagnostics-health-unknown = Unbekannt
-hts-diagnostics-metrics-figcaption = Prometheus-Metriken im Textformat
-hts-diagnostics-metrics-empty = Der Metrics-Endpunkt lieferte keinen Inhalt
-hts-diagnostics-error = Diese Diagnose-Oberflaeche ist voruebergehend nicht verfuegbar.
+
+# Konzept-Informationsebene (Richtung B, "Konzept zuerst").
+# Das Konzept ist ein Objekt erster Ordnung mit eigenem Permalink unter
+# /ui/hts/concepts?system=...&code=..., dargestellt in drei Panels:
+# Identitaet, Zuordnungen (ueber alle gespeicherten ConceptMaps) und Subsumption.
+hts-concept-title = Konzept
+hts-concept-lede = Ein Code aus jedem Blickwinkel, den der Terminologieserver beantworten kann: was er ist, worauf er abgebildet wird und wo er in der Hierarchie steht.
+hts-concept-open = Konzept öffnen
+hts-concept-panel-loading = Wird geladen
+hts-concept-panel-open = Dieses Panel öffnen
+
+hts-concept-identity-heading = Identität
+hts-concept-status-active = Aktiv
+hts-concept-status-inactive = Inaktiv
+hts-concept-status-unreported = Aktivität nicht gemeldet
+hts-concept-field-system = System
+hts-concept-field-code = Code
+hts-concept-field-display = Anzeigetext
+hts-concept-field-code-system-name = Name des CodeSystem
+hts-concept-field-version = Version
+hts-concept-field-selectability = Auswählbarkeit
+hts-concept-selectability-abstract = Abstrakt (nicht auswählbar)
+hts-concept-selectability-selectable = Auswählbar
+hts-concept-field-definition = Definition
+hts-concept-field-neighbours = Nachbarn in der Hierarchie
+hts-concept-field-used-supplements = Angewandte Ergänzungen
+hts-concept-designations-heading = Bezeichnungen
+hts-concept-designations-value = Bezeichnung
+hts-concept-designations-language = Sprache
+hts-concept-designations-use = Verwendung
+hts-concept-properties-heading = Eigenschaften
+hts-concept-properties-code = Eigenschaft
+hts-concept-properties-value = Wert
+hts-concept-raw-response = Rohantwort
+
+hts-concept-mappings-heading = Zuordnungen
+hts-concept-mappings-direction-forward = Zuordnungen, in denen dieses Konzept die Quelle ist, über alle gespeicherten ConceptMaps hinweg.
+hts-concept-mappings-direction-reverse = Zuordnungen, in denen dieses Konzept das Ziel ist, über alle gespeicherten ConceptMaps hinweg.
+hts-concept-mappings-switch-forward = Zuordnungen von diesem Konzept anzeigen
+hts-concept-mappings-switch-reverse = Zuordnungen auf dieses Konzept anzeigen
+hts-concept-mappings-empty = Keine ConceptMap bildet dieses Konzept ab.
+hts-concept-mappings-vocabulary = Zuordnungsvokabular
+hts-concept-mappings-vocabulary-equivalence = equivalence (R4 / R4B)
+hts-concept-mappings-vocabulary-relationship = relationship (R5 / R6)
+hts-concept-mappings-vocabulary-unknown = Nicht gemeldet
+hts-concept-mappings-unattributable = Der Server ordnet Treffer im Rückwärtsmodus keiner Quellzuordnung zu, daher lässt sich die Herkunft nicht anzeigen. Wechseln Sie in die Vorwärtsrichtung, um zu sehen, aus welcher ConceptMap jede Zuordnung stammt.
+hts-concept-mappings-origin = Herkunftszuordnung
+hts-concept-mappings-column-code = Code
+hts-concept-mappings-column-system = System
+hts-concept-mappings-column-display = Anzeigetext
+hts-concept-mappings-column-mapping = Beziehung
+
+hts-concept-relations-heading = Subsumption
+hts-concept-relations-lede = Jede Zeile ist eine Subsumptionsprüfung. Der Vorfahrenkandidat wird immer als Code A gesendet, sodass eine in sich stimmige Hierarchie jedes Mal "subsumes" antwortet.
+hts-concept-relation-parent = Übergeordnet
+hts-concept-relation-child = Untergeordnet
+hts-concept-relation-manual = Verglichen
+hts-concept-relations-column-relation = Beziehung
+hts-concept-relations-column-question = Gestellte Frage
+hts-concept-relations-column-outcome = Ergebnis
+hts-concept-relations-subsumes-verb = subsumiert
+hts-concept-subsumes-outcome-equivalent = Gleichwertig
+hts-concept-subsumes-outcome-subsumes = Subsumiert
+hts-concept-subsumes-outcome-subsumed-by = Subsumiert von
+hts-concept-subsumes-outcome-not-subsumed = Nicht subsumiert
+hts-concept-relations-conflict-caveat = Die Konzeptabfrage meldet diese Hierarchiebeziehung, die Subsumptionsprüfung bestätigt sie jedoch nicht. Meist wurde die Subsumptionshülle nach dem erneuten Import des CodeSystem nicht neu aufgebaut; die Hierarchie selbst blieb erhalten.
+hts-concept-relations-empty = Dieses Konzept hat keine über- oder untergeordneten Codes zum Vergleich.
+hts-concept-relations-dropped = { $n } weitere Vergleichscodes wurden nicht geprüft; dieses Panel führt höchstens 20 Subsumptionsaufrufe pro Darstellung aus.
+hts-concept-relations-compare-label = Mit Code vergleichen
+hts-concept-relations-compare-placeholder = Ein anderer Code in diesem System
+hts-concept-relations-compare-hint = Das System ist auf das dieses Konzepts festgelegt, geben Sie daher nur den Code ein. Geprüft wird, ob dieser Code das vorliegende subsumiert.
+hts-concept-relations-compare-submit = Vergleichen
+
+## HTS-Detailseiten -- kompakte Kopfzeile V3 (#551, Slices B/C/D).
+## Gemeinsame Beschriftungen für die Chip-Zeile und die Aufklappbox der
+## CodeSystem-/ValueSet-/ConceptMap-Detailseiten sowie die Überschriften
+## der Ergebnispanels und die beiden Ehrlichkeitshinweise (Baummodus-Pager,
+## originMap im Rückwärtsmodus).
+
+hts-detail-facts-label = Fakten
+hts-detail-canonical-url = Kanonische URL
+hts-detail-version-label = Version
+hts-detail-status-label = Status
+hts-cs-detail-facts-summary = Alle CodeSystem-Fakten
+hts-vs-detail-facts-summary = Alle ValueSet-Fakten
+hts-cm-detail-facts-summary = Alle ConceptMap-Fakten
+hts-cs-lookup-definition = Definition
+hts-cs-validate-result-heading = Validierungsergebnis
+hts-cs-subsumes-result-heading = Subsumtionsergebnis
+hts-vs-expand-result-heading = Expansion
+hts-vs-expand-table-caption = Vom Terminologieserver zurückgegebene Expansionsmitglieder.
+hts-vs-expand-tree-note = Der Baummodus liefert die gesamte Hierarchie; der Pager gibt es nur im flachen Modus.
+hts-cm-translate-table-caption = Vom Terminologieserver zurückgegebene Übersetzungstreffer.
+hts-cm-translate-origin-reverse-note = Im Rückwärtsmodus lässt HTS originMap weg, daher kann ein Treffer keiner bestimmten ConceptMap zugeordnet werden. Jede Herkunftszelle bleibt bewusst ein Gedankenstrich – es fehlt kein Wert.
+
+
+# Capability & Conformance page (HTS mirror of HFS's page). The shared
+# `cap-*` and `nav-capability-conformance` keys carry everything both
+# pages say identically; only what is specific to a terminology server
+# lives here.
+hts-capability-lede = Was dieser Terminologieserver aktuell anbietet — live aus /metadata zusammengestellt.
+hts-capability-operations-empty = Keine Operationen angekündigt.
+hts-capability-rest-empty = Keine REST-Ressourcen angekündigt.
+hts-capability-terminology-heading = Terminologie-Fähigkeiten
+hts-capability-expansion-hierarchical = Hierarchische Expansion
+hts-capability-expansion-paging = Expansions-Paging
+hts-capability-expansion-incomplete = Unvollständige Expansionen
+hts-capability-expansion-parameters = $expand-Parameter
+hts-capability-validate-code-translations = Validate-code-Übersetzungen
+hts-capability-translation-needs-map = Übersetzung benötigt eine Map
+hts-capability-closure = Closure-Pflege
+hts-capability-code-systems-declared = Deklarierte Codesysteme
+hts-capability-flag-true = Ja
+hts-capability-flag-false = Nein
+hts-capability-raw-truncated = Auf die ersten { $shown } von { $total } Bytes gekürzt — die Deklaration dieses Servers wächst mit den geladenen Codesystemen.
+hts-capability-raw-full = Vollständige Deklaration ansehen
+
+# Home V3 tile sub-lines. The mockup folds Backend, FHIR version,
+# Bundled data and Avg latency into the sub-line of the tile each
+# qualifies, instead of giving them tiles of their own.
+hts-home-tile-status-sub = Backend { $backend } · FHIR { $version }
+hts-home-tile-uptime-sub = hts v{ $version } · keine Neustarts seit { $since } UTC
+hts-home-tile-uptime-sub-noclock = hts v{ $version }
+hts-home-tile-loaded-systems-sub = { $mib } MiB auf der Festplatte gebündelt
+hts-home-tile-requests-sub = { $ms } ms Durchschnitt · aus /metrics
+
+# Chart caption, composed from the SELECTED window and status class.
+# Each locale owns its own word order through the two placeables.
+hts-home-chart-hint = { $window }, { $classes }. Wird erfasst, solange diese Seite geöffnet ist. Ohne den eigenen 15-s-Aktualisierungsabruf dieser Seite und /metrics.
+hts-home-chart-hint-window-15m = Letzte 15 Minuten
+hts-home-chart-hint-window-1h = Letzte Stunde
+hts-home-chart-hint-window-6h = Letzte 6 Stunden
+hts-home-chart-hint-series-all = alle Statusklassen
+hts-home-chart-hint-series-2xx = nur 2xx-Antworten
+hts-home-chart-hint-series-4xx = nur 4xx-Antworten
+hts-home-chart-hint-series-5xx = nur 5xx-Antworten

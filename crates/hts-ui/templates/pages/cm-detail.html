@@ -1,5 +1,18 @@
 {% extends "layouts/base.html" %}
 
+{#-
+  ConceptMap detail page — V3 "compact header" layout (mirrors
+  cs-detail / vs-detail).
+
+  Facts collapse into the page head as a `.facets.facets--bare` chip row
+  (version / status / group count / publisher) plus the canonical URL in a
+  `.detail__field--wide`; the full fact set — including the source/target
+  URIs — lives in a collapsed bare `<details>` disclosure inside a `.card`
+  so the Translate workbench starts high on the page.
+
+  Zero new CSS — see the guard test in tests/concept_maps.rs.
+-#}
+
 {% block title %}
 {%- if let Some(summary) = self.summary() -%}
   {{ chrome.i18n.t_arg("hts-cm-detail-title", "name", summary.heading().to_string()) }}
@@ -9,19 +22,17 @@
 {% endblock %}
 
 {% block content %}
-<section class="hts-cm-detail" aria-labelledby="hts-cm-detail-heading">
+<section id="hts-cm-detail" aria-labelledby="hts-cm-detail-heading">
   {#-
     Inline degraded banner (mirrors cs-detail.html / vs-detail.html for
     the same reasons: shell stays visible so operators can retry, and
     the banner renders identically across Slices B / C / D).
   -#}
   {% if let Some(reason) = self.degraded_reason() %}
-  <aside class="hts-degraded" role="alert" aria-live="assertive">
-    <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
-    <p class="hts-degraded__reason">
-      {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
-    </p>
-    <p class="hts-degraded__body">{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  <aside class="notice notice--warn" role="alert" aria-live="assertive">
+    <strong>{{ chrome.i18n.t("hts-degraded-title") }}</strong>
+    {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    {{ chrome.i18n.t("hts-degraded-body") }}
   </aside>
   {% endif %}
 
@@ -30,13 +41,14 @@
   {% endif %}
 
   {% if let Some(summary) = self.summary() %}
-    <a class="backlink" href="/ui/hts/concept-maps">‹ {{ chrome.i18n.t("hts-cm-browser-title") }}</a>
-    <header class="page-header hts-cm-detail__header">
-      <p class="page-header__eyebrow">{{ chrome.i18n.t("hts-cm-detail-eyebrow") }}</p>
-      <h1 id="hts-cm-detail-heading" class="page-header__title">
+    <a class="row-link" href="/ui/hts/concept-maps">‹ {{ chrome.i18n.t("hts-cm-browser-title") }}</a>
+
+    <header class="page-head">
+      <span class="stat__label">{{ chrome.i18n.t("hts-cm-detail-eyebrow") }}</span>
+      <h1 id="hts-cm-detail-heading" class="page-head__title">
         {{ summary.heading() }}
         {% if !summary.version.is_empty() %}
-          <span class="hts-cm-detail__version"> · v{{ summary.version }}</span>
+          <span class="tag tag--param">v{{ summary.version }}</span>
         {% endif %}
         {% if !summary.status.is_empty() %}
           <span class="tag tag--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
@@ -45,76 +57,103 @@
         {% endif %}
       </h1>
       {% if !summary.description.is_empty() %}
-        <p class="page-header__subtitle">{{ summary.description }}</p>
+        <p class="page-head__lede">{{ summary.description }}</p>
       {% endif %}
+
+      <div class="facets facets--bare">
+        <span class="facet-label">{{ chrome.i18n.t("hts-detail-facts-label") }}</span>
+        {% if !summary.version.is_empty() %}
+        <span class="chip">{{ chrome.i18n.t("hts-detail-version-label") }} <span class="count">{{ summary.version }}</span></span>
+        {% endif %}
+        {% if !summary.status.is_empty() %}
+        <span class="chip">{{ chrome.i18n.t("hts-detail-status-label") }} <span class="count">{{ chrome.i18n.t(format!("hts-cm-status-{}", summary.status).as_str()) }}</span></span>
+        {% endif %}
+        {% if let Some(n) = summary.group_count %}
+        <span class="chip">{{ chrome.i18n.t("hts-cm-detail-group-count") }} <span class="count">{{ n }}</span></span>
+        {% endif %}
+        {% if !summary.publisher.is_empty() %}
+        <span class="chip">{{ summary.publisher }}</span>
+        {% endif %}
+      </div>
+
+      <div class="kv-grid">
+        <div class="detail__field detail__field--wide">
+          <span>{{ chrome.i18n.t("hts-detail-canonical-url") }}</span>
+          {% if summary.url.is_empty() %}<div>&mdash;</div>{% else %}<code>{{ summary.url }}</code>{% endif %}
+        </div>
+      </div>
     </header>
 
-    <div class="hts-cm-detail__facts">
-      <section class="hts-cm-detail__section" aria-labelledby="hts-cm-detail-identity">
-        <h2 id="hts-cm-detail-identity" class="hts-cm-detail__section-title">
-          {{ chrome.i18n.t("hts-cm-detail-section-identity") }}
-        </h2>
-        <dl class="hts-cm-detail__dl">
-          <dt>{{ chrome.i18n.t("hts-cm-browser-column-url") }}</dt>
-          <dd>{% if summary.url.is_empty() %}&mdash;{% else %}<code>{{ summary.url }}</code>{% endif %}</dd>
+    <section class="card panel" style="margin-bottom:16px">
+      <details>
+        <summary class="field__label">{{ chrome.i18n.t("hts-cm-detail-facts-summary") }}</summary>
+        <div class="kv-grid" style="margin:14px 0 0">
+          <div class="detail__field detail__field--wide">
+            <span>{{ chrome.i18n.t("hts-detail-canonical-url") }}</span>
+            {% if summary.url.is_empty() %}<div>&mdash;</div>{% else %}<code>{{ summary.url }}</code>{% endif %}
+          </div>
 
-          <dt>{{ chrome.i18n.t("hts-cm-detail-publisher") }}</dt>
-          <dd>{% if summary.publisher.is_empty() %}&mdash;{% else %}{{ summary.publisher }}{% endif %}</dd>
-
-          <dt>{{ chrome.i18n.t("hts-cm-detail-jurisdiction") }}</dt>
-          <dd>
-            {% if summary.jurisdiction.is_empty() %}
-              &mdash;
-            {% else %}
-              <ul class="hts-cm-detail__list">
-                {% for j in summary.jurisdiction %}<li>{{ j }}</li>{% endfor %}
-              </ul>
-            {% endif %}
-          </dd>
-        </dl>
-      </section>
-
-      <section class="hts-cm-detail__section" aria-labelledby="hts-cm-detail-mapping">
-        <h2 id="hts-cm-detail-mapping" class="hts-cm-detail__section-title">
-          {{ chrome.i18n.t("hts-cm-detail-section-mapping") }}
-        </h2>
-        <dl class="hts-cm-detail__dl">
-          <dt>{{ chrome.i18n.t("hts-cm-detail-source-uri") }}</dt>
-          <dd>
-            {% if !summary.source_uri.is_empty() %}<code>{{ summary.source_uri }}</code>
+          <div class="detail__field detail__field--wide">
+            <span>{{ chrome.i18n.t("hts-cm-detail-source-uri") }}</span>
+            {%- if !summary.source_uri.is_empty() %}<code>{{ summary.source_uri }}</code>
             {%- else if !summary.source_canonical.is_empty() %}<code>{{ summary.source_canonical }}</code>
-            {%- else %}&mdash;
+            {%- else %}<div>&mdash;</div>
             {%- endif %}
-          </dd>
+          </div>
 
-          <dt>{{ chrome.i18n.t("hts-cm-detail-target-uri") }}</dt>
-          <dd>
-            {% if !summary.target_uri.is_empty() %}<code>{{ summary.target_uri }}</code>
+          <div class="detail__field detail__field--wide">
+            <span>{{ chrome.i18n.t("hts-cm-detail-target-uri") }}</span>
+            {%- if !summary.target_uri.is_empty() %}<code>{{ summary.target_uri }}</code>
             {%- else if !summary.target_canonical.is_empty() %}<code>{{ summary.target_canonical }}</code>
-            {%- else %}&mdash;
+            {%- else %}<div>&mdash;</div>
             {%- endif %}
-          </dd>
+          </div>
 
-          <dt>{{ chrome.i18n.t("hts-cm-detail-group-count") }}</dt>
-          <dd>
-            {% match summary.group_count %}
-              {% when Some(n) %}{{ n }}
-              {% when None %}&mdash;
-            {% endmatch %}
-          </dd>
+          <div class="detail__field">
+            <span>{{ chrome.i18n.t("hts-cm-browser-column-name") }}</span>
+            {% if summary.name.is_empty() %}<div>&mdash;</div>{% else %}<code>{{ summary.name }}</code>{% endif %}
+          </div>
 
-          <dt>{{ chrome.i18n.t("hts-cm-detail-purpose") }}</dt>
-          <dd>{% if summary.purpose.is_empty() %}&mdash;{% else %}{{ summary.purpose }}{% endif %}</dd>
-        </dl>
-      </section>
-    </div>
+          <div class="detail__field">
+            <span>{{ chrome.i18n.t("hts-cm-detail-publisher") }}</span>
+            <div>{% if summary.publisher.is_empty() %}&mdash;{% else %}{{ summary.publisher }}{% endif %}</div>
+          </div>
+
+          <div class="detail__field">
+            <span>{{ chrome.i18n.t("hts-cm-detail-group-count") }}</span>
+            <div>
+              {%- match summary.group_count -%}
+                {%- when Some(n) -%}{{ n }}
+                {%- when None -%}&mdash;
+              {%- endmatch -%}
+            </div>
+          </div>
+
+          <div class="detail__field">
+            <span>{{ chrome.i18n.t("hts-cm-detail-jurisdiction") }}</span>
+            <div>
+              {%- if summary.jurisdiction.is_empty() -%}
+                &mdash;
+              {%- else -%}
+                {%- for j in summary.jurisdiction %}{% if !loop.first %} · {% endif %}{{ j }}{% endfor -%}
+              {%- endif -%}
+            </div>
+          </div>
+
+          <div class="detail__field detail__field--wide">
+            <span>{{ chrome.i18n.t("hts-cm-detail-purpose") }}</span>
+            <div>{% if summary.purpose.is_empty() %}&mdash;{% else %}{{ summary.purpose }}{% endif %}</div>
+          </div>
+        </div>
+      </details>
+    </section>
 
     {#-
       Region wrapper (design doc §8.1 + §8.3). Same contract as
       cs-detail: tabs + workbench live inside #hts-cm-detail-region.
-      Facts block stays outside the region — it does not change with
-      the operation tab. §8.3 removes the former "Metadata" tab; the
-      strip lists operations only (Translate today).
+      The header and facts disclosure stay outside the region — they do
+      not change with the operation tab. §8.3 removes the former
+      "Metadata" tab; the strip lists operations only (Translate today).
     -#}
     <div id="hts-cm-detail-region">
     <nav class="tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-cm-detail-tabs-label") }}">
@@ -133,7 +172,7 @@
       </a>
     </nav>
 
-    <div id="hts-cm-workbench" class="hts-cm-detail__workbench" role="tabpanel" aria-labelledby="hts-cm-detail-heading">
+    <div id="hts-cm-workbench" role="tabpanel" aria-labelledby="hts-cm-detail-heading">
       {% match tab %}
         {% when CmTab::Translate %}
           {% let summary = Some(summary.clone()) %}
@@ -144,8 +183,8 @@
       {% if let Some(view) = workbench %}
         {% include "partials/hts-cm-translate-result.html" %}
       {% else %}
-        <div id="hts-workbench-result" class="hts-cm-detail__result" aria-live="polite">
-          <p class="hts-cm-detail__result-empty">{{ chrome.i18n.t("hts-cm-detail-result-empty") }}</p>
+        <div id="hts-workbench-result" aria-live="polite">
+          <p class="query-empty">{{ chrome.i18n.t("hts-cm-detail-result-empty") }}</p>
         </div>
       {% endif %}
     </div>

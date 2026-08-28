@@ -195,6 +195,42 @@ impl BrowserRowsView {
     fn page(&self) -> Option<&VsBrowserPage> {
         self.result.as_ref().ok()
     }
+
+    /// See `code_systems::BrowserRowsView::status_url` — the status facet
+    /// chips are plain links, so each carries the active text filters
+    /// forward and drops `_offset`.
+    fn status_url(&self, status: &str) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.filters.url),
+            ("version", &self.filters.version),
+            ("name", &self.filters.name),
+            ("title", &self.filters.title),
+        ] {
+            if let Some(v) = value {
+                if !v.is_empty() {
+                    ser.append_pair(field, v);
+                }
+            }
+        }
+        if !status.is_empty() {
+            ser.append_pair("status", status);
+        }
+        let query = ser.finish();
+        if query.is_empty() {
+            "/ui/hts/value-sets".to_owned()
+        } else {
+            format!("/ui/hts/value-sets?{query}")
+        }
+    }
+
+    /// Whether `status` is the chip currently selected. Empty == "any".
+    fn status_is(&self, status: &str) -> bool {
+        match &self.filters.status {
+            Some(active) => active == status,
+            None => status.is_empty(),
+        }
+    }
 }
 
 async fn browser_page(

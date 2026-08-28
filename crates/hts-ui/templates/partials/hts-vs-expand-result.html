@@ -13,82 +13,79 @@
               too-costly banner tooltip
 
   Renders (in order):
-    - Degraded banner (Connect / Timeout / ClientBuild)
+    - Degraded notice (Connect / Timeout / ClientBuild)
     - Ceiling warning when the operator's requested threshold exceeded
       the build-time ceiling — the header was NOT attached (§7.4.1 F1/F4)
-    - Too-costly banner (422): role="status" + per-request threshold form
+    - Too-costly notice (422): role="status" + per-request threshold form
       (§7.4 wireframe)
     - Shared OperationOutcome (all other error arms)
-    - Tree-mode label `showing full tree {N}` or flat-mode
-      `expansion.total {N} · offset {k}` header (§7.4.1 F10)
+    - The expansion `.card`: `.card-head` names the mode, `.table-wrap` +
+      `.data-table` carries the rows, `.table-foot` carries the counts
     - No-members neutral state, filter-no-match neutral state
-    - Concept rows (flat or tree)
     - Flat-only [Load more] pager (§7.4.1 F6)
-    - Raw request + response echo (§7.4 wireframe)
+    - Echoed parameters + raw request/response echo (§7.4 wireframe)
+
+  TREE RENDERING: an indented `.data-table`, not a `<ul role="tree">`.
+  The handler pre-flattens the hierarchy into `(depth, concept)` rows
+  (Askama cannot expand a recursive include at compile time) and each row
+  indents its Code cell with an inline `padding-left`. This keeps tree and
+  flat mode on the exact same table primitive with zero new CSS.
 -#}
-<div id="hts-workbench-result" class="hts-vs-detail__result" aria-live="polite">
+<div id="hts-workbench-result" aria-live="polite">
   {% if let Some(reason) = view.degraded_reason %}
-  <aside class="hts-degraded" role="alert" aria-live="assertive">
-    <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
-    <p class="hts-degraded__reason">
-      {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
-    </p>
-    <p class="hts-degraded__body">{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  <aside class="notice notice--warn" role="alert" aria-live="assertive">
+    <strong>{{ chrome.i18n.t("hts-degraded-title") }}</strong>
+    {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    {{ chrome.i18n.t("hts-degraded-body") }}
   </aside>
   {% endif %}
 
   {#-
-    Ceiling-warning banner: the operator asked for a threshold above the
+    Ceiling-warning notice: the operator asked for a threshold above the
     build-time ceiling, so the request header was dropped. §7.4.1 F1/F4
     — the operator can raise the ceiling by editing operator config.
   -#}
   {% if let Some(r) = view.result.as_ref() %}
     {% if let Some(requested) = r.ceiling_warning %}
-    <aside class="hts-vs-workbench__ceiling-warning" role="status">
-      <p class="hts-vs-workbench__ceiling-warning-title">
-        {{ chrome.i18n.t("hts-vs-expand-ceiling-warning-title") }}
-      </p>
-      <p class="hts-vs-workbench__ceiling-warning-body">
-        {{ chrome.i18n.t_arg("hts-vs-expand-ceiling-warning-body", "requested", requested.to_string()) }}
-        <span class="hts-vs-workbench__ceiling-value">
-          {{ chrome.i18n.t_arg("hts-vs-expand-ceiling-value", "ceiling", ceiling.to_string()) }}
-        </span>
-      </p>
-    </aside>
+    <p id="expand-ceiling-warning" class="notice notice--warn" role="status">
+      <strong>{{ chrome.i18n.t("hts-vs-expand-ceiling-warning-title") }}</strong>
+      {{ chrome.i18n.t_arg("hts-vs-expand-ceiling-warning-body", "requested", requested.to_string()) }}
+      {{ chrome.i18n.t_arg("hts-vs-expand-ceiling-value", "ceiling", ceiling.to_string()) }}
+    </p>
     {% endif %}
   {% endif %}
 
   {#-
-    Too-costly banner: HTS returned 422. `role="status"` per §7.4 a11y
-    (server said no, not a UI error). The banner exposes a compact
-    "Raise threshold" form whose hidden `threshold` field is the same
-    key the Advanced panel writes to — the value survives a re-submit.
+    Too-costly notice: HTS returned 422. `role="status"` per §7.4 a11y
+    (server said no, not a UI error). The notice is followed by a compact
+    "Raise threshold" form whose hidden `threshold` field is the same key
+    the Advanced panel writes to — the value survives a re-submit.
   -#}
   {% if let Some(outcome) = view.outcome.as_ref() %}
     {% if outcome.code == "too-costly" %}
-    <aside class="hts-vs-workbench__too-costly" role="status">
-      <p class="hts-vs-workbench__too-costly-title">
-        {{ chrome.i18n.t("hts-vs-expand-too-costly-title") }}
-      </p>
-      <p class="hts-vs-workbench__too-costly-body">
+    <section id="expand-too-costly" class="card panel" style="margin-bottom:16px">
+      <p class="notice notice--warn" role="status">
+        <strong>{{ chrome.i18n.t("hts-vs-expand-too-costly-title") }}</strong>
         {{ chrome.i18n.t("hts-vs-expand-too-costly-body") }}
       </p>
-      <form class="hts-vs-workbench__too-costly-form"
+      <form id="expand-too-costly-form"
             method="post"
             action="/ui/hts/value-sets/{{ id }}/expand"
             hx-post="/ui/hts/value-sets/{{ id }}/expand"
             hx-target="#hts-workbench-result"
             hx-swap="outerHTML">
-        <label for="expand-raise-threshold">{{ chrome.i18n.t("hts-vs-expand-raise-threshold") }}</label>
-        <input id="expand-raise-threshold" name="threshold" type="number" min="1"
-               value="{% match view.threshold %}{% when Some(t) %}{{ t }}{% when None %}{% endmatch %}">
+        <div class="field">
+          <label class="field__label" for="expand-raise-threshold">{{ chrome.i18n.t("hts-vs-expand-raise-threshold") }}</label>
+          <input class="field__input" id="expand-raise-threshold" name="threshold" type="number" min="1"
+                 value="{% match view.threshold %}{% when Some(t) %}{{ t }}{% when None %}{% endmatch %}">
+          <span class="field__hint">{{ chrome.i18n.t_arg("hts-vs-expand-ceiling-note", "ceiling", ceiling.to_string()) }}</span>
+        </div>
         <input type="hidden" name="mode" value="{% if view.tree_mode %}tree{% else %}flat{% endif %}">
-        <button type="submit" class="btn btn--secondary">{{ chrome.i18n.t("hts-vs-expand-raise-submit") }}</button>
-        <small class="hts-vs-workbench__ceiling-hint">
-          {{ chrome.i18n.t_arg("hts-vs-expand-ceiling-note", "ceiling", ceiling.to_string()) }}
-        </small>
+        <div class="form-actions">
+          <button type="submit" class="btn">{{ chrome.i18n.t("hts-vs-expand-raise-submit") }}</button>
+        </div>
       </form>
-    </aside>
+    </section>
     {% else %}
       {% let outcome = outcome.clone() %}
       {% include "partials/hts-outcome.html" %}
@@ -96,64 +93,35 @@
   {% endif %}
 
   {% if let Some(result) = view.result.as_ref() %}
-    <article class="hts-vs-workbench__result hts-vs-workbench__result--expand">
-      <header class="hts-vs-workbench__result-head">
-        {% if result.is_tree %}
-          <p class="hts-vs-workbench__result-heading">
-            {{ chrome.i18n.t_arg("hts-vs-expand-tree-label", "count", result.total_leaves().to_string()) }}
-          </p>
-        {% else %}
-          <p class="hts-vs-workbench__result-heading">
-            {% match result.total %}
-              {% when Some(t) %}
-                {{ chrome.i18n.t_arg("hts-vs-expand-total-label", "total", t.to_string()) }}
-              {% when None %}
-                {{ chrome.i18n.t("hts-vs-expand-total-unknown") }}
-            {% endmatch %}
-            {% match result.offset %}
-              {% when Some(o) %}
-                <span class="hts-vs-workbench__offset-label">
-                  · {{ chrome.i18n.t_arg("hts-vs-expand-offset-label", "offset", o.to_string()) }}
-                </span>
-              {% when None %}
-            {% endmatch %}
-          </p>
-        {% endif %}
+    <article class="card" style="margin-bottom:16px">
+      <div class="card-head">
+        <h3>
+          {{ chrome.i18n.t("hts-vs-expand-result-heading") }}
+          {% if result.is_tree %}
+            <span class="tag tag--param">{{ chrome.i18n.t("hts-vs-expand-mode-tree") }}</span>
+          {% else %}
+            <span class="tag tag--param">{{ chrome.i18n.t("hts-vs-expand-mode-flat") }}</span>
+          {% endif %}
+        </h3>
         {% if !result.identifier.is_empty() %}
-        <p class="hts-vs-workbench__result-sub"><code>{{ result.identifier }}</code></p>
+        <div class="card-head__tools"><code class="url">{{ result.identifier }}</code></div>
         {% endif %}
-      </header>
+      </div>
 
       {% if result.contains.is_empty() %}
-        {% if !result.requested_filter.is_empty() %}
-        <p class="hts-vs-workbench__filter-no-match">
-          {{ chrome.i18n.t_arg("hts-vs-expand-filter-no-match", "filter", result.requested_filter.to_string()) }}
-        </p>
-        {% else %}
-        <p class="hts-vs-workbench__no-members">{{ chrome.i18n.t("hts-vs-expand-no-members") }}</p>
-        {% endif %}
+        <div class="panel">
+          {% if !result.requested_filter.is_empty() %}
+          <p id="expand-filter-no-match" class="query-empty" style="margin:0">
+            {{ chrome.i18n.t_arg("hts-vs-expand-filter-no-match", "filter", result.requested_filter.to_string()) }}
+          </p>
+          {% else %}
+          <p id="expand-no-members" class="query-empty" style="margin:0">{{ chrome.i18n.t("hts-vs-expand-no-members") }}</p>
+          {% endif %}
+        </div>
       {% else %}
-        {% if result.is_tree %}
-          {#-
-            Tree rendering (§7.4.1 F10). Askama has no recursive-include
-            support the derive macro can expand at compile time, so the
-            handler pre-flattens the tree into (depth, concept) rows and
-            we indent with a simple padding-inline-start style. The
-            `role="tree"` container still wraps the whole thing for a11y.
-          -#}
-          <ul class="hts-vs-workbench__tree" role="tree">
-            {% for row in result.flat_tree_rows() %}
-            <li role="treeitem" class="hts-vs-workbench__tree-item"
-                aria-expanded="{% if row.has_children %}true{% else %}false{% endif %}"
-                style="padding-inline-start: {{ row.depth }}rem;">
-              {% if !row.code.is_empty() %}<code class="hts-vs-workbench__tree-code">{{ row.code }}</code>{% endif %}
-              {% if !row.display.is_empty() %}<span class="hts-vs-workbench__tree-display">{{ row.display }}</span>{% endif %}
-              {% if !row.system.is_empty() %}<code class="hts-vs-workbench__tree-system">{{ row.system }}</code>{% endif %}
-            </li>
-            {% endfor %}
-          </ul>
-        {% else %}
-          <table class="data-table hts-vs-workbench__flat">
+        <div class="table-wrap">
+          <table class="data-table">
+            <caption class="visually-hidden">{{ chrome.i18n.t("hts-vs-expand-table-caption") }}</caption>
             <thead>
               <tr>
                 <th scope="col">{{ chrome.i18n.t("hts-vs-expand-column-code") }}</th>
@@ -162,23 +130,57 @@
               </tr>
             </thead>
             <tbody>
-              {% for c in result.contains %}
-              <tr>
-                <td>{% if c.code.is_empty() %}&mdash;{% else %}<code>{{ c.code }}</code>{% endif %}</td>
-                <td>{% if c.display.is_empty() %}&mdash;{% else %}{{ c.display }}{% endif %}</td>
-                <td>{% if c.system.is_empty() %}&mdash;{% else %}<code>{{ c.system }}</code>{% endif %}</td>
-              </tr>
-              {% endfor %}
+              {% if result.is_tree %}
+                {#- Depth is expressed as inline padding on the Code cell:
+                    the agreed zero-CSS indent. The `14px` base is
+                    `.data-table td`'s own left padding, so a depth-0 row
+                    still lines up with the flat table. -#}
+                {% for row in result.flat_tree_rows() %}
+                <tr>
+                  <td style="padding-left: calc(14px + {{ row.depth }} * 20px)">
+                    {%- if row.code.is_empty() %}&mdash;{% else %}<code class="code">{{ row.code }}</code>{% endif -%}
+                  </td>
+                  <td>{% if row.display.is_empty() %}&mdash;{% else %}{{ row.display }}{% endif %}</td>
+                  <td>{% if row.system.is_empty() %}&mdash;{% else %}<code class="url">{{ row.system }}</code>{% endif %}</td>
+                </tr>
+                {% endfor %}
+              {% else %}
+                {% for c in result.contains %}
+                <tr>
+                  <td>{% if c.code.is_empty() %}&mdash;{% else %}<code class="code">{{ c.code }}</code>{% endif %}</td>
+                  <td>{% if c.display.is_empty() %}&mdash;{% else %}{{ c.display }}{% endif %}</td>
+                  <td>{% if c.system.is_empty() %}&mdash;{% else %}<code class="url">{{ c.system }}</code>{% endif %}</td>
+                </tr>
+                {% endfor %}
+              {% endif %}
             </tbody>
           </table>
+        </div>
 
-          {#-
-            Flat-mode pager (§7.4.1 F6). Renders only when the result
-            reports at least one more window OR the terminal-page
-            heuristic fires. Tree mode hides the pager entirely.
-          -#}
-          {% if view.has_more_flat() %}
-          <div class="hts-vs-workbench__pager">
+        <div class="table-foot">
+          {% if result.is_tree %}
+            <span>{{ chrome.i18n.t_arg("hts-vs-expand-tree-label", "count", result.total_leaves().to_string()) }}</span>
+            <span>{{ chrome.i18n.t("hts-vs-expand-tree-note") }}</span>
+          {% else %}
+            <span>
+              {%- match result.total -%}
+                {%- when Some(t) -%}
+                  {{ chrome.i18n.t_arg("hts-vs-expand-total-label", "total", t.to_string()) }}
+                {%- when None -%}
+                  {{ chrome.i18n.t("hts-vs-expand-total-unknown") }}
+              {%- endmatch -%}
+              {%- match result.offset -%}
+                {%- when Some(o) -%}
+                  · {{ chrome.i18n.t_arg("hts-vs-expand-offset-label", "offset", o.to_string()) }}
+                {%- when None -%}
+              {%- endmatch -%}
+            </span>
+            {#-
+              Flat-mode pager (§7.4.1 F6). Renders only when the result
+              reports at least one more window OR the terminal-page
+              heuristic fires. Tree mode hides the pager entirely.
+            -#}
+            {% if view.has_more_flat() %}
             <form method="post"
                   action="/ui/hts/value-sets/{{ id }}/expand"
                   hx-post="/ui/hts/value-sets/{{ id }}/expand"
@@ -191,42 +193,49 @@
               {% if let Some(t) = view.threshold %}
               <input type="hidden" name="threshold" value="{{ t }}">
               {% endif %}
-              <button type="submit" class="btn btn--secondary">{{ chrome.i18n.t("hts-vs-expand-load-more") }}</button>
+              <button type="submit" class="btn">{{ chrome.i18n.t("hts-vs-expand-load-more") }}</button>
             </form>
-          </div>
+            {% endif %}
           {% endif %}
-        {% endif %}
+        </div>
       {% endif %}
 
       {% if !result.echoed_parameters.is_empty() %}
-      <details class="hts-vs-workbench__echoed-parameters">
-        <summary>{{ chrome.i18n.t("hts-vs-expand-echoed-parameters") }}</summary>
-        <dl class="hts-vs-workbench__properties">
-          {% for entry in result.echoed_parameters %}
-          <dt><code>{{ entry.0 }}</code></dt>
-          <dd>{{ entry.1 }}</dd>
-          {% endfor %}
-        </dl>
-      </details>
+      <div class="panel">
+        <details>
+          <summary class="field__label">{{ chrome.i18n.t("hts-vs-expand-echoed-parameters") }}</summary>
+          <div class="kv-grid" style="margin:14px 0 0">
+            {% for entry in result.echoed_parameters %}
+            <div class="detail__field">
+              <span>{{ entry.0 }}</span>
+              <code>{{ entry.1 }}</code>
+            </div>
+            {% endfor %}
+          </div>
+        </details>
+      </div>
       {% endif %}
     </article>
   {% endif %}
 
   {#- Raw request + response echo (§7.4 wireframe). Kept last so the
-      readable summary stays visually primary. Copy affordance is a
-      plain textarea select-all target for intranet deployments. -#}
+      readable summary stays visually primary. -#}
   {% if !view.raw_body.is_empty() || !view.request_url.is_empty() %}
-  <details class="hts-vs-workbench__raw">
-    <summary>{{ chrome.i18n.t("hts-workbench-raw-response") }}</summary>
-    {% if !view.request_url.is_empty() %}
-    <p class="hts-vs-workbench__raw-url">
-      <span class="hts-vs-workbench__raw-url-label">{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
-      <code>{{ view.request_url }}</code>
-    </p>
-    {% endif %}
-    {% if !view.raw_body.is_empty() %}
-    <pre class="hts-vs-workbench__raw-body" tabindex="0"><code>{{ view.raw_body }}</code></pre>
-    {% endif %}
-  </details>
+  <section class="card panel">
+    <details>
+      <summary class="field__label">{{ chrome.i18n.t("hts-workbench-raw-response") }}</summary>
+      {% if !view.request_url.is_empty() %}
+      <div class="kv-grid" style="margin:14px 0">
+        <div class="detail__field detail__field--wide">
+          <span>{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
+          <code>{{ view.request_url }}</code>
+        </div>
+      </div>
+      {% endif %}
+      {% if !view.raw_body.is_empty() %}
+      <pre class="detail__code" tabindex="0">{{ view.raw_body }}</pre>
+      {% endif %}
+    </details>
+  </section>
   {% endif %}
 </div>

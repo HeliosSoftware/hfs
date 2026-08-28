@@ -308,6 +308,35 @@ impl UpstreamHealth {
             format!("{mins}m")
         }
     }
+
+    /// Wall-clock time the upstream process started, as `HH:MM` in UTC, for
+    /// the Uptime tile's sub-line ("no restarts since 14:02").
+    ///
+    /// Derived as `now − uptime_seconds`, which is the only thing either
+    /// server knows: `/health` reports how long *this* process has been up,
+    /// so the value is by construction the start of the current run. It is
+    /// therefore an honest "no restarts since" — a restart resets uptime and
+    /// the timestamp moves with it.
+    ///
+    /// UTC rather than local time: the UI has no timezone from the client
+    /// without JavaScript, and guessing the server's would mislead an
+    /// operator reading it from another region. Returns `None` if the clock
+    /// is before the epoch or the arithmetic would underflow, so the
+    /// template renders the version alone rather than a wrong time.
+    pub fn started_at_utc_hhmm(&self) -> Option<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let up = self.uptime_seconds.floor().max(0.0) as u64;
+        let started = now.checked_sub(up)?;
+        let secs_today = started % 86_400;
+        Some(format!(
+            "{:02}:{:02}",
+            secs_today / 3_600,
+            (secs_today % 3_600) / 60
+        ))
+    }
 }
 
 impl UpstreamTerminologyCapabilities {
@@ -680,6 +709,35 @@ pub struct LookupResult {
     pub properties: Vec<LookupProperty>,
     pub raw_body: String,
     pub request_url: String,
+    /// The canonical system `$lookup` resolved, echoed back by HTS
+    /// (`lookup.rs` always pushes `system` / `code` so the caller can confirm
+    /// what was looked up). Kept so the workbench can link into the concept
+    /// permalink at `/ui/hts/concepts?system=…&code=…` without re-deriving the
+    /// address from form state.
+    pub system: String,
+    /// The concept code `$lookup` resolved. See [`Self::system`].
+    pub code: String,
+}
+
+impl LookupResult {
+    /// Permalink into the concept information plane, or `None` when the
+    /// response did not carry both halves of the address (an older HTS, or a
+    /// decode that lost them) — the template then renders no link rather than
+    /// a broken one.
+    pub fn concept_permalink(&self) -> Option<String> {
+        if self.system.trim().is_empty() || self.code.trim().is_empty() {
+            return None;
+        }
+        Some(
+            ConceptRef {
+                system: self.system.clone(),
+                code: self.code.clone(),
+                version: non_empty_str(&self.version),
+                display_language: None,
+            }
+            .permalink(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -842,67 +900,111 @@ impl UpstreamClient {
         })
     }
 
-    /// Alt E helper — hop #1: search-list all resources of `resource_type`
-    /// in summary mode, split each entry's `resource.id` on `|` (the
-    /// backend's composite storage-id delimiter) and return the canonical
-    /// `url` whose base fhir id matches `id`.
+    /// Alt E helper — hop #1: search-list resources of `resource_type` in
+    /// summary mode, split each entry's `resource.id` on `|` (the backend's
+    /// composite storage-id delimiter) and return the canonical `url` whose
+    /// base fhir id matches `id`.
     ///
-    /// Emits [`UpstreamError::NotFound`] when no entry matches so the
-    /// detail handlers can render an OperationOutcome page shell (design
-    /// doc §7.3.1 / §7.4.1 / §7.5 invariant #5) rather than a raw HTTP
-    /// 404.
+    /// **Pages until it finds a match.** Until 2026-08-28 this read a single
+    /// `?_count=1000` page and gave up, which against the bundled seed set
+    /// silently hid **977 of 1,977 CodeSystems and 19,689 of 20,689
+    /// ValueSets** — roughly half the code systems and 95% of the value sets
+    /// had a browser row linking to a detail page that answered "not found".
+    /// ICD-10-CM sits at position 1,968 and was one of them.
+    ///
+    /// Paging rather than one huge `_count` because a detail page must not
+    /// pull 20k resources over the wire to render one concept; the first
+    /// page still resolves the common case in a single round trip.
+    ///
+    /// A targeted lookup would be better still, but HTS offers none that
+    /// works from an id: `GET /{type}/{id}` 404s on bootstrap-imported
+    /// resources and `?_id=` is silently ignored (it returns an unfiltered
+    /// page). Only `?url=` narrows, and the url is precisely what this
+    /// function exists to discover.
+    ///
+    /// Emits [`UpstreamError::NotFound`] when no page contains a match, so
+    /// the detail handlers render an OperationOutcome page shell (design doc
+    /// §7.3.1 / §7.4.1 / §7.5 invariant #5) rather than a raw HTTP 404.
     async fn resolve_canonical_url(
         &self,
         resource_type: &'static str,
         op: &'static str,
         id: &str,
     ) -> Result<String, UpstreamError> {
-        let list_url = format!("{}/{}?_count=1000", self.base_url, resource_type);
-        let response = self
-            .client
-            .get(&list_url)
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest(op, &list_url, e))?;
-        let status = response.status();
-        let raw = response.text().await.map_err(|e| UpstreamError::Decode {
-            op,
-            url: list_url.clone(),
-            message: e.to_string(),
-        })?;
-        if !status.is_success() {
-            let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
-            return Err(status_to_error(op, &list_url, status.as_u16(), &parsed));
-        }
-        let bundle: Value = serde_json::from_str(&raw).map_err(|e| UpstreamError::Decode {
-            op,
-            url: list_url.clone(),
-            message: e.to_string(),
-        })?;
+        /// Rows per request. Matches the pre-2026-08-28 single-shot size, so
+        /// anything that resolved before still resolves in one round trip.
+        const PAGE: usize = 1000;
+        /// Hard stop, in pages. 20,689 ValueSets is 21 pages; 40 leaves room
+        /// for a store to roughly double before this silently truncates
+        /// again. A malicious or broken upstream that always returns a full
+        /// page cannot spin this forever.
+        const MAX_PAGES: usize = 40;
+
         let notfound_url = format!("{}/{}/{}", self.base_url, resource_type, id);
         let want = base_id(id);
-        bundle
-            .get("entry")
-            .and_then(|entries| entries.as_array())
-            .and_then(|entries| {
-                entries.iter().find_map(|entry| {
-                    let resource = entry.get("resource")?;
-                    let entry_id = resource.get("id").and_then(|v| v.as_str())?;
-                    if base_id(entry_id) == want {
-                        resource
-                            .get("url")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_owned)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .ok_or(UpstreamError::NotFound {
+
+        for page in 0..MAX_PAGES {
+            let list_url = format!(
+                "{}/{}?_count={PAGE}&_offset={}",
+                self.base_url,
+                resource_type,
+                page * PAGE
+            );
+            let response = self
+                .client
+                .get(&list_url)
+                .header("Accept", "application/fhir+json")
+                .send()
+                .await
+                .map_err(|e| UpstreamError::from_reqwest(op, &list_url, e))?;
+            let status = response.status();
+            let raw = response.text().await.map_err(|e| UpstreamError::Decode {
                 op,
-                url: notfound_url,
-            })
+                url: list_url.clone(),
+                message: e.to_string(),
+            })?;
+            if !status.is_success() {
+                let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
+                return Err(status_to_error(op, &list_url, status.as_u16(), &parsed));
+            }
+            let bundle: Value = serde_json::from_str(&raw).map_err(|e| UpstreamError::Decode {
+                op,
+                url: list_url.clone(),
+                message: e.to_string(),
+            })?;
+
+            let entries = bundle
+                .get("entry")
+                .and_then(|entries| entries.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+
+            if let Some(found) = entries.iter().find_map(|entry| {
+                let resource = entry.get("resource")?;
+                let entry_id = resource.get("id").and_then(|v| v.as_str())?;
+                if base_id(entry_id) == want {
+                    resource
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                } else {
+                    None
+                }
+            }) {
+                return Ok(found);
+            }
+
+            // A short page is the last page. Stopping here keeps the common
+            // case — a store smaller than one page — at exactly one request.
+            if entries.len() < PAGE {
+                break;
+            }
+        }
+
+        Err(UpstreamError::NotFound {
+            op,
+            url: notfound_url,
+        })
     }
 
     /// Alt E helper — hop #2: fetch the full resource by canonical `url`.
@@ -1010,6 +1112,7 @@ impl UpstreamClient {
         id: &str,
         params: LookupParams,
     ) -> Result<LookupResult, UpstreamError> {
+        let requested_code = params.code.clone();
         let mut parameters: Vec<Value> = Vec::new();
         parameters.push(json!({"name": "code", "valueCode": params.code}));
         if let Some(v) = trim_opt(params.version) {
@@ -1033,6 +1136,10 @@ impl UpstreamClient {
         let mut result = LookupResult {
             raw_body: raw,
             request_url: url.clone(),
+            // Seeded from the request; overwritten by the echoed parameters
+            // below when the server sends them. The instance route derives
+            // `system` from `{id}`, so there is nothing to seed it with here.
+            code: requested_code,
             ..LookupResult::default()
         };
         for (name, value_obj) in iter_parameters(&parsed) {
@@ -1042,6 +1149,21 @@ impl UpstreamClient {
                 "display" => result.display = value_obj_str(value_obj, "valueString").to_owned(),
                 "definition" => {
                     result.definition = value_obj_str(value_obj, "valueString").to_owned()
+                }
+                // HTS echoes the resolved address back (`lookup.rs` pushes
+                // both unconditionally). Only overwrite on a non-empty value
+                // so the request-derived seed survives an older server.
+                "system" => {
+                    let v = value_obj_str(value_obj, "valueUri");
+                    if !v.is_empty() {
+                        result.system = v.to_owned();
+                    }
+                }
+                "code" => {
+                    let v = value_obj_str(value_obj, "valueCode");
+                    if !v.is_empty() {
+                        result.code = v.to_owned();
+                    }
                 }
                 "designation" => {
                     if let Some(d) = parse_lookup_designation(value_obj) {
@@ -1182,6 +1304,7 @@ impl UpstreamClient {
         params: LookupParams,
     ) -> Result<LookupResult, UpstreamError> {
         let system = system.trim();
+        let requested_code = params.code.clone();
         let mut parameters: Vec<Value> = Vec::new();
         parameters.push(json!({"name": "system", "valueUri": system}));
         parameters.push(json!({"name": "code", "valueCode": params.code}));
@@ -1206,6 +1329,10 @@ impl UpstreamClient {
         let mut result = LookupResult {
             raw_body: raw,
             request_url: url,
+            // Seeded from the request so the concept permalink resolves even
+            // against a server that does not echo the address back.
+            system: system.to_owned(),
+            code: requested_code,
             ..LookupResult::default()
         };
         for (name, value_obj) in iter_parameters(&parsed) {
@@ -1215,6 +1342,21 @@ impl UpstreamClient {
                 "display" => result.display = value_obj_str(value_obj, "valueString").to_owned(),
                 "definition" => {
                     result.definition = value_obj_str(value_obj, "valueString").to_owned()
+                }
+                // HTS echoes the resolved address back (`lookup.rs` pushes
+                // both unconditionally). Only overwrite on a non-empty value
+                // so the request-derived seed survives an older server.
+                "system" => {
+                    let v = value_obj_str(value_obj, "valueUri");
+                    if !v.is_empty() {
+                        result.system = v.to_owned();
+                    }
+                }
+                "code" => {
+                    let v = value_obj_str(value_obj, "valueCode");
+                    if !v.is_empty() {
+                        result.code = v.to_owned();
+                    }
                 }
                 "designation" => {
                     if let Some(d) = parse_lookup_designation(value_obj) {
@@ -3016,16 +3158,32 @@ fn parse_translate_match(param: &Value) -> Option<(TranslateMatch, MappingKind)>
                     mat.display = display;
                 }
             }
-            // Forward mode: HTS attaches an `originMap` URI part.
+            // Forward mode: HTS attaches an `originMap` part. The backend emits
+            // it as **valueCanonical** (`crates/hts/src/operations/translate.rs`
+            // builds `{"name":"originMap","valueCanonical": canonical}`); an
+            // earlier revision here read only `valueUri`, so the Origin column
+            // was silently always empty against a real server. Accept the
+            // canonical spelling first and keep `valueUri` as a tolerant
+            // fallback for non-HTS upstreams.
             "originMap" => {
-                let v = value_obj_str(part, "valueUri").to_owned();
+                let mut v = value_obj_str(part, "valueCanonical").to_owned();
+                if v.is_empty() {
+                    v = value_obj_str(part, "valueUri").to_owned();
+                }
                 if !v.is_empty() {
                     mat.origin = Some(v);
                 }
             }
-            // Reverse mode: HTS attaches a `source` URI part.
+            // Reverse mode: HTS attaches a `source` part. The backend emits a
+            // **valueCoding** (`{"system":…,"code":…}`), not a bare URI, so read
+            // the coding's system and fall back to `valueUri` for tolerance.
             "source" => {
-                let v = value_obj_str(part, "valueUri").to_owned();
+                let mut v = value_obj_str(part, "valueUri").to_owned();
+                if v.is_empty() {
+                    if let Some(c) = part.get("valueCoding").and_then(|c| c.as_object()) {
+                        v = c.get("system").and_then(|s| s.as_str()).unwrap_or("").to_owned();
+                    }
+                }
                 if !v.is_empty() && mat.origin.is_none() {
                     mat.origin = Some(v);
                 }
@@ -3858,23 +4016,34 @@ fn parse_closure_edges(resource: &Value) -> Vec<ClosureEdge> {
 //   • `GET /metadata?mode=terminology`    — FHIR TerminologyCapabilities.
 //   • `GET /metrics`                      — Prometheus text-format body.
 //
-// The existing [`UpstreamClient::terminology_capabilities`] method (used
-// by the dashboard) parses only the fields Slice A's cards render
-// (`codeSystem[].uri` + `fhirVersion`); Slice G's tabs need the richer
-// identity block (`url`, `version`, `name`, `title`, `status`, `date`)
-// plus per-`codeSystem[].version[]` details. Rather than mutate the
-// dashboard's projection, Slice G ships a parallel
-// [`terminology_capabilities_view`] method that returns
-// [`TerminologyCapabilitiesView`] — a strict superset of the fields the
-// TerminologyCap tab shows.
+// Two different projections read `/metadata?mode=terminology`, and they
+// are not interchangeable:
 //
-// `metrics_text` returns the raw body verbatim: the metrics tab wraps it
-// in `<pre>` inside a `<figure>` and does no numeric parsing.
+//   • [`UpstreamClient::terminology_capabilities`] — the dashboard's, which
+//     needs only `codeSystem[].uri` + `fhirVersion` for the loaded-systems
+//     tile.
+//   • [`UpstreamClient::terminology_capabilities_view`] — the Capability &
+//     Conformance page's, which reads the *declared capabilities*:
+//     `expansion` (flags + accepted parameters), `validateCode`,
+//     `translation` and `closure`.
+//
+// The page projection deliberately keeps **no identity block**. `url`,
+// `version`, `name`, `title` and `status` are byte-identical to the
+// CapabilityStatement rendered directly above it on the same page, so
+// showing them again was four duplicated rows and one permanently empty
+// one (HTS emits no `url` on TerminologyCapabilities).
+//
+// `metrics_text` returns the raw body verbatim and is now used only by the
+// dashboard chart; the capability page folds the raw *CapabilityStatement*
+// instead, mirroring HFS.
 
-/// Projection of a FHIR `CapabilityStatement` for the Diagnostics
-/// **Capability** tab (design doc §7.9). Only the identity block plus a
-/// REST-resource summary is parsed — the tab is a documentation surface,
-/// not a machine consumer, so unknown fields are silently dropped.
+/// Projection of a FHIR `CapabilityStatement` for the Capability &
+/// Conformance page.
+///
+/// Field-for-field this mirrors HFS's `crates/ui/src/capability.rs`
+/// (`CapabilitySummary` + `OperationRow` + `ResourceRow`) so the two pages
+/// can share templates and Fluent keys. It is a documentation surface, not
+/// a machine consumer, so unknown fields are silently dropped.
 #[derive(Clone, Debug, Default)]
 pub struct CapabilityView {
     pub url: String,
@@ -3883,10 +4052,64 @@ pub struct CapabilityView {
     pub title: String,
     pub status: String,
     pub date: String,
+    /// `implementation.description` — HFS shows this as the first summary row.
+    pub description: String,
+    pub fhir_version: String,
+    pub kind: String,
+    /// `format[]` — the wire formats the server accepts.
+    pub formats: Vec<String>,
+    /// System-level `rest[].interaction[].code`.
+    ///
+    /// **Empty against HTS today**: HTS serves `POST /` (batch) but does not
+    /// advertise it in `rest[].interaction`. The template therefore renders
+    /// this card only when the list is non-empty, so it appears on its own
+    /// if HTS ever declares them — rather than showing a permanently blank
+    /// card or, worse, a fabricated list.
+    pub interactions: Vec<String>,
+    /// System-level `rest[].operation[]`.
+    pub operations: Vec<CapabilityOperation>,
     /// Flattened `rest[].resource[]` summary — resource type + the list of
     /// advertised interaction verbs (`read`, `search-type`, ...). Empty
     /// when the upstream response does not carry a `rest[]` section.
     pub resources: Vec<CapabilityRestResource>,
+    /// Pretty-printed statement for the foldable raw block, mirroring the
+    /// `raw` field HFS keeps on its `CapabilityPage`. Retained from the
+    /// response already in hand — no second fetch.
+    ///
+    /// **Capped at [`RAW_STATEMENT_BYTE_CAP`].** HFS can inline its whole
+    /// statement because that document is a fixed size; HTS's grows with
+    /// the data, because it carries one
+    /// `capabilitystatement-supported-system` extension per loaded code
+    /// system. Against the bundled seed set that is ~1,975 extensions and a
+    /// 422 KB block — 95% of the page — on every load, `<details>` or not.
+    /// The cap is never silent: [`Self::raw_truncated`] drives a note that
+    /// states both sizes and links to `/metadata` for the complete document.
+    pub raw: String,
+    /// Whether [`Self::raw`] was cut short by the cap.
+    pub raw_truncated: bool,
+    /// Full pretty-printed length in bytes, so the note can state what was
+    /// withheld rather than just admitting that something was.
+    pub raw_full_bytes: usize,
+}
+
+/// Byte budget for the inlined raw statement (see [`CapabilityView::raw`]).
+///
+/// Sized to hold a whole statement from a server whose `/metadata` does not
+/// scale with its content, so the cap only ever engages on a seed-heavy
+/// terminology server — exactly the case where inlining it would be wrong.
+pub const RAW_STATEMENT_BYTE_CAP: usize = 16 * 1024;
+
+/// One row in [`CapabilityView::operations`].
+///
+/// HFS's equivalent (`OperationRow`) also carries a `definition_path` for
+/// operations whose canonical resolves to a same-server
+/// `/OperationDefinition/{id}`. Every operation HTS advertises points at an
+/// `hl7.org` canonical instead, so there is nothing to link and the field
+/// is omitted rather than always-empty.
+#[derive(Clone, Debug, Default)]
+pub struct CapabilityOperation {
+    pub name: String,
+    pub definition: String,
 }
 
 /// One row in [`CapabilityView::resources`].
@@ -3894,6 +4117,8 @@ pub struct CapabilityView {
 pub struct CapabilityRestResource {
     pub resource_type: String,
     pub interactions: Vec<String>,
+    /// `searchParam[].len()` — HFS shows the same count as a numeric column.
+    pub search_param_count: usize,
 }
 
 /// Projection of the `TerminologyCapabilities` fields the Diagnostics
@@ -3904,27 +4129,37 @@ pub struct CapabilityRestResource {
 /// the operator surface needs.
 #[derive(Clone, Debug, Default)]
 pub struct TerminologyCapabilitiesView {
-    pub url: String,
-    pub version: String,
-    pub name: String,
-    pub title: String,
-    pub status: String,
-    pub code_systems: Vec<TerminologyCodeSystemEntry>,
-}
-
-/// One row in [`TerminologyCapabilitiesView::code_systems`]. HTS today
-/// emits `codeSystem[].uri` but no `codeSystem[].version[]`; the parser
-/// accepts either the FHIR-spec array shape (`version[].code`) or a
-/// convenience flat string, so a richer server does not break the tab.
-#[derive(Clone, Debug, Default)]
-pub struct TerminologyCodeSystemEntry {
-    pub uri: String,
-    pub version: String,
+    /// `expansion.hierarchical` / `.paging` / `.incomplete`.
+    ///
+    /// Every flag is an `Option`: a server that omits the block renders an
+    /// em-dash. Defaulting a missing flag to `false` would state a
+    /// capability the server never claimed.
+    pub expansion_hierarchical: Option<bool>,
+    pub expansion_paging: Option<bool>,
+    pub expansion_incomplete: Option<bool>,
+    /// `expansion.parameter[].name` — the parameters `$expand` accepts.
+    /// Rendered as `.tag` chips, the same primitive HFS uses for its
+    /// system-interaction list.
+    pub expansion_parameters: Vec<String>,
+    /// `validateCode.translations`.
+    pub validate_code_translations: Option<bool>,
+    /// `translation.needsMap`.
+    pub translation_needs_map: Option<bool>,
+    /// Whether a `closure` block is **present**.
+    ///
+    /// Presence is the signal — FHIR models this as a BackboneElement, and
+    /// HTS emits a bare `{}` to mean "supported". Reading it as a boolean
+    /// value would report every server as unsupported.
+    pub supports_closure: bool,
+    /// How many code systems the server declares. The list itself is not
+    /// retained: it duplicates `/ui/hts/code-systems`, which renders the
+    /// same rows from the same table with more columns and real paging.
+    pub code_systems_declared: usize,
 }
 
 impl UpstreamClient {
     /// `GET /metadata` — the FHIR `CapabilityStatement`. Feeds the
-    /// Diagnostics **Capability** tab.
+    /// Capability &amp; Conformance page.
     pub async fn capability_statement(&self) -> Result<CapabilityView, UpstreamError> {
         let url = format!("{}/metadata", self.base_url);
         let response = self
@@ -3951,10 +4186,12 @@ impl UpstreamClient {
     }
 
     /// `GET /metadata?mode=terminology` — the FHIR
-    /// `TerminologyCapabilities`, projected into the richer
-    /// [`TerminologyCapabilitiesView`]. Feeds the Diagnostics
-    /// **TerminologyCap** tab; the dashboard keeps using
-    /// [`Self::terminology_capabilities`] for the loaded-systems count.
+    /// `TerminologyCapabilities`, projected into
+    /// [`TerminologyCapabilitiesView`]: the declared *capabilities*
+    /// (expansion, validate-code, translation, closure).
+    ///
+    /// Distinct from [`Self::terminology_capabilities`], which the dashboard
+    /// uses for the loaded-systems count — do not conflate the two.
     pub async fn terminology_capabilities_view(
         &self,
     ) -> Result<TerminologyCapabilitiesView, UpstreamError> {
@@ -4046,10 +4283,69 @@ fn parse_capability_statement(body: &Value) -> CapabilityView {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    search_param_count: resource
+                        .get("searchParam")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0),
                 })
                 .collect()
         })
         .unwrap_or_default();
+
+    // System-level `rest[].interaction[]` and `rest[].operation[]`. Both are
+    // flattened across every `rest[]` entry for the same reason `resources`
+    // is: a server may legitimately publish more than one mode.
+    let rest = |key: &str| -> Vec<Value> {
+        body.get("rest")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .flat_map(|r| {
+                        r.get(key)
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let interactions = rest("interaction")
+        .iter()
+        .filter_map(|i| i.get("code").and_then(|c| c.as_str()).map(str::to_owned))
+        .collect();
+    let operations = rest("operation")
+        .iter()
+        .map(|o| CapabilityOperation {
+            name: o
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            definition: o
+                .get("definition")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+        })
+        .collect();
+
+    // Pretty-printed so the foldable block is readable, then capped — see
+    // `CapabilityView::raw`. Cut on a char boundary; `floor_char_boundary`
+    // is still unstable, so walk back to one.
+    let raw_full = serde_json::to_string_pretty(body).unwrap_or_default();
+    let raw_full_bytes = raw_full.len();
+    let raw = if raw_full_bytes <= RAW_STATEMENT_BYTE_CAP {
+        raw_full
+    } else {
+        let mut end = RAW_STATEMENT_BYTE_CAP;
+        while end > 0 && !raw_full.is_char_boundary(end) {
+            end -= 1;
+        }
+        raw_full[..end].to_owned()
+    };
+
     CapabilityView {
         url: get_str("url"),
         version: get_str("version"),
@@ -4057,52 +4353,69 @@ fn parse_capability_statement(body: &Value) -> CapabilityView {
         title: get_str("title"),
         status: get_str("status"),
         date: get_str("date"),
+        description: body
+            .get("implementation")
+            .and_then(|i| i.get("description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        fhir_version: get_str("fhirVersion"),
+        kind: get_str("kind"),
+        formats: body
+            .get("format")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|f| f.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        interactions,
+        operations,
         resources,
+        raw,
+        raw_truncated: raw_full_bytes > RAW_STATEMENT_BYTE_CAP,
+        raw_full_bytes,
     }
 }
 
 fn parse_terminology_capabilities_view(body: &Value) -> TerminologyCapabilitiesView {
-    let get_str = |key: &str| -> String {
-        body.get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_owned()
+    // `expansion.<flag>` — `None` when the block or the flag is absent, so
+    // the card can say "not declared" rather than "false".
+    let expansion_flag = |name: &str| -> Option<bool> {
+        body.get("expansion")
+            .and_then(|e| e.get(name))
+            .and_then(|v| v.as_bool())
     };
-    let code_systems = body
-        .get("codeSystem")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|entry| {
-                    let uri = entry
-                        .get("uri")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_owned();
-                    // FHIR spec shape: `version` is an array of
-                    // BackboneElement with a `code` scalar. Fall back to
-                    // a flat string if a server flattens it.
-                    let version = entry
-                        .get("version")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|first| first.get("code"))
-                        .and_then(|v| v.as_str())
-                        .or_else(|| entry.get("version").and_then(|v| v.as_str()))
-                        .unwrap_or_default()
-                        .to_owned();
-                    TerminologyCodeSystemEntry { uri, version }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     TerminologyCapabilitiesView {
-        url: get_str("url"),
-        version: get_str("version"),
-        name: get_str("name"),
-        title: get_str("title"),
-        status: get_str("status"),
-        code_systems,
+        expansion_hierarchical: expansion_flag("hierarchical"),
+        expansion_paging: expansion_flag("paging"),
+        expansion_incomplete: expansion_flag("incomplete"),
+        expansion_parameters: body
+            .get("expansion")
+            .and_then(|e| e.get("parameter"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        validate_code_translations: body
+            .get("validateCode")
+            .and_then(|v| v.get("translations"))
+            .and_then(|v| v.as_bool()),
+        translation_needs_map: body
+            .get("translation")
+            .and_then(|t| t.get("needsMap"))
+            .and_then(|v| v.as_bool()),
+        // Presence, not value — HTS emits a bare `{}` to mean supported.
+        supports_closure: body.get("closure").is_some(),
+        code_systems_declared: body
+            .get("codeSystem")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
     }
 }
 
@@ -4334,5 +4647,1038 @@ impl Default for UpstreamHealth {
             backend: String::new(),
             uptime_seconds: 0.0,
         }
+    }
+}
+
+// ── Slice H: concept information plane (Direction B) ────────────────────
+//
+// The concept is a top-level object with its own permalink
+// (`/ui/hts/concepts?system=…&code=…`), rendered as three panels:
+//
+//   1. Identity     — `POST /CodeSystem/$lookup` with `property=*`.
+//   2. Mappings     — `POST /ConceptMap/$translate` with the `url` parameter
+//                     OMITTED, which makes HTS scan `concept_map_elements`
+//                     across every stored map
+//                     (`crates/hts/src/operations/translate.rs::process_translate`,
+//                     `crates/hts/src/backends/sqlite/concept_map.rs::translate_sync`).
+//   3. Subsumption  — one `POST /CodeSystem/$subsumes` per comparator.
+//
+// Two backend limits are rendered honestly rather than papered over:
+//
+//   * `originMap` is suppressed in reverse mode (translate.rs `if !is_reverse`),
+//     so a cross-map reverse query cannot attribute its matches. The parse
+//     records `unattributable` and the template renders an em-dash plus a
+//     footnote — it never invents an origin.
+//   * `source` / `target` (ValueSet scoping) are parsed into `TranslateRequest`
+//     but never bound by the SQL, so they are not exposed at all. Controls that
+//     do nothing are worse than absent controls.
+
+/// A concept address: the pair that makes a concept a first-class object with
+/// a stable permalink, plus the two optional refinements every panel forwards.
+///
+/// `system` is a canonical URI (`http://hl7.org/fhir/sid/icd-10-cm`), which is
+/// why the route is query-shaped rather than path-shaped: a path segment would
+/// need a double-encoded `%2F`, which axum's `Path` decoder normalizes away and
+/// many reverse proxies reject outright.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConceptRef {
+    pub system: String,
+    pub code: String,
+    pub version: Option<String>,
+    pub display_language: Option<String>,
+}
+
+impl ConceptRef {
+    /// Both halves of the address are required — a concept without a system
+    /// is not addressable, and neither is a system without a code.
+    pub fn is_addressable(&self) -> bool {
+        !self.system.trim().is_empty() && !self.code.trim().is_empty()
+    }
+
+    /// Which half is missing, for the pre-flight `invalid` OperationOutcome.
+    /// Returns `None` when the reference is complete.
+    pub fn missing_parameter(&self) -> Option<&'static str> {
+        match (self.system.trim().is_empty(), self.code.trim().is_empty()) {
+            (true, true) => Some("system+code"),
+            (true, false) => Some("system"),
+            (false, true) => Some("code"),
+            (false, false) => None,
+        }
+    }
+
+    /// Percent-encoded query string carrying the whole address. Built with
+    /// `form_urlencoded::Serializer` so a canonical URI's `://` and `/`
+    /// round-trip through the query rather than through a path segment.
+    fn query_string(&self, extra: &[(&str, &str)]) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        ser.append_pair("system", self.system.trim());
+        ser.append_pair("code", self.code.trim());
+        if let Some(v) = self.version.as_deref().and_then(non_empty_str) {
+            ser.append_pair("version", &v);
+        }
+        if let Some(v) = self.display_language.as_deref().and_then(non_empty_str) {
+            ser.append_pair("displayLanguage", &v);
+        }
+        for (k, v) in extra {
+            if !v.is_empty() {
+                ser.append_pair(k, v);
+            }
+        }
+        ser.finish()
+    }
+
+    /// The concept's permalink — the page a `$lookup` result links into.
+    pub fn permalink(&self) -> String {
+        format!("/ui/hts/concepts?{}", self.query_string(&[]))
+    }
+
+    /// Standalone URL for one lazy panel (`identity`, `mappings`,
+    /// `relations`). Used both as the htmx `hx-get` target and as the
+    /// `<noscript>` `<a href>` so the panel is reachable without JavaScript.
+    pub fn panel_url(&self, panel: &str) -> String {
+        format!("/ui/hts/concepts/{panel}?{}", self.query_string(&[]))
+    }
+
+    /// Panel URL with extra query pairs (the mappings direction toggle and
+    /// the subsumption comparator field both need one).
+    pub fn panel_url_with(&self, panel: &str, extra: &[(&str, &str)]) -> String {
+        format!("/ui/hts/concepts/{panel}?{}", self.query_string(extra))
+    }
+}
+
+/// One `parent` / `child` neighbour synthesised by `$lookup`.
+///
+/// `display` comes from the property's `description` part, which HTS fills
+/// with the neighbour's display when it has one (see
+/// `crates/hts/src/operations/lookup.rs`, test
+/// `lookup_wildcard_emits_definition_parent_child_inactive`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConceptRelative {
+    pub code: String,
+    pub display: String,
+}
+
+/// Panel 1 — everything `$lookup` knows about the concept.
+///
+/// Built from a [`LookupResult`] plus a re-read of its `raw_body`: the flat
+/// `LookupResult` projection is shared with the CodeSystem workbench and
+/// deliberately drops `system`, `code`, `abstract`, `used-supplement`, and the
+/// per-property `description` part. Rather than fork that projection (and churn
+/// Slice B's tests), the concept plane recovers the extra fields from the
+/// verbatim body the client already kept.
+#[derive(Clone, Debug, Default)]
+pub struct ConceptIdentity {
+    pub system: String,
+    pub code: String,
+    pub name: String,
+    pub version: String,
+    pub display: String,
+    pub definition: String,
+    pub is_abstract: bool,
+    /// `Some(true)` / `Some(false)` when `$lookup` synthesised the `inactive`
+    /// property; `None` when the server did not report it at all. The three
+    /// states are distinct: "retired" and "not reported" must not collapse.
+    pub inactive: Option<bool>,
+    pub parents: Vec<ConceptRelative>,
+    pub children: Vec<ConceptRelative>,
+    /// Properties other than the synthesised `parent` / `child` / `inactive`
+    /// triple, which get their own rendering.
+    pub properties: Vec<LookupProperty>,
+    pub designations: Vec<LookupDesignation>,
+    pub used_supplements: Vec<String>,
+    pub raw_body: String,
+    pub request_url: String,
+}
+
+impl ConceptIdentity {
+    /// Human label for the page heading: display falls back to name falls back
+    /// to the code, so the operator always sees something legible.
+    pub fn heading(&self) -> &str {
+        if !self.display.is_empty() {
+            &self.display
+        } else if !self.name.is_empty() {
+            &self.name
+        } else {
+            &self.code
+        }
+    }
+
+    /// Fluent key suffix for the activity chip: `active`, `inactive`, or
+    /// `unreported`.
+    pub fn status_suffix(&self) -> &'static str {
+        match self.inactive {
+            Some(true) => "inactive",
+            Some(false) => "active",
+            None => "unreported",
+        }
+    }
+
+    /// `.tag--*` modifier for the activity chip. `unreported` is deliberately
+    /// `unknown` rather than `matched`: a server that did not send `inactive`
+    /// has not told us the concept is active.
+    pub fn status_tag(&self) -> &'static str {
+        match self.inactive {
+            Some(true) => "conflict",
+            Some(false) => "matched",
+            None => "unknown",
+        }
+    }
+
+    /// Fluent key suffix for the selectability row.
+    pub fn selectability_suffix(&self) -> &'static str {
+        if self.is_abstract {
+            "abstract"
+        } else {
+            "selectable"
+        }
+    }
+
+    /// Project a shared [`LookupResult`] plus the concept address into the
+    /// richer identity view.
+    fn from_lookup(result: LookupResult, reference: &ConceptRef) -> Self {
+        let parsed: Value = serde_json::from_str(&result.raw_body).unwrap_or(Value::Null);
+
+        let mut identity = Self {
+            system: reference.system.trim().to_owned(),
+            code: reference.code.trim().to_owned(),
+            name: result.name,
+            version: result.version,
+            display: result.display,
+            definition: result.definition,
+            designations: result.designations,
+            raw_body: result.raw_body,
+            request_url: result.request_url,
+            ..Self::default()
+        };
+
+        for (name, value_obj) in iter_parameters(&parsed) {
+            match name {
+                // Echoed by HTS so the caller can confirm what was resolved;
+                // prefer it over the requested address when present.
+                "system" => {
+                    let v = value_obj_str(value_obj, "valueUri");
+                    if !v.is_empty() {
+                        identity.system = v.to_owned();
+                    }
+                }
+                "code" => {
+                    let v = value_obj_str(value_obj, "valueCode");
+                    if !v.is_empty() {
+                        identity.code = v.to_owned();
+                    }
+                }
+                "abstract" => {
+                    identity.is_abstract = value_obj
+                        .get("valueBoolean")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                }
+                "used-supplement" => {
+                    let v = value_obj
+                        .get("valueCanonical")
+                        .or_else(|| value_obj.get("valueUri"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if !v.is_empty() {
+                        identity.used_supplements.push(v.to_owned());
+                    }
+                }
+                "property" => {
+                    if let Some((code, value, description)) = parse_concept_property(value_obj) {
+                        match code.as_str() {
+                            "parent" => identity.parents.push(ConceptRelative {
+                                code: value,
+                                display: description,
+                            }),
+                            "child" => identity.children.push(ConceptRelative {
+                                code: value,
+                                display: description,
+                            }),
+                            "inactive" => {
+                                identity.inactive = Some(value.eq_ignore_ascii_case("true"));
+                            }
+                            _ => identity.properties.push(LookupProperty { code, value }),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        identity
+    }
+}
+
+/// Parse one `parameter[name=property]` group into `(code, value, description)`.
+///
+/// Unlike [`parse_lookup_property`] this keeps `description` separate rather
+/// than folding it into the value — the concept plane renders a neighbour's
+/// display next to its code, and collapsing the two would lose one of them.
+fn parse_concept_property(param: &Value) -> Option<(String, String, String)> {
+    let parts = param.get("part").and_then(|v| v.as_array())?;
+    let mut code = String::new();
+    let mut value = String::new();
+    let mut description = String::new();
+    for part in parts {
+        let name = match part.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        match name {
+            "code" => code = value_obj_str(part, "valueCode").to_owned(),
+            "value" => {
+                for k in [
+                    "valueCode",
+                    "valueString",
+                    "valueBoolean",
+                    "valueInteger",
+                    "valueDecimal",
+                    "valueDateTime",
+                    "valueUri",
+                    "valueCanonical",
+                ] {
+                    if let Some(v) = part.get(k) {
+                        value = match v {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        break;
+                    }
+                }
+            }
+            "description" => description = value_obj_str(part, "valueString").to_owned(),
+            _ => {}
+        }
+    }
+    if code.is_empty() {
+        None
+    } else {
+        Some((code, value, description))
+    }
+}
+
+/// Which side of the mapping the concept sits on for a cross-map `$translate`.
+///
+/// Reverse mode is not cosmetic: HTS keys it off `targetCode` + `targetSystem`
+/// (`translate_sync`'s `search_sys` / `other_side_sys` split), and it is the
+/// mode in which `originMap` is suppressed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MappingDirection {
+    /// The concept is the mapping's *source*; matches are the targets it maps
+    /// to.
+    #[default]
+    Forward,
+    /// The concept is the mapping's *target*; matches are the sources that map
+    /// onto it.
+    Reverse,
+}
+
+impl MappingDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Reverse => "reverse",
+        }
+    }
+
+    /// Parse the panel's `direction=` query pair. Unknown values collapse to
+    /// forward so a stale bookmark still lands on a working panel.
+    pub fn from_query(s: Option<&str>) -> Self {
+        match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("reverse") => Self::Reverse,
+            _ => Self::Forward,
+        }
+    }
+
+    pub fn is_reverse(self) -> bool {
+        matches!(self, Self::Reverse)
+    }
+
+    /// The other direction — what the panel's toggle link points at.
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Forward => Self::Reverse,
+            Self::Reverse => Self::Forward,
+        }
+    }
+}
+
+/// One matched coding from the cross-map `$translate`.
+#[derive(Clone, Debug, Default)]
+pub struct ConceptMappingRow {
+    pub code: String,
+    pub system: String,
+    pub display: String,
+    /// The concrete `equivalence` (R4/R4B) or `relationship` (R5/R6) value.
+    pub mapping_value: String,
+    /// Which of the two field names the response actually carried. HTS emits
+    /// exactly one — never both (`translate.rs` cfg-gates the push) — so this is
+    /// read off the wire rather than off a compile-time cfg: an R5 build of the
+    /// UI can be pointed at an R4 HTS via `HTS_UI_UPSTREAM_URL`.
+    pub kind: MappingKind,
+}
+
+/// Matches grouped by the ConceptMap they came from.
+///
+/// An empty `origin` means HTS did not attribute the match. That is a real
+/// state, not a parse failure: `translate.rs` suppresses `originMap` for every
+/// reverse-mode response.
+#[derive(Clone, Debug, Default)]
+pub struct ConceptMappingGroup {
+    /// `originMap` as `url` or `url|version`; empty when unattributable.
+    pub origin: String,
+    pub rows: Vec<ConceptMappingRow>,
+}
+
+impl ConceptMappingGroup {
+    pub fn is_attributed(&self) -> bool {
+        !self.origin.is_empty()
+    }
+}
+
+/// Panel 2 — every mapping for this concept, across every stored ConceptMap.
+#[derive(Clone, Debug, Default)]
+pub struct ConceptMappings {
+    pub direction: MappingDirection,
+    /// HTS's `result` parameter. `false` arrives at **HTTP 200** and is a
+    /// neutral empty state, never an error.
+    pub result: bool,
+    pub message: String,
+    pub groups: Vec<ConceptMappingGroup>,
+    pub match_count: usize,
+    /// True when at least one match arrived without an `originMap`. Drives the
+    /// em-dash Origin cell and its footnote.
+    pub unattributable: bool,
+    pub raw_body: String,
+    pub request_url: String,
+}
+
+impl ConceptMappings {
+    pub fn is_empty(&self) -> bool {
+        self.match_count == 0
+    }
+
+    /// Number of distinct ConceptMaps that contributed a match. The
+    /// unattributable bucket is not a map, so it does not count.
+    pub fn attributed_map_count(&self) -> usize {
+        self.groups.iter().filter(|g| g.is_attributed()).count()
+    }
+
+    /// Which mapping vocabulary this response spoke — `equivalence` (R4/R4B),
+    /// `relationship` (R5/R6), or `unknown`. Read off the first match, since
+    /// HTS emits one name uniformly across a response.
+    pub fn kind_str(&self) -> &'static str {
+        self.groups
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .map(|r| r.kind)
+            .find(|k| !matches!(k, MappingKind::Unknown))
+            .unwrap_or_default()
+            .as_str()
+    }
+}
+
+/// Where a subsumption comparator came from.
+///
+/// The two derived kinds are the point of the panel: they are the only
+/// comparators that can expose the closure/hierarchy disagreement described on
+/// [`SubsumptionRow::is_conflict`], because a user-entered code carries no
+/// expectation to contradict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComparatorKind {
+    /// A `parent` property from `$lookup` — the parent should subsume us.
+    Parent,
+    /// A `child` property from `$lookup` — we should subsume the child.
+    Child,
+    /// Operator-supplied free text. No expectation attaches to it.
+    Manual,
+}
+
+impl ComparatorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Parent => "parent",
+            Self::Child => "child",
+            Self::Manual => "manual",
+        }
+    }
+
+    /// Derived comparators carry the "answer must be `subsumes`" expectation;
+    /// a manual one does not.
+    pub fn is_derived(self) -> bool {
+        !matches!(self, Self::Manual)
+    }
+}
+
+/// One labelled relation row.
+///
+/// Invariant: `code_a` is **always** the ancestor candidate, so a healthy
+/// derived row always answers `subsumes`. Normalising the direction here means
+/// the template holds one rule instead of per-kind direction bookkeeping.
+#[derive(Clone, Debug, Default)]
+pub struct SubsumptionRow {
+    /// `parent` | `child` | `manual` — the Fluent key suffix for the row label.
+    pub kind_str: &'static str,
+    pub code_a: String,
+    pub code_b: String,
+    /// Display of the comparator concept, when `$lookup` supplied one.
+    pub display: String,
+    /// `equivalent` | `subsumes` | `subsumed-by` | `not-subsumed`; empty when
+    /// the call failed.
+    pub outcome: String,
+    /// True for `parent` / `child` rows — the ones that carry an expectation.
+    pub derived: bool,
+    pub outcome_error: Option<OutcomeView>,
+    pub degraded_reason: Option<&'static str>,
+}
+
+impl SubsumptionRow {
+    /// The disagreement: `$lookup` says this concept has the neighbour, and
+    /// `$subsumes` says the relationship is not there.
+    ///
+    /// This is reachable, not theoretical. Re-importing a hierarchical
+    /// CodeSystem wipes `concept_closure` while `concept_hierarchy` survives,
+    /// so `$lookup` keeps reporting `parent=A` after `$subsumes` has stopped
+    /// agreeing. A user-entered comparator could never reveal it, which is why
+    /// the derived rows exist.
+    pub fn is_conflict(&self) -> bool {
+        self.derived && !self.outcome.is_empty() && self.outcome != "subsumes"
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.outcome_error.is_some() || self.degraded_reason.is_some()
+    }
+
+    /// Tag modifier for the outcome cell: `matched` when the answer is what the
+    /// hierarchy implies, `conflict` on a derived disagreement, `unknown` when
+    /// the call did not produce an answer, `muted` for an unconstrained manual
+    /// row.
+    pub fn tag_modifier(&self) -> &'static str {
+        if self.outcome.is_empty() {
+            "unknown"
+        } else if self.is_conflict() {
+            "conflict"
+        } else if self.derived {
+            "matched"
+        } else {
+            "muted"
+        }
+    }
+}
+
+/// Panel 3 — the labelled relation table.
+///
+/// Informational only, and deliberately never a graph: `$subsumes` answers one
+/// pair at a time, so anything graph-shaped would be extrapolation.
+#[derive(Clone, Debug, Default)]
+pub struct SubsumptionReport {
+    pub rows: Vec<SubsumptionRow>,
+    /// Comparators discarded by the cap. Rendered, never silent.
+    pub dropped: usize,
+    pub request_url: String,
+}
+
+impl SubsumptionReport {
+    /// Hard cap on how many `$subsumes` calls one panel render may fan out. A
+    /// wide SNOMED concept can carry hundreds of children; 20 keeps the panel
+    /// responsive and the upstream unbothered.
+    pub const MAX_COMPARATORS: usize = 20;
+
+    pub fn conflicts(&self) -> usize {
+        self.rows.iter().filter(|r| r.is_conflict()).count()
+    }
+
+    /// `dropped` as a Fluent-friendly number. `usize` has no `FluentValue`
+    /// conversion, and a cast does not belong in a template.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped as u64
+    }
+
+    pub fn has_conflicts(&self) -> bool {
+        self.rows.iter().any(|r| r.is_conflict())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+impl UpstreamClient {
+    /// Panel 1 — `POST /CodeSystem/$lookup` with `property=*`.
+    ///
+    /// The wildcard is what makes the synthesised `parent` / `child` /
+    /// `inactive` properties appear (`lookup.rs`: `want_all` when the filter is
+    /// empty or contains `*`), and those are what panel 3 derives its
+    /// comparators from.
+    pub async fn concept_identity(
+        &self,
+        reference: &ConceptRef,
+    ) -> Result<ConceptIdentity, UpstreamError> {
+        let params = LookupParams {
+            code: reference.code.trim().to_owned(),
+            version: reference.version.clone(),
+            display_language: reference.display_language.clone(),
+            properties: vec!["*".to_owned()],
+            date: None,
+        };
+        let result = self
+            .cs_lookup_type_level(reference.system.trim(), params)
+            .await?;
+        Ok(ConceptIdentity::from_lookup(result, reference))
+    }
+
+    /// Panel 2 — `POST /ConceptMap/$translate` with **no `url` parameter**.
+    ///
+    /// Omitting `url` is the whole point: `process_translate` passes
+    /// `url: None` through to `translate_sync`, which then scans
+    /// `concept_map_elements` across every stored map instead of one. The
+    /// response's `originMap` part is what tells the operator which map each
+    /// match came from — except in reverse mode, where the backend suppresses
+    /// it (see [`ConceptMappings::unattributable`]).
+    ///
+    /// `source` / `target` are never emitted: `TranslateRequest` parses them
+    /// but no SQL binds them, so sending them would imply a filter that does
+    /// not exist.
+    pub async fn concept_mappings(
+        &self,
+        reference: &ConceptRef,
+        direction: MappingDirection,
+    ) -> Result<ConceptMappings, UpstreamError> {
+        let system = reference.system.trim();
+        let code = reference.code.trim();
+        let mut parameters: Vec<Value> = Vec::new();
+        match direction {
+            MappingDirection::Forward => {
+                parameters.push(json!({"name": "system", "valueUri": system}));
+                parameters.push(json!({"name": "code", "valueCode": code}));
+            }
+            MappingDirection::Reverse => {
+                // `translate_sync` keys the reverse search off `targetCode` and
+                // scopes it with `targetSystem`; passing the concept's own
+                // system as `system` here would filter the *other* side.
+                parameters.push(json!({"name": "reverse", "valueBoolean": true}));
+                parameters.push(json!({"name": "targetCode", "valueCode": code}));
+                parameters.push(json!({"name": "targetSystem", "valueUri": system}));
+            }
+        }
+        // `$translate` does not read `Accept-Language` uniformly, so the
+        // display language rides as an explicit parameter or not at all.
+        if let Some(v) = reference.display_language.as_deref().and_then(non_empty_str) {
+            parameters.push(json!({"name": "displayLanguage", "valueCode": v}));
+        }
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": parameters,
+        });
+        let url = format!("{}/ConceptMap/$translate", self.base_url);
+        let (raw, parsed) = self
+            .post_parameters("concept-translate", &url, &body)
+            .await?;
+
+        let mut out = ConceptMappings {
+            direction,
+            raw_body: raw,
+            request_url: url,
+            ..ConceptMappings::default()
+        };
+        // Insertion-ordered grouping: `origin -> index into out.groups`.
+        let mut index: Vec<(String, usize)> = Vec::new();
+        for (name, value_obj) in iter_parameters(&parsed) {
+            match name {
+                "result" => {
+                    out.result = value_obj
+                        .get("valueBoolean")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                }
+                "message" => out.message = value_obj_str(value_obj, "valueString").to_owned(),
+                "match" => {
+                    if let Some((row, origin)) = parse_concept_mapping_match(value_obj) {
+                        out.match_count += 1;
+                        if origin.is_empty() {
+                            out.unattributable = true;
+                        }
+                        let slot = index.iter().find(|(o, _)| *o == origin).map(|(_, i)| *i);
+                        match slot {
+                            Some(i) => out.groups[i].rows.push(row),
+                            None => {
+                                index.push((origin.clone(), out.groups.len()));
+                                out.groups.push(ConceptMappingGroup {
+                                    origin,
+                                    rows: vec![row],
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Panel 3 — one `POST /CodeSystem/$subsumes` per comparator.
+    ///
+    /// Comparators are the `parent` and `child` properties `$lookup` already
+    /// returned (one row each) plus an optional operator-supplied code. Every
+    /// call sends the ancestor candidate as `codeA`, so a healthy derived row
+    /// always answers `subsumes`.
+    ///
+    /// Cross-system comparisons are impossible here — the system is pinned
+    /// server-side from the concept address — so the 400 arm of `$subsumes` is
+    /// unreachable and the free-text field is pre-flighted rather than
+    /// round-tripped.
+    ///
+    /// Fan-out is bounded by [`HTS_UI_BATCH_FANOUT_CONCURRENCY`]; the returned
+    /// rows keep comparator order regardless of completion order.
+    pub async fn concept_subsumption(
+        &self,
+        reference: &ConceptRef,
+        identity: &ConceptIdentity,
+        manual: Option<&str>,
+    ) -> SubsumptionReport {
+        let system = reference.system.trim().to_owned();
+        let code = identity.code.trim().to_owned();
+
+        // (kind, ancestor candidate = codeA, descendant candidate = codeB, display)
+        let mut comparators: Vec<(ComparatorKind, String, String, String)> = Vec::new();
+        for parent in &identity.parents {
+            if parent.code.is_empty() {
+                continue;
+            }
+            comparators.push((
+                ComparatorKind::Parent,
+                parent.code.clone(),
+                code.clone(),
+                parent.display.clone(),
+            ));
+        }
+        for child in &identity.children {
+            if child.code.is_empty() {
+                continue;
+            }
+            comparators.push((
+                ComparatorKind::Child,
+                code.clone(),
+                child.code.clone(),
+                child.display.clone(),
+            ));
+        }
+        if let Some(manual) = manual.and_then(non_empty_str) {
+            // Direction is unknowable for a free-text code, so we ask the one
+            // question the panel's rule can express: does it subsume us?
+            comparators.push((
+                ComparatorKind::Manual,
+                manual.to_owned(),
+                code.clone(),
+                String::new(),
+            ));
+        }
+
+        let dropped = comparators
+            .len()
+            .saturating_sub(SubsumptionReport::MAX_COMPARATORS);
+        comparators.truncate(SubsumptionReport::MAX_COMPARATORS);
+
+        let request_url = format!("{}/CodeSystem/$subsumes", self.base_url);
+        if comparators.is_empty() {
+            return SubsumptionReport {
+                rows: Vec::new(),
+                dropped,
+                request_url,
+            };
+        }
+
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            HTS_UI_BATCH_FANOUT_CONCURRENCY,
+        ));
+        let mut handles = Vec::with_capacity(comparators.len());
+        for (position, (kind, code_a, code_b, display)) in comparators.into_iter().enumerate() {
+            let permits = permits.clone();
+            let client = self.clone();
+            let system = system.clone();
+            let version = reference.version.clone();
+            handles.push(tokio::spawn(async move {
+                // We own the semaphore and never close it, so `acquire` cannot
+                // fail here; binding the guard keeps the permit for the call.
+                let _permit = permits.acquire().await;
+                let outcome = client
+                    .cs_subsumes(
+                        &system,
+                        SubsumesParams {
+                            code_a: code_a.clone(),
+                            code_b: code_b.clone(),
+                            version,
+                        },
+                    )
+                    .await;
+                (position, kind, code_a, code_b, display, outcome)
+            }));
+        }
+
+        let mut collected: Vec<(usize, SubsumptionRow)> = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let (position, kind, code_a, code_b, display, outcome) = match handle.await {
+                Ok(v) => v,
+                // A panicked task would otherwise silently shrink the table;
+                // skipping keeps the remaining rows renderable.
+                Err(err) => {
+                    tracing::error!(?err, "hts-ui concept subsumption task failed");
+                    continue;
+                }
+            };
+            let mut row = SubsumptionRow {
+                kind_str: kind.as_str(),
+                code_a,
+                code_b,
+                display,
+                derived: kind.is_derived(),
+                ..SubsumptionRow::default()
+            };
+            match outcome {
+                Ok(result) => row.outcome = result.outcome,
+                Err(err) => match &err {
+                    UpstreamError::Outcome { outcome, .. } => {
+                        row.outcome_error = Some(outcome.clone())
+                    }
+                    UpstreamError::NotFound { .. } => {
+                        row.outcome_error = Some(OutcomeView {
+                            severity: "error".to_owned(),
+                            code: "not-found".to_owned(),
+                            ..OutcomeView::default()
+                        })
+                    }
+                    UpstreamError::HttpStatus { status, .. } => {
+                        row.outcome_error = Some(OutcomeView {
+                            severity: "error".to_owned(),
+                            code: match *status {
+                                400 => "invalid".to_owned(),
+                                404 => "not-found".to_owned(),
+                                _ => "unknown".to_owned(),
+                            },
+                            ..OutcomeView::default()
+                        })
+                    }
+                    UpstreamError::Decode { message, .. } => {
+                        row.outcome_error = Some(OutcomeView::invalid_input(message.clone()))
+                    }
+                    other => row.degraded_reason = Some(other.degraded_reason()),
+                },
+            }
+            collected.push((position, row));
+        }
+        collected.sort_by_key(|(position, _)| *position);
+
+        SubsumptionReport {
+            rows: collected.into_iter().map(|(_, row)| row).collect(),
+            dropped,
+            request_url,
+        }
+    }
+}
+
+/// Parse one `parameter[name=match]` group for the concept plane, returning the
+/// row and its `originMap` (empty when absent).
+///
+/// Deliberately separate from [`parse_translate_match`]: that one reads
+/// `originMap` as `valueUri`, but `translate.rs` emits it as
+/// **`valueCanonical`** (`{"name": "originMap", "valueCanonical": canonical}`).
+/// Accepting both spellings here keeps the Origin column populated against a
+/// real HTS.
+fn parse_concept_mapping_match(param: &Value) -> Option<(ConceptMappingRow, String)> {
+    let parts = param.get("part").and_then(|v| v.as_array())?;
+    let mut row = ConceptMappingRow::default();
+    let mut origin = String::new();
+    for part in parts {
+        let name = match part.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        match name {
+            "equivalence" => {
+                row.mapping_value = value_obj_str(part, "valueCode").to_owned();
+                row.kind = MappingKind::Equivalence;
+            }
+            "relationship" => {
+                row.mapping_value = value_obj_str(part, "valueCode").to_owned();
+                row.kind = MappingKind::Relationship;
+            }
+            "concept" => {
+                if let Some(coding) = part.get("valueCoding") {
+                    let s = |k: &str| {
+                        coding
+                            .get(k)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned()
+                    };
+                    row.code = s("code");
+                    row.system = s("system");
+                    row.display = s("display");
+                }
+            }
+            "originMap" => {
+                let v = part
+                    .get("valueCanonical")
+                    .or_else(|| part.get("valueUri"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !v.is_empty() {
+                    origin = v.to_owned();
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((row, origin))
+}
+
+#[cfg(test)]
+mod concept_plane_tests {
+    use super::*;
+
+    fn reference() -> ConceptRef {
+        ConceptRef {
+            system: "http://hl7.org/fhir/sid/icd-10-cm".into(),
+            code: "A01.0".into(),
+            version: None,
+            display_language: None,
+        }
+    }
+
+    #[test]
+    fn permalink_percent_encodes_the_canonical_system_uri() {
+        let link = reference().permalink();
+        assert!(
+            link.starts_with("/ui/hts/concepts?system=http%3A%2F%2Fhl7.org"),
+            "system must be percent-encoded in the query, got {link}",
+        );
+        assert!(link.contains("code=A01.0"), "code must round-trip: {link}");
+    }
+
+    #[test]
+    fn missing_halves_are_named_for_the_invalid_outcome() {
+        assert_eq!(reference().missing_parameter(), None);
+        let no_code = ConceptRef {
+            code: "  ".into(),
+            ..reference()
+        };
+        assert_eq!(no_code.missing_parameter(), Some("code"));
+        let neither = ConceptRef::default();
+        assert_eq!(neither.missing_parameter(), Some("system+code"));
+    }
+
+    #[test]
+    fn identity_splits_synthesised_parent_child_inactive_from_plain_properties() {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "name", "valueString": "ICD-10-CM"},
+                {"name": "display", "valueString": "Typhoid meningitis"},
+                {"name": "system", "valueUri": "http://hl7.org/fhir/sid/icd-10-cm"},
+                {"name": "code", "valueCode": "A01.0"},
+                {"name": "abstract", "valueBoolean": true},
+                {"name": "property", "part": [
+                    {"name": "code", "valueCode": "parent"},
+                    {"name": "value", "valueCode": "A01"},
+                    {"name": "description", "valueString": "Typhoid fever"}
+                ]},
+                {"name": "property", "part": [
+                    {"name": "code", "valueCode": "child"},
+                    {"name": "value", "valueCode": "A01.00"}
+                ]},
+                {"name": "property", "part": [
+                    {"name": "code", "valueCode": "inactive"},
+                    {"name": "value", "valueBoolean": false}
+                ]},
+                {"name": "property", "part": [
+                    {"name": "code", "valueCode": "notSelectable"},
+                    {"name": "value", "valueBoolean": true}
+                ]},
+                {"name": "used-supplement", "valueCanonical": "http://example.org/supp|1.0"}
+            ]
+        });
+        let lookup = LookupResult {
+            name: "ICD-10-CM".into(),
+            display: "Typhoid meningitis".into(),
+            raw_body: serde_json::to_string_pretty(&body).unwrap(),
+            ..LookupResult::default()
+        };
+        let identity = ConceptIdentity::from_lookup(lookup, &reference());
+
+        assert_eq!(identity.parents.len(), 1);
+        assert_eq!(identity.parents[0].code, "A01");
+        assert_eq!(identity.parents[0].display, "Typhoid fever");
+        assert_eq!(identity.children.len(), 1);
+        assert_eq!(identity.children[0].code, "A01.00");
+        assert_eq!(identity.inactive, Some(false));
+        assert!(identity.is_abstract);
+        assert_eq!(
+            identity.used_supplements,
+            vec!["http://example.org/supp|1.0"]
+        );
+        assert_eq!(
+            identity.properties.len(),
+            1,
+            "parent/child/inactive must not leak into the plain property list",
+        );
+        assert_eq!(identity.properties[0].code, "notSelectable");
+        assert_eq!(identity.status_suffix(), "active");
+    }
+
+    #[test]
+    fn identity_without_an_inactive_property_stays_unreported() {
+        let body = json!({"resourceType": "Parameters", "parameter": []});
+        let lookup = LookupResult {
+            raw_body: serde_json::to_string_pretty(&body).unwrap(),
+            ..LookupResult::default()
+        };
+        let identity = ConceptIdentity::from_lookup(lookup, &reference());
+        assert_eq!(identity.inactive, None);
+        assert_eq!(identity.status_suffix(), "unreported");
+    }
+
+    #[test]
+    fn origin_map_is_read_from_value_canonical() {
+        // `translate.rs` emits `valueCanonical`, not `valueUri`.
+        let param = json!({"name": "match", "part": [
+            {"name": "concept", "valueCoding": {"system": "http://s", "code": "T1"}},
+            {"name": "equivalence", "valueCode": "equivalent"},
+            {"name": "originMap", "valueCanonical": "http://example.org/cm/a|1.0"}
+        ]});
+        let (row, origin) = parse_concept_mapping_match(&param).expect("match parses");
+        assert_eq!(origin, "http://example.org/cm/a|1.0");
+        assert_eq!(row.kind, MappingKind::Equivalence);
+        assert_eq!(row.mapping_value, "equivalent");
+    }
+
+    #[test]
+    fn derived_row_disagreeing_with_lookup_is_a_conflict() {
+        let conflicting = SubsumptionRow {
+            kind_str: "parent",
+            derived: true,
+            outcome: "not-subsumed".into(),
+            ..SubsumptionRow::default()
+        };
+        assert!(conflicting.is_conflict());
+        assert_eq!(conflicting.tag_modifier(), "conflict");
+
+        let healthy = SubsumptionRow {
+            derived: true,
+            outcome: "subsumes".into(),
+            ..SubsumptionRow::default()
+        };
+        assert!(!healthy.is_conflict());
+        assert_eq!(healthy.tag_modifier(), "matched");
+
+        // A manual comparator carries no expectation, so it can never be a
+        // conflict — only derived rows can expose the closure gap.
+        let manual = SubsumptionRow {
+            kind_str: "manual",
+            derived: false,
+            outcome: "not-subsumed".into(),
+            ..SubsumptionRow::default()
+        };
+        assert!(!manual.is_conflict());
+        assert_eq!(manual.tag_modifier(), "muted");
     }
 }

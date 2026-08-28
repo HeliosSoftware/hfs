@@ -9,6 +9,25 @@ architecture, reuse strategy, and phasing before code lands.
 **Companion API truth:** [hts-details.md](hts-details.md).  
 **Fetched / authored:** 2026-08-18.
 
+> ## ⚠ Scope change — 2026-08-27
+>
+> **The Operations workbench page (§7.6) and the Home Quick-links strip (§7.1) are REMOVED
+> from the HTS UI.** Every reference to either below is historical and describes the shipped
+> v1, not the target.
+>
+> - **Operations** — delete `/ui/hts/operations` and its 11 routes, `pages/operations.html`,
+>   and all `hts-op-*` partials. This **orphans `$closure`, `$batch-validate-code` and
+>   ValueSet `$validate-code`**, because `VsTab` has only `Expand` and `CmTab` only
+>   `Translate`. Recommended: re-home them as `VsTab::{Validate, BatchValidate}` and
+>   `CmTab::Closure`.
+> - **Quick links** — drop `.hts-quick-strip` from `partials/hts-home-cards.html`, retire the
+>   `hts-home-quick-links` Fluent key, and delete `.hts-quick-strip` / `.hts-quick-links` from
+>   `app.css` (the only two `hts-*` rules in the file).
+>
+> Current plan of record: [hts-ui-improvement-plan.md](hts-ui-improvement-plan.md) §1.5.
+
+
+
 ---
 
 ## 1. Requirement (verbatim)
@@ -559,14 +578,7 @@ Where every benchmark falls short — HTS differentiators for v1:
 │   └── /ui/hts/value-sets/{id}         # ValueSet detail + embedded $expand
 ├── /ui/hts/concept-maps                # ConceptMap browser
 │   └── /ui/hts/concept-maps/{id}       # ConceptMap detail + embedded $translate
-├── /ui/hts/operations                  # Unified operation workbench
-│   ├── ?op=lookup
-│   ├── ?op=validate-code
-│   ├── ?op=subsumes
-│   ├── ?op=expand
-│   ├── ?op=translate
-│   ├── ?op=closure
-│   └── ?op=batch-validate
+├── (REMOVED 2026-08-27) /ui/hts/operations   # Unified operation workbench
 ├── /ui/hts/import                      # Import status + non-fatal error list
 ├── /ui/hts/bootstrap                   # Bootstrap ledger (v1.5)
 └── /ui/hts/diagnostics                 # /metadata + /health + /metrics
@@ -621,7 +633,6 @@ between Import and the Bootstrap ledger.
 | VS detail + expand | `GET /ValueSet/{id}`, `POST /ValueSet/{id}/$expand` | `GET/POST /ui/hts/value-sets/{id}` (+ expand fragment) |
 | CM browser | `GET /ConceptMap?...` | `GET /ui/hts/concept-maps`, `.../rows` |
 | CM detail + translate | `GET /ConceptMap/{id}`, `POST .../$translate` | `GET/POST /ui/hts/concept-maps/{id}` |
-| Operations | All seven ops (type + instance where applicable) | `GET /ui/hts/operations`, `GET .../input`, `POST .../run` |
 | Import | `POST /import` | `GET/POST /ui/hts/import` |
 | Bootstrap | *new admin route required* | `GET /ui/hts/bootstrap` (Phase 1.5) |
 | Diagnostics | `/metadata`, `/health`, `/metrics` | `GET /ui/hts/diagnostics` |
@@ -849,7 +860,7 @@ in-process self-call against `127.0.0.1` / `localhost`.
 | .stat-grid.stat-grid--2 — sr-only <h2> "Traffic metrics"      |
 |  [Requests — · hint]             [Avg latency — · hint]       |
 +---------------------------------------------------------------+
-| .card.hts-quick-strip — eyebrow "Quick links" (sr-only <h2>)  |
+| (REMOVED 2026-08-27) .card.hts-quick-strip — "Quick links"     |
 |  <a.pill CS> <a.pill VS> <a.pill CM> <a.pill Ops> <a.pill Im> |
 +---------------------------------------------------------------+
 @media (max-width: 900px) — .stat-grid collapses to 2 col, pills wrap.
@@ -1732,7 +1743,7 @@ that fell out of landing the ConceptMap surface:
   100 ms / 250 ms envelope; mock fixtures use 2 s connect / 5 s
   request as of §7.4.1.
 
-### 7.6 Operations workbench — `/ui/hts/operations`
+### 7.6 Operations workbench — `/ui/hts/operations` — **REMOVED 2026-08-27**
 
 - **Purpose** — Single place for all seven ops (§6.1); entry point for
   "arbitrary system/code" flows. Detail pages (§7.3/§7.4/§7.5) embed the

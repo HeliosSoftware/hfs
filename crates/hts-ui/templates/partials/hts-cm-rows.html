@@ -21,13 +21,13 @@
   the CS/VS mirror.
 -#}
 <div id="hts-cm-rows">
+  {#- `.notice.notice--warn`: see hts-cs-rows.html — the old
+      `.hts-degraded*` hooks had no rule in app.css. -#}
   {% if let Some(reason) = view.degraded_reason() %}
-  <aside class="hts-degraded" role="alert" aria-live="assertive">
-    <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
-    <p class="hts-degraded__reason">
-      {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
-    </p>
-    <p class="hts-degraded__body">{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  <aside class="notice notice--warn" role="alert" aria-live="assertive">
+    <p><strong>{{ chrome.i18n.t("hts-degraded-title") }}</strong></p>
+    <p>{{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}</p>
+    <p>{{ chrome.i18n.t("hts-degraded-body") }}</p>
   </aside>
   {% endif %}
 
@@ -52,7 +52,7 @@
           {% if let Some(page) = view.page() %}
             {% if page.rows.is_empty() %}
               {% if !view.count_over_max %}
-              <tr>
+              <tr class="data-table__empty">
                 <td colspan="5">{{ chrome.i18n.t("hts-cm-browser-empty") }}</td>
               </tr>
               {% endif %}
@@ -60,14 +60,16 @@
               {% for row in page.rows %}
               <tr>
                 <td class="col-name">
-                  <a href="/ui/hts/concept-maps/{{ row.id }}">
+                  {#- ConceptMap ids have no version pipe, but the segment is
+                      encoded anyway so any future id shape stays safe. -#}
+                  <a href="/ui/hts/concept-maps/{{ row.id|urlencode_strict }}">
                     {% if !row.name.is_empty() %}{{ row.name }}
                     {%- else %}{{ row.id }}
                     {%- endif %}
                   </a>
                 </td>
                 <td>{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
-                <td>{% if row.url.is_empty() %}&mdash;{% else %}<code class="url">{{ row.url }}</code>{% endif %}</td>
+                <td>{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
                 <td>
                   {#-
                     Stacked mapping cell: prefix labels (`S:` / `T:`) let
@@ -114,7 +116,7 @@
           {{ chrome.i18n.t_arg("hts-cm-browser-showing-count", "count", page.showing_count().to_string()) }}
         </span>
         {% if let Some(next) = page.next_offset() %}
-          <button type="button" class="btn btn--secondary"
+          <button type="button" class="btn"
                   hx-get="{{ view.filters.load_more_url(next) }}"
                   hx-target="#hts-cm-rows tbody"
                   hx-swap="beforeend"

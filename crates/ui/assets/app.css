@@ -1092,20 +1092,6 @@ button.pill {
   max-width: 620px;
 }
 
-/* Quick-links strip on the HTS dashboard: a full-width `.card` that stacks
-   the eyebrow label above a wrapping row of `.pill` anchors. Kept HTS-scoped
-   via the class name so it never interferes with HFS card layouts. */
-.hts-quick-strip {
-  padding: 16px 20px;
-  display: grid;
-  gap: 12px;
-}
-.hts-quick-strip .hts-quick-links {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
 /* Accessible sr-only helper — hides the element visually while keeping it
    in the accessibility tree. Referenced by row headings in the HTS
    dashboard partial and by outcome/import announcements. Without this rule
@@ -1127,20 +1113,6 @@ button.pill {
   padding: 20px 24px;
   color: var(--muted);
 }
-
-  /* Quick-links strip on the HTS dashboard: a full-width `.card` that stacks
-   the eyebrow label above a wrapping row of `.pill` anchors. Kept HTS-scoped
-   via the class name so it never interferes with HFS card layouts. */
-  .hts-quick-strip {
-    padding: 16px 20px;
-    display: grid;
-    gap: 12px;
-  }
-  .hts-quick-strip .hts-quick-links {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
 
   /* Accessible sr-only helper — hides the element visually while keeping it
      in the accessibility tree. Referenced by row headings in the HTS
@@ -2458,7 +2430,11 @@ textarea.field__input {
 }
 
 .data-table tbody tr:hover td,
-.data-table tbody tr[aria-selected="true"] td {
+.data-table tbody tr[aria-selected="true"] td,
+/* `aria-current` is the convention every other selected element in this file
+   uses (.chip, .tab, .nav-item, .filter-rail__item); tables joined it on
+   2026-08-27 so a selected row paints like everything else. */
+.data-table tbody tr[aria-current="true"] td {
   background: var(--accent-soft);
 }
 

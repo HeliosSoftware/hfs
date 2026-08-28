@@ -146,6 +146,9 @@ where
             version: env!("CARGO_PKG_VERSION"),
             upstream,
             bundled_data_bytes,
+            // Rolling `/metrics` samples for the Home request-rate chart.
+            // Starts empty; the Home page's own 15 s poll fills it.
+            metrics_ring: Default::default(),
         });
         Some(helios_hts_ui::router(ui_state))
     } else {

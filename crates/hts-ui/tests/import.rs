@@ -48,6 +48,7 @@ fn app_with_timeouts(
         )
         .expect("test upstream base URL parses"),
         bundled_data_bytes: None,
+        metrics_ring: Default::default(),
     });
     Router::new().nest("/ui", helios_hts_ui::router(state))
 }
@@ -305,6 +306,48 @@ async fn import_page_renders_full_shell_with_upload_form() {
         !html.contains("Terminology backend not fully available"),
         "healthy upstream must NOT render the degraded banner",
     );
+
+    // ── V3 stepped layout (#551) ────────────────────────────────────
+    // Three numbered `.card` steps. The form IS step 1's card so all
+    // three stay direct children of `<main class="content">`, which is
+    // what `.content > .card ~ .card` in app.css needs to space them.
+    for step in ["Choose source", "Review", "Result"] {
+        assert!(
+            html.contains(step),
+            "the stepped layout must render the `{step}` step heading",
+        );
+    }
+    assert!(
+        html.contains(r#"<form class="card""#) && html.contains(r#"id="hts-import-form""#),
+        "step 1 must be the form itself, carrying the shared .card class",
+    );
+    assert!(
+        html.matches(r#"class="card-head""#).count() >= 3,
+        "each of the three steps needs its own .card-head",
+    );
+    // Step 2's submit lives in a sibling card and is wired back to the
+    // form with the HTML `form=` attribute — the nojs POST contract
+    // depends on that association.
+    assert!(
+        html.contains(r#"form="hts-import-form""#),
+        "the submit must be associated with the form it lives outside of",
+    );
+    // Step 3 is the htmx swap target and is itself a card.
+    assert!(
+        html.contains(r#"id="hts-import-status""#) && html.contains(r#"aria-live="polite""#),
+        "the result step must be the polite live region htmx swaps into",
+    );
+    assert!(
+        html.contains(r#"data-import-status="empty""#),
+        "the untouched result step must announce the empty state",
+    );
+    // Step 2 must not fabricate a pre-flight entry count: HTS reports
+    // counts only in the POST /import response. It shows the real
+    // target URL instead.
+    assert!(
+        html.contains("/import<") || html.contains("/import</code>"),
+        "the review step must name the real upstream target URL",
+    );
     // Some keys collide with element ids by design (`hts-import-heading`
     // on the H1, `hts-import-submit` on the button, `hts-import-bundle`
     // on the textarea, `hts-import-status` on the status region) —
@@ -318,6 +361,16 @@ async fn import_page_renders_full_shell_with_upload_form() {
         "hts-import-status-rejected",
         "hts-import-empty-bundle-error",
         "hts-import-invalid-json-error",
+        "hts-import-step-source",
+        "hts-import-step-review",
+        "hts-import-step-result",
+        "hts-import-file-hint",
+        "hts-import-bundle-hint",
+        "hts-import-review-target",
+        "hts-import-review-request",
+        "hts-import-review-accepted",
+        "hts-import-review-existing",
+        "hts-import-review-note",
     ] {
         assert!(
             !html.contains(key),
@@ -346,10 +399,22 @@ async fn import_post_200_renders_success_summary() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
 
+    // V3 stepped layout (#551): the old `hts-import-status--ok` modifier
+    // had no CSS rule, so the marker moved to a styling-free data
+    // attribute and the *visual* distinction is carried by shared
+    // primitives — `.notice` (no modifier) plus a green `.tag--matched`.
     assert!(
-        html.contains("hts-import-status--ok"),
-        "200 must render the ok status class marker; got: {}",
+        html.contains(r#"data-import-status="success""#),
+        "200 must render the success status marker; got: {}",
         &html[..html.len().min(400)],
+    );
+    assert!(
+        html.contains(r#"<span class="tag tag--matched">"#),
+        "success must be tagged with tag--matched",
+    );
+    assert!(
+        !html.contains("notice notice--warn"),
+        "success must NOT render the amber warn notice",
     );
     assert!(
         html.contains("Import complete"),
@@ -401,8 +466,23 @@ async fn import_post_207_renders_partial_success_with_issue_list() {
     let html = body_text(response).await;
 
     assert!(
-        html.contains("hts-import-status--warn"),
-        "207 must render the amber (warn) status class marker",
+        html.contains(r#"data-import-status="partial""#),
+        "207 must render the partial status marker",
+    );
+    // The headline fix: partial-success must be visually distinct from
+    // success — amber notice + a muted tag, not the plain notice + green
+    // tag the 200 arm renders.
+    assert!(
+        html.contains(r#"class="notice notice--warn""#),
+        "207 must render the amber warn notice",
+    );
+    assert!(
+        html.contains(r#"<span class="tag tag--muted">"#),
+        "207 must be tagged with tag--muted",
+    );
+    assert!(
+        !html.contains("tag tag--matched"),
+        "207 must NOT reuse the success (green) tag",
     );
     assert!(
         html.contains("Import partially succeeded"),
@@ -411,6 +491,10 @@ async fn import_post_207_renders_partial_success_with_issue_list() {
     assert!(
         html.contains("<details"),
         "issue list must be inside a <details> expander",
+    );
+    assert!(
+        !html.contains("class=\"addbox\""),
+        "disclosures must be bare <details>, never the .addbox dropdown",
     );
     assert!(
         html.contains("2 issues"),
@@ -443,15 +527,23 @@ async fn import_post_400_renders_outcome_partial() {
     let html = body_text(response).await;
 
     assert!(
-        html.contains("hts-import-status--error"),
-        "400 must render the error status class marker",
+        html.contains(r#"data-import-status="rejected""#),
+        "400 must render the rejected status marker",
+    );
+    assert!(
+        html.contains(r#"<span class="tag tag--excluded">"#),
+        "400 must be tagged with tag--excluded",
+    );
+    assert!(
+        html.contains(r#"class="notice notice--warn""#),
+        "400 must render the amber warn notice",
     );
     assert!(
         html.contains("Import rejected"),
         "400 must render the rejected title (en value)",
     );
     assert!(
-        html.contains("hts-outcome hts-outcome--error"),
+        html.contains(r#"data-severity="error""#),
         "400 must render the shared OperationOutcome partial in error severity",
     );
     assert!(
@@ -481,8 +573,12 @@ async fn import_post_413_renders_too_large_guidance() {
     let html = body_text(response).await;
 
     assert!(
-        html.contains("hts-import-status--warn"),
-        "413 must render the warn status class marker",
+        html.contains(r#"data-import-status="too-large""#),
+        "413 must render the too-large status marker",
+    );
+    assert!(
+        html.contains(r#"class="notice notice--warn""#),
+        "413 must render the amber warn notice",
     );
     assert!(
         html.contains("Bundle too large"),
@@ -519,7 +615,7 @@ async fn import_pre_flight_empty_bundle_returns_outcome_without_calling_hts() {
     let html = body_text(response).await;
 
     assert!(
-        html.contains("hts-outcome hts-outcome--error"),
+        html.contains(r#"data-severity="error""#),
         "empty bundle must render the invalid-input outcome",
     );
 

@@ -7,67 +7,68 @@
   the CS detail workbench keeps the field set small so the inline surface
   reads at a glance.
 
-  Layout: `.field`/`.field__input` primitives; code and version share a
-  `.builder-grid` row (design doc §9 form contract).
+  V3 layout: the form IS the card. `.card-head` carries the heading (an
+  `<h3>` — the old `<h5>`-shaped hook rendered smaller than body text),
+  `.panel` carries the field stack. Field primitives are `.field` /
+  `.field__input`; code and version share a `.builder-grid` row (design
+  doc §9 form contract). The repeatable `property` checkboxes render as
+  `.chip` labels in a `.facets.facets--bare` row rather than a UA-styled
+  `<fieldset>`.
 -#}
 <form id="hts-workbench-input"
-      class="hts-cs-workbench__input"
+      class="card"
+      style="margin-bottom:16px"
       method="post"
       action="/ui/hts/code-systems/{{ id }}/lookup"
       hx-post="/ui/hts/code-systems/{{ id }}/lookup"
       hx-target="#hts-workbench-result"
       hx-swap="outerHTML"
       aria-labelledby="hts-workbench-input-heading">
-  <h3 id="hts-workbench-input-heading" class="hts-cs-workbench__input-heading">
-    {{ chrome.i18n.t("hts-cs-lookup-heading") }}
-  </h3>
-
-  <div class="builder-grid">
-    <div class="field">
-      <label class="field__label" for="lookup-code">{{ chrome.i18n.t("hts-cs-lookup-code") }}</label>
-      <input class="field__input" id="lookup-code" name="code" type="text" required autocomplete="off" spellcheck="false">
-    </div>
-    <div class="field">
-      <label class="field__label" for="lookup-version">{{ chrome.i18n.t("hts-cs-lookup-version") }}</label>
-      <input class="field__input" id="lookup-version" name="version" type="text" autocomplete="off" spellcheck="false"
-             value="{% if let Some(s) = summary %}{{ s.version }}{% endif %}">
-    </div>
+  <div class="card-head">
+    <h3 id="hts-workbench-input-heading">{{ chrome.i18n.t("hts-cs-lookup-heading") }}</h3>
   </div>
 
-  <div class="field">
-    <label class="field__label" for="lookup-display-language">{{ chrome.i18n.t("hts-cs-lookup-display-language") }}</label>
-    <input class="field__input" id="lookup-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false"
-           placeholder="{{ chrome.i18n.t("hts-cs-lookup-display-language-placeholder") }}">
-  </div>
+  <div class="panel">
+    <div class="builder-grid">
+      <div class="field">
+        <label class="field__label" for="lookup-code">{{ chrome.i18n.t("hts-cs-lookup-code") }}</label>
+        <input class="field__input" id="lookup-code" name="code" type="text" required autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label class="field__label" for="lookup-version">{{ chrome.i18n.t("hts-cs-lookup-version") }}</label>
+        <input class="field__input" id="lookup-version" name="version" type="text" autocomplete="off" spellcheck="false"
+               value="{% if let Some(s) = summary %}{{ s.version }}{% endif %}">
+      </div>
+    </div>
 
-  <fieldset>
-    <legend>{{ chrome.i18n.t("hts-cs-lookup-properties-legend") }}</legend>
+    <div class="field">
+      <label class="field__label" for="lookup-display-language">{{ chrome.i18n.t("hts-cs-lookup-display-language") }}</label>
+      <input class="field__input" id="lookup-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false"
+             placeholder="{{ chrome.i18n.t("hts-cs-lookup-display-language-placeholder") }}">
+    </div>
+
     {#-
       Repeatable `property` values. Passing `*` requests all properties
       (hts-details.md §CS `$lookup`); the other three are the most useful
       quick-picks for hierarchy inspection. Hard-coded rather than
       generated from a Rust array because Askama 0.16 has no
       &&str == &str fallback for iteration variables.
-    -#}
-    <label>
-      <input type="checkbox" name="property" value="*" checked>
-      <code>*</code>
-    </label>
-    <label>
-      <input type="checkbox" name="property" value="parent">
-      <code>parent</code>
-    </label>
-    <label>
-      <input type="checkbox" name="property" value="child">
-      <code>child</code>
-    </label>
-    <label>
-      <input type="checkbox" name="property" value="definition">
-      <code>definition</code>
-    </label>
-  </fieldset>
 
-  <div class="form-actions">
-    <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
+      `role="group"` + `aria-labelledby` replaces the <fieldset>/<legend>
+      pair so the labelled grouping survives without UA chrome.
+    -#}
+    <div class="field" role="group" aria-labelledby="lookup-properties-label">
+      <span class="field__label" id="lookup-properties-label">{{ chrome.i18n.t("hts-cs-lookup-properties-legend") }}</span>
+      <div class="facets facets--bare">
+        <label class="chip"><input type="checkbox" name="property" value="*" checked> <code>*</code></label>
+        <label class="chip"><input type="checkbox" name="property" value="parent"> <code>parent</code></label>
+        <label class="chip"><input type="checkbox" name="property" value="child"> <code>child</code></label>
+        <label class="chip"><input type="checkbox" name="property" value="definition"> <code>definition</code></label>
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
+    </div>
   </div>
 </form>

@@ -26,97 +26,105 @@
                 succeeded, used to render the map's canonical url header
     direction : TranslateDirection — current toggle state
 
-  Post form-polish (design doc §9): `.field`/`.field__input` primitives
-  everywhere; system/code and target VS URL pairs use `.builder-grid`.
+  V3 layout: the form IS the card — `.card-head` heading + `.panel` field
+  stack (design doc §9 form contract). The direction radios are
+  chip-shaped but remain real radios: the `.window-picker` link pair in
+  the mockup is `<a href>` and would discard the rest of the form state.
 -#}
 <form id="hts-workbench-input"
-      class="hts-cm-workbench__input"
+      class="card"
+      style="margin-bottom:16px"
       method="post"
       action="/ui/hts/concept-maps/{{ id }}/translate"
       hx-post="/ui/hts/concept-maps/{{ id }}/translate"
       hx-target="#hts-workbench-result"
       hx-swap="outerHTML"
       aria-labelledby="hts-workbench-input-heading">
-  <h3 id="hts-workbench-input-heading" class="hts-cm-workbench__input-heading">
-    {{ chrome.i18n.t("hts-cm-translate-heading") }}
-  </h3>
+  <div class="card-head">
+    <h3 id="hts-workbench-input-heading">{{ chrome.i18n.t("hts-cm-translate-heading") }}</h3>
+  </div>
 
-  {% if let Some(s) = summary %}
-    {% if !s.url.is_empty() %}
-    <p class="hts-cm-workbench__pinned-map">
-      <span class="hts-cm-workbench__pinned-map-label">{{ chrome.i18n.t("hts-cm-translate-scoped-map") }}</span>
-      <code>{{ s.url }}</code>
-    </p>
+  <div class="panel">
+    {% if let Some(s) = summary %}
+      {% if !s.url.is_empty() %}
+      <div class="kv-grid">
+        <div class="detail__field detail__field--wide">
+          <span>{{ chrome.i18n.t("hts-cm-translate-scoped-map") }}</span>
+          <code>{{ s.url }}</code>
+        </div>
+      </div>
+      {% endif %}
     {% endif %}
-  {% endif %}
 
-  {#-
-    Direction toggle. Clicking a radio re-fetches this partial with the
-    appropriate visibility. The URL carries `direction=…` and the server
-    re-renders this same partial with the matching field group. Same-URL
-    GET means the nojs fallback stays coherent (a hard nav to
-    /translate?direction=reverse still lands the right form).
+    {#-
+      Direction toggle. Clicking a radio re-fetches this partial with the
+      appropriate visibility. The URL carries `direction=…` and the server
+      re-renders this same partial with the matching field group. Same-URL
+      GET means the nojs fallback stays coherent (a hard nav to
+      /translate?direction=reverse still lands the right form).
 
-    `hx-params="none"` is critical: without it, htmx serialises the
-    trigger radio's own form value (`name="direction"`, currently-
-    checked `value="reverse"`) onto the GET URL. Because the URL
-    already carries the literal `?direction=reverse` from `hx-get`,
-    the wire ends up as `?direction=reverse&direction=reverse`, which
-    axum's `Query<TranslateInputForm>` (serde_urlencoded's derived
-    Deserialize) rejects with HTTP 400 on the duplicate scalar field.
-    htmx's default 4xx handler is `swap: false`, so the reverse
-    fieldset never lands in the DOM and Playwright times out looking
-    for `Target code`. `hx-params="none"` short-circuits htmx's
-    FormData collection for these two triggers so the URL is emitted
-    verbatim. See edson/docs/hts-ui-cm139-diagnosis.md for the wire
-    trace and htmx-source references.
+      `hx-params="none"` is critical: without it, htmx serialises the
+      trigger radio's own form value (`name="direction"`, currently-
+      checked `value="reverse"`) onto the GET URL. Because the URL
+      already carries the literal `?direction=reverse` from `hx-get`,
+      the wire ends up as `?direction=reverse&direction=reverse`, which
+      axum's `Query<TranslateInputForm>` (serde_urlencoded's derived
+      Deserialize) rejects with HTTP 400 on the duplicate scalar field.
+      htmx's default 4xx handler is `swap: false`, so the reverse
+      fieldset never lands in the DOM and Playwright times out looking
+      for `Target code`. `hx-params="none"` short-circuits htmx's
+      FormData collection for these two triggers so the URL is emitted
+      verbatim. See edson/docs/hts-ui-cm139-diagnosis.md for the wire
+      trace and htmx-source references.
 
-    `hx-select="#hts-workbench-input"` is equally critical: the GET
-    handler (`translate_input` in crates/hts-ui/src/concept_maps.rs)
-    always renders the full `DetailPageTemplate` (extends
-    `layouts/base.html`) so the nojs hard-nav fallback keeps working.
-    Without `hx-select`, htmx would swap the entire response body into
-    the form's outerHTML slot, nesting a second
-    `#hts-cm-detail-region` / `#hts-cm-workbench` / `#hts-workbench-input`
-    / `#hts-workbench-result` under the workbench and leaving the
-    original `#hts-workbench-result` sibling untouched. Subsequent
-    Playwright `page.locator("#hts-workbench-result")` calls trip
-    strict-mode with two matches; htmx also picks the first-in-DOM
-    (nested) result region on the next POST swap, so the operator's
-    match table ends up hidden below a stale empty-state block. The
-    tabs in `cs-detail.html` / `cm-detail.html` use the same
-    `hx-select` pattern to extract just the region from the full-page
-    response.
-  -#}
-  <fieldset>
-    <legend>{{ chrome.i18n.t("hts-cm-translate-direction-legend") }}</legend>
-    <label>
-      <input type="radio" name="direction" value="forward"
-             {% if direction == TranslateDirection::Forward %} checked{% endif %}
-             hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=forward"
-             hx-target="#hts-workbench-input"
-             hx-select="#hts-workbench-input"
-             hx-swap="outerHTML"
-             hx-trigger="click"
-             hx-params="none">
-      <span>{{ chrome.i18n.t("hts-cm-translate-direction-forward") }}</span>
-    </label>
-    <label>
-      <input type="radio" name="direction" value="reverse"
-             {% if direction == TranslateDirection::Reverse %} checked{% endif %}
-             hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=reverse"
-             hx-target="#hts-workbench-input"
-             hx-select="#hts-workbench-input"
-             hx-swap="outerHTML"
-             hx-trigger="click"
-             hx-params="none">
-      <span>{{ chrome.i18n.t("hts-cm-translate-direction-reverse") }}</span>
-    </label>
-  </fieldset>
+      `hx-select="#hts-workbench-input"` is equally critical: the GET
+      handler (`translate_input` in crates/hts-ui/src/concept_maps.rs)
+      always renders the full `DetailPageTemplate` (extends
+      `layouts/base.html`) so the nojs hard-nav fallback keeps working.
+      Without `hx-select`, htmx would swap the entire response body into
+      the form's outerHTML slot, nesting a second
+      `#hts-cm-detail-region` / `#hts-cm-workbench` / `#hts-workbench-input`
+      / `#hts-workbench-result` under the workbench and leaving the
+      original `#hts-workbench-result` sibling untouched. Subsequent
+      Playwright `page.locator("#hts-workbench-result")` calls trip
+      strict-mode with two matches; htmx also picks the first-in-DOM
+      (nested) result region on the next POST swap, so the operator's
+      match table ends up hidden below a stale empty-state block. The
+      tabs in `cs-detail.html` / `cm-detail.html` use the same
+      `hx-select` pattern to extract just the region from the full-page
+      response.
+    -#}
+    <div class="field" role="group" aria-labelledby="translate-direction-label">
+      <span class="field__label" id="translate-direction-label">{{ chrome.i18n.t("hts-cm-translate-direction-legend") }}</span>
+      <div class="facets facets--bare">
+        <label class="chip">
+          <input type="radio" name="direction" value="forward"
+                 {% if direction == TranslateDirection::Forward %} checked{% endif %}
+                 hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=forward"
+                 hx-target="#hts-workbench-input"
+                 hx-select="#hts-workbench-input"
+                 hx-swap="outerHTML"
+                 hx-trigger="click"
+                 hx-params="none">
+          {{ chrome.i18n.t("hts-cm-translate-direction-forward") }}
+        </label>
+        <label class="chip">
+          <input type="radio" name="direction" value="reverse"
+                 {% if direction == TranslateDirection::Reverse %} checked{% endif %}
+                 hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=reverse"
+                 hx-target="#hts-workbench-input"
+                 hx-select="#hts-workbench-input"
+                 hx-swap="outerHTML"
+                 hx-trigger="click"
+                 hx-params="none">
+          {{ chrome.i18n.t("hts-cm-translate-direction-reverse") }}
+        </label>
+      </div>
+    </div>
 
-  {% if direction == TranslateDirection::Forward %}
-  <fieldset>
-    <legend>{{ chrome.i18n.t("hts-cm-translate-source-legend") }}</legend>
+    {% if direction == TranslateDirection::Forward %}
+    <div role="group" aria-labelledby="translate-source-label">
+      <span class="field__label" id="translate-source-label">{{ chrome.i18n.t("hts-cm-translate-source-legend") }}</span>
     <div class="builder-grid">
       <div class="field">
         <label class="field__label" for="translate-system">{{ chrome.i18n.t("hts-cm-translate-source-system") }}</label>
@@ -133,25 +141,34 @@
       <input class="field__input" id="translate-display" name="display" type="text" autocomplete="off" spellcheck="false"
              placeholder="{{ chrome.i18n.t("hts-cm-translate-source-display-placeholder") }}">
     </div>
-  </fieldset>
-  {% else %}
-  <fieldset>
-    <legend>{{ chrome.i18n.t("hts-cm-translate-reverse-legend") }}</legend>
-    <div class="field">
-      <label class="field__label" for="translate-target-code">{{ chrome.i18n.t("hts-cm-translate-target-code") }}</label>
-      <input class="field__input" id="translate-target-code" name="targetCode" type="text" autocomplete="off" spellcheck="false">
-      <small class="field__hint">{{ chrome.i18n.t("hts-cm-translate-target-code-hint") }}</small>
     </div>
-  </fieldset>
-  {% endif %}
+    {% else %}
+    <div role="group" aria-labelledby="translate-reverse-label">
+      <span class="field__label" id="translate-reverse-label">{{ chrome.i18n.t("hts-cm-translate-reverse-legend") }}</span>
+      <div class="field">
+        <label class="field__label" for="translate-target-code">{{ chrome.i18n.t("hts-cm-translate-target-code") }}</label>
+        <input class="field__input" id="translate-target-code" name="targetCode" type="text" autocomplete="off" spellcheck="false">
+        <span class="field__hint">{{ chrome.i18n.t("hts-cm-translate-target-code-hint") }}</span>
+      </div>
+    </div>
+    {% endif %}
+  </div>
 
-  <fieldset>
-    <legend>{{ chrome.i18n.t("hts-cm-translate-target-legend") }}</legend>
+  {#- Second band: the constraints HTS applies to whichever side the
+      direction toggle made the target. Rendered as its own
+      `.card-head` + `.panel` pair, the same two-band idiom
+      `hts-cs-validate-input.html` uses for its Coding group. -#}
+  <div class="card-head">
+    <h3>{{ chrome.i18n.t("hts-cm-translate-target-legend") }}</h3>
+  </div>
+
+  <div class="panel">
     <div class="field">
       <label class="field__label" for="translate-target-system">{{ chrome.i18n.t("hts-cm-translate-target-system") }}</label>
       <input class="field__input" id="translate-target-system" name="targetSystem" type="text" autocomplete="off" spellcheck="false"
              placeholder="{{ chrome.i18n.t("hts-cm-translate-target-system-placeholder") }}">
     </div>
+
     <div class="builder-grid">
       <div class="field">
         <label class="field__label" for="translate-source-url">{{ chrome.i18n.t("hts-cm-translate-source-url") }}</label>
@@ -164,15 +181,15 @@
                placeholder="{{ chrome.i18n.t("hts-cm-translate-target-url-placeholder") }}">
       </div>
     </div>
-  </fieldset>
 
-  <div class="field">
-    <label class="field__label" for="translate-date">{{ chrome.i18n.t("hts-cm-translate-date") }}</label>
-    <input class="field__input" id="translate-date" name="date" type="text" autocomplete="off" spellcheck="false"
-           placeholder="{{ chrome.i18n.t("hts-cm-translate-date-placeholder") }}">
-  </div>
+    <div class="field">
+      <label class="field__label" for="translate-date">{{ chrome.i18n.t("hts-cm-translate-date") }}</label>
+      <input class="field__input" id="translate-date" name="date" type="text" autocomplete="off" spellcheck="false"
+             placeholder="{{ chrome.i18n.t("hts-cm-translate-date-placeholder") }}">
+    </div>
 
-  <div class="form-actions">
-    <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-cm-translate-submit") }}</button>
+    <div class="form-actions">
+      <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-cm-translate-submit") }}</button>
+    </div>
   </div>
 </form>

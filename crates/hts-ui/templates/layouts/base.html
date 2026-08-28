@@ -33,29 +33,34 @@
         <span class="icon">{% include "icons/book.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-code-systems") }}</span>
       </a>
-      <a class="nav-item nav-item--soon" href="/ui/hts/value-sets"{% if chrome.active_page == "value-sets" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-value-sets") }}">
+      <a class="nav-item" href="/ui/hts/value-sets"{% if chrome.active_page == "value-sets" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-value-sets") }}">
         <span class="icon">{% include "icons/bookmark.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-value-sets") }}</span>
       </a>
-      <a class="nav-item nav-item--soon" href="/ui/hts/concept-maps"{% if chrome.active_page == "concept-maps" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-concept-maps") }}">
+      <a class="nav-item" href="/ui/hts/concept-maps"{% if chrome.active_page == "concept-maps" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-concept-maps") }}">
         <span class="icon">{% include "icons/sync.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-concept-maps") }}</span>
       </a>
 
       <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-tools") }}</div>
-      <a class="nav-item nav-item--soon" href="/ui/hts/operations"{% if chrome.active_page == "operations" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-operations") }}">
-        <span class="icon">{% include "icons/sliders.svg" %}</span>
-        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-operations") }}</span>
-      </a>
-      <a class="nav-item nav-item--soon" href="/ui/hts/import"{% if chrome.active_page == "import" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-import") }}">
+      <a class="nav-item" href="/ui/hts/import"{% if chrome.active_page == "import" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-import") }}">
         <span class="icon">{% include "icons/import.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-import") }}</span>
       </a>
 
       <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-server") }}</div>
-      <a class="nav-item nav-item--soon" href="/ui/hts/diagnostics"{% if chrome.active_page == "diagnostics" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-diagnostics") }}">
+      {#-
+        Same label, same icon and same section as HFS's own entry
+        (`crates/ui/templates/layouts/base.html`): `nav-capability-conformance`
+        + `icons/shield.svg` under "Server". The key is shared, not copied,
+        so the two sidebars cannot drift.
+
+        No `nav-item--soon` here — that modifier is a "coming soon" marker
+        (it sets `cursor: default`), and this page has shipped.
+      -#}
+      <a class="nav-item" href="/ui/hts/capability-statement"{% if chrome.active_page == "capability-statement" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("nav-capability-conformance") }}">
         <span class="icon">{% include "icons/shield.svg" %}</span>
-        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-diagnostics") }}</span>
+        <span class="nav-item__label">{{ chrome.i18n.t("nav-capability-conformance") }}</span>
       </a>
     </nav>
 
@@ -90,24 +95,24 @@
   <div class="pane">
     <header class="topbar">
       <div class="topbar__tools">
-        <!--
-          Dialect chip (design doc §7.1 topbar): the session-wide BCP-47
-          displayLanguage / Accept-Language surface. A <details><summary>
-          disclosure so keyboard users can open it without JS; each option
-          POSTs back and the server sets the `hts_dialect` cookie so the
-          choice is persisted across pages. Per-op fields on §7.6 override
-          this session value.
-        -->
-        <details class="dialect-chip">
-          <summary class="dialect-chip__summary" aria-label="{{ chrome.i18n.t("hts-dialect-label") }}">
-            <span class="dialect-chip__prefix">{{ chrome.i18n.t("hts-dialect-prefix") }}</span>
-            <code class="dialect-chip__value">{{ chrome.i18n.lang() }}</code>
-          </summary>
-          <div class="dialect-chip__panel">
-            <p class="dialect-chip__heading">{{ chrome.i18n.t("hts-dialect-heading") }}</p>
-            <p class="dialect-chip__hint">{{ chrome.i18n.t("hts-dialect-hint") }}</p>
-          </div>
-        </details>
+        {#-
+          Byte-for-byte the same three controls as HFS's topbar, in the same
+          order — see `crates/ui/templates/layouts/base.html`. HTS and HFS are
+          one system to an operator, so the shared chrome must not diverge.
+
+          A fourth control used to sit ahead of these: a "dialect: en"
+          disclosure. It was **removed on 2026-08-28**. It shipped
+          non-functional in its very first commit (03c8e9d4d) — a <details>
+          holding a heading and a hint, with no options, no form and no POST —
+          and the `hts_dialect` cookie its comment promised has never existed
+          in any Rust file in any commit. It looked alive only because it
+          echoed the negotiated locale beside the switcher that actually sets
+          it. HFS has no dialect concept at all, and neither server propagates
+          the UI locale to outgoing requests, so nothing was lost.
+
+          Real `displayLanguage` support is unaffected: it lives as per-operation
+          form fields in the workbenches (`code_systems.rs`, `concepts.rs`).
+        -#}
         <!-- Language switcher: real links, so it works without JavaScript. -->
         <nav class="lang-switcher" aria-label="{{ chrome.i18n.t("language-label") }}">
           <a href="?lang=en"{% if chrome.i18n.lang() == "en" %} aria-current="true"{% endif %}>{{ chrome.i18n.t("language-en") }}</a>
@@ -116,12 +121,13 @@
         </nav>
         <div class="theme-toggle" role="group" aria-label="{{ chrome.i18n.t("theme-label") }}">
           <button type="button" data-set-theme="light" aria-label="{{ chrome.i18n.t("theme-light") }}">
-            <span aria-hidden="true">&#9728;</span>
+            {% include "icons/sun.svg" %}
           </button>
           <button type="button" data-set-theme="dark" aria-label="{{ chrome.i18n.t("theme-dark") }}">
-            <span aria-hidden="true">&#9789;</span>
+            {% include "icons/moon.svg" %}
           </button>
         </div>
+        <span class="topbar__avatar">K</span>
       </div>
     </header>
     <main class="content{% block content_class %}{% endblock %}">

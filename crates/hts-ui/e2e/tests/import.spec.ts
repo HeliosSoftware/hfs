@@ -3,10 +3,10 @@ import { expect, test } from "@playwright/test";
 // Phase 2 Slice F: standalone Import page (§7.7). Complements
 // tests/import.rs (the Rust in-process ring against a mocked upstream)
 // with browser-level coverage against the real hts backend booted by
-// e2e/boot.mjs. Mirrors the shape of operations.spec.ts:
+// e2e/boot.mjs. Four describes:
 //
 //   - describe A walks the page shell (heading, textarea, submit, nav
-//     placement, dialect chip).
+//     placement, topbar chrome).
 //   - describe B walks the two pre-flight gates (empty paste, invalid
 //     JSON). Both render an inline OperationOutcome without hitting
 //     the upstream — the round-trip contract is implicitly asserted by
@@ -107,41 +107,46 @@ test.describe("HTS Import page shell (§7.7)", () => {
     await expect(submit).toHaveAttribute("type", "submit");
   });
 
-  test("nav lists Import after Operations and before Diagnostics", async ({
+  test("nav lists Import after Concept maps and before Capability & Conformance", async ({
     page,
   }) => {
     await page.goto("/ui/hts/import");
-    // Same technique as operations.spec.ts::"the nav bar exposes the
-    // Operations entry after ConceptMaps": pluck the sidebar link
-    // labels in DOM order and compare indices.
+    // Pluck the sidebar link labels in DOM order and compare indices.
+    // (The former Operations entry this test used to anchor on was
+    // removed with the Operations page; Concept maps is now the last
+    // "Work" entry before the Tools section.)
     const navLinks = page
       .locator("nav")
       .getByRole("link")
-      .filter({ hasText: /Home|Code|Value|Concept|Operations|Import|Diagnostics/ });
+      .filter({ hasText: /Home|Code|Value|Concept|Import|Capability/ });
     const names = await navLinks.allTextContents();
-    const operationsIdx = names.findIndex((n) => /Operations/i.test(n));
+    const conceptMapsIdx = names.findIndex((n) => /Concept maps/i.test(n));
     const importIdx = names.findIndex((n) => /Import/i.test(n));
-    const diagnosticsIdx = names.findIndex((n) => /Diagnostics/i.test(n));
-    expect(operationsIdx, "Operations must be present in nav").toBeGreaterThan(-1);
+    const capabilityIdx = names.findIndex((n) => /Capability & Conformance/i.test(n));
+    expect(conceptMapsIdx, "Concept maps must be present in nav").toBeGreaterThan(-1);
     expect(importIdx, "Import must be present in nav").toBeGreaterThan(-1);
-    expect(diagnosticsIdx, "Diagnostics must be present in nav").toBeGreaterThan(-1);
+    expect(capabilityIdx, "Capability & Conformance must be present in nav").toBeGreaterThan(-1);
     expect(
       importIdx,
-      "Import must come after Operations in the sidebar nav",
-    ).toBeGreaterThan(operationsIdx);
+      "Import must come after Concept maps in the sidebar nav",
+    ).toBeGreaterThan(conceptMapsIdx);
     expect(
-      diagnosticsIdx,
-      "Diagnostics must come after Import in the sidebar nav",
+      capabilityIdx,
+      "Capability & Conformance must come after Import in the sidebar nav",
     ).toBeGreaterThan(importIdx);
   });
 
-  test("dialect chip renders the negotiated locale in the topbar", async ({
-    page,
-  }) => {
+  test("the topbar matches HFS's on this page too", async ({ page }) => {
     await page.goto("/ui/hts/import");
-    // The chip renders the BCP-47 tag inside `.dialect-chip__value`
-    // (§7.1 topbar). First paint on the Playwright ring is English.
-    await expect(page.locator(".dialect-chip__value")).toContainText("en");
+    // Chrome parity is per-page, not just on Home: the layout is shared, so
+    // a regression here would show up everywhere. The "dialect: en"
+    // disclosure this test used to assert was removed on 2026-08-28 — it
+    // shipped non-functional and HFS has no counterpart.
+    const tools = page.locator(".topbar__tools");
+    await expect(tools.locator(".lang-switcher")).toHaveCount(1);
+    await expect(tools.locator(".theme-toggle")).toHaveCount(1);
+    await expect(tools.locator(".topbar__avatar")).toHaveText("K");
+    await expect(tools.locator("details")).toHaveCount(0);
   });
 });
 
@@ -202,13 +207,23 @@ test.describe("HTS Import result variants (§7.7 ImportResult enum)", () => {
     await expect(page.getByText(/Import complete/i)).toBeVisible({
       timeout: 10_000,
     });
-    // Class marker guarded by the same Rust ring's success test
+    // Marker guarded by the same Rust ring's success test
     // (`import_post_200_renders_success_summary`) — a future template
     // refactor that drops it must land alongside a matched Rust-side
-    // change.
+    // change. The V3 stepped layout (#551) replaced the styling-free
+    // `hts-import-status--ok` class with a `data-` attribute; the
+    // *visual* success signal is `.notice` (no modifier) + a green
+    // `.tag--matched`.
     await expect(
-      page.locator(".hts-import-status.hts-import-status--ok"),
+      page.locator('[data-import-status="success"]'),
     ).toBeVisible();
+    await expect(
+      page.locator('[data-import-status="success"] .tag.tag--matched'),
+    ).toBeVisible();
+    // Success must NOT borrow the amber banner partial-success uses.
+    await expect(
+      page.locator('[data-import-status="success"] .notice--warn'),
+    ).toHaveCount(0);
   });
 
   test.skip(
@@ -219,7 +234,8 @@ test.describe("HTS Import result variants (§7.7 ImportResult enum)", () => {
       // covers the 207 arm end-to-end via a canned mock response:
       //   crates/hts-ui/tests/import.rs::
       //     import_post_207_renders_partial_success_with_issue_list
-      // which asserts the `hts-import-status--warn` class marker, the
+      // which asserts the `data-import-status="partial"` marker, the
+      // amber `.notice--warn` + `.tag--muted` pairing, the
       // Fluent "Import partially succeeded" title, the `<details>`
       // issue expander, and the plural-selected "2 issues" heading.
       // Reproducing that trigger through the real hts backend
@@ -245,11 +261,17 @@ test.describe("HTS Import result variants (§7.7 ImportResult enum)", () => {
       timeout: 10_000,
     });
     // The error status partial reuses the shared OperationOutcome
-    // renderer (partials/hts-outcome.html) — the class stack below is
+    // renderer (partials/hts-outcome.html) — the marker stack below is
     // the exact combination asserted by
     // `import_post_400_renders_outcome_partial` in the Rust ring.
     await expect(
-      page.locator(".hts-import-status.hts-import-status--error"),
+      page.locator('[data-import-status="rejected"]'),
+    ).toBeVisible();
+    await expect(
+      page.locator('[data-import-status="rejected"] .notice.notice--warn'),
+    ).toBeVisible();
+    await expect(
+      page.locator('[data-import-status="rejected"] .tag.tag--excluded'),
     ).toBeVisible();
     await expect(
       page.locator(".hts-outcome.hts-outcome--error"),
@@ -262,7 +284,7 @@ test.describe("HTS Import result variants (§7.7 ImportResult enum)", () => {
       // 13 MB pastes are impractical over Playwright's default
       // Chromium input path (browser process memory + WS frame
       // pressure + the fact that our webServer runs on the same box).
-      // The Rust ring exercises the 413 → `hts-import-status--warn` +
+      // The Rust ring exercises the 413 → `.notice--warn` +
       // `hts-import-too-large-hint` path via a canned response:
       //   crates/hts-ui/tests/import.rs::
       //     import_post_413_renders_too_large_guidance
@@ -293,24 +315,29 @@ test.describe("HTS Import a11y and dual-mode contract (§7.7)", () => {
     expect(forAttr).toBe("hts-import-bundle");
   });
 
-  test("the result region is inside a labelled landmark", async ({ page }) => {
+  test("the result step is a labelled polite live region", async ({ page }) => {
     await page.goto("/ui/hts/import");
-    // pages/import.html wraps the form + status in
-    // `<section class="hts-import" aria-labelledby="hts-import-heading">`
-    // which Playwright resolves as `role="region"` with an accessible
-    // name from the h1.
-    const region = page.getByRole("region", { name: /Import terminology/i });
-    await expect(region).toBeVisible();
-    // The status region lives inside that landmark, wrapped in a
-    // polite live region so htmx swaps announce without stealing
-    // focus (§7.7 a11y note). On initial GET the container only holds
-    // a visually-hidden placeholder — the sr-only helper collapses it
-    // to 0×0, which Playwright reports as "hidden". The a11y contract
-    // is presence + aria-live, not visual footprint, so we assert on
-    // attachment instead of visibility.
-    const status = region.locator("#hts-import-status");
+    // V3 stepped layout (#551): the old `<section class="hts-import"
+    // aria-labelledby="hts-import-heading">` wrapper is gone — it kept
+    // the step cards from being direct children of `.content`, which is
+    // what `.content > .card ~ .card` needs to space them. Step 3 is now
+    // its own `.card` landmark, named by its own `<h3>`, and is still
+    // the polite live region htmx swaps into (§7.7 a11y note).
+    const status = page.locator("#hts-import-status");
     await expect(status).toBeAttached();
     await expect(status).toHaveAttribute("aria-live", "polite");
+    await expect(
+      page.getByRole("region", { name: /Result/i }),
+    ).toBeVisible();
+  });
+
+  test("the page renders three numbered steps", async ({ page }) => {
+    await page.goto("/ui/hts/import");
+    for (const step of [/Choose source/i, /Review/i, /Result/i]) {
+      await expect(
+        page.getByRole("heading", { name: step, level: 3 }),
+      ).toBeVisible();
+    }
   });
 
   test("the form advertises the htmx dual-mode contract", async ({ page }) => {
@@ -319,11 +346,19 @@ test.describe("HTS Import a11y and dual-mode contract (§7.7)", () => {
     // `hx-post` + `hx-target` so the page works with or without JS.
     // Assert on regexes so a future refactor (e.g. absolute vs
     // relative URLs) does not cascade this test.
-    const form = page.locator("form.hts-import__form");
+    // The form IS step 1's `.card` in the V3 layout, hence `#`, not the
+    // former `.hts-import__form` class (which had no CSS rule).
+    const form = page.locator("form#hts-import-form");
     await expect(form).toBeVisible();
     await expect(form).toHaveAttribute("method", /post/i);
     await expect(form).toHaveAttribute("action", /\/ui\/hts\/import$/);
     await expect(form).toHaveAttribute("hx-post", /\/ui\/hts\/import$/);
     await expect(form).toHaveAttribute("hx-target", /#hts-import-status/);
+    // The submit lives in step 2's card and is wired back with the HTML
+    // `form=` attribute — the nojs POST depends on that association.
+    await expect(page.locator("#hts-import-submit")).toHaveAttribute(
+      "form",
+      "hts-import-form",
+    );
   });
 });

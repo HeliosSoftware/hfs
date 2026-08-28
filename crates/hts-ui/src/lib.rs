@@ -35,14 +35,16 @@
 //! and vendored htmx during Phase 1; Phase 8 (post-#543) will extract those
 //! into a `helios-ui-chrome` crate (see design doc §9.2).
 
+mod capability;
+mod chart;
 mod code_systems;
 mod concept_maps;
-mod diagnostics;
+mod concepts;
 mod home;
 mod i18n;
 mod import;
 mod metrics_parse;
-mod operations;
+mod metrics_ring;
 mod upstream;
 mod value_sets;
 
@@ -57,7 +59,12 @@ use rust_embed::RustEmbed;
 use std::sync::Arc;
 
 pub use i18n::{negotiate_locale, RequestLocale};
-pub use operations::BatchJobs;
+// Home request-rate chart (§7.1): the sample ring lives on `HtsUiState`, so
+// its type must be nameable by the `hts` binary and by the test rings.
+// `MetricsSample`/`StatusCounts` come with it — `MetricsRing::push` takes a
+// sample, so without them the public ring would have no callable surface.
+pub use metrics_parse::StatusCounts;
+pub use metrics_ring::{MetricsRing, MetricsSample};
 pub use upstream::{
     ClosureConcept, ClosureEdge, ClosureParams, ClosureResult, CmBrowserFilters, CmBrowserPage,
     CmBrowserRow, CodeSystemSummary, ConceptMapSummary, CsBrowserFilters, CsBrowserPage,
@@ -70,11 +77,17 @@ pub use upstream::{
     VsBrowserPage, VsBrowserRow, VsValidateMode, VsValidateParams, VsValidateResult,
     VsValidateSource, HTS_UI_BATCH_FANOUT_CONCURRENCY, HTS_UI_MAX_EXPANSION_SIZE_HINT,
 };
-// Slice G additions (diagnostics, §7.9). Appended below Slice F's block to
-// avoid touching the alphabetized list.
+// Capability & Conformance page projections. Appended below Slice F's
+// block to avoid touching the alphabetized list.
 pub use upstream::{
-    CapabilityRestResource, CapabilityView, TerminologyCapabilitiesView,
-    TerminologyCodeSystemEntry,
+    CapabilityOperation, CapabilityRestResource, CapabilityView, TerminologyCapabilitiesView,
+};
+// Slice H additions (the concept information plane, Direction B). Appended
+// below rather than folded into the alphabetized list above so the two
+// concurrent slices do not collide on the same lines.
+pub use upstream::{
+    ComparatorKind, ConceptIdentity, ConceptMappingGroup, ConceptMappingRow, ConceptMappings,
+    ConceptRef, ConceptRelative, MappingDirection, SubsumptionReport, SubsumptionRow,
 };
 
 /// Static UI assets (htmx, CSS, JS) embedded into the binary at compile time.
@@ -110,6 +123,19 @@ pub struct HtsUiState {
     /// `None` when no bootstrap directory was set — the dashboard tile then
     /// renders an em-dash rather than a misleading zero.
     pub bundled_data_bytes: Option<u64>,
+
+    /// Rolling `/metrics` samples backing the Home request-rate chart
+    /// (§7.1). Fed from the `/metrics` leg the Home cards fetch already
+    /// performs, so the chart adds no upstream traffic of its own.
+    ///
+    /// Deliberately a *state field* rather than a module-level `static`: a
+    /// process-global would be shared by every `#[tokio::test]` in this
+    /// crate, so one test's samples would leak into another's assertions.
+    /// `Arc` because `HtsUiState` is `Clone` and the ring must not be.
+    ///
+    /// Use [`Default::default()`] at construction sites that do not care
+    /// about the chart.
+    pub metrics_ring: Arc<metrics_ring::MetricsRing>,
 }
 
 /// Build the HTS UI router.
@@ -122,9 +148,9 @@ pub fn router(state: Arc<HtsUiState>) -> Router {
         .merge(code_systems::routes())
         .merge(value_sets::routes())
         .merge(concept_maps::routes())
-        .merge(operations::routes())
+        .merge(concepts::routes())
         .merge(import::routes())
-        .merge(diagnostics::routes())
+        .merge(capability::routes())
         .nest_service("/hts/assets", ServeEmbed::<Assets>::new())
         .with_state(state)
         .layer(axum::middleware::from_fn(i18n::negotiate_locale))
@@ -174,5 +200,6 @@ fn test_state() -> Arc<HtsUiState> {
         version: "0.0.0-test",
         upstream: UpstreamClient::new("http://127.0.0.1:1").expect("test client"),
         bundled_data_bytes: None,
+        metrics_ring: Default::default(),
     })
 }

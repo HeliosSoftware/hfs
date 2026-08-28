@@ -1,95 +1,133 @@
 {#-
-  Status region for the standalone Import page (design doc §7.7).
+  Step 3 — "Result" — of the V3 stepped Import layout (design doc §7.7).
 
-  Discriminates on the four visual variants precomputed in
-  `StatusView`. `role="status"` (not `alert`) — server-said-no is not a
-  UI error and should not steal focus.
+  This partial renders the *contents* of the `#hts-import-status` card
+  (`.card-head` + `.panel`), not a wrapper: `#hts-import-status` is itself
+  the htmx swap target (`hx-swap="innerHTML"`) and must stay a `.card`
+  sibling of steps 1 and 2 so `.content > .card ~ .card` keeps spacing it.
+
+  The four `StatusView` variants are visually distinct through shared HFS
+  primitives only — no `hts-import-status--*` modifiers, which never had a
+  CSS rule and made success and partial-success indistinguishable:
+
+    success   → `.notice` (muted line, no chrome) + `.tag.tag--matched`
+    partial   → `.notice.notice--warn`            + `.tag.tag--muted`
+    rejected  → `.notice.notice--warn`            + `.tag.tag--excluded`
+    too-large → `.notice.notice--warn`            + `.tag.tag--excluded`
+
+  There is deliberately no `.notice--ok`: app.css does not define one and
+  this partial does not invent CSS. The success state reads as a muted line
+  plus a green tag.
+
+  `data-import-status` on the panel is the stable machine hook the Rust ring
+  keys off of (it replaces the old class markers and carries no styling).
 
   When the upstream round-trip failed at the transport layer (5xx /
-  connect / timeout) the shared `hts-degraded.html` banner renders
-  inside the status region instead of a variant banner.
+  connect / timeout) the shared `hts-degraded.html` banner renders inside
+  the panel instead of a variant banner.
+
+  Note on `.field` wrappers below: `.field` is used purely as the shared
+  "block with bottom margin" primitive (app.css: `display:block;
+  margin-bottom:14px`) so the counts table and the disclosures are not
+  flush against each other. No new CSS is introduced.
 -#}
+<div class="card-head">
+  <h3 id="hts-import-result-heading">3 &middot; {{ chrome.i18n.t("hts-import-step-result") }}</h3>
+</div>
+<div class="panel" data-import-status="{{ view.status_slug() }}">
 {% if let Some(reason) = view.degraded_reason %}
   {% let request_id = None::<String> %}
   {% let since = None::<String> %}
   {% include "partials/hts-degraded.html" %}
 {% else if view.is_too_large %}
-  <aside class="hts-import-status hts-import-status--warn" role="status" aria-live="polite">
-    <p class="hts-import-status__title">{{ chrome.i18n.t("hts-import-status-too-large") }}</p>
-    <p class="hts-import-status__body">{{ chrome.i18n.t("hts-import-too-large-hint") }}</p>
-    <p class="hts-import-status__help"><a href="/ui/hts/import#help-split">{{ chrome.i18n.t("hts-import-help") }}</a></p>
-  </aside>
+  <p class="notice notice--warn">
+    {{ chrome.i18n.t("hts-import-status-too-large") }}
+    <span class="tag tag--excluded">{{ chrome.i18n.t("hts-import-tag-error") }}</span>
+  </p>
+  <p class="query-empty">{{ chrome.i18n.t("hts-import-too-large-hint") }}</p>
 {% else if view.is_rejected %}
-  <aside class="hts-import-status hts-import-status--error" role="status" aria-live="polite">
-    <p class="hts-import-status__title">{{ chrome.i18n.t("hts-import-status-rejected") }}</p>
-    {% if let Some(outcome) = view.outcome %}
+  <p class="notice notice--warn">
+    {{ chrome.i18n.t("hts-import-status-rejected") }}
+    <span class="tag tag--excluded">{{ chrome.i18n.t("hts-import-tag-error") }}</span>
+  </p>
+  {% if let Some(outcome) = view.outcome %}
+    <div class="field">
       {% include "partials/hts-outcome.html" %}
-    {% endif %}
-    {% if !view.issues.is_empty() %}
-      <details class="hts-import-status__issues">
-        <summary>{{ chrome.i18n.t_arg("hts-import-issues-heading", "n", view.issue_count() as i64) }}</summary>
-        <ul class="hts-import-status__issue-list">
-          {% for msg in view.issues %}
-            <li>{{ msg }}</li>
-          {% endfor %}
-        </ul>
+    </div>
+  {% endif %}
+  <p class="query-empty">{{ chrome.i18n.t("hts-import-rejected-note") }}</p>
+  {% if !view.issues.is_empty() %}
+    <div class="field">
+      <details>
+        <summary><span class="detail__hint-inline">{{ chrome.i18n.t_arg("hts-import-issues-heading", "n", view.issue_count() as i64) }}</span></summary>
+        <pre class="detail__code">{{ view.issues_text() }}</pre>
       </details>
-    {% endif %}
-  </aside>
+    </div>
+  {% endif %}
+  {% if !view.raw_body.is_empty() %}
+    <details>
+      <summary><span class="detail__hint-inline">{{ chrome.i18n.t("hts-import-raw-toggle") }}</span> <code>{{ view.request_url }}</code></summary>
+      <pre class="detail__code">{{ view.raw_body }}</pre>
+    </details>
+  {% endif %}
 {% else if view.is_success || view.is_partial %}
-  {#- Success / partial-success share the counts table shape. -#}
-  <aside class="hts-import-status hts-import-status--{% if view.is_partial %}warn{% else %}ok{% endif %}"
-         role="status"
-         aria-live="polite">
-    <p class="hts-import-status__title">
-      {% if view.is_success %}
-        {{ chrome.i18n.t("hts-import-status-success") }}
-      {% else %}
-        {{ chrome.i18n.t("hts-import-status-partial") }}
-      {% endif %}
+  {#- Success / partial-success share the counts table shape; only the
+      banner chrome and the tag differ. -#}
+  {% if view.is_partial %}
+    <p class="notice notice--warn">
+      {{ chrome.i18n.t("hts-import-status-partial") }}
+      <span class="tag tag--muted">{{ chrome.i18n.t("hts-import-tag-partial") }}</span>
     </p>
-    <h2 class="hts-import-status__counts-heading">{{ chrome.i18n.t("hts-import-counts-heading") }}</h2>
-    <table class="hts-import-status__counts">
-      <thead>
-        <tr>
-          <th scope="col">&nbsp;</th>
-          <th scope="col">{{ chrome.i18n.t("hts-import-counts-created") }}</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <th scope="row">{{ chrome.i18n.t("hts-import-resource-code-system") }}</th>
-          <td>{% if let Some(n) = view.counts_code_systems %}{{ n }}{% else %}&mdash;{% endif %}</td>
-        </tr>
-        <tr>
-          <th scope="row">{{ chrome.i18n.t("hts-import-resource-value-set") }}</th>
-          <td>{% if let Some(n) = view.counts_value_sets %}{{ n }}{% else %}&mdash;{% endif %}</td>
-        </tr>
-        <tr>
-          <th scope="row">{{ chrome.i18n.t("hts-import-resource-concept-map") }}</th>
-          <td>{% if let Some(n) = view.counts_concept_maps %}{{ n }}{% else %}&mdash;{% endif %}</td>
-        </tr>
-        <tr>
-          <th scope="row">{{ chrome.i18n.t("hts-import-resource-concept") }}</th>
-          <td>{% if let Some(n) = view.counts_concepts %}{{ n }}{% else %}&mdash;{% endif %}</td>
-        </tr>
-      </tbody>
-    </table>
-    {% if !view.issues.is_empty() %}
-      <details class="hts-import-status__issues">
-        <summary>{{ chrome.i18n.t_arg("hts-import-issues-heading", "n", view.issue_count() as i64) }}</summary>
-        <ul class="hts-import-status__issue-list">
-          {% for msg in view.issues %}
-            <li>{{ msg }}</li>
-          {% endfor %}
-        </ul>
+  {% else %}
+    <p class="notice">
+      {{ chrome.i18n.t("hts-import-status-success") }}
+      <span class="tag tag--matched">{{ chrome.i18n.t("hts-import-tag-success") }}</span>
+    </p>
+  {% endif %}
+  <div class="field">
+    <div class="table-wrap">
+      <table class="data-table">
+        <caption class="visually-hidden">{{ chrome.i18n.t("hts-import-counts-heading") }}</caption>
+        <thead>
+          <tr>
+            <th scope="col">{{ chrome.i18n.t("hts-import-counts-resource") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-import-counts-created") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">{{ chrome.i18n.t("hts-import-resource-code-system") }}</th>
+            <td>{% if let Some(n) = view.counts_code_systems %}{{ n }}{% else %}&mdash;{% endif %}</td>
+          </tr>
+          <tr>
+            <th scope="row">{{ chrome.i18n.t("hts-import-resource-value-set") }}</th>
+            <td>{% if let Some(n) = view.counts_value_sets %}{{ n }}{% else %}&mdash;{% endif %}</td>
+          </tr>
+          <tr>
+            <th scope="row">{{ chrome.i18n.t("hts-import-resource-concept-map") }}</th>
+            <td>{% if let Some(n) = view.counts_concept_maps %}{{ n }}{% else %}&mdash;{% endif %}</td>
+          </tr>
+          <tr>
+            <th scope="row">{{ chrome.i18n.t("hts-import-resource-concept") }}</th>
+            <td>{% if let Some(n) = view.counts_concepts %}{{ n }}{% else %}&mdash;{% endif %}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% if !view.issues.is_empty() %}
+    <div class="field">
+      <details>
+        <summary><span class="detail__hint-inline">{{ chrome.i18n.t_arg("hts-import-issues-heading", "n", view.issue_count() as i64) }}</span></summary>
+        <pre class="detail__code">{{ view.issues_text() }}</pre>
       </details>
-    {% endif %}
-    {% if !view.raw_body.is_empty() %}
-      <details class="hts-import-status__raw">
-        <summary><code>{{ view.request_url }}</code></summary>
-        <pre class="hts-import-status__raw-body"><code>{{ view.raw_body }}</code></pre>
-      </details>
-    {% endif %}
-  </aside>
+    </div>
+  {% endif %}
+  {% if !view.raw_body.is_empty() %}
+    <details>
+      <summary><span class="detail__hint-inline">{{ chrome.i18n.t("hts-import-raw-toggle") }}</span> <code>{{ view.request_url }}</code></summary>
+      <pre class="detail__code">{{ view.raw_body }}</pre>
+    </details>
+  {% endif %}
 {% endif %}
+</div>

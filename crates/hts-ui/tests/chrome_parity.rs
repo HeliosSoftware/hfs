@@ -35,6 +35,7 @@ fn app() -> Router {
         )
         .expect("closed loopback URL always parses"),
         bundled_data_bytes: None,
+        metrics_ring: Default::default(),
     });
     Router::new().nest("/ui", helios_hts_ui::router(state))
 }
@@ -201,12 +202,15 @@ const CM_DETAIL: &str = include_str!("../templates/pages/cm-detail.html");
 fn cs_detail_template_carries_backlink_to_code_systems_browser() {
     // §14.5: Category C clone of `crates/ui/templates/pages/bulk-import-detail.html`
     // — hardcoded href to the list page, chevron U+2039, Fluent title key.
+    // The hook is `.row-link`, not the old `.backlink`: the V3 layout pass
+    // dropped every HTS-only class, and `.backlink` has no rule in
+    // `crates/ui/assets/app.css`.
     // Template-source check because the backlink lives inside
     // `{% if let Some(summary) = self.summary() %}` and closed-loopback
     // summaries are `None`; a source check is both stricter and cheaper
     // than standing up a per-resource mock upstream.
     let needle =
-        "<a class=\"backlink\" href=\"/ui/hts/code-systems\">\u{2039} {{ chrome.i18n.t(\"hts-cs-browser-title\") }}</a>";
+        "<a class=\"row-link\" href=\"/ui/hts/code-systems\">\u{2039} {{ chrome.i18n.t(\"hts-cs-browser-title\") }}</a>";
     assert!(
         CS_DETAIL.contains(needle),
         "cs-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
@@ -216,7 +220,7 @@ fn cs_detail_template_carries_backlink_to_code_systems_browser() {
 #[test]
 fn vs_detail_template_carries_backlink_to_value_sets_browser() {
     let needle =
-        "<a class=\"backlink\" href=\"/ui/hts/value-sets\">\u{2039} {{ chrome.i18n.t(\"hts-vs-browser-title\") }}</a>";
+        "<a class=\"row-link\" href=\"/ui/hts/value-sets\">\u{2039} {{ chrome.i18n.t(\"hts-vs-browser-title\") }}</a>";
     assert!(
         VS_DETAIL.contains(needle),
         "vs-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
@@ -226,10 +230,184 @@ fn vs_detail_template_carries_backlink_to_value_sets_browser() {
 #[test]
 fn cm_detail_template_carries_backlink_to_concept_maps_browser() {
     let needle =
-        "<a class=\"backlink\" href=\"/ui/hts/concept-maps\">\u{2039} {{ chrome.i18n.t(\"hts-cm-browser-title\") }}</a>";
+        "<a class=\"row-link\" href=\"/ui/hts/concept-maps\">\u{2039} {{ chrome.i18n.t(\"hts-cm-browser-title\") }}</a>";
     assert!(
         CM_DETAIL.contains(needle),
         "cm-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
+    );
+}
+
+// ── Track E: Home chart geometry is a guarded copy of HFS's ──────────
+
+/// Pull `const NAME: i64 = <int>;` out of a Rust source file.
+fn rust_const(source: &str, name: &str) -> i64 {
+    let needle = format!("const {name}: i64 = ");
+    let start = source
+        .find(&needle)
+        .unwrap_or_else(|| panic!("`{needle}…` not found — did the constant get renamed?"))
+        + needle.len();
+    let rest = &source[start..];
+    let end = rest
+        .find(';')
+        .unwrap_or_else(|| panic!("`const {name}` has no terminating `;`"));
+    rest[..end]
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("`const {name}` is not an integer literal: {e}"))
+}
+
+/// Pull the plot width out of a `viewBox="0 0 <width> …"` attribute.
+fn view_box_width(template: &str) -> i64 {
+    let needle = "viewBox=\"0 0 ";
+    let start = template
+        .find(needle)
+        .expect("template must carry a `viewBox=\"0 0 …\"` attribute")
+        + needle.len();
+    let rest = &template[start..];
+    let end = rest.find(' ').expect("viewBox must have four components");
+    rest[..end].parse().expect("viewBox width must be an integer")
+}
+
+#[test]
+fn chart_geometry_matches_hfs() {
+    // `edson/docs/hts-ui-design.md` §9.0 defers the `helios-ui-chrome`
+    // extraction, so `crates/hts-ui/src/chart.rs` is a *copy* of HFS's
+    // chart geometry rather than a shared dependency. That copy is only
+    // safe while it stays identical: both charts render against the same
+    // `.chart` / `.grid-line` / `.axis-label` rules in the one shared
+    // `crates/ui/assets/app.css`, so a plot box that drifts on one side
+    // would silently mis-render on the other.
+    //
+    // Read both sides off disk rather than `include_str!`-ing only ours:
+    // the point is to notice when *HFS* moves.
+    let hfs_lib = std::fs::read_to_string("../ui/src/lib.rs")
+        .expect("HFS lib.rs must be readable from the hts-ui crate directory");
+    let hfs_index = std::fs::read_to_string("../ui/templates/pages/index.html")
+        .expect("HFS index.html must be readable from the hts-ui crate directory");
+    let hts_chart = include_str!("../src/chart.rs");
+    let hts_template = include_str!("../templates/partials/hts-home-chart.html");
+
+    for name in ["PLOT_LEFT", "PLOT_RIGHT", "PLOT_TOP"] {
+        assert_eq!(
+            rust_const(&hfs_lib, name),
+            rust_const(hts_chart, name),
+            "{name} drifted between crates/ui/src/lib.rs and crates/hts-ui/src/chart.rs",
+        );
+    }
+
+    // HFS derives its plot bottom as `CHART_HEIGHT - 22` inside `build_chart`;
+    // HTS spells the result out as `PLOT_BOTTOM` so the template and the
+    // geometry share one literal. Recompute HFS's to compare like for like.
+    let hfs_height = rust_const(&hfs_lib, "CHART_HEIGHT");
+    let hfs_bottom_offset = {
+        let needle = "let plot_bottom = height - ";
+        let start = hfs_lib
+            .find(needle)
+            .expect("HFS build_chart must still derive plot_bottom from height")
+            + needle.len();
+        let rest = &hfs_lib[start..];
+        let end = rest.find(';').expect("plot_bottom expression must end in `;`");
+        rest[..end].trim().parse::<i64>().expect("integer offset")
+    };
+    assert_eq!(
+        hfs_height, rust_const(hts_chart, "CHART_HEIGHT"),
+        "CHART_HEIGHT drifted between HFS and HTS",
+    );
+    assert_eq!(
+        hfs_height - hfs_bottom_offset,
+        rust_const(hts_chart, "PLOT_BOTTOM"),
+        "HFS's plot bottom (CHART_HEIGHT - {hfs_bottom_offset}) no longer equals HTS's PLOT_BOTTOM",
+    );
+
+    // The viewBox width is the other half of the contract: HFS's index.html
+    // and HTS's chart partial must open the same coordinate space, and it
+    // must equal PLOT_RIGHT on both sides.
+    let hfs_width = view_box_width(&hfs_index);
+    let hts_width = view_box_width(hts_template);
+    assert_eq!(hfs_width, hts_width, "chart viewBox width drifted");
+    assert_eq!(
+        hts_width,
+        rust_const(hts_chart, "PLOT_RIGHT"),
+        "the chart viewBox width must equal PLOT_RIGHT",
+    );
+
+    // Spelled-out expectations, so a *coordinated* drift on both sides still
+    // has to be a deliberate edit to this test.
+    assert_eq!(rust_const(hts_chart, "PLOT_LEFT"), 40);
+    assert_eq!(rust_const(hts_chart, "PLOT_RIGHT"), 1060);
+    assert_eq!(rust_const(hts_chart, "PLOT_TOP"), 10);
+    assert_eq!(rust_const(hts_chart, "PLOT_BOTTOM"), 278);
+    assert_eq!(rust_const(hts_chart, "CHART_HEIGHT"), 300);
+}
+
+/// Remove `{# … #}` Askama comments so a class named in prose is not mistaken
+/// for one the template emits.
+fn strip_askama_comments(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{#") {
+        out.push_str(&rest[..open]);
+        match rest[open..].find("#}") {
+            Some(close) => rest = &rest[open + close + 2..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn home_chart_uses_only_classes_that_exist_in_the_shared_stylesheet() {
+    // The HTS UI adds no CSS of its own — it embeds `crates/ui/assets`
+    // wholesale. A class with no rule there is dead markup, so every class
+    // the chart partial emits must be greppable in app.css.
+    let css = std::fs::read_to_string("../ui/assets/app.css").expect("shared app.css");
+    // Strip `{# … #}` template comments first: this file documents *why* two
+    // HFS classes are omitted, and naming them in prose must not read as
+    // emitting them.
+    let template = strip_askama_comments(include_str!(
+        "../templates/partials/hts-home-chart.html"
+    ));
+    let template = template.as_str();
+    for class in [
+        "chart-card",
+        "chart-card__head",
+        "chart-card__tools",
+        "window-picker",
+        "window-picker__option",
+        "window-picker__option--active",
+        "chart-legend",
+        "chart-legend__item",
+        "chart-legend__item--active",
+        "chart-legend__total",
+        "chart-legend__dot",
+        "stat__label",
+        "stat__value",
+        "stat__sub",
+        "grid-line",
+        "axis-label",
+    ] {
+        assert!(
+            template.contains(class),
+            "the chart partial must still emit `{class}`",
+        );
+        assert!(
+            css.contains(&format!(".{class}")),
+            "`{class}` has no rule in crates/ui/assets/app.css — no new CSS is allowed",
+        );
+    }
+
+    // HFS emits `.chart-legend__type` but app.css has no rule for it; the
+    // HTS copy deliberately drops it in favour of a bare <span>.
+    assert!(
+        !template.contains("chart-legend__type"),
+        "`chart-legend__type` has no CSS rule — do not copy it from HFS",
+    );
+    // The type-picker pill and the expand button have no HTS analogue and
+    // would render as controls that do nothing.
+    assert!(
+        !template.contains("pill--square"),
+        "the expand pill is a dead control in HTS — it must not be rendered",
     );
 }
 

@@ -147,6 +147,76 @@ pub fn sum_counter(map: &HashMap<String, Vec<Sample>>, name: &str) -> Option<f64
     Some(samples.iter().map(|s| s.value).sum())
 }
 
+/// Read a single-sample gauge (`uptime_seconds`). Returns `None` when the
+/// metric is absent or carries no sample. When a gauge somehow reports more
+/// than one series we take the first — `uptime_seconds` is unlabelled, so
+/// that arm is defensive rather than expected.
+pub fn gauge(map: &HashMap<String, Vec<Sample>>, name: &str) -> Option<f64> {
+    map.get(name)?.first().map(|s| s.value)
+}
+
+/// Routes the Home request-rate chart must not count.
+///
+/// The Home page polls `/ui/hts/home/cards` every 15 s, and that poll is
+/// itself an HTTP request the upstream counts. Left in the series, an idle
+/// server would plot a permanent flat line of ~4 req/min — the chart
+/// measuring its own refresh. `/metrics` is excluded for the same reason:
+/// each poll scrapes it once. Both are matched against the `route` label,
+/// which `helios_observability` fills from axum's templated `MatchedPath`,
+/// so these are exact route templates, not raw URIs.
+pub const SELF_ROUTES: [&str; 2] = ["/ui/hts/home/cards", "/metrics"];
+
+/// Cumulative `http_requests_total` split by HTTP status class.
+///
+/// Each field is a *counter* value (monotonically increasing for the life of
+/// the upstream process), never a rate. Turning these into a rate is
+/// [`crate::metrics_ring`]'s job.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatusCounts {
+    /// Every counted request, whatever its status class — including 1xx/3xx,
+    /// which get no series of their own.
+    pub all: u64,
+    pub s2xx: u64,
+    pub s4xx: u64,
+    pub s5xx: u64,
+}
+
+/// Bucket `http_requests_total` by status class, dropping any sample whose
+/// `route` label appears in `excluded_routes`.
+///
+/// Samples with an unparseable or missing `status` label still count toward
+/// `all` — dropping them would understate total traffic, and `all` is the
+/// default series. Fractional counter values (never emitted in practice) are
+/// truncated toward zero rather than rejected.
+pub fn request_counts_by_status_class(
+    map: &HashMap<String, Vec<Sample>>,
+    excluded_routes: &[&str],
+) -> StatusCounts {
+    let mut out = StatusCounts::default();
+    let Some(samples) = map.get("http_requests_total") else {
+        return out;
+    };
+    for sample in samples {
+        if let Some(route) = sample.labels.get("route")
+            && excluded_routes.contains(&route.as_str())
+        {
+            continue;
+        }
+        if sample.value < 0.0 {
+            continue;
+        }
+        let value = sample.value as u64;
+        out.all = out.all.saturating_add(value);
+        match sample.labels.get("status").and_then(|s| s.as_bytes().first()) {
+            Some(b'2') => out.s2xx = out.s2xx.saturating_add(value),
+            Some(b'4') => out.s4xx = out.s4xx.saturating_add(value),
+            Some(b'5') => out.s5xx = out.s5xx.saturating_add(value),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Compute the process-wide average of a histogram, expressed in the
 /// histogram's native unit. Uses `sum(name_sum) / sum(name_count)` — the
 /// canonical Prometheus recipe. Returns `None` when either series is
@@ -245,6 +315,57 @@ broken_counter{route=\"/y\"} +Inf
         let s = &map.get("custom_metric").unwrap()[0];
         assert_eq!(s.labels.get("msg"), Some(&"a \"quoted\" val".to_string()));
         assert_eq!(s.labels.get("path"), Some(&"C:\\tmp".to_string()));
+    }
+
+    /// Self-traffic exclusion (§7.1 chart): the Home poll route and
+    /// `/metrics` must not appear in the charted counts, or an idle server
+    /// plots a flat line generated entirely by the chart's own refresh.
+    #[test]
+    fn request_counts_exclude_self_traffic_routes() {
+        let text = "\
+http_requests_total{method=\"GET\",route=\"/ui/hts\",status=\"200\"} 10
+http_requests_total{method=\"GET\",route=\"/ui/hts/home/cards\",status=\"200\"} 400
+http_requests_total{method=\"GET\",route=\"/metrics\",status=\"200\"} 400
+http_requests_total{method=\"GET\",route=\"/CodeSystem/$lookup\",status=\"404\"} 3
+http_requests_total{method=\"POST\",route=\"/import\",status=\"500\"} 1
+";
+        let map = parse(text);
+        let counts = request_counts_by_status_class(&map, &SELF_ROUTES);
+        assert_eq!(
+            counts.all, 14,
+            "self-traffic (800 requests) must be excluded from the charted total",
+        );
+        assert_eq!(counts.s2xx, 10);
+        assert_eq!(counts.s4xx, 3);
+        assert_eq!(counts.s5xx, 1);
+
+        // Without the exclusion list every self-request is counted — proving
+        // the filter, not the absence of the data.
+        let unfiltered = request_counts_by_status_class(&map, &[]);
+        assert_eq!(unfiltered.all, 814);
+    }
+
+    #[test]
+    fn request_counts_keep_unlabelled_status_in_the_all_series() {
+        // `all` is the default series; a sample we cannot classify must still
+        // be counted there rather than silently understating traffic.
+        let map = parse("http_requests_total{route=\"/x\"} 7\n");
+        let counts = request_counts_by_status_class(&map, &SELF_ROUTES);
+        assert_eq!(counts.all, 7);
+        assert_eq!(counts.s2xx, 0);
+    }
+
+    #[test]
+    fn request_counts_are_zero_when_the_counter_is_absent() {
+        let counts = request_counts_by_status_class(&parse("other_metric 1\n"), &SELF_ROUTES);
+        assert_eq!(counts, StatusCounts::default());
+    }
+
+    #[test]
+    fn gauge_reads_uptime_seconds() {
+        let map = parse("uptime_seconds 123.5\n");
+        assert_eq!(gauge(&map, "uptime_seconds"), Some(123.5));
+        assert!(gauge(&map, "missing_gauge").is_none());
     }
 
     #[test]

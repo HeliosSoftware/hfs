@@ -1,22 +1,38 @@
-//! Slice F — standalone Import page (design doc §7.7).
+//! Standalone Import page (design doc §7.7), V3 "stepped" layout (#551).
 //!
 //! Two routes under `/hts/import`:
 //!
-//! - `GET /hts/import` — full-page shell with upload form + empty status
-//!   region. On `HX-Request` returns only the upload-form partial (dual-mode
-//!   per design doc §7.6 F14 / §7.10 row 7.7 nojs contract).
+//! - `GET /hts/import` — full-page shell with steps 1–2 (source + review)
+//!   and an empty step-3 result card. On `HX-Request` returns only the
+//!   form partial (dual-mode per design doc §7.6 F14 / §7.10 row 7.7 nojs
+//!   contract).
 //! - `POST /hts/import` — accepts the JSON Bundle from the form, proxies to
 //!   HTS `POST /import`, and renders the status partial. On hard nav
 //!   re-renders the full page with the status partial embedded.
 //!
-//! Slice F v1 ships **paste-only**: the design lists both paste and file
-//! sources in §7.7 but the file-upload path requires multipart plumbing
-//! that would inflate the diff without new test coverage the paste path
-//! doesn't already provide. See `# TODO(F): file input follow-up` below.
-//! The `<input type="file">` still renders for a11y symmetry with the
-//! radio group, but its value is currently ignored by the server (a
-//! stub input error surfaces via the same empty-bundle gate that
-//! catches paste-mode misses).
+//! # Layout
+//!
+//! Three numbered `.card` steps, all direct children of `.content` so the
+//! shared `.content > .card ~ .card` rule spaces them. The three result
+//! states are told apart by shared HFS primitives (`.notice` /
+//! `.notice--warn` plus `.tag--matched` / `.tag--muted` / `.tag--excluded`)
+//! rather than the old `hts-import-status--*` modifiers, which had no CSS
+//! rule at all and made success and partial-success identical.
+//!
+//! # Why step 2 shows no entry counts
+//!
+//! HTS returns per-resource counts **only** in the `POST /import` response
+//! body (`upstream::ImportCounts`), so it cannot know them before writing.
+//! Step 2 is therefore a genuine confirm step — target server, request
+//! shape, accepted resource types, and the update-in-place semantics — and
+//! never a fabricated pre-flight summary.
+//!
+//! # File input
+//!
+//! The `<input type="file">` is handled entirely client-side by
+//! `assets/import.js`, which `FileReader`s the picked file into the
+//! `#hts-import-bundle` textarea; the server still only ever reads the
+//! urlencoded `bundle` field and never sees `bundle_file`.
 
 use askama::Template;
 use axum::{
@@ -50,6 +66,12 @@ struct ImportPageTemplate<'a> {
     /// the shell then renders the shared `hts-degraded.html` banner and
     /// disables the submit button (design doc §7 preamble degraded state).
     degraded_reason: Option<&'static str>,
+    /// Absolute URL the Bundle will be POSTed to upstream. Rendered in
+    /// step 2 ("Review") so the operator can see which terminology server
+    /// is about to be written to before committing. Known server-side
+    /// without a round-trip — unlike the entry counts, which HTS reports
+    /// only in the `POST /import` *response*.
+    target_url: String,
 }
 
 #[derive(Template)]
@@ -57,6 +79,7 @@ struct ImportPageTemplate<'a> {
 struct ImportFormTemplate<'a> {
     chrome: Chrome<'a>,
     degraded_reason: Option<&'static str>,
+    target_url: String,
 }
 
 #[derive(Template)]
@@ -157,6 +180,33 @@ impl StatusView {
     fn issue_count(&self) -> usize {
         self.issues.len()
     }
+
+    /// Non-fatal issues as one newline-joined block, for the
+    /// `<pre class="detail__code">` inside the issues disclosure.
+    fn issues_text(&self) -> String {
+        self.issues.join("\n")
+    }
+
+    /// Machine-readable marker rendered as `data-import-status` on the
+    /// step-3 panel. Replaces the old `hts-import-status--{ok,warn,error}`
+    /// class markers, which carried no CSS rule and therefore made
+    /// success and partial-success visually identical (#551). Tests key
+    /// off this attribute; styling comes from `.notice` / `.tag` only.
+    fn status_slug(&self) -> &'static str {
+        if self.degraded_reason.is_some() {
+            "degraded"
+        } else if self.is_too_large {
+            "too-large"
+        } else if self.is_rejected {
+            "rejected"
+        } else if self.is_partial {
+            "partial"
+        } else if self.is_success {
+            "success"
+        } else {
+            "unknown"
+        }
+    }
 }
 
 // ── GET /hts/import ─────────────────────────────────────────────────────
@@ -176,11 +226,13 @@ async fn import_page(
     // the upstream `/health` probe fails — same trigger as the
     // dashboard and browser pages (design doc §7 preamble).
     let degraded_reason = probe_degraded(&state).await;
+    let target_url = import_target_url(&state);
     if is_htmx {
         return render(
             ImportFormTemplate {
                 chrome,
                 degraded_reason,
+                target_url,
             }
             .render(),
         );
@@ -190,9 +242,16 @@ async fn import_page(
             chrome,
             status: None,
             degraded_reason,
+            target_url,
         }
         .render(),
     )
+}
+
+/// Upstream URL the Bundle is POSTed to. Shared by the review step and
+/// the transport-failure status view so both name the same endpoint.
+fn import_target_url(state: &HtsUiState) -> String {
+    format!("{}/import", state.upstream.base_url())
 }
 
 async fn probe_degraded(state: &HtsUiState) -> Option<&'static str> {
@@ -211,6 +270,7 @@ async fn import_run(
     body: Bytes,
 ) -> Response {
     let form = parse_form(&body);
+    let target_url = import_target_url(&state);
     let chrome = Chrome {
         i18n: I18n::new(locale),
         active_page: "import",
@@ -228,7 +288,7 @@ async fn import_run(
         let view = StatusView::from_outcome(OutcomeView::invalid_input(
             chrome.i18n.t("hts-import-empty-bundle-error"),
         ));
-        return respond(&chrome, view, is_htmx);
+        return respond(&chrome, view, is_htmx, target_url);
     }
 
     // Pre-flight gate #2 — invalid JSON. Same shape as gate #1 but a
@@ -238,23 +298,27 @@ async fn import_run(
         let view = StatusView::from_outcome(OutcomeView::invalid_input(
             chrome.i18n.t("hts-import-invalid-json-error"),
         ));
-        return respond(&chrome, view, is_htmx);
+        return respond(&chrome, view, is_htmx, target_url);
     }
 
     match state.upstream.import_bundle(bundle_trim).await {
         Ok(result) => {
             let view = StatusView::from_result(result);
-            respond(&chrome, view, is_htmx)
+            respond(&chrome, view, is_htmx, target_url)
         }
         Err(err) => {
-            let request_url = format!("{}/import", state.upstream.base_url());
-            let view = StatusView::from_error(request_url, &err);
-            respond(&chrome, view, is_htmx)
+            let view = StatusView::from_error(target_url.clone(), &err);
+            respond(&chrome, view, is_htmx, target_url)
         }
     }
 }
 
-fn respond<'a>(chrome: &Chrome<'a>, view: StatusView, is_htmx: bool) -> Response {
+fn respond<'a>(
+    chrome: &Chrome<'a>,
+    view: StatusView,
+    is_htmx: bool,
+    target_url: String,
+) -> Response {
     if is_htmx {
         return render(
             ImportStatusTemplate {
@@ -273,6 +337,7 @@ fn respond<'a>(chrome: &Chrome<'a>, view: StatusView, is_htmx: bool) -> Response
             // failure via `from_error` and its `degraded_reason`
             // renders inside the status region.
             degraded_reason: None,
+            target_url,
         }
         .render(),
     )

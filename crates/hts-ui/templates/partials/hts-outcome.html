@@ -22,24 +22,31 @@
     • `location[]` renders as a small monospace list, useful for form-field
       wiring in Wave 2 slices (Ops workbench).
 -#}
-<aside class="hts-outcome hts-outcome--{{ outcome.severity }}"
+{#- `.hts-outcome*` had no rule in app.css, so severity was invisible.
+    Severity now rides on `data-severity` (no styling attached) and the box
+    reuses `.notice.notice--warn`, matching every other warning surface. -#}
+<aside class="notice notice--warn" data-severity="{{ outcome.severity }}"
        role="{% if outcome.severity == "fatal" || outcome.severity == "error" %}alert{% else %}status{% endif %}"
        aria-live="polite">
-  <p class="hts-outcome__code">
+  <p class="field__label">
     <span class="visually-hidden">{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", outcome.severity.to_string()) }}</span>
-    {{ chrome.i18n.t(format!("hts-outcome-code-{}", outcome.code).as_str()) }}
+    {#- `t_or`, not `t`: the catalog carries only the four codes the UI
+        reasons about, and `t` would print the composed *key* for any other
+        FHIR issue code. This is the fallback the comment above has always
+        promised — an unknown code surfaces as itself. -#}
+    {{ chrome.i18n.t_or(format!("hts-outcome-code-{}", outcome.code).as_str(), outcome.code.as_str()) }}
   </p>
   {% if !outcome.diagnostics.is_empty() %}
-  <p class="hts-outcome__diagnostics">{{ outcome.diagnostics }}</p>
+  <p>{{ outcome.diagnostics }}</p>
   {% endif %}
   {% if !outcome.location.is_empty() %}
-  <ul class="hts-outcome__location">
+  <ul class="filter-rail__list">
     {% for loc in outcome.location %}
     <li><code>{{ loc }}</code></li>
     {% endfor %}
   </ul>
   {% endif %}
   {% if let Some(rid) = outcome.request_id %}
-  <p class="hts-outcome__meta"><small>{{ chrome.i18n.t_arg("hts-outcome-request-id", "id", rid.to_string()) }}</small></p>
+  <p class="field__hint"><small>{{ chrome.i18n.t_arg("hts-outcome-request-id", "id", rid.to_string()) }}</small></p>
   {% endif %}
 </aside>

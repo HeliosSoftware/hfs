@@ -17,35 +17,30 @@ test.describe("HTS home (Phase 2 Slice A)", () => {
     await expect(page.getByRole("heading", { name: "Home", exact: true })).toBeVisible();
   });
 
-  test("cards row renders the status / backend / uptime / FHIR version tiles", async ({ page }) => {
+  test("one row of four consolidated tiles, per the V3 mockup", async ({ page }) => {
     await page.goto("/ui/hts");
-    // Scope the assertion to the Home cards region. Since the sidebar's
-    // FHIR-version selector added by the 2026-08-20 visual-parity work
-    // also renders "FHIR version" as its menu heading, the labels only
-    // become unambiguous when we anchor at `.hts-home`.
+    // Until 2026-08-28 this was eight tiles across three rows. Backend,
+    // FHIR version, Bundled data and Avg latency no longer have tiles of
+    // their own — each folds into the `.stat__sub` of the tile it
+    // qualifies, which is what the approved mockup draws.
     const cards = page.locator(".hts-home");
-    for (const label of [
-      "Status",
-      "Backend",
-      "Uptime",
-      "FHIR version",
-      "Loaded systems",
-      "Bundled data",
-    ]) {
+    await expect(cards.locator("article.card.stat")).toHaveCount(4);
+    for (const label of ["Status", "Uptime", "Loaded code systems", "Requests"]) {
       await expect(cards.getByText(label, { exact: true }).first()).toBeVisible();
     }
   });
 
-  test("metrics row renders the Requests + Avg latency tiles", async ({ page }) => {
-    // The two Wave-2 tiles are wired to `/metrics` in Home::fetch() and no
-    // longer hardcode an em-dash. The values may still legitimately be
-    // "—" the very first paint if the histogram count is zero (edge case
-    // right at boot), so we only assert the labels are present — the raw
-    // presence of the tiles is what proves the wiring.
+  test("the folded-in values survive as tile sub-lines", async ({ page }) => {
+    // The consolidation must not lose data. Every value that used to have a
+    // tile still renders, one line lower. Values themselves can legitimately
+    // be em-dashes at first paint (a zero-count histogram right at boot), so
+    // assert on the sub-line prose that frames them.
     await page.goto("/ui/hts");
-    for (const label of ["Requests", "Avg latency"]) {
-      await expect(page.getByText(label, { exact: true })).toBeVisible();
-    }
+    const cards = page.locator(".hts-home");
+    await expect(cards.locator(".stat__sub").first()).toContainText(/backend/i);
+    await expect(cards).toContainText(/no restarts since/i);
+    await expect(cards).toContainText(/bundled on disk|TerminologyCapabilities/i);
+    await expect(cards).toContainText(/average · from \/metrics|Since server start/i);
   });
 
   test("sidebar lists every canonical HTS UI section", async ({ page }) => {
@@ -55,19 +50,30 @@ test.describe("HTS home (Phase 2 Slice A)", () => {
       "Code Systems",
       "Value Sets",
       "Concept Maps",
-      "Operations",
       "Import",
-      "Diagnostics",
+      // HFS's own label, shared via the workspace Fluent catalog. This
+      // entry was called "Diagnostics" until 2026-08-27. The "Operations"
+      // entry that used to sit before Import went with the Operations page.
+      "Capability & Conformance",
     ]) {
       await expect(page.locator("#sidebar nav").getByText(label, { exact: false })).toBeVisible();
     }
   });
 
-  test("dialect chip shows the negotiated locale in the topbar", async ({ page }) => {
+  test("the topbar carries exactly HFS's three controls, and nothing more", async ({ page }) => {
     await page.goto("/ui/hts");
-    // The chip renders the effective BCP-47 tag in a <code> inside a
-    // <details><summary>. First paint: "dialect: en".
-    await expect(page.locator(".dialect-chip__value")).toContainText("en");
+    const tools = page.locator(".topbar__tools");
+    // HFS's topbar is the language switcher, the theme toggle and the
+    // avatar — in that order. HTS is the same system to an operator, so its
+    // chrome must not diverge.
+    await expect(tools.locator(".lang-switcher")).toHaveCount(1);
+    await expect(tools.locator(".theme-toggle")).toHaveCount(1);
+    await expect(tools.locator(".topbar__avatar")).toHaveText("K");
+    // A fourth control — a "dialect: en" disclosure — was removed on
+    // 2026-08-28. It shipped non-functional in its first commit and HFS has
+    // no counterpart. Nothing in the topbar may open a menu.
+    await expect(tools.locator("details")).toHaveCount(0);
+    await expect(page.locator(".dialect-chip, .dialect-chip__value")).toHaveCount(0);
   });
 
   test("language switcher lands us in Spanish when we click ES", async ({ page }) => {

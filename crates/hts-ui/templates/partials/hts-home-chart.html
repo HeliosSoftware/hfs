@@ -1,0 +1,126 @@
+{#-
+  Home request-rate chart (design doc §7.1).
+
+  Markup is a deliberate clone of HFS's `.card.chart-card` block in
+  `crates/ui/templates/pages/index.html` so both products render against the
+  same rules in the shared `crates/ui/assets/app.css` — no HTS-specific CSS
+  exists, and none may be added here. Every class below was checked to have a
+  rule in that stylesheet.
+
+  Two things HFS emits that are deliberately absent:
+    * `.chart-legend__type` — it appears in HFS's markup but has no rule in
+      app.css, so it is dead weight; a bare <span> renders identically.
+    * the type-picker `.pill` / `.pill--square` expand button — HTS has no
+      resource-type dimension and no expanded chart view, so those would be
+      controls that do nothing.
+
+  What is plotted is a RATE (requests per minute), not the cumulative
+  counter `/metrics` exposes. See `src/metrics_ring.rs` for why, and for how
+  restarts, counter resets, and unobserved stretches become gaps.
+-#}
+<section class="card chart-card" aria-labelledby="hts-home-chart-heading">
+  <header class="chart-card__head">
+    <div>
+      <span class="stat__label" id="hts-home-chart-heading">{{ chrome.i18n.t("hts-home-chart-title") }}</span>
+      <span class="stat__value">
+        {%- if cards.chart.view.has_data -%}
+          {{ cards.chart.view.latest }}
+        {%- else -%}
+          &mdash;
+        {%- endif -%}
+      </span>
+      {#-
+        `.stat__sub` carries the honest state, never the chart: either why
+        there is no line, or (when there is one) what the numbers exclude.
+      -#}
+      {% match cards.chart.empty %}
+        {% when Some(reason) %}
+          <span class="stat__sub">{{ chrome.i18n.t(reason.key()) }}</span>
+        {% when None %}
+          {#-
+            Composed from the *selected* window and status class, not fixed
+            prose. The V3 mockup's caption reads "Last hour, all status
+            classes." — true only for the 1h chip with the All legend item,
+            and this picker offers three windows and four classes. Each
+            locale owns its own word order via the two placeables.
+
+            The sampling caveat is kept even though the mockup drops it: the
+            ring only fills while someone has this page open, and that is the
+            single fact that explains an otherwise inexplicably sparse chart.
+          -#}
+          <span class="stat__sub">{{ chrome.i18n.t_arg2_msg("hts-home-chart-hint", "window", cards.window.hint_key(), "classes", cards.series.hint_key()) }}</span>
+      {% endmatch %}
+    </div>
+    <div class="chart-card__tools">
+      {#-
+        Time-window selector. Each option is a plain link back to the Home
+        page carrying `?window=&series=`, so it works with JavaScript off;
+        with htmx on, the swapped region's own `hx-get` picks the selection
+        up on the next tick.
+      -#}
+      <nav class="window-picker" aria-label="{{ chrome.i18n.t("hts-home-chart-window") }}">
+        {% for w in cards.chart.windows %}
+        <a
+          class="window-picker__option{% if w.active %} window-picker__option--active{% endif %}"
+          href="{{ w.href }}"
+          {% if w.active %}aria-current="true"{% endif %}
+        >{{ chrome.i18n.t(w.label_key) }}</a>
+        {% endfor %}
+      </nav>
+    </div>
+  </header>
+
+  {#-
+    The axis frame always renders, even with nothing to plot: an empty plot
+    box plus the `.stat__sub` explanation is honest, whereas a fabricated
+    flat line at zero would claim we observed silence.
+
+    role=group rather than img — the legend below is the interactive part,
+    but keeping the accessible name on a group matches HFS and leaves room
+    for future in-chart links without tripping axe's nested-interactive rule.
+  -#}
+  <svg class="chart" viewBox="0 0 1060 {{ cards.chart.view.height }}" role="group"
+       aria-labelledby="hts-home-chart-heading">
+    {% for tick in cards.chart.view.y_ticks %}
+    <line class="grid-line" x1="40" y1="{{ tick.pos }}" x2="1060" y2="{{ tick.pos }}" />
+    <text class="axis-label" x="0" y="{{ tick.label_y }}">{{ tick.label }}</text>
+    {% endfor %}
+    {#-
+      One <polyline> per continuously observed run. A break between two
+      polylines is a stretch nobody was sampling — never bridged, because a
+      straight line across it would assert traffic we did not measure.
+    -#}
+    {% for points in cards.chart.view.polylines %}
+    <polyline class="series series--{{ cards.chart.view.color }}" points="{{ points }}" />
+    {% endfor %}
+    {% for tick in cards.chart.view.x_ticks %}
+    <text class="axis-label" x="{{ tick.pos }}" y="{{ tick.label_y }}">{{ tick.label }}</text>
+    {% endfor %}
+  </svg>
+
+  {#-
+    Legend doubles as the status-class selector: All / 2xx / 4xx / 5xx. The
+    active entry is an inert <span>; the rest are plain links, so the
+    selector works without JavaScript. The trailing number is the requests of
+    that class observed inside the current window.
+  -#}
+  <ul class="chart-legend" aria-label="{{ chrome.i18n.t("hts-home-chart-series") }}">
+    {% for item in cards.chart.legend %}
+    <li>
+      {% if item.active %}
+      <span class="chart-legend__item chart-legend__item--active" aria-current="true">
+        <span class="chart-legend__dot chart-legend__dot--{{ item.color }}" aria-hidden="true"></span>
+        <span>{{ chrome.i18n.t(item.label_key) }}</span>
+        <span class="chart-legend__total">{{ item.total }}</span>
+      </span>
+      {% else %}
+      <a class="chart-legend__item" href="{{ item.href }}">
+        <span class="chart-legend__dot chart-legend__dot--{{ item.color }}" aria-hidden="true"></span>
+        <span>{{ chrome.i18n.t(item.label_key) }}</span>
+        <span class="chart-legend__total">{{ item.total }}</span>
+      </a>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>

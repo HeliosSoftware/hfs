@@ -51,6 +51,7 @@ fn app_with_timeouts(
         )
         .expect("test upstream base URL parses"),
         bundled_data_bytes: None,
+        metrics_ring: Default::default(),
     });
     Router::new().nest("/ui", helios_hts_ui::router(state))
 }
@@ -112,7 +113,7 @@ impl CannedResponse {
                             "code": "T1",
                             "display": "Target One"
                         }},
-                        {"name": "originMap", "valueUri": "http://example.org/cm/map#1"}
+                        {"name": "originMap", "valueCanonical": "http://example.org/cm/map#1"}
                     ]},
                     {"name": "match", "part": [
                         {"name": "equivalence", "valueCode": "wider"},
@@ -120,7 +121,7 @@ impl CannedResponse {
                             "system": "http://example.org/target-cs",
                             "code": "T2"
                         }},
-                        {"name": "originMap", "valueUri": "http://example.org/cm/map#2"}
+                        {"name": "originMap", "valueCanonical": "http://example.org/cm/map#2"}
                     ]}
                 ]
             }),
@@ -493,7 +494,7 @@ async fn browser_over_max_count_renders_invalid_input_outcome() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("hts-outcome hts-outcome--error"),
+        html.contains(r#"data-severity="error""#),
         "over-max _count must render the outcome partial in error severity",
     );
 }
@@ -580,7 +581,7 @@ async fn detail_unknown_id_renders_outcome_inside_shell() {
     );
     let html = body_text(response).await;
     assert!(
-        html.contains("hts-outcome hts-outcome--error"),
+        html.contains(r#"data-severity="error""#),
         "unknown CM id must render the outcome partial in error severity",
     );
 }
@@ -604,7 +605,7 @@ async fn translate_tab_htmx_returns_full_page_for_region_swap() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("hts-cm-workbench__input"),
+        html.contains(r#"id="hts-workbench-input""#),
         "workbench input partial must still render inside the region",
     );
     assert!(
@@ -798,7 +799,7 @@ async fn translate_reverse_without_target_code_renders_inline_validation_outcome
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("hts-outcome hts-outcome--error"),
+        html.contains(r#"data-severity="error""#),
         "missing `targetCode` in reverse mode must render the invalid-input outcome",
     );
 
@@ -837,7 +838,7 @@ async fn translate_forward_without_code_renders_inline_validation_outcome_withou
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("hts-outcome hts-outcome--error"),
+        html.contains(r#"data-severity="error""#),
         "missing `code` in forward mode must render the invalid-input outcome",
     );
 
@@ -874,11 +875,11 @@ async fn translate_no_matches_renders_neutral_state_not_error() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("hts-cm-workbench__no-matches"),
+        html.contains(r#"id="translate-no-matches""#),
         "result=false must render the neutral no-matches state (class marker)",
     );
     assert!(
-        !html.contains("hts-outcome--error"),
+        !html.contains(r#"data-severity="error""#),
         "no-matches must NOT surface as an error outcome",
     );
 }
@@ -935,7 +936,7 @@ async fn translate_r4_response_labels_column_as_equivalence() {
     );
     // Table renders (grid is present).
     assert!(
-        html.contains("hts-cm-workbench__matches"),
+        html.contains(r#"id="translate-matches""#),
         "R4/R4B success response must render the match grid",
     );
 }
@@ -1010,7 +1011,7 @@ async fn translate_hts_error_renders_outcome_partial() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("hts-outcome hts-outcome--error"),
+        html.contains(r#"data-severity="error""#),
         "HTS 5xx must render the shared error outcome partial",
     );
 }
@@ -1057,5 +1058,259 @@ async fn translate_does_not_expose_unsupported_params() {
     assert!(
         html.contains("name=\"targetSystem\""),
         "camelCase `targetSystem` MUST be present as the only spelling",
+    );
+}
+
+// ── V2 "top strip" browser layout (#551 browser redesign) ───────────────
+//
+// Mirror of `code_systems.rs` / `value_sets.rs`, plus the two CM-specific
+// consequences of the relayout: the Source system / Target system inputs
+// are gone (HTS's `GET /ConceptMap` accepts only url / version / name /
+// title / status and silently drops anything else — see
+// `crates/hts/src/operations/search.rs`), replaced by a `.field__hint`
+// that points the operator at the Mapping column instead.
+
+#[tokio::test]
+async fn browser_renders_v2_top_strip_shell() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/concept-maps")
+                .header(header::ACCEPT_LANGUAGE, "en")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    for hook in [
+        r#"<body class="app-shell">"#,
+        r#"class="content content--app""#,
+        r#"class="card table-card""#,
+        r#"class="toolbar__search""#,
+        r#"class="facets facets--bare""#,
+        r#"class="chip""#,
+        r#"class="field__hint""#,
+    ] {
+        assert!(
+            html.contains(hook),
+            "V2 top-strip layout must render `{hook}`",
+        );
+    }
+    for dead in [
+        "filter-rail",
+        "filter-layout",
+        "content--wide",
+        "btn--ghost",
+        "btn--secondary",
+        r#"class="hts-degraded""#,
+        r#"name="source""#,
+        r#"name="target""#,
+    ] {
+        assert!(
+            !html.contains(dead),
+            "`{dead}` must not be rendered by the V2 concept-map browser",
+        );
+    }
+    assert!(
+        html.contains(r#"<aside class="notice notice--warn""#),
+        "the degraded banner must use the shared `.notice.notice--warn` skin",
+    );
+    assert!(
+        !html.contains("hts-cm-browser-filter-hint"),
+        "the dropped-filter hint must be Fluent-resolved, not a raw key",
+    );
+}
+
+#[tokio::test]
+async fn status_chips_mark_the_active_facet_and_carry_text_filters() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/concept-maps?name=sc&status=draft")
+                .header(header::ACCEPT_LANGUAGE, "en")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(
+        html.contains(r#"href="/ui/hts/concept-maps?name=sc&#38;status=draft" aria-current="true""#),
+        "the active status chip must carry aria-current=\"true\"",
+    );
+    assert_eq!(
+        html.matches(r#"class="chip" href"#).count(),
+        5,
+        "five chips: any + draft/active/retired/unknown",
+    );
+    assert!(
+        html.contains(r#"href="/ui/hts/concept-maps?name=sc""#),
+        "the `any status` chip must drop only `status`, keeping `name`",
+    );
+    assert!(
+        html.contains(r#"<input type="hidden" name="status" value="draft">"#),
+        "the active status must ride along with the filter form",
+    );
+}
+
+#[tokio::test]
+async fn browser_rows_render_the_stacked_mapping_cell() {
+    // The mock's search leg seeds one ConceptMap with source/target URIs,
+    // so this covers the Mapping column that replaced the dropped
+    // source/target filters as the way to read "does this map X to Y".
+    let (base, _state) = start_mock().await;
+    let response = app_pointing_at(&base)
+        .oneshot(
+            Request::get("/ui/hts/concept-maps")
+                .header(header::ACCEPT_LANGUAGE, "en")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(
+        html.contains(r#"href="/ui/hts/concept-maps/example-cm""#),
+        "the row must link to the detail page",
+    );
+    assert!(
+        html.contains(r#"<div class="cm-mapping">"#)
+            && html.contains(r#"<span class="cm-mapping__prefix""#),
+        "the Mapping column keeps its stacked S:/T: cell",
+    );
+    assert!(
+        html.contains("http://example.org/vs/source")
+            && html.contains("http://example.org/vs/target"),
+        "both sides of the mapping render",
+    );
+    assert!(
+        html.contains(r#"<span class="url">http://example.org/cm/example</span>"#),
+        "the canonical URL column renders in a `.url` span",
+    );
+}
+
+// ── Static guard: the CM detail surface introduces no CSS of its own ────
+
+/// Strip Askama comments (`{# … #}`) from a template source, so class
+/// names quoted in prose (including ones the template deliberately does
+/// NOT use, like `.addbox`) are not mistaken for rendered markup.
+fn strip_template_comments(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{#") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("#}") {
+            Some(end) => rest = &rest[start + end + 2..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Every class the ConceptMap detail templates use must already have a
+/// rule in the shared `crates/ui/assets/app.css`. The V3 layout pass ships
+/// zero new CSS.
+#[test]
+fn cm_detail_templates_only_use_classes_that_exist_in_app_css() {
+    const APP_CSS: &str = include_str!("../../ui/assets/app.css");
+    let templates = [
+        (
+            "pages/cm-detail.html",
+            include_str!("../templates/pages/cm-detail.html"),
+        ),
+        (
+            "partials/hts-cm-translate-input.html",
+            include_str!("../templates/partials/hts-cm-translate-input.html"),
+        ),
+        (
+            "partials/hts-cm-translate-result.html",
+            include_str!("../templates/partials/hts-cm-translate-result.html"),
+        ),
+    ];
+
+    let mut checked = 0usize;
+    for (name, template) in templates {
+        let body = strip_template_comments(template);
+        for chunk in body.split(r#"class=""#).skip(1) {
+            let value = chunk.split('"').next().unwrap_or_default();
+            if value.contains('{') {
+                continue;
+            }
+            for class in value.split_whitespace() {
+                assert!(
+                    APP_CSS.contains(&format!(".{class}")),
+                    "class `{class}` used by {name} has no rule in crates/ui/assets/app.css",
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 30,
+        "expected the scan to reach the templates' class attributes, only saw {checked}",
+    );
+}
+
+/// The V3 compact header on the ConceptMap detail page.
+#[test]
+fn cm_detail_page_uses_the_v3_compact_header_shape() {
+    const PAGE: &str = include_str!("../templates/pages/cm-detail.html");
+    let body = strip_template_comments(PAGE);
+
+    for hook in [
+        r#"<header class="page-head">"#,
+        r#"class="page-head__title""#,
+        r#"class="facets facets--bare""#,
+        r#"class="detail__field detail__field--wide""#,
+        r#"<summary class="field__label">"#,
+    ] {
+        assert!(body.contains(hook), "V3 compact header must render `{hook}`");
+    }
+    for dead in ["page-header", "addbox", "hts-cm-detail__", "backlink", "<dl"] {
+        assert!(
+            !body.contains(dead),
+            "`{dead}` belongs to the pre-V3 stacked layout and must be gone",
+        );
+    }
+    assert!(
+        !body.contains("<details open"),
+        "the facts disclosure must render collapsed",
+    );
+}
+
+/// Reverse-mode `$translate` responses carry no `originMap`, so the Origin
+/// column is an em-dash by design. The result partial must SAY so rather
+/// than leaving the operator to guess whether the value was lost.
+#[tokio::test]
+async fn translate_reverse_result_footnotes_the_suppressed_origin_map() {
+    let (base, state) = start_mock().await;
+    state.set_canned(CannedResponse::ok_translate_equivalence()).await;
+
+    let response = app_pointing_at(&base)
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/concept-maps/example-cm/translate")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from("direction=reverse&targetCode=B"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("In reverse mode HTS omits originMap"),
+        "reverse-mode matches must carry the suppressed-originMap footnote; got:\n{html}",
     );
 }

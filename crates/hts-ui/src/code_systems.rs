@@ -211,6 +211,49 @@ impl BrowserRowsView {
     fn page(&self) -> Option<&CsBrowserPage> {
         self.result.as_ref().ok()
     }
+
+    /// Href for one status facet chip. The chips are plain links (they
+    /// work with JS off and are the only filter that is not a form
+    /// control), so each one has to carry the active text filters
+    /// forward; `_offset` is deliberately dropped so switching status
+    /// restarts paging. An empty `status` is the "any status" chip.
+    ///
+    /// Built with `form_urlencoded` rather than string concatenation so a
+    /// filter value containing `&` / spaces / unicode cannot inject query
+    /// parameters (same reasoning as `CsBrowserFilters::load_more_url`).
+    fn status_url(&self, status: &str) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.filters.url),
+            ("version", &self.filters.version),
+            ("name", &self.filters.name),
+            ("title", &self.filters.title),
+        ] {
+            if let Some(v) = value {
+                if !v.is_empty() {
+                    ser.append_pair(field, v);
+                }
+            }
+        }
+        if !status.is_empty() {
+            ser.append_pair("status", status);
+        }
+        let query = ser.finish();
+        if query.is_empty() {
+            "/ui/hts/code-systems".to_owned()
+        } else {
+            format!("/ui/hts/code-systems?{query}")
+        }
+    }
+
+    /// Whether `status` is the chip currently selected — drives
+    /// `aria-current="true"`. The empty string matches "no status filter".
+    fn status_is(&self, status: &str) -> bool {
+        match &self.filters.status {
+            Some(active) => active == status,
+            None => status.is_empty(),
+        }
+    }
 }
 
 async fn browser_page(

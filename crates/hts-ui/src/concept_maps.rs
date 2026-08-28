@@ -217,6 +217,44 @@ impl BrowserRowsView {
     fn page(&self) -> Option<&CmBrowserPage> {
         self.result.as_ref().ok()
     }
+
+    /// See `code_systems::BrowserRowsView::status_url`. `source` /
+    /// `target` are no longer offered as inputs (HTS drops them), but a
+    /// hand-written URL that carries them still round-trips through the
+    /// chips rather than being silently dropped here.
+    fn status_url(&self, status: &str) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.filters.url),
+            ("name", &self.filters.name),
+            ("title", &self.filters.title),
+            ("source", &self.filters.source),
+            ("target", &self.filters.target),
+        ] {
+            if let Some(v) = value {
+                if !v.is_empty() {
+                    ser.append_pair(field, v);
+                }
+            }
+        }
+        if !status.is_empty() {
+            ser.append_pair("status", status);
+        }
+        let query = ser.finish();
+        if query.is_empty() {
+            "/ui/hts/concept-maps".to_owned()
+        } else {
+            format!("/ui/hts/concept-maps?{query}")
+        }
+    }
+
+    /// Whether `status` is the chip currently selected. Empty == "any".
+    fn status_is(&self, status: &str) -> bool {
+        match &self.filters.status {
+            Some(active) => active == status,
+            None => status.is_empty(),
+        }
+    }
 }
 
 async fn browser_page(

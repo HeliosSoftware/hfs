@@ -36,6 +36,7 @@ fn app() -> Router {
         )
         .expect("closed loopback URL always parses"),
         bundled_data_bytes: None,
+        metrics_ring: Default::default(),
     });
     Router::new().nest("/ui", helios_hts_ui::router(state))
 }
@@ -149,52 +150,6 @@ const ROUTES: &[Route] = &[
         path: "/ui/hts/concept-maps/does-not-exist/translate",
         expect: "hts-cm-detail",
     },
-    // Slice E: standalone Operations workbench. The default landing
-    // arm renders `?op=lookup&resource=CodeSystem`; the shell heading
-    // is the stable marker across states (loaded / degraded).
-    Route {
-        path: "/ui/hts/operations",
-        expect: "hts-operations-heading",
-    },
-    // Slice E2 §7.6.1 F16 hook #1 — the op × resource matrix.  Each
-    // op-selector link must reach a per-op input partial via the
-    // `/hts/operations/input` route. Every row is asserted from
-    // inside this walker so the whole enumeration lives in a single
-    // `#[tokio::test]` (Windows STATUS_INVALID_HANDLE guard, §7.3.1
-    // invariant #6). `hts-workbench-input` is the shared per-op
-    // input wrapper id (F15) that every input partial re-emits.
-    Route {
-        path: "/ui/hts/operations/input?op=lookup&resource=CodeSystem",
-        expect: "hts-workbench-input",
-    },
-    Route {
-        path: "/ui/hts/operations/input?op=validate-code&resource=CodeSystem",
-        expect: "hts-workbench-input",
-    },
-    Route {
-        path: "/ui/hts/operations/input?op=validate-code&resource=ValueSet",
-        expect: "hts-workbench-input",
-    },
-    Route {
-        path: "/ui/hts/operations/input?op=subsumes&resource=CodeSystem",
-        expect: "hts-workbench-input",
-    },
-    Route {
-        path: "/ui/hts/operations/input?op=expand&resource=ValueSet",
-        expect: "hts-workbench-input",
-    },
-    Route {
-        path: "/ui/hts/operations/input?op=translate&resource=ConceptMap",
-        expect: "hts-workbench-input",
-    },
-    Route {
-        path: "/ui/hts/operations/input?op=closure",
-        expect: "hts-workbench-input",
-    },
-    Route {
-        path: "/ui/hts/operations/input?op=batch-validate&resource=ValueSet",
-        expect: "hts-workbench-input",
-    },
     // Slice F: standalone Import page. The shell renders a real
     // `<form>` (nojs contract) with a paste-mode textarea; the H1
     // string is the stable marker across states (loaded / degraded).
@@ -206,27 +161,20 @@ const ROUTES: &[Route] = &[
         // Fluent en value for `hts-import-heading` is "Import terminology".
         expect: ">Import terminology<",
     },
-    // Slice G: standalone Diagnostics page. Two entries — the shell
-    // and the panel fragment. The shell renders the 4-tab strip
-    // (Capability, TerminologyCap, /health, /metrics); the panel
-    // route is the htmx `hx-get` target for the tab swap. The panel
-    // marker is a class the shared panel partial always emits (the
-    // capability tab is the default when `?tab=` is absent).
-    // Per-tab HTTP failure paths are covered in `tests/diagnostics.rs`.
+    // Capability & Conformance. One entry — the page mirrors HFS's own
+    // capability page (stacked `.card` sections, no tab strip), so there is
+    // no fragment endpoint. It was called "Diagnostics" at
+    // `/ui/hts/diagnostics` until 2026-08-27; that path now 308s here and
+    // is therefore **not** in this matrix, which asserts 200 on every row.
+    // The redirect is covered in `tests/capability.rs`. Per-source failure
+    // isolation lives there too.
     Route {
-        path: "/ui/hts/diagnostics",
-        // Fluent en value for `hts-diagnostics-heading` is "Diagnostics".
-        // The `>Diagnostics<` marker is on both the H1 and the sidebar
-        // nav item, so it survives any state (loaded / degraded).
-        expect: ">Diagnostics<",
-    },
-    Route {
-        path: "/ui/hts/diagnostics/panel",
-        // Outer wrapper class emitted unconditionally by the shared
-        // panel partial. Stable across all four tabs *and* the
-        // per-tab OperationOutcome arm (§7.9 per-tab isolation),
-        // so the marker survives a closed-loopback upstream too.
-        expect: "hts-diagnostics-panel-body",
+        path: "/ui/hts/capability-statement",
+        // Fluent en value for `cap-title` — HFS's own key, shared via the
+        // workspace catalog. It is on the H1, so it survives any state
+        // (loaded / degraded); the sidebar carries the different
+        // `nav-capability-conformance` label, exactly as HFS does.
+        expect: ">Capability Statement<",
     },
 ];
 

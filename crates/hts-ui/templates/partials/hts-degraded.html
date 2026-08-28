@@ -17,16 +17,16 @@
                  triage
     request_id : optional correlation id
 -#}
-<aside class="hts-degraded" role="alert" aria-live="assertive">
-  <p class="hts-degraded__title">{{ chrome.i18n.t("hts-degraded-title") }}</p>
-  <p class="hts-degraded__reason">
+<aside class="notice notice--warn" role="alert" aria-live="assertive">
+  <p class="field__label">{{ chrome.i18n.t("hts-degraded-title") }}</p>
+  <p>
     {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
   </p>
   {% if let Some(t) = since %}
-  <p class="hts-degraded__since"><small>{{ chrome.i18n.t_arg("hts-degraded-since", "timestamp", t.to_string()) }}</small></p>
+  <p class="field__hint"><small>{{ chrome.i18n.t_arg("hts-degraded-since", "timestamp", t.to_string()) }}</small></p>
   {% endif %}
-  <p class="hts-degraded__body">{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  <p>{{ chrome.i18n.t("hts-degraded-body") }}</p>
   {% if let Some(rid) = request_id %}
-  <p class="hts-degraded__meta"><small>{{ chrome.i18n.t_arg("hts-outcome-request-id", "id", rid.to_string()) }}</small></p>
+  <p class="field__hint"><small>{{ chrome.i18n.t_arg("hts-outcome-request-id", "id", rid.to_string()) }}</small></p>
   {% endif %}
 </aside>

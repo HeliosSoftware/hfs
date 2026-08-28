@@ -1,5 +1,11 @@
 # HTS UI — GitHub Discussion draft (ready to paste)
 
+> **Superseded in part (2026-08-27).** The **Operations workbench page and the Home Quick-links
+> strip have been removed** from the HTS UI. References to either below are historical. The
+> removal orphans `$closure`, `$batch-validate-code` and ValueSet `$validate-code`; see
+> [hts-ui-improvement-plan.md](hts-ui-improvement-plan.md) §1.5 for the re-homing decision.
+
+
 > **Not yet published.** This file is the Phase 5 deliverable of the
 > `hts_ui_delivery_strategy_8b4bcd79.plan.md` delivery plan (D1 of
 > [#551](https://github.com/HeliosSoftware/hfs/issues/551)). Publishing

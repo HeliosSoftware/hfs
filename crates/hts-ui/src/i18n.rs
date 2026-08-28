@@ -200,6 +200,25 @@ impl I18n {
             .unwrap_or_else(|| key.to_owned())
     }
 
+    /// Look up a message, falling back to `fallback` rather than to the key
+    /// when the catalog has no entry.
+    ///
+    /// For keys built from server-supplied values, where the set of possible
+    /// keys is open. The OperationOutcome partial composes
+    /// `hts-outcome-code-<code>` from a FHIR issue code, and the catalog
+    /// carries only the four the UI reasons about (`not-found`, `invalid`,
+    /// `too-costly`, `unknown`). Its own comment has always promised it
+    /// "falls back to the raw code so unknown codes still surface" — but
+    /// [`Self::t`] returns the *key*, so an ordinary `business-rule` issue
+    /// rendered the literal string `hts-outcome-code-business-rule` on the
+    /// page. This makes the documented behaviour real: the reader sees
+    /// `business-rule`, which is at least the truth from the server.
+    pub fn t_or(&self, key: &str, fallback: &str) -> String {
+        LOCALES
+            .try_lookup(self.locale, key)
+            .unwrap_or_else(|| fallback.to_owned())
+    }
+
     /// Look up a message with one named placeable, e.g.
     /// `t_arg("hts-home-uptime", "duration", "3d")`.
     pub fn t_arg(&self, key: &str, name: &str, value: impl Into<FluentValue<'static>>) -> String {
@@ -231,6 +250,29 @@ impl I18n {
         LOCALES
             .try_lookup_with_args(self.locale, key, &args)
             .unwrap_or_else(|| key.to_owned())
+    }
+
+    /// Like [`Self::t_arg2`], but both placeable values are themselves
+    /// **message keys**, resolved in the same locale before interpolation.
+    ///
+    /// Exists because the two sub-messages cannot be composed in the
+    /// template: writing `t_arg2(k, "a", t(k1), "b", t(k2))` there makes
+    /// Askama hand `t_arg2` a `&&String`, which does not satisfy
+    /// `Into<FluentValue<'static>>`. Resolving here keeps the call site
+    /// readable and the composition in Rust, where it belongs.
+    ///
+    /// Fluent's own `{ message-ref }` syntax cannot do this: the reference
+    /// has to be literal in the `.ftl`, and these two are chosen at runtime
+    /// from the selected chart window and status class.
+    pub fn t_arg2_msg(
+        &self,
+        key: &str,
+        name1: &str,
+        key1: &str,
+        name2: &str,
+        key2: &str,
+    ) -> String {
+        self.t_arg2(key, name1, self.t(key1), name2, self.t(key2))
     }
 }
 
@@ -281,6 +323,38 @@ mod tests {
         let (locale, explicit) = negotiate(&Uri::from_static("/ui/hts?lang=de"), &map);
         assert_eq!(locale, &DE);
         assert!(explicit);
+    }
+
+    /// `t_or` exists because keys composed from server-supplied values form
+    /// an open set. `t` renders the *key* on a miss, which is right for the
+    /// UI's own hardcoded keys and wrong for these: an OperationOutcome
+    /// carrying an issue code the catalog has no sentence for used to print
+    /// `hts-outcome-code-business-rule` at the reader.
+    #[test]
+    fn t_or_falls_back_to_the_value_not_the_key() {
+        let i18n = I18n::new(RequestLocale::default());
+
+        // A code the catalog does carry still gets its sentence.
+        assert_eq!(
+            i18n.t_or("hts-outcome-code-not-found", "not-found"),
+            i18n.t("hts-outcome-code-not-found"),
+        );
+        assert_ne!(
+            i18n.t_or("hts-outcome-code-not-found", "not-found"),
+            "not-found",
+            "a translated code must not degrade to its raw form",
+        );
+
+        // A code it does not carry surfaces as itself, never as the key.
+        assert_eq!(
+            i18n.t_or("hts-outcome-code-business-rule", "business-rule"),
+            "business-rule",
+        );
+        assert_eq!(
+            i18n.t("hts-outcome-code-business-rule"),
+            "hts-outcome-code-business-rule",
+            "plain `t` still echoes the key — that is why `t_or` exists",
+        );
     }
 
     /// Guards against the mojibake regression fixed 2026-08-19: the shared

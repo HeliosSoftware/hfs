@@ -50,7 +50,7 @@ Skill composition (co-load these when working on HTS UI):
   - [.claude/skills/frontend-design/SKILL.md](../frontend-design/SKILL.md) —
     palette, typography, layout, accessibility, no-SPA/no-CDN rules
 - **Situational**: [.claude/skills/test-hfs/SKILL.md](../test-hfs/SKILL.md),
-  [.claude/skills/run-hfs-server/SKILL.md](../run-hfs-server/SKILL.md),
+  [.claude/skills/run-hfs-and-hts/SKILL.md](../run-hfs-and-hts/SKILL.md),
   [.claude/skills/work-with-auth/SKILL.md](../work-with-auth/SKILL.md).
 - **User-scope skills**: when personal skills for HTMX authoring, terminology
   UX, or front-end design are installed under `~/.claude/skills/`, they
@@ -343,23 +343,14 @@ in [ui-design-map.md](ui-design-map.md):
 
 ## 8. Local run recipe
 
-The full Rust + MinGW setup for this Windows machine lives at
-[edson/docs/start-app.md](../../edson/docs/start-app.md). The minimum for a
-UI dev loop with HTS:
-
-```powershell
-Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
-$env:Path = "$env:USERPROFILE\.cargo\bin;$env:USERPROFILE\mingw64-toolchain\mingw64\bin;$env:Path"
-
-$env:HTS_DATABASE_URL   = ".\data\hts.db"
-$env:HTS_BOOTSTRAP_DIR  = ".\crates\hts\terminology-data"
-$env:HTS_LOG_LEVEL      = "info"
-.\target\debug\hts.exe run              # binds 127.0.0.1:8090
-
-$env:HFS_TERMINOLOGY_SERVER     = "http://127.0.0.1:8090"
-$env:FHIRPATH_TERMINOLOGY_SERVER = "http://127.0.0.1:8090"
-.\target\debug\hfs.exe                  # binds 127.0.0.1:8080, UI at /ui
-```
+For starting `hts` alone, or `hfs` + `hts` together wired via
+`HFS_TERMINOLOGY_SERVER` / `FHIRPATH_TERMINOLOGY_SERVER`, see
+[.claude/skills/run-hts-server/SKILL.md](../run-hts-server/SKILL.md) and
+[.claude/skills/run-hfs-and-hts/SKILL.md](../run-hfs-and-hts/SKILL.md) —
+both cover the bundled `crates/hts/terminology-data` seed set via
+`HTS_BOOTSTRAP_DIR`. The full Rust + MinGW toolchain setup for this
+Windows machine lives at
+[edson/docs/start-app.md](../../edson/docs/start-app.md).
 
 Sanity: `Invoke-WebRequest http://127.0.0.1:8090/metadata?mode=terminology`
 should return a TerminologyCapabilities resource.

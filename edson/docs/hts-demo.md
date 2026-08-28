@@ -6,12 +6,19 @@ binary before we open the single PR for #551.
 **Scope**: everything shipped in `crates/hts-ui` v1 — §7.1 Home, §7.2
 CodeSystem browser, §7.3 CodeSystem detail (Lookup / Validate / Subsumes),
 §7.4 ValueSet browser + `$expand`, §7.5 ConceptMap browser + `$translate`,
-§7.6 Operations workbench (7 ops, batch-validate polling, closure banner),
-§7.7 Import, §7.9 Diagnostics. §7.8 Bootstrap ledger is deferred to Phase 8+
-and is NOT part of this demo.
+the concept information plane, §7.7 Import, and Capability & Conformance.
+§7.8 Bootstrap ledger is deferred to Phase 8+ and is NOT part of this demo.
+
+**Two pages that used to be in this guide are gone.** The standalone
+Operations workbench (`/ui/hts/operations`) was **deleted** — that path now
+returns `404`. `$closure`, `$batch-validate-code` and ValueSet
+`$validate-code` are **API-only**: they are still routed and still work over
+HTTP (see §4.3), they just have no UI page. And `/ui/hts/diagnostics` was
+renamed to **Capability & Conformance** at `/ui/hts/capability-statement`;
+the old path `308`s to the new one.
 
 **Exit criterion** (from plan `hts_ui_delivery_strategy_8b4bcd79.plan.md`
-Phase 4): reviewer says "UI OK" on every §7 page below, or files findings
+Phase 4): reviewer says "UI OK" on every page below, or files findings
 that a follow-up iteration addresses before Phase 5.
 
 ---
@@ -21,19 +28,21 @@ that a follow-up iteration addresses before Phase 5.
 ## 0. Prerequisites (one-time)
 
 
-| Thing          | Value                                                                                                                    | Why                                                                                                                                                        |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Rust toolchain | `stable-x86_64-pc-windows-gnu` (portable mingw-w64 at `C:\Users\tercere\tools\mingw64\`)                                 | The `stable-*-pc-windows-gnullvm` linker is not installed on this host; Phase 3b confirmed builds on `-gnu` clean.                                         |
-| Cargo profile  | `dev` is fine — release not needed for the demo                                                                          | UI logic is not perf-sensitive.                                                                                                                            |
-| Node / pnpm    | Only needed if you want to reuse `crates/hts-ui/e2e/seed.mjs` to seed via Playwright's harness                           | You can also curl the same bundle by hand — see §1.                                                                                                        |
-| Ports          | HTS binary listens on `HTS_SERVER_PORT` (default **8090**); the e2e harness reuses `HTS_E2E_PORT` (also default `8090`). | Both default to the same port, so a booted `hts` binary and the seed script line up out of the box. Swap in another port only if `8090` is already in use. |
-| Locale packs   | `locales/{en,es,de}/main.ftl` already bundled into the binary                                                            | No filesystem lookup at runtime.                                                                                                                           |
+| Thing          | Value                                                                                             | Why                                                                                                                                    |
+| -------------- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Rust toolchain | `stable-x86_64-pc-windows-gnu` (portable mingw-w64 at `C:\Users\tercere\tools\mingw64\`)          | The `stable-*-pc-windows-gnullvm` linker is not installed on this host; Phase 3b confirmed builds on `-gnu` clean.                      |
+| Cargo profile  | `dev` is fine — release not needed for the demo                                                   | UI logic is not perf-sensitive.                                                                                                        |
+| Seed data      | `crates/hts/terminology-data/` — 17 files, **151 MB** on disk                                     | The official terminology seed set. This is what the whole guide walks through; there is no fixture bundle any more.                     |
+| Disk           | ~1 GB free for `./data/hts.db`                                                                    | The seed set expands to a persistent SQLite file, not an in-memory store.                                                               |
+| Ports          | HTS listens on `HTS_SERVER_PORT` (default **8090**), host `HTS_SERVER_HOST` (default `127.0.0.1`) | Every URL below assumes `http://127.0.0.1:8090`.                                                                                       |
+| Locale packs   | `locales/{en,es,de}/main.ftl` at the workspace root, compiled into the binary                     | No filesystem lookup at runtime.                                                                                                       |
+| curl           | Any curl. Every command below quotes its URL in **single** quotes                                 | Single quotes keep `$lookup` from being read as a shell/PowerShell variable. On Windows PowerShell 5.1 spell it `curl.exe` — plain `curl` there is an alias for `Invoke-WebRequest`. |
 
 
 If you are inside the corporate VPN and off-VPN switches, remember: HTS
-itself does not talk to the internet at runtime (all data is in-process
-SQLite + embedded core packs). The `HTTP_PROXY` env in your shell does not
-affect the HTS binary for `/ui/hts` requests.
+itself does not talk to the internet at runtime (all data is in the local
+SQLite file + embedded core packs). The `HTTP_PROXY` env in your shell does
+not affect the HTS binary for `/ui/hts` requests.
 
 ---
 
@@ -42,147 +51,214 @@ affect the HTS binary for `/ui/hts` requests.
 ## 1. Boot the server
 
 
-
-### 1.1 Empty-store boot (home sanity)
+### 1.1 Boot against the official seed set
 
 ```powershell
-$env:HTS_UI_ENABLED = "true"          # NOT "1" — the binary flag parses as bool
-$env:HTS_SERVER_PORT = "8090"         # optional; default is 8090 anyway
+$env:HTS_BOOTSTRAP_DIR = "./crates/hts/terminology-data"
+$env:HTS_UI_ENABLED    = "true"      # NOT "1" — the binary flag parses as bool
 cargo run --bin hts
 ```
 
-Open [http://127.0.0.1:8090/ui/hts](http://127.0.0.1:8090/ui/hts). You should see:
+One-liner equivalent (bash / WSL):
 
-- Topbar with the **HTS** brand, a dialect chip (defaulting to `en`), a
-theme toggle, and a help link.
-- Status card row: **status = up**, backend = SQLite in-memory (or the
-file backend if you set one), uptime counting up, FHIR version = the
-compile-time version of the `hts` binary.
-- Loaded systems card = **0** and Bundled data card = **0 MB** on a fresh
-boot. This is expected on empty storage — proceed to §2 to seed.
-- Quick-links row: Browse CS, Browse VS, Browse CM, Operations. Import
-status strip below (should say "No imports yet").
+```bash
+HTS_BOOTSTRAP_DIR=./crates/hts/terminology-data HTS_UI_ENABLED=true cargo run --bin hts
+```
 
-If the dashboard renders but the status card says **degraded** with a
-reason like "upstream 5xx" or "decode error", stop and share the reason —
-that is a bug we want to catch before Phase 6.
+**First boot takes a while.** It imports ~150 MB of terminology
+distributions (ICD-9-CM, ICD-10-CM, MeSH, NCI Thesaurus, NDC, NUCC, UCUM,
+the HL7 R4 core + terminology packages, US Core, IPS, PHIN VADS and VSAC)
+into `./data/hts.db`. Let it finish — the log prints one line per file.
+
+**Later boots are fast.** Every imported file is recorded in the
+`bootstrap_imports` ledger table keyed on path, with `size_bytes` +
+`mtime_unix` and a content hash as the fallback check. Unchanged files are
+recognised by the cheap stat alone and skipped without being re-read; a new
+file, an updated release, or a changed `HTS_IMPORT_LANGUAGES` re-triggers
+import of just the affected files.
+
+Once it is up, open [http://127.0.0.1:8090/ui/hts](http://127.0.0.1:8090/ui/hts).
+Sanity-check the shell before you go anywhere:
+
+- **Sidebar** — brand *Helios Terminology Server* + `hts v0.2.1`; a
+  *Terminology* group (Home, Code Systems, Value Sets, Concept Maps), a
+  *Tools* group (Import), a *Server* group (Capability & Conformance), and
+  a display-only **FHIR R4** version selector pinned to the sidebar foot.
+- **Topbar** — a language switcher (`English` / `Spanish` / `German`, real
+  `?lang=` links so it works without JS), a light/dark theme toggle, and the
+  `K` avatar.
+- **Home tiles** — `Status = OK`, `backend sqlite · FHIR R4`; Uptime;
+  **Loaded code systems = 1977** with `150 MiB bundled on disk`; Requests
+  with an average latency read from `/metrics`.
+
+> **The "dialect" chip is gone.** It was removed from the topbar on
+> 2026-08-28 — it had shipped non-functional (a `<details>` with no options
+> and no form, and the `hts_dialect` cookie its comment promised never
+> existed). Real `displayLanguage` control lives in the per-operation form
+> fields on the workbenches. If you still see a dialect chip, you are
+> running a stale binary — rebuild.
 
 ### 1.2 Optional overrides worth knowing
 
 
-| Env var                           | Default                                         | What it does                                                                                                                                                      |
-| --------------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `HTS_UI_ENABLED`                  | `false`                                         | Master switch that mounts `/ui/hts` under the `hts` binary. Bool-typed — use `"true"` / `"false"`, not `"1"` / `"0"`.                                             |
-| `HTS_SERVER_PORT`                 | `8090`                                          | The TCP port `hts` binds. `HTS_SERVER_HOST` (default `127.0.0.1`) pairs with it.                                                                                  |
-| `HTS_UI_UPSTREAM_URL`             | (in-process)                                    | When set, the UI proxies to an external HTS instead of its own `AppState`. Use this to demo the degraded-guard banner: point it at a URL that answers 5xx (§4.5). |
-| `HTS_MAX_EXPANSION_SIZE`          | `3500`                                          | HTS-side ceiling used when a `$expand` request omits `count`. Setting it low (e.g. `5`) turns `ex-vs-too-costly` into a live too-costly demo (§4.4).              |
-| `HTS_UI_BATCH_FANOUT_CONCURRENCY` | `8` (compile-time constant, not env-driven yet) | Max in-flight rows the batch-validate workbench queues at once. Referenced here for §4.3; you cannot override it at runtime in v1.                                |
+| Env var                   | Default                         | What it does                                                                                                                                        |
+| ------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HTS_UI_ENABLED`          | `false`                         | Master switch that mounts `/ui/hts`. Bool-typed — use `"true"` / `"false"`, not `"1"` / `"0"`.                                                     |
+| `HTS_BOOTSTRAP_DIR`       | (unset)                         | Directory of terminology distributions auto-imported on boot. Unset ⇒ empty store **and** the Home "bundled on disk" tile shows an em-dash.        |
+| `HTS_SERVER_PORT`         | `8090`                          | TCP port. `HTS_SERVER_HOST` (default `127.0.0.1`) pairs with it.                                                                                    |
+| `HTS_DATABASE_URL`        | `./data/hts.db`                 | The SQLite file. Delete it to force a full re-import on the next boot.                                                                              |
+| `HTS_STORAGE_BACKEND`     | `sqlite`                        | `sqlite` \| `postgres`.                                                                                                                             |
+| `HTS_MAX_EXPANSION_SIZE`  | `3500`                          | HTS-side ceiling applied when a `$expand` request omits `count`. Lower it to reproduce the too-costly path (§4.4).                                   |
+| `HTS_UI_UPSTREAM_URL`     | `http://127.0.0.1:{port}`       | The UI always talks to HTS over HTTP; by default that is this same binary on loopback. Point it elsewhere to demo the degraded banner (§4.5).        |
+| `HTS_BOOTSTRAP_BATCH_SIZE`| (see `config.rs`)               | Import batching knob for the bootstrap pass.                                                                                                         |
+| `HTS_IMPORT_LANGUAGES`    | (unset)                         | BCP-47 filter applied at import. Recorded in the ledger, so changing it re-imports affected files.                                                   |
 
-
-Note the last row: `HTS_UI_BATCH_FANOUT_CONCURRENCY` is defined as a Rust
-`const` in `crates/hts-ui/src/upstream.rs`, not an env lookup. Changing it
-requires a rebuild. This is called out on the plan's Phase 8 backlog.
 
 ---
 
 
 
-## 2. Seed the terminology store
+## 2. What the seed set gives you
 
-The dashboard is useful empty, but every other page needs data. Two
-options — use whichever is more convenient.
+Nothing to seed by hand — §1.1 did it. This section is the map you need to
+navigate 20k+ resources, plus two behaviours that will otherwise look like
+bugs.
 
-### 2.1 Reuse the Playwright seed (recommended)
+### 2.1 Verify the inventory
 
-`crates/hts-ui/e2e/seed.mjs` builds a canonical `Bundle` with 34 CS + 5 VS +
-2 CM. Run it against your booted server:
-
-```powershell
-cd crates/hts-ui
-$env:HTS_E2E_PORT = "8090"    # matches the binary's HTS_SERVER_PORT default
-$env:NO_PROXY = "127.0.0.1,localhost"   # keeps node's fetch off the corporate proxy
-node -e "import('./e2e/seed.mjs').then(m => m.default()).then(()=>console.log('SEED OK'))"
+```bash
+curl -s 'http://127.0.0.1:8090/health'
+curl -s 'http://127.0.0.1:8090/CodeSystem?_count=5000' | grep -o '"resourceType":"CodeSystem"' | wc -l
+curl -s 'http://127.0.0.1:8090/ConceptMap?_count=5000' | grep -o '"resourceType":"ConceptMap"' | wc -l
 ```
 
-It POSTs the bundle to `http://127.0.0.1:8090/import` and prints
-`[seed] import 200 OK: CS=34 VS=6 CM=2 concepts=64` followed by
-`SEED OK` on success. If it prints an `OperationOutcome` body instead,
-read the diagnostic — usually the port is wrong or the binary is not
-running yet.
+On the reference box that produced this guide:
 
-> **Caveat (Bucket C, HTS backend — out of #551 scope):**
-> re-importing the same seed on top of existing data leaves
-> `concept_closure` empty for the affected CodeSystems. `$lookup`
-> and `$validate-code` keep working (they read `concept_hierarchy`
-> directly), but `$subsumes(A, B)` on `ex-cs-1` silently regresses
-> from `subsumes` to `not-subsumed` until the next HTS restart —
-> at startup, `migrate_concept_closure` rebuilds the closure for
-> every system that has hierarchy edges but no closure rows. Root
-> cause is inside `crates/hts` (`import::fhir_bundle`) and belongs
-> to a separate backend mini-issue; the UI is not touching HTS
-> internals.
->
-> **Workaround for the demo.** If `§3.3` Subsumes suddenly reports
-> `not-subsumed` where §3.3 expects `subsumes`:
->
-> 1. Cheapest: stop `hts`, boot it again (no re-seed needed) — the
->    startup migration rebuilds the closure over the existing data
->    in place.
-> 2. Fresh start: stop `hts`, delete `$env:TEMP\.hts-e2e-8090.db*`
->    (or the file at `HTS_DATABASE_URL`), boot again, and re-run
->    this seed step once.
->
-> The Playwright suite sidesteps this by wiping the ephemeral
-> SQLite inside `boot.mjs` on every run, so its subsumes test
-> always exercises a fresh-import path.
-
-
-
-### 2.2 Curl a minimum bundle (if you want to see the wire format)
-
-```powershell
-$body = @'
-{ "resourceType": "Bundle", "type": "collection", "entry": [
-  { "resource": { "resourceType": "CodeSystem", "id": "ex-cs-1",
-      "url": "http://example.org/cs", "version": "1.0.0",
-      "status": "active", "content": "complete",
-      "concept": [ { "code": "A", "display": "Alpha" },
-                   { "code": "B", "display": "Beta"  } ] } }
-] }
-'@
-Invoke-WebRequest -Uri http://127.0.0.1:8090/import -Method POST `
-    -ContentType "application/fhir+json" -Body $body
+```
+{"status":"ok","service":"hts","version":"0.2.1","backend":"sqlite", ... }
+1977
+80
 ```
 
-Success = HTTP `200` + a `Bundle` echo. HTTP `207` on partial success,
-`400` on bad JSON, `413` on payloads over 10 MB — these are the four
-Import-page states you will see in §3.6.
+ValueSets are the big one — **20 689** of them (`_count=100000` to count
+them all). CodeSystems **1 977**, ConceptMaps **80**.
 
-### 2.3 What the full seed gives you
+> **`Bundle.total` is the page size, not the store size.** `GET
+> /CodeSystem?_count=1` answers `"total":1`; `_count=1000` answers
+> `"total":1000`. Count entries yourself, or read the Home tile — the
+> **Loaded code systems** number comes from
+> `TerminologyCapabilities.codeSystem[]` and is the honest 1977.
 
-After §2.1 the store contains:
+> **Instance reads do not work on seeded resources.** `GET
+> /CodeSystem/icd9cm` and `GET /CodeSystem/icd9cm%7C2015` both return
+> `404` + an `OperationOutcome`. `_id` is ignored by search. To fetch a
+> resource from the API, filter on its canonical URL — that is the path
+> the UI uses too:
+>
+> ```bash
+> curl -s 'http://127.0.0.1:8090/CodeSystem?url=http://hl7.org/fhir/narrative-status'
+> ```
 
-> **How to find these in the UI.** Every browser table's link text is the
-> resource `name` (with `id` shown only when `name` is empty); the `id`
-> ends up in the row's link `href` (e.g.
-> `/ui/hts/value-sets/ex-vs-1`). Use the **UI label (Name)** column
-> below to spot a specific fixture in the table, or the **URL** column
-> — both are painted verbatim. If in doubt, deep-link with the id.
+### 2.2 Two id shapes — and which one to use
 
-| Resource   | Id                              | UI label (Name) — link text          | Canonical URL                                             | Highlights (why the demo uses it)                                                                                     |
-| ---------- | ------------------------------- | ------------------------------------ | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| CodeSystem | `ex-cs-1`                       | `ExampleCodeSystem`                  | `http://example.org/cs`                                   | A → B subsumption; A has a `designation` and a `status=active` property. Powers Lookup / Validate / Subsumes on §7.3. |
-| CodeSystem | `ex-cs-limbs`                   | `ExampleLimbsCS`                     | `http://example.org/cs/limbs`                             | 60 flat concepts. Backs `ex-vs-1` (paged expand) and `ex-vs-too-costly` (§4.2).                                       |
-| CodeSystem | `ex-cs-source` / `ex-cs-target` | `ExampleSourceCS` / `ExampleTargetCS`| `http://example.org/cs/source` / `.../cs/target`          | Referenced by `ex-cm-1`.                                                                                              |
-| CodeSystem | `ex-cs-2` … `ex-cs-31`          | (filler names — one per row)         | `http://example.org/cs/filler-N`                          | Filler rows so the browser Load-more button fires.                                                                    |
-| ValueSet   | `ex-vs-1`                       | `ExampleLimbsVS`                     | `http://example.org/vs/limbs`                             | Flat expansion of `ex-cs-limbs`. Pager fires past 25 rows.                                                            |
-| ValueSet   | `ex-vs-tree`                    | `ExampleTreeVS`                      | `http://example.org/vs/tree`                              | Hierarchical expansion of `ex-cs-1` — role="tree" mode.                                                               |
-| ValueSet   | `ex-vs-batch-mixed`             | `ExampleBatchMixedVS`                | `http://example.org/vs/batch-mixed`                       | Envelope composing `ex-cs` + `ex-cs/source`. Target of choice for the `$batch-validate-code` demo (§3.6) — a single batch job validates codes drawn from both CodeSystems against one URL. |
-| ValueSet   | `ex-vs-too-costly`              | `ExampleTooCostlyVS`                 | `http://example.org/vs/too-costly`                        | Reuses `ex-cs-limbs`; when `HTS_MAX_EXPANSION_SIZE=5` boots the binary, its default expand blows past the ceiling.    |
-| ValueSet   | `ex-vs-source` / `ex-vs-target` | `ExampleSourceVS` / `ExampleTargetVS`| `http://example.org/vs/source` / `.../vs/target`          | Referenced by `ex-cm-1`.                                                                                              |
-| ConceptMap | `ex-cm-1`                       | `ExampleCM`                          | `http://example.org/cm/example`                           | Forward A → T1 with `equivalent` equivalence.                                                                         |
-| ConceptMap | `ex-cm-no-match`                | `ExampleCMNoMatch`                   | `http://example.org/cm/no-match`                          | Empty group so a well-formed translate returns HTTP 200 + `result=false`.                                             |
+`GET /CodeSystem` projects composite ids: `icd9cm|2015`,
+`nci-thesaurus|current`, `narrative-status|4.0.1`. The browser table's row
+links use the **short** form:
 
+```
+href="/ui/hts/code-systems/icd9cm"
+href="/ui/hts/code-systems/nci-thesaurus"
+href="/ui/hts/code-systems/narrative-status"
+```
+
+Both shapes resolve (`/ui/hts/code-systems/icd9cm%7C2015/lookup` is a 200
+too), but **document and demo the short form** — that is what a reader
+clicking a row actually gets.
+
+### 2.3 Detail pages 308 to their default workbench tab
+
+Every detail base URL permanently redirects to its first operation tab:
+
+| You open                                        | You land on                                              |
+| ----------------------------------------------- | ---------------------------------------------------------- |
+| `/ui/hts/code-systems/icd9cm`                   | `/ui/hts/code-systems/icd9cm/lookup`                       |
+| `/ui/hts/value-sets/immunization-status`        | `/ui/hts/value-sets/immunization-status/expand`            |
+| `/ui/hts/concept-maps/sc-encounter-status`      | `/ui/hts/concept-maps/sc-encounter-status/translate`       |
+| `/ui/hts/diagnostics`                           | `/ui/hts/capability-statement`                             |
+| `/ui/hts/`                                      | `/ui/hts`                                                  |
+
+All five are `308`. That is the design (§8.3 — the URL bar always names the
+active operation), not a bug. The steps below give the URL you land on.
+
+### 2.4 The fixtures this guide uses
+
+Every id, URL and code in this table was verified live against a seeded
+server before it was written down.
+
+The **UI label** column is the row's link text, which is the resource
+`name` — not its title, and never the id.
+
+| Resource   | Route id             | UI label (Name) — link text     | Canonical URL                                                | Why the demo uses it                                                                       |
+| ---------- | -------------------- | ------------------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| CodeSystem | `v3-EntityRisk`      | `v3.EntityRisk`                 | `http://terminology.hl7.org/CodeSystem/v3-EntityRisk`          | 11 concepts, `hierarchyMeaning = is-a`, `IFL → EXP` and `INF → BHZ`. Drives Lookup **and** Subsumes on §3.3. Browser row 4. |
+| CodeSystem | `narrative-status`   | `NarrativeStatus`               | `http://hl7.org/fhir/narrative-status`                         | Four flat codes with definitions. The cleanest `$lookup` / `$validate-code` demo.            |
+| CodeSystem | `icd9cm`             | `ICD-9-CM`                      | `http://hl7.org/fhir/sid/icd-9-cm`                             | Browser row 1. Metadata-only in this seed — good for showing the facts block, useless for `$lookup`. |
+| CodeSystem | `nci-thesaurus`      | `NCIt`                          | (browser row 2)                                                | Browser row 2.                                                                               |
+| CodeSystem | `mesh`               | `MeSH`                          | (browser row 3)                                                | Browser row 3.                                                                               |
+| ValueSet   | `immunization-status`| `ImmunizationStatusCodes`       | `http://hl7.org/fhir/ValueSet/immunization-status`             | 3-code expansion. The smallest complete `$expand` result. Browser row 3.                     |
+| ValueSet   | `v3-EntityRisk`      | `v3.EntityRisk`                 | `http://terminology.hl7.org/ValueSet/v3-EntityRisk`            | 11 members, 2 of them nested — the readable **tree mode** demo.                              |
+| ValueSet   | `languages`          | `CommonLanguages`               | `http://hl7.org/fhir/ValueSet/languages`                       | 56 members ⇒ the flat pager fires at `count=50`.                                             |
+| ValueSet   | `v3-ActCode`         | `v3.ActCode`                    | `http://terminology.hl7.org/ValueSet/v3-ActCode`               | 1 302 members. Use it to see tree mode refuse to page.                                       |
+| ValueSet   | `contract-assettype` | `ContractResourceAssetTypeCodes`| `http://hl7.org/fhir/ValueSet/contract-assettype`              | Browser row 1.                                                                               |
+| ValueSet   | `bodysite-laterality` / `timing-abbreviation` | `Laterality` / `TimingAbbreviation` | `http://hl7.org/fhir/ValueSet/{bodysite-laterality,timing-abbreviation}` | 3 and 16 members — quick contrast against the 56-member pager case. Browser rows 4 and 5. |
+| ConceptMap | `sc-encounter-status`| `EncounterStatusCanonicalMap`   | `http://hl7.org/fhir/ConceptMap/sc-encounter-status`           | `encounter-status` → `resource-status`, `equivalent`. Forward **and** reverse `$translate`.  |
+| ConceptMap | `sc-appointmentstatus` / `sc-episode-of-care-status` | `AppointmentStatusCanonicalMap` / `EpisodeOfCareStatusCanonicalMap` | `http://hl7.org/fhir/ConceptMap/sc-*` | Browser rows 2 and 3.                                                    |
+
+Note that two of these canonical URLs resolve to **two** stored versions
+(`v3-EntityRisk` as CodeSystem *and* as ValueSet each have a pair). Both
+rows link to the same route id, and the detail page picks one — see the
+`Version` red flag in §3.3.
+
+### 2.5 Detail pages resolve the whole catalog — fixed 2026-08-28
+
+Worth knowing about, because a demo against an older build will hit it.
+
+Detail pages resolve a route id to a canonical URL by search-listing the
+resource type and matching on the base id. Until 2026-08-28 that scan read a
+single `?_count=1000` page, so anything past position 1 000 could not open
+**even though the browser linked to it** — 977 of 1 977 CodeSystems and
+19 689 of 20 689 ValueSets. It failed quietly: HTTP 200, with a not-found
+outcome rendered inside the page shell.
+
+It now pages with `_offset` until it finds a match. Check any of the systems
+that used to be unreachable:
+
+```bash
+# ICD-10-CM sits at position 1 968 in the default order.
+curl -s -L 'http://127.0.0.1:8090/ui/hts/code-systems/icd10cm' | grep -c 'not found'
+# → 0
+
+# And a ValueSet near the end of 20 689.
+curl -s -L 'http://127.0.0.1:8090/ui/hts/value-sets/2.16.840.1.113762.1.4.1190.25' | grep -c 'not found'
+# → 0
+```
+
+Cost scales with depth, and only for resources deep in the catalog: ~140 ms
+for the first page (unchanged), ~1.35 s for the very last ValueSet of 20 689.
+
+Two related backend behaviours are worth knowing when you write your own
+queries — neither is a UI issue:
+
+```bash
+# `_id` is silently ignored: this returns an unfiltered page, not one match.
+curl -s 'http://127.0.0.1:8090/CodeSystem?_id=icd10cm' | grep -o '"total":[0-9]*'
+
+# `?url=` is the search parameter that actually narrows.
+curl -s 'http://127.0.0.1:8090/CodeSystem?url=http://hl7.org/fhir/sid/icd-10-cm' | grep -o '"total":[0-9]*'
+```
+
+Also avoid a very large `_count` on ValueSet — `?_count=100000` resets the
+connection on a seeded store. Page with `_offset` instead.
 
 ---
 
@@ -197,307 +273,539 @@ observe, what a green vs. red result looks like.
 
 **Steps**
 
-1. Land on `/ui/hts` (`/ui/hts/` 308-redirects to the canonical path if you get the trailing slash wrong).
-2. Wait 15 seconds without clicking. Watch the status cards.
-3. Toggle theme via the topbar chip. Toggle again.
-4. Open the dialect chip; pick `es`. Reload with `?lang=es` in the URL if the chip does not persist.
+1. Land on `/ui/hts` (`/ui/hts/` 308-redirects to the canonical path if you
+   get the trailing slash wrong).
+2. Wait 15 seconds without clicking. Watch the tiles.
+3. Click the `1h` and `6h` range links under the chart, then a series chip
+   (`2xx` / `4xx` / `5xx`).
+4. Toggle theme via the topbar buttons. Toggle back.
+5. Click **Spanish** in the topbar switcher (or append `?lang=es`).
 
 **Expected**
 
-- Poll after 15 s: the "Requests" / "Latency" / "Uptime" numbers refresh
-in place. No layout shift. Focus stays where it was.
-- Theme toggle: instant switch. No off-origin asset load (open DevTools →
-Network; every request should be `127.0.0.1:8090`).
-- `es`: card labels, quick-link labels, and topbar all switch to Spanish.
-The FHIR-version chip stays as `R4` (or whatever your binary was built
-with) — it is metadata, not a translatable term.
+- Four tiles: **Server status** (`OK`, `backend sqlite · FHIR R4`),
+  **Uptime** (`hts v0.2.1 · no restarts since HH:MM UTC`), **Loaded code
+  systems** (`1977`, `150 MiB bundled on disk`), **Requests** (count +
+  average latency `· from /metrics`).
+- Below them, a **Requests per minute** chart. Its caption says
+  "Sampled while this page is open. Excludes this page's own 15 s refresh
+  and /metrics scrapes." Range links are `15m` / `1h` / `6h`; the series row
+  is `All` / `2xx` / `4xx` / `5xx` with live counts. These are plain links
+  (`/ui/hts?window=1h&series=all`), so they are deep-linkable and work
+  without JS.
+- Poll after 15 s: `hx-trigger="every 15s"` refetches
+  `/ui/hts/home/cards?window=…&series=…` and swaps the tiles in place. No
+  layout shift, focus stays put.
+- Theme toggle: instant switch. No off-origin asset load — open DevTools →
+  Network; every request should be `127.0.0.1:8090`. The only four assets
+  are `/ui/hts/assets/{app.css,htmx.min.js,theme.js,logo.png}`.
+- `es`: tiles read *Estado del servidor* / *Tiempo activo* / *Sistemas de
+  códigos cargados* / *Solicitudes*. `de` on the browser pages reads
+  *Codesysteme*, *Suchen*, *Zurücksetzen*, status chips *aktiv / Entwurf /
+  zurückgezogen / unbekannt*.
 
 **Red flags**
 
 - A poll erases focus or scrolls the page.
 - Any request in DevTools points at `cdn.*`, `jsdelivr`, or `unpkg`.
-- A locale key renders as `hts-dashboard-something-something` — that
-means a Fluent key was added on one side of the code but not on the
-other. File it.
+- A locale key renders as `hts-dashboard-something-something` — a Fluent key
+  was added on one side of the code but not the other. File it.
+- The tiles show em-dashes plus a **"Terminology backend not fully
+  available — The terminology server did not respond in time"** banner.
+  This *does* happen transiently on a cold or loaded server: the UI's
+  upstream client has a 5 s request timeout and the first
+  `/metadata?mode=terminology` fetch after idle can exceed it. One refresh
+  should clear it. If it does not clear, that is §4.5 territory.
 
 
 
 ### 3.2 §7.2 CodeSystem browser — `/ui/hts/code-systems`
 
-Layout note (Phase 5): the filter form lives in a sticky rail on the
-left; string fields (URL / Name / Title / Version) are plain text
-inputs that map 1:1 to FHIR search parameters, so matching is exact
-and case-sensitive — inherited from the HTS backend (no match-mode
-toggle; see design doc §7.2.1.1). The results table on the right
-renders **Name · Title · URL · Version · Status** so every filter
-has a visible column.
+Layout note: the filter form is a **horizontal toolbar** above the table —
+four `type="search"` inputs (*Name*, *Title*, *Canonical URL*, *Version*), a
+**Search** button and a **Reset** link, with a **Status** facet chip row
+beneath (`Any status` / `active` / `draft` / `retired` / `unknown`, plain
+links). The form fires on `input changed delay:300ms, change, submit`, so
+typing is debounced at 300 ms. The results table renders
+**Name · Title · URL · Version · Status** so every filter has a visible
+column.
 
-> **UI-vs-route naming.** `ex-cs-1` is the FHIR `id`; it does not
-> appear as visible text in the table. The link text is the resource's
-> `name` (`ExampleCodeSystem` for `ex-cs-1`) and the `id` is only in
-> the row's link `href`. Scan the URL / Name / Title columns — or
-> deep-link with `/ui/hts/code-systems/ex-cs-1`. See §2.3 for the
-> full id ↔ Name ↔ URL map.
+String filters map 1:1 to FHIR search parameters, so matching is **exact and
+case-sensitive** — inherited from the HTS backend, no match-mode toggle.
+
+> **UI-vs-route naming.** `icd9cm` is the route id; it does not appear as
+> visible text. The link text is the resource `name` (`ICD-9-CM`), and the
+> id lives only in the row's `href`. Scan the Name / Title / URL columns, or
+> deep-link. See §2.2 and §2.4.
 
 **Steps**
 
-1. Click **Browse CS** on the dashboard (or open `/ui/hts/code-systems`).
-2. Type an exact `name` that exists in the seed (e.g. the seed CS
-  `name`) into the *Name* filter. Wait 300 ms — the table should
-   narrow. Try the same string in the opposite case; with the current
-   backend that usually returns **no** rows (case-sensitive).
-3. Reset the filter. You should see 25 rows + a **Load more** button
-  (seed has 34 CodeSystems; `_count` default is 25).
-4. Click **Load more** once. Rows should grow (≈34 total) and the
-  **Load more** button should **disappear** (end of list).
-5. (Optional) Hard-refresh and click **Load more** twice quickly —
-  you must **not** see duplicate rows; a second click must not be
-   possible after the button is gone.
+1. Click **Code Systems** in the sidebar (or open `/ui/hts/code-systems`).
+   You should see 25 rows and a **Load more** button. Row 1 is **ICD-9-CM**,
+   row 2 **NCIt**, row 3 **MeSH**, row 4 **v3.EntityRisk**.
+2. Type `ICD-9-CM` into the *Name* box. Wait 300 ms — the table narrows to
+   one row and the **Load more** button disappears.
+3. Type `icd-9-cm` instead (lowercase). You get **no** rows and the empty
+   state **"No CodeSystems match these filters"**. Case sensitivity, not a
+   bug.
+4. Click **Reset**. Paste `http://hl7.org/fhir/narrative-status` into
+   *Canonical URL*. One row: **NarrativeStatus**.
+5. Reset again. Click the **draft** status chip, then **retired**, then
+   **Any status**. Each is a full page load (they are links, not JS).
+6. Click **Load more** once. Rows grow to 50 and the footer's next request
+   advances to `_offset=50`.
+
+Same thing from the command line if you want to see the fragments:
+
+```bash
+curl -s 'http://127.0.0.1:8090/ui/hts/code-systems/rows?name=ICD-9-CM'
+curl -s 'http://127.0.0.1:8090/ui/hts/code-systems/rows?_count=25&_offset=25'
+```
 
 **Expected**
 
-- Debounced filter: typing does not fire a request per keystroke;
-only after 300 ms of quiet does the tbody re-render. Status
-`<select>` re-fires immediately via `change`.
-- Load-more appends the next page below the current rows (no full
-re-render, no scroll jump). The footer is OOB-swapped so the
-button's `_offset` advances; at the terminal page the button is
-omitted.
-- Empty state (type gibberish): the tbody shows a "No CodeSystems match"
-row — but the header, filters, and buttons stay put.
+- Debounced filter: typing does not fire a request per keystroke; only after
+  300 ms of quiet does the tbody re-render.
+- Load-more appends the next page below the current rows (no full re-render,
+  no scroll jump). The footer is OOB-swapped (`hx-select-oob="#hts-cs-rows-foot"`)
+  so the button's `_offset` advances; at the terminal page the button is
+  omitted entirely.
+- The footer counts what is on screen: `Showing 25 CodeSystems`,
+  `Showing 1 CodeSystems`.
 
 **Red flags**
 
-- Load-more scrolls to the top, double-renders rows, or keeps
-offering **Load more** after every row is already visible.
+- Load-more scrolls to the top, double-renders rows, or keeps offering
+  **Load more** after every row is already visible.
 - Filter clears the tbody to a spinner instead of a skeleton row.
-- A visible match-mode `<select>` next to URL/Name/Title (those
-were rolled back; must not reappear without a backend plan).
+- A visible match-mode `<select>` next to URL/Name/Title (those were rolled
+  back; must not reappear without a backend plan).
+- `Showing 1 CodeSystems` — the footer does not pluralise. Cosmetic; file it
+  if you care.
 
 
 
-### 3.3 §7.3 CodeSystem detail — `/ui/hts/code-systems/ex-cs-1`
+### 3.3 §7.3 CodeSystem detail — `/ui/hts/code-systems/v3-EntityRisk/lookup`
 
-Design doc §8.3: the resource summary (URL, publisher, jurisdiction,
-content mode, concept count, status pill) is a **facts block always
-visible at the top**; below it, a **tab strip lists operations only**
-— Lookup, Validate, Subsumes. There is no "Metadata" tab. The naked
-`/ui/hts/code-systems/ex-cs-1` URL 308-redirects to
-`/ui/hts/code-systems/ex-cs-1/lookup`, so the URL bar always names the
-active operation.
+Design doc §8.3: the resource summary is a **facts block always visible at
+the top**; below it a **tab strip lists operations only** — Lookup, Validate,
+Subsumes. There is no "Metadata" tab. `/ui/hts/code-systems/v3-EntityRisk`
+308-redirects to `…/lookup`, so the URL bar always names the active
+operation.
 
-> **UI-vs-route naming.** Same rule as §3.2: `ex-cs-1` is only in the
-> route; the browser paints the row as Name **ExampleCodeSystem** /
-> URL `http://example.org/cs`. Steps below use the deep-link, but you
-> can also reach the same page by clicking that row from §3.2.
+The facts block shows the title, a version pill, a status pill, the
+description, a **Facts** row (Version · Status · Content mode · Publisher),
+the **Canonical URL**, and a foldable **All CodeSystem facts** (Canonical
+URL, Name, Publisher, Jurisdiction, Content mode, Concept count).
 
 **Steps**
 
-1. Open `/ui/hts/code-systems/ex-cs-1` (or click the **ExampleCodeSystem**
-   row from §3.2). The URL should resolve to
-   `/ui/hts/code-systems/ex-cs-1/lookup`; the **Lookup** tab is active
-   (`aria-current="true"`). Above the tab strip, confirm the facts
-   block shows `url = http://example.org/cs`, `version = 1.0.0`, the
-   status pill, and the concept count.
-2. **Lookup**: type code `"A"` in the Code input. Submit.
-3. **Validate**: click the Validate tab. Type code `"A"`, then run again
-   with `"NONEXISTENT"`. Two runs.
-4. **Subsumes**: click the Subsumes tab. Enter code A `"A"` and code B
-   `"B"`. Submit. Then swap them and run again.
+1. Open
+   [http://127.0.0.1:8090/ui/hts/code-systems/v3-EntityRisk](http://127.0.0.1:8090/ui/hts/code-systems/v3-EntityRisk).
+   You land on `/ui/hts/code-systems/v3-EntityRisk/lookup` with **Lookup**
+   active. Confirm the facts block reads
+   `v3 Code System EntityRisk` · `v2018-08-12` · `active`, Content mode
+   `complete`, Publisher `HL7, Inc`, Canonical URL
+   `http://terminology.hl7.org/CodeSystem/v3-EntityRisk`.
+
+2. **Lookup.** Fill in:
+
+   | Field              | Value        |
+   | ------------------ | ------------ |
+   | Code               | `IFL`        |
+   | Version            | `2018-08-12` (pre-filled from the facts block) |
+   | Display language   | *leave empty* |
+   | Properties         | leave `*` checked |
+
+   Submit. You should get:
+
+   ```
+   inflammable   IFL   [Open concept]
+   system      http://terminology.hl7.org/CodeSystem/v3-EntityRisk
+   Name        v3.EntityRisk
+   Version     2018-08-12
+   Definition  Material is highly inflammable and in certain mixtures (with air)
+               may lead to explosions. Keep away from fire, sparks and excessive heat.
+   Designations  en → inflammable
+   Properties    child → EXP        inactive → false
+   ```
+
+   plus a foldable **Raw request and response** showing
+   `Request URL http://127.0.0.1:8090/CodeSystem/$lookup` and the
+   `Parameters` body.
+
+3. Uncheck `*` and check **parent** + **child** instead. Re-run. The
+   Properties panel drops `inactive` and keeps only `child → EXP`. That is
+   the `property` filter reaching the server.
+
+4. **Validate** tab. Leave mode on **code**, enter `EXP`. Submit →
+   green **valid** badge, display `explosive`, `Code EXP`, `system` and
+   `Version`.
+   Switch mode to **coding**, leave *Coding system* at its pre-filled
+   canonical URL, enter *Coding code* `EXP`. Submit → the same **valid**
+   result through the `Coding` shape.
+
+5. Still on Validate, enter `NOPE`. Submit → red **invalid** badge and
+   `Message: Unknown code 'NOPE' in the CodeSystem
+   'http://terminology.hl7.org/CodeSystem/v3-EntityRisk' version '…'`.
+
+6. **Subsumes** tab. Three runs:
+
+   | Code A | Code B | Expected badge  | Sentence                              |
+   | ------ | ------ | --------------- | ------------------------------------- |
+   | `IFL`  | `EXP`  | `subsumes`      | *Code A subsumes code B.*             |
+   | `EXP`  | `IFL`  | `subsumed-by`   | *Code A is subsumed by code B.*       |
+   | `IFL`  | `POI`  | `not-subsumed`  | *Neither code subsumes the other.*    |
+
+   Cross-check any of them against the API:
+
+   ```bash
+   curl -s 'http://127.0.0.1:8090/CodeSystem/$subsumes?system=http://terminology.hl7.org/CodeSystem/v3-EntityRisk&codeA=IFL&codeB=EXP'
+   # {"resourceType":"Parameters","parameter":[{"name":"outcome","valueCode":"subsumes"}]}
+   ```
+
+7. Second CodeSystem for contrast: open
+   `/ui/hts/code-systems/narrative-status/lookup`, code `generated`. You get
+   display **Generated**, `Name NarrativeStatus`, `Version 4.0.1`, the
+   definition, and `inactive → false`. Same result over the API:
+
+   ```bash
+   curl -s 'http://127.0.0.1:8090/CodeSystem/$lookup?system=http://hl7.org/fhir/narrative-status&code=generated'
+   ```
 
 **Expected**
 
-- Tab clicks swap ONLY the region under the facts block — the facts
-  block stays visible above. Region-wrap contract (§8.1).
+- Tab clicks swap ONLY the region under the facts block — the facts block
+  stays visible above. Region-wrap contract (§8.1).
 - The URL bar updates to `/{id}/{op}` on each tab click
   (`hx-push-url="true"`).
-- Lookup on `"A"` shows the `Alpha` display, the `en` designation, and
-  the `status=active` property panel.
-- Validate on `"A"` = result `true`. On `"NONEXISTENT"` = `false` with
-  an `OperationOutcome` diagnostic in the outcome banner.
-- Subsumes `A subsumes B` = `subsumes`. Swapping = `subsumed-by`.
+- The UI resolves the canonical URL first and then calls the **type-level**
+  operation — the raw panel says `.../CodeSystem/$lookup`, not
+  `.../CodeSystem/{id}/$lookup`. That is deliberate: the instance route
+  misses on composite ids (§2.2).
 
 **Red flags**
 
 - Any "Metadata" tab visible in the tab strip (retired in §8.3; file it).
 - Clicking a tab reloads the whole page (Askama base + topbar re-render).
-- The facts block above the tab strip disappears when a different
-  operation tab is clicked.
-- The workbench input has a duplicated `id="hts-workbench-input"` —
-  this was a Grupo A bug; the fix is in commit `61bfc4f59`. If it
-  reappears file it.
-- **Subsumes reports `not-subsumed` where the expected is `subsumes`
-  / `subsumed-by`.** Not a UI regression — this is the HTS backend
-  bug flagged in §2.1's Bucket C caveat: `concept_closure` was
-  wiped by a prior re-import and never rebuilt. Restart `hts` (the
-  startup `migrate_concept_closure` migration is the safety net)
-  and re-run this step; if it still reproduces on a fresh boot,
-  then file it.
+- The facts block disappears when a different operation tab is clicked.
+- **Outcome codes that read like keys.** Fixed 2026-08-28. The catalog
+  carries sentences for only four issue codes (`not-found`, `invalid`,
+  `too-costly`, `unknown`) and the template builds the key from whatever
+  code the server sent, so anything else used to render literally as
+  `hts-outcome-code-business-rule`. It now falls back to the code itself —
+  you should see `business-rule`, never `hts-outcome-code-…`. If you do see
+  a key, that is a regression worth filing.
+- **`Concept count —`.** The facts block shows an em-dash for every seeded
+  CodeSystem because HTS does not populate `CodeSystem.count`. Expected
+  today; not a render bug.
+- **`Version` echoed back different from what you typed.** `v3-EntityRisk`
+  is stored twice (`2018-08-12` and `4.0.0`); a Validate run pinned to
+  `2018-08-12` can answer `Version 4.0.0`. Backend version-selection
+  behaviour, not the UI. Worth a note on the plan.
 
 
 
 ### 3.4 §7.4 ValueSet browser + `$expand` — `/ui/hts/value-sets`
 
-> **UI-vs-route naming.** The browser table columns are **Name · Title ·
-> URL · Version · Status** (see [`hts-vs-rows.html`](../../crates/hts-ui/templates/partials/hts-vs-rows.html)).
-> `ex-vs-1` is the FHIR `id` and appears **only** in the row's link
-> `href` (`/ui/hts/value-sets/ex-vs-1`), never as visible text — the
-> link text is the `name` (`ExampleLimbsVS`) because the seed provides
-> one. To find the row scan the URL column for
-> `http://example.org/vs/limbs`, or search by Name (`ExampleLimbsVS`)
-> / Title (`Example Limbs Value Set`). If you prefer, deep-link
-> directly with `/ui/hts/value-sets/ex-vs-1` — the base URL 308-
-> redirects to `/expand` per §8.3. The same rule applies to
-> `ex-vs-tree` → **ExampleTreeVS** / `http://example.org/vs/tree`.
+The browser is the same toolbar + facet layout as §3.2, columns
+**Name · Title · URL · Version · Status**. Row 1 is
+**ContractResourceAssetTypeCodes**, row 2 **v3.PaymentTerms**, row 3
+**ImmunizationStatusCodes**, row 4 **Laterality**, row 5
+**TimingAbbreviation**.
+
+The detail page has exactly one tab, **Expand** — ValueSet
+`$validate-code` is API-only (§4.3).
 
 **Steps**
 
-1. Click **Browse VS** on the dashboard. Confirm you see 5 rows (or
-   Load-more if fewer). If the table is empty, re-run the seed from
-   §2.1 — the curl bundle in §2.2 imports only `ex-cs-1` and leaves
-   `/value-sets` empty.
-2. Locate the **ExampleLimbsVS** row (Title *Example Limbs Value Set*,
-   URL `http://example.org/vs/limbs`) and click it. You land on
-   `/ui/hts/value-sets/ex-vs-1/expand` (route id `ex-vs-1`). Direct
-   deep-link: [http://127.0.0.1:8090/ui/hts/value-sets/ex-vs-1](http://127.0.0.1:8090/ui/hts/value-sets/ex-vs-1).
-3. Under the *Expand* tab, click **Run** with defaults (`count=50`, flat).
-4. Change *count* to `10`; toggle **tree** mode; click Run.
-5. Go back to the browser; open the **ExampleTreeVS** row (URL
-   `http://example.org/vs/tree`, route id `ex-vs-tree`). Direct
-   deep-link: [http://127.0.0.1:8090/ui/hts/value-sets/ex-vs-tree](http://127.0.0.1:8090/ui/hts/value-sets/ex-vs-tree).
-6. On ex-vs-tree, toggle *tree mode*; you should see nested `A > B`.
+1. Click **Value Sets** in the sidebar. Confirm 25 rows + **Load more**.
+2. Open the **ImmunizationStatusCodes** row. You land on
+   [http://127.0.0.1:8090/ui/hts/value-sets/immunization-status/expand](http://127.0.0.1:8090/ui/hts/value-sets/immunization-status/expand).
+   The facts block reads `Immunization Status Codes` · `v4.0.1` · `draft`,
+   Publisher `FHIR Project team`, Canonical URL
+   `http://hl7.org/fhir/ValueSet/immunization-status`.
+3. **Expand** with the defaults — *Filter* empty, *Count* `50`, *Offset*
+   `0`, mode **flat**. Click Run. You should see:
+
+   ```
+   Expansion  [Flat]  urn:uuid:…
+   completed          Completed           http://hl7.org/fhir/event-status
+   entered-in-error   Entered in Error    http://hl7.org/fhir/event-status
+   not-done           Not Done            http://hl7.org/fhir/event-status
+   total 3 · offset 0
+   ```
+
+   plus an **Echoed parameters** panel: `count 50`, `offset 0`,
+   `excludeNested true`, `used-codesystem
+   http://hl7.org/fhir/event-status|4.0.1`, `warning-draft …`.
+
+   Same over the API:
+
+   ```bash
+   curl -s 'http://127.0.0.1:8090/ValueSet/$expand?url=http://hl7.org/fhir/ValueSet/immunization-status'
+   ```
+
+4. **Pager.** Open `/ui/hts/value-sets/languages/expand` and Run with
+   `count=50`. 56 members exist, so 50 render (`ar Arabic`, `bn Bengali`,
+   `cs Czech`, `da Danish`, `de German`, …) and the footer offers a next
+   page carrying `offset=50`. Click it; the last 6 render and the pager
+   retires.
+
+5. **Tree mode.** Open `/ui/hts/value-sets/v3-EntityRisk/expand`, switch the
+   mode radio to **tree**, Run. 11 rows render with `EXP` indented under
+   `IFL` and `BHZ` under `INF`. Footer:
+   *showing full tree · 9 leaves — Tree mode returns the whole hierarchy;
+   the pager is flat-mode only.* Echoed parameters swap `excludeNested true`
+   for `hierarchical true`.
+
+6. **Tree mode at scale.** Same thing on
+   `/ui/hts/value-sets/v3-ActCode/expand`: 1 302 rows arrive in one
+   response, footer reads *showing full tree · 1301 leaves*, and setting
+   `count=25` changes nothing. That is the documented contract, but it is
+   also 1 302 `<tr>` in one swap — worth knowing before you demo it on a
+   projector.
+
+7. **Filter.** Back on `languages`, type `Eng` into *Filter* and Run. The
+   expansion narrows server-side to `total 9` — `en`, the eight `en-*`
+   regional variants, and `bn Bengali` (the match is a case-insensitive
+   substring on the display, so *B-eng-ali* qualifies).
 
 **Expected**
 
-- Flat mode: table of 50 limb concepts with a Load-more/pager below.
-- Tree mode on `ex-vs-1`: the underlying CS is flat (no
-`hierarchyMeaning`), so HTS returns a flat expansion and the
-workbench silently renders it as a flat table with the pager. There
-is **no banner** — tree mode degrades gracefully to flat rather
-than surfacing an OperationOutcome. Verified via Playwright at
-§3.4 in `value-sets.spec.ts` (`toggling tree mode on a flat CS degrades silently to a flat table`).
-- Tree mode on `ex-vs-tree`: `<ul role="tree">` renders `A` as the
-root and `B` as its child. Keyboard arrows navigate.
+- Tree rendering is an **indented `.data-table`**, not a `<ul role="tree">`.
+  Each row's Code cell carries `padding-left: calc(14px + depth * 20px)`.
+  Do not go looking for `role="tree"` — it was replaced.
+- Flat mode paginates; tree mode does not, and says so in the footer.
+- The advanced fieldset (`displayLanguage`, `activeOnly`,
+  `includeDesignations`, `useSupplement`, `date`, `property`,
+  `tx-resource`, `system-version`, `check-system-version`,
+  `force-system-version`, `default-valueset-version`, `threshold`) is
+  present and collapsed. Everything in it is echoed back in the parameters
+  panel when the server honours it.
 
 **Red flags**
 
 - Tree/flat toggle causes the whole page to reload.
-- Pager button disappears when it should be shown (rule: hidden only
-when `expansion.total ≤ rendered rows`).
+- Pager button disappears in flat mode when it should be shown (rule: hidden
+  only when `expansion.total ≤ rendered rows`).
+- Any ValueSet you pick expands to `total 0` — several seeded value sets
+  (`observation-codes` / LOINC, `clinical-findings` / SNOMED CT,
+  `all-languages`, `condition-code`) are stored as metadata only because
+  their code systems are not in this seed set. Expected, not a bug. Pick a
+  fixture from §2.4 instead.
 
 
 
 ### 3.5 §7.5 ConceptMap browser + `$translate` — `/ui/hts/concept-maps`
 
-Layout note (Phase 5): CM shares the sticky-rail form with CS / VS
-(see §3.2), but the results table is **5-column with a stacked
-Mapping cell** — Name · Title · URL · Mapping (`S:` source URI +
-`T:` target URI on two aligned lines) · Status. The rail advertises
-*Source system* / *Target system* inputs, but they are still
-silently dropped by axum's `Query` extractor on the backend — the
-`ResourceSearchQuery` struct does not declare `source-uri` /
-`target-uri`. The Mapping column still surfaces the values from
-each CM resource in the response, so operators can eyeball
-direction even though they cannot filter by it. Tracked as a
-`helios-hts` bug.
+The CM browser shares the toolbar layout but has **three** text filters
+(*Name*, *Title*, *Canonical URL*) — no Version — and a 5-column table:
+**Name · Title · URL · Mapping · Status**. The Mapping cell stacks the
+source and target on two aligned lines:
 
-> **UI-vs-route naming.** Same rule as §3.2 / §3.4: `ex-cm-1` and
-> `ex-cm-no-match` are FHIR ids and appear only in the row's link
-> `href`. In the table look for Name **ExampleCM** and
-> **ExampleCMNoMatch**, or deep-link via
-> `/ui/hts/concept-maps/ex-cm-1`. See §2.3.
+```
+S: http://hl7.org/fhir/ValueSet/encounter-status
+T: http://hl7.org/fhir/ValueSet/resource-status
+```
+
+There are no *Source system* / *Target system* filter inputs any more — the
+earlier build advertised them while axum's `Query` extractor silently
+dropped them. They were removed rather than left lying. The Mapping column
+is how you eyeball direction.
 
 **Steps**
 
-1. Click **Browse CM**.
-2. In the rail, type `http://example.org/cs/source` in *Source
-  system* — HTS currently ignores the parameter (backend bug, see
-   the layout note above), so expect the table not to narrow; the
-   `S:` line in the Mapping cell will still show the URI for maps
-   that carry it.
-3. Open the **ExampleCM** row (route id `ex-cm-1`).
-4. On the *Translate* tab, enter source `A`, source system
-  `http://example.org/cs/source`. Submit.
-5. Toggle direction to **Reverse**. Wait for the input to re-render.
-6. Submit reverse with target `T1`, target system
-  `http://example.org/cs/target`.
-7. Open the **ExampleCMNoMatch** row (route id `ex-cm-no-match`). Repeat forward translate on `A`. Compare.
+1. Click **Concept Maps**. 80 maps exist; row 1 is
+   **EncounterStatusCanonicalMap**, row 2 **AppointmentStatusCanonicalMap**,
+   row 3 **EpisodeOfCareStatusCanonicalMap**.
+2. Open the **EncounterStatusCanonicalMap** row → you land on
+   [http://127.0.0.1:8090/ui/hts/concept-maps/sc-encounter-status/translate](http://127.0.0.1:8090/ui/hts/concept-maps/sc-encounter-status/translate).
+   Facts block: `Canonical Mapping for "EncounterStatus"` · `v4.0.1` ·
+   `draft`, **Groups 1**, Publisher `HL7 (FHIR Project)`, and under **All
+   ConceptMap facts** a `Source` / `Target` pair naming the two ValueSets.
+
+3. **Forward translate.** Direction stays **Forward**. Fill in:
+
+   | Field         | Value                                    |
+   | ------------- | ---------------------------------------- |
+   | Source system | `http://hl7.org/fhir/encounter-status`   |
+   | Source code   | `planned`                                |
+
+   Submit. Expected:
+
+   ```
+   1 matches   [Forward]
+   Code     System                                  Display  Equivalence  Origin
+   planned  http://hl7.org/fhir/resource-status     —        equivalent   http://hl7.org/fhir/ConceptMap/sc-encounter-status|4.0.1
+   ```
+
+   Same over the API:
+
+   ```bash
+   curl -s 'http://127.0.0.1:8090/ConceptMap/$translate?url=http://hl7.org/fhir/ConceptMap/sc-encounter-status&system=http://hl7.org/fhir/encounter-status&code=planned'
+   # … {"name":"result","valueBoolean":true}
+   ```
+
+4. **Reverse.** Click the **Reverse** radio. The input region re-renders:
+   the source fields are replaced by *Target code* and *Target system*.
+   Enter target system `http://hl7.org/fhir/resource-status`, target code
+   `planned`. Submit. Expected: `1 matches` with a **Reverse** chip, plus an
+   explanatory note — *"In reverse mode HTS omits originMap, so a match
+   cannot be attributed to a specific concept map."*
+
+5. **No match.** Back on Forward, source system
+   `http://hl7.org/fhir/encounter-status`, source code `NOPE`. Submit.
+   Expected: HTTP 200 with **"No matches for this source."** and the
+   outcome *No mapping found for the provided code*. No equivalence table.
 
 **Expected**
 
-- Forward on `ex-cm-1`: match found, target `T1` with `equivalent`
-equivalence (or `relationship: equivalent` on R5+ — depends on
-compile-time FHIR version).
-- Reverse: the form's field labels flip from source-* to target-* and
-vice-versa. No duplicate `direction` in the URL — this was the CM:139
-bug; the fix `hx-params="none"` is pinned by a Rust ring test.
-- `ex-cm-no-match`: HTTP 200 with `result = false` and a "no mapping"
-outcome. The equivalence panel should not render.
+- The direction toggle is a `hx-get` on the input region with
+  `hx-target="#hts-workbench-input"`, so only the form re-renders.
+- No duplicate `direction` in the URL — this was the CM:139 bug; the fix
+  (`hx-params="none"`) is pinned by a Rust ring test.
 
 **Red flags**
 
 - Reverse click leaves the URL bar with `?direction=reverse&direction=reverse`.
 - The target-side fields do not re-label after a direction toggle.
+- A no-match run renders an empty table instead of the outcome banner.
 
 
 
-### 3.6 §7.6 Operations workbench — `/ui/hts/operations`
+### 3.6 Concept plane — `/ui/hts/concepts?system=…&code=…`
 
-Standalone workbench. 7 ops in the selector: `$lookup`, `$validate-code`,
-`$subsumes`, `$expand`, `$translate`, `$closure`, `$batch-validate-code`.
+Every other surface is resource-first: find a CodeSystem, then ask it a
+question. This one inverts that. The address is `system` + `code`, and the
+page answers the three questions an operator actually has about a code they
+were handed. It is query-shaped on purpose — a canonical system URI in a
+path segment would need double-encoding, and proxies reject it.
+
+You reach it from the **Open concept** link on any `$lookup` result, or by
+hand.
 
 **Steps**
 
-1. Pick `$lookup`. Enter system `http://example.org/cs`, code `A`. Run.
-2. Pick `$validate-code`. Try `A` (valid) and `NONEXISTENT` (invalid) —
-  same behaviour as §3.3 but through the standalone workbench.
-3. Pick `$closure`. Read the stateless-server banner (v1 does not
-  persist closure names).
-4. Pick `$batch-validate-code`. First set **Target ValueSet** to
-  `http://example.org/vs/batch-mixed` (the seed's `ex-vs-batch-mixed`
-  envelope — see §2.3; the input is HTML5 `required`, so submitting
-  with it empty just fires the browser tooltip and never reaches the
-  server). The form v1 renders exactly 3 rows — enter:
-  - `http://example.org/cs` / `A` (valid)
-  - `http://example.org/cs` / `X` (invalid — unknown code)
-  - `http://example.org/cs/source` / `A` (valid, different CS, still
-    inside the envelope)
+1. On §3.3 step 2's Lookup result, click **Open concept**. You land on:
 
-   Submit.
+   ```
+   /ui/hts/concepts?system=http%3A%2F%2Fterminology.hl7.org%2FCodeSystem%2Fv3-EntityRisk&code=IFL&version=2018-08-12
+   ```
+
+   Or type it directly:
+   [http://127.0.0.1:8090/ui/hts/concepts?system=http%3A%2F%2Fterminology.hl7.org%2FCodeSystem%2Fv3-EntityRisk&code=IFL](http://127.0.0.1:8090/ui/hts/concepts?system=http%3A%2F%2Fterminology.hl7.org%2FCodeSystem%2Fv3-EntityRisk&code=IFL)
+
+2. **Identity** renders server-side in the shell, so it is there on first
+   paint:
+
+   ```
+   inflammable                                    [Active]
+   System          http://terminology.hl7.org/CodeSystem/v3-EntityRisk
+   Code            IFL
+   Display         inflammable
+   CodeSystem name v3.EntityRisk
+   Version         2018-08-12
+   Selectability   Selectable
+   Definition      Material is highly inflammable and …
+   Hierarchy neighbours   Child EXP
+   Designations    inflammable / en / —
+   Properties      status → active
+   ```
+
+   Drop the `&version=` from the URL and the same page answers
+   `CodeSystem name EntityRisk` / `Version 4.0.0` — the other stored
+   version of the same canonical. Useful to know before you get confused by
+   it on stage.
+
+3. **Mappings** and **Subsumption** are lazy — their skeletons self-fetch on
+   `hx-trigger="load"`. Watch them fill in. Each skeleton carries a
+   `<noscript>` "Open this panel" link to the standalone route
+   (`/ui/hts/concepts/mappings?…`), which renders the full page around that
+   one panel, so the plane degrades to plain navigation without JS.
+
+4. **Subsumption** on `IFL` shows one row, from the child side:
+
+   ```
+   Subsumption
+   Relation | Question asked   | Outcome
+   Child    | IFL subsumes EXP | Subsumes
+   (explosive)
+   ```
+
+   Open the child to see the same edge from the other end:
+
+   [`/ui/hts/concepts?system=http%3A%2F%2Fterminology.hl7.org%2FCodeSystem%2Fv3-EntityRisk&code=EXP`](http://127.0.0.1:8090/ui/hts/concepts?system=http%3A%2F%2Fterminology.hl7.org%2FCodeSystem%2Fv3-EntityRisk&code=EXP)
+
+   ```
+   Relation | Question asked   | Outcome
+   Parent   | IFL subsumes EXP | Subsumes
+   (inflammable)
+   ```
+
+   The panel's own caption explains the framing: *"Each row is one
+   subsumption check. The ancestor candidate is always sent as code A, so a
+   hierarchy that agrees with itself answers 'subsumes' every time."*
+
+5. **Compare with code.** Type a bare code into the *Compare* box at the
+   bottom of the Subsumption panel — the system is pinned to the concept's,
+   so a bare code is all it wants. On `EXP`, comparing with `POI` adds a
+   *Compared* row reading `POI subsumes EXP → Not subsumed`.
+
+6. **Mappings on a mapped concept.** The v3 risk codes are not in any stored
+   ConceptMap, so their Mappings panel reads *"No ConceptMap maps this
+   concept. No mapping found for the provided code"* — the empty state, not
+   an error. Use the encounter-status concept to see a real one:
+
+   [`/ui/hts/concepts?system=http%3A%2F%2Fhl7.org%2Ffhir%2Fencounter-status&code=planned`](http://127.0.0.1:8090/ui/hts/concepts?system=http%3A%2F%2Fhl7.org%2Ffhir%2Fencounter-status&code=planned)
+
+   ```
+   Mappings — Mappings where this concept is the source, across every stored ConceptMap.
+   Mapping vocabulary   equivalence (R4 / R4B)
+   Origin map           http://hl7.org/fhir/ConceptMap/sc-encounter-status|4.0.1
+   Code     | System                              | Display | Relationship
+   planned  | http://hl7.org/fhir/resource-status | —       | equivalent
+   ```
+
+   Note the panel found this **without** being told which map to use — it
+   calls `$translate` with `url` omitted.
 
 **Expected**
 
-- The 7-op selector is a `<nav role="navigation">` (NOT `role="tab"` —
-that was the Grupo A bug, fix in `61bfc4f59`).
-- Batch-validate immediately renders a skeleton table with 3 rows.
-Each row loads its own result via HTMX polling, at most 8 in-flight
-(§4.3). Rows resolve independently — do not wait for all three.
-- After each row resolves, its skeleton is swapped for a completed row
-with the result badge (`valid` / `invalid` / `error`). Both `A` rows
-end up `valid` (the target envelope includes both CodeSystems), the
-`X` row ends up `invalid`.
-- A `<progress>` bar at the top of the table climbs from 0 → 3.
+- Identity is server-rendered; the other two panels swap themselves in and
+  the returned fragment re-emits its `id` **without** the trigger, so the
+  swap terminates (no polling loop).
+- Every panel has its own **Raw response** disclosure.
+- The permalink survives copy/paste out of a ticket — that is the whole
+  point of the route shape.
 
 **Red flags**
 
-- Any tab swap loses the operation context (workbench should preserve
-filled inputs when possible).
-- Batch table shows all rows as "pending" forever (means the
-self-terminating progress endpoint hung — see §7.6 impl notes).
-- Any row shows a raw JSON stack trace instead of an OperationOutcome.
-- Submitting the form does nothing and the browser shows a
-"Please fill out this field" tooltip on **Target ValueSet** — that is
-the HTML5 `required` constraint on `input[name="target"]` in
-`hts-vs-batch-input.html`, not a bug. Paste the target URL from step 4
-and resubmit.
+- A panel keeps re-fetching itself (trigger not stripped on the response).
+- A half-typed permalink returns axum's bare `400` instead of a rendered
+  `invalid` OperationOutcome inside the page.
+- The Compare box accepts `system|code` or a bare URI and round-trips it as
+  a *code*. There is a local pre-flight that is supposed to name that
+  mistake; if a pasted `system|code` sails through to a confusing 404, file it.
 
 
 
 ### 3.7 §7.7 Import — `/ui/hts/import`
 
-**Demo bundles (paste or save as `bundle-small.json`)**
+The page is three numbered steps: **1 · Choose source**, **2 · Review**,
+**3 · Result**. Step 1 has a *Source* radio (**Paste JSON** / **Upload
+file**), a `bundle_file` picker and a `bundle` textarea. Step 2 restates the
+target (`http://127.0.0.1:8090/import`), the request
+(`POST application/fhir+json`), the accepted resources (CodeSystem,
+ValueSet, ConceptMap) and the merge rule (*Existing resources are updated in
+place when `url` and `version` match*). Step 3 starts at *"No import has
+been submitted yet."*
 
-200 success (same shape as §2.2):
+> **This step writes to the store.** The rest of this guide is read-only. If
+> you are demoing against a shared seeded server, either skip §3.7 or point
+> a throwaway `HTS_DATABASE_URL` at a scratch file first.
+
+**Demo bundle (paste, or save as `bundle-small.json`)**
 
 ```json
 {
@@ -507,8 +815,8 @@ and resubmit.
     {
       "resource": {
         "resourceType": "CodeSystem",
-        "id": "ex-cs-1",
-        "url": "http://example.org/cs",
+        "id": "demo-cs-1",
+        "url": "http://example.org/demo/cs",
         "version": "1.0.0",
         "status": "active",
         "content": "complete",
@@ -522,7 +830,8 @@ and resubmit.
 }
 ```
 
-207 partial success (one good entry + one entry with `id` but no `resourceType`):
+Partial-success variant — one good entry plus one entry with an `id` but no
+`resourceType`:
 
 ```json
 {
@@ -532,100 +841,109 @@ and resubmit.
     {
       "resource": {
         "resourceType": "CodeSystem",
-        "id": "ex-cs-ok",
-        "url": "http://example.org/cs/ok",
+        "id": "demo-cs-ok",
+        "url": "http://example.org/demo/cs/ok",
         "version": "1.0.0",
         "status": "active",
         "content": "complete",
         "concept": [{ "code": "X", "display": "Ok" }]
       }
     },
-    {
-      "resource": {
-        "id": "broken-no-type"
-      }
-    }
+    { "resource": { "id": "broken-no-type" } }
   ]
 }
 ```
 
 **Steps (paste path)**
 
-1. Click **Import** from the topbar or dashboard status strip.
-2. Paste an empty string. Submit. → pre-flight 400.
-3. Paste `{ not json`. Submit. → pre-flight 400.
-4. Paste the **200 success** bundle above. Submit. → 200 success.
-5. Paste the **207 partial success** bundle above. Submit. → 207
-  partial success.
+1. Click **Import** in the sidebar.
+2. Paste an empty string. Submit. → pre-flight 400, UI-owned.
+3. Paste `{ not json`. Submit. → pre-flight 400, UI-owned.
+4. Paste the first bundle. Submit. → 200 success, with the imported-entry
+   count in step 3.
+5. Paste the partial-success bundle. Submit. → 207 with a per-entry
+   breakdown.
 
-**Steps (file path — added 2026-08-20, see design §14.6)**
+**Steps (file path)**
 
-6. Click the **file** radio. The paste textarea hides; the file input
-   becomes visible.
-7. Save the 200-success JSON above as `bundle-small.json`, then pick
-   that file. Notice the paste textarea (now hidden) receives the file
-   contents via `FileReader.readAsText()`. Submit. → 200 success, same
-   summary strip as the paste path.
-8. Click the **paste** radio again. The file input hides, the textarea
-   reappears with the file contents still in place (in case you want
-   to edit before re-submitting).
+6. Click the **Upload file** radio. The paste textarea hides; the file input
+   appears with the hint *"JSON only. The file is read in your browser and
+   copied into the Bundle field below; nothing is sent until you submit."*
+7. Pick `bundle-small.json`. Submit. → same result strip as the paste path.
+8. Click **Paste JSON** again. The textarea reappears with the file contents
+   still in place, in case you want to edit before re-submitting.
 
 **Expected**
 
-- Pre-flight errors are UI-owned — they never hit the backend. The
-submit button re-enables after the error banner renders.
-- Success shows the number of imported entries and a link back to the
-respective browser.
-- 207 shows a per-entry breakdown: which entries succeeded and which
-failed, with each failure's `OperationOutcome`.
-- 413 (paste > 10 MB) is intentionally not covered by a Playwright test;
-the Rust ring covers it with a canned mock — you can skip it in the
-demo unless you want to paste a large fixture by hand.
-- **File path caveat.** The file is urlencoded into the same
-  `bundle=…` field the paste path uses, so URL-encoding overhead
-  (~33 %) means the effective JSON cap on the file path is ~7.5 MiB
-  before HTS returns 413. For anything larger, paste the Bundle
-  directly (paste bytes go on the wire verbatim) or split the file.
+- Pre-flight errors never hit the backend. The submit button re-enables
+  after the error banner renders.
+- Success reports how many entries were imported and links back to the
+  respective browser.
+- 207 shows which entries succeeded and which failed, each failure with its
+  `OperationOutcome`.
+- 413 (paste > 10 MB) is intentionally not covered by a Playwright test; the
+  Rust ring covers it with a canned mock. Skip it in the demo unless you
+  want to paste a large fixture by hand.
+- **File path caveat.** The file is urlencoded into the same `bundle=…`
+  field the paste path uses, so URL-encoding overhead (~33 %) puts the
+  effective JSON cap on the file path at ~7.5 MiB before HTS returns 413.
+  For anything larger, paste the Bundle directly (paste bytes go on the wire
+  verbatim) or split the file.
 
 **Red flags**
 
 - Submit stays disabled after a validation error (means the
-`UpstreamHealth` decode broke — Grupo B bug pattern).
-- File picker does nothing when clicked (means `import.js` did not
-  load — check `/ui/hts/assets/import.js` returns 200 and the
-  `<script>` tag is present in `import.html`).
+  `UpstreamHealth` decode broke — Grupo B bug pattern).
+- File picker does nothing when clicked (means `import.js` did not load —
+  check `/ui/hts/assets/import.js` returns 200 and the `<script>` tag is
+  present in `import.html`).
 
 
 
-### 3.8 §7.9 Diagnostics — `/ui/hts/diagnostics`
+### 3.8 Capability & Conformance — `/ui/hts/capability-statement`
 
-Four tabs: CapabilityStatement / TerminologyCapabilities / /health /
-/metrics.
+Formerly §7.9 Diagnostics at `/ui/hts/diagnostics`. That path still works
+and answers `308 → /ui/hts/capability-statement`; bookmarks and old links
+survive. There are no tabs any more — it is **six stacked cards**, composed
+live from `/metadata` and `/metadata?mode=terminology` in one pass.
+
+```bash
+curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}\n' 'http://127.0.0.1:8090/ui/hts/diagnostics'
+# 308 -> http://127.0.0.1:8090/ui/hts/capability-statement
+```
 
 **Steps**
 
-1. Click each tab in turn.
-2. Between tabs, watch the URL — it should update via `hx-push-url` so
-  you can share a deep link.
-3. Force one tab into an error state: temporarily rename the underlying
-  endpoint on the binary side (or unset `HTS_UI_UPSTREAM_URL` after
-   setting it in §4.4). The failed tab's panel turns red; the other
-   three stay green — that is the per-tab isolation contract.
+1. Open
+   [http://127.0.0.1:8090/ui/hts/capability-statement](http://127.0.0.1:8090/ui/hts/capability-statement).
+2. Read down the cards. Expand the last one.
+3. Click the **1977** in *Terminology Capabilities* — it links to
+   `/ui/hts/code-systems`.
+4. Click **View the complete statement** at the bottom — it opens
+   `/metadata`.
 
-**Expected**
+**Expected**, card by card:
 
-- CapabilityStatement renders as a resource summary (rest interactions,
-supported types).
-- TerminologyCapabilities lists the loaded `codeSystem[]` (0 on a fresh
-boot, N after seed).
-- `/health` renders as a small key/value table.
-- `/metrics` renders as the raw Prometheus text — this is intentional
-(design §7.9 F3: no re-parse, no chart).
+| Card                          | What it shows on the seeded server                                                                                                                                                                                                                     |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Server Summary**            | Description `Helios Terminology Server SQLite backend`; Base URL `http://heliossoftware.com/fhir/hts/CapabilityStatement/hts`; FHIR version `4.0.1`; Status `active`; Kind `instance`; Date `2026-04-01`; Formats `application/fhir+json, application/fhir+xml`. |
+| **System Interactions**       | **Absent.** HTS declares no `rest[].interaction[]`, and the template omits the whole card rather than rendering an empty one. Its absence is the correct result — do not file it.                                                                        |
+| **Operations**                | `$versions`, `$lookup`, `$validate-code`, `$subsumes`, `$expand`, `$translate`, `$closure`, each with its HL7 `OperationDefinition` canonical. Note `$closure` is listed here but has no UI page (§4.3).                                                  |
+| **Per-Resource Capabilities** | CodeSystem / ValueSet / ConceptMap, each `read create update delete search-type`, each with `5` search params.                                                                                                                                          |
+| **Terminology Capabilities**  | Hierarchical expansion `No`; Expansion paging `Yes`; Incomplete expansions `No`; Validate-code translations `No`; Translation needs a map `Yes`; Closure maintenance `Yes`; **Code systems declared `1977`** (a link); and the `$expand` parameter list — `activeOnly, check-system-version, count, displayLanguage, excludeNested, force-system-version, includeDefinition, includeDesignations, offset, property, system-version, tx-resource`. |
+| **Raw CapabilityStatement (JSON)** | A `<details>` disclosure, collapsed by default. Opens to pretty-printed JSON, cut off with: *"Truncated to the first 16384 of 356648 bytes — this server's statement grows with the code systems it loads."* followed by a **View the complete statement** link to `/metadata`. |
 
 **Red flags**
 
-- A red panel disables the other tabs. Isolation broken.
-- `/metrics` gets rendered as HTML with `<pre>` escaping missing.
+- A "System Interactions" card rendering **empty** rather than being
+  omitted.
+- The truncation note missing while the JSON is obviously cut — that means
+  someone changed the cap without updating the note.
+- The raw JSON rendered as HTML (missing `<pre>` escaping).
+- *Terminology Capabilities* claiming `Hierarchical expansion: Yes`. It says
+  `No` today, which is what the statement declares — even though tree mode
+  in §3.4 works. That mismatch is a backend conformance question, not a UI
+  one; note it on the plan rather than filing it against `crates/hts-ui`.
 
 ---
 
@@ -637,88 +955,156 @@ Run these across at least two pages each.
 
 ### 4.1 Theme (light / dark / system)
 
-Toggle from the topbar chip on §7.1, §7.4, and §7.6. Confirm:
+Toggle from the topbar buttons on §3.1, §3.4, and §3.8. Confirm:
 
-- No FOUC (Flash Of Unstyled Content) when navigating pages.
+- No FOUC (Flash Of Unstyled Content) when navigating pages — `theme.js`
+  runs before first paint.
 - Both themes ship enough contrast for `axe-core` (verified in Phase 3
-Playwright; visually spot-check the outcome banners on the operations
-workbench — they use accent colors that are easy to underdo).
+  Playwright). Visually spot-check the outcome banners on the CodeSystem
+  Validate tab — they use accent colors that are easy to underdo.
 
 
 
 ### 4.2 i18n (en / es / de)
 
-Switch to `es` on §7.1. Click Browse CS. Confirm all labels are in
-Spanish. Then switch to `de` and load §7.6. Confirm at least the
-`hts-operations-*` keys are populated. Look for:
+Switch to **Spanish** on §3.1 and confirm the tiles read *Estado del
+servidor* / *Tiempo activo* / *Sistemas de códigos cargados* /
+*Solicitudes*. Then switch to **German** and load `/ui/hts/code-systems`:
+heading *Codesysteme*, buttons *Suchen* / *Zurücksetzen*, status chips
+*Jeder Status / aktiv / Entwurf / zurückgezogen / unbekannt*.
 
-- Untranslated keys (rendered as `hts-something-else`) — file if you see
-any. Key parity is enforced in CI but locale drift is possible during
-hand-edit.
-- Right-to-left or long-word wraps that push the layout. German has some
-very long compound words (`Terminologiediagramm`, etc.) that we should
-see fitting in the topbar.
+The switcher is three plain `?lang=` links, so it works with JS disabled and
+the choice is visible in the URL.
+
+Look for:
+
+- Untranslated keys rendered as `hts-something-else`. There should be
+  **none**: a sweep of all six pages in all three locales came back clean on
+  2026-08-28, and outcome codes now degrade to the code rather than the key
+  (§3.3). Anything you spot is a regression — file it.
+- Long German compounds pushing the layout. The sidebar and the browser
+  toolbar are the tight spots.
 
 
 
-### 4.3 Batch-validate polling (§7.6)
+### 4.3 Operations with no UI page (API-only)
 
-Do this if you want to actually see the fan-out mechanism:
+Three operations are routed and working but deliberately have no page: the
+standalone Operations workbench that used to host them was deleted.
+`/ui/hts/operations` returns `404`. Demo them with curl.
 
-1. In the batch panel, enter 20 rows — a mix of valid and invalid codes
-  from the seed.
-2. Submit. Watch the skeleton table.
-3. Open DevTools → Network. Filter on `/ui/hts/operations/batch-validate/`.
-4. Confirm at most 8 requests are in-flight at any moment. As one
-  resolves the next queued row's request fires.
+**ValueSet `$validate-code`** — `GET` or `POST /ValueSet/$validate-code`:
 
-This exercises `HTS_UI_BATCH_FANOUT_CONCURRENCY = 8` (compile-time
-constant). If you want to see it lower or higher you must rebuild.
+```bash
+curl -s 'http://127.0.0.1:8090/ValueSet/$validate-code?url=http://hl7.org/fhir/ValueSet/immunization-status&system=http://hl7.org/fhir/event-status&code=completed'
+```
 
-### 4.4 Too-costly banner (§7.4)
+```json
+{"resourceType":"Parameters","parameter":[
+  {"name":"code","valueCode":"completed"},
+  {"name":"display","valueString":"Completed"},
+  {"name":"issues","resource":{"resourceType":"OperationOutcome", ... }}, ... ]}
+```
 
-1. Kill the running HTS.
-2. Re-boot with `HTS_MAX_EXPANSION_SIZE=5`:
-  ```powershell
-    $env:HTS_UI_ENABLED = "true"
-    $env:HTS_MAX_EXPANSION_SIZE = "5"
-    cargo run --bin hts
-  ```
-3. Re-seed (§2.1). Open `/ui/hts/value-sets/ex-vs-too-costly` (Name
-   **ExampleTooCostlyVS** in the browser, URL
-   `http://example.org/vs/too-costly`).
-4. On the Expand tab, **clear the** `count` **input** (empty, not `0` — HTS
-  only applies the ceiling when `count` is absent).
-5. Run.
+**`$batch-validate-code`** — `POST /ValueSet/$batch-validate-code` only.
+Each row is a `validation` parameter carrying its **own** `Parameters`
+resource, and each of those must carry its own `url`; a `url` at the top
+level is not inherited and every row comes back
+`Missing required parameter: url`.
 
-Expected: a red banner with "expansion too costly" and a **Raise
-threshold** form that lets you retry with an explicit `count` — the same
-input the workbench filled in step 4 with the default `50`. This confirms
-the design's clause that the ceiling is *per-request*, not global.
+```bash
+curl -s -X POST -H 'Content-Type: application/fhir+json' \
+  -d '{"resourceType":"Parameters","parameter":[
+    {"name":"validation","resource":{"resourceType":"Parameters","parameter":[
+      {"name":"url","valueUri":"http://hl7.org/fhir/ValueSet/immunization-status"},
+      {"name":"coding","valueCoding":{"system":"http://hl7.org/fhir/event-status","code":"completed"}}]}},
+    {"name":"validation","resource":{"resourceType":"Parameters","parameter":[
+      {"name":"url","valueUri":"http://hl7.org/fhir/ValueSet/immunization-status"},
+      {"name":"coding","valueCoding":{"system":"http://hl7.org/fhir/event-status","code":"NOPE"}}]}}]}' \
+  'http://127.0.0.1:8090/ValueSet/$batch-validate-code'
+```
 
-### 4.5 Degraded state (§7.1)
+You get one `validation` output per input, in order, each holding a
+`Parameters` (with `result` / `display` / `issues`) or an
+`OperationOutcome`.
 
-Two ways to force it.
+**`$closure`** — `POST /ConceptMap/$closure`. Listed in the Capability &
+Conformance *Operations* card and declared `Closure maintenance: Yes`. It
+maintains named server-side closure state, so it is a write: not exercised
+in this read-only walk-through. Use a scratch database if you want to demo it.
 
-**Option A** — point the UI at a broken upstream:
+
+
+### 4.4 Expansion ceiling ("too costly")
+
+`HTS_MAX_EXPANSION_SIZE` (default **3500**) is applied only when a
+`$expand` request omits `count` — it is a per-request ceiling, not a global
+cap.
+
+**You cannot reproduce it on the seeded store as booted.** The largest
+expansion in this seed set is `http://terminology.hl7.org/ValueSet/v3-ActCode`
+at **1 302** members, comfortably under 3 500; the value sets that would be
+huge (`observation-codes` / LOINC, `clinical-findings` / SNOMED CT) expand
+to `total 0` because their code systems are not in the bundle.
+
+To see the banner you need a dedicated boot with the ceiling lowered:
 
 ```powershell
-$env:HTS_UI_ENABLED = "true"
+$env:HTS_BOOTSTRAP_DIR     = "./crates/hts/terminology-data"
+$env:HTS_UI_ENABLED        = "true"
+$env:HTS_MAX_EXPANSION_SIZE = "5"
+cargo run --bin hts
+```
+
+Then open `/ui/hts/value-sets/languages/expand`, **clear the `count` input**
+(empty, not `0` — HTS only applies the ceiling when `count` is absent) and
+Run. Expected: a red banner and a **Raise threshold** form that retries with
+an explicit `count` — the same input the workbench normally pre-fills with
+`50`. The expand form's advanced fieldset also carries a `threshold` field
+for exactly this retry.
+
+Treat this section as **not verified on the shared demo server**. Run it on
+your own instance before signing it off.
+
+
+
+### 4.5 Degraded state
+
+The UI always talks to HTS over HTTP — by default to
+`http://127.0.0.1:{HTS_SERVER_PORT}`, i.e. the same binary on loopback. When
+that leg fails or exceeds the 5 s request timeout, the Home cards render a
+banner:
+
+> **Terminology backend not fully available** — The terminology server did
+> not respond in time. *Some tiles are hidden until HTS becomes reachable
+> again. Interactive controls are disabled on affected pages.*
+
+…and the affected tiles collapse to em-dashes while the chart caption
+switches to *"/metrics is unreachable — no new samples are arriving."*
+
+**Option A (transient, free).** You will very likely hit this without trying
+on a loaded or freshly restarted server — the first
+`/metadata?mode=terminology` fetch after idle can exceed the timeout on a
+store with 1 977 code systems. Refresh; the tiles fill back in. If you want
+to force it, hammer the API in one shell while reloading `/ui/hts` in the
+browser.
+
+**Option B (deterministic).** Point the UI at a dead upstream:
+
+```powershell
+$env:HTS_UI_ENABLED     = "true"
 $env:HTS_UI_UPSTREAM_URL = "http://127.0.0.1:9999"   # nothing listens
 cargo run --bin hts
 ```
 
-Load `/ui/hts`. The status cards should show:
+Load `/ui/hts`. Expected: the banner, `status` and the inventory tiles as
+em-dashes, and the page still rendering — no white screen.
 
-- `status = degraded`
-- `degraded reason = connection refused` (or similar)
-- The dashboard still renders — no white-screen — and the quick-links
-are disabled with an `aria-disabled="true"` state.
-
-**Option B** — leave `HTS_UI_UPSTREAM_URL` unset, boot normally, but do
-NOT seed. The dashboard reports `loaded systems = 0`. That is technically
-"up but empty" (not degraded); the UI should say so, not hide it. If
-that number is missing entirely, that is a rendering bug.
+**Option C (up but empty).** Boot without `HTS_BOOTSTRAP_DIR`. The store is
+empty, so **Loaded code systems** reads `0` and the bundled-data hint shows
+an em-dash rather than a misleading `0 MB`. That is "up but empty", not
+degraded, and the UI should say so rather than hide it. If the number is
+missing entirely, that is a rendering bug.
 
 ---
 
@@ -728,23 +1114,58 @@ that number is missing entirely, that is a rendering bug.
 
 You are done when:
 
-- [ ] §7.1 Dashboard — poll works, theme + locale switch clean.
-- [ ] §7.2 CS browser — debounce + Load-more + empty state.
-- [ ] §7.3 CS detail — 308 redirect to `/lookup`; facts block stays
-      above; Lookup / Validate / Subsumes tabs move `aria-current`.
-- [ ] §7.4 VS browser + `$expand` — flat pager + tree mode + too-costly.
-- [ ] §7.5 CM browser + `$translate` — forward + reverse + no-match.
-- [ ] §7.6 Operations — all 7 ops, batch-validate fan-out, closure banner.
-- [ ] §7.7 Import — pre-flight, 200, 207, (413 skipped by design).
-- [ ] §7.9 Diagnostics — 4 tabs, per-tab isolation, deep-linkable URL.
+- [ ] §3.1 Home — 4 tiles + chart, 15 s poll, range/series links,
+      theme + locale switch clean.
+- [ ] §3.2 CS browser — 300 ms debounce, case-sensitive filters, status
+      facets, Load-more advancing `_offset`, empty state.
+- [ ] §3.3 CS detail — 308 to `/lookup`; facts block stays above; Lookup /
+      Validate / Subsumes move `aria-current`; `IFL`/`EXP`/`POI` give
+      `subsumes` / `subsumed-by` / `not-subsumed`.
+- [ ] §3.4 VS browser + `$expand` — 3-code expansion on
+      `immunization-status`, 56-member pager on `languages`, indented tree
+      on `v3-EntityRisk`.
+- [ ] §3.5 CM browser + `$translate` — Mapping column, forward, reverse,
+      no-match.
+- [ ] §3.6 Concept plane — Identity server-rendered, Mappings and
+      Subsumption lazy-load and terminate, Compare box works, permalink
+      round-trips.
+- [ ] §3.7 Import — pre-flight, 200, 207, file/paste toggle. *(Skip on a
+      shared server — it writes.)*
+- [ ] §3.8 Capability & Conformance — 5 cards rendered + System Interactions
+      correctly absent, `/ui/hts/diagnostics` still 308s, raw JSON truncated
+      with the note and the `/metadata` link.
+- [ ] §4.3 API-only ops — `$validate-code` and `$batch-validate-code`
+      answered over curl; `/ui/hts/operations` confirmed `404`.
 - [ ] Themes — light + dark on at least two pages.
 - [ ] i18n — `en` + `es` on at least two pages; `de` spot check.
-- [ ] Degraded — one of §4.5 options triggers the banner without
-  crashing the UI.
+- [ ] Degraded — one of §4.5 options shows the banner without crashing the UI.
+
+Fixed on 2026-08-28, found by writing this guide against the real seed set:
+
+- ~~Detail pages only resolve the first 1 000 rows~~ — they now page with
+  `_offset`, so the whole catalog opens (§2.5).
+- ~~Outcome codes render as raw Fluent keys~~ — an untranslated FHIR issue
+  code now surfaces as itself (`business-rule`), which is what the partial
+  always documented.
+
+Known findings still open, so nobody re-files them:
+
+1. **`Concept count` is always an em-dash** — HTS does not populate
+   `CodeSystem.count` (§3.3). Analysis and cost:
+   `edson/docs/hts-ui-improvement-plan.md` §14.
+2. **`Bundle.total` echoes the page size**, not the store size (§2.1).
+3. **`GET /{type}/{id}` instance reads 404** on seeded resources, and `?_id=`
+   is silently ignored; only `?url=` search narrows (§2.1, §2.5).
+4. **`TerminologyCapabilities` declares `Hierarchical expansion: No`** while
+   tree mode demonstrably works (§3.8).
+5. **`GET /ValueSet?_count=100000` resets the connection** on a seeded store
+   — page with `_offset` instead (§2.5).
+6. **ICD-9-CM imported one concept** from a 1 MB source file. A silent
+   import failure, not a UI issue.
 
 When every box is ticked, respond "UI OK" and I move to Phase 5 (draft
 `edson/docs/hts-ui-discussion.md`).
 
 Any red flag above → file it as a comment on the plan or as a new bullet
-here; I will loop with a fix and we re-run the affected block before
-signing off.
+here; I will loop with a fix and we re-run the affected block before signing
+off.
