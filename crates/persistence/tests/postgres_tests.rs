@@ -503,7 +503,15 @@ mod query_builder_tests {
         assert!(result.is_some());
         let fragment = result.unwrap();
         assert!(fragment.sql.contains("value_token_system"));
-        assert!(!fragment.sql.contains("value_token_code"));
+        // The `system|` form binds the system and nothing else — still exactly
+        // one parameter. It does carry `value_token_code IS NOT NULL` as of
+        // schema v30, which is not a second binding: it is the conjunct that
+        // makes the partial `idx_search_token_code_recent` reachable for this
+        // shape, and it excludes no row (`IndexValue::Token.code` is a
+        // non-optional `String`). What must stay true is that no code VALUE is
+        // compared, which is what would make the search wrong.
+        assert!(fragment.sql.contains("value_token_code IS NOT NULL"));
+        assert!(!fragment.sql.contains("value_token_code ="));
         assert_eq!(fragment.params.len(), 1);
     }
 

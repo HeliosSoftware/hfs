@@ -521,12 +521,24 @@ ORDER BY c.last_updated DESC, c.resource_id ASC;
 
 \echo ''
 \echo '######## AA. FAST PATH token Encounter?class=v3-ActCode|AMB — the 462ms p99 shape ########'
--- WHAT TO LOOK FOR: `Index Only Scan using idx_search_token`, `Heap Fetches: 0`,
--- rows=22 out of the Limit, and NO Sort node. v24 added
--- `last_updated DESC, resource_id ASC` as key columns after the two equality
--- columns, so the index supplies the required order and the LIMIT stops at 22.
--- A `Sort`, a `Bitmap Heap Scan`, or a non-zero `Heap Fetches` means the change
--- did not take and this shape is still materialising ~40,000 rows to return 22.
+-- WHAT TO LOOK FOR, AS OF v30: `Index Only Scan using idx_search_token_code`
+-- with `Filter: (value_token_system = ...)`, `Heap Fetches: 0`, rows=22 out of
+-- the Limit, and NO Sort node.
+--
+-- v24 built `idx_search_token` for this shape and got it index-only and ordered.
+-- v30 dropped that index (2,283 MB) because v20's code-first
+-- `idx_search_token_code` reaches the identical plan: it seeks the code, its
+-- remaining key columns ARE `last_updated DESC, resource_id ASC` so the LIMIT
+-- still stops at 22, and `value_token_system` is in its INCLUDE payload so the
+-- system is filtered without a heap fetch. On a local replica the two plans read
+-- the same 6 buffers for the same 22 rows. AB below is the paired counterfactual
+-- that measures the claim here, on real data.
+--
+-- A `Sort`, a `Bitmap Heap Scan`, or a non-zero `Heap Fetches` means the v30
+-- reasoning is wrong and this shape is materialising the whole match set again.
+-- `Rows Removed by Filter` far above `rows` means the requested (system, code)
+-- pair barely co-occurs and the scan is walking the code slice — the bounded
+-- worst case v30's docstring states.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        r.last_updated AS sort_key
@@ -542,31 +554,34 @@ WHERE r.is_deleted = FALSE
 ORDER BY c.last_updated DESC, c.resource_id ASC;
 
 \echo ''
-\echo '######## AB. AA COUNTERFACTUAL — same query against the pre-v24 index shape ########'
--- The paired "before" for AA, in the same pass and against the same cache, so
--- the comparison is not a cross-run one (see the header: only a changed plan or
--- a changed hit+read counts).
+\echo '######## AB. AA COUNTERFACTUAL — the same query with v24 idx_search_token back ########'
+-- The paired counterfactual for AA, in the same pass and against the same cache,
+-- so the comparison is not a cross-run one (see the header: only a changed plan
+-- or a changed hit+read counts).
 --
--- DDL is transactional in Postgres, so dropping the v24 index and rebuilding the
--- v23 definition inside a transaction that ROLLBACKs leaves the database exactly
--- as it was. The rebuild is partial on `value_token_system IS NOT NULL`
--- (~1.6M of 39.5M rows), so it costs seconds, and it runs before the k6 load
--- starts. If any statement in this block fails, psql's session ends the
--- transaction and the v24 index is still there.
+-- v30 dropped `idx_search_token`. This rebuilds exactly the v24 definition
+-- inside a transaction that ROLLBACKs, so the run measures what those 2,283 MB
+-- bought for the `system|code` shape rather than arguing about it. DDL is
+-- transactional in Postgres, so the database is left exactly as it was; the
+-- build is partial on `value_token_system IS NOT NULL` and runs before the k6
+-- load starts. If any statement in this block fails, psql's session ends the
+-- transaction and nothing is left behind.
 --
--- EXPECTED, if the diagnosis is right: `Index Scan using idx_search_token_v23`
--- (not Index Only), tens of thousands of rows fetched from the heap, a Sort or
--- HashAggregate over the whole match set, and hit+read one to two orders of
--- magnitude above AA.
+-- EXPECTED, if v30's reasoning is right: the SAME node type as AA (Index Only
+-- Scan), rows=22, Heap Fetches 0, and hit+read within noise of AA — with the
+-- only difference being that the system moves from `Filter` into the
+-- `Index Cond`. If instead AB is materially cheaper than AA, the drop was wrong
+-- and the index has to come back; the per-shape number to weigh it against is
+-- the ~2,170 MB of cache AA's index set no longer occupies.
 BEGIN;
 -- Bound the blast radius: if anything else holds a lock on search_index we abort
 -- rather than hang the whole capture, and the ROLLBACK below still restores the
--- v24 index.
+-- v30 index set.
 SET LOCAL lock_timeout = '30s';
 SET LOCAL statement_timeout = '300s';
-DROP INDEX idx_search_token;
-CREATE INDEX idx_search_token_v23
-  ON search_index (tenant_id, resource_type, param_name, value_token_system, value_token_code)
+CREATE INDEX idx_search_token_v24
+  ON search_index (tenant_id, resource_type, param_name, value_token_system,
+                   value_token_code, last_updated DESC, resource_id ASC)
   WHERE value_token_system IS NOT NULL;
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
@@ -584,7 +599,7 @@ ORDER BY c.last_updated DESC, c.resource_id ASC;
 ROLLBACK;
 
 \echo ''
-\echo '######## AC. v24 index is back (must print idx_search_token, one row) ########'
+\echo '######## AC. v30 token index set (must print idx_search_token_code, _code_recent, _system) ########'
 SELECT indexname, indexdef FROM pg_indexes
 WHERE tablename = 'search_index' AND indexname LIKE 'idx_search_token%'
 ORDER BY indexname;
@@ -642,6 +657,115 @@ JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
                 AND r.id = c.resource_id
 WHERE r.is_deleted = FALSE
 ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SCHEMA v30 — the `system|` form, which nothing above ever modelled.
+--
+-- `build_token_condition` emits four predicate shapes and only ONE is strict in
+-- `value_token_system` alone: the `system|` spelling, `value_token_system = $n`.
+-- Every section above sends `system|code`, which is strict in both columns. So
+-- the whole capture measured the shape `idx_search_token` was *chosen* for and
+-- never the shape it was the only candidate for — the same omission the v24
+-- header calls out about v20, one level down.
+--
+-- v30 replaced `idx_search_token` (2,283 MB, 62% of the token family together
+-- with its two siblings) with a seek-only, deduplicating
+-- `idx_search_token_system (tenant_id, resource_type, param_name,
+-- value_token_system)` and made `build_token_condition` emit
+-- `value_token_code IS NOT NULL` alongside the system equality, which brings the
+-- recent-first `idx_search_token_code_recent` in as a second candidate.
+--
+-- The two regimes to look for, and which index should win each:
+--   broad system  (matches much of the parameter slice) -> idx_search_token_code_recent,
+--                  streaming `last_updated DESC`, LIMIT stops it, ~22 rows out
+--   narrow system (matches little)                      -> idx_search_token_system,
+--                  exact seek, heap fetch per match, small Sort
+-- Either is acceptable. What is NOT is a Sort over tens of thousands of rows,
+-- which is what `idx_search_token` itself did here: its key is
+-- (…, value_token_system, value_token_code, last_updated, resource_id), and a
+-- `system|` predicate does not bind `value_token_code`, so the sort key was
+-- never reachable for this shape. On a local replica that cost 1,074 buffers and
+-- a 66,667-row top-N sort to return 22.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+\echo ''
+\echo '######## AF1. FAST PATH token Encounter?class=<v3-ActCode>| — BROAD system| ########'
+-- The system that most Encounter.class rows carry. Expect
+-- idx_search_token_code_recent, no Sort, rows=22, double-digit buffers.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+         AND param_name = 'class'
+         AND (value_token_code IS NOT NULL
+              AND value_token_system = 'http://terminology.hl7.org/CodeSystem/v3-ActCode')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Encounter'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AF2. AF1 COUNTERFACTUAL — pre-v30 form, no IS NOT NULL conjunct ########'
+-- The identical query without the conjunct v30 added, so the only candidate is
+-- the seek-only index (`idx_search_token_code_recent` is partial on
+-- `value_token_code IS NOT NULL`, which this form cannot prove). Expect a seek
+-- followed by a heap fetch per matching row and a Sort — i.e. materially MORE
+-- hit+read than AF1. If AF2 is not worse, the conjunct is buying nothing and can
+-- be reverted.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+         AND param_name = 'class'
+         AND (value_token_system = 'http://terminology.hl7.org/CodeSystem/v3-ActCode')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Encounter'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AF3. FAST PATH token Encounter?class=missing| — NARROW/zero-match system| ########'
+-- The other regime. Expect idx_search_token_system, an exact seek, rows=0 and
+-- single-digit buffers. This is the shape that justifies keeping a system-keyed
+-- index at all instead of dropping one outright.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+         AND param_name = 'class'
+         AND (value_token_code IS NOT NULL AND value_token_system = 'missing')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Encounter'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AF4. v30 TOKEN FAMILY FOOTPRINT — the number the whole change is about ########'
+-- The token family was 7,474 MB of an 11.9 GB index set on an 11 GB host, and
+-- `idx_search_token` was 2,283 MB of it. The replacement carries the same rows
+-- with no payload and no per-row key column, so btree deduplication collapses
+-- each (tenant, type, param, system) group to one key plus a posting list. A
+-- local replica put the ratio at 4.9%; this is the real number.
+SELECT s.indexrelname,
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
+       s.idx_scan, s.idx_tup_read
+FROM pg_stat_user_indexes s
+WHERE s.relname = 'search_index'
+  AND s.indexrelname LIKE 'idx_search_token%'
+ORDER BY pg_relation_size(s.indexrelid) DESC;
+
+SELECT count(*) FILTER (WHERE value_token_code IS NOT NULL)   AS rows_with_a_code,
+       count(*) FILTER (WHERE value_token_system IS NOT NULL) AS rows_with_a_system,
+       count(DISTINCT (resource_type, param_name, value_token_system))
+         FILTER (WHERE value_token_system IS NOT NULL)        AS distinct_system_groups
+FROM search_index;
 
 \echo ''
 \echo '######## AG. STRING Patient?name=Emilia — v24 form (implies the partial index predicate) ########'
