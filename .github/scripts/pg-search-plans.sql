@@ -718,19 +718,45 @@ ORDER BY c.last_updated DESC, c.resource_id ASC;
 
 \echo ''
 \echo '######## AJ. STRING Patient?address:contains=Springfield — leading % is not sargable ########'
--- Exactly half, and it is not an estimate: `k6/searchConfig.js` in the pinned
--- benchmark repo declares `"modifiers": ["", ":contains"]` for all three string
--- shapes and `search.js` picks one per request with `pickRand`. Run
--- 33179839720: 50,112 string iterations, 25,056 expected `:contains`, 24,865
--- observed. This shape therefore sets the whole `string` p99 no matter how fast
--- the other half gets.
+-- Exactly half of the string traffic, and it is not an estimate:
+-- `k6/searchConfig.js` in the pinned benchmark repo declares
+-- `"modifiers": ["", ":contains"]` for all three string shapes and `search.js`
+-- picks one per request with `pickRand`. Run 33179839720: 50,112 string
+-- iterations, 25,056 expected `:contains`, 24,865 observed. This shape sets the
+-- whole `string` p99 no matter how fast the other half gets, which is why the
+-- category did not move when v30's seek landed.
 --
--- v30 deliberately leaves it on the v24 form, conjunct and all: dropping the
--- conjunct here only moves an unavoidable full-slice scan off the 47 MB
--- `idx_search_string` onto the wider one, 1,709 -> 2,169 buffers measured. A
--- leading `%` cannot seek a btree; a trigram GIN is the only real answer and
--- does not fit an 11 GB host against a 15.7 GB working set. Expect a scan, not
--- a seek, and expect it on `idx_search_string`.
+-- A leading `%` cannot seek a btree, so v30 gives it a trigram GIN
+-- (`idx_search_string_trgm`, pg_trgm + btree_gin) and drops the
+-- `value_string IS NOT NULL` conjunct that kept the planner off it.
+--
+-- WHAT TO LOOK FOR: `Bitmap Index Scan on idx_search_string_trgm` with all four
+-- conditions in the Index Cond — tenant, type, param and the `~~` — and tens of
+-- buffers. Run 33179839720 measured this shape at 5,138 buffers / 10.5 ms on
+-- `idx_search_string`; locally the trigram path is 58 buffers / 0.41 ms. If you
+-- see `idx_search_string_folded_pattern` with a Filter instead, the extension
+-- was unavailable and it correctly degraded to the pre-v30 plan.
+-- AJ2 is the paired v29 control.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Patient'
+         AND param_name = 'address'
+         AND COALESCE(value_string_folded, lower(value_string)) LIKE '%springfield%' ESCAPE '\'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Patient'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AJ2. AJ COUNTERFACTUAL — the v29 :contains form ########'
+-- The same page with the `value_string IS NOT NULL` conjunct back. Pure SQL,
+-- no DDL: this file must never leave an index behind, and a rolled-back
+-- counterfactual that swallows its own terminator has already leaked a
+-- CREATE INDEX into a measured window once. Same pass, same cache, so this is
+-- a true paired control for AJ.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        r.last_updated AS sort_key
