@@ -46,8 +46,7 @@ use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 ///   make this assertion false and leave stale rows for a later create to
 ///   inherit, which is why those call sites carry the obligation in a comment.
 /// - A caller that has just run [`PostgresBackend::delete_search_index`], which
-///   clears the `search_index` rows (and, with [`FtsRow::Drop`], the
-///   `resource_fts` row too).
+///   clears the `search_index` rows and the `resource_fts` row with them.
 ///
 /// Claiming `Fresh` wrongly leaves stale index rows behind — a resource that
 /// still matches searches for values it no longer has — so it is an explicit
@@ -58,28 +57,6 @@ pub(crate) enum IndexWrite {
     Fresh,
     /// The resource may already be indexed; clear it first.
     Replace,
-}
-
-/// Whether [`PostgresBackend::delete_search_index`] must also drop the
-/// `resource_fts` row.
-///
-/// The full-text write is an upsert against a UNIQUE `idx_fts_lookup` (schema
-/// v27), so a caller that re-indexes immediately afterwards does not need the
-/// row deleted first — the upsert replaces it. Every one of the 192,825 updates
-/// in a 5-minute crud run used to pay a `DELETE FROM resource_fts` (227.3 s of
-/// Postgres execution time, measured on run 33086933938) purely to make room
-/// for an insert that now writes over the row itself.
-///
-/// A caller that is *not* going to re-index must still pass [`FtsRow::Drop`],
-/// or the resource stays matchable by `_text` / `_content`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FtsRow {
-    /// Delete the `resource_fts` row: the caller is removing this resource's
-    /// index entries and nothing will put the row back.
-    Drop,
-    /// Leave the `resource_fts` row in place: the caller re-indexes
-    /// immediately and the upsert replaces it.
-    Keep,
 }
 
 /// The full-text upsert, shared by the first attempt and the truncating retry.
@@ -504,20 +481,20 @@ impl ResourceStorage for PostgresBackend {
             };
         }
 
-        // Re-index the resource. The `search_index` rows have to go first, and
-        // clearing them here leaves nothing for the indexing write to clear —
-        // `Replace` would have issued a second identical DELETE against the
-        // same rows. The `resource_fts` row stays: `index_fts_content` upserts
-        // over it, which is one statement and one round trip less per update.
-        self.delete_search_index(&client, tenant_id, resource_type, id, FtsRow::Keep)
-            .await?;
+        // Re-index the resource. `Replace` clears the old `search_index` rows
+        // inside the same statement that writes the new ones — the clearing
+        // `DELETE` used to be a `delete_search_index` call of its own here, i.e.
+        // a second statement and a second round trip binding the same three
+        // parameters. The `resource_fts` row stays either way:
+        // `index_fts_content` upserts over it, which is one more statement and
+        // round trip saved per update.
         self.index_resource(
             &client,
             tenant_id,
             resource_type,
             id,
             now,
-            IndexWrite::Fresh,
+            IndexWrite::Replace,
             &resource,
         )
         .await?;
@@ -1137,18 +1114,19 @@ impl PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to insert restore history: {}", e)))?;
 
         // The delete dropped the search index entries; rebuild them for the
-        // resource that is live again. As in `update`, the preceding
-        // `delete_search_index` is what clears `search_index`, so the indexing
-        // write has nothing left to clear; the full-text row is upserted over.
-        self.delete_search_index(&client, tenant_id, resource_type, id, FtsRow::Keep)
-            .await?;
+        // resource that is live again. As in `update`, `Replace` folds the
+        // clearing `DELETE` into the insert rather than sending it separately —
+        // and it must stay a `Replace`, not a `Fresh`: a resource can be
+        // soft-deleted by a path that leaves its rows in place, so this cannot
+        // assert that nothing is indexed under the id. The full-text row is
+        // upserted over.
         self.index_resource(
             &client,
             tenant_id,
             resource_type,
             id,
             now,
-            IndexWrite::Fresh,
+            IndexWrite::Replace,
             &resource,
         )
         .await?;
@@ -1195,15 +1173,10 @@ impl PostgresBackend {
             return Ok(());
         }
 
-        if mode == IndexWrite::Replace {
-            execute_cached(
-                client,
-                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
-        }
+        // `Replace` no longer sends a `DELETE` of its own: the clearing delete
+        // rides inside the first insert statement (`INSERT_SQL_REPLACE`), which
+        // is one statement and one round trip instead of two, binding the same
+        // three parameters once instead of twice. See `replace_rows`.
 
         // Extract values using the registry-driven extractor
         let mut rows: Vec<IndexRow> = match self
@@ -1249,14 +1222,28 @@ impl PostgresBackend {
         rows.extend(self.contained_index_rows(tenant_id, resource_type, resource_id, resource));
 
         let count = rows.len();
-        PostgresSearchIndexWriter::insert_rows(
-            client,
-            tenant_id,
-            resource_type,
-            resource_id,
-            &rows,
-        )
-        .await?;
+        match mode {
+            IndexWrite::Fresh => {
+                PostgresSearchIndexWriter::insert_rows(
+                    client,
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    &rows,
+                )
+                .await?
+            }
+            IndexWrite::Replace => {
+                PostgresSearchIndexWriter::replace_rows(
+                    client,
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    &rows,
+                )
+                .await?
+            }
+        }
         tracing::debug!(
             "Dynamically indexed {} values for {}/{}",
             count,
@@ -1329,9 +1316,9 @@ impl PostgresBackend {
     ///
     /// The write is an upsert keyed on `idx_fts_lookup`, which schema v27 makes
     /// UNIQUE. Two things follow from that. A rewrite no longer needs its own
-    /// `DELETE` — `update` and `restore` ask `delete_search_index` to leave the
-    /// row alone (`FtsRow::Keep`) and this statement replaces it in place, which
-    /// removes one statement and one round trip from every update. And a
+    /// `DELETE` — `update` and `restore` leave the row alone and this statement
+    /// replaces it in place, which removes one statement and one round trip from
+    /// every update. And a
     /// duplicate `resource_fts` row is now impossible: `search_text` /
     /// `search_content` join `resources` to `resource_fts`, so a duplicate used
     /// to return the same resource twice in a `_text` / `_content` page.
@@ -1490,19 +1477,36 @@ impl PostgresBackend {
         Ok(())
     }
 
-    /// Delete search index entries for a resource.
-    /// Removes a resource's search entries, returning how many `search_index`
-    /// rows were deleted.
+    /// Removes a resource from search entirely: its `search_index` rows and its
+    /// `resource_fts` row. Returns how many `search_index` rows went.
     ///
-    /// `fts` says whether the `resource_fts` row goes with them; see
-    /// [`FtsRow`].
+    /// This used to take an `FtsRow` telling it whether to drop the full-text
+    /// row, because a *re-indexing* caller — `update`, `restore` — wanted only
+    /// the `search_index` half cleared: the full-text write is an upsert against
+    /// the UNIQUE `idx_fts_lookup` (schema v27) and replaces the row in place, so
+    /// deleting it first was one statement and one round trip of pure waste
+    /// (227.3 s over a 5-minute crud run's 192,825 updates, measured on run
+    /// 33086933938).
+    ///
+    /// Those callers no longer come here at all. Clearing the `search_index`
+    /// rows is now folded into the statement that writes the new ones
+    /// (`IndexWrite::Replace` -> `PostgresSearchIndexWriter::replace_rows`),
+    /// which removes a second statement and round trip on top of the one the
+    /// `FtsRow` split removed. What is left is the one caller that means
+    /// "unindex this resource" — `delete_search_entries`, the `$reindex` clear —
+    /// and it always wanted both halves gone, so the parameter had one possible
+    /// value and is now implicit.
+    ///
+    /// The obligation the enum carried is still real and now lives here: a
+    /// caller that removes `search_index` rows and does *not* rewrite them must
+    /// take the `resource_fts` row too, or the resource stays matchable by
+    /// `_text` / `_content` after it has stopped matching everything else.
     pub(crate) async fn delete_search_index(
         &self,
         client: &deadpool_postgres::Client,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        fts: FtsRow,
     ) -> StorageResult<u64> {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
@@ -1518,15 +1522,13 @@ impl PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
 
-        // Delete from FTS table if it exists
-        if fts == FtsRow::Drop {
-            let _ = execute_cached(
-                    client,
-                    "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                    &[&tenant_id, &resource_type, &resource_id],
-                )
-                .await;
-        }
+        // The full-text row goes with them.
+        let _ = execute_cached(
+                client,
+                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                &[&tenant_id, &resource_type, &resource_id],
+            )
+            .await;
 
         Ok(deleted)
     }
@@ -3458,7 +3460,6 @@ impl ReindexTarget for PostgresBackend {
             tenant.tenant_id().as_str(),
             resource_type,
             resource_id,
-            FtsRow::Drop,
         )
         .await
     }
