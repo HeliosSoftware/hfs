@@ -1,0 +1,6 @@
+# Built JupyterLite site (70 MB default / ~463 MB vendored) — reproduce via build.sh
+dist/
+# Local build venv
+.venv/
+# JupyterLite build cache
+.jupyterlite.doit.db
