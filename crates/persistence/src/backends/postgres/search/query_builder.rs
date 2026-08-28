@@ -898,6 +898,14 @@ impl PostgresQueryBuilder {
                     // system, and it is the reason v30 could replace the 2,283 MB
                     // `idx_search_token` with a seek-only index.
                     //
+                    // As of v31 it is not merely helpful, it is LOAD-BEARING:
+                    // v31 dropped `idx_search_token_system` (the planner pointed
+                    // `system|code` at it — 80,089,347 tuples read, 358 ms p99),
+                    // so `idx_search_token_code_recent` is now the ONLY index a
+                    // `system|` predicate can reach. Remove this conjunct and the
+                    // form falls back to a sequential-scale scan of the
+                    // (tenant, type) slice.
+                    //
                     // It excludes nothing. `IndexValue::Token` declares
                     // `code: String`, and both writer paths set the column
                     // unconditionally beside the system —
@@ -2938,15 +2946,15 @@ mod tests {
 
     /// v30 replaced `idx_search_token` (2,283 MB, system-first, and unable to
     /// give this shape the sort key because `value_token_code` sat between the
-    /// system and `last_updated`) with a seek-only
-    /// `idx_search_token_system (tenant_id, resource_type, param_name,
-    /// value_token_system)`. The `system|` form is the only shape strict in
-    /// `value_token_system` and therefore the only one that can reach either.
+    /// system and `last_updated`) with a seek-only `idx_search_token_system`;
+    /// v31 dropped that too, because `system|code` is strict in
+    /// `value_token_system` as well and the planner pointed it there —
+    /// 80,089,347 tuples read for a 358 ms p99.
     ///
-    /// The `value_token_code IS NOT NULL` conjunct is what gives it a second
-    /// candidate — the partial, recent-first `idx_search_token_code_recent` —
-    /// so a broad system streams to the LIMIT instead of sorting its match set.
-    /// Drop the conjunct and that plan becomes illegal; turn it into a
+    /// So `idx_search_token_code_recent` is now the ONLY index the `system|`
+    /// form can reach, and the `value_token_code IS NOT NULL` conjunct below is
+    /// the only reason it can: that index is partial on exactly that predicate.
+    /// Drop the conjunct and this shape has no index at all; turn it into a
     /// comparison against a code VALUE and the search becomes wrong.
     #[test]
     fn system_only_token_implies_the_code_partial_predicate() {

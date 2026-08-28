@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 30;
+pub const SCHEMA_VERSION: i32 = 31;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -350,6 +350,7 @@ async fn migrate_schema(
             27 => migrate_v27_to_v28(client).await?,
             28 => migrate_v28_to_v29(client).await?,
             29 => migrate_v29_to_v30(client).await?,
+            30 => migrate_v30_to_v31(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -2236,6 +2237,243 @@ async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v29->v30 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v30 -> v31: v30's replacement index became an attractive nuisance, and the
+/// recent-first token index cannot answer a `system|code` predicate without the
+/// heap.
+///
+/// ## What v30 got right, and what it got wrong
+///
+/// Run 33176893776 against run 33128380492, same runner (`github-agent1`), so
+/// the comparison is same-hardware:
+///
+/// ```text
+///                 baseline      v30      ratio
+/// all_indexes      12 GB      9605 MB    -2,395 MB   <- the point of v30
+/// heap_only        3682 MB    3682 MB     unchanged
+/// import           3.1 RPS    3.4 RPS     1.09x
+/// crud             3629 RPS   3933 RPS    1.08x
+/// search           2989 RPS   2541 RPS    0.85x      <- this migration
+/// ```
+///
+/// The footprint claim landed slightly better than predicted:
+/// `idx_search_token_system` measured **96 MB** against a predicted ~113 MB,
+/// replacing 2,283 MB. The run's own census says why the deduplication estimate
+/// held: 7,511,154 of 9,605,846 code-bearing rows carry a system (78.2%, against
+/// the 77.5% the replica assumed) across **76 distinct
+/// (resource_type, param_name, value_token_system) groups**, i.e. ~99,000 rows
+/// per posting list. The write-side prediction landed too — import and crud
+/// moved +9% and +8% together, which is one fewer btree insert per token row.
+///
+/// What v30 got wrong is one sentence of its own docstring: "S3 is served by
+/// `idx_search_token_code`". It *can* be, and sections AD, AE and AF of the plan
+/// capture show it being served exactly that way — `Index Only Scan using
+/// idx_search_token_code`, `Heap Fetches: 0`, 5 buffers. But v30 never asked
+/// whether the planner would *choose* it, and for one parameter it does not:
+///
+/// ```text
+/// shape                        base p99   v30 p99
+/// token Encounter class            26 ms    358 ms
+/// ```
+///
+/// ## The measured mechanism
+///
+/// `pg_stat_user_indexes` from the v30 run:
+///
+/// ```text
+/// index                          scans   tuples_read    size     tuples/scan
+/// idx_search_token_system         5,334    80,089,347    96 MB      15,015
+/// idx_search_token_code          39,003       415,842  2906 MB          10.7
+/// idx_search_token_code_recent   17,516     3,361,223  2253 MB         191
+/// ```
+///
+/// A 96 MB index with **no payload and no sort key** read 80 million tuples.
+/// The only predicate shapes strict in `value_token_system` are `system|` (which
+/// this benchmark never sends) and `system|code`, so those 5,334 scans are
+/// `system|code` — a shape `idx_search_token_system` cannot answer without a
+/// heap fetch for `value_token_code` on every row it returns, followed by a sort
+/// of the whole match set, because it carries neither the code nor the fast
+/// path's sort key.
+///
+/// Section AF2 of the same capture measures that plan directly, and prints the
+/// reason the planner chooses it:
+///
+/// ```text
+/// Index Scan using idx_search_token_system  (cost=0.56..110.84 rows=210)
+///                                           (actual rows=67692) 67,651 buffers
+/// -> Sort (top-N heapsort)                                      808 ms
+/// ```
+///
+/// **rows=210 estimated, 67,692 actual — a 322x under-estimate.** That is the
+/// same (system, code) independence error v24 documented; v24 neutralised it by
+/// making the index the planner preferred *cheap*, at a cost of 2,283 MB, and
+/// v30 removed that index without removing the error. `Encounter.class` is where
+/// it bites because the parameter has ~10 distinct codes over one system, so
+/// seeking the system alone returns essentially the whole slice. The p50 stayed
+/// at 8 ms and only the p99 moved, which is the signature: the plan is fine when
+/// the requested value is the common one and catastrophic when it is not.
+///
+/// Section AA shows the second-worst plan, chosen for `class=v3-ActCode|AMB`:
+/// `Index Scan using idx_search_token_code_recent` with `Filter:
+/// (value_token_system = ... AND value_token_code = ...)`. That index carries
+/// `value_token_code` as payload but **not `value_token_system`**, so it is a
+/// plain `Index Scan`, not an `Index Only Scan`: every candidate row costs a
+/// random heap fetch into a 3.7 GB heap scattered across 22.6M rows just to
+/// evaluate the system.
+///
+/// ## The fix: leave no reachable plan that touches the heap
+///
+/// Steering the planner was rejected. An extended statistic on
+/// (`value_token_system`, `value_token_code`) would correct the 322x estimate,
+/// but it is a bet on an estimate rather than a property of the schema, and v24
+/// already recorded the objection: it "would leave the cliff in place for every
+/// value whose estimate is still wrong". Instead, both changes below make the
+/// *reachable* plans safe, so the estimate stops mattering.
+///
+/// **1. `idx_search_token_system` is dropped.** v30 created it one migration ago
+/// and it is dropped here on its own measurement. It exists for `system|`, but
+/// it is seekable by `system|code` too — both forms are strict in
+/// `value_token_system` and there is no predicate that separates them — and for
+/// `system|code` it is the worst plan in the family. Its 96 MB is not the point;
+/// the 80 million heap-fetched tuples are.
+///
+/// This meets the drop rule v18/v22/v26/v28 set. The slice `system|` seeks it
+/// for is served by `idx_search_token_code_recent` over a **superset** of its
+/// rows: that index is partial on `value_token_code IS NOT NULL`, and every row
+/// with a system has a code (`IndexValue::Token` declares `code: String`; pinned
+/// by `a_token_row_never_has_a_system_without_a_code`), it shares the identical
+/// leading three key columns, and change 2 below puts the system in its payload
+/// so the scan is index-only. v30's `value_token_code IS NOT NULL` conjunct in
+/// `build_token_condition` is what makes that index provable for the `system|`
+/// form, and it becomes load-bearing here rather than merely helpful: without
+/// it, `system|` would have no index at all.
+///
+/// **2. `idx_search_token_code_recent` gets `value_token_system` in its
+/// payload.** Traced to its LIVE definition — v21's, verified against
+/// `pg_indexes` on a database migrated through the whole chain, *not* the v1
+/// shape in `create_indexes`:
+///
+/// ```text
+/// (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+/// INCLUDE (value_token_code)  WHERE value_token_code IS NOT NULL
+/// ```
+///
+/// The key is untouched. `last_updated DESC, resource_id ASC` are already KEY
+/// columns and stay KEY columns — this migration adds a second `INCLUDE` column
+/// and nothing else, so the streaming property v19 established and v27 had to
+/// restore is not at risk here. Only the payload changes, and payload is exactly
+/// what an index-only filter needs.
+///
+/// After both changes every predicate `build_token_condition` emits has only
+/// index-only, LIMIT-terminating plans available:
+///
+/// ```text
+/// shape        candidate                      plan
+/// code=$c      idx_search_token_code          seek code, stream sort key, index-only
+///              _code_recent                   stream, filter code from payload, index-only
+/// system|code  idx_search_token_code          seek code, stream, filter system from payload
+///              _code_recent                   stream, filter BOTH from payload  <- change 2
+/// system|      _code_recent                   stream, filter system from payload  <- change 2
+/// ```
+///
+/// Measured on a replica built to the run's real distribution — the
+/// `Encounter/class` slice at full size (67,500 rows against the run's 67,692),
+/// ~10 codes over one system, `value_token_code` at the production statistics
+/// target of 4000:
+///
+/// ```text
+///                              v30                          v31
+/// system|code class|AMB    Index Scan token_system,      Index Only Scan token_code
+///                          22,500 heap rows + Sort,      Heap Fetches 0, 5 buffers
+///                          1,478 buffers
+/// system|code class|EMER   same shape                    Index Only Scan, 5 buffers
+/// system|code class|OBSENC same shape                    Index Only Scan, 5 buffers
+/// broad system|            Index Scan + Sort,            Index Only Scan _code_recent,
+///                          1,478 buffers                 Heap Fetches 0, 5 buffers
+/// recent-first FORCED,     Index Scan, 407 heap          Index Only Scan,
+///   class|EMER             fetches for the filter        Heap Fetches 0
+/// ```
+///
+/// ## What this costs, and what it gives back
+///
+/// The `system|` form loses its exact seek. A system that matches little or
+/// nothing now walks its parameter's slice instead of seeking to an empty range
+/// — index-only, no heap, no random I/O, bounded by one `(resource_type,
+/// param_name)` slice. On the replica that is 1,419 buffers and 14 ms for a
+/// zero-match `class` system, against 4 buffers under v30. That is the honest
+/// price, it is paid by a shape this benchmark does not send, and it is an order
+/// of magnitude better than the 808 ms the index cost when the planner pointed
+/// `system|code` at it.
+///
+/// Footprint: -96 MB for the drop, plus the width of `value_token_system` on
+/// every row of a 2,253 MB index. The replica puts that at +27.9% (435 ->
+/// 557 MB), but its entries are 115 bytes against the real index's 246, and the
+/// added column is a fixed ~32 bytes either way, so the real growth is between
+/// +13% (+293 MB) and the replica's +28% (+628 MB) — call it ~+360 MB. Net
+/// against the 12 GB baseline this branch started from: still **-1.9 to
+/// -2.2 GB**. Section AF4 of the plan capture prints the real number, and it now
+/// prints `idx_search_token_code_recent`'s definition alongside it so the next
+/// round can check the key columns from the artifact instead of from
+/// `create_indexes`.
+///
+/// The write path keeps most of what v30 bought: the dropped index removes one
+/// btree insert per system-bearing row, exactly as before, and change 2 widens
+/// entries in an index those rows already entered rather than adding a new one.
+///
+/// ## What this migration deliberately does NOT touch
+///
+/// `quantity Observation value-quantity` also regressed on that run (27 ->
+/// 261 ms p99). It is not this branch's. `pg-search-plans.sql` documents the
+/// same shape alternating on identical code since run 33077075313, where it
+/// normalised to 0.20x against this run's 0.12x; the AM1/AM2 captures are the
+/// same index and the same node types in both runs with costs within 0.2%
+/// (1327.71 vs 1327.01); `value_quantity_rows` is 512,311 and `table_rows`
+/// 22,644,934 in **both**; and `param_name`'s `n_distinct` is 107 in both with
+/// top frequencies equal to three decimal places. Every untouched index holds
+/// its tuples-per-scan across the two runs to within 1% (string 3,119 vs 3,119,
+/// composite 2,287 vs 2,299, reference 134.6 vs 135.3) — the sole exception
+/// being `idx_search_quantity_recent`. Nothing in this branch writes a different
+/// row or changes a statistic, so there is no mechanism by which it could move
+/// that estimate. It is the documented instability and it is left alone.
+///
+/// ## What this costs a real database
+///
+/// One catalog-only `DROP INDEX` and one `DROP`/`CREATE` pair over the
+/// `value_token_code IS NOT NULL` slice. The build takes a `SHARE` lock on
+/// `search_index`, so writes block for its duration; it runs at startup under
+/// `initialize_schema`'s advisory lock, before the instance serves traffic.
+/// `CREATE INDEX CONCURRENTLY` is not used, for the reason v15 gives: a process
+/// death mid-build leaves an INVALID index that a later `IF NOT EXISTS` skips
+/// forever.
+///
+/// Applied to a legacy (pre-v17) layout too, for v30's reason: both token
+/// indexes here were created by ungated migrations (v19, v20, v21), so both
+/// layouts hold the identical shapes.
+async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        // 1. Seekable by `system|code`, which it cannot answer without a heap
+        //    fetch per row and a sort. 5,334 scans, 80,089,347 tuples read.
+        "DROP INDEX IF EXISTS idx_search_token_system",
+        // 2. v21's key verbatim — `last_updated DESC, resource_id ASC` stay KEY
+        //    columns — with `value_token_system` added to the payload so a
+        //    `system|code` or `system|` filter is evaluated from the index
+        //    instead of from the heap.
+        "DROP INDEX IF EXISTS idx_search_token_code_recent",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_code_recent
+         ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+         INCLUDE (value_token_code, value_token_system)
+         WHERE value_token_code IS NOT NULL",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v30->v31 failed: {}", e)))?;
     }
 
     Ok(())

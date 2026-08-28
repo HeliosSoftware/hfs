@@ -539,6 +539,17 @@ ORDER BY c.last_updated DESC, c.resource_id ASC;
 -- `Rows Removed by Filter` far above `rows` means the requested (system, code)
 -- pair barely co-occurs and the scan is walking the code slice — the bounded
 -- worst case v30's docstring states.
+--
+-- v31 UPDATE: on run 33176893776 this section printed
+-- `Index Scan using idx_search_token_code_recent` with the system in the Filter
+-- — a plain Index Scan, so a heap fetch per candidate row, because that index
+-- did not carry `value_token_system`. Worse, the k6 workload put this shape on
+-- `idx_search_token_system` (5,334 scans, 80,089,347 tuples read on a 96 MB
+-- index with no payload and no sort key), which is a heap fetch per row plus a
+-- sort, and took the shape's p99 from 26 ms to 358 ms. v31 drops that index and
+-- adds `value_token_system` to `idx_search_token_code_recent`'s payload, so
+-- BOTH remaining candidates are index-only. **Any `Index Scan` here that is not
+-- an `Index Only Scan` is now a regression**, whichever of the two it names.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        r.last_updated AS sort_key
@@ -676,23 +687,35 @@ ORDER BY c.last_updated DESC, c.resource_id ASC;
 -- `value_token_code IS NOT NULL` alongside the system equality, which brings the
 -- recent-first `idx_search_token_code_recent` in as a second candidate.
 --
--- The two regimes to look for, and which index should win each:
---   broad system  (matches much of the parameter slice) -> idx_search_token_code_recent,
---                  streaming `last_updated DESC`, LIMIT stops it, ~22 rows out
---   narrow system (matches little)                      -> idx_search_token_system,
---                  exact seek, heap fetch per match, small Sort
--- Either is acceptable. What is NOT is a Sort over tens of thousands of rows,
--- which is what `idx_search_token` itself did here: its key is
--- (…, value_token_system, value_token_code, last_updated, resource_id), and a
--- `system|` predicate does not bind `value_token_code`, so the sort key was
--- never reachable for this shape. On a local replica that cost 1,074 buffers and
--- a 66,667-row top-N sort to return 22.
+-- v30 kept a seek-only `idx_search_token_system` for the narrow regime. v31
+-- DROPPED it: `system|code` is strict in `value_token_system` too, so nothing
+-- separated the two forms, and the planner pointed `system|code` at it —
+-- 5,334 scans reading 80,089,347 tuples on an index with no payload and no sort
+-- key, i.e. a heap fetch per row and a sort. AF2 below measures that plan at
+-- 808 ms with the planner estimating rows=210 against 67,692 actual.
+--
+-- So after v31 there is ONE candidate for `system|`, and it must be index-only:
+--   any system| -> idx_search_token_code_recent, streaming `last_updated DESC`,
+--                  filtering value_token_system out of its INCLUDE payload,
+--                  LIMIT stops it. Expect `Index Only Scan`, `Heap Fetches: 0`.
+-- The cost v31 accepts is that a system matching little or nothing walks its
+-- parameter's slice rather than seeking to an empty range — index-only, no heap,
+-- bounded by one (resource_type, param_name) slice. AF3 is that case.
+--
+-- What must NOT appear anywhere below is a Sort over tens of thousands of rows.
+-- That is what `idx_search_token` itself did for this shape before v30: its key
+-- was (…, value_token_system, value_token_code, last_updated, resource_id), and
+-- a `system|` predicate does not bind `value_token_code`, so the sort key was
+-- unreachable — 1,074 buffers and a 66,667-row top-N sort to return 22.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 \echo ''
 \echo '######## AF1. FAST PATH token Encounter?class=<v3-ActCode>| — BROAD system| ########'
 -- The system that most Encounter.class rows carry. Expect
--- idx_search_token_code_recent, no Sort, rows=22, double-digit buffers.
+-- `Index Only Scan using idx_search_token_code_recent`, `Heap Fetches: 0`, no
+-- Sort, rows=22, single-digit buffers. On run 33176893776 this was an `Index
+-- Scan` (28 buffers for 22 rows) because the index did not yet carry
+-- `value_token_system`; v31 added it to the payload.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        r.last_updated AS sort_key
@@ -709,12 +732,20 @@ ORDER BY c.last_updated DESC, c.resource_id ASC;
 
 \echo ''
 \echo '######## AF2. AF1 COUNTERFACTUAL — pre-v30 form, no IS NOT NULL conjunct ########'
--- The identical query without the conjunct v30 added, so the only candidate is
--- the seek-only index (`idx_search_token_code_recent` is partial on
--- `value_token_code IS NOT NULL`, which this form cannot prove). Expect a seek
--- followed by a heap fetch per matching row and a Sort — i.e. materially MORE
--- hit+read than AF1. If AF2 is not worse, the conjunct is buying nothing and can
--- be reverted.
+-- The identical query without the conjunct v30 added.
+-- `idx_search_token_code_recent` is partial on `value_token_code IS NOT NULL`,
+-- which this form cannot prove, so after v31 dropped `idx_search_token_system`
+-- there is NO index this predicate can use at all — the conjunct is the only
+-- thing that makes the `system|` form indexable.
+--
+-- On run 33176893776, when the seek-only index still existed, this printed
+-- `Index Scan using idx_search_token_system` -> 67,692 rows -> top-N Sort,
+-- 67,651 buffers, **808 ms**, with the planner estimating rows=210 against
+-- 67,692 actual — the 322x (system, code) independence under-estimate that made
+-- that index a hazard and got it dropped in v31.
+--
+-- Expect this to remain dramatically worse than AF1 whatever it picks. If AF2 is
+-- ever NOT worse, the conjunct is buying nothing and can be reverted.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        r.last_updated AS sort_key
@@ -730,9 +761,14 @@ ORDER BY c.last_updated DESC, c.resource_id ASC;
 
 \echo ''
 \echo '######## AF3. FAST PATH token Encounter?class=missing| — NARROW/zero-match system| ########'
--- The other regime. Expect idx_search_token_system, an exact seek, rows=0 and
--- single-digit buffers. This is the shape that justifies keeping a system-keyed
--- index at all instead of dropping one outright.
+-- The other regime, and the price v31 pays. v30 answered this with an exact seek
+-- on idx_search_token_system (4 buffers). That index is gone, so this now walks
+-- the whole `Encounter/class` slice — but INDEX-ONLY, out of
+-- idx_search_token_code_recent's payload, so it is bounded by one parameter
+-- slice with no random heap I/O, and it ends in a Sort of whatever it found.
+-- Expect `Index Only Scan`, `Heap Fetches: 0`, rows=0, and buffers on the order
+-- of the class slice's index pages. A NON-zero `Heap Fetches` here means the
+-- payload change did not take.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        r.last_updated AS sort_key
@@ -760,6 +796,14 @@ FROM pg_stat_user_indexes s
 WHERE s.relname = 'search_index'
   AND s.indexrelname LIKE 'idx_search_token%'
 ORDER BY pg_relation_size(s.indexrelid) DESC;
+
+-- TRAP 15: the live key columns, printed so the next round reads them from the
+-- catalog rather than from `create_indexes`. `idx_search_token_code_recent` must
+-- show `last_updated DESC, resource_id` as KEY columns and BOTH
+-- `value_token_code` and `value_token_system` in the INCLUDE.
+SELECT indexname, indexdef FROM pg_indexes
+WHERE tablename = 'search_index' AND indexname LIKE 'idx_search_token%'
+ORDER BY indexname;
 
 SELECT count(*) FILTER (WHERE value_token_code IS NOT NULL)   AS rows_with_a_code,
        count(*) FILTER (WHERE value_token_system IS NOT NULL) AS rows_with_a_system,
