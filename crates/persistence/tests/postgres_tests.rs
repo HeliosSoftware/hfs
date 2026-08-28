@@ -1445,6 +1445,130 @@ mod postgres_integration {
         }
     }
 
+    /// A tombstone's version comes from the row, not from an earlier read.
+    ///
+    /// `delete` used to `SELECT version_id`, add one in Rust, and
+    /// compare-and-swap. It now computes the increment inside the `UPDATE`'s
+    /// target list, so this pins the arithmetic that replaced the Rust: after
+    /// two updates the live row is v3 and the tombstone must be v4, with a
+    /// contiguous, duplicate-free version chain behind it.
+    #[tokio::test]
+    async fn postgres_integration_delete_tombstone_version_follows_the_row() {
+        use helios_persistence::core::VersionedStorage;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("delete-tombstone-version");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "active": true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.version_id(), "1");
+
+        let v2 = backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType": "Patient", "active": false}),
+            )
+            .await
+            .unwrap();
+        let v3 = backend
+            .update(
+                &tenant,
+                &v2,
+                json!({"resourceType": "Patient", "active": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v3.version_id(), "3");
+
+        backend.delete(&tenant, "Patient", created.id()).await.unwrap();
+
+        let mut versions = backend
+            .list_versions(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        versions.sort_by_key(|v| v.parse::<u64>().unwrap());
+        assert_eq!(
+            versions,
+            vec!["1", "2", "3", "4"],
+            "the tombstone must continue the chain at current + 1"
+        );
+    }
+
+    /// Concurrent writers on one row must never produce an internal error.
+    ///
+    /// This is the failure the removed compare-and-swap existed to prevent: a
+    /// version computed from a stale read colliding with one another writer had
+    /// already inserted, tripping `resource_history`'s
+    /// `PRIMARY KEY (tenant_id, resource_type, id, version_id)`. Deriving the
+    /// version inside the statement makes that unreachable, because PostgreSQL
+    /// re-evaluates the target list against the committed new tuple when it
+    /// unblocks. Every outcome here must therefore be a success or an ordinary
+    /// `NotFound`/`VersionConflict` — never a `Backend` error — and the surviving
+    /// history must have no duplicate versions.
+    #[tokio::test]
+    async fn postgres_integration_concurrent_update_and_delete_never_collide() {
+        use helios_persistence::core::VersionedStorage;
+        use std::sync::Arc;
+
+        let backend = Arc::new(create_backend().await);
+        let tenant = create_tenant("concurrent-update-delete");
+
+        for _ in 0..12 {
+            let created = backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "active": true}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            let id = created.id().to_string();
+
+            let (b1, b2, t1, t2, id1, id2) = (
+                backend.clone(),
+                backend.clone(),
+                tenant.clone(),
+                tenant.clone(),
+                id.clone(),
+                id.clone(),
+            );
+            let updater = tokio::spawn(async move {
+                b1.update(&t1, &created, json!({"resourceType": "Patient", "active": false}))
+                    .await
+                    .map(|_| ())
+            });
+            let deleter = tokio::spawn(async move { b2.delete(&t2, "Patient", &id1).await });
+
+            for outcome in [updater.await.unwrap(), deleter.await.unwrap()] {
+                match outcome {
+                    Ok(())
+                    | Err(StorageError::Resource(ResourceError::NotFound { .. }))
+                    | Err(StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })) => {}
+                    other => panic!("concurrent update/delete produced {:?}", other),
+                }
+            }
+
+            let versions = backend.list_versions(&tenant, "Patient", &id2).await.unwrap();
+            let mut unique = versions.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                versions.len(),
+                "duplicate history versions for {id2}: {versions:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn postgres_integration_delete_nonexistent_fails() {
         let backend = create_backend().await;
