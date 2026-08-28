@@ -1320,6 +1320,32 @@ mod fast_path_tests {
         );
     }
 
+    /// The string fast path is the statement v30 rewrote — 30% of the search
+    /// suite's Postgres time in run 33128380492 — so pin that its two-parameter
+    /// range form still matches `INDEX_MEMBERSHIP_PREFIX` exactly. If it stopped
+    /// matching, the page would silently fall back to the join-everything path
+    /// and the seek would be worth nothing.
+    #[test]
+    fn taken_for_the_v30_string_range_form() {
+        let q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "address".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "Springfield")],
+            chain: vec![],
+            components: vec![],
+        });
+        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
+        assert_eq!(
+            pred.as_deref(),
+            Some(
+                "param_name = 'address' AND \
+                 COALESCE(value_string_folded, lower(value_string)) ~>=~ $3 AND \
+                 COALESCE(value_string_folded, lower(value_string)) ~<~ $4"
+            )
+        );
+    }
+
     #[test]
     fn refused_on_a_legacy_layout() {
         // The decisive gate: legacy rows have no `last_updated`, so ordering by

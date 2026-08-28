@@ -42,22 +42,73 @@ fn like_escape(value: &str) -> String {
 /// `idx_search_string_folded_pattern` under `text_pattern_ops`, can.
 ///
 /// Must stay character-for-character identical to the index definition in
-/// `schema.rs::migrate_v23_to_v24`, or Postgres will not use the index.
+/// `schema.rs::migrate_v29_to_v30`, or Postgres will not use the index.
 ///
-/// Every predicate built from this expression is emitted with a leading
-/// `value_string IS NOT NULL` conjunct. `idx_search_string_folded_pattern` is
-/// partial on exactly that, and a partial index is only usable when the query
-/// *implies* its predicate — which `COALESCE(a, b) LIKE …` does not, COALESCE
-/// not being strict. Run 33029355759 measured the consequence: the pattern index
-/// had 0 scans while `idx_search_string_folded`, which can only supply the
-/// `(tenant_id, resource_type, param_name)` prefix and then filter, took 38,694
-/// scans for 142,058,567 tuples — 3,671 tuples read per query.
+/// ## Why the default (starts-with) form carries no `value_string IS NOT NULL`
 ///
-/// The conjunct loses no row. `writer.rs` sets `value_string_folded` only
-/// together with `value_string` (and the contained-row path sets `value_string`
-/// alone), so `COALESCE(value_string_folded, lower(value_string)) IS NOT NULL`
-/// and `value_string IS NOT NULL` select the same rows.
+/// v24 added that conjunct so the pattern index — then partial on
+/// `WHERE value_string IS NOT NULL` — could be *proved* usable, because
+/// `COALESCE(a, b) LIKE …` does not imply it (COALESCE is not strict). It did
+/// make the index legal. It also made it unreachable on cost, and v30 measured
+/// why: the conjunct is a second, independently-multiplied selectivity factor on
+/// a table where only 0.9% of rows have a string value, and `param_name` already
+/// determines that column. Postgres estimated the `(Patient, address)` slice at
+/// 25 rows instead of 5,000 and picked the physically smallest index that could
+/// supply the `(tenant, type, param)` prefix — `idx_search_string`, 50 MB —
+/// filtering the rest. See `schema.rs::migrate_v29_to_v30` for the plans.
+///
+/// v30 moves the reachability proof into the operator instead: `~>=~` is strict
+/// in the expression, so it implies the index's new
+/// `COALESCE(…) IS NOT NULL` predicate on its own, and the conjunct — with its
+/// wrong estimate — is gone. `:contains`/`:text` keep the conjunct deliberately:
+/// a leading `%` cannot seek, so for them the small index and its cheap slice
+/// scan is the better plan and this must not push them onto the wider one.
 const FOLDED_STRING_EXPR: &str = "COALESCE(value_string_folded, lower(value_string))";
+
+/// The exclusive upper bound of the byte-ordered range that holds exactly the
+/// strings beginning with `prefix`, or `None` when no such bound exists.
+///
+/// `~>=~`/`~<~` (the `text_pattern_ops` operators) compare bytewise, and UTF-8
+/// byte order is code-point order, so `prefix <= x < next(prefix)` selects
+/// exactly the values whose byte prefix — equivalently, whose character prefix,
+/// UTF-8 being self-synchronizing — is `prefix`. `next` is `prefix` with its
+/// last character replaced by the next code point.
+///
+/// This is the same construction `match_pattern_prefix` (`indxpath.c`) performs
+/// when it can see a `LIKE` pattern as a `Const`; doing it here is what makes
+/// the seek survive a *parameterized* pattern, which the planner cannot rewrite
+/// at all — see `migrate_v29_to_v30`.
+///
+/// Two cases have no bound and fall back to `LIKE`:
+/// - an empty prefix (every value matches, and there is nothing to increment);
+/// - a prefix that is entirely `char::MAX`, for which nothing sorts higher.
+///
+/// The UTF-16 surrogate block is skipped because it holds no scalar value: no
+/// text a Postgres UTF-8 database can store falls inside it, so widening the
+/// bound across it cannot admit a row.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        if let Some(next) = next_char(last) {
+            let mut bound: String = chars.into_iter().collect();
+            bound.push(next);
+            return Some(bound);
+        }
+        // `last` is `char::MAX`: nothing sorts after it in this position, so the
+        // increment has to carry into the preceding character.
+    }
+    None
+}
+
+/// The next Unicode scalar value after `c`, skipping the surrogate block.
+fn next_char(c: char) -> Option<char> {
+    let mut next = c as u32 + 1;
+    if next == 0xD800 {
+        next = 0xE000;
+    }
+    char::from_u32(next)
+}
+
 
 /// Builds the numeric comparison SQL for `col` against the implicit-precision
 /// range `[lo, hi)` per the FHIR prefix semantics, advancing `next` and
@@ -759,20 +810,36 @@ impl PostgresQueryBuilder {
         SqlFragment::new(sql)
     }
 
+    /// Builds the `id IN (…)` membership test for a `string` parameter.
+    ///
+    /// The three FHIR modifiers land on three different index shapes:
+    /// - default (starts-with) — a bytewise range on `FOLDED_STRING_EXPR`, which
+    ///   `idx_search_string_folded_pattern` seeks. Two bind parameters.
+    /// - `:contains`/`:text` — a substring `LIKE`, which nothing can seek; it
+    ///   keeps the `value_string IS NOT NULL` conjunct so it stays on the small
+    ///   `idx_search_string` slice scan instead of the wider pattern index.
+    /// - `:exact` — `value_string = $n` on the bare column, served by
+    ///   `idx_search_string`.
     fn build_string_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         let modifier = param.modifier.as_ref();
         let mut conditions = Vec::new();
+        // A value does not always cost exactly one bind parameter — the
+        // starts-with form binds a low and a high bound — so the placeholder
+        // number is carried rather than derived from the value's position.
+        let mut next = offset;
 
-        for (i, value) in param.values.iter().enumerate() {
-            let param_num = offset + i + 1;
+        for value in param.values.iter() {
             let condition = match modifier {
-                Some(SearchModifier::Exact) => SqlFragment::with_params(
-                    format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string = ${})",
-                        param.name, param_num
-                    ),
-                    vec![SqlParam::text(&value.value)],
-                ),
+                Some(SearchModifier::Exact) => {
+                    next += 1;
+                    SqlFragment::with_params(
+                        format!(
+                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string = ${})",
+                            param.name, next
+                        ),
+                        vec![SqlParam::text(&value.value)],
+                    )
+                }
                 // `:text` on a string is a case-insensitive partial match,
                 // implemented here as a substring match (same as `:contains`).
                 // Match the accent-folded column (falling back to the raw column
@@ -781,32 +848,62 @@ impl PostgresQueryBuilder {
                 // A leading `%` is not btree-sargable; this stays a scan unless the
                 // optional pg_trgm index is present. It is at least now scoped to
                 // one parameter's slice of the index rather than the whole table.
-                Some(SearchModifier::Contains | SearchModifier::Text) => SqlFragment::with_params(
-                    format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string IS NOT NULL AND {} LIKE ${} ESCAPE '\\')",
-                        param.name, FOLDED_STRING_EXPR, param_num
-                    ),
-                    vec![SqlParam::text(&format!(
-                        "%{}%",
-                        like_escape(&fold_text(&value.value))
-                    ))],
-                ),
-                _ => {
-                    // Default: starts-with (case- and accent-insensitive).
-                    //
-                    // `LIKE`, not `ILIKE`: `fold_text` already lowercases both the
-                    // stored column and the pattern, so `ILIKE` was doing no work
-                    // that `LIKE` doesn't — but it made the predicate unindexable.
+                Some(SearchModifier::Contains | SearchModifier::Text) => {
+                    next += 1;
                     SqlFragment::with_params(
                         format!(
                             "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string IS NOT NULL AND {} LIKE ${} ESCAPE '\\')",
-                            param.name, FOLDED_STRING_EXPR, param_num
+                            param.name, FOLDED_STRING_EXPR, next
                         ),
                         vec![SqlParam::text(&format!(
-                            "{}%",
+                            "%{}%",
                             like_escape(&fold_text(&value.value))
                         ))],
                     )
+                }
+                _ => {
+                    // Default: starts-with (case- and accent-insensitive).
+                    //
+                    // Emitted as an explicit bytewise range rather than
+                    // `LIKE 'prefix%'`. The two are exactly equivalent —
+                    // `like_escape` makes the pattern a pure literal prefix, and
+                    // `prefix_upper_bound` is the same bound Postgres derives
+                    // itself — but a range is sargable unconditionally, whereas
+                    // `LIKE` is only sargable when the planner can see the
+                    // pattern as a `Const`. It never can here: the pattern is a
+                    // bind parameter, and any generic plan turns the whole
+                    // predicate into `~~ like_escape($n, '\')`, a function call
+                    // on a parameter, from which no prefix can be extracted.
+                    let folded = fold_text(&value.value);
+                    match prefix_upper_bound(&folded) {
+                        Some(upper) => {
+                            let lo = next + 1;
+                            let hi = next + 2;
+                            next += 2;
+                            SqlFragment::with_params(
+                                format!(
+                                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {expr} ~>=~ ${lo} AND {expr} ~<~ ${hi})",
+                                    param.name,
+                                    expr = FOLDED_STRING_EXPR,
+                                ),
+                                vec![SqlParam::text(&folded), SqlParam::text(&upper)],
+                            )
+                        }
+                        // No upper bound exists: an empty search value (which
+                        // matches every indexed value) or an all-`char::MAX`
+                        // prefix. Fall back to the pre-v30 `LIKE` form, which
+                        // needs the explicit conjunct to reach a partial index.
+                        None => {
+                            next += 1;
+                            SqlFragment::with_params(
+                                format!(
+                                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string IS NOT NULL AND {} LIKE ${} ESCAPE '\\')",
+                                    param.name, FOLDED_STRING_EXPR, next
+                                ),
+                                vec![SqlParam::text(&format!("{}%", like_escape(&folded)))],
+                            )
+                        }
+                    }
                 }
             };
             conditions.push(condition);
@@ -2703,13 +2800,17 @@ mod tests {
     #[test]
     fn string_search_is_sargable_and_escapes_wildcards() {
         // `ILIKE` can never use a btree, and the raw `COALESCE(folded, value_string)`
-        // could not be matched by any index. The emitted predicate must be a `LIKE`
-        // against the exact expression the v14 index is built on.
+        // could not be matched by any index. v30 goes further than `LIKE`: the
+        // starts-with form is emitted as an explicit bytewise range, because a
+        // `LIKE` whose pattern is a bind parameter cannot be turned into an
+        // index range by the planner at all (`match_pattern_prefix` needs a
+        // `Const`). See `migrate_v29_to_v30`.
         let param = SearchParameter {
             name: "name".to_string(),
             param_type: SearchParamType::String,
             modifier: None,
-            // A literal '%' in the search value must not become a wildcard.
+            // A literal '%' in the search value is not a wildcard, and in the
+            // range form it never becomes one — there is no pattern to escape.
             values: vec![SearchValue::new(SearchPrefix::Eq, "50%Off")],
             chain: vec![],
             components: vec![],
@@ -2718,9 +2819,11 @@ mod tests {
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
 
         assert!(
-            frag.sql
-                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"),
-            "string search must LIKE against the indexed folded expression: {}",
+            frag.sql.contains(
+                "COALESCE(value_string_folded, lower(value_string)) ~>=~ $3 AND \
+                 COALESCE(value_string_folded, lower(value_string)) ~<~ $4"
+            ),
+            "starts-with must be a bytewise range on the indexed folded expression: {}",
             frag.sql
         );
         assert!(
@@ -2728,14 +2831,149 @@ mod tests {
             "ILIKE is not btree-sargable: {}",
             frag.sql
         );
-        match &frag.params[0] {
-            SqlParam::Text(p) => assert_eq!(
-                p, "50\\%off%",
-                "the value's own '%' must be escaped; only the trailing \
-                 starts-with wildcard is live"
+        let bounds: Vec<&str> = frag
+            .params
+            .iter()
+            .map(|p| match p {
+                SqlParam::Text(s) => s.as_str(),
+                other => panic!("expected a text bound, got {:?}", other),
+            })
+            .collect();
+        assert_eq!(
+            bounds,
+            vec!["50%off", "50%ofg"],
+            "the bounds are the folded value and its successor, and carry no              LIKE escaping because there is no pattern"
+        );
+    }
+
+    #[test]
+    fn prefix_upper_bound_covers_exactly_the_prefix() {
+        // ASCII: increment the last character.
+        assert_eq!(prefix_upper_bound("emilia").as_deref(), Some("emilib"));
+        assert_eq!(prefix_upper_bound("a").as_deref(), Some("b"));
+        // Multi-byte: the successor is the next code point, and UTF-8 byte order
+        // is code-point order, so `~<~` (bytewise) still bounds the prefix.
+        assert_eq!(prefix_upper_bound("caf\u{e9}").as_deref(), Some("caf\u{ea}"));
+        // The surrogate block holds no scalar value, so it is stepped over.
+        assert_eq!(
+            prefix_upper_bound("\u{d7ff}").as_deref(),
+            Some("\u{e000}")
+        );
+        // `char::MAX` has no successor: the increment carries left.
+        assert_eq!(
+            prefix_upper_bound("a\u{10ffff}").as_deref(),
+            Some("b")
+        );
+        // Nothing sorts above an all-`char::MAX` prefix, and an empty prefix
+        // matches everything. Both fall back to `LIKE`.
+        assert_eq!(prefix_upper_bound("\u{10ffff}"), None);
+        assert_eq!(prefix_upper_bound(""), None);
+    }
+
+    /// Every value the FHIR benchmark's `searchConfig.js` sends for a `string`
+    /// parameter must take the seeking path, not the `LIKE` fallback.
+    ///
+    /// Run 33179839720 left 24,865 calls on the `LIKE` statement, and the first
+    /// hypothesis was that `prefix_upper_bound` was returning `None` more often
+    /// than expected. It was not — the remainder is `:contains`, which the
+    /// script sends for half of every string request — but the question is
+    /// worth closing permanently rather than re-deriving.
+    #[test]
+    fn every_benchmark_search_term_gets_a_bound() {
+        // Verbatim from HealthSamurai/fhir-server-performance-benchmark,
+        // k6/searchConfig.js, the "string" block.
+        let terms = [
+            "NON-EXISTS",
+            "Emilia", "Carolynn", "Stefan", "Linh", "Harold",
+            "Pilar", "Ron", "Garfield", "Margaretta", "Giovanna",
+            "Dione", "Arron", "Lanny", "Harvey", "Beatriz",
+            "Donovan", "Reyes", "Santiago", "Kyong", "Curtis",
+            "Raynham", "Springfield", "Lowell", "Southwick", "Mashpee",
+            "Holbrook", "Falmouth", "Revere", "Sturbridge", "Blackstone",
+            "Westport", "Walpole", "Northampton", "Fall River", "Waltham",
+            "Acushnet Center", "Newton", "Winchester", "Maynard",
+            "ORLEANS MEDICAL CENTER, P.C.",
+            "ENCOMPASS HEALTH BRAINTREE HOSPITAL OF BRAINTREE",
+            "STEWARD HOLY FAMILY HOSPITAL INC",
+            "THE NORTHEAST HEALTH GROUP, INC",
+            "PLYMOUTH BAY INTERNAL MEDICINE",
+            "ART OF CARE INC",
+            "T MASSACHUSETTS, LLC",
+            "RIVERBEND OF SOUTH NATICK",
+            "NEW ENGLAND PROFESSIONAL HOME HEALTH CARE LLC",
+            "HDH CORPORATION",
+            // The script escapes `\ , $ |` before sending; if any survives to
+            // here it is still a literal prefix character, in the range exactly
+            // as it was in the `LIKE` pattern after `like_escape`.
+            "ORLEANS MEDICAL CENTER\\, P.C.",
+        ];
+        for term in terms {
+            let query =
+                SearchQuery::new("Patient").with_parameter(string_param("name", None, term));
+            let frag =
+                PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+            assert!(
+                frag.sql.contains("~>=~ $3 AND") && frag.sql.contains("~<~ $4)"),
+                "{:?} fell back to the LIKE form: {}",
+                term,
+                frag.sql
+            );
+            assert!(
+                !frag.sql.contains("IS NOT NULL"),
+                "{:?} kept the conjunct: {}",
+                term,
+                frag.sql
+            );
+        }
+    }
+
+    #[test]
+    fn empty_string_value_falls_back_to_the_like_form() {
+        // `name=` matches every indexed value; there is no prefix to bound, so
+        // the pre-v30 `LIKE '%'` form is emitted — and it needs the explicit
+        // conjunct to reach a partial index.
+        let query = SearchQuery::new("Patient").with_parameter(string_param("name", None, ""));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+
+        assert!(
+            frag.sql.contains(
+                "value_string IS NOT NULL AND \
+                 COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"
             ),
+            "{}",
+            frag.sql
+        );
+        match &frag.params[0] {
+            SqlParam::Text(p) => assert_eq!(p, "%"),
             other => panic!("expected a text param, got {:?}", other),
         }
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn multi_value_string_search_numbers_both_bounds_of_every_value() {
+        // The starts-with form binds two parameters per value, so a two-value
+        // OR-list must be numbered $3..$6 — not $3,$4 — or every later
+        // parameter in the query is bound to the wrong placeholder.
+        let param = SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Eq, "ann"),
+                SearchValue::new(SearchPrefix::Eq, "bob"),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Patient").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+
+        assert!(frag.sql.contains("~>=~ $3 AND"), "{}", frag.sql);
+        assert!(frag.sql.contains("~<~ $4)"), "{}", frag.sql);
+        assert!(frag.sql.contains("~>=~ $5 AND"), "{}", frag.sql);
+        assert!(frag.sql.contains("~<~ $6)"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 4);
     }
 
     /// Builds a string `SearchParameter` with an optional modifier.
@@ -2752,18 +2990,35 @@ mod tests {
 
     #[test]
     fn folded_string_search_implies_the_partial_index_predicate() {
-        // `idx_search_string_folded_pattern` is partial on `value_string IS NOT
-        // NULL`, and Postgres only uses a partial index when the query implies
-        // its predicate. `COALESCE(a, b) LIKE …` does not imply it — COALESCE is
-        // not strict — so without this conjunct the index is unreachable and the
-        // scan degrades to a filter over the whole parameter slice (measured:
-        // 0 scans on the pattern index, 3,671 tuples read per scan on the other
-        // one). See `migrate_v23_to_v24`.
-        for modifier in [
-            None,
-            Some(SearchModifier::Contains),
-            Some(SearchModifier::Text),
-        ] {
+        // `idx_search_string_folded_pattern` is partial, and Postgres only uses
+        // a partial index when the query implies its predicate.
+        //
+        // v24 got there with an explicit `value_string IS NOT NULL` conjunct,
+        // because `COALESCE(a, b) LIKE …` does not imply it (COALESCE is not
+        // strict). v30 rewords the index predicate onto the COALESCE itself and
+        // lets the strict operator do the proving — which also takes the
+        // conjunct, and the 200x row-estimate error it caused, out of the
+        // starts-with plan. See `migrate_v29_to_v30`.
+        let query =
+            SearchQuery::new("Patient").with_parameter(string_param("name", None, "Emilia"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+        assert!(
+            frag.sql.contains("COALESCE(value_string_folded, lower(value_string)) ~>=~ $3"),
+            "starts-with must prove the predicate through the strict operator: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("IS NOT NULL"),
+            "the conjunct is what made the planner estimate 25 rows for a \
+             5,000-row slice; it must not come back: {}",
+            frag.sql
+        );
+
+        // `:contains`/`:text` keep it. A leading `%` cannot seek either index,
+        // so dropping the conjunct would only move an unavoidable full-slice
+        // scan from the 50 MB `idx_search_string` onto the wide covering one —
+        // measured 1,709 -> 2,169 buffers.
+        for modifier in [Some(SearchModifier::Contains), Some(SearchModifier::Text)] {
             let query = SearchQuery::new("Patient").with_parameter(string_param(
                 "name",
                 modifier.clone(),
@@ -2776,7 +3031,7 @@ mod tests {
                     "value_string IS NOT NULL AND \
                      COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"
                 ),
-                "modifier {:?} must imply the partial index predicate: {}",
+                "modifier {:?} must keep the v24 form: {}",
                 modifier,
                 frag.sql
             );

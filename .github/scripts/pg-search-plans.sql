@@ -812,18 +812,45 @@ SELECT count(*) FILTER (WHERE value_token_code IS NOT NULL)   AS rows_with_a_cod
 FROM search_index;
 
 \echo ''
-\echo '######## AG. STRING Patient?name=Emilia — v24 form (implies the partial index predicate) ########'
--- `idx_search_string_folded_pattern` is partial on `value_string IS NOT NULL`
--- and had **0 scans** in run 33029355759, because `COALESCE(a, b) LIKE …` does
--- not imply that predicate (COALESCE is not strict). The whole load fell to
--- `idx_search_string_folded`, which is keyed on the bare column and so can only
--- supply the (tenant, type, param) prefix before filtering: 38,694 scans,
--- 142,058,567 tuples, 3,671 tuples read per query.
+\echo '######## AG. STRING Patient?name=Emilia — v33 form (bytewise prefix range) ########'
+-- v24 added a `value_string IS NOT NULL` conjunct so the partial pattern index
+-- could be proved usable. It was legal after that and still had **0 scans** in
+-- three consecutive runs, because the conjunct is also a selectivity factor,
+-- and the planner multiplies it in as if it were independent of `param_name`
+-- when `param_name` entirely determines it: the (Patient, address) slice was
+-- estimated at 1 row instead of 5,000, and on that estimate the 50 MB
+-- `idx_search_string` looked free.
 --
--- WHAT TO LOOK FOR: `Index Only Scan using idx_search_string_folded_pattern`
--- with an Index Cond containing `~>=~`/`~<~` (the text_pattern_ops range LIKE
--- rewrites into) rather than a Filter, and `Heap Fetches: 0` from the v24
--- INCLUDE (resource_id, last_updated).
+-- v33 drops the conjunct, rewords the index predicate onto the COALESCE so a
+-- strict operator proves it on its own, and emits the prefix as an explicit
+-- bytewise range (`~>=~`/`~<~`, the same bounds `match_pattern_prefix` derives
+-- — but derived in Rust, so they survive a bind parameter, which `LIKE` does
+-- not).
+--
+-- WHAT TO LOOK FOR: `idx_search_string_folded_pattern` with `~>=~`/`~<~` in the
+-- Index Cond and NO Filter / Rows Removed line, and tens of buffers rather than
+-- thousands. AH is the paired pre-v33 control — if AG and AH read the same
+-- number of buffers, v33 did nothing.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Patient'
+         AND param_name = 'name'
+         AND COALESCE(value_string_folded, lower(value_string)) ~>=~ 'emilia'
+         AND COALESCE(value_string_folded, lower(value_string)) ~<~ 'emilib'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Patient'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## AH. AG COUNTERFACTUAL — the pre-v33 form v33 replaced ########'
+-- The same page, asked the way the pre-v33 code asked it: the `value_string IS NOT NULL`
+-- conjunct plus a prefix `LIKE`. Same pass, same cache, so this is a true
+-- paired control for AG. Run 33128380492 measured this shape at
+-- `Rows Removed by Filter: 3520`, `Buffers: shared hit=2045 read=1073`, 35.5 ms.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        r.last_updated AS sort_key
@@ -838,33 +865,19 @@ WHERE r.is_deleted = FALSE
 ORDER BY c.last_updated DESC, c.resource_id ASC;
 
 \echo ''
-\echo '######## AH. AG COUNTERFACTUAL — pre-v24 form, no IS NOT NULL conjunct ########'
--- Identical query minus the one conjunct. Same pass, same cache, so this is a
--- true paired control: if AG and AH produce the same plan then the conjunct did
--- not unlock the pattern index and the string half of v24 is a no-op (it is
--- still not a regression — idx_search_string_folded is deliberately kept).
+\echo '######## AI. STRING Patient?address=Springfield — v33 form, larger slice ########'
+-- The 5,000-row slice. The pre-v33 form read 4,997 buffers here to return 22 rows
+-- (run 33128380492, 6.29 ms single-user); on a local table built to these
+-- proportions v33 reads 25. Expect `~>=~`/`~<~` in the Index Cond and no
+-- `Rows Removed by Filter`.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        r.last_updated AS sort_key
 FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
        WHERE tenant_id = 'default' AND resource_type = 'Patient'
-         AND param_name = 'name'
-         AND COALESCE(value_string_folded, lower(value_string)) LIKE 'emilia%' ESCAPE '\'
-       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
-JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Patient'
-                AND r.id = c.resource_id
-WHERE r.is_deleted = FALSE
-ORDER BY c.last_updated DESC, c.resource_id ASC;
-
-\echo ''
-\echo '######## AI. STRING Patient?address=Springfield — v24 form, larger slice ########'
-EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
-SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
-       r.last_updated AS sort_key
-FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
-       WHERE tenant_id = 'default' AND resource_type = 'Patient'
-         AND param_name = 'address' AND value_string IS NOT NULL
-         AND COALESCE(value_string_folded, lower(value_string)) LIKE 'springfield%' ESCAPE '\'
+         AND param_name = 'address'
+         AND COALESCE(value_string_folded, lower(value_string)) ~>=~ 'springfield'
+         AND COALESCE(value_string_folded, lower(value_string)) ~<~ 'springfiele'
        ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
 JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Patient'
                 AND r.id = c.resource_id
@@ -873,12 +886,19 @@ ORDER BY c.last_updated DESC, c.resource_id ASC;
 
 \echo ''
 \echo '######## AJ. STRING Patient?address:contains=Springfield — leading % is not sargable ########'
--- Half of the benchmark's string requests carry `:contains`, whose leading `%`
--- no btree can seek. The conjunct still helps: the pattern index is partial and
--- covering, so the unavoidable scan runs over ~250k entries index-only instead
--- of over the parameter slice of a 372 MB non-partial index with a heap fetch
--- per candidate. Expect a scan, not a seek — but check which index and whether
--- Heap Fetches is 0.
+-- Exactly half, and it is not an estimate: `k6/searchConfig.js` in the pinned
+-- benchmark repo declares `"modifiers": ["", ":contains"]` for all three string
+-- shapes and `search.js` picks one per request with `pickRand`. Run
+-- 33179839720: 50,112 string iterations, 25,056 expected `:contains`, 24,865
+-- observed. This shape therefore sets the whole `string` p99 no matter how fast
+-- the other half gets.
+--
+-- v33 deliberately leaves it on the v24 form, conjunct and all: dropping the
+-- conjunct here only moves an unavoidable full-slice scan off the 47 MB
+-- `idx_search_string` onto the wider one, 1,709 -> 2,169 buffers measured. A
+-- leading `%` cannot seek a btree; a trigram GIN is the only real answer and
+-- does not fit an 11 GB host against a 15.7 GB working set. Expect a scan, not
+-- a seek, and expect it on `idx_search_string`.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        r.last_updated AS sort_key
