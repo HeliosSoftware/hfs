@@ -886,9 +886,37 @@ impl PostgresQueryBuilder {
                     predicates.push(format!("value_token_code = ${}", next));
                     params.push(SqlParam::text(code));
                 } else if code.is_empty() {
-                    // system| - match any code in system
+                    // system| - match any code in system.
+                    //
+                    // `value_token_code IS NOT NULL` is a deliberate,
+                    // row-set-preserving conjunct, not a filter: it is what makes
+                    // the partial `idx_search_token_code_recent` (v21, `WHERE
+                    // value_token_code IS NOT NULL`) a legal candidate for this
+                    // shape, so a *broad* system streams recent-first and stops
+                    // at the LIMIT instead of heap-fetching and sorting its whole
+                    // match set. v30 measures 1074 buffers -> 26 for a 66,667-row
+                    // system, and it is the reason v30 could replace the 2,283 MB
+                    // `idx_search_token` with a seek-only index.
+                    //
+                    // As of v31 it is not merely helpful, it is LOAD-BEARING:
+                    // v31 dropped `idx_search_token_system` (the planner pointed
+                    // `system|code` at it — 80,089,347 tuples read, 358 ms p99),
+                    // so `idx_search_token_code_recent` is now the ONLY index a
+                    // `system|` predicate can reach. Remove this conjunct and the
+                    // form falls back to a sequential-scale scan of the
+                    // (tenant, type) slice.
+                    //
+                    // It excludes nothing. `IndexValue::Token` declares
+                    // `code: String`, and both writer paths set the column
+                    // unconditionally beside the system —
+                    // `IndexRow::from_extracted` and `CompositeRow::place` — so
+                    // no row this backend has ever written has a system without
+                    // a code. An empty code is a non-NULL empty string.
                     next += 1;
-                    predicates.push(format!("value_token_system = ${}", next));
+                    predicates.push(format!(
+                        "(value_token_code IS NOT NULL AND value_token_system = ${})",
+                        next
+                    ));
                     params.push(SqlParam::text(system));
                 } else {
                     // system|code - exact match
@@ -2914,6 +2942,78 @@ mod tests {
             .expect("a lone membership test is extractable");
         assert_eq!(pred, "param_name = 'status' AND (value_token_code = $3)");
         assert!(!pred.contains("value_token_system"));
+    }
+
+    /// v30 replaced `idx_search_token` (2,283 MB, system-first, and unable to
+    /// give this shape the sort key because `value_token_code` sat between the
+    /// system and `last_updated`) with a seek-only `idx_search_token_system`;
+    /// v31 dropped that too, because `system|code` is strict in
+    /// `value_token_system` as well and the planner pointed it there —
+    /// 80,089,347 tuples read for a 358 ms p99.
+    ///
+    /// So `idx_search_token_code_recent` is now the ONLY index the `system|`
+    /// form can reach, and the `value_token_code IS NOT NULL` conjunct below is
+    /// the only reason it can: that index is partial on exactly that predicate.
+    /// Drop the conjunct and this shape has no index at all; turn it into a
+    /// comparison against a code VALUE and the search becomes wrong.
+    #[test]
+    fn system_only_token_implies_the_code_partial_predicate() {
+        let param = SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "http://loinc.org|")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(
+            pred,
+            "param_name = 'code' AND ((value_token_code IS NOT NULL AND value_token_system = $3))"
+        );
+        assert_eq!(frag.params.len(), 1);
+        match &frag.params[0] {
+            SqlParam::Text(system) => assert_eq!(system, "http://loinc.org"),
+            other => panic!("expected one text param, got {:?}", other),
+        }
+    }
+
+    /// The `system|` conjunct is only row-set-preserving while every token row
+    /// that carries a system also carries a code. `IndexValue::Token` makes that
+    /// a type-level fact (`code: String`), but an OR-list mixing spellings must
+    /// still put each arm's conjunct inside its own parentheses, or `AND`
+    /// binding tighter than `OR` would be the only thing keeping the grouping
+    /// correct.
+    #[test]
+    fn mixed_token_or_list_keeps_each_arm_parenthesized() {
+        let param = SearchParameter {
+            name: "class".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Eq, "AMB"),
+                SearchValue::new(SearchPrefix::Eq, "http://terminology.hl7.org/CodeSystem/v3-ActCode|"),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token OR-list");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(
+            pred,
+            concat!(
+                "param_name = 'class' AND (value_token_code = $3 OR ",
+                "(value_token_code IS NOT NULL AND value_token_system = $4))"
+            )
+        );
+        assert_eq!(frag.params.len(), 2);
     }
 
     #[test]

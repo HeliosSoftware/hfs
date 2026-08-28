@@ -1024,6 +1024,42 @@ mod tests {
         }
     }
 
+    /// The load-bearing half of schema v30. `build_token_condition` emits
+    /// `value_token_code IS NOT NULL AND value_token_system = $n` for the
+    /// `system|` form, which is row-set-preserving only while no written row has
+    /// a system without a code — and v30 dropped the 2,283 MB `idx_search_token`
+    /// on the strength of that. `IndexValue::Token` makes it a type-level fact
+    /// (`code: String`, not `Option<String>`), and both writer paths carry it
+    /// through; this pins the behaviour so a later `Option` would fail here
+    /// rather than silently narrow every `system|` search.
+    #[test]
+    fn a_token_row_never_has_a_system_without_a_code() {
+        for code in ["8302-2", ""] {
+            let row = row_of(IndexValue::Token {
+                system: Some("http://loinc.org".to_string()),
+                code: code.to_string(),
+                display: None,
+                identifier_type_system: None,
+                identifier_type_code: None,
+            });
+            assert!(row.value_token_system.is_some());
+            assert!(
+                row.value_token_code.is_some(),
+                "a system-bearing row with a NULL code would make the v30 \
+                 `system|` predicate lose matches"
+            );
+        }
+
+        // The composite path is the other producer of these columns.
+        let composite = crate::backends::postgres::search::composite_rows::CompositeRow {
+            value_token_system: Some("http://loinc.org".to_string()),
+            value_token_code: Some("8480-6".to_string()),
+            ..Default::default()
+        };
+        let row = IndexRow::from_composite(&composite, None);
+        assert!(row.value_token_system.is_some() && row.value_token_code.is_some());
+    }
+
     #[test]
     fn each_value_kind_lands_in_its_own_columns() {
         let string = row_of(IndexValue::String("Smith".to_string()));
