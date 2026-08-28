@@ -2,10 +2,10 @@
 // its SQL decodes into the editor pane, and Run executes it over its
 // depends-on ViewDefinition through $sql-run.
 import { expect, test } from "../pages/fixtures";
-import { createResource } from "../pages/api";
+import { createResource, waitSearchable } from "../pages/api";
 
 test("a stored SQLQuery lists, decodes its SQL, and previews rows", async ({ page, request }) => {
-  await createResource(request, "Patient", { name: [{ family: "SqlLibE2E" }] });
+  const patientId = await createResource(request, "Patient", { name: [{ family: "SqlLibE2E" }] });
   const canonical = `http://example.org/ViewDefinition/e2e-lib-${Date.now()}`;
   await createResource(request, "ViewDefinition", {
     name: "e2e_lib_patients",
@@ -31,6 +31,11 @@ test("a stored SQLQuery lists, decodes its SQL, and previews rows", async ({ pag
       { contentType: "application/sql", data: Buffer.from(sql).toString("base64") },
     ],
   });
+
+  // ES composites index asynchronously: the rail, the depends-on
+  // resolution, and the run preview all read through search (#596).
+  await waitSearchable(request, "Library", libId);
+  await waitSearchable(request, "Patient", patientId);
 
   await page.goto(`/ui/sql/queries?lib=${libId}`);
   await expect(page.locator(`#lib-rail-list [data-type='${libId}']`)).toHaveAttribute(
