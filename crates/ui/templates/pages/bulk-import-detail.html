@@ -126,7 +126,7 @@
     {% endif %}
   </div>
   {% if manifests.is_empty() %}
-  <div class="empty-state bulk-import-manifest-empty">{{ i18n.t("bulk-import-no-manifests") }}</div>
+  <div class="empty-state" data-empty="manifests">{{ i18n.t("bulk-import-no-manifests") }}</div>
   {% else %}
   <ul class="bulk-import-manifest-list">
     {% for m in manifests %}

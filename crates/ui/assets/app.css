@@ -2577,11 +2577,6 @@ details.json-fold[open] > summary .icon {
   padding: 32px 12px;
 }
 
-/* The manifests card's empty state (#733): a tighter inset than the page
-   empty-state, and the tests' stable hook for "no manifests yet". */
-.bulk-import-manifest-empty {
-  padding: 20px 12px;
-}
 
 .data-table tbody tr:not(.data-table__empty):hover td,
 .data-table tbody tr[aria-selected="true"] td {

@@ -51,7 +51,7 @@ export class BulkImportPage {
   }
 
   get manifestEmptyState(): Locator {
-    return this.manifestsCard.locator(".bulk-import-manifest-empty");
+    return this.manifestsCard.locator("[data-empty=manifests]");
   }
 
   get logEmptyState(): Locator {
