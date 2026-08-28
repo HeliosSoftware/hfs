@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use helios_fhir::search::ABSTRACT_BASE_TYPES;
 use helios_fhirpath::EvaluationContext;
+use helios_fhirpath::parser::Expression as FhirPathExpression;
 use helios_fhirpath_support::EvaluationResult;
 use parking_lot::RwLock;
 use regex::Regex;
@@ -123,6 +124,83 @@ pub struct ContainedExtraction {
     pub values: Vec<ExtractedValue>,
 }
 
+/// A search-parameter expression with all of its per-`(expression,
+/// resource_type)` preparation already done.
+///
+/// Everything the extractor did to an expression before evaluating it is a pure
+/// function of the expression text and the resource type:
+///
+/// | step                                        | cost per call            |
+/// |---------------------------------------------|--------------------------|
+/// | `rewrite_choice_types`                      | 4 regex `replace_all`    |
+/// | `filter_expression_for_resource`            | split unions, `String` per member, join |
+/// | `helios_fhirpath::parse_expression`         | **build the chumsky parser**, then parse |
+/// | `resolve_target_types`                      | split the unions a second time |
+///
+/// None of it reads the resource and none of it reads the registry —
+/// `retained_parts`, `simplify_resolve_pattern`, `strip_abstract_base_prefix`
+/// and `resolve_target_type` are free functions of those two strings — yet all
+/// of it ran again for every resource written, once per active parameter:
+/// 32 parameters for a Patient, 47 for an Observation.
+///
+/// On the FHIR benchmark's import suite (1.63M resources across 1,000 Synthea
+/// transaction bundles) that is on the order of 50M chumsky parser
+/// constructions to obtain a few thousand distinct ASTs. Memoizing on exactly
+/// the two inputs the computation depends on makes a hit indistinguishable from
+/// recomputing it.
+///
+/// Parse *failures* are cached as well, so a malformed custom SearchParameter
+/// costs one parse for the process instead of one per resource; the
+/// per-resource warning it produces is unchanged.
+///
+/// Bounded by the number of distinct `(expression, resource_type)` pairs the
+/// registry can produce. A parameter is only ever prepared against a type in
+/// its own `base`, so for the 1,375-parameter R4 spec file the live set is a
+/// few thousand entries — the same order as the registry itself.
+struct PreparedExpression {
+    /// `filter_expression_for_resource(rewrite_choice_types(expression), rt)`.
+    /// Kept as text because it appears verbatim in `ExtractionError` messages.
+    filtered: String,
+    /// `filtered`, parsed — or the parse error, verbatim as
+    /// `helios_fhirpath::parse_expression` produced it. `None` when `filtered`
+    /// is empty and there is nothing to evaluate.
+    ast: Option<Result<Arc<FhirPathExpression>, String>>,
+    /// `resolve_target_types(rewritten, rt)` — the reference-target restriction.
+    /// Computed for every parameter and applied, as before, only to `reference`
+    /// ones; computing it eagerly costs one extra union split per cache miss.
+    target_types: Option<Vec<String>>,
+}
+
+/// A composite component's sub-expression, rewritten and parsed.
+///
+/// Component expressions evaluate relative to a base instance rather than the
+/// resource root, so they are never resource-type filtered.
+struct PreparedComponent {
+    rewritten: String,
+    ast: Result<Arc<FhirPathExpression>, String>,
+}
+
+/// Keyed resource type first, then expression, so a lookup borrows both keys
+/// as `&str` and a cache hit allocates nothing.
+type PreparedMap = HashMap<String, HashMap<String, Arc<PreparedExpression>>>;
+
+fn prepared_cache() -> &'static RwLock<PreparedMap> {
+    static CACHE: OnceLock<RwLock<PreparedMap>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn component_cache() -> &'static RwLock<HashMap<String, Arc<PreparedComponent>>> {
+    static CACHE: OnceLock<RwLock<HashMap<String, Arc<PreparedComponent>>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Parses `expr` into a shareable AST, keeping the exact error text
+/// `helios_fhirpath::parse_expression` produces so a cached failure reads
+/// identically to a fresh one.
+fn parse_prepared(expr: &str) -> Result<Arc<FhirPathExpression>, String> {
+    helios_fhirpath::parse_expression(expr).map(Arc::new)
+}
+
 /// Extracts searchable values from FHIR resources using FHIRPath.
 pub struct SearchParameterExtractor {
     registry: Arc<RwLock<SearchParameterRegistry>>,
@@ -161,6 +239,34 @@ impl SearchParameterExtractor {
             }
         }
 
+        // One conversion of this resource into the evaluator's own tree, shared
+        // by every parameter below. It used to live inside `evaluate_fhirpath`,
+        // i.e. it was redone from scratch for each of the ~32 (Patient) to ~47
+        // (Observation) active parameters — making the deep copy of the
+        // resource, not the FHIRPath evaluation, the dominant cost of indexing
+        // it. See the `PreparedExpression` note for the arithmetic.
+        //
+        // A conversion failure used to surface once per parameter, get logged
+        // and skipped, and leave `extract` returning an empty vector. It still
+        // returns an empty vector, with one warning instead of N. (In practice
+        // it cannot fail: the only fallible arm is a `serde_json` number that is
+        // neither `i64` nor `f64`, which the parser cannot produce.)
+        let context = match Self::evaluation_context(resource) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to convert {} into an evaluation tree for indexing: {}",
+                    resource_type,
+                    e
+                );
+                return Ok(Vec::new());
+            }
+        };
+
+        // Base instances for composite parameters, memoized per resource by
+        // base expression. See `extract_composite`.
+        let mut composite_bases: HashMap<String, Vec<EvaluationContext>> = HashMap::new();
+
         let mut results = Vec::new();
 
         // Get active parameters for this resource type
@@ -170,7 +276,7 @@ impl SearchParameterExtractor {
         };
 
         for param in &params {
-            match self.extract_for_param(resource, param) {
+            match self.extract_for_param_in(resource, &context, &mut composite_bases, param) {
                 Ok(values) => results.extend(values),
                 Err(e) => {
                     // Log the error but continue with other parameters
@@ -199,7 +305,7 @@ impl SearchParameterExtractor {
                 if !seen.insert(param.code.clone()) {
                     continue;
                 }
-                match self.extract_for_param(resource, param) {
+                match self.extract_for_param_in(resource, &context, &mut composite_bases, param) {
                     Ok(values) => results.extend(values),
                     Err(e) => {
                         tracing::warn!(
@@ -256,9 +362,29 @@ impl SearchParameterExtractor {
     }
 
     /// Extracts values for a specific parameter from a resource.
+    ///
+    /// Builds a one-off evaluation context for `resource`. Callers indexing a
+    /// whole resource should go through [`Self::extract`], which builds one
+    /// context and reuses it across every parameter.
     pub fn extract_for_param(
         &self,
         resource: &Value,
+        param: &SearchParameterDefinition,
+    ) -> Result<Vec<ExtractedValue>, ExtractionError> {
+        let context = Self::evaluation_context(resource)?;
+        let mut composite_bases = HashMap::new();
+        self.extract_for_param_in(resource, &context, &mut composite_bases, param)
+    }
+
+    /// Extracts values for one parameter against an already-built context.
+    ///
+    /// `context` must have `resource` as its `this`; `resource` itself is still
+    /// read for the `resourceType` the expression is filtered against.
+    fn extract_for_param_in(
+        &self,
+        resource: &Value,
+        context: &EvaluationContext,
+        composite_bases: &mut HashMap<String, Vec<EvaluationContext>>,
         param: &SearchParameterDefinition,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
         if NON_INDEXABLE_PARAM_CODES.contains(&param.code.as_str()) {
@@ -268,7 +394,7 @@ impl SearchParameterExtractor {
         // Composite parameters are indexed component-by-component, with all the
         // components of one composite instance sharing a `composite_group`.
         if matches!(param.param_type, SearchParamType::Composite) {
-            return self.extract_composite(resource, param);
+            return self.extract_composite(resource, context, composite_bases, param);
         }
 
         if param.expression.is_empty() {
@@ -281,17 +407,19 @@ impl SearchParameterExtractor {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Rewrite choice-type casts (`value as Quantity` → `valueQuantity`) so they
-        // resolve against schema-less JSON, then filter to this resource type.
-        let rewritten = rewrite_choice_types(&param.expression);
-        let filtered_expr = self.filter_expression_for_resource(&rewritten, resource_type);
-
-        if filtered_expr.is_empty() {
+        // Choice-type rewriting, union filtering, parsing, and the reference
+        // target restriction are all pure functions of
+        // (`param.expression`, `resource_type`) and are done once per pair.
+        let prepared = self.prepared(&param.expression, resource_type);
+        let Some(ast) = prepared.ast.as_ref() else {
             return Ok(Vec::new());
-        }
+        };
+        let ast = ast.as_ref().map_err(|e| ExtractionError::FhirPathError {
+            expression: prepared.filtered.clone(),
+            message: e.clone(),
+        })?;
 
-        // Evaluate the filtered FHIRPath expression using the actual evaluator
-        let values = self.evaluate_fhirpath(resource, &filtered_expr)?;
+        let values = Self::evaluate_prepared(context, ast, &prepared.filtered)?;
 
         let mut results = Vec::new();
         for value in values {
@@ -309,9 +437,9 @@ impl SearchParameterExtractor {
         // Re-apply the target-type restriction that `simplify_resolve_pattern`
         // had to strip from the expression. See [`Self::resolve_target_types`].
         if matches!(param.param_type, SearchParamType::Reference)
-            && let Some(allowed) = self.resolve_target_types(&rewritten, resource_type)
+            && let Some(allowed) = prepared.target_types.as_deref()
         {
-            Self::restrict_reference_targets(&mut results, &allowed);
+            Self::restrict_reference_targets(&mut results, allowed);
         }
 
         Ok(results)
@@ -328,6 +456,8 @@ impl SearchParameterExtractor {
     fn extract_composite(
         &self,
         resource: &Value,
+        context: &EvaluationContext,
+        composite_bases: &mut HashMap<String, Vec<EvaluationContext>>,
         param: &SearchParameterDefinition,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
         let components = match &param.component {
@@ -340,11 +470,16 @@ impl SearchParameterExtractor {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let rewritten_base = rewrite_choice_types(&param.expression);
-        let base_expr = self.filter_expression_for_resource(&rewritten_base, resource_type);
-        if base_expr.is_empty() {
+        let prepared_base = self.prepared(&param.expression, resource_type);
+        let Some(base_ast) = prepared_base.ast.as_ref() else {
             return Ok(Vec::new());
-        }
+        };
+        let base_ast = base_ast
+            .as_ref()
+            .map_err(|e| ExtractionError::FhirPathError {
+                expression: prepared_base.filtered.clone(),
+                message: e.clone(),
+            })?;
 
         // Resolve each component's value type from the registry (by definition URL).
         let component_types: Vec<Option<SearchParamType>> = {
@@ -389,11 +524,44 @@ impl SearchParameterExtractor {
             .count()
             .min(u8::MAX as usize) as u8;
 
-        // Each base instance becomes a composite group.
-        let base_nodes = self.evaluate_fhirpath(resource, &base_expr)?;
+        // Each base instance becomes a composite group, and each gets its own
+        // evaluation context because the component sub-expressions are relative
+        // to it.
+        //
+        // Both halves of that are memoized per resource by base expression,
+        // because several composites routinely share one. Observation — 42% of
+        // the resources in the benchmark's Synthea corpus — carries eight
+        // composite parameters over just three distinct bases:
+        //
+        //   Observation                            code-value-{concept,date,quantity,string}
+        //   Observation | Observation.component    combo-code-value-{concept,quantity}
+        //   Observation.component                  component-code-value-{concept,quantity}
+        //
+        // Six of those eight have a base that selects the resource itself, so
+        // each one used to evaluate the base (which clones the whole evaluation
+        // tree), rebuild the whole resource as JSON via
+        // `evaluation_result_to_json_values`, and then convert that JSON back
+        // into a tree — three full deep copies of the resource, eight times
+        // over, to obtain three distinct answers.
+        //
+        // The contexts are built eagerly for every base instance rather than on
+        // first use by a component. Every composite in the R4 spec has at least
+        // one resolvable component, so nothing is built that is not used; the
+        // only behavioural edge is that a conversion failure on a node whose
+        // components are all unindexable would now surface. That conversion is
+        // infallible in practice (see `extract`).
+        if !composite_bases.contains_key(&prepared_base.filtered) {
+            let nodes = Self::evaluate_prepared(context, base_ast, &prepared_base.filtered)?;
+            let mut contexts = Vec::with_capacity(nodes.len());
+            for node in &nodes {
+                contexts.push(Self::evaluation_context(node)?);
+            }
+            composite_bases.insert(prepared_base.filtered.clone(), contexts);
+        }
+        let base_contexts = &composite_bases[&prepared_base.filtered];
 
         let mut results = Vec::new();
-        for (group_idx, node) in base_nodes.iter().enumerate() {
+        for (group_idx, node_context) in base_contexts.iter().enumerate() {
             let group = group_idx as u32;
             for ((component, sub_type), slot) in components
                 .iter()
@@ -407,8 +575,15 @@ impl SearchParameterExtractor {
                 if component.expression.is_empty() {
                     continue;
                 }
-                let comp_expr = rewrite_choice_types(&component.expression);
-                let values = self.evaluate_fhirpath(node, &comp_expr)?;
+                let comp = self.prepared_component(&component.expression);
+                let comp_ast = comp
+                    .ast
+                    .as_ref()
+                    .map_err(|e| ExtractionError::FhirPathError {
+                        expression: comp.rewritten.clone(),
+                        message: e.clone(),
+                    })?;
+                let values = Self::evaluate_prepared(node_context, comp_ast, &comp.rewritten)?;
                 for value in values {
                     let converted = ValueConverter::convert(&value, sub_type, &param.code)?;
                     for idx_value in converted {
@@ -556,29 +731,116 @@ impl SearchParameterExtractor {
         });
     }
 
-    /// Evaluates a FHIRPath expression against a resource using the helios-fhirpath evaluator.
+    /// The evaluation context for one resource: the resource converted into the
+    /// evaluator's `EvaluationResult` tree, installed as `this`.
+    ///
+    /// This conversion is a full recursive copy of the resource — every string
+    /// cloned, every JSON object rebuilt as a `HashMap` — so it is the single
+    /// most expensive thing indexing does per resource, and the whole point of
+    /// hoisting it is that one is enough for all of a resource's parameters.
+    fn evaluation_context(resource: &Value) -> Result<EvaluationContext, ExtractionError> {
+        let mut context = EvaluationContext::new_empty_with_default_version();
+        context.set_this(json_to_evaluation_result(resource)?);
+        Ok(context)
+    }
+
+    /// Evaluates an already-parsed expression against an already-built context.
+    ///
+    /// The error text is assembled exactly as
+    /// `helios_fhirpath::evaluate_expression` assembled it, so
+    /// `ExtractionError::FhirPathError` messages are unchanged by the split into
+    /// parse-once / evaluate-many.
+    fn evaluate_prepared(
+        context: &EvaluationContext,
+        ast: &FhirPathExpression,
+        expression: &str,
+    ) -> Result<Vec<Value>, ExtractionError> {
+        let result = helios_fhirpath::evaluator::evaluate(ast, context, None).map_err(|e| {
+            ExtractionError::FhirPathError {
+                expression: expression.to_string(),
+                message: format!(
+                    "Failed to evaluate FHIRPath expression '{}': {}",
+                    expression, e
+                ),
+            }
+        })?;
+
+        evaluation_result_to_json_values(&result)
+    }
+
+    /// Evaluates a FHIRPath expression against a resource using the
+    /// helios-fhirpath evaluator, building a context and parsing the expression
+    /// from scratch.
+    ///
+    /// Test-only: the indexing path goes through [`Self::prepared`] and
+    /// [`Self::evaluate_prepared`] so that neither the parse nor the tree
+    /// conversion is repeated per resource. The tests below still want to
+    /// evaluate a one-off expression against a one-off resource.
+    #[cfg(test)]
     fn evaluate_fhirpath(
         &self,
         resource: &Value,
         expression: &str,
     ) -> Result<Vec<Value>, ExtractionError> {
-        // Convert JSON to EvaluationResult and set up context
-        let eval_result = json_to_evaluation_result(resource)?;
-
-        // Create evaluation context with the resource as 'this'
-        let mut context = EvaluationContext::new_empty_with_default_version();
-        context.set_this(eval_result);
-
-        // Evaluate the FHIRPath expression
-        let result = helios_fhirpath::evaluate_expression(expression, &context).map_err(|e| {
-            ExtractionError::FhirPathError {
-                expression: expression.to_string(),
-                message: e,
-            }
+        let context = Self::evaluation_context(resource)?;
+        let ast = parse_prepared(expression).map_err(|e| ExtractionError::FhirPathError {
+            expression: expression.to_string(),
+            message: e,
         })?;
+        Self::evaluate_prepared(&context, &ast, expression)
+    }
 
-        // Convert EvaluationResult back to JSON values
-        evaluation_result_to_json_values(&result)
+    /// The memoized preparation of `expression` for `resource_type`.
+    ///
+    /// See the [`PreparedExpression`] note for why this is sound and why it
+    /// matters.
+    fn prepared(&self, expression: &str, resource_type: &str) -> Arc<PreparedExpression> {
+        if let Some(hit) = prepared_cache()
+            .read()
+            .get(resource_type)
+            .and_then(|by_expr| by_expr.get(expression))
+        {
+            return Arc::clone(hit);
+        }
+
+        // Rewrite choice-type casts (`value as Quantity` -> `valueQuantity`) so
+        // they resolve against schema-less JSON, then filter to this resource
+        // type, then parse.
+        let rewritten = rewrite_choice_types(expression);
+        let filtered = self.filter_expression_for_resource(&rewritten, resource_type);
+        let ast = (!filtered.is_empty()).then(|| parse_prepared(&filtered));
+        let target_types = self.resolve_target_types(&rewritten, resource_type);
+
+        let entry = Arc::new(PreparedExpression {
+            filtered,
+            ast,
+            target_types,
+        });
+        prepared_cache()
+            .write()
+            .entry(resource_type.to_string())
+            .or_default()
+            .insert(expression.to_string(), Arc::clone(&entry));
+        entry
+    }
+
+    /// The memoized preparation of a composite component's sub-expression.
+    ///
+    /// Component expressions are evaluated relative to a base instance, not to
+    /// the resource root, so they are rewritten but never resource-type
+    /// filtered — hence a cache keyed by the expression alone.
+    fn prepared_component(&self, expression: &str) -> Arc<PreparedComponent> {
+        if let Some(hit) = component_cache().read().get(expression) {
+            return Arc::clone(hit);
+        }
+
+        let rewritten = rewrite_choice_types(expression);
+        let ast = parse_prepared(&rewritten);
+        let entry = Arc::new(PreparedComponent { rewritten, ast });
+        component_cache()
+            .write()
+            .insert(expression.to_string(), Arc::clone(&entry));
+        entry
     }
 }
 
