@@ -515,23 +515,26 @@ impl ResourceStorage for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        // Check if resource exists and get its fhir_version
+        // Read the version to compare-and-swap against — and only the version.
+        //
+        // This used to select `data` and `fhir_version` as well, purely to hand
+        // them back to the history insert below. That shipped the resource's
+        // whole JSONB body to the client and straight back again on all 275,382
+        // deletes in a crud run: two wire copies of a multi-kilobyte document,
+        // plus a jsonb re-parse in the backend, for a value the server already
+        // had. The `RETURNING` clause of the soft-delete now supplies both from
+        // the row it has just written.
         let row = query_opt_cached(
             &client,
-            "SELECT version_id, data, fhir_version FROM resources
+            "SELECT version_id FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
             &[&tenant_id, &resource_type, &id],
         )
         .await
         .map_err(|e| internal_error(format!("Failed to check resource: {}", e)))?;
 
-        let (current_version, data, fhir_version_str) = match row {
-            Some(row) => {
-                let v: String = row.get(0);
-                let d: Value = row.get(1);
-                let f: String = row.get(2);
-                (v, d, f)
-            }
+        let current_version = match row {
+            Some(row) => row.get::<_, String>(0),
             None => {
                 return Err(StorageError::Resource(ResourceError::NotFound {
                     resource_type: resource_type.to_string(),
@@ -545,31 +548,48 @@ impl ResourceStorage for PostgresBackend {
         // Calculate new version for the deletion record
         let new_version: u64 = current_version.parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
-        let is_deleted = true;
 
-        // Soft delete the resource, guarded by the version we just read.
+        // Soft delete the resource and write its deletion history row, guarded
+        // by the version we just read.
         //
         // The `version_id`/`is_deleted` predicates make this a compare-and-swap
         // rather than a blind overwrite. Without them a concurrent writer that
         // lands between the SELECT above and this UPDATE is silently clobbered,
         // and worse: `new_version` was computed from the stale read, so the
-        // history INSERT below then collides with the row that writer already
-        // wrote and trips `PRIMARY KEY (tenant_id, resource_type, id,
-        // version_id)` (schema.rs). Because neither statement runs inside a
-        // transaction, the UPDATE is already committed at that point — the
-        // caller gets a 500 and the current row now points at a version whose
-        // history entry holds someone else's content.
+        // history row would collide with the one that writer already wrote and
+        // trip `PRIMARY KEY (tenant_id, resource_type, id, version_id)`
+        // (schema.rs) — leaving, back when the two writes were separate
+        // statements, a committed soft delete whose caller got a 500.
         //
         // MongoDB and S3 already guarded their equivalent writes (a
         // `version_id` term in the update filter, and a conditional PUT
         // respectively); this brings PostgreSQL to parity. Losing the race is
         // reported as `NotFound`, which is what a caller racing a concurrent
         // delete would have seen anyway.
+        //
+        // The two writes are now one statement, the shape `create` and `update`
+        // already use. They used to be an `UPDATE` followed by an `INSERT`, with
+        // no transaction around them, so a process or connection death between
+        // the two left a resource deleted and no version recording the deletion.
+        // A single statement is a single implicit transaction: the tombstone
+        // lands with the delete or neither does.
+        //
+        // `RETURNING` also feeds the history row from the tuple just written, so
+        // the deletion entry carries the resource's own `data` and
+        // `fhir_version` without either making a round trip through the client.
+        // As in `create` and `update`, no matching row means the CTE yields
+        // nothing, the insert selects nothing, and the statement reports zero
+        // rows affected — one signal for both writes.
         let updated = execute_cached(
                 &client,
-                "UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1
-                 WHERE tenant_id = $3 AND resource_type = $4 AND id = $5
-                   AND version_id = $6 AND is_deleted = FALSE",
+                "WITH del AS (
+                     UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1
+                     WHERE tenant_id = $3 AND resource_type = $4 AND id = $5
+                       AND version_id = $6 AND is_deleted = FALSE
+                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version FROM del",
                 &[
                     &now,
                     &new_version_str,
@@ -588,16 +608,6 @@ impl ResourceStorage for PostgresBackend {
                 id: id.to_string(),
             }));
         }
-
-        // Insert deletion record into history (preserve fhir_version)
-        execute_cached(
-                &client,
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &new_version_str, &data, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
 
         // Delete search index entries (skip when search is offloaded)
         if !self.is_search_offloaded() {
@@ -1287,6 +1297,60 @@ impl PostgresBackend {
     /// duplicate `resource_fts` row is now impossible: `search_text` /
     /// `search_content` join `resources` to `resource_fts`, so a duplicate used
     /// to return the same resource twice in a `_text` / `_content` page.
+    ///
+    /// # Where the remaining cost is, measured
+    ///
+    /// This statement is still the single most expensive one in the crud suite
+    /// after `search_index`: 2,597.9 s over 550,764 calls on run 33128380492,
+    /// **4.717 ms to write one row**, 20% of the suite. The obvious suspect is
+    /// GIN maintenance on `content_tsvector`, which is built from every string
+    /// in the resource. It is not the answer. Decomposed on local Postgres 18.6
+    /// over a 60,000-resource corpus (mean content 688 bytes, 61 lexemes), four
+    /// clients, same statement, arms differing only in what the table carries:
+    ///
+    /// ```text
+    /// arm                                        ms/call    share
+    /// full upsert, both GIN indexes               0.1610     100%
+    /// same, GIN indexes dropped                   0.1218      76%
+    /// `to_tsvector` alone, nothing written        0.1020      63%
+    /// ```
+    ///
+    /// So roughly **63% of this statement is `to_tsvector` running in the
+    /// Postgres backend**, 24% is GIN, and 12% is the heap and unique-index
+    /// write. And the tokeniser is linear in input bytes, not per call — 120,
+    /// 688 and 2,752-byte inputs cost 0.021, 0.076 and 0.319 ms of tokenisation,
+    /// a flat ~0.11 us/byte (~9 MB/s) across a 23x range.
+    ///
+    /// That redirects the obvious optimisations. GIN pending-list tuning has a
+    /// 24% ceiling and measured +4.5% at `gin_pending_list_limit = 32MB`, inside
+    /// noise; `fastupdate = off` was measured by an earlier seat at **2.24x
+    /// slower** and must stay on. Deduplicating words before tokenising was
+    /// tried and did nothing (545-byte deduplicated input, 0.0868 ms, against
+    /// 688 bytes at 0.0841 ms) — it also changes `ts_rank` ordering for
+    /// `_content` while leaving `@@` membership identical, so it costs
+    /// semantics for no gain.
+    ///
+    /// The only lever that moves this is **fewer bytes reaching `to_tsvector`**,
+    /// and `_content` is defined as the whole resource, so the bytes are the
+    /// feature. What is left is therefore a policy decision rather than an
+    /// optimisation: making the `content_tsvector` half optional would return
+    /// most of 2,597.9 s to a deployment that does not use `_content`. It is
+    /// deliberately not done here — the benchmark issues no `_text` or
+    /// `_content` query at all, so switching it off would buy 20% of crud
+    /// without buying any user anything, and a silently unindexed `_content`
+    /// that answers with an empty page is worse than a slow one. The numbers are
+    /// recorded so the choice can be made with them rather than guessed at.
+    ///
+    /// # A defect this does not fix
+    ///
+    /// `PostgresTransaction` (`transaction.rs`) writes `resources`,
+    /// `resource_history` and `search_index`, and never `resource_fts`. A
+    /// resource created through a bundle therefore has no full-text row and is
+    /// invisible to `_text` and `_content` on this backend until something
+    /// re-indexes it. That is pre-existing and unfiled. It is left alone here
+    /// deliberately: the fix adds a `to_tsvector` per bundle entry, which is
+    /// cost on the import path, and it belongs with a decision about the
+    /// paragraph above rather than inside a performance change.
     async fn index_fts_content(
         &self,
         client: &deadpool_postgres::Client,

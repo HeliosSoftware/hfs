@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 29;
+pub const SCHEMA_VERSION: i32 = 30;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -349,6 +349,7 @@ async fn migrate_schema(
             26 => migrate_v26_to_v27(client).await?,
             27 => migrate_v27_to_v28(client).await?,
             28 => migrate_v28_to_v29(client).await?,
+            29 => migrate_v29_to_v30(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1963,6 +1964,185 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v28->v29 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v29 -> v30: stop maintaining three indexes nothing reads, and compress the
+/// two JSONB columns with LZ4 instead of PGLZ.
+///
+/// Every council round so far has attacked `search_index`. This one attacks the
+/// other 62% of the crud suite. On run 33128380492 the `resources` /
+/// `resource_history` group cost 4,773.5 s of the suite's 12,856 s of Postgres
+/// execution time:
+///
+/// ```text
+/// exec_s   calls    mean_ms   statement
+/// 1664.9   275382     6.046   WITH ins AS (INSERT INTO resources … ) INSERT INTO resource_history …
+/// 1437.4   259914     5.530   WITH upd AS (UPDATE  resources … ) INSERT INTO resource_history …
+///  963.5   275382     3.499   UPDATE resources SET is_deleted = …, deleted_at = …
+///  707.7   275382     2.570   INSERT INTO resource_history (…)
+/// ```
+///
+/// Those four statements write 810,678 `resources` tuples and 810,678
+/// `resource_history` tuples in a 302-second run. Postgres executes 12,856 s of
+/// work in that window — roughly 43x concurrency against a 4-CPU container — so
+/// the database is saturated and work removed converts close to linearly into
+/// throughput. Both halves of this migration remove work from the tuple-write
+/// path itself, which is the part of those statements no query plan can avoid.
+///
+/// ## Three indexes that cannot serve a query
+///
+/// Tracing the whole chain forward rather than reading `create_indexes` — v1
+/// builds two on each table, v7 adds `idx_resources_fhir_version`, v15 adds the
+/// partial `idx_resources_search`, and nothing before this migration drops any
+/// of them — a `resources` write maintains **five** indexes and a
+/// `resource_history` write **three**. Three of those eight can never be chosen
+/// over an index that is already there:
+///
+/// | index | why it is dead |
+/// |---|---|
+/// | `idx_resources_type (tenant_id, resource_type)` | a strict **prefix** of `resources_pkey (tenant_id, resource_type, id)` |
+/// | `idx_history_resource (tenant_id, resource_type, id)` | a strict **prefix** of `resource_history_pkey (tenant_id, resource_type, id, version_id)` |
+/// | `idx_resources_fhir_version (tenant_id, fhir_version)` | no statement in the workspace filters, joins, groups or orders by `fhir_version` |
+///
+/// A prefix index answers no predicate its table's primary key does not already
+/// answer, in the same order, with the same leading columns — and in
+/// `idx_resources_type`'s case v15's `idx_resources_search` leads with the same
+/// two columns as well. The `fhir_version` index is a stronger case still:
+/// `grep` over every `.rs` and `.sql` file in `crates/` finds `fhir_version`
+/// only ever *selected*, never constrained. It has been maintained on every
+/// write since schema v7 and never once been read.
+///
+/// That takes `resources` from five indexes to three and `resource_history` from
+/// three to two — 810,678 fewer index-entry insertions on each table per crud
+/// run, 1.6M in total, plus the heap and WAL those entries occupy. Note the
+/// soft-delete `UPDATE` is not a HOT update and never can be, because it moves
+/// `last_updated`, which `idx_resources_updated` indexes; it therefore touches
+/// *every* index on the table, so removing two of its five is a direct cut to
+/// its index work.
+///
+/// The two remaining `resources` indexes are both load-bearing and stay:
+/// `idx_resources_updated` serves a `_lastUpdated` search with no resource type
+/// bound, which v15's type-leading index cannot, and `idx_resources_search`
+/// serves every type-scoped search's `ORDER BY last_updated DESC, id ASC`.
+///
+/// What is given up is small and named: a `SELECT COUNT(*) … WHERE tenant_id = $1
+/// AND resource_type = $2` that used to index-only-scan the narrow
+/// `idx_resources_type` now scans `resources_pkey`, which carries the `id`
+/// column as well and is therefore a few times wider per entry. That is a scan
+/// over a warm b-tree on the `_total=accurate` path, traded against 1.6M writes.
+///
+/// Dropping `idx_resources_type` also removes a live planner footgun. The
+/// backend runs prepared statements, so `read`, `update` and `delete` execute
+/// under a **generic** plan, and their predicate is
+/// `tenant_id = $1 AND resource_type = $2 AND id = $3`. With this index present
+/// the planner has two candidates that both cost out at `rows=1`, and in a
+/// tenant dominated by one resource type it picks the prefix index and filters
+/// on `id`. That was reproduced locally on Postgres 18: the point read planned
+/// as `Index Scan using idx_resources_type … Filter: (id = $1), Rows Removed by
+/// Filter: 4235, Buffers: shared hit=1575` — 783 buffer hits for a primary-key
+/// lookup that needs three. Removing the index removes the choice.
+///
+/// ## PGLZ -> LZ4 on `resources.data` and `resource_history.data`
+///
+/// A stored FHIR resource is a few kilobytes of JSON. Once the tuple exceeds
+/// `TOAST_TUPLE_THRESHOLD` the toaster compresses `data`, and with the default
+/// `default_toast_compression = pglz` that compression runs in the Postgres
+/// backend on **every create, every update, and every history row** — three
+/// compressions per crud cycle, 1.6M per run. PGLZ manages roughly 50-100 MB/s;
+/// LZ4 is several times that for a slightly worse ratio, and Postgres has
+/// supported it as a per-column TOAST method since 14. The benchmark's
+/// `postgres:18` image ships with LZ4 built in.
+///
+/// The ratio cost is small at this shape: over the 60,000-resource local corpus
+/// the mean compressed `data` datum is 1,532 bytes under PGLZ and 1,586 under
+/// LZ4 — 3.5% larger — and both stay inline, so no extra TOAST chunks appear.
+/// Decompression gets faster too (0.0216 ms to 0.0185 ms for a point read that
+/// returns `data`), which the 1,101,528 reads in a crud run also collect.
+///
+/// ## Measured
+///
+/// Local Postgres 18.6, a 200,000-row pre-populated `resources` spread over 140
+/// resource types (so the planner sees realistic selectivity), `ANALYZE`d,
+/// carrying the full live index set including v15's `idx_resources_search`, and
+/// driven by pgbench with one client through the exact statement shapes this
+/// backend issues — create CTE, update CTE, pre-delete read, soft delete,
+/// history insert. The metric is summed Postgres execution time per crud cycle.
+/// Seven alternating repetitions per arm; medians:
+///
+/// ```text
+/// arm                                          ms/cycle   vs baseline
+/// current (8 indexes, pglz, split delete)        0.4264         —
+/// drop the three indexes only                    0.3520      -17.4%
+/// lz4 only                                       0.3513      -17.6%
+/// both (this migration)                          0.2734      -35.9%
+/// both + the folded delete in storage.rs         0.2285      -46.4%
+/// ```
+///
+/// Applied to the 4,773.5 s those four statements cost on run 33128380492, -36%
+/// is about **1,700 s removed from a 12,856 s suite, 13% of crud**, and the
+/// storage.rs change on top of it a few hundred more. That is an expectation,
+/// not a promise. The lab is a single client on a 200,000-row corpus with
+/// `fsync=off`, so it measures backend CPU and buffer work and nothing of the
+/// lock contention or I/O that 300 virtual users against a 4-CPU container with
+/// 1.6M resources will add. Index depth and cache pressure are both understated,
+/// which if anything understates the index half; the LZ4 half is pure backend
+/// CPU and should carry over most directly.
+///
+/// ## What this costs a real database
+///
+/// Three `DROP INDEX`es and four catalog-only `ALTER TABLE … SET COMPRESSION`.
+/// Nothing is rewritten. `SET COMPRESSION` applies to values written from now
+/// on; rows already stored keep their PGLZ datums and are read back exactly as
+/// before, because the compression method travels in the varlena header. There
+/// is therefore no backfill to run and no window in which the table is
+/// inconsistent.
+///
+/// The `ALTER`s are attempted individually and a failure is logged rather than
+/// propagated: a Postgres built without `--with-lz4` rejects the method, and
+/// that is a reason to keep PGLZ, not a reason to refuse to start.
+///
+/// A note for whoever picks this up next: `default_toast_compression` can be set
+/// per database (`ALTER DATABASE … SET default_toast_compression = 'lz4'`),
+/// which would extend the same win to `search_index`'s text columns. That table
+/// belongs to another seat and was not measured here, so this migration stays
+/// column-scoped.
+async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        // 1-2. Strict prefixes of their tables' primary keys.
+        "DROP INDEX IF EXISTS idx_resources_type",
+        "DROP INDEX IF EXISTS idx_history_resource",
+        // 3. Maintained since v7; no statement in the workspace constrains
+        //    `fhir_version`.
+        "DROP INDEX IF EXISTS idx_resources_fhir_version",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v29->v30 failed: {}", e)))?;
+    }
+
+    // Catalog-only, and optional: a server built without LZ4 rejects the method
+    // and keeps PGLZ, which is correct, just slower. The tsvector columns are
+    // included because a large narrative pushes `resource_fts` over the TOAST
+    // threshold on exactly the write path this migration is trying to cheapen.
+    let compression = [
+        "ALTER TABLE resources ALTER COLUMN data SET COMPRESSION lz4",
+        "ALTER TABLE resource_history ALTER COLUMN data SET COMPRESSION lz4",
+        "ALTER TABLE resource_fts ALTER COLUMN narrative_tsvector SET COMPRESSION lz4",
+        "ALTER TABLE resource_fts ALTER COLUMN content_tsvector SET COMPRESSION lz4",
+    ];
+
+    for sql in compression {
+        if let Err(e) = client.execute(sql, &[]).await {
+            tracing::warn!(
+                "LZ4 TOAST compression is unavailable on this server, keeping PGLZ ({sql}): {e}"
+            );
+        }
     }
 
     Ok(())
