@@ -7,7 +7,8 @@
          data-msg-total="{{ i18n.t_arg("queries-results-total", "count", "{count}".to_string()) }}"
          data-msg-included="{{ i18n.t_arg("queries-results-included", "count", "{count}".to_string()) }}"
          data-msg-empty="{{ i18n.t("queries-results-empty") }}"
-         data-msg-updated="{{ i18n.t("queries-col-updated") }}">
+         data-msg-updated="{{ i18n.t("queries-col-updated") }}"
+         data-msg-fetch-error="{{ i18n.t_arg("queries-results-fetch-error", "origin", "{origin}".to_string()) }}">
   <div class="query-results__head">
     <h2 class="query-group__type">{{ i18n.t("queries-results") }}</h2>
     <span class="query-results__meta" id="query-results-meta"></span>
@@ -30,6 +31,8 @@
   </div>
   <div class="table-foot">
     <span id="query-results-note"></span>
+    <p class="alert alert--inline" id="query-results-error" role="alert"
+       aria-live="assertive" aria-atomic="true" hidden></p>
     <nav class="pagination">
       <button class="btn" type="button" id="query-results-prev" hidden>{{ i18n.t("queries-prev") }}</button>
       <button class="btn" type="button" id="query-results-next" hidden>{{ i18n.t("queries-next") }}</button>

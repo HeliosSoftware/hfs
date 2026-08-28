@@ -30,6 +30,34 @@ fn app() -> Router {
     )
 }
 
+fn resources_app() -> Router {
+    let source = helios_ui::StaticConformanceSource::empty().with_metadata(serde_json::json!({
+        "resourceType": "CapabilityStatement",
+        "fhirVersion": "4.0.1",
+        "rest": [{"mode": "server", "resource": [{
+            "type": "Patient",
+            "interaction": [{"code": "create"}]
+        }]}]
+    }));
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        None,
+        helios_ui::NlSearch {
+            enabled: true,
+            configured: true,
+            model: "test-model".to_string(),
+        },
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+    )
+}
+
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -133,7 +161,7 @@ async fn resources_create_label_names_the_selected_type_per_locale() {
         ("es", "Crear Patient"),
         ("de", "Patient erstellen"),
     ] {
-        let response = app()
+        let response = resources_app()
             .oneshot(
                 Request::get(format!("/ui/resources?lang={lang}"))
                     .body(Body::empty())
@@ -146,6 +174,59 @@ async fn resources_create_label_names_the_selected_type_per_locale() {
             html.contains(sentence),
             "{lang} resources page must contain {sentence:?}, got: {html}"
         );
+    }
+}
+
+#[tokio::test]
+async fn pagination_failure_message_is_localized_with_the_public_origin_slot() {
+    for (lang, sentence) in [
+        (
+            "en",
+            "Could not load results from {origin}. Check HFS_BASE_URL and try again.",
+        ),
+        (
+            "es",
+            "No se pudieron cargar los resultados desde {origin}. Revise HFS_BASE_URL e inténtelo de nuevo.",
+        ),
+        (
+            "de",
+            "Ergebnisse von {origin} konnten nicht geladen werden. Prüfen Sie HFS_BASE_URL und versuchen Sie es erneut.",
+        ),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui/search?lang={lang}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert!(
+            html.contains(sentence),
+            "{lang} search page must expose the localized pagination error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resources_create_block_reason_is_localized() {
+    for (lang, sentence) in [
+        ("en", "not available in the selected FHIR version"),
+        ("es", "no está disponible en la versión FHIR seleccionada"),
+        ("de", "ist in der ausgewählten FHIR-Version nicht verfügbar"),
+    ] {
+        let response = resources_app()
+            .oneshot(
+                Request::get(format!("/ui/resources?lang={lang}&type=patient"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert!(html.contains(sentence), "missing {lang} reason: {html}");
+        assert!(html.contains(r#"data-create-eligible="false""#));
     }
 }
 

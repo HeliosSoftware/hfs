@@ -177,10 +177,6 @@
 
   /* Delegated editor interactions within the modal body. */
   editorBody.addEventListener("click", function (event) {
-    var arrow = event.target.closest("[data-fold]");
-    if (arrow) { toggleFold(arrow.dataset.fold); return; }
-    var foldAllBtn = event.target.closest("[data-json-fold]");
-    if (foldAllBtn) { setAllFolds(foldAllBtn.dataset.jsonFold === "all"); return; }
     if (event.target.id === "editor-json-edit") {
       var raw = editorBody.querySelector("#editor-json-raw");
       var viewEl = editorBody.querySelector("#json-view");
@@ -281,30 +277,6 @@
     });
   });
 
-  /* JSON fold helpers, scoped to the modal body. */
-  function toggleFold(foldId) {
-    var opener = editorBody.querySelector('.json-line[data-fold-id="' + foldId + '"]');
-    if (!opener) return;
-    opener.classList.toggle("json-line--collapsed", !opener.classList.contains("json-line--collapsed"));
-    reflowFolds();
-  }
-  function setAllFolds(collapse) {
-    editorBody.querySelectorAll(".json-line--foldable").forEach(function (o) {
-      if (o.dataset.parents) o.classList.toggle("json-line--collapsed", collapse);
-    });
-    reflowFolds();
-  }
-  function reflowFolds() {
-    editorBody.querySelectorAll(".json-line").forEach(function (line) {
-      var parents = (line.dataset.parents || "").split(" ");
-      line.hidden = parents.some(function (p) {
-        if (!p) return false;
-        var o = editorBody.querySelector('.json-line[data-fold-id="' + p + '"]');
-        return o && o.classList.contains("json-line--collapsed");
-      });
-    });
-  }
-
   function openResource(type, id) {
     current = { type: type, id: id };
     subject.textContent = type + "/" + id;
@@ -317,6 +289,11 @@
   }
 
   function openNew(type) {
+    if (
+      !type ||
+      root.dataset.createEligible !== "true" ||
+      root.dataset.createTarget !== type
+    ) return;
     current = { type: type, id: "" };
     subject.textContent = type + " · " + "new";
     openModal();
@@ -324,19 +301,21 @@
     renderEditor({ resourceType: type });
   }
 
-  /* Clicking a result row opens it. The results table (from saved-queries.js)
-   * renders id links as `/{type}/{id}`; intercept them into the modal. The
-   * results live in the content column, not under `root` (the type panel), so
-   * the listener is on the document. */
+  /* Clicking a result row opens it. The href remains the server-provided
+   * public URL, which may include a path prefix or tenant segment. Use the
+   * trusted resource identity attached by saved-queries.js instead of parsing
+   * that deployment-specific URL. The results live in the content column, not
+   * under `root` (the type panel), so the listener is on the document. */
   document.addEventListener(
     "click",
     function (event) {
       var link = event.target.closest("#query-results-body a.url");
       if (!link) return;
-      var m = /^\/([A-Za-z]+)\/([^/?]+)/.exec(link.getAttribute("href") || "");
-      if (!m) return;
+      var type = link.dataset.resourceType || "";
+      var id = link.dataset.resourceId || "";
+      if (!/^[A-Za-z]+$/.test(type) || !/^[A-Za-z0-9.-]{1,64}$/.test(id)) return;
       event.preventDefault();
-      openResource(m[1], m[2]);
+      openResource(type, id);
     },
     true
   );
@@ -347,7 +326,7 @@
       // `panel.dataset.selectedType` (the rail's `<aside>`) is the single
       // source of truth for the selected type (#605) — the button carries no
       // type of its own any more.
-      openNew(root.dataset.selectedType || "Patient");
+      openNew(root.dataset.selectedType);
     });
   }
 

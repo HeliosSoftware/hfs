@@ -473,6 +473,7 @@ impl BulkSubmitProvider for SqliteBackend {
             total_entries: 0,
             processed_entries: 0,
             failed_entries: 0,
+            lease_expiry: None,
         })
     }
 
@@ -486,7 +487,7 @@ impl BulkSubmitProvider for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
 
         let result = conn.query_row(
-            "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries
+            "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry
              FROM bulk_manifests
              WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
             params![tenant_id, &submission_id.submitter, &submission_id.submission_id, manifest_id],
@@ -499,6 +500,7 @@ impl BulkSubmitProvider for SqliteBackend {
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         );
@@ -512,6 +514,7 @@ impl BulkSubmitProvider for SqliteBackend {
                 total,
                 processed,
                 failed,
+                lease_expiry,
             )) => {
                 let status: ManifestStatus = status_str.parse().map_err(|_| {
                     internal_error(format!("Invalid manifest status: {}", status_str))
@@ -530,6 +533,11 @@ impl BulkSubmitProvider for SqliteBackend {
                     total_entries: total as u64,
                     processed_entries: processed as u64,
                     failed_entries: failed as u64,
+                    lease_expiry: lease_expiry.and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|d| d.with_timezone(&Utc))
+                    }),
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -589,7 +597,6 @@ impl BulkSubmitProvider for SqliteBackend {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
-        let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
         // Verify manifest exists
@@ -606,18 +613,25 @@ impl BulkSubmitProvider for SqliteBackend {
             ));
         }
 
-        // Update manifest status to processing
-        conn.execute(
-            "UPDATE bulk_manifests SET status = 'processing'
-             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
-            params![
-                tenant_id,
-                &submission_id.submitter,
-                &submission_id.submission_id,
-                manifest_id
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
+        // Update manifest status to processing. The connection is scoped to
+        // this one statement: a pooled sync connection held across the entry
+        // loop's awaits is what deadlocked two concurrent workers (#646) —
+        // every per-entry storage call takes its own connection, and the held
+        // one starved them under load.
+        {
+            let conn = self.get_connection()?;
+            conn.execute(
+                "UPDATE bulk_manifests SET status = 'processing'
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
+                params![
+                    tenant_id,
+                    &submission_id.submitter,
+                    &submission_id.submission_id,
+                    manifest_id
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
+        }
 
         let mut results = Vec::new();
         let mut error_count = 0u32;
@@ -685,8 +699,10 @@ impl BulkSubmitProvider for SqliteBackend {
             results.push(entry_result);
         }
 
-        // Update manifest counts
+        // Update manifest counts, on a fresh connection: the loop above is
+        // long and its per-entry calls pool their own.
         let now = Utc::now().to_rfc3339();
+        let conn = self.get_connection()?;
         conn.execute(
             "UPDATE bulk_manifests SET
                 total_entries = total_entries + ?1,
@@ -1328,14 +1344,14 @@ impl SubmitClaimStrategy for SqliteBackend {
             manifest_id,
             worker_id: worker_id.clone(),
             lease_expiry,
+            lease_duration,
             fencing_token: new_token as u64,
         }))
     }
 
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
         let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        let now = Utc::now();
-        let new_expiry = now + chrono::Duration::seconds(60);
+        let new_expiry = lease.renewed_expiry();
         let affected = conn
             .execute(
                 "UPDATE bulk_manifests SET lease_expiry = ?1

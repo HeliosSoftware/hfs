@@ -95,17 +95,23 @@ note the version bump in the commit.
 
 ### Client-side scripts
 
-Each is a small, self-contained IIFE loaded with `defer` by the one page that
-needs it — except `theme.js`, which loads **without `defer`**, before first
-paint, to avoid a flash of the wrong theme.
+Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
+`json-view.js` and `busy.js` load from the shared layout because their behavior
+is used across workspaces — `busy.js` ahead of every page script (defer runs in
+document order) because page scripts call into it. `theme.js` loads **without
+`defer`**, before first paint, to avoid a flash of the wrong theme. `busy.js`
+is the crate's one exported global (`window.hfsBusy`): unlike the closed IIFEs
+it exists to be called by the others.
 
 | Asset | Owns |
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
+| `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
 | `saved-queries.js` | Saved queries, the visual search builder, and the `/_user/settings` read/modify/write cycle |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
+| `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
 | `resources.js` | The Resources workspace edit modal and "Create new" |
-| `batch.js` | Bundle pick → execution plan → per-entry outcomes |
+| `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
 | `resource-filter.js`, `conformance-crud.js` | The conformance viewers' rail filter and write half |
@@ -135,6 +141,40 @@ The English catalog (`locales/en/main.ftl`) follows one convention:
 Spanish and German keep their own capitalization norms (both languages use
 sentence case where English uses Title Case); the convention above is for
 `en` only.
+
+## Required-field marker (#680)
+
+Required fields get an accent-colored asterisk, matching the marker already
+used by the resource editor's add-picker (`.editor-add__name em`). This is
+implemented as a single CSS `:has()` rule next to `.field__label` in
+`assets/app.css`, not per-field markup: the `required` attribute on the input
+is the source of truth, and the rule appends `*` after the field's visible
+label whenever it wraps a required input. The one field without a visible
+label — the search builder's query URL — is marked on its `query-builder__tag`
+chip instead. No template renders `*` for this; the only literal `<em>*</em>`
+in the codebase is the editor's own (unrelated) marker. Changing the
+convention later (e.g. an `(optional)` suffix instead) means editing only
+that one CSS rule.
+
+## Error wording (#677)
+
+Errors follow one convention across the Fluent catalogs
+(`locales/{en,es,de}/main.ftl`) and the OperationOutcome diagnostics that
+`crates/rest/src/error.rs` renders into them:
+
+- Full-sentence errors end with a terminal period; fragments, labels, and
+  status values (`Failed`, `failed`, `unavailable`) take none.
+- Operation failures use one shape: a full sentence naming the object, with
+  the cause after an em dash — `Could not add the tenant — that ID is
+  already in use.`
+- Interpolated values are single-quoted: `Content type 'text/csv' is not
+  supported.`
+- Duality: this convention governs what the user sees — the message catalogs
+  and the `diagnostics` field of returned `OperationOutcome`s, which reach
+  the browser verbatim. It does not apply to `RestError`'s `Display` impl in
+  `crates/rest/src/error.rs`, which stays in its own `Label: value` shape —
+  that form is for logs and traces, not the UI, and is intentionally
+  distinct.
 
 ## Rules of the road — where things go
 
@@ -196,12 +236,20 @@ These are the shared primitives. Before styling anything, reach for one; add to
 
 | Class | What it is |
 |---|---|
-| `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current` | The button. Secondary by default; primary is the one blue action on a page. |
+| `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current`, `.btn--icon` | The action button: 30px high, 12px horizontal padding, 12px type, and a 9px radius. Primary, danger, and current change emphasis only; `--icon` makes the control a 30px square with no horizontal padding. |
 | `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
+| `.panel` | Padding for a full-width card that hosts detail fields without rail behavior. |
+| `.kv-grid` | Responsive two-column key/value layout; collapses to one column on compact viewports. |
 | `.page-head`, `.page-head__title`, `.page-head__lede`, `.page-head--row` | Page heading block; the only `<h1>` treatment; `--row` puts an action on the right. |
+| `.back-link` | In-page return link with theme-safe normal, visited, hover, and focus states. |
 | `.table-wrap` > `.data-table`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper; empty-state row; footer with pagination. |
+| `.empty-state` | The same centered, muted empty treatment for non-table content. |
 | `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
 | `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
+| `.choice-grid`, `.choice-card`, `.choice-card__title`, `.choice-card__hint` | The radio-group treatment: one selectable card per choice, `:has(:checked)` accent (#735). |
+| `.progress`, `.progress__bar`, `.progress--complete`, `.progress--failed`, `.progress--cancelled` | Full-width job progress track; terminal states recolor the fill. |
+| `.job-card`, `.job-card__head`, `.job-card__name`, `.job-card__actions`, `.job-card__meta`, `.job-card__files` | One async job: name + action row, progress track, one meta line, download pills. |
+| `.form-legend`, `.field-row` | Standalone section heading between cards; uppercase-labelled fields side by side. |
 | `.menu`, `.menu__panel`, `.menu__heading`, `.menu__option` | The `<details>` dropdown (tenant/version selectors, Recent). |
 | `.notice`, `.notice--warn` | Inline banner. |
 | `.pill` | Large control chip (chart tools). |
@@ -210,10 +258,40 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.toolbar`, `.toolbar__title`, `.toolbar__search`, `.toolbar__count` | In-card section header with optional search. |
 | `.tabs`, `.tab`, `.tab--on` | Tab strip. |
 | `.filter-rail`, `.nav-panel` | Left rails: the filter list inside a page; the type panel flush against the sidebar. |
-| `.icon-button`, `.icon-button--danger` | Bare icon action (table rows). |
+| `.icon-button`, `.icon-button--danger` | Bare 30px-square icon action (table rows), with the action-button 9px radius. |
+| `.busy-status` > `.spinner` | Inline working state: the ring plus a short label, `role="status"` in the markup so it announces. |
 
 Starting a new page: copy `templates/pages/_scaffold.html` (or crib
 `tenants.html`, the smallest real page). Both compose only this vocabulary.
+
+Button emphasis never changes geometry: pair `.btn` with `--primary`,
+`--danger`, or `--current` for color and state, and add `--icon` only for a
+square icon-only action. Inputs keep their own field scale and do not dictate
+button height. The sole fixed-height exception is the open
+`.addbox--modal > summary.btn`: while its native `<details>` is open, that
+summary becomes the full-viewport backdrop (`height: auto`, zero padding and
+radius); its closed state and the actions inside the dialog use the canonical
+button scale.
+
+### Busy states
+
+One convention for "this control is doing something" (#679), in two lanes:
+
+- **Fetch-driven scripts** call `window.hfsBusy` (`assets/busy.js`).
+  `during(buttons, work)` disables the controls, stamps `aria-busy="true"`,
+  and clears when the promise `work()` returns settles — pass a *function*,
+  never a promise, so the re-entrancy guard runs before the request exists;
+  a `work()` that navigates away returns a promise that never settles.
+  `region(el, label)` reveals a pre-rendered `.busy-status` element and
+  labels its `[data-busy-label]`; `opts.region`/`opts.label` on `during` tie
+  one to the same lifetime. The CSS ring keys off `aria-busy`, so the
+  visuals cannot ship without the semantics; reduced motion gets the same
+  ring as a static glyph. The `::after` ring must keep `content: ""` — CSS
+  generated *text* would join the accessible name.
+- **htmx controls** use `hx-disabled-elt` (#581); `hx-indicator` is
+  deliberately absent (the tenants tests pin this). A pending state that
+  outlives the request belongs in the swapped fragment, like the tenants
+  provisioning row.
 
 ---
 
@@ -279,6 +357,7 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/resources` | GET | Resources workspace: type rail with live counts, search, edit modal |
 | `/ui/editor` | GET | Standalone schema-driven resource editor |
 | `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request |
+| `/ui/json-view/render` | POST | Renders raw `application/json` as a highlighted, foldable HTML fragment; applies no FHIR semantics and retains no payload |
 | `/ui/editor/expand` | GET | ValueSet expansion, proxied to `HFS_TERMINOLOGY_SERVER` |
 | `/ui/queries` | GET | Saved FHIR queries per resource type (#234) and the visual search builder |
 | `/ui/queries/params` | GET | Per-type search-parameter catalog backing the builder's datalist |

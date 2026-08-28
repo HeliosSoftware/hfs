@@ -2,7 +2,7 @@
 //!
 //! The SQL-on-FHIR v2 IG does not ship declarative JSON test fixtures for
 //! `$sql-run` the way it does for ViewDefinition (see
-//! `crates/sof/tests/sql-on-fhir-v2/tests/*.json`). The closest upstream
+//! `crates/sof/tests/sql-on-fhir/tests/*.json`). The closest upstream
 //! reference is `HL7/sql-on-fhir:sof-js/tests/server/sql.test.js`, a
 //! JavaScript/Bun test suite that drives a live HTTP server. This file
 //! ports those scenarios to Rust integration tests against our own

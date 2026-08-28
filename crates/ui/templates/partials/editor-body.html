@@ -19,7 +19,7 @@
 </form>
 
 {% if let Some(message) = parse_error %}
-<div class="editor__parse-error" role="alert">
+<div class="alert" role="alert">
   <strong>{{ i18n.t("editor-invalid-json") }}</strong>
   <code>{{ message }}</code>
 </div>
@@ -27,7 +27,7 @@
 
 <div class="editor__grid">
   <!-- ============ LEFT: JSON ============ -->
-  <section class="card editor-json">
+  <section class="card editor-json" data-json-view-scope>
     <div class="card-head">
       <h3><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("editor-view-json") }}</h3>
       <div class="card-head__tools card-head__tools--start">
@@ -44,16 +44,7 @@
       textarea cannot number lines or fold objects). Every object and array
       carries a fold arrow; the gutter counts lines like a code editor.
     -->
-    <div class="json-view" id="json-view">
-      {% for line in json_lines %}
-      <div class="json-line{% if line.foldable %} json-line--foldable{% endif %}"
-           data-fold-id="{{ line.fold_id }}" data-parents="{{ line.parents }}"{% if !line.path.is_empty() %} data-jpath="{{ line.path }}"{% endif %}>
-        <span class="json-line__num">{{ line.num }}</span>
-        <span class="json-line__fold">{% if line.foldable %}<span class="json-line__arrow" data-fold="{{ line.fold_id }}">▾</span>{% endif %}</span>
-        <span class="json-line__code" style="padding-left: {{ line.depth }}em">{% for t in line.tokens %}<span class="jt--{{ t.kind }}">{{ t.text }}</span>{% endfor %}<span class="json-line__summary">{{ line.summary }}</span></span>
-      </div>
-      {% endfor %}
-    </div>
+    {% include "partials/json-view.html" %}
 
     <!-- Raw editing, one toggle away. On apply it re-parses and the form
          re-renders from it. -->

@@ -1,5 +1,5 @@
 {% if let Some(msg) = error %}
-<div class="form-error" role="alert">{{ msg }}</div>
+<div class="alert" role="alert">{{ msg }}</div>
 {% endif %}
 
 {% if polling %}
@@ -41,7 +41,7 @@
       </td>
       {% if row.provisioning %}
       <td class="col-num">
-        <span class="provisioning" role="status">
+        <span class="busy-status" role="status">
           <span class="spinner" aria-hidden="true"></span>
           {{ i18n.t("tenants-row-provisioning") }}
         </span>

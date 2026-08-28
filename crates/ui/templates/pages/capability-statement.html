@@ -13,27 +13,31 @@
   <div class="card-head">
     <h3>{{ i18n.t("cap-summary-heading") }}</h3>
   </div>
-  <div class="detail__field"><span>{{ i18n.t("cap-summary-description") }}</span><div>{{ view.summary.description }}</div></div>
-  <div class="detail__field"><span>{{ i18n.t("cap-summary-url") }}</span><div>{{ view.summary.implementation_url }}</div></div>
-  <div class="detail__field"><span>{{ i18n.t("cap-summary-fhir-version") }}</span><div>{{ view.summary.fhir_version }}</div></div>
-  <div class="detail__field"><span>{{ i18n.t("cap-summary-status") }}</span><div>{{ view.summary.status }}</div></div>
-  <div class="detail__field"><span>{{ i18n.t("cap-summary-kind") }}</span><div>{{ view.summary.kind }}</div></div>
-  <div class="detail__field"><span>{{ i18n.t("cap-summary-date") }}</span><div>{{ view.summary.date }}</div></div>
-  <div class="detail__field"><span>{{ i18n.t("cap-summary-formats") }}</span><div>{{ view.summary.formats.join(", ") }}</div></div>
+  <div class="card__body">
+    <div class="detail__field"><span>{{ i18n.t("cap-summary-description") }}</span><div>{{ view.summary.description }}</div></div>
+    <div class="detail__field"><span>{{ i18n.t("cap-summary-url") }}</span><div>{{ view.summary.implementation_url }}</div></div>
+    <div class="detail__field"><span>{{ i18n.t("cap-summary-fhir-version") }}</span><div>{{ view.summary.fhir_version }}</div></div>
+    <div class="detail__field"><span>{{ i18n.t("cap-summary-status") }}</span><div>{{ view.summary.status }}</div></div>
+    <div class="detail__field"><span>{{ i18n.t("cap-summary-kind") }}</span><div>{{ view.summary.kind }}</div></div>
+    <div class="detail__field"><span>{{ i18n.t("cap-summary-date") }}</span><div>{{ view.summary.date }}</div></div>
+    <div class="detail__field"><span>{{ i18n.t("cap-summary-formats") }}</span><div>{{ view.summary.formats.join(", ") }}</div></div>
+  </div>
 </section>
 
 <section class="card">
   <div class="card-head">
     <h3>{{ i18n.t("cap-interactions-heading") }}</h3>
   </div>
-  <p>
-    {% for i in view.interactions %}
-    <span class="tag">{{ i.code }}</span>
-    {% endfor %}
-  </p>
-  {% for i in view.interactions %}{% if i.conditional %}
-  <p class="page-head__lede">{{ i18n.t("cap-transaction-note") }}</p>
-  {% endif %}{% endfor %}
+  <div class="card__body">
+    <p>
+      {% for i in view.interactions %}
+      <span class="tag">{{ i.code }}</span>
+      {% endfor %}
+    </p>
+    {% for i in view.interactions %}{% if i.conditional %}
+    <p class="page-head__lede">{{ i18n.t("cap-transaction-note") }}</p>
+    {% endif %}{% endfor %}
+  </div>
 </section>
 
 <section class="card table-card">
@@ -102,12 +106,15 @@
   </div>
 </section>
 
-<section class="card">
-  <details>
-    <summary>{{ i18n.t("cap-raw-toggle") }}</summary>
+<details class="card json-fold">
+  <summary class="card-head">
+    <h3>{{ i18n.t("cap-raw-toggle") }}</h3>
+    <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+  </summary>
+  <div class="card__body">
     <pre class="detail__code">{{ raw }}</pre>
-  </details>
-</section>
+  </div>
+</details>
 {% else %}
 <p class="notice notice--warn">{{ i18n.t("cap-unavailable") }}</p>
 {% endif %}

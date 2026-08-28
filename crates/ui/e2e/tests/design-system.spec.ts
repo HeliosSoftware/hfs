@@ -9,8 +9,7 @@ import postcss from "postcss";
 //   - a class that matches no rule is a typo or a second vocabulary starting
 //     (class="table" shipped that way and styled nothing);
 //   - a page <h1> off the canonical class is a second heading scale;
-//   - primary buttons that resolve to different metrics on different pages
-//     are two button designs;
+//   - ordinary actions use one exact size scale, regardless of emphasis;
 //   - a selector defined twice renders as the cascade-merge of two authors'
 //     blocks, which nobody wrote.
 
@@ -102,25 +101,152 @@ test("every page <h1> uses the canonical .page-head__title", async ({ page, requ
   expect(offenders, `page titles off the canonical class:\n${offenders.join("\n")}`).toEqual([]);
 });
 
-test("primary buttons resolve to the same metrics on every page", async ({ page, request }) => {
-  // Computed, not declared: a page-layer override that restyles the shared
-  // control shows up here no matter how it was written.
-  const byRoute = new Map<string, string[]>();
+test("ordinary actions resolve to the canonical button scale on every page", async ({ page, request }) => {
+  const offenders: string[] = [];
+  const primaryColors = new Map<string, string[]>();
   for (const route of [...ROUTES, await seedBulkImportDetail(request)]) {
     await page.goto(route, { waitUntil: "networkidle" });
-    const signatures = await page.$$eval(".btn--primary", (nodes) =>
+    const actions = await page.$$eval(".btn, .icon-button", (nodes) =>
       nodes
         .filter((n) => n instanceof HTMLElement && n.offsetParent !== null)
         .map((n) => {
           const s = getComputedStyle(n);
-          return `height=${s.height} radius=${s.borderRadius} bg=${s.backgroundColor} color=${s.color}`;
+          const box = n.getBoundingClientRect();
+          return {
+            label: `${n.tagName.toLowerCase()}.${Array.from(n.classList).join(".")} “${(n.textContent ?? "").trim().slice(0, 30)}”`,
+            isButton: n.classList.contains("btn"),
+            isIconButton: n.classList.contains("icon-button"),
+            isIconShape: n.classList.contains("btn--icon"),
+            isPrimary: n.classList.contains("btn--primary"),
+            height: s.height,
+            width: s.width,
+            radius: s.borderRadius,
+            fontSize: s.fontSize,
+            paddingLeft: s.paddingLeft,
+            paddingRight: s.paddingRight,
+            background: s.backgroundColor,
+            color: s.color,
+            targetWidth: box.width,
+            targetHeight: box.height,
+          };
         }),
     );
-    if (signatures.length) byRoute.set(route, Array.from(new Set(signatures)));
+    const routePrimaryColors: string[] = [];
+    for (const action of actions) {
+      if (action.targetWidth < 24 || action.targetHeight < 24) {
+        offenders.push(`${route}: ${action.label} target=${action.targetWidth}x${action.targetHeight}`);
+      }
+      if (action.isIconButton) {
+        if (action.width !== "30px" || action.height !== "30px" || action.radius !== "9px") {
+          offenders.push(`${route}: ${action.label} icon geometry=${action.width}x${action.height} radius=${action.radius}`);
+        }
+        continue;
+      }
+      if (!action.isButton) continue;
+      if (action.height !== "30px" || action.radius !== "9px" || action.fontSize !== "12px") {
+        offenders.push(`${route}: ${action.label} height=${action.height} radius=${action.radius} font=${action.fontSize}`);
+      }
+      const expectedPadding = action.isIconShape ? "0px" : "12px";
+      if (action.paddingLeft !== expectedPadding || action.paddingRight !== expectedPadding) {
+        offenders.push(`${route}: ${action.label} padding=${action.paddingLeft}/${action.paddingRight}`);
+      }
+      if (action.isIconShape && action.width !== "30px") {
+        offenders.push(`${route}: ${action.label} icon width=${action.width}`);
+      }
+      if (action.isPrimary) routePrimaryColors.push(`${action.background}/${action.color}`);
+    }
+    if (routePrimaryColors.length) primaryColors.set(route, Array.from(new Set(routePrimaryColors)));
   }
-  const distinct = new Set(Array.from(byRoute.values()).flat());
-  const listing = Array.from(byRoute, ([r, sigs]) => `${r}: ${sigs.join(" | ")}`).join("\n");
-  expect(distinct.size, `primary buttons diverge across pages:\n${listing}`).toBeLessThanOrEqual(1);
+  expect(offenders, `actions off the canonical scale or below 24px:\n${offenders.join("\n")}`).toEqual([]);
+
+  const distinctPrimaryColors = new Set(Array.from(primaryColors.values()).flat());
+  const listing = Array.from(primaryColors, ([r, colors]) => `${r}: ${colors.join(" | ")}`).join("\n");
+  expect(distinctPrimaryColors.size, `primary emphasis diverges across pages:\n${listing}`).toBeLessThanOrEqual(1);
+});
+
+test("emphasis variants cannot declare geometry and the retired accent variant stays absent", async ({ request }) => {
+  const css = await stylesheet(request);
+  const root = postcss.parse(css);
+  const geometry = /^(?:width|min-width|max-width|height|min-height|max-height|padding(?:-.+)?|font(?:-.+)?|line-height|border-radius|gap)$/;
+  const offenders: string[] = [];
+  const contextual: string[] = [];
+  root.walkRules((rule) => {
+    const emphasis = rule.selectors.filter((selector) => /\.btn--(?:primary|danger|current)(?![-\w])/.test(selector));
+    rule.walkDecls((decl) => {
+      if (!geometry.test(decl.prop)) return;
+      if (emphasis.length) offenders.push(`${emphasis.join(", ")}: ${decl.prop}: ${decl.value}`);
+      for (const selector of rule.selectors) {
+        const target = selector.trim();
+        if (!/\.btn(?:--[\w-]+)?(?:\[[^\]]+\]|:[\w()-]+)*$/.test(target)) continue;
+        if (target === ".btn" || target === ".btn--icon" || target === ".addbox--modal[open] > summary.btn") continue;
+        contextual.push(`${target}: ${decl.prop}: ${decl.value}`);
+      }
+    });
+  });
+  expect(offenders, `emphasis variants declaring geometry:\n${offenders.join("\n")}`).toEqual([]);
+  expect(contextual, `contextual button geometry outside the icon/backdrop exceptions:\n${contextual.join("\n")}`).toEqual([]);
+  expect(css).not.toContain(".btn--accent");
+});
+
+test("shared query-builder actions stay 30px while their inputs keep the field scale", async ({ page }) => {
+  for (const route of ["/ui/resources", "/ui/search", "/ui/queries"]) {
+    await page.goto(route, { waitUntil: "networkidle" });
+    const form = page.locator("#saved-query-form");
+    await expect(form, `${route} should render the shared query builder`).toBeVisible();
+    for (const control of ["#query-copy", ".query-recent__toggle", "[data-intent='run']"]) {
+      await expect(form.locator(control)).toHaveCSS("height", "30px");
+    }
+    await expect(form.locator("#query-copy")).toHaveCSS("width", "30px");
+    await expect(form.locator("#query-copy")).toHaveCSS("padding-left", "0px");
+    await expect(form.locator(".query-builder__url")).toHaveCSS("height", "38px");
+
+    if (route === "/ui/queries") {
+      await expect(form.locator("[data-intent='save']")).toHaveCSS("height", "30px");
+      await expect(form.locator("input[name='name']")).toHaveCSS("height", "36px");
+    }
+  }
+
+  for (const theme of ["light", "dark"] as const) {
+    for (const width of [1280, 390]) {
+      await page.setViewportSize({ width, height: 800 });
+      await page.goto("/ui");
+      await page.evaluate((selected) => localStorage.setItem("hfs-theme", selected), theme);
+      await page.goto("/ui/queries", { waitUntil: "networkidle" });
+      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      for (const control of ["#query-copy", ".query-recent__toggle", "[data-intent='run']", "[data-intent='save']"]) {
+        await expect(page.locator(`#saved-query-form ${control}`)).toHaveCSS("height", "30px");
+      }
+    }
+  }
+});
+
+test("icon-only action shapes compute to the shared 30px square", async ({ page }) => {
+  await page.goto("/ui");
+  const metrics = await page.evaluate(() => {
+    const classes = ["btn btn--icon", "icon-button"];
+    return classes.map((className) => {
+      const probe = document.createElement("button");
+      probe.className = className;
+      probe.type = "button";
+      probe.textContent = "x";
+      document.body.append(probe);
+      const style = getComputedStyle(probe);
+      const result = {
+        className,
+        width: style.width,
+        height: style.height,
+        radius: style.borderRadius,
+        paddingLeft: style.paddingLeft,
+        paddingRight: style.paddingRight,
+      };
+      probe.remove();
+      return result;
+    });
+  });
+  expect(metrics).toEqual([
+    { className: "btn btn--icon", width: "30px", height: "30px", radius: "9px", paddingLeft: "0px", paddingRight: "0px" },
+    { className: "icon-button", width: "30px", height: "30px", radius: "9px", paddingLeft: "0px", paddingRight: "0px" },
+  ]);
 });
 
 test("no selector is defined twice in app.css", async ({ request }) => {

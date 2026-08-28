@@ -666,7 +666,7 @@ async fn serve(
         // configured from HFS_UI_* client credentials.
         let self_base_url = format!("http://127.0.0.1:{}", config.port);
         let outbound_auth = AuthConfig::from_env().outbound_provider();
-        helios_ui::mount(
+        helios_ui::mount_with_body_limit_and_tenant_routing(
             app,
             env!("CARGO_PKG_VERSION"),
             config.data_dir.clone(),
@@ -683,6 +683,8 @@ async fn serve(
             config.default_fhir_version,
             config.terminology_server.clone(),
             config.base_url.clone(),
+            config.max_body_size,
+            config.multitenancy.routing_mode.supports_url_path(),
         )
     };
     #[cfg(not(all(feature = "ui", not(feature = "headless"))))]
@@ -872,10 +874,10 @@ async fn init_audit(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Use `from_env()` (not `parse()`) so `multitenancy` and `bulk_export`
-    // sub-structs — both `#[arg(skip)]` for clap — are populated from
-    // their `HFS_*` environment variables.
-    let config = ServerConfig::from_env();
+    // Keep the skipped sub-configs populated while surfacing invalid CLI and
+    // environment values instead of silently replacing the whole config with
+    // defaults.
+    let config = ServerConfig::try_from_env().unwrap_or_else(|error| error.exit());
     helios_observability::uptime::init();
     helios_observability::telemetry::init("hfs", &config.log_level);
     helios_observability::metrics::init("hfs");
@@ -883,6 +885,14 @@ async fn main() -> anyhow::Result<()> {
     // backed by the reqlog ring buffer, so it opts into recording. Servers that
     // don't (hts, sof-server, fhirpath-server) leave it off and skip the cost.
     helios_observability::reqlog::enable();
+
+    if let Some(message) = config.loopback_public_base_warning() {
+        warn!(
+            public_base_url = %config.base_url,
+            bind_address = %config.socket_addr(),
+            "{message}. Set HFS_BASE_URL to the public HTTP(S) origin clients can reach"
+        );
+    }
 
     if let Err(errors) = config.validate() {
         for error in &errors {
@@ -925,6 +935,8 @@ async fn main() -> anyhow::Result<()> {
     info!(
         port = config.port,
         host = %config.host,
+        bind_address = %config.socket_addr(),
+        public_base_url = %config.base_url,
         fhir_version = ?config.default_fhir_version,
         storage_backend = %backend_mode,
         terminology_server = ?config.terminology_server,
@@ -2881,6 +2893,20 @@ mod tests {
             config.validate().is_ok(),
             "default ServerConfig should be valid"
         );
+    }
+
+    #[test]
+    fn test_server_config_validation() {
+        let mut config = ServerConfig {
+            base_url: "https://fhir.example.test/fhir/".to_string(),
+            ..Default::default()
+        };
+        config.normalize_public_base_url().unwrap();
+        assert_eq!(config.base_url, "https://fhir.example.test/fhir");
+        assert!(config.validate().is_ok());
+
+        config.base_url = "javascript:alert(1)".to_string();
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -28,6 +28,10 @@ language-label = Sprache
 language-en = Englisch
 language-es = Spanisch
 language-de = Deutsch
+user-menu-label = Kontomenü
+user-local = Lokaler Benutzer
+user-local-hint = Authentifizierung ist deaktiviert
+user-logout = Abmelden
 
 ## Startseite
 
@@ -56,7 +60,7 @@ terminology-lede = Verbinden Sie HFS mit einem FHIR-Terminologieserver.
 terminology-configured-heading = Terminologieserver konfiguriert
 terminology-configured-body = HFS_TERMINOLOGY_SERVER verweist auf eine gültige Server-URL.
 terminology-configured-open = Terminologieserver öffnen
-terminology-invalid-heading = HFS_TERMINOLOGY_SERVER ist ungültig
+terminology-invalid-heading = HFS_TERMINOLOGY_SERVER ist ungültig.
 terminology-invalid-body = Verwenden Sie eine absolute HTTP- oder HTTPS-URL mit einem Host. Pfade und ein abschließender Schrägstrich sind zulässig. Fügen Sie keine Zugangsdaten, Abfrageparameter oder Fragmente ein.
 terminology-invalid-note = Aktualisieren Sie die Umgebungsvariable und starten Sie HFS neu.
 terminology-setup-heading = Terminologieserver verbinden
@@ -78,7 +82,7 @@ action-retry = Erneut versuchen
 
 error-not-found = Die angeforderte Ressource wurde nicht gefunden.
 error-unauthorized = Sie sind nicht berechtigt, diese Aktion auszuführen.
-error-generic = Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.
+error-generic = Etwas ist schiefgelaufen. Versuchen Sie es erneut.
 
 ## Dashboard-Gerüst (Figma "Dashboard V1.1")
 
@@ -134,7 +138,7 @@ tenants-unregistered = nicht registriert
 tenants-delete = Mandant löschen
 tenants-delete-confirm = Mandant "{ $id }" abmelden? Die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
 tenants-row-provisioning = Wird bereitgestellt … das kann einen Moment dauern.
-tenants-row-failed = Bereitstellung fehlgeschlagen
+tenants-row-failed = Der Mandant konnte nicht bereitgestellt werden.
 tenants-dismiss = Verwerfen
 
 tenant-heading = Tenants
@@ -286,7 +290,7 @@ cmp-new = Neue Compartment-Definition
 cmp-edit = Bearbeiten
 cmp-delete = Löschen
 cmp-delete-confirm = Diese Compartment-Definition löschen? Ihre Compartment-Routen funktionieren dann nicht mehr.
-crud-delete-failed = Löschen fehlgeschlagen
+crud-delete-failed = Das Element konnte nicht gelöscht werden.
 
 ## Compartment-Ansicht & Tester (#237)
 
@@ -422,6 +426,7 @@ queries-open-tab = In neuem Tab öffnen
 queries-col-updated = Aktualisiert
 queries-prev = Zurück
 queries-next = Weiter
+queries-results-fetch-error = Ergebnisse von { $origin } konnten nicht geladen werden. Prüfen Sie HFS_BASE_URL und versuchen Sie es erneut.
 
 queries-rail-heading = Ressourcentypen
 queries-rail-filter = Typen filtern
@@ -501,6 +506,7 @@ editor-primitive-extension-hint = Dieser Wert trägt eigene Extensions (ein `_`-
 
 editor-collapse-all = Alle einklappen
 editor-expand-all = Alle ausklappen
+json-view-toggle-fold = JSON-Abschnitt umschalten
 editor-edit-raw = Rohtext bearbeiten
 editor-versions = Versionen
 editor-versions-none = Keine früheren Versionen.
@@ -510,7 +516,12 @@ editor-versions-none = Keine früheren Versionen.
 
 resources-heading = Ressourcen
 resources-lede = FHIR-Ressourcen durchsuchen, suchen, erstellen und bearbeiten. In natürlicher Sprache suchen oder die Abfrage selbst bauen, dann ein Ergebnis zum Bearbeiten öffnen.
+resources-create = Ressource erstellen
 resources-create-typed = { $type } erstellen
+resources-create-invalid-type = Dieser Ressourcentyp ist in der ausgewählten FHIR-Version nicht verfügbar. Korrigieren Sie die Abfrage oder wählen Sie einen Typ aus der Liste.
+resources-create-not-advertised = Dieser Server erlaubt das Erstellen dieses Ressourcentyps nicht. Sie können ihn weiterhin durchsuchen.
+resources-create-schema-unavailable = Für diesen Ressourcentyp gibt es in der ausgewählten FHIR-Version kein Editorschema. Die UI kann ihn deshalb nicht sicher erstellen.
+resources-create-metadata-unavailable = Die Serverfähigkeiten sind nicht verfügbar. Das Erstellen bleibt deaktiviert, bis die UI sie prüfen kann.
 resources-save-blocked = Beheben Sie die Validierungsprobleme vor dem Speichern.
 resources-save-invalid = Das JSON ist ungültig — beheben Sie es vor dem Speichern.
 resources-edit-title = Ressource bearbeiten
@@ -528,9 +539,9 @@ batch-lede = Lade ein FHIR-Bundle hoch, prüfe die auszuführenden Aktionen, fü
 batch-upload = Hochladen
 batch-drop-hint = Bundle-JSON-Datei hier ablegen
 batch-drop-browse = oder klicken zum Durchsuchen
-batch-invalid-json = Diese Datei ist kein gültiges JSON
-batch-not-a-bundle = Dieses JSON ist kein FHIR-Bundle
-batch-bad-type = Hier lassen sich nur Bundles vom Typ batch oder transaction ausführen
+batch-invalid-json = Diese Datei ist kein gültiges JSON.
+batch-not-a-bundle = Dieses JSON ist kein FHIR-Bundle.
+batch-bad-type = Hier lassen sich nur Bundles vom Typ batch oder transaction ausführen.
 batch-request = Anfrage
 batch-entries = Einträge
 batch-semantics-batch = Batch: Einträge laufen unabhängig — ein fehlgeschlagener Eintrag stoppt die anderen nicht und macht sie nicht rückgängig.
@@ -539,16 +550,18 @@ batch-tab-actions = Aktionen
 batch-tab-json = Bundle-JSON
 batch-no-body = (kein Body — dieser Eintrag adressiert nur eine Ressource)
 batch-cancel = Abbrechen
-batch-upload-another = Weitere hochladen
 batch-execute = Ausführen
+batch-plan-heading = Ausführungsplan
+batch-done = Fertig
 batch-response-heading = Ergebnisse pro Aktion
 batch-sum-created = erstellt
 batch-sum-updated = aktualisiert
 batch-sum-other = gelesen/sonstige
 batch-sum-failed = fehlgeschlagen
-batch-request-failed = Die Anfrage ist fehlgeschlagen
-batch-back = Zurück zum Bundle
-batch-execute-again = Erneut ausführen
+batch-request-failed = Die Anfrage ist fehlgeschlagen.
+batch-reading = Bundle wird gelesen…
+batch-executing = Wird ausgeführt…
+batch-read-failed = Die Datei konnte nicht gelesen werden.
 
 ## Bulk Import workspace (#527)
 
@@ -556,7 +569,6 @@ bulk-import-title = Massenimport
 bulk-import-new = Neue Submission
 bulk-import-create-title = Bulk Submission anlegen
 bulk-import-field-name = Name der Submission
-bulk-import-field-recipient = Basis-URL des Empfängers
 bulk-import-auth = Authentifizierung
 bulk-import-auth-hint = Wie gegenüber dem Empfängerserver authentifiziert wird.
 bulk-import-auth-none = Keine
@@ -595,6 +607,9 @@ bulk-import-detail-auth = Authentifizierung
 bulk-import-abort = Abbrechen
 bulk-import-complete = Abschließen
 bulk-import-delete = Löschen
+bulk-import-edit = Bearbeiten
+bulk-import-edit-title = Submission bearbeiten
+bulk-import-edit-submit = Änderungen speichern
 bulk-import-add-manifest = Manifest hinzufügen
 bulk-import-add-manifest-title = Manifest hinzufügen
 bulk-import-add-manifest-submit = Hinzufügen
@@ -607,9 +622,13 @@ bulk-import-field-output-format-hint = Das Format der Bulk-Data-Dateien im Manif
 bulk-import-field-headers = Header für Dateiabrufe
 bulk-import-field-headers-hint = HTTP-Header, die der Empfänger beim Abruf einer Datendatei verwenden soll, je Zeile "Name: Wert".
 bulk-import-manifests = Manifeste
+bulk-import-manifest-actions = Manifest-Aktionen
 bulk-import-no-manifests = Noch keine Manifeste. Fügen Sie eines hinzu, um Daten zu übermitteln.
 bulk-import-submit = Übermitteln
 bulk-import-submit-all = Alle übermitteln
+bulk-import-sort = Sortieren
+bulk-import-sort-recent = Neueste zuerst
+bulk-import-sort-oldest = Älteste zuerst
 bulk-import-remove = Entfernen
 bulk-import-log = Submission-Protokoll
 bulk-import-log-empty = Noch nichts übermittelt.
@@ -698,6 +717,9 @@ bulk-export-field-since-custom = Benutzerdefinierter Zeitpunkt
 bulk-export-field-since-custom-hint = Gilt, wenn Seit auf Benutzerdefiniert steht. RFC 3339, z. B. 2026-08-01T00:00:00Z.
 bulk-export-start = Export starten
 bulk-export-running = laufend
+bulk-export-clear = Leeren
+bulk-export-files-word = Dateien
+bulk-export-exports-word = Exporte
 bulk-export-none = Noch keine Exporte. Starten Sie einen auf der Massenexport-Seite.
 bulk-export-status-in-progress = Läuft
 bulk-export-status-complete = Abgeschlossen
@@ -768,7 +790,7 @@ vd-empty-lede = Lege mit „Neu erstellen" die erste ViewDefinition an.
 vd-degraded = Die Liste der View-Definitionen konnte nicht geladen werden.
 vd-saved = Gespeichert.
 vd-run = Ausführen
-vd-run-failed = Die Ausführung der View ist fehlgeschlagen.
+vd-run-failed = Die View konnte nicht ausgeführt werden.
 vd-save = Speichern
 vd-duplicate = Duplizieren
 vd-delete = Löschen

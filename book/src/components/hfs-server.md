@@ -47,8 +47,14 @@ The server is configured entirely through [environment variables](../configurati
 ```bash
 # Explicit example
 HFS_SERVER_PORT=3000 \
+HFS_BASE_URL=https://fhir.example.com \
 HFS_STORAGE_BACKEND=postgres \
 HFS_DATABASE_URL="postgresql://user:pass@localhost/fhir" \
 HFS_LOG_LEVEL=debug \
   ./hfs
 ```
+
+`HFS_BASE_URL` is the public origin HFS writes into FHIR responses. Include a
+reverse-proxy path prefix when one exists, for example
+`https://fhir.example.com/fhir`. HFS validates and logs the value at startup.
+It warns when a loopback base does not match the listener.

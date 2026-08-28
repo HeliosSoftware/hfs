@@ -19,16 +19,32 @@
     <h1 class="page-head__title">{{ i18n.t("resources-heading") }}</h1>
     <p class="page-head__lede" id="resources-subtitle">{{ i18n.t("resources-lede") }}</p>
   </div>
-  <button type="button" class="btn btn--primary resources-create" id="resource-create"
-          data-msg-create="{{ i18n.t_arg("resources-create-typed", "type", "{type}".to_string()) }}">
-    <span class="icon">{% include "icons/plus.svg" %}</span>
-    <span class="resources-create__label">{{ i18n.t_arg("resources-create-typed", "type", selected_type.clone()) }}</span>
-  </button>
+  <div class="resources-create-wrap">
+    <button type="button" class="btn btn--primary resources-create" id="resource-create"
+            aria-describedby="resource-create-reason"
+            data-msg-create="{{ i18n.t_arg("resources-create-typed", "type", "{type}".to_string()) }}"
+            data-msg-create-generic="{{ i18n.t("resources-create") }}"
+            {% if create_disabled %}disabled{% endif %}>
+      <span class="icon">{% include "icons/plus.svg" %}</span>
+      <span class="resources-create__label">{{ create_label }}</span>
+    </button>
+    <p class="field__hint" id="resource-create-reason" {% if create_reason.is_empty() %}hidden{% endif %}>{{ create_reason }}</p>
+  </div>
 </section>
 
 <div class="queries-layout search-page" data-mode="{% if nl.configured %}nl{% else %}builder{% endif %}">
   <aside class="filter-rail" id="resources" aria-label="{{ i18n.t("queries-rail-heading") }}"
-         data-selected-type="{{ selected_type }}">
+         data-selected-type="{{ selected_type }}"
+         data-create-eligible="{% if create_disabled %}false{% else %}true{% endif %}"
+         data-create-target="{% if create_disabled %}{% else %}{{ selected_type }}{% endif %}"
+         data-create-metadata="{% if create_metadata_available %}available{% else %}unavailable{% endif %}"
+         data-create-resource-types="{{ create_resource_types }}"
+         data-create-advertised-types="{{ create_advertised_types }}"
+         data-create-schema-types="{{ create_schema_types }}"
+         data-msg-create-invalid="{{ i18n.t("resources-create-invalid-type") }}"
+         data-msg-create-not-advertised="{{ i18n.t("resources-create-not-advertised") }}"
+         data-msg-create-schema-unavailable="{{ i18n.t("resources-create-schema-unavailable") }}"
+         data-msg-create-metadata-unavailable="{{ i18n.t("resources-create-metadata-unavailable") }}">
     <div class="filter-rail__heading">{{ i18n.t("resources-types-heading") }}</div>
     <div class="filter-rail__search">
       <span class="icon">{% include "icons/search.svg" %}</span>
@@ -112,6 +128,16 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
   Edit Resource modal (shadowbox). Opened by JS when a result row is clicked, or
   by "Create new" for a fresh resource. It embeds the schema-driven editor body
   and offers Save / Delete / History with the version diff, over the FHIR API.
+
+  #681: this does not use the shared partials/dialog.html macro. That macro's
+  <details>/<summary> disclosure is the no-JS mechanism the addbox--modal
+  dialogs need; this modal is opened/closed by resources.js toggling `hidden`
+  on an always-present element (so resources.js can address #resource-modal,
+  its tabs, and its Edit/History panes directly) and has its own header
+  layout (subject line, tab switcher, Save/Delete actions) that the shared
+  head slot does not model. It still consumes the same tokens: var(--scrim)
+  and the var(--z-dialog-backdrop) band (app.css), and the same ARIA pattern
+  (role="dialog" aria-modal="true" aria-labelledby) as the shared macro.
 -->
 <div class="modal" id="resource-modal" hidden
      data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}"

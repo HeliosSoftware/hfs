@@ -2,7 +2,7 @@
 //!
 //! Mirrors `sof_conformance.rs` (SQLite) and `sof_conformance_postgres.rs` (PG)
 //! but wires the HTTP server's storage backend to a MongoDB container via
-//! `testcontainers`. Same fixture set (`crates/sof/tests/sql-on-fhir-v2/tests/`),
+//! `testcontainers`. Same fixture set (`crates/sof/tests/sql-on-fhir/tests/`),
 //! same comparator, same regression-floor pattern.
 //!
 //! The MongoDB aggregation emitter is at parity with the SQL backends: it
@@ -120,7 +120,7 @@ mod sof_conformance_mongodb_tests {
     }
 
     fn load_fixtures() -> Vec<Fixture> {
-        let dir = std::path::Path::new("../sof/tests/sql-on-fhir-v2/tests");
+        let dir = std::path::Path::new("../sof/tests/sql-on-fhir/tests");
         assert!(
             dir.exists(),
             "conformance fixture directory not found: {}",

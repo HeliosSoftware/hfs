@@ -16,7 +16,7 @@
 use askama::Template;
 use axum::{
     Extension,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
 };
@@ -25,7 +25,47 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::i18n::{I18n, RequestLocale};
-use crate::{RequestTenant, RequestVersion, WebState, current_status, render, settings_user_key};
+use crate::{
+    RequestTenant, RequestVersion, WebState, current_status, query_value, render, settings_user_key,
+};
+
+fn public_url_with_segments<'a>(
+    public_base_url: &str,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut url = reqwest::Url::parse(public_base_url)
+        .expect("WebState requires a valid HTTP(S) public base URL");
+    {
+        let mut path = url
+            .path_segments_mut()
+            .expect("HTTP(S) public base URL supports path segments");
+        path.pop_if_empty();
+        for segment in segments {
+            path.push(segment);
+        }
+    }
+    url.to_string().trim_end_matches('/').to_string()
+}
+
+fn recipient_base_url(state: &WebState, tenant: &RequestTenant) -> String {
+    recipient_base_url_value(
+        &state.public_base_url,
+        state.tenant_path_routing,
+        &tenant.id,
+    )
+}
+
+fn recipient_base_url_value(
+    public_base_url: &str,
+    tenant_path_routing: bool,
+    tenant_id: &str,
+) -> String {
+    if tenant_path_routing {
+        public_url_with_segments(public_base_url, [tenant_id])
+    } else {
+        public_base_url.to_string()
+    }
+}
 
 /// Log entries kept per submission. The whole settings document is capped at
 /// 256 KiB server-side, so the log must stay bounded.
@@ -87,7 +127,11 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub file_request_headers: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_submitted_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub aborted_at: String,
 }
 
 /// The `byTenant.<tenant>.bulkImport.submissions` object for this user.
@@ -184,7 +228,9 @@ struct SubmissionRow {
 struct ManifestRow {
     id: String,
     manifest_url: String,
-    last_submitted_at: String,
+    created_at: String,
+    can_submit: bool,
+    can_abort: bool,
 }
 
 struct LogLine {
@@ -211,9 +257,6 @@ struct BulkImportPage {
     available: bool,
     rows: Vec<SubmissionRow>,
     error: Option<String>,
-    /// Where every new submission goes (`HFS_BASE_URL`, #689) — shown in the
-    /// dialog so the fixed recipient is visible, not invisible.
-    recipient: String,
 }
 
 #[derive(Template)]
@@ -229,9 +272,15 @@ struct BulkImportDetailPage {
     created_at: String,
     status_label: String,
     auth: String,
+    client_id: String,
+    token_url: String,
+    can_finalize: bool,
+    terminal: bool,
+    sort: &'static str,
     manifests: Vec<ManifestRow>,
     log: Vec<LogLine>,
     error: Option<String>,
+    edit_open: bool,
 }
 
 /// Inline fragment returned by the test-authentication button.
@@ -248,6 +297,14 @@ struct TestAuthResult {
 
 fn parse_submission(value: &Value) -> Submission {
     serde_json::from_value(value.clone()).unwrap_or_default()
+}
+
+fn is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "stopped")
+}
+
+fn conflict(message: &str) -> Response {
+    (StatusCode::CONFLICT, message.to_string()).into_response()
 }
 
 /// `GET /ui/bulk-import` — the submissions list.
@@ -288,7 +345,6 @@ pub async fn page(
         available,
         rows,
         error: None,
-        recipient: state.public_base_url.trim_end_matches('/').to_string(),
     })
 }
 
@@ -328,7 +384,7 @@ pub async fn create(
         // The recipient is always this server's HFS_BASE_URL (#689) — typing
         // it per submission is how a submission ended up pointed at something
         // that is not a Bulk Data Submit endpoint (#686).
-        recipient_base_url: state.public_base_url.trim_end_matches('/').to_string(),
+        recipient_base_url: recipient_base_url(&state, &rt),
         auth: if form.auth == "backend-services" {
             form.auth
         } else {
@@ -368,6 +424,7 @@ pub async fn detail(
     rt: RequestTenant,
     principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     let i18n = I18n::new(locale);
     let status = current_status(&state, rv.0, &rt);
@@ -377,6 +434,24 @@ pub async fn detail(
         return Redirect::to("/ui/bulk-import").into_response();
     };
 
+    let sort = match query_value(query.as_deref(), "sort").as_deref() {
+        Some("oldest") => "oldest",
+        _ => "recent",
+    };
+
+    render_detail_page(i18n, status, id, s, None, false, sort)
+}
+
+fn render_detail_page(
+    i18n: I18n,
+    status: crate::Status,
+    id: String,
+    s: Submission,
+    error: Option<String>,
+    edit_open: bool,
+    sort: &'static str,
+) -> Response {
+    let terminal = is_terminal(&s.status);
     let mut manifests: Vec<ManifestRow> = s
         .manifests
         .iter()
@@ -385,11 +460,23 @@ pub async fn detail(
             ManifestRow {
                 id: mid.clone(),
                 manifest_url: m.manifest_url,
-                last_submitted_at: m.last_submitted_at,
+                created_at: m.created_at,
+                can_submit: !terminal && m.last_submitted_at.is_empty() && m.aborted_at.is_empty(),
+                can_abort: !terminal && !m.last_submitted_at.is_empty() && m.aborted_at.is_empty(),
             }
         })
         .collect();
-    manifests.sort_by(|a, b| a.id.cmp(&b.id));
+    manifests.sort_by(|a, b| {
+        let order = a
+            .created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id));
+        if sort == "oldest" {
+            order
+        } else {
+            order.reverse()
+        }
+    });
 
     let log: Vec<LogLine> = s
         .log
@@ -432,10 +519,16 @@ pub async fn detail(
         recipient: s.recipient_base_url,
         created_at: s.created_at,
         status_label: label,
-        auth: s.auth,
+        auth: s.auth.clone(),
+        client_id: s.client_id,
+        token_url: s.token_url,
+        can_finalize: s.status == "in-progress",
+        terminal,
+        sort,
         manifests,
         log,
-        error: None,
+        error,
+        edit_open,
     })
 }
 
@@ -449,6 +542,82 @@ pub async fn delete(
     let user_key = settings_user_key(principal.as_deref());
     let _ = patch_submission(&state, &user_key, &rt.id, &id, Value::Null).await;
     Redirect::to("/ui/bulk-import").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct EditSubmissionForm {
+    pub name: String,
+    #[serde(default)]
+    pub auth: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub token_url: String,
+}
+
+/// `POST /ui/bulk-import/{id}/edit` updates local presentation and transport
+/// settings. Protocol identity and accumulated submission state are immutable.
+pub async fn edit(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    Path(id): Path<String>,
+    axum::Form(form): axum::Form<EditSubmissionForm>,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+        return Redirect::to("/ui/bulk-import").into_response();
+    };
+    let auth = if form.auth == "backend-services" {
+        "backend-services"
+    } else {
+        "none"
+    };
+    let name = form.name.trim().to_string();
+    let (client_id, token_url) = if auth == "backend-services" {
+        (
+            form.client_id.trim().to_string(),
+            form.token_url.trim().to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    let tenant_id = rt.id.clone();
+    let submission_key = id.clone();
+    let patch = json!({
+        "byTenant": { tenant_id: { "bulkImport": { "submissions": { submission_key: {
+            "name": name,
+            "auth": auth,
+            "clientId": if client_id.is_empty() { Value::Null } else { json!(client_id.clone()) },
+            "tokenUrl": if token_url.is_empty() { Value::Null } else { json!(token_url.clone()) }
+        } } } } }
+    });
+    let Some(store) = &state.settings else {
+        return (StatusCode::BAD_GATEWAY, "settings store unavailable").into_response();
+    };
+    match store.patch_settings(&user_key, patch, None).await {
+        Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
+        Err(e) => {
+            s.name = form.name.trim().to_string();
+            s.auth = auth.to_string();
+            s.client_id = client_id;
+            s.token_url = token_url;
+            let i18n = I18n::new(locale);
+            let mut response = render_detail_page(
+                i18n,
+                current_status(&state, rv.0, &rt),
+                id,
+                s,
+                Some(e.to_string()),
+                true,
+                "recent",
+            );
+            *response.status_mut() = StatusCode::BAD_GATEWAY;
+            response
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -474,12 +643,17 @@ pub async fn add_manifest(
     let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
+    if is_terminal(&s.status) {
+        return conflict("terminal submissions cannot accept new manifests");
+    }
     let manifest = Manifest {
         manifest_url: form.manifest_url.trim().to_string(),
         fhir_base_url: form.fhir_base_url.trim().to_string(),
         output_format: form.output_format.trim().to_string(),
         file_request_headers: form.file_request_headers.trim().to_string(),
+        created_at: now_stamp(),
         last_submitted_at: String::new(),
+        aborted_at: String::new(),
     };
     let mid = uuid::Uuid::new_v4().to_string();
     s.manifests
@@ -549,9 +723,6 @@ fn kickoff_parameters(
         if !m.output_format.is_empty() {
             parameter.push(json!({ "name": "outputFormat", "valueString": m.output_format }));
         }
-        if let Some(old) = replaces {
-            parameter.push(json!({ "name": "replacesManifestUrl", "valueUrl": old }));
-        }
         for line in m.file_request_headers.lines() {
             if let Some((name, value)) = line.split_once(':') {
                 parameter.push(json!({ "name": "fileRequestHeader", "part": [
@@ -560,6 +731,9 @@ fn kickoff_parameters(
                 ]}));
             }
         }
+    }
+    if let Some(old) = replaces {
+        parameter.push(json!({ "name": "replacesManifestUrl", "valueUrl": old }));
     }
     json!({ "resourceType": "Parameters", "parameter": parameter })
 }
@@ -671,10 +845,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
 /// The URL a submission's kick-off is POSTed to — the one failure messages
 /// must name (#686).
 fn kickoff_target(submission: &Submission) -> String {
-    format!(
-        "{}/$bulk-submit",
-        submission.recipient_base_url.trim_end_matches('/')
-    )
+    public_url_with_segments(&submission.recipient_base_url, ["$bulk-submit"])
 }
 
 /// POSTs a kick-off to the recipient, returning
@@ -750,10 +921,7 @@ fn summarize_error_body(content_type: &str, body: &str) -> String {
 /// (submitter + submissionId, `Prefer: respond-async`), returning the poll
 /// URL the recipient hands back in `Content-Location`.
 async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, String> {
-    let target = format!(
-        "{}/$bulk-submit-status",
-        submission.recipient_base_url.trim_end_matches('/')
-    );
+    let target = public_url_with_segments(&submission.recipient_base_url, ["$bulk-submit-status"]);
     // Only the identifying parameters ride the status kick-off.
     let parameters = kickoff_parameters(submission, id, "", None, None);
     let identifying: Vec<Value> = parameters["parameter"]
@@ -858,10 +1026,14 @@ pub async fn submit_manifest(
     Path((id, mid)): Path<(String, String)>,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
-    if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
-        submit_with_id(&mut s, &id, Some(&mid)).await;
-        let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+        return Redirect::to("/ui/bulk-import").into_response();
+    };
+    if is_terminal(&s.status) || !manifest_can_submit(&s, &mid) {
+        return conflict("manifest is not eligible for submission");
     }
+    submit_with_id(&mut s, &id, Some(&mid)).await;
+    let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
@@ -873,17 +1045,43 @@ pub async fn submit_all(
     Path(id): Path<String>,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
-    if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
-        submit_with_id(&mut s, &id, None).await;
-        let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+        return Redirect::to("/ui/bulk-import").into_response();
+    };
+    if is_terminal(&s.status) || !s.manifests.keys().any(|mid| manifest_can_submit(&s, mid)) {
+        return conflict("submission has no eligible manifests");
     }
+    submit_with_id(&mut s, &id, None).await;
+    let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
+}
+
+fn parsed_manifest(submission: &Submission, mid: &str) -> Option<Manifest> {
+    submission
+        .manifests
+        .get(mid)
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+fn manifest_can_submit(submission: &Submission, mid: &str) -> bool {
+    parsed_manifest(submission, mid).is_some_and(|manifest| {
+        manifest.last_submitted_at.is_empty() && manifest.aborted_at.is_empty()
+    })
+}
+
+fn manifest_can_abort(submission: &Submission, mid: &str) -> bool {
+    parsed_manifest(submission, mid).is_some_and(|manifest| {
+        !manifest.last_submitted_at.is_empty() && manifest.aborted_at.is_empty()
+    })
 }
 
 async fn submit_with_id(submission: &mut Submission, id: &str, only: Option<&str>) {
     let mids: Vec<String> = submission.manifests.keys().cloned().collect();
     for mid in mids {
         if only.is_some_and(|o| o != mid) {
+            continue;
+        }
+        if !manifest_can_submit(submission, &mid) {
             continue;
         }
         submit_one_with_id(submission, id, &mid).await;
@@ -983,29 +1181,33 @@ async fn set_status(
     status: &str,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
-    if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
-        push_log(&mut s, format!("Marking submission {status}..."));
-        let parameters = kickoff_parameters(&s, &id, status, None, None);
-        match post_kickoff(&s, &parameters).await {
-            Ok((code, _, _)) if (200..300).contains(&code) => {
-                push_log(&mut s, format!("Recipient acknowledged ({code})."));
-                s.status = status.to_string();
-            }
-            Ok((code, content_type, body)) => {
-                push_log(
-                    &mut s,
-                    format!(
-                        "Recipient rejected the status change: {code}: {}",
-                        summarize_error_body(&content_type, &body)
-                    ),
-                );
-            }
-            Err(e) => {
-                push_log(&mut s, format!("Status change failed: {e}"));
-            }
-        }
-        let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+        return Redirect::to("/ui/bulk-import").into_response();
+    };
+    if s.status != "in-progress" {
+        return conflict("only in-progress submissions can change terminal status");
     }
+    push_log(&mut s, format!("Marking submission {status}..."));
+    let parameters = kickoff_parameters(&s, &id, status, None, None);
+    match post_kickoff(&s, &parameters).await {
+        Ok((code, _, _)) if (200..300).contains(&code) => {
+            push_log(&mut s, format!("Recipient acknowledged ({code})."));
+            s.status = status.to_string();
+        }
+        Ok((code, content_type, body)) => {
+            push_log(
+                &mut s,
+                format!(
+                    "Recipient rejected the status change: {code}: {}",
+                    summarize_error_body(&content_type, &body)
+                ),
+            );
+        }
+        Err(e) => {
+            push_log(&mut s, format!("Status change failed: {e}"));
+        }
+    }
+    let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
@@ -1063,8 +1265,8 @@ pub async fn keys() -> Response {
 }
 
 /// `GET /ui/bulk-import/empty-manifest.json` — an empty Bulk Export Manifest.
-/// Aborting a single manifest is spec'd as replacing it with an empty one;
-/// this is the empty one, hosted where the recipient can fetch it.
+/// Kept as a public compatibility endpoint for existing integrations; new
+/// per-manifest aborts use a replace-only kick-off.
 pub async fn empty_manifest() -> Response {
     axum::Json(json!({
         "transactionTime": now_stamp(),
@@ -1087,111 +1289,113 @@ pub async fn replace_manifest(
     axum::Form(form): axum::Form<ManifestForm>,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
-    if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
-        let old_url = s
-            .manifests
-            .get(&mid)
-            .and_then(|m| m["manifestUrl"].as_str())
-            .unwrap_or_default()
-            .to_string();
-        if !old_url.is_empty() {
-            let replacement = Manifest {
-                manifest_url: form.manifest_url.trim().to_string(),
-                fhir_base_url: form.fhir_base_url.trim().to_string(),
-                output_format: form.output_format.trim().to_string(),
-                file_request_headers: form.file_request_headers.trim().to_string(),
-                last_submitted_at: String::new(),
-            };
-            push_log(
-                &mut s,
-                format!(
-                    "Replacing manifest \"{old_url}\" with \"{}\"...",
-                    replacement.manifest_url
-                ),
-            );
-            let parameters =
-                kickoff_parameters(&s, &id, "in-progress", Some(&replacement), Some(&old_url));
-            match post_kickoff(&s, &parameters).await {
-                Ok((code, _, _)) if (200..300).contains(&code) => {
-                    push_log(&mut s, format!("Replacement accepted ({code})."));
-                    let mut entry = serde_json::to_value(&replacement).unwrap_or(Value::Null);
-                    entry["lastSubmittedAt"] = json!(now_stamp());
-                    s.manifests.insert(mid, entry);
-                }
-                Ok((code, content_type, body)) => {
-                    push_log(
-                        &mut s,
-                        format!(
-                            "Replacement rejected: {code}: {}",
-                            summarize_error_body(&content_type, &body)
-                        ),
-                    );
-                }
-                Err(e) => {
-                    push_log(&mut s, format!("Replacement failed: {e}"));
-                }
+    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+        return Redirect::to("/ui/bulk-import").into_response();
+    };
+    if is_terminal(&s.status) || !manifest_can_abort(&s, &mid) {
+        return conflict("manifest is not eligible for replacement");
+    }
+    let old_url = s
+        .manifests
+        .get(&mid)
+        .and_then(|m| m["manifestUrl"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    if !old_url.is_empty() {
+        let replacement = Manifest {
+            manifest_url: form.manifest_url.trim().to_string(),
+            fhir_base_url: form.fhir_base_url.trim().to_string(),
+            output_format: form.output_format.trim().to_string(),
+            file_request_headers: form.file_request_headers.trim().to_string(),
+            created_at: s
+                .manifests
+                .get(&mid)
+                .and_then(|value| value.get("createdAt"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            last_submitted_at: String::new(),
+            aborted_at: String::new(),
+        };
+        push_log(
+            &mut s,
+            format!(
+                "Replacing manifest \"{old_url}\" with \"{}\"...",
+                replacement.manifest_url
+            ),
+        );
+        let parameters =
+            kickoff_parameters(&s, &id, "in-progress", Some(&replacement), Some(&old_url));
+        match post_kickoff(&s, &parameters).await {
+            Ok((code, _, _)) if (200..300).contains(&code) => {
+                push_log(&mut s, format!("Replacement accepted ({code})."));
+                let mut entry = serde_json::to_value(&replacement).unwrap_or(Value::Null);
+                entry["lastSubmittedAt"] = json!(now_stamp());
+                s.manifests.insert(mid, entry);
             }
-            let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+            Ok((code, content_type, body)) => {
+                push_log(
+                    &mut s,
+                    format!(
+                        "Replacement rejected: {code}: {}",
+                        summarize_error_body(&content_type, &body)
+                    ),
+                );
+            }
+            Err(e) => {
+                push_log(&mut s, format!("Replacement failed: {e}"));
+            }
         }
+        let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
     }
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
-/// `POST /ui/bulk-import/{id}/manifests/{mid}/abort` — abort one manifest by
-/// replacing it with the empty manifest this server hosts. The empty
-/// manifest's URL is derived from the request's Host header, since that is
-/// the address the recipient reached us... the address the *browser* reached
-/// us on, which is the best externally-visible base the UI can know.
+/// `POST /ui/bulk-import/{id}/manifests/{mid}/abort` — retire one submitted
+/// manifest with a replace-only kick-off.
 pub async fn abort_manifest(
     State(state): State<WebState>,
     rt: RequestTenant,
     principal: Option<Extension<helios_auth::Principal>>,
-    headers: axum::http::HeaderMap,
     Path((id, mid)): Path<(String, String)>,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
-    if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
-        let old_url = s
-            .manifests
-            .get(&mid)
-            .and_then(|m| m["manifestUrl"].as_str())
-            .unwrap_or_default()
-            .to_string();
-        if !old_url.is_empty() {
-            let host = headers
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("localhost:8080");
-            let empty = Manifest {
-                manifest_url: format!("http://{host}/ui/bulk-import/empty-manifest.json"),
-                fhir_base_url: format!("http://{host}"),
-                ..Default::default()
-            };
-            push_log(&mut s, format!("Aborting manifest \"{old_url}\"..."));
-            let parameters =
-                kickoff_parameters(&s, &id, "in-progress", Some(&empty), Some(&old_url));
-            match post_kickoff(&s, &parameters).await {
-                Ok((code, _, _)) if (200..300).contains(&code) => {
-                    push_log(&mut s, format!("Abort accepted ({code})."));
-                    if let Some(entry) = s.manifests.get_mut(&mid) {
-                        entry["abortedAt"] = json!(now_stamp());
-                    }
-                }
-                Ok((code, content_type, body)) => {
-                    push_log(
-                        &mut s,
-                        format!(
-                            "Abort rejected: {code}: {}",
-                            summarize_error_body(&content_type, &body)
-                        ),
-                    );
-                }
-                Err(e) => {
-                    push_log(&mut s, format!("Abort failed: {e}"));
+    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+        return Redirect::to("/ui/bulk-import").into_response();
+    };
+    if is_terminal(&s.status) || !manifest_can_abort(&s, &mid) {
+        return conflict("manifest is not eligible for abort");
+    }
+    let old_url = s
+        .manifests
+        .get(&mid)
+        .and_then(|m| m["manifestUrl"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    if !old_url.is_empty() {
+        push_log(&mut s, format!("Aborting manifest \"{old_url}\"..."));
+        let parameters = kickoff_parameters(&s, &id, "in-progress", None, Some(&old_url));
+        match post_kickoff(&s, &parameters).await {
+            Ok((code, _, _)) if (200..300).contains(&code) => {
+                push_log(&mut s, format!("Abort accepted ({code})."));
+                if let Some(entry) = s.manifests.get_mut(&mid) {
+                    entry["abortedAt"] = json!(now_stamp());
                 }
             }
-            let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+            Ok((code, content_type, body)) => {
+                push_log(
+                    &mut s,
+                    format!(
+                        "Abort rejected: {code}: {}",
+                        summarize_error_body(&content_type, &body)
+                    ),
+                );
+            }
+            Err(e) => {
+                push_log(&mut s, format!("Abort failed: {e}"));
+            }
         }
+        let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
     }
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
@@ -1216,4 +1420,33 @@ pub async fn test_auth(
         Err(e) => (false, e),
     };
     render(TestAuthResult { ok, message })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recipient_base_preserves_prefix_and_adds_path_tenant() {
+        assert_eq!(
+            recipient_base_url_value("https://public.example/fhir", true, "acme"),
+            "https://public.example/fhir/acme"
+        );
+    }
+
+    #[test]
+    fn recipient_base_stays_unprefixed_for_header_only_routing() {
+        assert_eq!(
+            recipient_base_url_value("https://public.example/fhir", false, "acme"),
+            "https://public.example/fhir"
+        );
+    }
+
+    #[test]
+    fn public_url_builder_encodes_tenant_segments() {
+        assert_eq!(
+            recipient_base_url_value("https://public.example/fhir", true, "north clinic"),
+            "https://public.example/fhir/north%20clinic"
+        );
+    }
 }

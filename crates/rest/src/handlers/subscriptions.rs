@@ -41,7 +41,8 @@ where
 
     let snapshot = resolve_snapshot(&state, engine, &tenant, &id).await?;
 
-    let status_resource = build_subscription_status(&snapshot, &id, state.base_url());
+    let subscription_url = state.public_url_for_request(&tenant, ["Subscription", id.as_str()]);
+    let status_resource = build_subscription_status(&snapshot, &subscription_url);
 
     Ok((StatusCode::OK, Json(status_resource)).into_response())
 }
@@ -240,11 +241,8 @@ where
         .generate_token(tenant.tenant_id(), &id);
 
     // Build WebSocket URL from the base URL.
-    let ws_base = state
-        .base_url()
-        .replace("http://", "ws://")
-        .replace("https://", "wss://");
-    let ws_url = format!("{}/ws/subscriptions/bind", ws_base);
+    let ws_http_url = state.public_url_for_request(&tenant, ["ws", "subscriptions", "bind"]);
+    let ws_url = websocket_url(&ws_http_url)?;
 
     // Return Parameters resource per FHIR spec.
     let parameters = json!({
@@ -268,8 +266,26 @@ where
     Ok((StatusCode::OK, Json(parameters)).into_response())
 }
 
+fn websocket_url(http_url: &str) -> RestResult<String> {
+    let mut ws_url = url::Url::parse(http_url).map_err(|error| RestError::InternalError {
+        message: format!("failed to build WebSocket URL: {error}"),
+    })?;
+    let ws_scheme = if ws_url.scheme() == "https" {
+        "wss"
+    } else {
+        "ws"
+    };
+    ws_url
+        .set_scheme(ws_scheme)
+        .map_err(|_| RestError::InternalError {
+            message: "failed to set WebSocket URL scheme".to_string(),
+        })?;
+
+    Ok(ws_url.to_string())
+}
+
 /// Builds a SubscriptionStatus resource for the $status response.
-fn build_subscription_status(sub: &StatusSnapshot, id: &str, base_url: &str) -> serde_json::Value {
+fn build_subscription_status(sub: &StatusSnapshot, subscription_url: &str) -> serde_json::Value {
     if uses_backport_ig(sub.fhir_version) {
         // R4 backport: return Parameters resource
         json!({
@@ -278,7 +294,7 @@ fn build_subscription_status(sub: &StatusSnapshot, id: &str, base_url: &str) -> 
                 {
                     "name": "subscription",
                     "valueReference": {
-                        "reference": format!("{}/Subscription/{}", base_url, id)
+                        "reference": subscription_url
                     }
                 },
                 {
@@ -307,7 +323,7 @@ fn build_subscription_status(sub: &StatusSnapshot, id: &str, base_url: &str) -> 
             "type": "query-status",
             "eventsSinceSubscriptionStart": sub.events_since_start,
             "subscription": {
-                "reference": format!("Subscription/{}", id)
+                "reference": subscription_url
             },
             "topic": sub.topic_url
         })
@@ -389,5 +405,25 @@ mod tests {
         );
         assert_eq!(bare.status, SubscriptionStatusCode::Requested);
         assert_eq!(bare.topic_url, "");
+    }
+
+    #[test]
+    fn public_subscription_urls_keep_prefix_and_tenant() {
+        let snapshot = StatusSnapshot {
+            status: SubscriptionStatusCode::Active,
+            topic_url: "https://example.test/topic".to_string(),
+            events_since_start: 1,
+            fhir_version: FhirVersion::default(),
+        };
+        let subscription_url = "https://public.example/fhir/acme/Subscription/sub-1";
+        let status = build_subscription_status(&snapshot, subscription_url);
+        assert_eq!(
+            status["parameter"][0]["valueReference"]["reference"],
+            subscription_url
+        );
+        assert_eq!(
+            websocket_url("https://public.example/fhir/acme/ws/subscriptions/bind").unwrap(),
+            "wss://public.example/fhir/acme/ws/subscriptions/bind"
+        );
     }
 }

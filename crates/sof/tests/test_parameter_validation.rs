@@ -108,8 +108,8 @@ fn apply_result_filtering(
     match params.format {
         ContentType::Json | ContentType::NdJson => apply_json_filtering(output_data, params),
         ContentType::Csv | ContentType::CsvWithHeader => apply_csv_filtering(output_data, params),
-        ContentType::Parquet => {
-            // Parquet filtering is not implemented in this scope
+        ContentType::Parquet | ContentType::ArrowIpc => {
+            // Columnar-format filtering is not implemented in this scope
             Ok(output_data)
         }
     }

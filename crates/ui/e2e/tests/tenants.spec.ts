@@ -1,4 +1,8 @@
 import { test, expect } from "../pages/fixtures";
+import {
+  CANONICAL_BUTTON_GEOMETRY,
+  readButtonGeometries,
+} from "../pages/button-geometry";
 
 // Tenant maintenance (/ui/tenants): the htmx add-tenant slide-over, the live
 // search filter, and per-row delete (hx-confirm). Skips itself if this backend
@@ -64,13 +68,21 @@ test.describe("tenants", () => {
     await tenants.addForm.locator("input[name=id]").fill(id);
     await tenants.addForm.locator("input[name=display_name]").fill("Second");
     await tenants.addForm.locator("button[type=submit]").click();
-    await expect(page.locator("#tenant-rows .form-error")).toContainText("already exists");
+    // The dialog's own submit error (#681 adenda): rendered inside the panel
+    // via an out-of-band swap, not the page-level #tenant-rows banner, which
+    // sits behind the modal scrim while the dialog is open.
+    await expect(page.locator("#tenant-add-error")).toContainText("already exists");
     await expect(tenants.addForm.locator("input[name=id]")).toHaveValue(id);
     await expect(tenants.addForm.locator("input[name=display_name]")).toHaveValue("Second");
   });
 
   test("typing a display name mirrors a slug into the tenant id", async ({ tenants }) => {
     await tenants.addToggle.click();
+    const actionMetrics = await readButtonGeometries(
+      tenants.addForm.locator(".addbox__actions .btn"),
+    );
+    expect(actionMetrics).toHaveLength(2);
+    for (const geometry of actionMetrics) expect(geometry).toEqual(CANONICAL_BUTTON_GEOMETRY);
     await tenants.addForm.locator("input[name=display_name]").fill("Acme Health");
     await expect(tenants.addForm.locator("input[name=id]")).toHaveValue("acme-health");
     await tenants.addForm.locator("input[name=display_name]").fill("  Ünïcode & Co.  ");

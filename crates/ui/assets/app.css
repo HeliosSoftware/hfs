@@ -62,6 +62,19 @@
   --divider-glint: #ffffff;
   /* Outline-only pills (version selector) */
   --outline: #e4e4e4;
+  /* Dialogs (#681): one scrim for every modal treatment (Edit Resource's
+     .modal__backdrop and the addbox--modal disclosures' summary-as-backdrop)
+     so a future change to the darken amount is a single edit. Black at 45%
+     is the value Edit Resource shipped with; re-declared (same value, for
+     now) under [data-theme="dark"] below as the point to retune it — flat
+     black reads differently over a dark page, but that tuning is out of
+     scope here. One shared z-index band keeps both parts of every dialog
+     above the rest of the page (sidebar, dropdown menus) without the
+     per-dialog 20/40/50/100 spread this replaces; .menu__panel dropdowns are
+     not dialogs and keep their own stacking. */
+  --scrim: rgb(0 0 0 / 45%);
+  --z-dialog-backdrop: 100;
+  --z-dialog-panel: 110;
   /* Chart */
   --grid-line: #dcdcdc;
   /* Series palette (#555): six distinguishable strokes, legible on both
@@ -82,6 +95,14 @@
      opposite move per theme — darker on the light tint, lighter on the dark —
      so it is theme-specific (see the dark block). */
   --accent-text: #0a5f96;
+  --json-key: #0a5f96;
+  --json-string: #137333;
+  --json-number: #b4232d;
+  --json-literal: #6f42c1;
+  /* Destructive text clears 7:1 on the light card surface; the soft hover
+     fill keeps 5.8:1 contrast with the same foreground. */
+  --danger: #a61b12;
+  --danger-soft: #f0dfde;
   /* Menu panel input */
   --input-bg: #f5f5f5;
   /* Pill scrollbars: thin bar, fully-rounded track and thumb. */
@@ -116,6 +137,16 @@
   --muted: #a0a0a0;
   /* Selected-item accent text on the dark tint: lighter, to clear 4.5:1. */
   --accent-text: #7cc9ff;
+  --json-key: #7cc9ff;
+  --json-string: #7ee787;
+  --json-number: #ff7b72;
+  --json-literal: #d2a8ff;
+  /* Theme-specific destructive pair: 7.6:1 on the card and 5.6:1 on soft. */
+  --danger: #ff9a90;
+  --danger-soft: #453534;
+  /* Same value as light for now (#681) — the point to adjust from if flat
+     black at 45% is later found to read too heavy/light over the dark bg. */
+  --scrim: rgb(0 0 0 / 45%);
   --divider: #000000;
   --divider-glint: rgb(255 255 255 / 12%);
   --outline: #353535;
@@ -576,27 +607,6 @@ button.menu__option {
   gap: 16px;
 }
 
-.lang-switcher {
-  display: flex;
-  gap: 4px;
-}
-
-.lang-switcher a {
-  padding: 4px 8px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--muted);
-  text-decoration: none;
-}
-
-.lang-switcher a[aria-current="true"] {
-  background: var(--surface);
-  border: 1px solid var(--surface-border);
-  color: var(--text-strong);
-}
-
 .theme-toggle {
   display: flex;
   align-items: center;
@@ -642,6 +652,106 @@ button.menu__option {
   box-shadow: var(--surface-shadow);
   font-weight: 500;
   color: var(--muted);
+  overflow: hidden;
+}
+
+/* The user menu (#725): the avatar doubles as the disclosure summary; the
+   panel hangs off the topbar's right edge at a width for a name + email. */
+.menu--user .menu__panel {
+  width: 264px;
+}
+
+.topbar__avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Account-card layout (#725, proposal B): centered identity block, the
+   language selector as a segmented row, Sign out full width. */
+.user-menu__id {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 14px 4px 12px;
+  text-align: center;
+}
+
+.user-menu__avatar {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: var(--accent-strong);
+  color: #ffffff;
+  font-weight: 600;
+  font-size: 20px;
+}
+
+.user-menu__name {
+  max-width: 100%;
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-menu__hint {
+  max-width: 100%;
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-menu__seg {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  margin: 2px 2px 4px;
+  background: var(--accent-soft);
+  border-radius: 999px;
+}
+
+.user-menu__seg a {
+  flex: 1;
+  padding: 6px 0;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  text-align: center;
+  text-decoration: none;
+}
+
+.user-menu__seg a[aria-current="true"] {
+  background: var(--surface);
+  color: var(--text-strong);
+  box-shadow: var(--surface-shadow);
+}
+
+.user-menu__out {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 4px 2px 2px;
+  padding: 8px 0;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  font-weight: 500;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.user-menu__out:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
 }
 
 .content {
@@ -655,6 +765,20 @@ button.menu__option {
    specificity. */
 
 /* ---------- Cards ---------- */
+
+/* Padded body for card content that is not a table or a card-head — form
+   panes, field lists. `.card` itself stays padding-free (tables run edge to
+   edge), which left bare content flush against the border (#649). */
+.card__body {
+  padding: 14px;
+}
+
+/* An empty-state pane: breathing room between the lede and its call to
+   action (the lede's own margin is 0 for the page head, where the section
+   gap already separates it). */
+.card__body > .page-head__lede {
+  margin-bottom: 14px;
+}
 
 .card {
   background: var(--surface);
@@ -1221,7 +1345,7 @@ button.pill {
   position: absolute;
   right: 0;
   top: 50px;
-  z-index: 20;
+  z-index: var(--z-dialog-panel);
   width: 340px;
   padding: 20px;
   background: var(--surface);
@@ -1246,6 +1370,27 @@ button.pill {
   font-weight: 500;
   color: var(--muted);
   margin-bottom: 6px;
+}
+
+/* Required-field marker (#680): the `required` attribute on the input is the
+   single source of truth, and this is the single point of flip. It reaches
+   every dialog field (present and future) without touching a template —
+   `.field` wraps `label > span.field__label + input.field__input`, and the
+   search builder's URL input has no visible label of its own, so its marker
+   lands on the query-builder tag chip instead. Empty alt text (the `/ ""`
+   in `content`) keeps this purely visual: assistive tech already announces
+   "required" from the input's `required` attribute, which stays in the
+   markup. To change the convention later (e.g. an `(optional)` suffix
+   instead of an accent asterisk on required fields), edit only this rule —
+   swap `:required` for `:optional` and change `content` — never the
+   templates. Child combinator (`> :required`) keeps bulk-import's
+   `fieldset.field` (which nests its own `label.field` fields) from matching
+   on a nested required input and marking the fieldset's legend instead. */
+.field:has(> :required) > .field__label::after,
+.query-builder__row:has(> .query-builder__url:required) > .query-builder__tag::after {
+  content: " *" / "";
+  color: var(--accent);
+  font-style: normal;
 }
 
 .field__input {
@@ -1278,6 +1423,18 @@ textarea.field__input {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* The native dropdown arrow hugs the border regardless of padding, so draw
+   our own chevron with the same inset the text gets. The muted gray reads on
+   both themes. */
+select.field__input {
+  appearance: none;
+  padding-right: 36px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23888888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px;
+}
+
 .field__hint {
   display: block;
   font-size: 12px;
@@ -1292,7 +1449,19 @@ textarea.field__input {
   justify-content: flex-end;
 }
 
-.spinner {
+/* Add Tenant dialog's own submit-error slot (#681 adenda): sits below the
+   fields, above the action row (see #tenant-add-error in tenants.html and
+   partials/tenant_add_error.html). `.alert`'s own margin is bottom-only
+   (sized for a banner that precedes content, tenant_rows.html); scoped here
+   by id, not on `.alert` itself, so this does not add a gap under every
+   other alert use. The `.alert` selector, not the bare id, keeps the empty
+   (no-error) container from reserving this space. */
+#tenant-add-error.alert {
+  margin-top: 16px;
+}
+
+.spinner,
+.btn[aria-busy="true"]::after {
   width: 14px;
   height: 14px;
   border-radius: 50%;
@@ -1304,15 +1473,43 @@ textarea.field__input {
   to { transform: rotate(360deg); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .spinner { animation: none; }
+  .spinner,
+  .btn[aria-busy="true"]::after { animation: none; }
 }
 
-/* In-table provisioning state for tenants being created in the background
-   (#581): the row polls in via the rows fragment until the job finishes. */
-.provisioning {
+/* The busy button (#679), driven by busy.js: the label yields its space to
+   the ring — width stays put, the accessible name stays in the tree. Under
+   reduced motion the ring remains as a static glyph (the animation stops
+   above); a merely-dimmed label would read as disabled, not working. */
+.btn[aria-busy="true"] {
+  position: relative;
+  color: transparent;
+  cursor: progress;
+}
+
+.btn[aria-busy="true"]::after {
+  content: "";
+  position: absolute;
+  top: calc(50% - 7px);
+  left: calc(50% - 7px);
+}
+
+/* The ring must not inherit accent-on-accent on the filled button — the
+   track all but vanishes in dark theme. Explicit white, not currentColor:
+   the button's color is transparent while busy. */
+.btn--primary[aria-busy="true"]::after {
+  border-color: rgb(255 255 255 / 45%);
+  border-top-color: #ffffff;
+}
+
+/* Inline working state (#679): spinner plus a short label, role="status" in
+   the markup so it announces. Also the tenants in-table provisioning row
+   (#581), which polls in via the rows fragment until the job finishes. */
+.busy-status {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  margin: 0;
   font-size: 13px;
   color: var(--muted);
 }
@@ -1330,11 +1527,17 @@ textarea.field__input {
    same no-JS <details> mechanics, presented as a modal. While open, the
    summary itself stretches over the viewport as the backdrop, so clicking
    outside the panel closes the dialog without any script. */
-.addbox--modal[open] > summary {
+.addbox--modal[open] > summary.btn {
   position: fixed;
   inset: 0;
-  z-index: 40;
-  background: rgb(10 14 20 / 45%);
+  z-index: var(--z-dialog-backdrop);
+  /* The summary doubles as the button (.btn/.btn--primary), whose fixed
+     height would beat the inset stretch and shrink the backdrop to a bar
+     across the top of the viewport. */
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: var(--scrim);
   border-radius: 0;
   cursor: default;
   /* The summary's label is a text node, which `> *` cannot hide. */
@@ -1350,7 +1553,7 @@ textarea.field__input {
   top: 50%;
   left: 50%;
   right: auto;
-  z-index: 50;
+  z-index: var(--z-dialog-panel);
   width: min(460px, calc(100vw - 40px));
   max-height: calc(100vh - 80px);
   overflow-y: auto;
@@ -1358,16 +1561,27 @@ textarea.field__input {
 }
 
 .field__hint--error {
-  color: rgb(220 38 38);
+  color: var(--danger);
 }
 
-.form-error {
-  margin-bottom: 12px;
+/* The one error treatment (#676): danger tokens, so it holds in both themes.
+   Block by default; the inline variant sits next to the button that raised
+   the error. */
+.alert {
+  display: block;
+  margin: 0 0 12px;
   padding: 10px 14px;
+  border: 1px solid var(--danger);
   border-radius: 10px;
-  background: rgb(220 38 38 / 10%);
-  color: #dc2626;
-  font-size: 14px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.alert--inline {
+  display: inline-block;
+  margin: 0;
+  padding: 5px 10px;
 }
 
 .col-num {
@@ -1420,10 +1634,11 @@ textarea.field__input {
 .icon-button {
   display: inline-grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
   border: 0;
-  border-radius: 8px;
+  border-radius: 9px;
   background: transparent;
   color: var(--muted);
   cursor: pointer;
@@ -1659,6 +1874,22 @@ textarea.field__input {
   font-size: 13px;
   color: var(--muted);
 }
+
+.back-link,
+.back-link:visited {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+
+.back-link:hover {
+  text-decoration: underline;
+}
+
+.back-link:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
 }
 
 @layer pages {
@@ -1713,6 +1944,7 @@ textarea.field__input {
 .btn {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
   height: 30px;
   padding: 0 12px;
   font: inherit;
@@ -1745,8 +1977,6 @@ textarea.field__input {
 }
 
 .btn--primary {
-  height: 36px;
-  padding: 0 18px;
   color: #ffffff;
   background: var(--accent-strong);
   border-color: var(--accent-strong);
@@ -1755,6 +1985,12 @@ textarea.field__input {
 .btn--primary:hover {
   background: var(--accent-strong);
   filter: brightness(1.08);
+}
+
+.btn--icon {
+  width: 30px;
+  padding: 0;
+  justify-content: center;
 }
 
 .btn:disabled {
@@ -1834,15 +2070,6 @@ textarea.field__input {
   color: var(--muted);
 }
 
-.query-error {
-  margin: 0 0 12px;
-  padding: 10px 14px;
-  font-size: 13px;
-  color: var(--text);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent);
-  border-radius: 10px;
-}
 
 @media (max-width: 900px) {
   .query-form {
@@ -1909,8 +2136,6 @@ textarea.field__input {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 38px;
-  padding: 0 14px;
   white-space: nowrap;
 }
 
@@ -1925,6 +2150,18 @@ textarea.field__input {
   right: 0;
   width: 380px;
   max-width: 90vw;
+}
+
+/* Short action and sort menus keep the shared popover behavior without
+   inheriting the account/recent-search panel width. */
+.menu__panel--compact {
+  width: max-content;
+  min-width: 140px;
+  padding: 8px;
+}
+
+.menu__panel--compact .menu__option {
+  white-space: nowrap;
 }
 }
 
@@ -2009,8 +2246,9 @@ textarea.field__input {
 .history__banner--same { color: var(--muted); }
 
 .history__banner--error {
-  background: var(--accent-soft);
-  border-color: var(--accent);
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 /* ---- the diff ---- */
@@ -2041,10 +2279,6 @@ textarea.field__input {
   flex: 0 1 280px;
 }
 
-.query-builder__save .btn {
-  height: 36px;
-}
-
 .query-builder__hint {
   flex: 1;
   margin: 0 0 8px;
@@ -2070,6 +2304,11 @@ textarea.field__input {
   .menu__panel--right {
     right: auto;
     left: 0;
+  }
+
+  .toolbar .menu__panel--right.menu__panel--compact {
+    right: 0;
+    left: auto;
   }
 }
 
@@ -2255,6 +2494,68 @@ textarea.field__input {
   min-width: 0;
 }
 
+/* The right-hand meta of a rail item — the resource type on the SQL rails
+   (#649, Figma 420-2): quiet right-aligned text, not a count pill. */
+.filter-rail__meta {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+/* The JSON / SQL editor pane (#649): the design's inner inset box — mono at
+   an explicit size, generous height, vertical resize only. */
+.json-editor {
+  display: block;
+  width: 100%;
+  min-height: 320px;
+  padding: 14px;
+  box-sizing: border-box;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--input-bg, var(--surface));
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+/* Right-aligned actions row at the foot of a form pane. */
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.json-editor--short {
+  min-height: 120px;
+}
+
+.json-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* The collapsible JSON fold's summary rides .card-head; the chevron flips
+   when the fold opens, like the app's other disclosures. */
+details.json-fold > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+details.json-fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.json-fold[open] > summary .icon {
+  transform: rotate(180deg);
+}
+
 .filter-rail__item:hover {
   background: var(--accent-soft);
 }
@@ -2423,17 +2724,24 @@ textarea.field__input {
   border-bottom: 0;
 }
 
-.data-table__empty td {
+.data-table__empty td,
+.empty-state {
+  margin: 0;
   color: var(--muted);
   text-align: center;
   padding: 32px 12px;
 }
 
-.data-table tbody tr:hover td,
+
+/* Merge of two independent intents, 2026-08-28:
+   - main excluded the empty-state row from hover highlighting, so "no
+     results" no longer lights up under the cursor;
+   - this branch added `aria-current`, the convention every other selected
+     element in this file already uses (.chip, .tab, .nav-item,
+     .filter-rail__item), so a selected row paints like everything else.
+   They touch different selectors in the same list; both are kept. */
+.data-table tbody tr:not(.data-table__empty):hover td,
 .data-table tbody tr[aria-selected="true"] td,
-/* `aria-current` is the convention every other selected element in this file
-   uses (.chip, .tab, .nav-item, .filter-rail__item); tables joined it on
-   2026-08-27 so a selected row paints like everything else. */
 .data-table tbody tr[aria-current="true"] td {
   background: var(--accent-soft);
 }
@@ -2611,6 +2919,198 @@ textarea.field__input {
 }
 
 @layer pages {
+/* Bulk Import detail: consistent rhythm between its non-empty cards. */
+.bulk-import-section {
+  margin-bottom: 16px;
+}
+
+.bulk-import-summary-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px 24px;
+  align-items: start;
+}
+
+.bulk-import-summary-card > .kv-grid {
+  margin-bottom: 0;
+}
+
+.bulk-import-summary__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.bulk-import-summary__actions > form,
+.bulk-import-summary__actions > details,
+.bulk-import-manifest-row > form,
+.bulk-import-manifest-menu__panel form {
+  margin: 0;
+}
+
+.bulk-import-manifests-card {
+  padding-top: 20px;
+  overflow: visible;
+  border-top: 1px solid var(--surface-border);
+}
+
+.bulk-import-manifests-card .toolbar {
+  justify-content: space-between;
+}
+
+.bulk-import-sort__label {
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.bulk-import-sort__chevron {
+  transition: transform 120ms ease;
+}
+
+.bulk-import-sort[open] .bulk-import-sort__chevron {
+  transform: rotate(180deg);
+}
+
+.bulk-import-manifest-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.bulk-import-manifest-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 30px;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.bulk-import-manifest-row__url {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bulk-import-manifest-menu {
+  position: relative;
+}
+
+.bulk-import-manifest-menu > summary {
+  list-style: none;
+}
+
+.bulk-import-manifest-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.bulk-import-manifest-menu__trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.bulk-import-manifest-menu__trigger:hover,
+.bulk-import-manifest-menu__trigger:focus-visible {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.bulk-import-manifest-menu__trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bulk-import-manifest-menu__panel {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 150px;
+  padding: 6px;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--surface-shadow);
+}
+
+.bulk-import-manifest-menu__item {
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.bulk-import-manifest-menu__item:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+
+.bulk-import-manifest-menu__item--danger {
+  color: var(--danger);
+}
+
+.bulk-import-section button:disabled,
+.page-head [data-bulk-import-add-manifest]:disabled,
+.bulk-import-manifest-menu__item:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+@media (max-width: 900px) {
+  .bulk-import-summary-card {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .bulk-import-summary__actions {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 520px) {
+  .bulk-import-manifests-card {
+    padding-top: 14px;
+  }
+
+  .bulk-import-manifest-row {
+    gap: 7px;
+    padding: 8px;
+  }
+}
+
+/* Status cards have no actions or content after their sole grid. */
+#bulk-status.bulk-import-section > .kv-grid:only-child {
+  margin-bottom: 0;
+}
+
 /* Detail panel (right rail on the SearchParameter viewer) */
 
 .detail {
@@ -3319,10 +3819,8 @@ textarea.field__input {
   color: var(--muted);
 }
 
-/* The Ask button keeps the shared primary metrics (36px — design-system.spec
-   holds every page to one primary button); only its icon gap is local. */
-.nl-input .btn--primary {
-  gap: 8px;
+/* The Ask button keeps the shared action-button scale. */
+.nl-input .btn {
   white-space: nowrap;
 }
 
@@ -3378,8 +3876,9 @@ textarea.field__input {
 }
 
 .nl-answer--error {
-  background: var(--input-bg);
-  border-color: var(--muted);
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 .nl-answer__caveats-heading {
@@ -3462,12 +3961,6 @@ textarea.field__input {
 }
 
 .query-builder__copy {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 38px;
-  height: 38px;
-  padding: 0;
   color: var(--muted);
 }
 
@@ -3652,7 +4145,7 @@ textarea.field__input {
 
 .json-line__fold {
   flex: 0 0 auto;
-  width: 16px;
+  width: 24px;
   text-align: center;
   color: var(--muted);
   user-select: none;
@@ -3660,7 +4153,15 @@ textarea.field__input {
 
 .json-line__arrow {
   cursor: pointer;
-  display: inline-block;
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
   transition: transform 0.1s;
 }
 
@@ -3673,11 +4174,11 @@ textarea.field__input {
 .json-line--collapsed .json-line__summary { display: inline; padding-left: 2px; }
 
 /* Syntax highlighting. */
-.jt--key { color: var(--accent); }
-.jt--string { color: #1a7f37; }
-.jt--number { color: #cf222e; }
+.jt--key { color: var(--json-key); }
+.jt--string { color: var(--json-string); }
+.jt--number { color: var(--json-number); }
 .jt--bool,
-.jt--null { color: #8250df; font-weight: 600; }
+.jt--null { color: var(--json-literal); font-weight: 600; }
 .jt--punct { color: var(--muted); }
 
 /* ---- version rail ---- */
@@ -3718,16 +4219,8 @@ textarea.field__input {
 }
 .editor-validity--ok { color: var(--accent); }
 
-.editor__parse-error {
-  padding: 12px 14px;
-  margin-bottom: 12px;
-  font-size: 13px;
-  background: var(--input-bg);
-  border: 1px solid var(--muted);
-  border-radius: 10px;
-}
 
-.editor__parse-error code {
+.alert code {
   display: block;
   margin-top: 6px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -3839,7 +4332,7 @@ textarea.field__input {
 .editor-row__error {
   margin: 2px 0 4px 0;
   font-size: 12px;
-  color: #cf222e;
+  color: var(--danger);
 }
 
 /* ---- "what can I add here?" ---- */
@@ -4086,6 +4579,16 @@ textarea.field__input {
   gap: 16px;
 }
 
+/* In a row head the actions sit beside the title, not under a lede: flex
+   line-up at the title's level, no conformance-page top offset. */
+.page-head--row .page-head__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 0;
+}
+
 .filter-rail__item--on {
   background: var(--accent-soft);
   color: var(--text-strong);
@@ -4098,7 +4601,7 @@ textarea.field__input {
 .modal {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: var(--z-dialog-backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4108,7 +4611,7 @@ textarea.field__input {
 .modal__backdrop {
   position: absolute;
   inset: 0;
-  background: rgb(0 0 0 / 45%);
+  background: var(--scrim);
 }
 
 .modal__box {
@@ -4202,11 +4705,11 @@ textarea.field__input {
   background: #eaf6ec;
 }
 .modal__status--error {
-  color: #cf222e;
+  color: var(--danger);
   font-weight: 600;
-  background: #ffebe9;
-  border-top: 1px solid #ffcdca;
-  border-bottom: 1px solid #ffcdca;
+  background: var(--danger-soft);
+  border-top: 1px solid var(--danger);
+  border-bottom: 1px solid var(--danger);
 }
 
 .modal__body {
@@ -4242,10 +4745,16 @@ textarea.field__input {
    The label names the selected type ("Create new Patient") and can grow long
    (#605) — the button caps its width and truncates the label rather than
    pushing the header row wider than the page. */
-.resources-create {
+.resources-create-wrap {
   flex: 0 1 auto;
   min-width: 0;
   max-width: 320px;
+}
+
+.resources-create {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .resources-create__label {
@@ -4583,6 +5092,15 @@ textarea.field__input {
   color: var(--text);
 }
 
+/* Spacing between the dropzone and its error banner (pre-existing gap,
+   fixed per user QA on #681): `.alert`'s own margin is bottom-only, sized
+   for a banner that precedes content elsewhere, so it leaves no gap above
+   `.batch-drop`. Scoped by id, not on `.alert` itself, to avoid affecting
+   any other `.alert` use on the page. */
+#batch-upload-error.alert {
+  margin-top: 16px;
+}
+
 .request-strip {
   display: flex;
   align-items: center;
@@ -4595,10 +5113,19 @@ textarea.field__input {
 }
 
 .request-strip__label {
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+/* The request line uses the app's mono stack at an explicit size — with no
+   rule it fell back to the UA's default monospace, visibly larger than the
+   surrounding text (#674). */
+.request-strip code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
 }
 
 .batch-tabs {
@@ -4607,7 +5134,22 @@ textarea.field__input {
   margin-bottom: 8px;
 }
 
+/* Card content sits inset from the card border (#674): the tab row, entry
+   list, and JSON pane pick up the card's horizontal padding instead of
+   running edge-to-edge. */
+.card > .batch-tabs {
+  margin: 12px 14px 8px;
+}
+
+.card > .batch-rows,
+.card > .batch-json {
+  margin: 0 14px 12px;
+}
+
 .batch-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   padding: 8px 14px;
   border: 1px solid var(--divider);
   border-radius: 999px;
@@ -4696,16 +5238,47 @@ textarea.field__input {
   overflow-x: auto;
 }
 
+.batch-row__body .json-view,
+.batch-json .json-view {
+  padding: 0;
+  max-height: 60vh;
+}
+
+.json-view__fallback {
+  margin: 0;
+  white-space: pre;
+  font: inherit;
+}
+
 .batch-footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
   margin-top: 14px;
 }
 
-.batch-footer__right {
-  display: flex;
-  gap: 8px;
+/* #679: one busy region serves both the parse and execute phases; sticky
+   keeps it in view when a large plan pushes the bottom footer past the
+   viewport (#675's scroll problem, again). */
+.batch-busy {
+  position: sticky;
+  bottom: 12px;
+  width: fit-content;
+  margin-top: 12px;
+  padding: 6px 12px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 9px;
+  box-shadow: var(--surface-shadow);
+}
+
+.batch-footer--top {
+  margin: 0 0 12px;
+}
+
+.batch-footer--end {
+  justify-content: flex-end;
 }
 
 .batch-badge {
@@ -4724,10 +5297,27 @@ textarea.field__input {
   color: var(--muted);
 }
 
-.batch-error {
-  margin-top: 10px;
-  color: var(--danger);
+/* The card head's right-hand cluster (#729): created count beside the
+   status badge. */
+.card-head__meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
+
+.batch-created {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The stage takes programmatic focus when revealed (#679); it is not
+   keyboard-reachable, so the browser's default ring around the whole
+   section is noise (#726). */
+#batch-preflight:focus {
+  outline: none;
+}
+
 
 .batch-json {
   margin: 0;
@@ -4897,6 +5487,162 @@ textarea.field__input {
   gap: 8px;
   align-items: center;
 }
+
+/* ---- Bulk Export against the Figma frame (#735) ---------------------- */
+
+.bulk-export-form__name {
+  max-width: 420px;
+}
+
+/* A small standalone section heading between cards. */
+.form-legend {
+  margin: 4px 2px -8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+/* The app's radio-group treatment: one selectable card per choice. */
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+}
+
+.choice-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.choice-card:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.choice-card:has(input:focus-visible) {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.choice-card input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.choice-card__title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.choice-card__hint {
+  margin-left: 26px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* Uppercase-labelled filter fields side by side. */
+.field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+.field-row .field__label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ---- Active Exports job cards (#735) --------------------------------- */
+
+.job-card {
+  padding: 14px;
+}
+
+.job-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.job-card__name {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.job-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.progress {
+  height: 8px;
+  margin: 12px 0 10px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  overflow: hidden;
+}
+
+.progress__bar {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.progress--complete .progress__bar {
+  background: var(--ok);
+}
+
+.progress--failed .progress__bar,
+.progress--cancelled .progress__bar {
+  background: var(--danger);
+}
+
+.job-card__meta {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.job-card__files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.job-card__files a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.job-card__files a:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
 }
 
 @layer pages {
@@ -4951,6 +5697,9 @@ body.app-shell .pane {
 .content--app .queries-main {
   min-height: 0;
   overflow-y: auto;
+  /* The column scrolls itself: without this the scrollbar rides flush
+     against the title-row buttons and card edges. */
+  padding-right: 10px;
 }
 
 .content--app .detail {

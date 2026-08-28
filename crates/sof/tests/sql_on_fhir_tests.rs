@@ -367,7 +367,7 @@ fn test_basic_boolean_attribute() {
 fn test_repeat_directive() {
     // Load and run repeat directive tests
     let mut test_suite_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_suite_path.push("tests/sql-on-fhir-v2/tests/repeat.json");
+    test_suite_path.push("tests/sql-on-fhir/tests/repeat.json");
 
     if !test_suite_path.exists() {
         panic!("Repeat test file not found at {:?}", test_suite_path);

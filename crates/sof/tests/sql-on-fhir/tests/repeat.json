@@ -6,6 +6,7 @@
     {
       "resourceType": "Questionnaire",
       "id": "q1",
+      "status": "active",
       "item": [
         {
           "linkId": "g1",
@@ -29,7 +30,7 @@
         {
           "linkId": "g2",
           "text": "Group 2",
-          "type": "group"
+          "type": "display"
         }
       ]
     },

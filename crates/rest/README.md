@@ -138,12 +138,18 @@ the background and is polled via `/$reindex-status/[job_id]`.
   built-in set**, not just after an operator edits one. Resources written
   before the upgrade were extracted under the old definitions and have no index
   rows for the new parameter, so it matches nothing on that older data until a
-  `$reindex` runs. Two current cases: `_source` (`meta.source`), which no
-  version of the server indexed before [#523], and `_language`
-  (`Resource.language`) on R5/R6. Neither returns an error on stale data — it
-  simply under-matches, which is the failure mode a reindex exists to clear.
+  `$reindex` runs. Three current cases: `_source` (`meta.source`), which no
+  version of the server indexed before [#523]; `_language`
+  (`Resource.language`) on R5/R6; and the `ViewDefinition` SearchParameters
+  from the SQL-on-FHIR IG (`url`, `name`, `status`, `date`, `context`, …)
+  added in [#570] — `ViewDefinition` resources created before that upgrade are
+  not searchable by those parameters until `POST /ViewDefinition/$reindex` (or
+  a system-wide `$reindex`) runs. None of these return an error on stale
+  data — they simply under-match, which is the failure mode a reindex exists
+  to clear.
 
 [#523]: https://github.com/HeliosSoftware/hfs/issues/523
+[#570]: https://github.com/HeliosSoftware/hfs/issues/570
 
 Both operations emit BALP `AuditEvent`s — purge on completion or failure,
 reindex at start and at its terminal state (complete / cancel / fail, outcome
@@ -423,6 +429,11 @@ curl http://localhost:8080/acme/Patient/123
 curl http://localhost:8080/acme/metadata
 # Returns implementation.url: "http://localhost:8080/acme"
 ```
+
+All advertised URLs use `HFS_BASE_URL`. Set it to the public origin and any
+reverse-proxy prefix, such as `https://fhir.example.com/fhir`. URL-routed
+requests append the selected tenant after that prefix. Header-routed requests
+keep the configured base unchanged. Forwarding headers never override it.
 
 ### URL-Based Routing Setup
 

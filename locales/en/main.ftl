@@ -30,6 +30,10 @@ language-label = Language
 language-en = English
 language-es = Spanish
 language-de = German
+user-menu-label = Account menu
+user-local = Local user
+user-local-hint = Authentication is disabled
+user-logout = Sign out
 
 ## Home / landing page
 
@@ -60,7 +64,7 @@ terminology-lede = Connect HFS to a FHIR terminology server.
 terminology-configured-heading = Terminology Server Configured
 terminology-configured-body = HFS_TERMINOLOGY_SERVER points to a valid server URL.
 terminology-configured-open = Open Terminology Server
-terminology-invalid-heading = HFS_TERMINOLOGY_SERVER is invalid
+terminology-invalid-heading = HFS_TERMINOLOGY_SERVER is invalid.
 terminology-invalid-body = Use an absolute HTTP or HTTPS URL with a host. Paths and a trailing slash are allowed. Do not include credentials, a query string, or a fragment.
 terminology-invalid-note = Update the environment variable, then restart HFS.
 terminology-setup-heading = Connect a Terminology Server
@@ -82,7 +86,7 @@ action-retry = Retry
 
 error-not-found = The requested resource was not found.
 error-unauthorized = You are not authorized to perform this action.
-error-generic = Something went wrong. Please try again.
+error-generic = Something went wrong. Try again.
 
 ## Dashboard shell (Figma "Dashboard V1.1")
 
@@ -138,7 +142,7 @@ tenants-unregistered = unregistered
 tenants-delete = Delete Tenant
 tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept unless purged via the API.
 tenants-row-provisioning = Provisioning… this may take a moment.
-tenants-row-failed = Provisioning failed
+tenants-row-failed = Could not provision the tenant.
 tenants-dismiss = Dismiss
 
 tenant-heading = Tenants
@@ -290,7 +294,7 @@ cmp-new = New Compartment Definition
 cmp-edit = Edit
 cmp-delete = Delete
 cmp-delete-confirm = Delete this compartment definition? Its compartment routes stop resolving.
-crud-delete-failed = Delete failed
+crud-delete-failed = Could not delete this item.
 
 ## Compartment viewer & tester (#237)
 
@@ -426,6 +430,7 @@ queries-open-tab = Open in New Tab
 queries-col-updated = Updated
 queries-prev = Previous
 queries-next = Next
+queries-results-fetch-error = Could not load results from { $origin }. Check HFS_BASE_URL and try again.
 
 queries-rail-heading = Resource Types
 queries-rail-filter = Filter types
@@ -505,6 +510,7 @@ editor-primitive-extension-hint = This value carries extensions of its own (a `_
 
 editor-collapse-all = Collapse all
 editor-expand-all = Expand all
+json-view-toggle-fold = Toggle JSON section
 editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
@@ -513,7 +519,12 @@ editor-versions-none = No prior versions.
 
 resources-heading = Resources
 resources-lede = Browse, search, create, and edit FHIR resources. Search in natural language or build the query by hand, then open any result to edit it.
+resources-create = Create new resource
 resources-create-typed = Create new { $type }
+resources-create-invalid-type = This resource type is not available in the selected FHIR version. Correct the query or choose a type from the list.
+resources-create-not-advertised = This server does not allow creating this resource type. You can still search it.
+resources-create-schema-unavailable = This resource type has no editor schema in the selected FHIR version, so the UI cannot create it safely.
+resources-create-metadata-unavailable = Server capabilities are unavailable. Creation stays disabled until the UI can verify them.
 resources-save-blocked = Fix the validation issues before saving.
 resources-save-invalid = The JSON is not valid — fix it before saving.
 resources-edit-title = Edit Resource
@@ -531,9 +542,9 @@ batch-lede = Upload a FHIR Bundle, review the actions it will run, execute it ag
 batch-upload = Upload
 batch-drop-hint = Drop a bundle JSON file here
 batch-drop-browse = or click to browse
-batch-invalid-json = That file is not valid JSON
-batch-not-a-bundle = That JSON is not a FHIR Bundle
-batch-bad-type = Only Bundles of type batch or transaction can be executed here
+batch-invalid-json = That file is not valid JSON.
+batch-not-a-bundle = That JSON is not a FHIR Bundle.
+batch-bad-type = Only Bundles of type batch or transaction can be executed here.
 batch-request = Request
 batch-entries = entries
 batch-semantics-batch = Batch: entries run independently — a failed entry does not stop or undo the others.
@@ -542,16 +553,18 @@ batch-tab-actions = Actions
 batch-tab-json = Bundle JSON
 batch-no-body = (no body — this entry only addresses a resource)
 batch-cancel = Cancel
-batch-upload-another = Upload another
 batch-execute = Execute
+batch-plan-heading = Execution Plan
+batch-done = Done
 batch-response-heading = Per-Action Outcomes
 batch-sum-created = created
 batch-sum-updated = updated
 batch-sum-other = read/other
 batch-sum-failed = failed
-batch-request-failed = The request failed
-batch-back = Back to Bundle
-batch-execute-again = Execute again
+batch-request-failed = The request failed.
+batch-reading = Reading bundle…
+batch-executing = Executing…
+batch-read-failed = The file could not be read.
 
 ## Bulk Import workspace (#527)
 
@@ -559,7 +572,6 @@ bulk-import-title = Bulk Import
 bulk-import-new = New Submission
 bulk-import-create-title = Create Bulk Submission
 bulk-import-field-name = Submission name
-bulk-import-field-recipient = Recipient base URL
 bulk-import-auth = Authentication
 bulk-import-auth-hint = How to authenticate to the recipient server.
 bulk-import-auth-none = None
@@ -598,6 +610,9 @@ bulk-import-detail-auth = Authentication
 bulk-import-abort = Abort
 bulk-import-complete = Complete
 bulk-import-delete = Delete
+bulk-import-edit = Edit
+bulk-import-edit-title = Edit Submission
+bulk-import-edit-submit = Save Changes
 bulk-import-add-manifest = Add Manifest
 bulk-import-add-manifest-title = Add Manifest
 bulk-import-add-manifest-submit = Add
@@ -610,9 +625,13 @@ bulk-import-field-output-format-hint = The format for the Bulk Data files in the
 bulk-import-field-headers = File request headers
 bulk-import-field-headers-hint = HTTP headers the Data Recipient should use when requesting a data file, one "Name: value" per line.
 bulk-import-manifests = Manifests
+bulk-import-manifest-actions = Manifest actions
 bulk-import-no-manifests = No manifests yet. Add one to submit data.
 bulk-import-submit = Submit
 bulk-import-submit-all = Submit All
+bulk-import-sort = Sort
+bulk-import-sort-recent = Most recent
+bulk-import-sort-oldest = Oldest
 bulk-import-remove = Remove
 bulk-import-log = Submission Log
 bulk-import-log-empty = Nothing submitted yet.
@@ -701,6 +720,9 @@ bulk-export-field-since-custom = Custom instant
 bulk-export-field-since-custom-hint = Used when Since is Custom. RFC 3339, e.g. 2026-08-01T00:00:00Z.
 bulk-export-start = Start Export
 bulk-export-running = running
+bulk-export-clear = Clear
+bulk-export-files-word = files
+bulk-export-exports-word = exports
 bulk-export-none = No exports yet. Start one from the Bulk Export page.
 bulk-export-status-in-progress = In progress
 bulk-export-status-complete = Complete
@@ -771,12 +793,12 @@ vd-empty-lede = Create your first ViewDefinition with Create New.
 vd-degraded = The view definition list could not be loaded.
 vd-saved = Saved.
 vd-run = Run
-vd-run-failed = Running the view failed.
+vd-run-failed = Could not run the view.
 vd-save = Save
 vd-duplicate = Duplicate
 vd-delete = Delete
 vd-delete-confirm = Delete view definition "{ $name }"? This cannot be undone.
-vd-delete-failed = Deleting the view definition failed.
+vd-delete-failed = Could not delete the view definition.
 vd-json-heading = Definition (JSON)
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
@@ -791,11 +813,11 @@ lib-empty-lede = Create your first library with Create New.
 lib-degraded = The library list could not be loaded.
 lib-sql-heading = SQL
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
-lib-delete-failed = Deleting the library failed.
+lib-delete-failed = Could not delete the library.
 
 ## SQL Export and Files pages (#649)
 
-export-start-failed = Starting the export failed.
+export-start-failed = Could not start the export.
 export-started = Export started.
 export-cancelled = Cancellation requested.
 export-job-heading = Export Job
@@ -813,7 +835,7 @@ export-format = Output format
 export-start = Start Export
 files-job-heading = Export Job
 files-load = Load Manifest
-files-error = Loading the manifest failed.
+files-error = Could not load the manifest.
 files-outputs-heading = Outputs
 files-col-output = Output
 files-col-downloads = Downloads
