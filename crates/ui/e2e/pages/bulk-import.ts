@@ -1,5 +1,5 @@
 // Bulk Import submission detail (/ui/bulk-import/{id}): the summary metadata,
-// status fragment, manifest table, and submission log.
+// status fragment, manifest list, and submission log.
 import type { APIRequestContext, Locator, Page } from "@playwright/test";
 
 export class BulkImportPage {
@@ -41,9 +41,7 @@ export class BulkImportPage {
   }
 
   get manifestsCard(): Locator {
-    return this.page
-      .locator("section.table-card")
-      .filter({ has: this.page.getByRole("heading", { name: "Manifests" }) });
+    return this.page.locator("section.bulk-import-manifests-card");
   }
 
   get logCard(): Locator {
@@ -53,7 +51,7 @@ export class BulkImportPage {
   }
 
   get manifestEmptyState(): Locator {
-    return this.manifestsCard.locator(".data-table__empty td");
+    return this.manifestsCard.locator(".bulk-import-manifest-empty");
   }
 
   get logEmptyState(): Locator {

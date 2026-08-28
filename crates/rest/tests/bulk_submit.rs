@@ -242,6 +242,19 @@ fn kickoff_body() -> Value {
     })
 }
 
+fn replace_only_body() -> Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "submitter", "valueIdentifier": {"system": "http://ehr", "value": "ehr-1"}},
+            {"name": "submissionId", "valueString": "it-1"},
+            {"name": "submissionStatus", "valueCoding": {
+                "system": "http://hl7.org/fhir/event-status", "code": "in-progress"}},
+            {"name": "replacesManifestUrl", "valueUrl": "https://provider/manifest.json"}
+        ]
+    })
+}
+
 fn status_body() -> Value {
     json!({
         "resourceType": "Parameters",
@@ -411,6 +424,39 @@ async fn test_kickoff_returns_200() {
     let (server, ..) = create_submit_server().await;
     let resp = server.post("/$bulk-submit").json(&kickoff_body()).await;
     assert_eq!(resp.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_replace_only_kickoff_retires_manifest_without_adding_an_empty_one() {
+    let (server, backend, ..) = create_submit_server().await;
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&replace_only_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("test-tenant"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    let sub_id = helios_persistence::core::SubmissionId::new("http://ehr|ehr-1", "it-1");
+    let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+    assert_eq!(manifests.len(), 1, "replace-only must not add a manifest");
+    assert_eq!(
+        manifests[0].status,
+        helios_persistence::core::ManifestStatus::Replaced
+    );
 }
 
 #[tokio::test]

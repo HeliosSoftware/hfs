@@ -44,6 +44,24 @@ for (const theme of THEMES) {
     });
   }
 
+  test(`open Bulk Import dialogs are free of WCAG 2.2 AA violations — ${theme}`, async ({
+    page,
+    chrome,
+    request,
+  }) => {
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/bulk-import", { waitUntil: "networkidle" });
+    await page.locator("summary.btn", { hasText: "New Submission" }).click();
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+
+    const detail = await seedBulkImportDetail(request);
+    await page.goto(detail, { waitUntil: "networkidle" });
+    await page.locator("summary.btn", { hasText: "Edit" }).click();
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+    await page.keyboard.press("Escape");
+    await page.locator("summary.btn", { hasText: "Add Manifest" }).click();
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+  });
 
   test(`invalid Resources create state is accessible — ${theme}`, async ({ page, chrome }) => {
     await chrome.seedTheme(theme);

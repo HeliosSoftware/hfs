@@ -12,7 +12,7 @@
   {% if available %}
   {% call dialog::modal(i18n.t("bulk-import-new"), "bulk-import-create-dialog-title", i18n.t("bulk-import-create-title")) %}
       <form method="post" action="/ui/bulk-import">
-        {% call dialog::field(i18n.t("bulk-import-field-name"), "name", "text", required=true) %}{% endcall %}
+        {% call dialog::field(i18n.t("bulk-import-field-name"), "name", "text", required=true, initial_focus=true) %}{% endcall %}
         {% call dialog::field(i18n.t("bulk-import-field-submitter-system"), "submitter_system", "text", placeholder="urn:helios:hfs:bulk-submit") %}{% endcall %}
         {% call dialog::field(i18n.t("bulk-import-field-submitter-value"), "submitter_value", "text", hint=i18n.t("bulk-import-field-submitter-hint")) %}{% endcall %}
         {% call dialog::field(i18n.t("bulk-import-field-submission-id"), "submission_id", "text", hint=i18n.t("bulk-import-field-submission-id-hint")) %}{% endcall %}

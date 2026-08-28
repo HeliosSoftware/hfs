@@ -23,6 +23,19 @@
     if (summary && box.contains(document.activeElement)) summary.focus();
   }
 
+  function focusEntry(box) {
+    var entry = box.querySelector("[data-addbox-initial-focus]");
+    if (entry) entry.focus();
+  }
+
+  document.querySelectorAll("details.addbox[open]").forEach(focusEntry);
+
+  document.addEventListener("toggle", function (event) {
+    var box = event.target;
+    if (!box.matches || !box.matches("details.addbox[open]")) return;
+    window.requestAnimationFrame(function () { focusEntry(box); });
+  }, true);
+
   document.addEventListener("keydown", function (event) {
     if (event.key !== "Escape") return;
     document.querySelectorAll(OPEN).forEach(close);

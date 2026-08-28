@@ -117,3 +117,25 @@ test("native Addbox dialogs keep canonical actions and the open-summary backdrop
   expect(actionMetrics).toHaveLength(2);
   for (const geometry of actionMetrics) expect(geometry).toEqual(CANONICAL_BUTTON_GEOMETRY);
 });
+
+test("Bulk Import create, add, and remove forms work without JavaScript", async ({ page }) => {
+  await page.goto("/ui/bulk-import");
+  const create = page.locator("details.addbox--modal");
+  await create.locator("summary").click();
+  await create.locator("input[name='name']").fill("no-js-submission");
+  await create.getByRole("button", { name: "Create Submission" }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-import\/[0-9a-f-]+$/);
+
+  const add = page.locator("details[data-bulk-import-add-manifest]");
+  await add.locator("summary").click();
+  await add.locator("input[name='manifest_url']").fill("https://example.test/manifest.json");
+  await add.getByRole("button", { name: "Add", exact: true }).click();
+  await expect(page.locator(".bulk-import-manifest-row__url")).toHaveText(
+    "https://example.test/manifest.json",
+  );
+
+  const menu = page.locator("details.bulk-import-manifest-menu");
+  await menu.locator("summary").click();
+  await menu.getByRole("button", { name: "Remove" }).click();
+  await expect(page.locator(".bulk-import-manifest-empty")).toBeVisible();
+});

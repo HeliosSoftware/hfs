@@ -21,9 +21,13 @@
     title_id      — id placed on the title element and referenced by the
                     panel's aria-labelledby. Must be unique on the page.
     title_text    — already-localized dialog title.
+    marker        — optional boolean data-attribute name stamped on the
+                    <details> element itself, for scripts/tests that need to
+                    address one specific dialog (e.g. Add Manifest's
+                    data-bulk-import-add-manifest).
 -->
-{% macro modal(trigger_label, title_id, title_text) %}
-<details class="addbox addbox--modal">
+{% macro modal(trigger_label, title_id, title_text, marker="") %}
+<details class="addbox addbox--modal"{% if !marker.is_empty() %} {{ marker }}{% endif %}>
   <summary class="btn btn--primary">
     {% include "icons/plus.svg" %}
     {{ trigger_label }}
@@ -47,14 +51,17 @@
   needs more than this — the bulk-import auth fieldset's radios, the headers
   textarea, the tenant name/id inputs wired to the slug-mirror script's
   data-tenant-* attributes — is not the standard case and stays as markup.
+
+  initial_focus marks the field addbox.js moves focus to when the dialog
+  opens (data-addbox-initial-focus) — set it on a dialog's first field.
 -->
-{% macro field(label, name, kind, required=false, placeholder="", hint="") %}
+{% macro field(label, name, kind, required=false, placeholder="", hint="", initial_focus=false) %}
 <label class="field">
   <span class="field__label">{{ label }}</span>
   <input class="field__input" type="{{ kind }}" name="{{ name }}"
          {% if required %}required{% endif %}
          {% if !placeholder.is_empty() %}placeholder="{{ placeholder }}"{% endif %}
-         autocomplete="off">
+         autocomplete="off"{% if initial_focus %} data-addbox-initial-focus{% endif %}>
   {% if !hint.is_empty() %}<span class="field__hint">{{ hint }}</span>{% endif %}
 </label>
 {% endmacro %}
