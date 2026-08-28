@@ -409,8 +409,7 @@ async fn hard_navigation_renders_a_full_page_with_all_three_panels() {
         "identity must render server-side in the shell",
     );
     assert!(
-        html.contains("<code>http://example.org/cs</code>")
-            && html.contains("<code>A01.0</code>"),
+        html.contains("<code>http://example.org/cs</code>") && html.contains("<code>A01.0</code>"),
         "the address must render as the identity panel's first two facts",
     );
     // `property=*` synthesises parent / child / inactive; the identity panel

@@ -71,11 +71,7 @@ fn app_with_timeouts(
 /// defaults to gives no guarantees about when the server task first polls,
 /// and 100 ms connect + 250 ms request is not enough headroom in practice.
 fn app_pointing_at(base_url: &str) -> Router {
-    app_with_timeouts(
-        base_url,
-        Duration::from_secs(5),
-        Duration::from_secs(2),
-    )
+    app_with_timeouts(base_url, Duration::from_secs(5), Duration::from_secs(2))
 }
 
 /// Router pointed at a closed loopback port — the "Connect" fixture for
@@ -237,31 +233,16 @@ async fn start_mock() -> (String, MockState) {
         canned: Arc::new(Mutex::new(CannedResponse::ok_expansion_flat())),
     };
     let router: Router = Router::new()
-        .route(
-            "/__mock_ready",
-            get(|| async { (StatusCode::OK, "ok") }),
-        )
-        .route(
-            "/ValueSet",
-            get(mock_handler_get_search),
-        )
-        .route(
-            "/ValueSet/{id}",
-            get(mock_handler_get_id),
-        )
-        .route(
-            "/ValueSet/{id}/$expand",
-            post(mock_handler),
-        )
+        .route("/__mock_ready", get(|| async { (StatusCode::OK, "ok") }))
+        .route("/ValueSet", get(mock_handler_get_search))
+        .route("/ValueSet/{id}", get(mock_handler_get_id))
+        .route("/ValueSet/{id}/$expand", post(mock_handler))
         // §8.2 canonical-url contract: expand_run prefers the type-level
         // endpoint when the resource read resolves a canonical url. The
         // seeded search Bundle already provides one, so the type-level
         // route is what tests actually exercise now — keep the instance
         // route above as a fallback that mirrors the pre-§8.2 path.
-        .route(
-            "/ValueSet/$expand",
-            post(mock_handler),
-        )
+        .route("/ValueSet/$expand", post(mock_handler))
         // Fallback catches routing misses so an unexpected URL becomes a
         // captured request (with method GET-through-{method} inferred by
         // axum) rather than a silent 404 the test can't attribute.
@@ -625,8 +606,14 @@ async fn expand_input_shows_advanced_details_and_threshold_field() {
         .await
         .unwrap();
     let html = body_text(response).await;
-    assert!(html.contains("name=\"filter\""), "filter input must be present");
-    assert!(html.contains("name=\"count\""), "count input must be present");
+    assert!(
+        html.contains("name=\"filter\""),
+        "filter input must be present"
+    );
+    assert!(
+        html.contains("name=\"count\""),
+        "count input must be present"
+    );
     assert!(
         html.contains("name=\"threshold\""),
         "Advanced panel must expose a `threshold` numeric input",
@@ -899,11 +886,8 @@ async fn expand_threshold_above_ceiling_drops_header_and_warns() {
     let (base, state) = start_mock().await;
     state.set_canned(CannedResponse::ok_expansion_flat()).await;
 
-    let over =
-        helios_hts_ui::HTS_UI_MAX_EXPANSION_SIZE_HINT + 1;
-    let form_body = format!(
-        "mode=flat&count=25&offset=0&threshold={over}"
-    );
+    let over = helios_hts_ui::HTS_UI_MAX_EXPANSION_SIZE_HINT + 1;
+    let form_body = format!("mode=flat&count=25&offset=0&threshold={over}");
 
     let response = app_pointing_at(&base)
         .oneshot(
@@ -996,9 +980,7 @@ async fn expand_filter_no_match_renders_neutral_state_with_filter() {
                 .uri("/ui/hts/value-sets/example-vs/expand")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header("HX-Request", "true")
-                .body(Body::from(
-                    "mode=flat&count=25&offset=0&filter=xyzzy",
-                ))
+                .body(Body::from("mode=flat&count=25&offset=0&filter=xyzzy"))
                 .unwrap(),
         )
         .await
@@ -1185,9 +1167,18 @@ fn vs_detail_page_uses_the_v3_compact_header_shape() {
         r#"class="detail__field detail__field--wide""#,
         r#"<summary class="field__label">"#,
     ] {
-        assert!(body.contains(hook), "V3 compact header must render `{hook}`");
+        assert!(
+            body.contains(hook),
+            "V3 compact header must render `{hook}`"
+        );
     }
-    for dead in ["page-header", "addbox", "hts-vs-detail__", "backlink", "<dl"] {
+    for dead in [
+        "page-header",
+        "addbox",
+        "hts-vs-detail__",
+        "backlink",
+        "<dl",
+    ] {
         assert!(
             !body.contains(dead),
             "`{dead}` belongs to the pre-V3 stacked layout and must be gone",

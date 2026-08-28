@@ -67,7 +67,10 @@ async fn home_serves_full_page_at_ui_hts() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    assert!(html.contains("<!doctype html>"), "response must be a full HTML page");
+    assert!(
+        html.contains("<!doctype html>"),
+        "response must be a full HTML page"
+    );
     assert!(
         html.contains("9.9.9-test"),
         "sidebar must render the version we mounted with"

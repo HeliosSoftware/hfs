@@ -80,7 +80,7 @@ Detailed operational guidance lives in Codex project skills under `.agents/skill
 (and Claude Code skills under `.claude/skills/`).
 Use those skills instead of expanding this always-loaded file.
 
-Cursor project skills live under `.cursor/skills/`:
+General skills:
 
 - `fhir-developer` - Anthropic FHIR R4 developer skill (resources, cardinality, coding systems, REST/SMART, OperationOutcome). Use for generic FHIR/HL7 API modeling; compose with the HFS-specific skills below for runtime behavior.
 

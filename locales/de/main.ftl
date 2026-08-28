@@ -67,7 +67,7 @@ terminology-setup-heading = Terminologieserver verbinden
 terminology-setup-body = Setzen Sie HFS_TERMINOLOGY_SERVER auf die Basis-URL des FHIR-Terminologieservers, den HFS verwenden soll.
 terminology-setup-note = Setzen Sie die Variable in der Umgebung, die HFS startet, und starten Sie den Server danach neu.
 terminology-search-label = CodeSystems und ValueSets durchsuchen
-terminology-search-placeholder = z. B. 73211009, "Diabetes", http://snomed.info/sct
+terminology-search-placeholder = z. B. 73211009, „Diabetes“, http://snomed.info/sct
 terminology-display-language = Anzeigesprache
 terminology-no-results = Keine passenden Konzepte gefunden.
 
@@ -136,7 +136,7 @@ tenants-col-actions = Aktionen
 tenants-empty = Keine Mandanten gefunden.
 tenants-unregistered = nicht registriert
 tenants-delete = Mandant löschen
-tenants-delete-confirm = Mandant "{ $id }" abmelden? Die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
+tenants-delete-confirm = Mandant „{ $id }" abmelden? Die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
 tenants-row-provisioning = Wird bereitgestellt … das kann einen Moment dauern.
 tenants-row-failed = Der Mandant konnte nicht bereitgestellt werden.
 tenants-dismiss = Verwerfen
@@ -230,7 +230,7 @@ queries-run = Ausführen
 queries-rename = Umbenennen
 queries-delete = Löschen
 queries-rename-prompt = Neuer Name
-queries-confirm-delete = "{ $name }" löschen?
+queries-confirm-delete = „{ $name }“ löschen?
 queries-unavailable = Gespeicherte Abfragen sind nicht verfügbar: Das Storage-Backend dieses Servers unterstützt keine Benutzereinstellungen.
 
 ## SearchParameter-Ansicht (#238)
@@ -338,7 +338,7 @@ cmp-result-fanout-note = Ausgeschlossene Typen werden übersprungen, nicht fehlg
 queries-builder-heading = Such-Builder
 queries-url-label = FHIR-Such-URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Bearbeite die GET-URL direkt oder über die Zeilen darunter — beide bleiben synchron. Ausführen führt die Suche hier aus und trägt sie unter "Zuletzt" ein; mit einem Namen bleibt sie in der Liste gespeichert.
+queries-builder-hint = Bearbeite die GET-URL direkt oder über die Zeilen darunter — beide bleiben synchron. Ausführen führt die Suche hier aus und trägt sie unter „Zuletzt" ein; mit einem Namen bleibt sie in der Liste gespeichert.
 queries-recent = Zuletzt
 queries-recent-heading = Letzte Suchen
 queries-recent-empty = Noch keine letzten Suchen — führe eine aus, um sie hier einzutragen.

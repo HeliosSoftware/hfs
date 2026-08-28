@@ -240,10 +240,7 @@ async fn start_mock() -> (String, MockState) {
         canned: Arc::new(Mutex::new(CannedResponse::ok_translate_equivalence())),
     };
     let router: Router = Router::new()
-        .route(
-            "/__mock_ready",
-            get(|| async { (StatusCode::OK, "ok") }),
-        )
+        .route("/__mock_ready", get(|| async { (StatusCode::OK, "ok") }))
         .route("/ConceptMap", get(mock_handler_get_search))
         .route("/ConceptMap/{id}", get(mock_handler_get_id))
         .route("/ConceptMap/{id}/$translate", post(mock_translate_handler))
@@ -640,12 +637,10 @@ async fn translate_input_hx_reverse_direction_renders_target_code() {
     let (base, _state) = start_mock().await;
     let response = app_pointing_at(&base)
         .oneshot(
-            axum::http::Request::get(
-                "/ui/hts/concept-maps/example-cm/translate?direction=reverse",
-            )
-            .header("HX-Request", "true")
-            .body(Body::empty())
-            .unwrap(),
+            axum::http::Request::get("/ui/hts/concept-maps/example-cm/translate?direction=reverse")
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -1137,7 +1132,9 @@ async fn status_chips_mark_the_active_facet_and_carry_text_filters() {
     let html = body_text(response).await;
 
     assert!(
-        html.contains(r#"href="/ui/hts/concept-maps?name=sc&#38;status=draft" aria-current="true""#),
+        html.contains(
+            r#"href="/ui/hts/concept-maps?name=sc&#38;status=draft" aria-current="true""#
+        ),
         "the active status chip must carry aria-current=\"true\"",
     );
     assert_eq!(
@@ -1272,9 +1269,18 @@ fn cm_detail_page_uses_the_v3_compact_header_shape() {
         r#"class="detail__field detail__field--wide""#,
         r#"<summary class="field__label">"#,
     ] {
-        assert!(body.contains(hook), "V3 compact header must render `{hook}`");
+        assert!(
+            body.contains(hook),
+            "V3 compact header must render `{hook}`"
+        );
     }
-    for dead in ["page-header", "addbox", "hts-cm-detail__", "backlink", "<dl"] {
+    for dead in [
+        "page-header",
+        "addbox",
+        "hts-cm-detail__",
+        "backlink",
+        "<dl",
+    ] {
         assert!(
             !body.contains(dead),
             "`{dead}` belongs to the pre-V3 stacked layout and must be gone",
@@ -1292,7 +1298,9 @@ fn cm_detail_page_uses_the_v3_compact_header_shape() {
 #[tokio::test]
 async fn translate_reverse_result_footnotes_the_suppressed_origin_map() {
     let (base, state) = start_mock().await;
-    state.set_canned(CannedResponse::ok_translate_equivalence()).await;
+    state
+        .set_canned(CannedResponse::ok_translate_equivalence())
+        .await;
 
     let response = app_pointing_at(&base)
         .oneshot(

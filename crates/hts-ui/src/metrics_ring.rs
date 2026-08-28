@@ -319,7 +319,10 @@ mod tests {
             1,
             "an uptime regression must clear every pre-restart sample",
         );
-        assert_eq!(held[0].counts.all, 7, "only the post-restart sample survives");
+        assert_eq!(
+            held[0].counts.all, 7,
+            "only the post-restart sample survives"
+        );
     }
 
     #[test]
@@ -334,8 +337,15 @@ mod tests {
         ring.push(sample(45.0, 17.0, 22));
 
         let points = rates(&ring.snapshot(), all);
-        assert_eq!(points.len(), 1, "only the post-restart interval is plottable");
-        assert!(points[0].break_before, "the surviving point opens a new segment");
+        assert_eq!(
+            points.len(),
+            1,
+            "only the post-restart interval is plottable"
+        );
+        assert!(
+            points[0].break_before,
+            "the surviving point opens a new segment"
+        );
         assert_eq!(points[0].per_min, 60, "15 requests over 15 s is 60/min");
     }
 
@@ -353,15 +363,18 @@ mod tests {
     fn consecutive_samples_difference_into_requests_per_minute() {
         let s = [
             sample(0.0, 100.0, 0),
-            sample(15.0, 115.0, 5),   // 5 in 15 s -> 20/min
-            sample(30.0, 130.0, 35),  // 30 in 15 s -> 120/min
+            sample(15.0, 115.0, 5),  // 5 in 15 s -> 20/min
+            sample(30.0, 130.0, 35), // 30 in 15 s -> 120/min
         ];
         let points = rates(&s, all);
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].per_min, 20);
         assert_eq!(points[1].per_min, 120);
         assert!(points[0].break_before, "first point opens the segment");
-        assert!(!points[1].break_before, "an observed interval stays connected");
+        assert!(
+            !points[1].break_before,
+            "an observed interval stays connected"
+        );
     }
 
     #[test]
@@ -453,8 +466,8 @@ mod tests {
     fn window_total_sums_only_usable_intervals_inside_the_window() {
         let s = [
             sample(0.0, 100.0, 0),
-            sample(15.0, 115.0, 10),        // +10, inside
-            sample(30.0, 130.0, 25),        // +15, inside
+            sample(15.0, 115.0, 10),         // +10, inside
+            sample(30.0, 130.0, 25),         // +15, inside
             sample(3_630.0, 3_730.0, 9_000), // gap -> contributes nothing
             sample(3_645.0, 3_745.0, 9_007), // +7, outside a [0,100] window
         ];

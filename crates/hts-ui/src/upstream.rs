@@ -78,9 +78,11 @@ impl UpstreamClient {
         if is_loopback_base_url(&base_url) {
             builder = builder.no_proxy();
         }
-        let client = builder.build().map_err(|source| UpstreamError::ClientBuild {
-            message: source.to_string(),
-        })?;
+        let client = builder
+            .build()
+            .map_err(|source| UpstreamError::ClientBuild {
+                message: source.to_string(),
+            })?;
         Ok(Self { client, base_url })
     }
 
@@ -111,13 +113,14 @@ impl UpstreamClient {
                 status: status.as_u16(),
             });
         }
-        response.json::<UpstreamHealth>().await.map_err(|e| {
-            UpstreamError::Decode {
+        response
+            .json::<UpstreamHealth>()
+            .await
+            .map_err(|e| UpstreamError::Decode {
                 op: "health",
                 url,
                 message: e.to_string(),
-            }
-        })
+            })
     }
 
     /// `GET /metadata?mode=terminology` — the `TerminologyCapabilities`.
@@ -593,9 +596,7 @@ impl CodeSystemSummary {
                 .unwrap_or_default()
                 .to_owned()
         };
-        let count = resource
-            .get("count")
-            .and_then(|v| v.as_u64());
+        let count = resource.get("count").and_then(|v| v.as_u64());
         let jurisdiction = resource
             .get("jurisdiction")
             .and_then(|v| v.as_array())
@@ -610,9 +611,7 @@ impl CodeSystemSummary {
                                     .and_then(|v| v.as_array())
                                     .and_then(|codings| codings.first())
                                     .and_then(|c| {
-                                        c.get("display")
-                                            .and_then(|v| v.as_str())
-                                            .map(str::to_owned)
+                                        c.get("display").and_then(|v| v.as_str()).map(str::to_owned)
                                     })
                             })
                     })
@@ -1039,7 +1038,12 @@ impl UpstreamClient {
         })?;
         if !status.is_success() {
             let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
-            return Err(status_to_error(op, &full_endpoint, status.as_u16(), &parsed));
+            return Err(status_to_error(
+                op,
+                &full_endpoint,
+                status.as_u16(),
+                &parsed,
+            ));
         }
         let bundle: Value = serde_json::from_str(&raw).map_err(|e| UpstreamError::Decode {
             op,
@@ -1090,11 +1094,10 @@ impl UpstreamClient {
     /// Not finding the id in step 1 surfaces as [`UpstreamError::NotFound`]
     /// so the detail handler can render an explanatory OperationOutcome
     /// partial (design doc §7.3) rather than propagating a page 404.
-    pub async fn read_code_system(
-        &self,
-        id: &str,
-    ) -> Result<CodeSystemSummary, UpstreamError> {
-        let canonical_url = self.resolve_canonical_url("CodeSystem", "cs-read", id).await?;
+    pub async fn read_code_system(&self, id: &str) -> Result<CodeSystemSummary, UpstreamError> {
+        let canonical_url = self
+            .resolve_canonical_url("CodeSystem", "cs-read", id)
+            .await?;
         let parsed = self
             .fetch_by_url("CodeSystem", "cs-read", id, &canonical_url)
             .await?;
@@ -1431,9 +1434,7 @@ fn is_loopback_base_url(base_url: &str) -> bool {
     } else {
         host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
     };
-    host.eq_ignore_ascii_case("localhost")
-        || host == "::1"
-        || host.starts_with("127.")
+    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
 }
 
 fn trim_opt(v: Option<String>) -> Option<String> {
@@ -1485,11 +1486,7 @@ fn parse_lookup_designation(param: &Value) -> Option<LookupDesignation> {
             _ => {}
         }
     }
-    if d.value.is_empty() {
-        None
-    } else {
-        Some(d)
-    }
+    if d.value.is_empty() { None } else { Some(d) }
 }
 
 fn parse_lookup_property(param: &Value) -> Option<LookupProperty> {
@@ -1531,11 +1528,7 @@ fn parse_lookup_property(param: &Value) -> Option<LookupProperty> {
             _ => {}
         }
     }
-    if p.code.is_empty() {
-        None
-    } else {
-        Some(p)
-    }
+    if p.code.is_empty() { None } else { Some(p) }
 }
 
 // ── Slice C: ValueSet browser + detail + expand ─────────────────────────
@@ -1709,9 +1702,7 @@ impl ValueSetSummary {
                                     .and_then(|v| v.as_array())
                                     .and_then(|codings| codings.first())
                                     .and_then(|c| {
-                                        c.get("display")
-                                            .and_then(|v| v.as_str())
-                                            .map(str::to_owned)
+                                        c.get("display").and_then(|v| v.as_str()).map(str::to_owned)
                                     })
                             })
                     })
@@ -1904,8 +1895,7 @@ impl ExpansionResult {
             Some(n) => n > 0,
             None => {
                 // Fallback: terminal-page heuristic.
-                self.requested_count > 0
-                    && (self.contains.len() as u32) >= self.requested_count
+                self.requested_count > 0 && (self.contains.len() as u32) >= self.requested_count
             }
         }
     }
@@ -2012,7 +2002,9 @@ impl UpstreamClient {
     /// explanatory OperationOutcome partial inside the page shell (design
     /// doc §7.4 states matrix, §7.4.1 invariant #5).
     pub async fn read_value_set(&self, id: &str) -> Result<ValueSetSummary, UpstreamError> {
-        let canonical_url = self.resolve_canonical_url("ValueSet", "vs-read", id).await?;
+        let canonical_url = self
+            .resolve_canonical_url("ValueSet", "vs-read", id)
+            .await?;
         let parsed = self
             .fetch_by_url("ValueSet", "vs-read", id, &canonical_url)
             .await?;
@@ -2058,7 +2050,11 @@ impl UpstreamClient {
         if let Some(true) = params.include_designations {
             parameters.push(json!({"name": "includeDesignations", "valueBoolean": true}));
         }
-        for v in params.use_supplement.iter().filter_map(|s| non_empty_str(s)) {
+        for v in params
+            .use_supplement
+            .iter()
+            .filter_map(|s| non_empty_str(s))
+        {
             parameters.push(json!({"name": "useSupplement", "valueCanonical": v}));
         }
         if let Some(v) = params.date.as_deref().and_then(non_empty_str) {
@@ -2073,7 +2069,11 @@ impl UpstreamClient {
             // the operator pin references, matching §7.4 wireframe.
             parameters.push(json!({"name": "tx-resource", "valueString": v}));
         }
-        for v in params.system_version.iter().filter_map(|s| non_empty_str(s)) {
+        for v in params
+            .system_version
+            .iter()
+            .filter_map(|s| non_empty_str(s))
+        {
             parameters.push(json!({"name": "system-version", "valueCanonical": v}));
         }
         for v in params
@@ -2095,9 +2095,7 @@ impl UpstreamClient {
             .as_deref()
             .and_then(non_empty_str)
         {
-            parameters.push(
-                json!({"name": "default-valueset-version", "valueCanonical": v}),
-            );
+            parameters.push(json!({"name": "default-valueset-version", "valueCanonical": v}));
         }
         // §7.4.1 F7: `hierarchical` and `excludeNested` are mutually
         // exclusive — emit one, never both. If both are set upstream of
@@ -2134,12 +2132,8 @@ impl UpstreamClient {
         let contains = parse_expansion_contains(expansion.get("contains"));
         let is_tree = contains_has_children(&contains);
         let echoed_parameters = parse_expansion_parameters(expansion.get("parameter"));
-        let total = expansion
-            .get("total")
-            .and_then(|v| v.as_u64());
-        let offset = expansion
-            .get("offset")
-            .and_then(|v| v.as_u64());
+        let total = expansion.get("total").and_then(|v| v.as_u64());
+        let offset = expansion.get("offset").and_then(|v| v.as_u64());
         let timestamp = expansion
             .get("timestamp")
             .and_then(|v| v.as_str())
@@ -2201,7 +2195,11 @@ impl UpstreamClient {
         if let Some(true) = params.include_designations {
             parameters.push(json!({"name": "includeDesignations", "valueBoolean": true}));
         }
-        for v in params.use_supplement.iter().filter_map(|s| non_empty_str(s)) {
+        for v in params
+            .use_supplement
+            .iter()
+            .filter_map(|s| non_empty_str(s))
+        {
             parameters.push(json!({"name": "useSupplement", "valueCanonical": v}));
         }
         if let Some(v) = params.date.as_deref().and_then(non_empty_str) {
@@ -2213,7 +2211,11 @@ impl UpstreamClient {
         for v in params.tx_resource.iter().filter_map(|s| non_empty_str(s)) {
             parameters.push(json!({"name": "tx-resource", "valueString": v}));
         }
-        for v in params.system_version.iter().filter_map(|s| non_empty_str(s)) {
+        for v in params
+            .system_version
+            .iter()
+            .filter_map(|s| non_empty_str(s))
+        {
             parameters.push(json!({"name": "system-version", "valueCanonical": v}));
         }
         for v in params
@@ -2235,9 +2237,7 @@ impl UpstreamClient {
             .as_deref()
             .and_then(non_empty_str)
         {
-            parameters.push(
-                json!({"name": "default-valueset-version", "valueCanonical": v}),
-            );
+            parameters.push(json!({"name": "default-valueset-version", "valueCanonical": v}));
         }
         if let Some(true) = params.hierarchical {
             parameters.push(json!({"name": "hierarchical", "valueBoolean": true}));
@@ -2577,11 +2577,21 @@ impl CmBrowserRow {
         // to an em-dash in the template.
         let source_uri = pick_first_str(
             resource,
-            &["sourceUri", "sourceCanonical", "sourceScopeUri", "sourceScopeCanonical"],
+            &[
+                "sourceUri",
+                "sourceCanonical",
+                "sourceScopeUri",
+                "sourceScopeCanonical",
+            ],
         );
         let target_uri = pick_first_str(
             resource,
-            &["targetUri", "targetCanonical", "targetScopeUri", "targetScopeCanonical"],
+            &[
+                "targetUri",
+                "targetCanonical",
+                "targetScopeUri",
+                "targetScopeCanonical",
+            ],
         );
         Self {
             id: base_id(&s("id")).to_owned(),
@@ -2672,9 +2682,7 @@ impl ConceptMapSummary {
                                     .and_then(|v| v.as_array())
                                     .and_then(|codings| codings.first())
                                     .and_then(|c| {
-                                        c.get("display")
-                                            .and_then(|v| v.as_str())
-                                            .map(str::to_owned)
+                                        c.get("display").and_then(|v| v.as_str()).map(str::to_owned)
                                     })
                             })
                     })
@@ -2925,7 +2933,9 @@ impl UpstreamClient {
     /// explanatory OperationOutcome partial inside the page shell (§7.5
     /// states matrix, mirroring §7.3.1 / §7.4.1 invariant #5).
     pub async fn read_concept_map(&self, id: &str) -> Result<ConceptMapSummary, UpstreamError> {
-        let canonical_url = self.resolve_canonical_url("ConceptMap", "cm-read", id).await?;
+        let canonical_url = self
+            .resolve_canonical_url("ConceptMap", "cm-read", id)
+            .await?;
         let parsed = self
             .fetch_by_url("ConceptMap", "cm-read", id, &canonical_url)
             .await?;
@@ -3181,7 +3191,11 @@ fn parse_translate_match(param: &Value) -> Option<(TranslateMatch, MappingKind)>
                 let mut v = value_obj_str(part, "valueUri").to_owned();
                 if v.is_empty() {
                     if let Some(c) = part.get("valueCoding").and_then(|c| c.as_object()) {
-                        v = c.get("system").and_then(|s| s.as_str()).unwrap_or("").to_owned();
+                        v = c
+                            .get("system")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_owned();
                     }
                 }
                 if !v.is_empty() && mat.origin.is_none() {
@@ -3383,10 +3397,7 @@ impl UpstreamClient {
     /// The empty-`concept` case is a legal seed — HTS returns an empty
     /// ConceptMap with no groups, which the workbench renders neutrally
     /// (`is_empty_graph = true`) rather than as an error.
-    pub async fn cm_closure(
-        &self,
-        params: &ClosureParams,
-    ) -> Result<ClosureResult, UpstreamError> {
+    pub async fn cm_closure(&self, params: &ClosureParams) -> Result<ClosureResult, UpstreamError> {
         let mut parameters: Vec<Value> = Vec::new();
         parameters.push(json!({"name": "name", "valueString": params.name}));
         for concept in &params.concepts {
@@ -3489,8 +3500,7 @@ impl UpstreamClient {
                 // Accepts either a JSON object (`{...}`) or the string
                 // as-is; parse-failure surfaces as an invalid-input
                 // OperationOutcome from HTS rather than a UI crash.
-                let inline: Value =
-                    serde_json::from_str(vs_json.trim()).unwrap_or(Value::Null);
+                let inline: Value = serde_json::from_str(vs_json.trim()).unwrap_or(Value::Null);
                 if !inline.is_null() {
                     parameters.push(json!({"name": "valueSet", "resource": inline}));
                 }
@@ -3506,13 +3516,10 @@ impl UpstreamClient {
         match params.mode {
             VsValidateMode::Code => {
                 if !params.code.is_empty() {
-                    parameters
-                        .push(json!({"name": "code", "valueCode": params.code.clone()}));
+                    parameters.push(json!({"name": "code", "valueCode": params.code.clone()}));
                 }
                 if !params.system.is_empty() {
-                    parameters.push(
-                        json!({"name": "system", "valueUri": params.system.clone()}),
-                    );
+                    parameters.push(json!({"name": "system", "valueUri": params.system.clone()}));
                 }
                 if let Some(v) = trim_opt(params.system_version.clone()) {
                     parameters.push(json!({"name": "systemVersion", "valueString": v}));
@@ -3549,16 +3556,10 @@ impl UpstreamClient {
                     }
                     let mut coding = serde_json::Map::new();
                     if !system.is_empty() {
-                        coding.insert(
-                            "system".to_string(),
-                            Value::String(system.to_owned()),
-                        );
+                        coding.insert("system".to_string(), Value::String(system.to_owned()));
                     }
                     if !code.is_empty() {
-                        coding.insert(
-                            "code".to_string(),
-                            Value::String(code.to_owned()),
-                        );
+                        coding.insert("code".to_string(), Value::String(code.to_owned()));
                     }
                     coding_array.push(Value::Object(coding));
                 }
@@ -3594,11 +3595,13 @@ impl UpstreamClient {
             parameters.push(json!({"name": "abstract", "valueBoolean": true}));
         }
         if let Some(true) = params.lenient_display_validation {
-            parameters.push(
-                json!({"name": "lenient-display-validation", "valueBoolean": true}),
-            );
+            parameters.push(json!({"name": "lenient-display-validation", "valueBoolean": true}));
         }
-        for v in params.use_supplement.iter().filter_map(|s| non_empty_str(s)) {
+        for v in params
+            .use_supplement
+            .iter()
+            .filter_map(|s| non_empty_str(s))
+        {
             parameters.push(json!({"name": "useSupplement", "valueCanonical": v}));
         }
         for v in params.tx_resource.iter().filter_map(|s| non_empty_str(s)) {
@@ -3616,20 +3619,17 @@ impl UpstreamClient {
             .iter()
             .filter_map(|s| non_empty_str(s))
         {
-            parameters
-                .push(json!({"name": "check-system-version", "valueCanonical": v}));
+            parameters.push(json!({"name": "check-system-version", "valueCanonical": v}));
         }
         for v in params
             .force_system_version
             .iter()
             .filter_map(|s| non_empty_str(s))
         {
-            parameters
-                .push(json!({"name": "force-system-version", "valueCanonical": v}));
+            parameters.push(json!({"name": "force-system-version", "valueCanonical": v}));
         }
         if let Some(v) = trim_opt(params.default_valueset_version.clone()) {
-            parameters
-                .push(json!({"name": "default-valueset-version", "valueCanonical": v}));
+            parameters.push(json!({"name": "default-valueset-version", "valueCanonical": v}));
         }
 
         let body = json!({
@@ -3653,15 +3653,9 @@ impl UpstreamClient {
                 }
                 "code" => out.code = value_obj_str(value_obj, "valueCode").to_owned(),
                 "system" => out.system = value_obj_str(value_obj, "valueUri").to_owned(),
-                "version" => {
-                    out.version = value_obj_str(value_obj, "valueString").to_owned()
-                }
-                "display" => {
-                    out.display = value_obj_str(value_obj, "valueString").to_owned()
-                }
-                "message" => {
-                    out.message = value_obj_str(value_obj, "valueString").to_owned()
-                }
+                "version" => out.version = value_obj_str(value_obj, "valueString").to_owned(),
+                "display" => out.display = value_obj_str(value_obj, "valueString").to_owned(),
+                "message" => out.message = value_obj_str(value_obj, "valueString").to_owned(),
                 "issues" => {
                     if let Some(resource) = value_obj.get("resource") {
                         out.issues = Some(OutcomeView::from_body(resource));
@@ -3779,10 +3773,7 @@ impl UpstreamClient {
     /// generic `UpstreamError::Outcome` / `HttpStatus` arms. 5xx
     /// still flows through `UpstreamError` so the shared degraded
     /// banner picks it up.
-    pub async fn import_bundle(
-        &self,
-        bundle_json: &str,
-    ) -> Result<ImportResult, UpstreamError> {
+    pub async fn import_bundle(&self, bundle_json: &str) -> Result<ImportResult, UpstreamError> {
         let url = format!("{}/import", self.base_url);
         let response = self
             .client
@@ -3794,14 +3785,11 @@ impl UpstreamClient {
             .await
             .map_err(|e| UpstreamError::from_reqwest("import", &url, e))?;
         let status = response.status();
-        let raw = response
-            .text()
-            .await
-            .map_err(|e| UpstreamError::Decode {
-                op: "import",
-                url: url.clone(),
-                message: e.to_string(),
-            })?;
+        let raw = response.text().await.map_err(|e| UpstreamError::Decode {
+            op: "import",
+            url: url.clone(),
+            message: e.to_string(),
+        })?;
         let status_u16 = status.as_u16();
 
         // 413 typically has no body — synthesize the result without
@@ -4276,9 +4264,7 @@ fn parse_capability_statement(body: &Value) -> CapabilityView {
                         .map(|arr| {
                             arr.iter()
                                 .filter_map(|i| {
-                                    i.get("code")
-                                        .and_then(|c| c.as_str())
-                                        .map(|s| s.to_owned())
+                                    i.get("code").and_then(|c| c.as_str()).map(|s| s.to_owned())
                                 })
                                 .collect()
                         })
@@ -5262,7 +5248,11 @@ impl UpstreamClient {
         }
         // `$translate` does not read `Accept-Language` uniformly, so the
         // display language rides as an explicit parameter or not at all.
-        if let Some(v) = reference.display_language.as_deref().and_then(non_empty_str) {
+        if let Some(v) = reference
+            .display_language
+            .as_deref()
+            .and_then(non_empty_str)
+        {
             parameters.push(json!({"name": "displayLanguage", "valueCode": v}));
         }
         let body = json!({
@@ -5388,9 +5378,8 @@ impl UpstreamClient {
             };
         }
 
-        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(
-            HTS_UI_BATCH_FANOUT_CONCURRENCY,
-        ));
+        let permits =
+            std::sync::Arc::new(tokio::sync::Semaphore::new(HTS_UI_BATCH_FANOUT_CONCURRENCY));
         let mut handles = Vec::with_capacity(comparators.len());
         for (position, (kind, code_a, code_b, display)) in comparators.into_iter().enumerate() {
             let permits = permits.clone();

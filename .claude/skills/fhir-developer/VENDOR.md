@@ -6,7 +6,7 @@
 | Path | `plugins/healthcare/skills/fhir-developer/` |
 | Upstream skill name | `fhir-developer` / `fhir-developer-skill` |
 | License | Provided under [Anthropic's terms of service](https://www.anthropic.com/legal/consumer-terms) (per upstream README) |
-| Vendored for | Cursor project skills (`.cursor/skills/`) and Claude Code project skills (`.claude/skills/`) |
+| Vendored for | Claude Code project skills (`.claude/skills/`) |
 
 ## Contents
 

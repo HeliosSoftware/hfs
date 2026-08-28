@@ -17,7 +17,7 @@ metadata:
 
 # FHIR Developer Skill
 
-Vendored from Anthropic's `fhir-developer` healthcare plugin for Cursor project use.
+Vendored from Anthropic's `fhir-developer` healthcare plugin as a Claude Code project skill.
 
 ## Helios HFS notes
 

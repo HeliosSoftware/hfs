@@ -104,7 +104,9 @@ fn parse_labels(inside: &str) -> BTreeMap<String, String> {
         if i >= bytes.len() {
             break;
         }
-        let key = std::str::from_utf8(&bytes[key_start..i]).unwrap_or("").trim();
+        let key = std::str::from_utf8(&bytes[key_start..i])
+            .unwrap_or("")
+            .trim();
         i += 1; // skip '='
         // Value: quoted string.
         if i >= bytes.len() || bytes[i] != b'"' {
@@ -207,7 +209,11 @@ pub fn request_counts_by_status_class(
         }
         let value = sample.value as u64;
         out.all = out.all.saturating_add(value);
-        match sample.labels.get("status").and_then(|s| s.as_bytes().first()) {
+        match sample
+            .labels
+            .get("status")
+            .and_then(|s| s.as_bytes().first())
+        {
             Some(b'2') => out.s2xx = out.s2xx.saturating_add(value),
             Some(b'4') => out.s4xx = out.s4xx.saturating_add(value),
             Some(b'5') => out.s5xx = out.s5xx.saturating_add(value),
@@ -260,7 +266,11 @@ http_request_duration_seconds_count{route=\"/metrics\"} 8
         let map = parse(SAMPLE);
         let counters = map.get("http_requests_total").expect("counter present");
         assert_eq!(counters.len(), 3);
-        assert!(counters.iter().any(|s| s.labels.get("route") == Some(&"/ui/hts".to_string())));
+        assert!(
+            counters
+                .iter()
+                .any(|s| s.labels.get("route") == Some(&"/ui/hts".to_string()))
+        );
     }
 
     #[test]
@@ -303,7 +313,9 @@ broken_counter{route=\"/x\"} 5
 broken_counter{route=\"/y\"} +Inf
 ";
         let map = parse(text);
-        let samples = map.get("broken_counter").expect("only finite samples survive");
+        let samples = map
+            .get("broken_counter")
+            .expect("only finite samples survive");
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value, 5.0);
     }

@@ -254,8 +254,7 @@ async fn start_mock() -> (String, MockState) {
 /// Minimal well-formed Bundle body used by every test that expects to
 /// pass the pre-flight JSON gate. HTS only inspects it here through
 /// the mock, so the shape is only "parseable JSON".
-const VALID_BUNDLE: &str =
-    r#"{"resourceType":"Bundle","type":"collection","entry":[]}"#;
+const VALID_BUNDLE: &str = r#"{"resourceType":"Bundle","type":"collection","entry":[]}"#;
 
 fn encode_form(pairs: &[(&str, &str)]) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());

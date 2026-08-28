@@ -106,7 +106,11 @@ struct ConceptForm {
 fn non_empty(v: Option<String>) -> Option<String> {
     v.and_then(|s| {
         let t = s.trim();
-        if t.is_empty() { None } else { Some(t.to_owned()) }
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_owned())
+        }
     })
 }
 
@@ -254,8 +258,10 @@ impl ConceptView {
     /// direction. One URL serves both `href` (hard nav renders a full page)
     /// and `hx-get` (renders the fragment).
     pub(crate) fn mappings_toggle_url(&self) -> String {
-        self.reference
-            .panel_url_with("mappings", &[("direction", self.direction.toggled().as_str())])
+        self.reference.panel_url_with(
+            "mappings",
+            &[("direction", self.direction.toggled().as_str())],
+        )
     }
 
     pub(crate) fn relations_url(&self) -> String {

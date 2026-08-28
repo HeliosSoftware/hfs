@@ -480,11 +480,7 @@ impl TranslateResultView {
         }
     }
 
-    fn from_error(
-        request_url: String,
-        direction: TranslateDirection,
-        err: &UpstreamError,
-    ) -> Self {
+    fn from_error(request_url: String, direction: TranslateDirection, err: &UpstreamError) -> Self {
         let mut view = Self::empty(direction);
         view.request_url = request_url;
         match err {
@@ -519,7 +515,6 @@ impl TranslateResultView {
         }
         view
     }
-
 }
 
 async fn translate_run(
@@ -568,7 +563,10 @@ async fn translate_run(
     let cm = state.upstream.read_concept_map(&id).await;
     let canonical = cm.as_ref().map(|s| s.url.clone()).unwrap_or_default();
     let translate_result = if !canonical.is_empty() {
-        state.upstream.cm_translate_by_url(&canonical, &params).await
+        state
+            .upstream
+            .cm_translate_by_url(&canonical, &params)
+            .await
     } else {
         state.upstream.cm_translate_instance(&id, &params).await
     };
@@ -603,10 +601,7 @@ fn validate_pre_flight(params: &TranslateParams) -> Option<String> {
             let code = params.code.as_deref().unwrap_or_default().trim();
             let system = params.system.as_deref().unwrap_or_default().trim();
             if code.is_empty() || system.is_empty() {
-                Some(
-                    "Forward translation requires both `code` and `system`."
-                        .to_owned(),
-                )
+                Some("Forward translation requires both `code` and `system`.".to_owned())
             } else {
                 None
             }
@@ -614,9 +609,7 @@ fn validate_pre_flight(params: &TranslateParams) -> Option<String> {
         TranslateDirection::Reverse => {
             let target = params.target_code.as_deref().unwrap_or_default().trim();
             if target.is_empty() {
-                Some(
-                    "Reverse translation requires `targetCode`.".to_owned(),
-                )
+                Some("Reverse translation requires `targetCode`.".to_owned())
             } else {
                 None
             }

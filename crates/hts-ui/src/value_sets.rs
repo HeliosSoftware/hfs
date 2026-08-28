@@ -33,8 +33,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::upstream::{
-    ExpandParams, ExpansionResult, OutcomeView, UpstreamError, ValueSetSummary, VsBrowserFilters,
-    VsBrowserPage, HTS_UI_MAX_EXPANSION_SIZE_HINT,
+    ExpandParams, ExpansionResult, HTS_UI_MAX_EXPANSION_SIZE_HINT, OutcomeView, UpstreamError,
+    ValueSetSummary, VsBrowserFilters, VsBrowserPage,
 };
 use crate::{Chrome, HtsUiState};
 

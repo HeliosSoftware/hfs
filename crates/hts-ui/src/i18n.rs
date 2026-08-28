@@ -395,7 +395,10 @@ mod tests {
                         !rendered.contains(pair),
                         "{}.ftl key `{}` contains mojibake sequence `{}` \
                          (rendered: {rendered:?}). See `locales/{}/main.ftl`.",
-                        locale, key, pair, locale,
+                        locale,
+                        key,
+                        pair,
+                        locale,
                     );
                 }
             }

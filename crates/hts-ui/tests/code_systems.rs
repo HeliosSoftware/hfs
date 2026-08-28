@@ -675,7 +675,10 @@ fn cs_detail_page_uses_the_v3_compact_header_shape() {
         r#"class="detail__field detail__field--wide""#,
         r#"<summary class="field__label">"#,
     ] {
-        assert!(body.contains(hook), "V3 compact header must render `{hook}`");
+        assert!(
+            body.contains(hook),
+            "V3 compact header must render `{hook}`"
+        );
     }
     for dead in [
         "page-header",

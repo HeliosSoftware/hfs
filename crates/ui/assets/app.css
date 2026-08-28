@@ -110,14 +110,18 @@
   --scroll-thumb: #bdbdbd;
   --scroll-thumb-hover: #a0a0a0;
   /* Semantic status tokens (referenced by .tag--*, .lint__item--*, .notice--warn,
-   .btn--danger, .batch-badge--*, and .tag--stored/config/conflict families).
-   Colors clear 4.5:1 on the light surfaces per WCAG 2.2 AA. */
+     .batch-badge--*, and .tag--stored/config/conflict families).
+     Colors clear 4.5:1 on the light surfaces per WCAG 2.2 AA.
+
+     Only `ok` and `warn` live here: `--danger` / `--danger-soft` are declared
+     above and re-declaring them shadowed the canonical values. The translucent
+     `rgb(… / 12%)` form in particular made `.btn--danger:hover` paint a
+     same-hue wash behind same-hue text, which the contrast guard in
+     `crates/ui/e2e/tests/bulk-import.spec.ts` reads as a ratio of exactly 1. */
   --ok: #1a7a3a;
   --ok-soft: rgb(26 122 58 / 12%);
   --warn: #a45d00;
   --warn-soft: rgb(164 93 0 / 12%);
-  --danger: #b3261e;
-  --danger-soft: rgb(179 38 30 / 12%);
 
   font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
@@ -156,13 +160,12 @@
   --scroll-thumb: rgb(255 255 255 / 25%);
   --scroll-thumb-hover: rgb(255 255 255 / 38%);
   /* Semantic status tokens (dark theme): each raised for 4.5:1 on the
-     dark surfaces; the -soft variants stay translucent to sit on cards. */
+     dark surfaces; the -soft variants stay translucent to sit on cards.
+     `--danger` / `--danger-soft` are declared above — see the light block. */
   --ok: #6bd48b;
   --ok-soft: rgb(107 212 139 / 15%);
   --warn: #f4b95a;
   --warn-soft: rgb(244 185 90 / 15%);
-  --danger: #ff8a80;
-  --danger-soft: rgb(255 138 128 / 15%);
 }
 }
 
@@ -1233,32 +1236,6 @@ button.pill {
   border: 0;
 }
 
-.notice {
-  padding: 20px 24px;
-  color: var(--muted);
-}
-
-  /* Accessible sr-only helper — hides the element visually while keeping it
-     in the accessibility tree. Referenced by row headings in the HTS
-     dashboard partial and by outcome/import announcements. Without this rule
-     those `<h2>`s would render at browser default size and break the
-     visual hierarchy. */
-  .visually-hidden {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }
-
-  .notice {
-    padding: 20px 24px;
-    color: var(--muted);
-  }
 
 .stat-grid--5 {
   grid-template-columns: repeat(5, 1fr);
@@ -1512,15 +1489,6 @@ select.field__input {
   margin: 0;
   font-size: 13px;
   color: var(--muted);
-}
-
-/* Form action bar: submit/cancel row at the bottom of `.field`-stacked
-   forms. Used by the HTS workbench + import pages so the button sits
-   under the last `.field` without collapsing its margin. */
-.form-actions {
-  display: flex;
-  gap: 12px;
-  margin-top: 8px;
 }
 
 /* Centered-popup variant of the addbox (the Bulk Import dialogs, #527): the
@@ -2848,12 +2816,12 @@ details.json-fold[open] > summary .icon {
 
 /* FHIR publication-status tags (HTS browsers + resource detail headers).
    Distinct from the .tag--stored/config/conflict family: those describe
-   configuration/lint outcomes, these describe a resource's own status. */
-.tag--active {
-  background: var(--ok-soft);
-  color: var(--ok);
-}
+   configuration/lint outcomes, these describe a resource's own status.
 
+   `active` is deliberately absent here: the subscription-state block below
+   already defines `.tag--active` with the identical treatment, and defining
+   it twice is what `design-system.spec.ts` forbids. FHIR's `active` status
+   and a live subscription happen to want the same pill. */
 .tag--draft {
   background: var(--warn-soft);
   color: var(--warn);
