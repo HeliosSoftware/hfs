@@ -25,6 +25,7 @@ use crate::types::{
 };
 
 use super::PostgresBackend;
+use super::cached::{query_dyn_cached, query_one_dyn_cached};
 use super::search::chain_builder::ChainQueryBuilder;
 use super::search::query_builder::{PostgresQueryBuilder, SortValueKind, SqlParam};
 
@@ -34,6 +35,24 @@ fn internal_error(message: String) -> StorageError {
         message,
         source: None,
     })
+}
+
+/// Whether a built search statement's text is drawn from a bounded family, and
+/// so may be kept in the connection's prepared-statement cache.
+///
+/// Everything the query builder varies is bounded except one thing. The
+/// predicate shape is bounded by the parameter types; the inlined `param_name`
+/// is bounded by the SearchParameter registry; the inlined `LIMIT` is bounded
+/// because `_count` is clamped to 1000 by `extractors::pagination`. `OFFSET` is
+/// not bounded by anything, and it is inlined too — so an offset-paged crawl
+/// mints one statement per page, for as long as the client keeps paging. Those
+/// stay off the cached path rather than rely on the cache's flush to clean up
+/// after them.
+///
+/// Cursor pagination is unaffected: it binds its keyset values as parameters, so
+/// every page of a cursor-paged search shares one statement text.
+fn statement_is_reusable(query: &SearchQuery) -> bool {
+    query.offset.unwrap_or(0) == 0
 }
 
 fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
@@ -274,10 +293,12 @@ impl SearchProvider for PostgresBackend {
             .iter()
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
-        let rows = client
-            .query(&sql, &param_refs)
-            .await
-            .or_query_error("Failed to execute search")?;
+        let rows = if statement_is_reusable(query) {
+            query_dyn_cached(&client, &sql, &param_refs).await
+        } else {
+            client.query(&sql, &param_refs).await
+        }
+        .or_query_error("Failed to execute search")?;
 
         // Parse rows, capturing the sort key for cursor construction.
         let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
@@ -416,8 +437,10 @@ impl SearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let row = client
-            .query_one(&sql, &param_refs)
+        // No `LIMIT`/`OFFSET` in this one at all: the text varies only by
+        // predicate shape and inlined `param_name`, so it is unconditionally
+        // reusable.
+        let row = query_one_dyn_cached(&client, &sql, &param_refs)
             .await
             .or_query_error("Failed to count resources")?;
 
@@ -479,10 +502,14 @@ impl MultiTypeSearchProvider for PostgresBackend {
             offset
         );
 
-        let rows = client
-            .query(&sql, &[&tenant_id])
-            .await
-            .or_query_error("Failed to execute multi-type search")?;
+        // Same `OFFSET` reservation as `search`; the type list is inlined but is
+        // bounded by the resource types a client can name.
+        let rows = if offset == 0 {
+            query_dyn_cached(&client, &sql, &[&tenant_id]).await
+        } else {
+            client.query(&sql, &[&tenant_id]).await
+        }
+        .or_query_error("Failed to execute multi-type search")?;
 
         let mut resources = Vec::new();
         for row in &rows {
@@ -647,6 +674,13 @@ impl RevincludeProvider for PostgresBackend {
                 .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
 
+            // Deliberately NOT cached. `placeholders` has one entry per
+            // reference value, and there are two per resource on the page, so
+            // the statement text is a function of the page's size — up to 2,000
+            // placeholders, a distinct text for every page width a client asks
+            // for, and a large one. That is precisely the unbounded key the
+            // statement cache must not be fed. It also runs once per search
+            // rather than once per result, so there is little to win.
             let rows = client
                 .query(&sql, &param_refs)
                 .await
@@ -750,6 +784,15 @@ impl ChainedSearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
+        // Deliberately NOT cached: `chain_builder` splices a token's *system*
+        // into the SQL as a literal (search/chain_builder.rs, the `Token` arms of
+        // `build_terminal_condition` and its reverse twin). The value is
+        // quote-escaped, so this is a cache-key problem rather than an injection
+        // one — but a client-supplied value in the text means a distinct
+        // statement per system, which is exactly the unbounded key to avoid.
+        // Binding it instead means renumbering the chain builder's placeholder
+        // accounting, which another seat is already inside; recorded rather than
+        // fixed here.
         let rows = client
             .query(&sql, &param_refs)
             .await
@@ -798,6 +841,7 @@ impl ChainedSearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
+        // Not cached, for the reason given in `resolve_chain`.
         let rows = client
             .query(&sql, &param_refs)
             .await
@@ -834,8 +878,7 @@ impl TextSearchProvider for PostgresBackend {
             count + 1
         );
 
-        let rows = client
-            .query(&sql, &[&tenant_id, &resource_type, &text])
+        let rows = query_dyn_cached(&client, &sql, &[&tenant_id, &resource_type, &text])
             .await
             .or_query_error("Failed to execute text search")?;
 
@@ -909,8 +952,7 @@ impl TextSearchProvider for PostgresBackend {
             count + 1
         );
 
-        let rows = client
-            .query(&sql, &[&tenant_id, &resource_type, &content])
+        let rows = query_dyn_cached(&client, &sql, &[&tenant_id, &resource_type, &content])
             .await
             .or_query_error("Failed to execute content search")?;
 
@@ -1036,8 +1078,7 @@ impl PostgresBackend {
                         .iter()
                         .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                         .collect();
-                    let rows = client
-                        .query(&fragment.sql, &param_refs)
+                    let rows = query_dyn_cached(&client, &fragment.sql, &param_refs)
                         .await
                         .or_query_error("Failed to execute contained query")?;
                     rows.iter()
@@ -1250,14 +1291,18 @@ impl PostgresBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<Option<StoredResource>> {
-        let rows = client
-            .query(
-                "SELECT version_id, data, last_updated, fhir_version FROM resources
+        // One statement per included reference: an `_include` that resolves 20
+        // subjects issues this 20 times for one search. Literal text, primary-key
+        // lookup — the safest thing in the file to cache, and it was the only
+        // hot uncached statement left outside the query builder's output.
+        let rows = query_dyn_cached(
+            client,
+            "SELECT version_id, data, last_updated, fhir_version FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .or_query_error("Failed to fetch resource")?;
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .or_query_error("Failed to fetch resource")?;
 
         if rows.is_empty() {
             return Ok(None);
@@ -1282,6 +1327,37 @@ impl PostgresBackend {
             None,
             fhir_version,
         )))
+    }
+}
+
+#[cfg(test)]
+mod statement_reuse_tests {
+    use super::*;
+    use crate::types::SearchQuery;
+
+    fn q() -> SearchQuery {
+        SearchQuery::new("Patient")
+    }
+
+    #[test]
+    fn a_first_page_is_reusable() {
+        assert!(statement_is_reusable(&q()));
+    }
+
+    #[test]
+    fn an_explicit_zero_offset_is_reusable() {
+        let mut query = q();
+        query.offset = Some(0);
+        assert!(statement_is_reusable(&query));
+    }
+
+    #[test]
+    fn a_nonzero_offset_is_not_reusable() {
+        // `_offset` is inlined into the SQL and nothing clamps it, so caching
+        // this text would mint one prepared statement per page crawled.
+        let mut query = q();
+        query.offset = Some(50);
+        assert!(!statement_is_reusable(&query));
     }
 }
 

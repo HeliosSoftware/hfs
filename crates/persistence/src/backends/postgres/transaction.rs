@@ -131,8 +131,18 @@ impl PostgresTransaction {
         fhir_version: FhirVersion,
         index_layout: super::schema::IndexLayout,
     ) -> StorageResult<Self> {
-        // Start the transaction
-        client.execute("BEGIN", &[]).await.map_err(|e| {
+        // Start the transaction.
+        //
+        // `batch_execute` and not `execute`: `execute("BEGIN", &[])` takes the
+        // extended protocol, which for a `&str` means Parse + Describe + Sync
+        // and then Bind + Execute + Sync — two round trips and a throwaway
+        // server-side prepared statement, for a three-letter utility statement
+        // with no parameters and no plan. The simple query protocol is one round
+        // trip and no statement at all, and it is what `tokio_postgres`' own
+        // `Client::transaction()` uses for exactly these three keywords. Every
+        // bundle pays this twice (BEGIN and COMMIT), plus once more on the
+        // rollback paths.
+        client.batch_execute("BEGIN").await.map_err(|e| {
             StorageError::Transaction(TransactionError::RolledBack {
                 reason: format!("Failed to begin transaction: {}", e),
             })
@@ -768,7 +778,7 @@ impl Transaction for PostgresTransaction {
         // the caller gets a definite answer.
         if self.conflict.is_some() {
             if let Some(client) = self.client.as_ref() {
-                let _ = client.execute("ROLLBACK", &[]).await;
+                let _ = client.batch_execute("ROLLBACK").await;
             }
             self.active = false;
             self.pending.clear();
@@ -782,7 +792,7 @@ impl Transaction for PostgresTransaction {
         self.flush().await?;
 
         if let Some(client) = self.client.as_ref() {
-            client.execute("COMMIT", &[]).await.map_err(|e| {
+            client.batch_execute("COMMIT").await.map_err(|e| {
                 StorageError::Transaction(TransactionError::RolledBack {
                     reason: format!("Commit failed: {}", e),
                 })
@@ -805,7 +815,7 @@ impl Transaction for PostgresTransaction {
         self.pending_index_rows = 0;
 
         if let Some(client) = self.client.as_ref() {
-            client.execute("ROLLBACK", &[]).await.map_err(|e| {
+            client.batch_execute("ROLLBACK").await.map_err(|e| {
                 StorageError::Transaction(TransactionError::RolledBack {
                     reason: format!("Rollback failed: {}", e),
                 })
@@ -856,7 +866,7 @@ impl Drop for PostgresTransaction {
                     // Ignore the result: the connection drops (returns to the pool)
                     // when this task ends regardless, and a failed rollback here
                     // just means a broken connection deadpool will discard anyway.
-                    let _ = client.execute("ROLLBACK", &[]).await;
+                    let _ = client.batch_execute("ROLLBACK").await;
                 });
             }
             Err(_) => {
