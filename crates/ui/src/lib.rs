@@ -1082,6 +1082,9 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
             axum::routing::post(sql_export_cancel),
         )
         .route("/ui/sql/files", get(sql_files_page))
+        // Query-notebook POC (#650): run a ViewDefinition against $sql-run and
+        // chart the result in-product. Self-contained, same-origin only.
+        .route("/ui/sql/notebook", get(sql_notebook_page))
         .route("/ui/subscriptions", get(subscriptions::page))
         // Schema-driven resource editor (#264). One POST endpoint applies every
         // structural mutation and re-renders: the document rides with it.
@@ -2781,6 +2784,176 @@ async fn compartments_page(
 
 /// Status read path. Returns a fragment to htmx (`HX-Request`) and a full page
 /// on a hard navigation, so the same URL works with and without JavaScript.
+/// Query-notebook POC (#650). A self-contained SQL-on-FHIR "notebook": write a
+/// ViewDefinition, run it against the same-origin `$sql-run` endpoint, and see
+/// the result as a table plus an inline-SVG group-by chart — the #650 loop
+/// ("write a ViewDefinition, run it, chart the result without leaving the
+/// server") in the least code that demonstrates it. Every asset is inline; the
+/// page makes no off-origin request (respects the UI's no-CDN guard) and talks
+/// only to `$sql-run`, so it inherits the server's auth/tenant/row limits.
+async fn sql_notebook_page() -> Html<&'static str> {
+    Html(SQL_NOTEBOOK_POC_HTML)
+}
+
+const SQL_NOTEBOOK_POC_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL-on-FHIR Query Notebook (POC)</title>
+<style>
+  :root { --ink:#0b0b0b; --muted:#6b6a66; --line:#e4e3dc; --bg:#faf9f5; --surface:#fff; --accent:#2a78d6; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 -apple-system,Segoe UI,system-ui,sans-serif; }
+  .wrap { max-width:60rem; margin:0 auto; padding:2rem 1.25rem 4rem; }
+  h1 { font-size:1.5rem; margin:0 0 .25rem; }
+  h3 { font-size:.9rem; margin:1.1rem 0 .5rem; }
+  .sub { color:var(--muted); margin:0 0 1.5rem; font-size:.9rem; }
+  code { font-family:ui-monospace,Consolas,monospace; font-size:.9em; }
+  .cell { background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:1rem; margin-bottom:1.25rem; }
+  label { font-size:.8rem; color:var(--muted); display:block; margin-bottom:.35rem; }
+  textarea { width:100%; min-height:11rem; font:13px/1.5 ui-monospace,Consolas,monospace; border:1px solid var(--line); border-radius:6px; padding:.6rem; resize:vertical; }
+  .row { display:flex; gap:.75rem; align-items:end; flex-wrap:wrap; margin-top:.75rem; }
+  input[type=text] { border:1px solid var(--line); border-radius:6px; padding:.45rem .6rem; font:13px ui-monospace,monospace; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:.55rem 1rem; font-size:.9rem; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  select { border:1px solid var(--line); border-radius:6px; padding:.4rem; }
+  table { border-collapse:collapse; width:100%; font-size:.85rem; }
+  th,td { text-align:left; padding:.4rem .6rem; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; }
+  .muted { color:var(--muted); font-size:.85rem; }
+  .err { color:#c0392b; font-size:.85rem; white-space:pre-wrap; }
+  .scroll { overflow-x:auto; }
+  .pill { font:11px ui-monospace,monospace; color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:.1rem .5rem; vertical-align:middle; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SQL-on-FHIR Query Notebook <span class="pill">POC &middot; #650</span></h1>
+  <p class="sub">Write a ViewDefinition, run it against <code>$sql-run</code>, and chart the result &mdash; without leaving the server. No external requests; the page talks only to this origin.</p>
+
+  <div class="cell">
+    <label for="vd">ViewDefinition &mdash; runs against POST /$sql-run</label>
+    <textarea id="vd" spellcheck="false">{
+  "resourceType": "ViewDefinition",
+  "status": "active",
+  "resource": "Patient",
+  "select": [
+    { "column": [
+      { "name": "id", "path": "id" },
+      { "name": "gender", "path": "gender" },
+      { "name": "birth_date", "path": "birthDate" },
+      { "name": "active", "path": "active" }
+    ] }
+  ]
+}</textarea>
+    <div class="row">
+      <div>
+        <label for="tenant">X-Tenant-ID (optional)</label>
+        <input type="text" id="tenant" placeholder="(none)">
+      </div>
+      <button id="run" type="button">Run</button>
+      <span id="status" class="muted"></span>
+    </div>
+  </div>
+
+  <div class="cell" id="results" style="display:none">
+    <div class="row" style="justify-content:space-between; margin-top:0">
+      <div><strong id="rowcount"></strong> <span class="muted">rows</span></div>
+      <div>
+        <label for="groupcol" style="display:inline; margin:0 .4rem 0 0">Group by</label>
+        <select id="groupcol"></select>
+      </div>
+    </div>
+    <h3>Distribution</h3>
+    <div id="chart"></div>
+    <h3>Table <span class="muted">(first 200)</span></h3>
+    <div class="scroll"><table id="table"></table></div>
+  </div>
+
+  <div id="error" class="err"></div>
+</div>
+
+<script>
+(function () {
+  var runBtn = document.getElementById('run');
+  var vd = document.getElementById('vd');
+  var tenant = document.getElementById('tenant');
+  var statusEl = document.getElementById('status');
+  var results = document.getElementById('results');
+  var errorEl = document.getElementById('error');
+  var tableEl = document.getElementById('table');
+  var chartEl = document.getElementById('chart');
+  var groupSel = document.getElementById('groupcol');
+  var rowcount = document.getElementById('rowcount');
+  var rows = [], cols = [];
+
+  runBtn.addEventListener('click', run);
+
+  async function run() {
+    errorEl.textContent = '';
+    results.style.display = 'none';
+    var body = vd.value;
+    try { JSON.parse(body); } catch (e) { errorEl.textContent = 'ViewDefinition is not valid JSON: ' + e.message; return; }
+    runBtn.disabled = true; statusEl.textContent = 'Running...';
+    try {
+      var headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+      if (tenant.value.trim()) headers['X-Tenant-ID'] = tenant.value.trim();
+      var res = await fetch('/$sql-run?_format=json', { method: 'POST', headers: headers, credentials: 'same-origin', body: body });
+      var text = await res.text();
+      if (!res.ok) { errorEl.textContent = 'HTTP ' + res.status + '\n' + text; statusEl.textContent = ''; return; }
+      var data = JSON.parse(text);
+      rows = Array.isArray(data) ? data : (data.rows || []);
+      statusEl.textContent = '';
+      render();
+    } catch (e) {
+      errorEl.textContent = 'Request failed: ' + e.message + '\n(Is the HFS server running and serving /$sql-run at this origin?)';
+      statusEl.textContent = '';
+    } finally { runBtn.disabled = false; }
+  }
+
+  function render() {
+    cols = rows.length ? Object.keys(rows[0]) : [];
+    rowcount.textContent = rows.length;
+    var thead = '<tr>' + cols.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr>';
+    var tbody = rows.slice(0, 200).map(function (r) {
+      return '<tr>' + cols.map(function (c) { return '<td>' + esc(fmt(r[c])) + '</td>'; }).join('') + '</tr>';
+    }).join('');
+    tableEl.innerHTML = thead + tbody;
+    groupSel.innerHTML = cols.map(function (c) { return '<option' + (c === 'gender' ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('');
+    groupSel.onchange = drawChart;
+    drawChart();
+    results.style.display = '';
+  }
+
+  function drawChart() {
+    var col = groupSel.value || cols[0];
+    var counts = {};
+    rows.forEach(function (r) { var k = fmt(r[col]) || '(null)'; counts[k] = (counts[k] || 0) + 1; });
+    var entries = Object.keys(counts).map(function (k) { return [k, counts[k]]; }).sort(function (a, b) { return b[1] - a[1]; });
+    var max = entries.reduce(function (m, e) { return Math.max(m, e[1]); }, 1);
+    var barH = 22, gap = 8, labelW = 110, chartW = 340, leftPad = labelW + 6;
+    var h = Math.max(entries.length * (barH + gap), barH);
+    var svg = '<svg width="100%" viewBox="0 0 ' + (leftPad + chartW + 48) + ' ' + h + '" font-family="ui-monospace,monospace" font-size="12">';
+    entries.forEach(function (e, i) {
+      var y = i * (barH + gap);
+      var w = Math.round((e[1] / max) * chartW);
+      svg += '<text x="' + labelW + '" y="' + (y + barH * 0.7) + '" text-anchor="end" fill="#6b6a66">' + esc(e[0]) + '</text>';
+      svg += '<rect x="' + leftPad + '" y="' + y + '" width="' + w + '" height="' + barH + '" rx="2" fill="#2a78d6"></rect>';
+      svg += '<text x="' + (leftPad + w + 6) + '" y="' + (y + barH * 0.7) + '" fill="#0b0b0b">' + e[1] + '</text>';
+    });
+    svg += '</svg>';
+    chartEl.innerHTML = svg;
+  }
+
+  function fmt(v) { return v === null || v === undefined ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v)); }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]; }); }
+})();
+</script>
+</body>
+</html>
+"##;
+
 async fn status(
     State(state): State<WebState>,
     locale: RequestLocale,
