@@ -117,19 +117,12 @@
   --scroll-track: #ececec;
   --scroll-thumb: #bdbdbd;
   --scroll-thumb-hover: #a0a0a0;
-  /* Semantic status tokens (referenced by .tag--*, .lint__item--*, .notice--warn,
-     .batch-badge--*, and .tag--stored/config/conflict families).
-     Colors clear 4.5:1 on the light surfaces per WCAG 2.2 AA.
-
-     Only `ok` and `warn` live here: `--danger` / `--danger-soft` are declared
-     above and re-declaring them shadowed the canonical values. The translucent
-     `rgb(… / 12%)` form in particular made `.btn--danger:hover` paint a
-     same-hue wash behind same-hue text, which the contrast guard in
-     `crates/ui/e2e/tests/bulk-import.spec.ts` reads as a ratio of exactly 1. */
-  --ok: #1a7a3a;
-  --ok-soft: rgb(26 122 58 / 12%);
-  --warn: #a45d00;
-  --warn-soft: rgb(164 93 0 / 12%);
+  /* The semantic status pairs `.tag--*`, `.lint__item--*`, `.notice--warn` and
+     `.batch-badge--*` reference are declared once, above. This branch used to
+     redeclare all six here; every one of them now has a canonical definition
+     earlier in the same rule, so a second declaration only shadowed it — which
+     is what `design-system.spec.ts` and the contrast guard in
+     `bulk-import.spec.ts` exist to catch. */
 
   font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
@@ -171,13 +164,7 @@
   --scroll-track: rgb(255 255 255 / 7%);
   --scroll-thumb: rgb(255 255 255 / 25%);
   --scroll-thumb-hover: rgb(255 255 255 / 38%);
-  /* Semantic status tokens (dark theme): each raised for 4.5:1 on the
-     dark surfaces; the -soft variants stay translucent to sit on cards.
-     `--danger` / `--danger-soft` are declared above — see the light block. */
-  --ok: #6bd48b;
-  --ok-soft: rgb(107 212 139 / 15%);
-  --warn: #f4b95a;
-  --warn-soft: rgb(244 185 90 / 15%);
+  /* Dark-theme status pairs are declared once, above — see the light block. */
 }
 }
 
