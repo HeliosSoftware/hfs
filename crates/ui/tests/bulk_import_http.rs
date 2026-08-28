@@ -401,8 +401,10 @@ async fn editing_a_submission_changes_only_local_display_and_auth_fields() {
     assert!(!html.contains("evil.example"));
     assert!(html.contains(r#"value="After""#));
     assert!(html.contains(r#"value="none" checked"#));
-    assert!(html.contains(r#"name="client_id" autocomplete="off" value="""#));
-    assert!(html.contains(r#"name="token_url" autocomplete="off" value="""#));
+    // A cleared credential renders with no value attribute at all - the
+    // shared fieldset omits it when empty rather than emitting value="".
+    assert!(html.contains(r#"name="client_id" autocomplete="off">"#));
+    assert!(html.contains(r#"name="token_url" autocomplete="off">"#));
 }
 
 #[tokio::test]

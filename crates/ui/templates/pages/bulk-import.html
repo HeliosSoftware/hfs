@@ -7,7 +7,10 @@
 
 {% block content %}
 <header class="page-head page-head--row">
-  <h1 class="page-head__title">{{ i18n.t("bulk-import-title") }}</h1>
+  <div>
+    <h1 class="page-head__title">{{ i18n.t("bulk-import-title") }}</h1>
+    <p class="page-head__lede">{{ i18n.t("bulk-import-lede") }}</p>
+  </div>
 
   {% if available %}
   {% call dialog::modal(i18n.t("bulk-import-new"), "bulk-import-create-dialog-title", i18n.t("bulk-import-create-title")) %}
@@ -17,44 +20,11 @@
         {% call dialog::field(i18n.t("bulk-import-field-submitter-value"), "submitter_value", "text", hint=i18n.t("bulk-import-field-submitter-hint")) %}{% endcall %}
         {% call dialog::field(i18n.t("bulk-import-field-submission-id"), "submission_id", "text", hint=i18n.t("bulk-import-field-submission-id-hint")) %}{% endcall %}
 
-        <fieldset class="field">
-          <legend class="field__label">{{ i18n.t("bulk-import-auth") }}</legend>
-          <span class="field__hint">{{ i18n.t("bulk-import-auth-hint") }}</span>
-          <label class="field">
-            <input type="radio" name="auth" value="none" checked>
-            {{ i18n.t("bulk-import-auth-none") }}
-            <span class="field__hint">{{ i18n.t("bulk-import-auth-none-hint") }}</span>
-          </label>
-          <label class="field">
-            <input type="radio" name="auth" value="backend-services">
-            {{ i18n.t("bulk-import-auth-backend") }}
-            <span class="field__hint">{{ i18n.t("bulk-import-auth-backend-hint") }}</span>
-          </label>
-          <label class="field">
-            <span class="field__label">{{ i18n.t("bulk-import-field-client-id") }}</span>
-            <input class="field__input" type="text" name="client_id" autocomplete="off">
-            <span class="field__hint">{{ i18n.t("bulk-import-field-client-id-hint") }}</span>
-          </label>
-          <label class="field">
-            <span class="field__label">{{ i18n.t("bulk-import-field-token-url") }}</span>
-            <input class="field__input" type="url" name="token_url" autocomplete="off">
-            <span class="field__hint">{{ i18n.t("bulk-import-field-token-url-hint") }}</span>
-          </label>
-          <p class="field__hint">
-            {{ i18n.t("bulk-import-jwks-hint") }}
-            <a href="/.well-known/bulk-submit-jwks.json" target="_blank" rel="noopener">
-              /.well-known/bulk-submit-jwks.json
-            </a>
-          </p>
-          <button type="submit" class="btn"
-                  formaction="/ui/bulk-import/test-auth"
-                  hx-post="/ui/bulk-import/test-auth"
-                  hx-target="#test-auth-result"
-                  hx-swap="innerHTML">
-            {{ i18n.t("bulk-import-test-auth") }}
-          </button>
-          <div id="test-auth-result" role="status"></div>
-        </fieldset>
+        {% let auth_value = "none" %}
+        {% let client_id_value = "" %}
+        {% let token_url_value = "" %}
+        {% let test_auth_result_id = "test-auth-result" %}
+        {% include "partials/bulk_import_auth_fieldset.html" %}
 
         <div class="addbox__actions">
           <button type="button" class="btn" data-addbox-close>{{ i18n.t("ui-cancel") }}</button>

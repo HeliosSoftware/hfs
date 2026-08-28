@@ -8,6 +8,7 @@
   <div>
     <a class="back-link" href="/ui/bulk-import">‹ {{ i18n.t("bulk-import-all") }}</a>
     <h1 class="page-head__title">{{ name }}</h1>
+    <p class="page-head__lede">{{ i18n.t("bulk-import-detail-lede") }}</p>
   </div>
 
   {% if terminal %}
@@ -44,40 +45,24 @@
     <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-auth") }}</span><div>{{ auth }}</div></div>
   </div>
   <div class="detail__actions bulk-import-summary__actions">
-    <details class="addbox addbox--modal"{% if edit_open %} open{% endif %}>
-      <summary class="btn">{% include "icons/pencil.svg" %}{{ i18n.t("bulk-import-edit") }}</summary>
-      <div class="addbox__panel" role="dialog" aria-labelledby="bulk-import-edit-title">
-        <div class="addbox__head">
-          <div class="addbox__title" id="bulk-import-edit-title">{{ i18n.t("bulk-import-edit-title") }}</div>
-          <button type="button" class="addbox__x" data-addbox-close aria-label="{{ i18n.t("ui-close") }}">×</button>
-        </div>
+    {% call dialog::modal(i18n.t("bulk-import-edit"), "bulk-import-edit-title", i18n.t("bulk-import-edit-title"), icon="pencil", primary=false, open=edit_open) %}
         {% match error %}{% when Some(message) %}<div class="alert" role="alert">{{ message }}</div>{% when None %}{% endmatch %}
         <form method="post" action="/ui/bulk-import/{{ id }}/edit">
-          <label class="field">
-            <span class="field__label">{{ i18n.t("bulk-import-field-name") }}</span>
-            <input class="field__input" type="text" name="name" value="{{ name }}" required autocomplete="off" data-addbox-initial-focus>
-          </label>
-          <fieldset class="field">
-            <legend class="field__label">{{ i18n.t("bulk-import-auth") }}</legend>
-            <span class="field__hint">{{ i18n.t("bulk-import-auth-hint") }}</span>
-            <label class="field"><input type="radio" name="auth" value="none"{% if auth == "none" %} checked{% endif %}> {{ i18n.t("bulk-import-auth-none") }}</label>
-            <label class="field"><input type="radio" name="auth" value="backend-services"{% if auth == "backend-services" %} checked{% endif %}> {{ i18n.t("bulk-import-auth-backend") }}</label>
-            <label class="field">
-              <span class="field__label">{{ i18n.t("bulk-import-field-client-id") }}</span>
-              <input class="field__input" type="text" name="client_id" autocomplete="off" value="{{ client_id }}">
-            </label>
-            <label class="field">
-              <span class="field__label">{{ i18n.t("bulk-import-field-token-url") }}</span>
-              <input class="field__input" type="url" name="token_url" autocomplete="off" value="{{ token_url }}">
-            </label>
-          </fieldset>
+          {# `value=name` would resolve to the macro's own `name` parameter
+             (macro args shadow the caller's scope), so bind it first. #}
+          {% let submission_name = name.as_str() %}
+          {% call dialog::field(i18n.t("bulk-import-field-name"), "name", "text", required=true, initial_focus=true, value=submission_name) %}{% endcall %}
+          {% let auth_value = auth.as_str() %}
+          {% let client_id_value = client_id.as_str() %}
+          {% let token_url_value = token_url.as_str() %}
+          {% let test_auth_result_id = "edit-test-auth-result" %}
+          {% include "partials/bulk_import_auth_fieldset.html" %}
           <div class="addbox__actions">
             <button type="button" class="btn" data-addbox-close>{{ i18n.t("ui-cancel") }}</button>
             <button type="submit" class="btn btn--primary">{{ i18n.t("bulk-import-edit-submit") }}</button>
           </div>
         </form>
-      </div>
-    </details>
+    {% endcall %}
     <form method="post" action="/ui/bulk-import/{{ id }}/delete">
       <button type="submit" class="btn btn--danger">{% include "icons/trash.svg" %}{{ i18n.t("bulk-import-delete") }}</button>
     </form>
