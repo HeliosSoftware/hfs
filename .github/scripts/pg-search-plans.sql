@@ -1118,10 +1118,22 @@ SELECT COALESCE((SELECT value_reference FROM search_index
 -- `Index Cond:`, or the plan reads the whole `subject` slice. That would mean
 -- `=` is not reachable through this index and `idx_search_reference` must be
 -- restored.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated
+       FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
          AND param_name = 'subject'
          AND (value_reference = :'ref'
               OR value_reference LIKE :'ref' || '/\_history/%' ESCAPE '\')
        ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
 \echo '######## AU. AN COUNTERFACTUAL — the same shape with idx_search_reference back ########'
 -- The paired "before", in the same pass and against the same cache. DDL is
 -- transactional, so the ROLLBACK leaves the database exactly as it was.
@@ -1155,6 +1167,15 @@ JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
 WHERE r.is_deleted = FALSE
 ORDER BY c.last_updated DESC, c.resource_id ASC;
 ROLLBACK;
+-- Backstop. The ROLLBACK above undoes the CREATE only if the BEGIN actually
+-- opened a transaction. If ANY earlier statement in this file is left
+-- unterminated, psql folds the BEGIN into it, the whole thing fails to parse,
+-- the CREATE INDEX then runs in autocommit, and the ROLLBACK is a no-op
+-- warning. That is not hypothetical: it is exactly what happened to sections
+-- AT/AV below, and the leaked index sat in the schema for the whole of run
+-- 33128380492's k6 window. This statement is unconditional and does not care
+-- which of the two happened.
+DROP INDEX IF EXISTS idx_search_reference_v26;
 
 \echo ''
 \echo '######## AV. TOKEN Observation?code:text=blood — the token_display shape ########'
@@ -1178,6 +1199,12 @@ FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
          AND param_name = 'code'
          AND value_token_display ILIKE '%blood%'
        ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
 \echo '######## AW. REFERENCE Observation?subject:code-text=a — the reference_display shape ########'
 -- `value_reference_display ILIKE $n || '%'`. Same argument as AP, and stronger:
 -- the pattern here is an `OpExpr` (`$n || '%'`), not a `Const`, so no fixed
