@@ -14,13 +14,15 @@
     <h3>{{ i18n.t("cap-summary-heading") }}</h3>
   </div>
   <div class="card__body">
-    <div class="detail__field"><span>{{ i18n.t("cap-summary-description") }}</span><div>{{ view.summary.description }}</div></div>
-    <div class="detail__field"><span>{{ i18n.t("cap-summary-url") }}</span><div>{{ view.summary.implementation_url }}</div></div>
-    <div class="detail__field"><span>{{ i18n.t("cap-summary-fhir-version") }}</span><div>{{ view.summary.fhir_version }}</div></div>
-    <div class="detail__field"><span>{{ i18n.t("cap-summary-status") }}</span><div>{{ view.summary.status }}</div></div>
-    <div class="detail__field"><span>{{ i18n.t("cap-summary-kind") }}</span><div>{{ view.summary.kind }}</div></div>
-    <div class="detail__field"><span>{{ i18n.t("cap-summary-date") }}</span><div>{{ view.summary.date }}</div></div>
-    <div class="detail__field"><span>{{ i18n.t("cap-summary-formats") }}</span><div>{{ view.summary.formats.join(", ") }}</div></div>
+    <div class="kv-grid kv-grid--flush">
+      <div class="detail__field detail__field--wide"><span>{{ i18n.t("cap-summary-description") }}</span><div>{{ view.summary.description }}</div></div>
+      <div class="detail__field detail__field--wide"><span>{{ i18n.t("cap-summary-url") }}</span><div>{{ view.summary.implementation_url }}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-fhir-version") }}</span><div>{{ view.summary.fhir_version }}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-status") }}</span><div>{{ view.summary.status }}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-kind") }}</span><div>{{ view.summary.kind }}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-date") }}</span><div>{{ view.summary.date }}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-formats") }}</span><div>{{ view.summary.formats.join(", ") }}</div></div>
+    </div>
   </div>
 </section>
 

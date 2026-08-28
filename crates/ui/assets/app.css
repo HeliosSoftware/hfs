@@ -2447,6 +2447,31 @@ select.field__input {
   margin-top: 12px;
 }
 
+/* Shared labelled-value compositions. The flush modifier sets the value that
+   the existing key/value grid consumes in the later page layer, so component
+   ownership does not depend on !important or layer-breaking specificity. */
+:where(.detail__field) {
+  min-width: 0;
+}
+
+:where(.detail__field) > div {
+  overflow-wrap: anywhere;
+}
+
+.detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail-stack > .form-actions {
+  margin-top: 0;
+}
+
+.kv-grid--flush {
+  --kv-grid-margin-bottom: 0;
+}
+
 .json-editor--short {
   min-height: 120px;
 }
@@ -2791,10 +2816,6 @@ details.json-fold[open] > summary .icon {
   align-items: start;
 }
 
-.bulk-import-summary-card > .kv-grid {
-  margin-bottom: 0;
-}
-
 .bulk-import-summary__actions {
   display: flex;
   flex-wrap: wrap;
@@ -2964,11 +2985,6 @@ details.json-fold[open] > summary .icon {
     gap: 7px;
     padding: 8px;
   }
-}
-
-/* Status cards have no actions or content after their sole grid. */
-#bulk-status.bulk-import-section > .kv-grid:only-child {
-  margin-bottom: 0;
 }
 
 /* Detail panel (right rail on the SearchParameter viewer) */
@@ -3266,7 +3282,7 @@ details.json-fold[open] > summary .icon {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px 18px;
-  margin-bottom: 14px;
+  margin-bottom: var(--kv-grid-margin-bottom, 14px);
 }
 
 .detail__field--wide {

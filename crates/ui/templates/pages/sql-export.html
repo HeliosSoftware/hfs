@@ -34,11 +34,15 @@
   <div class="card-head">
     <h3>{{ i18n.t("export-job-heading") }}</h3>
   </div>
-  <div class="detail__field"><span>{{ i18n.t("export-job-id") }}</span><div><code>{{ job_id }}</code></div></div>
+  <div class="card__body">
+    <div class="kv-grid kv-grid--flush">
+      <div class="detail__field detail__field--wide"><span>{{ i18n.t("export-job-id") }}</span><div><code>{{ job_id }}</code></div></div>
   {% if let Some(state) = job_status %}
   {% match state %}
   {% when SqlExportStatus::Running(progress) %}
-  <div class="detail__field"><span>{{ i18n.t("export-job-state") }}</span><div>{{ i18n.t("export-state-running") }}{% if let Some(p) = progress %} — {{ p }}{% endif %}</div></div>
+      <div class="detail__field detail__field--wide"><span>{{ i18n.t("export-job-state") }}</span><div>{{ i18n.t("export-state-running") }}{% if let Some(p) = progress %} — {{ p }}{% endif %}</div></div>
+    </div>
+  </div>
   <div class="card-head">
     <a class="btn" href="/ui/sql/export?job={{ job_id }}">{{ i18n.t("export-refresh") }}</a>
     <form method="post" action="/ui/sql/export/cancel">
@@ -47,13 +51,20 @@
     </form>
   </div>
   {% when SqlExportStatus::Done %}
-  <div class="detail__field"><span>{{ i18n.t("export-job-state") }}</span><div>{{ i18n.t("export-state-done") }}</div></div>
+      <div class="detail__field detail__field--wide"><span>{{ i18n.t("export-job-state") }}</span><div>{{ i18n.t("export-state-done") }}</div></div>
+    </div>
+  </div>
   <div class="card-head">
     <a class="btn btn--primary" href="/ui/sql/files?job={{ job_id }}">{{ i18n.t("export-view-files") }}</a>
   </div>
   {% when SqlExportStatus::Unknown %}
-  <p class="notice notice--warn">{{ i18n.t("export-state-unknown") }}</p>
+    </div>
+    <p class="notice notice--warn">{{ i18n.t("export-state-unknown") }}</p>
+  </div>
   {% endmatch %}
+  {% else %}
+    </div>
+  </div>
   {% endif %}
 </section>
 {% endif %}
@@ -65,7 +76,7 @@
   {% if subjects.is_empty() %}
   <div class="card__body"><p class="page-head__lede">{{ i18n.t("export-no-subjects") }}</p></div>
   {% else %}
-  <form method="post" action="/ui/sql/export" class="card__body">
+  <form method="post" action="/ui/sql/export" class="card__body detail-stack">
     {% for s in subjects %}
     <div class="detail__field">
       <span><label><input type="checkbox" name="subject" value="{{ s.reference }}"> {{ s.name }}</label></span>

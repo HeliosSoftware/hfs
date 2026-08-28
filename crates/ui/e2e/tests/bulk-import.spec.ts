@@ -45,6 +45,8 @@ for (const viewport of VIEWPORTS) {
         overflowY: style.overflowY,
         scrolls: element.scrollHeight > element.clientHeight,
         columns: getComputedStyle(grid).gridTemplateColumns.split(/\s+/).filter(Boolean).length,
+        rowGap: getComputedStyle(grid).rowGap,
+        marginBottom: getComputedStyle(grid).marginBottom,
       };
     });
     expect(summaryLayout).toEqual({
@@ -53,6 +55,8 @@ for (const viewport of VIEWPORTS) {
       overflowY: "visible",
       scrolls: false,
       columns: viewport.columns,
+      rowGap: "14px",
+      marginBottom: "0px",
     });
 
     const boxes = await Promise.all(

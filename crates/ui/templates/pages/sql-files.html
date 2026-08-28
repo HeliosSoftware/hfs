@@ -18,7 +18,7 @@
   <div class="card-head">
     <h3>{{ i18n.t("files-job-heading") }}</h3>
   </div>
-  <form method="get" action="/ui/sql/files" class="card__body">
+  <form method="get" action="/ui/sql/files" class="card__body detail-stack">
     <div class="detail__field">
       <span><label for="files-job">{{ i18n.t("export-job-id") }}</label></span>
       <div><input id="files-job" class="field__input" type="text" name="job" value="{{ job }}"></div>
