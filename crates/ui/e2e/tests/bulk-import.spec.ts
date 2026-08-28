@@ -69,6 +69,47 @@ for (const viewport of VIEWPORTS) {
   });
 }
 
+for (const viewport of [
+  { name: "wide", width: 1440, height: 1024 },
+  { name: "narrow", width: 390, height: 844 },
+] as const) {
+  test(`summary actions follow the responsive Figma composition — ${viewport.name}`, async ({
+    page,
+    request,
+    bulkImport,
+  }) => {
+    await page.setViewportSize(viewport);
+    await bulkImport.seedAndGoto(request, `summary-actions-${viewport.name}`);
+
+    const metadata = bulkImport.summaryGrid;
+    const actions = bulkImport.summary.locator(".bulk-import-summary__actions");
+    const [summaryBounds, metadataBounds, actionBounds] = await Promise.all([
+      bulkImport.summary.boundingBox(),
+      metadata.boundingBox(),
+      actions.boundingBox(),
+    ]);
+    expect(summaryBounds).not.toBeNull();
+    expect(metadataBounds).not.toBeNull();
+    expect(actionBounds).not.toBeNull();
+
+    if (viewport.name === "wide") {
+      expect(actionBounds!.x).toBeGreaterThan(metadataBounds!.x + metadataBounds!.width);
+      expect(Math.abs(actionBounds!.y - metadataBounds!.y)).toBeLessThanOrEqual(1);
+    } else {
+      expect(actionBounds!.y).toBeGreaterThanOrEqual(metadataBounds!.y + metadataBounds!.height);
+      expect(actionBounds!.x).toBeGreaterThanOrEqual(summaryBounds!.x);
+      expect(actionBounds!.x + actionBounds!.width).toBeLessThanOrEqual(
+        summaryBounds!.x + summaryBounds!.width,
+      );
+      expect(
+        await page.evaluate(
+          () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+        ),
+      ).toBe(true);
+    }
+  });
+}
+
 for (const theme of ["light", "dark"] as const) {
   test(`back link, destructive action, and empty states use shared treatments — ${theme}`, async ({
     request,
@@ -222,6 +263,7 @@ test("manifest-row actions use the canonical scale across emphasis variants", as
   request,
   bulkImport,
 }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
   const detail = await bulkImport.seedAndGoto(request, `button-scale-${Date.now()}`);
   const response = await request.post(`${detail}/manifests`, {
     form: {
@@ -235,10 +277,63 @@ test("manifest-row actions use the canonical scale across emphasis variants", as
   expect(response.status()).toBeLessThan(400);
   await page.goto(detail, { waitUntil: "networkidle" });
 
-  const metrics = await readButtonGeometries(bulkImport.manifestsCard.locator("tbody .btn"));
-  expect(metrics.length).toBeGreaterThanOrEqual(3);
+  const metrics = await readButtonGeometries(
+    bulkImport.manifestsCard.locator(".bulk-import-manifest-row .btn"),
+  );
+  expect(metrics).toHaveLength(1);
   for (const geometry of metrics) expect(geometry).toEqual(CANONICAL_BUTTON_GEOMETRY);
+
+  const menuTrigger = bulkImport.manifestsCard.locator(".bulk-import-manifest-menu__trigger");
+  await expect(menuTrigger).toHaveCSS("width", "30px");
+  await expect(menuTrigger).toHaveCSS("height", "30px");
+  await expect(menuTrigger).toHaveCSS("border-radius", "9px");
+  await expect(menuTrigger).toHaveCSS("border-top-width", "0px");
 });
+
+for (const viewport of [
+  { width: 1440, height: 1024 },
+  { width: 390, height: 844 },
+] as const) {
+  test(`long manifest URLs ellipsize without clipping the row menu — ${viewport.width}px`, async ({
+    page,
+    request,
+    bulkImport,
+  }) => {
+    await page.setViewportSize(viewport);
+    const detail = await bulkImport.seedAndGoto(request, `long-url-${viewport.width}`);
+    const manifestUrl = `https://example.test/${"deeply-nested-segment/".repeat(16)}manifest.json?${"filter=Patient%2F".repeat(8)}`;
+    const response = await request.post(`${detail}/manifests`, {
+      form: { manifest_url: manifestUrl },
+      maxRedirects: 0,
+    });
+    expect(response.status()).toBeGreaterThanOrEqual(300);
+    expect(response.status()).toBeLessThan(400);
+    await page.goto(detail, { waitUntil: "networkidle" });
+
+    const url = page.locator(".bulk-import-manifest-row__url");
+    await expect(url).toHaveText(manifestUrl);
+    expect(
+      await url.evaluate((element) => element.scrollWidth > element.clientWidth),
+    ).toBe(true);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      ),
+    ).toBe(true);
+
+    const trigger = page.locator(".bulk-import-manifest-menu__trigger");
+    await trigger.focus();
+    await page.keyboard.press("Enter");
+    const panel = page.locator(".bulk-import-manifest-menu__panel");
+    await expect(panel).toBeVisible();
+    const bounds = await panel.boundingBox();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width);
+    await page.keyboard.press("Escape");
+    await expect(panel).not.toBeVisible();
+    await expect(trigger).toBeFocused();
+  });
+}
 
 // #721: the New Submission summary doubles as the modal backdrop; the
 // button's fixed height used to beat the inset stretch and shrink it to a
