@@ -599,7 +599,7 @@ mod tests {
 
     /// A composite component carrying a reference is read by exactly the
     /// predicates a plain reference row is, so it is normalized on the same
-    /// terms as `IndexRow::from_extracted` — see schema v31.
+    /// terms as `IndexRow::from_extracted` — see schema v32.
     #[test]
     fn a_composite_reference_component_is_version_stripped() {
         let mut row = CompositeRow::default();

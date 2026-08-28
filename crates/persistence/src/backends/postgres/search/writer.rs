@@ -431,7 +431,7 @@ impl IndexRow {
                 display,
             } => {
                 // Stored in its version-agnostic base form. See
-                // `migrate_v30_to_v31`: no reader of this column has ever been
+                // `migrate_v31_to_v32`: no reader of this column has ever been
                 // able to use a `/_history/<vid>` suffix, and three of them are
                 // silently broken by one.
                 row.value_reference =
@@ -1109,7 +1109,7 @@ mod tests {
         assert!(number.value_quantity_value.is_none());
     }
 
-    /// The whole of schema v31 rests on this: `value_reference` holds the
+    /// The whole of schema v32 rests on this: `value_reference` holds the
     /// version-agnostic base, so `build_reference_condition` can emit one
     /// equality instead of `= OR LIKE '<base>/\_history/%'`, and so the three
     /// readers that split the column on `/` (`_revinclude`, `ChainQueryBuilder`,

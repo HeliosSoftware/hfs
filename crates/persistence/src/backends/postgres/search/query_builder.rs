@@ -42,22 +42,22 @@ fn like_escape(value: &str) -> String {
 /// `idx_search_string_folded_pattern` under `text_pattern_ops`, can.
 ///
 /// Must stay character-for-character identical to the index definition in
-/// `schema.rs::migrate_v29_to_v30`, or Postgres will not use the index.
+/// `schema.rs::migrate_v32_to_v33`, or Postgres will not use the index.
 ///
 /// ## Why the default (starts-with) form carries no `value_string IS NOT NULL`
 ///
 /// v24 added that conjunct so the pattern index — then partial on
 /// `WHERE value_string IS NOT NULL` — could be *proved* usable, because
 /// `COALESCE(a, b) LIKE …` does not imply it (COALESCE is not strict). It did
-/// make the index legal. It also made it unreachable on cost, and v30 measured
+/// make the index legal. It also made it unreachable on cost, and v33 measured
 /// why: the conjunct is a second, independently-multiplied selectivity factor on
 /// a table where only 0.9% of rows have a string value, and `param_name` already
 /// determines that column. Postgres estimated the `(Patient, address)` slice at
 /// 25 rows instead of 5,000 and picked the physically smallest index that could
 /// supply the `(tenant, type, param)` prefix — `idx_search_string`, 50 MB —
-/// filtering the rest. See `schema.rs::migrate_v29_to_v30` for the plans.
+/// filtering the rest. See `schema.rs::migrate_v32_to_v33` for the plans.
 ///
-/// v30 moves the reachability proof into the operator instead: `~>=~` is strict
+/// v33 moves the reachability proof into the operator instead: `~>=~` is strict
 /// in the expression, so it implies the index's new
 /// `COALESCE(…) IS NOT NULL` predicate on its own, and the conjunct — with its
 /// wrong estimate — is gone. `:contains`/`:text` keep the conjunct deliberately:
@@ -77,7 +77,7 @@ const FOLDED_STRING_EXPR: &str = "COALESCE(value_string_folded, lower(value_stri
 /// This is the same construction `match_pattern_prefix` (`indxpath.c`) performs
 /// when it can see a `LIKE` pattern as a `Const`; doing it here is what makes
 /// the seek survive a *parameterized* pattern, which the planner cannot rewrite
-/// at all — see `migrate_v29_to_v30`.
+/// at all — see `migrate_v32_to_v33`.
 ///
 /// Two cases have no bound and fall back to `LIKE`:
 /// - an empty prefix (every value matches, and there is nothing to increment);
@@ -402,7 +402,7 @@ impl PostgresQueryBuilder {
         let p1 = param_offset + 1;
 
         // A plain equality. `value_reference` holds the version-agnostic base
-        // (schema v31), so the `LIKE $n || '/_history/%'` arm this used to carry
+        // (schema v32), so the `LIKE $n || '/_history/%'` arm this used to carry
         // could match nothing — and it was the worst-shaped predicate in the
         // backend: the pattern is an `OpExpr` built in SQL rather than a `Const`,
         // so no fixed prefix could be derived from it under *any* plan, and an OR
@@ -891,7 +891,7 @@ impl PostgresQueryBuilder {
                         }
                         // No upper bound exists: an empty search value (which
                         // matches every indexed value) or an all-`char::MAX`
-                        // prefix. Fall back to the pre-v30 `LIKE` form, which
+                        // prefix. Fall back to the pre-v33 `LIKE` form, which
                         // needs the explicit conjunct to reach a partial index.
                         None => {
                             next += 1;
@@ -1776,7 +1776,7 @@ impl PostgresQueryBuilder {
     ///
     /// The identifier lookup **drives**; the reference index is seeked with what
     /// it produces. The sub-select yields the target's `Type/id` — the exact
-    /// form the writer stores (schema v31 also strips any `/_history/<vid>`, so
+    /// form the writer stores (schema v32 also strips any `/_history/<vid>`, so
     /// there is no other stored form to consider) — and the enclosing
     /// `value_reference` is compared against that set. This is the shape the
     /// SQLite backend has always used (`build_identifier_condition`), reached
@@ -1919,7 +1919,7 @@ impl PostgresQueryBuilder {
     ///
     /// Matching stays version-agnostic throughout, but from **both** ends now:
     /// the search value is stripped of any `/_history/<vid>` here, and the stored
-    /// value was stripped by the writer (schema v31). The `OR value_reference
+    /// value was stripped by the writer (schema v32). The `OR value_reference
     /// LIKE '<base>/\_history/%'` arm this used to carry is therefore gone —
     /// there is no longer a stored form for it to find. That arm was the second
     /// index probe of every reference search in the benchmark and it forced the
@@ -2019,7 +2019,7 @@ impl PostgresQueryBuilder {
 
                 if base.contains('/') {
                     // `Type/id` or an absolute URL. One equality: the stored
-                    // value is the version-agnostic base (schema v31), so a
+                    // value is the version-agnostic base (schema v32), so a
                     // stored version cannot hide a match from it.
                     let exact = param_num + 1;
                     param_num += 1;
@@ -2800,11 +2800,11 @@ mod tests {
     #[test]
     fn string_search_is_sargable_and_escapes_wildcards() {
         // `ILIKE` can never use a btree, and the raw `COALESCE(folded, value_string)`
-        // could not be matched by any index. v30 goes further than `LIKE`: the
+        // could not be matched by any index. v33 goes further than `LIKE`: the
         // starts-with form is emitted as an explicit bytewise range, because a
         // `LIKE` whose pattern is a bind parameter cannot be turned into an
         // index range by the planner at all (`match_pattern_prefix` needs a
-        // `Const`). See `migrate_v29_to_v30`.
+        // `Const`). See `migrate_v32_to_v33`.
         let param = SearchParameter {
             name: "name".to_string(),
             param_type: SearchParamType::String,
@@ -2930,7 +2930,7 @@ mod tests {
     #[test]
     fn empty_string_value_falls_back_to_the_like_form() {
         // `name=` matches every indexed value; there is no prefix to bound, so
-        // the pre-v30 `LIKE '%'` form is emitted — and it needs the explicit
+        // the pre-v33 `LIKE '%'` form is emitted — and it needs the explicit
         // conjunct to reach a partial index.
         let query = SearchQuery::new("Patient").with_parameter(string_param("name", None, ""));
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
@@ -2995,10 +2995,10 @@ mod tests {
         //
         // v24 got there with an explicit `value_string IS NOT NULL` conjunct,
         // because `COALESCE(a, b) LIKE …` does not imply it (COALESCE is not
-        // strict). v30 rewords the index predicate onto the COALESCE itself and
+        // strict). v33 rewords the index predicate onto the COALESCE itself and
         // lets the strict operator do the proving — which also takes the
         // conjunct, and the 200x row-estimate error it caused, out of the
-        // starts-with plan. See `migrate_v29_to_v30`.
+        // starts-with plan. See `migrate_v32_to_v33`.
         let query =
             SearchQuery::new("Patient").with_parameter(string_param("name", None, "Emilia"));
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
@@ -3376,7 +3376,7 @@ mod tests {
             "reference OR-list must be one sublink: {}",
             frag.sql
         );
-        // One param per type-prefixed value since v31: the base. The stored
+        // One param per type-prefixed value since v32: the base. The stored
         // value is the base too, so there is no second form to match.
         assert_eq!(frag.params.len(), 2);
         assert!(
@@ -3456,7 +3456,7 @@ mod tests {
         );
     }
 
-    /// v31's read-side claim, pinned. The `Type/id` form — every reference
+    /// v32's read-side claim, pinned. The `Type/id` form — every reference
     /// search the benchmark sends, and 18% of the search suite's Postgres time —
     /// must emit ONE equality. A disjunction here forces a `BitmapOr` and a
     /// `Bitmap Heap Scan` whose `Filter` re-evaluates the whole predicate on
