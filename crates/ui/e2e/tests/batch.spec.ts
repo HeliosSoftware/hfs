@@ -4,6 +4,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
+import {
+  CANONICAL_BUTTON_GEOMETRY,
+  readButtonGeometry,
+} from "../pages/button-geometry";
 
 // The Batch/Transaction workspace (#476): upload → preflight → execute →
 // response, entirely against the ordinary FHIR API.
@@ -72,16 +76,19 @@ test("a transaction bundle uploads, previews, executes, and reports", async ({ p
   await expect(page.locator("#batch-json .json-view")).toBeVisible();
   await page.locator("#batch-tab-actions").click();
 
-  // The execute error slot lives inside the footer, next to its button (#676).
-  await expect(page.locator(".batch-footer #batch-execute-error")).toHaveCount(1);
+  // The execute error slot sits above the plan card (#730), and the bottom
+  // footer is gone — Cancel/Execute exist once, at the top.
+  await expect(page.locator("#batch-execute-error + .card")).toHaveCount(1);
+  await expect(page.locator("#batch-preflight .batch-footer")).toHaveCount(1);
 
   // Execute: outcomes per entry plus the aggregate summary.
-  await page.locator("#batch-execute").click();
+  await page.locator("#batch-execute-top").click();
   await expect(page.locator("#batch-response")).toBeVisible();
   await expect(page.locator("#batch-outcomes .batch-row")).toHaveCount(2);
   await expect(page.locator("#batch-outcomes .batch-badge").first()).toContainText("201");
-  await expect(page.locator("#batch-summary")).toContainText("2");
-  await expect(page.locator("#batch-summary")).toContainText(/created/i);
+  // The created count reads in the card head, beside the status badge (#729).
+  await expect(page.locator("#batch-created")).toContainText("2");
+  await expect(page.locator("#batch-created")).toContainText(/created/i);
   await expect(page.locator("#batch-overall")).toHaveClass(/--ok/);
 
   // Done is the one way out (#675): back to a clean upload stage. Done hid
@@ -91,6 +98,25 @@ test("a transaction bundle uploads, previews, executes, and reports", async ({ p
   await expect(page.locator("#batch-preflight")).toBeHidden();
   await expect(page.locator("#batch-drop")).toBeFocused();
 });
+
+for (const type of ["batch", "transaction"] as const) {
+  test(`${type} preflight keeps Cancel/Execute on the canonical scale`, async ({ page }) => {
+    test.skip(
+      type === "transaction" && process.env.HFS_E2E_NO_TRANSACTIONS === "1",
+      "transactions refused on this backend",
+    );
+    await page.goto("/ui/batch", { waitUntil: "networkidle" });
+    await page.locator("#batch-file").setInputFiles(bundleFile(type));
+    await expect(page.locator("#batch-preflight")).toBeVisible();
+
+    const controls = ["#batch-cancel-top", "#batch-execute-top"];
+    const geometries = await Promise.all(
+      controls.map((selector) => readButtonGeometry(page.locator(selector))),
+    );
+    expect(new Set(geometries.map((geometry) => JSON.stringify(geometry))).size).toBe(1);
+    expect(geometries[0]).toEqual(CANONICAL_BUTTON_GEOMETRY);
+  });
+}
 
 test("JSON previews are lazy, cached, compact, accessible, and isolated per view", async ({ page }) => {
   const previews: { contentType: string | undefined; body: string | null }[] = [];
@@ -213,7 +239,7 @@ test("an invalid replacement clears the old preview and cannot execute stale or 
 
   // Exercise the defensive guard even though the hidden control cannot be
   // reached by a user while the upload stage is visible.
-  await page.locator("#batch-execute").evaluate((button: HTMLButtonElement) => button.click());
+  await page.locator("#batch-execute-top").evaluate((button: HTMLButtonElement) => button.click());
   expect(executeRequests).toBe(0);
   await expect(page.locator("#batch-upload-error")).toBeVisible();
 });
@@ -320,7 +346,7 @@ test("a non-bundle file is rejected with a message, not a crash", async ({ page 
 // The transient states are made deterministically observable: FileReader
 // delivery and the execute POST are both parked behind manual releases.
 
-const FOOTER_CONTROLS = ["#batch-execute", "#batch-execute-top", "#batch-cancel", "#batch-cancel-top"];
+const FOOTER_CONTROLS = ["#batch-execute-top", "#batch-cancel-top"];
 
 test("picking a file shows the busy region before any file bytes arrive", async ({ page }) => {
   await page.goto("/ui/batch", { waitUntil: "networkidle" });
@@ -373,21 +399,23 @@ test("execute busies the whole footer, ignores re-entrant clicks, and lands focu
   await page.goto("/ui/batch", { waitUntil: "networkidle" });
   await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
   await expect(page.locator("#batch-preflight")).toBeVisible();
-  await page.locator("#batch-execute").click();
+  const geometryBefore = await readButtonGeometry(page.locator("#batch-execute-top"));
+  await page.locator("#batch-execute-top").click();
 
-  // Both Execute copies spin, and the Cancels go inert with them: a
+  // Execute spins and Cancel goes inert with it: a
   // mid-flight Cancel raced the settling response and crashed on the nulled
   // bundle before #679.
-  await expect(page.locator("#batch-execute")).toHaveAttribute("aria-busy", "true");
   await expect(page.locator("#batch-execute-top")).toHaveAttribute("aria-busy", "true");
   for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeDisabled();
+  expect(await readButtonGeometry(page.locator("#batch-execute-top"))).toEqual(geometryBefore);
+  expect(await readButtonGeometry(page.locator("#batch-cancel-top"))).toEqual(geometryBefore);
   await expect(page.locator("#batch-busy")).toBeVisible();
   await expect(page.locator("#batch-busy")).toContainText("Executing");
 
   // The default-motion busy button: the label yields to the animated ring,
   // and the filled primary gets the explicit white ring (accent-on-accent
   // vanishes in dark theme).
-  const busyStyle = await page.locator("#batch-execute").evaluate((button) => ({
+  const busyStyle = await page.locator("#batch-execute-top").evaluate((button) => ({
     color: getComputedStyle(button).color,
     content: getComputedStyle(button, "::after").content,
     animation: getComputedStyle(button, "::after").animationName,
@@ -401,7 +429,7 @@ test("execute busies the whole footer, ignores re-entrant clicks, and lands focu
   // Re-entrant activation cannot double-POST: a real click on a disabled
   // button dispatches nothing, and a synthetic event that does reach the
   // handler is ignored by the busy guard.
-  await page.locator("#batch-execute").evaluate((button: HTMLButtonElement) => button.click());
+  await page.locator("#batch-execute-top").evaluate((button: HTMLButtonElement) => button.click());
   await page
     .locator("#batch-execute-top")
     .evaluate((button) => button.dispatchEvent(new MouseEvent("click", { bubbles: true })));
@@ -444,10 +472,10 @@ test("a whole-bundle failure clears the busy state and re-enables the footer", a
 
   await page.goto("/ui/batch", { waitUntil: "networkidle" });
   await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
-  await page.locator("#batch-execute").click();
+  await page.locator("#batch-execute-top").click();
 
   // The busy state is genuinely entered before the failure lands…
-  await expect(page.locator("#batch-execute")).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator("#batch-execute-top")).toHaveAttribute("aria-busy", "true");
   await expect(page.locator("#batch-busy")).toBeVisible();
   release();
 
@@ -456,10 +484,44 @@ test("a whole-bundle failure clears the busy state and re-enables the footer", a
   await expect(page.locator("#batch-execute-error")).toBeVisible();
   await expect(page.locator("#batch-preflight")).toBeVisible();
   for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeEnabled();
-  await expect(page.locator("#batch-execute")).not.toHaveAttribute("aria-busy", "true");
+  await expect(page.locator("#batch-execute-top")).not.toHaveAttribute("aria-busy", "true");
   await expect(page.locator("#batch-busy")).toBeHidden();
   // Focus returns to the trigger, which sits next to the inline error (#676).
-  await expect(page.locator("#batch-execute")).toBeFocused();
+  await expect(page.locator("#batch-execute-top")).toBeFocused();
+
+  // Cancel wipes the attempt completely: dropping the next file must not
+  // resurface the abandoned attempt's error (#731).
+  await page.locator("#batch-cancel-top").click();
+  await expect(page.locator("#batch-upload-error")).toBeHidden();
+  await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
+  await expect(page.locator("#batch-preflight")).toBeVisible();
+  await expect(page.locator("#batch-execute-error")).toBeHidden();
+});
+
+test("revealing a tall preflight neither scrolls the page nor paints a focus ring", async ({
+  page,
+}) => {
+  await page.goto("/ui/batch", { waitUntil: "networkidle" });
+  // Enough entries that the rendered plan is taller than the viewport —
+  // the size precondition of the focus() scroll (#732).
+  const entries = Array.from({ length: 60 }, (_, i) => ({
+    request: { method: "POST", url: "Patient" },
+    resource: { resourceType: "Patient", name: [{ family: `Tall${i}` }] },
+  }));
+  const file = writeRawFile(
+    JSON.stringify({ resourceType: "Bundle", type: "batch", entry: entries }),
+    "tall",
+  );
+  await page.locator("#batch-file").setInputFiles(file);
+  await expect(page.locator("#batch-preflight")).toBeVisible();
+  await expect(page.locator("#batch-rows .batch-row")).toHaveCount(60);
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+  // The stage holds programmatic focus without the browser's default ring
+  // tracing its outline (#726).
+  await expect(page.locator("#batch-preflight")).toBeFocused();
+  expect(
+    await page.locator("#batch-preflight").evaluate((el) => getComputedStyle(el).outlineStyle),
+  ).toBe("none");
 });
 
 test("reduced-motion users get a static ring, not an animated one", async ({ page }) => {
@@ -474,12 +536,12 @@ test("reduced-motion users get a static ring, not an animated one", async ({ pag
 
   await page.goto("/ui/batch", { waitUntil: "networkidle" });
   await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
-  await page.locator("#batch-execute").click();
-  await expect(page.locator("#batch-execute")).toHaveAttribute("aria-busy", "true");
+  await page.locator("#batch-execute-top").click();
+  await expect(page.locator("#batch-execute-top")).toHaveAttribute("aria-busy", "true");
 
   // The static form: the ring glyph is present but does not animate. A
   // label-only dimmed button would read as "disabled", not "working".
-  const after = await page.locator("#batch-execute").evaluate((button) => ({
+  const after = await page.locator("#batch-execute-top").evaluate((button) => ({
     content: getComputedStyle(button, "::after").content,
     animation: getComputedStyle(button, "::after").animationName,
   }));
@@ -512,7 +574,7 @@ test("a synchronously-failing operation cannot leave a stale region label", asyn
   // region keeps the stale label and announces it on its next reveal.
   const state = await page.evaluate(() => {
     const region = document.getElementById("batch-busy") as HTMLElement;
-    const button = document.getElementById("batch-execute") as HTMLButtonElement;
+    const button = document.getElementById("batch-execute-top") as HTMLButtonElement;
     const busyApi = (window as { hfsBusy?: { during: Function } }).hfsBusy!;
     busyApi.during(
       [button],

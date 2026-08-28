@@ -154,9 +154,9 @@ async fn the_export_page_uses_form_panels_with_name_and_hint_up_top() {
     let (status, html) = get_text(&base, "/ui/bulk-export").await;
     assert_eq!(status, 200);
 
-    // The form sections use the non-sticky .form-panel, not the sticky
-    // .detail sidebar layout (#608).
-    assert!(html.contains("card form-panel"));
+    // The scope choices are the designed radio-card row (#735), and nothing
+    // borrows the sticky .detail sidebar layout (#608).
+    assert_eq!(html.matches(r#"class="choice-card""#).count(), 3);
     assert!(!html.contains("card detail"));
 
     // The Name field comes before the scope radios in the first panel.

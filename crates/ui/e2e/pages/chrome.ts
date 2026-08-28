@@ -36,8 +36,15 @@ export class AppChrome {
     }, theme);
   }
 
+  /** A language option inside the avatar user menu (#725): a real `?lang=`
+   * link behind a `<details>` disclosure, so it works without JS. */
   langLink(lang: string): Locator {
-    return this.page.locator(`.lang-switcher a[href*='lang=${lang}']`);
+    return this.page.locator(`.menu--user a[href*='lang=${lang}']`);
+  }
+
+  /** The avatar disclosure in the topbar (#725). */
+  get userMenu(): Locator {
+    return this.page.locator("details.menu--user");
   }
 
   /** The FHIR-version disclosure in the sidebar footer (#343): a `<details>`

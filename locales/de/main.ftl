@@ -28,6 +28,10 @@ language-label = Sprache
 language-en = Englisch
 language-es = Spanisch
 language-de = Deutsch
+user-menu-label = Kontomenü
+user-local = Lokaler Benutzer
+user-local-hint = Authentifizierung ist deaktiviert
+user-logout = Abmelden
 
 ## Startseite
 
@@ -710,6 +714,9 @@ bulk-export-field-since-custom = Benutzerdefinierter Zeitpunkt
 bulk-export-field-since-custom-hint = Gilt, wenn Seit auf Benutzerdefiniert steht. RFC 3339, z. B. 2026-08-01T00:00:00Z.
 bulk-export-start = Export starten
 bulk-export-running = laufend
+bulk-export-clear = Leeren
+bulk-export-files-word = Dateien
+bulk-export-exports-word = Exporte
 bulk-export-none = Noch keine Exporte. Starten Sie einen auf der Massenexport-Seite.
 bulk-export-status-in-progress = Läuft
 bulk-export-status-complete = Abgeschlossen

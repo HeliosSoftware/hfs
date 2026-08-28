@@ -1070,7 +1070,6 @@ async fn test_parquet_response_uses_native_parquet_content_type() {
 /// wrapper, but the inner ViewDefinition has a type mismatch serde can't
 /// parse) must surface as `422 Unprocessable Entity`, not `400 Bad Request`.
 #[tokio::test]
-#[ignore = "production returns 400: strict Parameters deserialization short-circuits the 422 path, tracked in #670"]
 async fn test_invalid_view_definition_returns_422() {
     let server = common::test_server().await;
 

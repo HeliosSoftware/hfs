@@ -43,10 +43,9 @@
   var outcomes = document.getElementById("batch-outcomes");
   var overall = document.getElementById("batch-overall");
   var summary = document.getElementById("batch-summary");
-  var executeBtn = document.getElementById("batch-execute");
   var executeTopBtn = document.getElementById("batch-execute-top");
-  var cancelBtn = document.getElementById("batch-cancel");
   var cancelTopBtn = document.getElementById("batch-cancel-top");
+  var createdBadge = document.getElementById("batch-created");
   var doneBtn = document.getElementById("batch-done");
   var busyRegion = document.getElementById("batch-busy");
 
@@ -194,7 +193,9 @@
              revealed stage, not its primary action. */
           var active = document.activeElement;
           if (active === document.body || stages.upload.contains(active)) {
-            stages.preflight.focus();
+            /* preventScroll (#732): on a plan taller than the viewport the
+               default scroll-into-view pinned the Execute row to the top. */
+            stages.preflight.focus({ preventScroll: true });
           }
         } finally {
           busy.done();
@@ -301,6 +302,11 @@
     bundle = null;
     fileInput.value = "";
     clearPreflight();
+    /* Errors are page-level elements, not stage content: hiding a stage
+       leaves them set, so an abandoned attempt's error would greet the next
+       one (#731). */
+    uploadError.hidden = true;
+    executeError.hidden = true;
     show("upload");
     /* Done/Cancel hid the stage that held focus; land on the one action
        the upload stage offers (#679). Containment, not body: the focus
@@ -314,7 +320,6 @@
       drop.focus();
     }
   }
-  cancelBtn.addEventListener("click", reset);
   cancelTopBtn.addEventListener("click", reset);
 
   /* ---- stage 3: execute and report ------------------------------------ */
@@ -331,7 +336,7 @@
        crashed the settling renderResponse. Busy holds until the outcome is
        rendered, not merely until response headers arrive. */
     hfsBusy.during(
-      [executeBtn, executeTopBtn],
+      [executeTopBtn],
       function () {
         return fetch("/", {
           method: "POST",
@@ -350,10 +355,9 @@
             executeError.hidden = false;
           });
       },
-      { alsoDisable: [cancelBtn, cancelTopBtn], region: busyRegion, label: messages.msgExecuting }
+      { alsoDisable: [cancelTopBtn], region: busyRegion, label: messages.msgExecuting }
     );
   }
-  executeBtn.addEventListener("click", execute);
   executeTopBtn.addEventListener("click", execute);
   /* The run already happened: Done lands back on a clean upload stage
      rather than offering to re-run a mutation that succeeded (#675). */
@@ -416,12 +420,16 @@
       outcomes.appendChild(li);
     });
 
+    /* The created count reads in the card head next to the status badge
+       (#729); the rest of the tally keeps the summary line, failures above
+       all. */
+    createdBadge.textContent = created ? created + " " + messages.msgCreated : "";
     var parts = [];
-    if (created) parts.push(created + " " + messages.msgCreated);
     if (updated) parts.push(updated + " " + messages.msgUpdated);
     if (other) parts.push(other + " " + messages.msgOther);
     if (failed) parts.push(failed + " " + messages.msgFailed);
     summary.textContent = parts.join(" · ");
+    summary.hidden = !parts.length;
 
     show("response");
     /* The disabled trigger was hidden with its stage; land on the one

@@ -590,27 +590,6 @@ button.menu__option {
   gap: 16px;
 }
 
-.lang-switcher {
-  display: flex;
-  gap: 4px;
-}
-
-.lang-switcher a {
-  padding: 4px 8px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--muted);
-  text-decoration: none;
-}
-
-.lang-switcher a[aria-current="true"] {
-  background: var(--surface);
-  border: 1px solid var(--surface-border);
-  color: var(--text-strong);
-}
-
 .theme-toggle {
   display: flex;
   align-items: center;
@@ -656,6 +635,106 @@ button.menu__option {
   box-shadow: var(--surface-shadow);
   font-weight: 500;
   color: var(--muted);
+  overflow: hidden;
+}
+
+/* The user menu (#725): the avatar doubles as the disclosure summary; the
+   panel hangs off the topbar's right edge at a width for a name + email. */
+.menu--user .menu__panel {
+  width: 264px;
+}
+
+.topbar__avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Account-card layout (#725, proposal B): centered identity block, the
+   language selector as a segmented row, Sign out full width. */
+.user-menu__id {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 14px 4px 12px;
+  text-align: center;
+}
+
+.user-menu__avatar {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: var(--accent-strong);
+  color: #ffffff;
+  font-weight: 600;
+  font-size: 20px;
+}
+
+.user-menu__name {
+  max-width: 100%;
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-menu__hint {
+  max-width: 100%;
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-menu__seg {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  margin: 2px 2px 4px;
+  background: var(--accent-soft);
+  border-radius: 999px;
+}
+
+.user-menu__seg a {
+  flex: 1;
+  padding: 6px 0;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  text-align: center;
+  text-decoration: none;
+}
+
+.user-menu__seg a[aria-current="true"] {
+  background: var(--surface);
+  color: var(--text-strong);
+  box-shadow: var(--surface-shadow);
+}
+
+.user-menu__out {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 4px 2px 2px;
+  padding: 8px 0;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  font-weight: 500;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.user-menu__out:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
 }
 
 .content {
@@ -1296,13 +1375,6 @@ select.field__input {
   justify-content: flex-end;
 }
 
-/* Dialog feet pair a plain button with the primary; both sit on the primary's
-   metrics so the row lines up. */
-.addbox__actions .btn {
-  height: 36px;
-  padding: 0 18px;
-}
-
 /* Add Tenant dialog's own submit-error slot (#681 adenda): sits below the
    fields, above the action row (see #tenant-add-error in tenants.html and
    partials/tenant_add_error.html). `.alert`'s own margin is bottom-only
@@ -1372,7 +1444,7 @@ select.field__input {
    same no-JS <details> mechanics, presented as a modal. While open, the
    summary itself stretches over the viewport as the backdrop, so clicking
    outside the panel closes the dialog without any script. */
-.addbox--modal[open] > summary {
+.addbox--modal[open] > summary.btn {
   position: fixed;
   inset: 0;
   z-index: var(--z-dialog-backdrop);
@@ -1479,10 +1551,11 @@ select.field__input {
 .icon-button {
   display: inline-grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
   border: 0;
-  border-radius: 8px;
+  border-radius: 9px;
   background: transparent;
   color: var(--muted);
   cursor: pointer;
@@ -1820,8 +1893,6 @@ select.field__input {
 }
 
 .btn--primary {
-  height: 36px;
-  padding: 0 18px;
   color: #ffffff;
   background: var(--accent-strong);
   border-color: var(--accent-strong);
@@ -1832,18 +1903,10 @@ select.field__input {
   filter: brightness(1.08);
 }
 
-/* Accent-filled at the standard .btn metrics: for buttons that sit in a row
-   with plain siblings, where the taller primary would break the line-up. */
-.btn--accent {
-  color: #ffffff;
-  background: var(--accent-strong);
-  border-color: var(--accent-strong);
-}
-
-.btn--accent:hover {
-  background: var(--accent-strong);
-  border-color: var(--accent-strong);
-  filter: brightness(1.08);
+.btn--icon {
+  width: 30px;
+  padding: 0;
+  justify-content: center;
 }
 
 .btn:disabled {
@@ -1989,8 +2052,6 @@ select.field__input {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 38px;
-  padding: 0 14px;
   white-space: nowrap;
 }
 
@@ -2120,10 +2181,6 @@ select.field__input {
 
 .query-builder__name {
   flex: 0 1 280px;
-}
-
-.query-builder__save .btn {
-  height: 36px;
 }
 
 .query-builder__hint {
@@ -3421,10 +3478,8 @@ details.json-fold[open] > summary .icon {
   color: var(--muted);
 }
 
-/* The Ask button keeps the shared primary metrics (36px — design-system.spec
-   holds every page to one primary button); only its icon gap is local. */
-.nl-input .btn--primary {
-  gap: 8px;
+/* The Ask button keeps the shared action-button scale. */
+.nl-input .btn {
   white-space: nowrap;
 }
 
@@ -3565,12 +3620,6 @@ details.json-fold[open] > summary .icon {
 }
 
 .query-builder__copy {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 38px;
-  height: 38px;
-  padding: 0;
   color: var(--muted);
 }
 
@@ -4757,6 +4806,9 @@ details.json-fold[open] > summary .icon {
 }
 
 .batch-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   padding: 8px 14px;
   border: 1px solid var(--divider);
   border-radius: 999px;
@@ -4902,6 +4954,27 @@ details.json-fold[open] > summary .icon {
 .batch-summary {
   margin: 4px 0 10px;
   color: var(--muted);
+}
+
+/* The card head's right-hand cluster (#729): created count beside the
+   status badge. */
+.card-head__meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.batch-created {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The stage takes programmatic focus when revealed (#679); it is not
+   keyboard-reachable, so the browser's default ring around the whole
+   section is noise (#726). */
+#batch-preflight:focus {
+  outline: none;
 }
 
 
@@ -5072,6 +5145,162 @@ details.json-fold[open] > summary .icon {
   display: flex;
   gap: 8px;
   align-items: center;
+}
+
+/* ---- Bulk Export against the Figma frame (#735) ---------------------- */
+
+.bulk-export-form__name {
+  max-width: 420px;
+}
+
+/* A small standalone section heading between cards. */
+.form-legend {
+  margin: 4px 2px -8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+/* The app's radio-group treatment: one selectable card per choice. */
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+}
+
+.choice-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.choice-card:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.choice-card:has(input:focus-visible) {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.choice-card input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.choice-card__title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.choice-card__hint {
+  margin-left: 26px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* Uppercase-labelled filter fields side by side. */
+.field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+.field-row .field__label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ---- Active Exports job cards (#735) --------------------------------- */
+
+.job-card {
+  padding: 14px;
+}
+
+.job-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.job-card__name {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.job-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.progress {
+  height: 8px;
+  margin: 12px 0 10px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  overflow: hidden;
+}
+
+.progress__bar {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.progress--complete .progress__bar {
+  background: var(--ok);
+}
+
+.progress--failed .progress__bar,
+.progress--cancelled .progress__bar {
+  background: var(--danger);
+}
+
+.job-card__meta {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.job-card__files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.job-card__files a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.job-card__files a:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 }
 

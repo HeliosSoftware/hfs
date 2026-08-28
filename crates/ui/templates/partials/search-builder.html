@@ -22,7 +22,7 @@
            placeholder="{{ i18n.t("queries-url-placeholder") }}"
            aria-label="{{ i18n.t("queries-url-label") }}"
            {% if let Some(v) = builder_url %}value="GET {{ v }}"{% endif %}>
-    <button class="btn query-builder__copy" type="button" id="query-copy"
+    <button class="btn btn--icon query-builder__copy" type="button" id="query-copy"
             aria-label="{{ i18n.t("search-copy") }}" title="{{ i18n.t("search-copy") }}">
       <span class="icon">{% include "icons/copy.svg" %}</span>
     </button>

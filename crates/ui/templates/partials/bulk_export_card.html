@@ -1,47 +1,63 @@
+{# One export job against the Active Exports frame (#735): name and the
+   status action row up top, the full-width progress track, one meta line.
+   In-progress cards poll their own fragment every 5s. #}
 {% if card.status == "in-progress" %}
-<div id="job-{{ card.id }}" class="card detail"
+<div id="job-{{ card.id }}" class="card job-card"
      hx-get="/ui/bulk-export/active/{{ card.id }}/card"
      hx-trigger="every 5s"
      hx-swap="outerHTML">
 {% else %}
-<div id="job-{{ card.id }}" class="card detail">
+<div id="job-{{ card.id }}" class="card job-card">
 {% endif %}
-  <div class="toolbar">
-    <h2 class="toolbar__title">{{ card.name }}</h2>
-    <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
+  <div class="job-card__head">
+    <h2 class="job-card__name">{{ card.name }}</h2>
+    <div class="job-card__actions">
+      {% if card.status == "in-progress" %}
+      <form method="post" action="/ui/bulk-export/active/{{ card.id }}/cancel">
+        <button type="submit" class="btn">{{ i18n.t("bulk-export-cancel") }}</button>
+      </form>
+      {% endif %}
+      {% if card.status == "failed" %}
+      <form method="post" action="/ui/bulk-export/active/{{ card.id }}/retry">
+        <button type="submit" class="btn">{{ i18n.t("bulk-export-retry") }}</button>
+      </form>
+      {% endif %}
+      <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
+    </div>
+  </div>
+
+  <div class="progress progress--{{ card.status }}" role="progressbar"
+       aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ card.progress_pct }}"
+       aria-label="{{ card.status_label }}">
+    <div class="progress__bar" style="width: {{ card.progress_pct }}%"></div>
   </div>
 
   {% if card.status == "in-progress" %}
-  <div class="detail__field">
-    <span>{{ i18n.t("bulk-export-progress") }}</span>
-    <div>{% if !card.progress.is_empty() %}{{ card.progress }}{% else %}{{ i18n.t("bulk-export-progress-waiting") }}{% endif %}</div>
-  </div>
-  <form method="post" action="/ui/bulk-export/active/{{ card.id }}/cancel">
-    <button type="submit" class="btn">{{ i18n.t("bulk-export-cancel") }}</button>
-  </form>
+  <p class="job-card__meta">
+    {% if !card.progress.is_empty() %}{{ card.progress }}{% else %}{{ i18n.t("bulk-export-progress-waiting") }}{% endif %}
+  </p>
   {% endif %}
 
   {% if card.status == "complete" %}
-  <div class="detail__field">
-    <span>{{ i18n.t("bulk-export-files") }}</span>
-    <div>{{ card.file_count }}{% if !card.elapsed.is_empty() %} · {{ i18n.t("bulk-export-finished-in") }} {{ card.elapsed }}{% endif %}</div>
-  </div>
+  <p class="job-card__meta">
+    {{ card.file_count }} {{ i18n.t("bulk-export-files-word") }}{% if !card.elapsed.is_empty() %} · {{ i18n.t("bulk-export-finished-in") }} {{ card.elapsed }}{% endif %}
+  </p>
   {% if !card.files.is_empty() %}
-  <ul>
+  <div class="job-card__files">
     {% for f in card.files %}
-    <li><a href="{{ f.1 }}" download>{{ f.0 }}</a></li>
+    <a href="{{ f.1 }}" download>
+      <span class="icon">{% include "icons/import.svg" %}</span>{{ f.0 }}
+    </a>
     {% endfor %}
-  </ul>
+  </div>
   {% endif %}
   {% endif %}
 
   {% if card.status == "failed" %}
-  <div class="detail__field">
-    <span>{{ i18n.t("bulk-export-error") }}</span>
-    <div>{{ card.error }}</div>
-  </div>
-  <form method="post" action="/ui/bulk-export/active/{{ card.id }}/retry">
-    <button type="submit" class="btn">{{ i18n.t("bulk-export-retry") }}</button>
-  </form>
+  <p class="job-card__meta">{{ card.error }}</p>
+  {% endif %}
+
+  {% if card.status == "cancelled" %}
+  <p class="job-card__meta">{{ card.status_label }}</p>
   {% endif %}
 </div>

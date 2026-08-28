@@ -236,7 +236,7 @@ These are the shared primitives. Before styling anything, reach for one; add to
 
 | Class | What it is |
 |---|---|
-| `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current` | The button. Secondary by default; primary is the one blue action on a page. |
+| `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current`, `.btn--icon` | The action button: 30px high, 12px horizontal padding, 12px type, and a 9px radius. Primary, danger, and current change emphasis only; `--icon` makes the control a 30px square with no horizontal padding. |
 | `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
 | `.panel` | Padding for a full-width card that hosts detail fields without rail behavior. |
 | `.kv-grid` | Responsive two-column key/value layout; collapses to one column on compact viewports. |
@@ -246,6 +246,10 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.empty-state` | The same centered, muted empty treatment for non-table content. |
 | `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
 | `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
+| `.choice-grid`, `.choice-card`, `.choice-card__title`, `.choice-card__hint` | The radio-group treatment: one selectable card per choice, `:has(:checked)` accent (#735). |
+| `.progress`, `.progress__bar`, `.progress--complete`, `.progress--failed`, `.progress--cancelled` | Full-width job progress track; terminal states recolor the fill. |
+| `.job-card`, `.job-card__head`, `.job-card__name`, `.job-card__actions`, `.job-card__meta`, `.job-card__files` | One async job: name + action row, progress track, one meta line, download pills. |
+| `.form-legend`, `.field-row` | Standalone section heading between cards; uppercase-labelled fields side by side. |
 | `.menu`, `.menu__panel`, `.menu__heading`, `.menu__option` | The `<details>` dropdown (tenant/version selectors, Recent). |
 | `.notice`, `.notice--warn` | Inline banner. |
 | `.pill` | Large control chip (chart tools). |
@@ -254,11 +258,20 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.toolbar`, `.toolbar__title`, `.toolbar__search`, `.toolbar__count` | In-card section header with optional search. |
 | `.tabs`, `.tab`, `.tab--on` | Tab strip. |
 | `.filter-rail`, `.nav-panel` | Left rails: the filter list inside a page; the type panel flush against the sidebar. |
-| `.icon-button`, `.icon-button--danger` | Bare icon action (table rows). |
+| `.icon-button`, `.icon-button--danger` | Bare 30px-square icon action (table rows), with the action-button 9px radius. |
 | `.busy-status` > `.spinner` | Inline working state: the ring plus a short label, `role="status"` in the markup so it announces. |
 
 Starting a new page: copy `templates/pages/_scaffold.html` (or crib
 `tenants.html`, the smallest real page). Both compose only this vocabulary.
+
+Button emphasis never changes geometry: pair `.btn` with `--primary`,
+`--danger`, or `--current` for color and state, and add `--icon` only for a
+square icon-only action. Inputs keep their own field scale and do not dictate
+button height. The sole fixed-height exception is the open
+`.addbox--modal > summary.btn`: while its native `<details>` is open, that
+summary becomes the full-viewport backdrop (`height: auto`, zero padding and
+radius); its closed state and the actions inside the dialog use the canonical
+button scale.
 
 ### Busy states
 
