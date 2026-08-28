@@ -3243,7 +3243,6 @@ async fn migrate_v33_to_v34(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-
 /// v22 -> v23: drop `fk_search_resource`.
 ///
 /// `search_index` carried a composite FK to `resources` with `ON DELETE

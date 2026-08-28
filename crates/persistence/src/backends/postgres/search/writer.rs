@@ -487,8 +487,7 @@ impl IndexRow {
                 // `migrate_v31_to_v32`: no reader of this column has ever been
                 // able to use a `/_history/<vid>` suffix, and three of them are
                 // silently broken by one.
-                row.value_reference =
-                    Some(strip_reference_version(reference).to_string());
+                row.value_reference = Some(strip_reference_version(reference).to_string());
                 row.value_reference_display = display.clone();
             }
             IndexValue::Uri(uri) => {
@@ -761,9 +760,11 @@ impl PostgresSearchIndexWriter {
                     .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)),
             );
 
-            execute_cached(client, sql, &param_refs).await.map_err(|e| {
-                internal_error(format!("Failed to insert search index rows: {}", e))
-            })?;
+            execute_cached(client, sql, &param_refs)
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to insert search index rows: {}", e))
+                })?;
         }
 
         Ok(())
@@ -1250,9 +1251,15 @@ mod tests {
         for (stored, expected) in [
             ("Patient/1/_history/4", "Patient/1"),
             ("Patient/1", "Patient/1"),
-            ("http://ex.org/fhir/Patient/1/_history/2", "http://ex.org/fhir/Patient/1"),
+            (
+                "http://ex.org/fhir/Patient/1/_history/2",
+                "http://ex.org/fhir/Patient/1",
+            ),
             // No suffix to strip, and nothing that merely contains the text.
-            ("Patient/_history-is-not-a-version", "Patient/_history-is-not-a-version"),
+            (
+                "Patient/_history-is-not-a-version",
+                "Patient/_history-is-not-a-version",
+            ),
             ("#contained-1", "#contained-1"),
         ] {
             let row = row_of(IndexValue::Reference {
@@ -1268,7 +1275,6 @@ mod tests {
             );
         }
     }
-
 
     /// A plain row and a contained row now travel in the same statement, so the
     /// four columns that tell them apart have to be set per row. Getting

@@ -108,7 +108,6 @@ fn next_char(c: char) -> Option<char> {
     char::from_u32(next)
 }
 
-
 /// Builds the numeric comparison SQL for `col` against the implicit-precision
 /// range `[lo, hi)` per the FHIR prefix semantics, advancing `next` and
 /// returning the SQL plus its bound params. `num` is used only for the `ap`
@@ -2859,17 +2858,14 @@ mod tests {
         assert_eq!(prefix_upper_bound("a").as_deref(), Some("b"));
         // Multi-byte: the successor is the next code point, and UTF-8 byte order
         // is code-point order, so `~<~` (bytewise) still bounds the prefix.
-        assert_eq!(prefix_upper_bound("caf\u{e9}").as_deref(), Some("caf\u{ea}"));
+        assert_eq!(
+            prefix_upper_bound("caf\u{e9}").as_deref(),
+            Some("caf\u{ea}")
+        );
         // The surrogate block holds no scalar value, so it is stepped over.
-        assert_eq!(
-            prefix_upper_bound("\u{d7ff}").as_deref(),
-            Some("\u{e000}")
-        );
+        assert_eq!(prefix_upper_bound("\u{d7ff}").as_deref(), Some("\u{e000}"));
         // `char::MAX` has no successor: the increment carries left.
-        assert_eq!(
-            prefix_upper_bound("a\u{10ffff}").as_deref(),
-            Some("b")
-        );
+        assert_eq!(prefix_upper_bound("a\u{10ffff}").as_deref(), Some("b"));
         // Nothing sorts above an all-`char::MAX` prefix, and an empty prefix
         // matches everything. Both fall back to `LIKE`.
         assert_eq!(prefix_upper_bound("\u{10ffff}"), None);
@@ -2890,14 +2886,45 @@ mod tests {
         // k6/searchConfig.js, the "string" block.
         let terms = [
             "NON-EXISTS",
-            "Emilia", "Carolynn", "Stefan", "Linh", "Harold",
-            "Pilar", "Ron", "Garfield", "Margaretta", "Giovanna",
-            "Dione", "Arron", "Lanny", "Harvey", "Beatriz",
-            "Donovan", "Reyes", "Santiago", "Kyong", "Curtis",
-            "Raynham", "Springfield", "Lowell", "Southwick", "Mashpee",
-            "Holbrook", "Falmouth", "Revere", "Sturbridge", "Blackstone",
-            "Westport", "Walpole", "Northampton", "Fall River", "Waltham",
-            "Acushnet Center", "Newton", "Winchester", "Maynard",
+            "Emilia",
+            "Carolynn",
+            "Stefan",
+            "Linh",
+            "Harold",
+            "Pilar",
+            "Ron",
+            "Garfield",
+            "Margaretta",
+            "Giovanna",
+            "Dione",
+            "Arron",
+            "Lanny",
+            "Harvey",
+            "Beatriz",
+            "Donovan",
+            "Reyes",
+            "Santiago",
+            "Kyong",
+            "Curtis",
+            "Raynham",
+            "Springfield",
+            "Lowell",
+            "Southwick",
+            "Mashpee",
+            "Holbrook",
+            "Falmouth",
+            "Revere",
+            "Sturbridge",
+            "Blackstone",
+            "Westport",
+            "Walpole",
+            "Northampton",
+            "Fall River",
+            "Waltham",
+            "Acushnet Center",
+            "Newton",
+            "Winchester",
+            "Maynard",
             "ORLEANS MEDICAL CENTER, P.C.",
             "ENCOMPASS HEALTH BRAINTREE HOSPITAL OF BRAINTREE",
             "STEWARD HOLY FAMILY HOSPITAL INC",
@@ -3008,7 +3035,8 @@ mod tests {
             SearchQuery::new("Patient").with_parameter(string_param("name", None, "Emilia"));
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
         assert!(
-            frag.sql.contains("COALESCE(value_string_folded, lower(value_string)) ~>=~ $3"),
+            frag.sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) ~>=~ $3"),
             "starts-with must prove the predicate through the strict operator: {}",
             frag.sql
         );
@@ -3034,9 +3062,8 @@ mod tests {
             let frag =
                 PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
             assert!(
-                frag.sql.contains(
-                    "COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"
-                ),
+                frag.sql
+                    .contains("COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"),
                 "modifier {:?} must match the folded expression: {}",
                 modifier,
                 frag.sql
@@ -3347,7 +3374,10 @@ mod tests {
             modifier: None,
             values: vec![
                 SearchValue::new(SearchPrefix::Eq, "AMB"),
-                SearchValue::new(SearchPrefix::Eq, "http://terminology.hl7.org/CodeSystem/v3-ActCode|"),
+                SearchValue::new(
+                    SearchPrefix::Eq,
+                    "http://terminology.hl7.org/CodeSystem/v3-ActCode|",
+                ),
             ],
             chain: vec![],
             components: vec![],
@@ -3575,10 +3605,10 @@ mod tests {
             frag.sql
         );
         assert!(
-            frag.sql
-                .contains("ref.value_reference IN") &&
-            frag.sql
-                .contains("idx.resource_type || '/' || idx.resource_id"),
+            frag.sql.contains("ref.value_reference IN")
+                && frag
+                    .sql
+                    .contains("idx.resource_type || '/' || idx.resource_id"),
             "the sub-select must yield the target's Type/id: {}",
             frag.sql
         );

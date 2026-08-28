@@ -4004,7 +4004,9 @@ mod fts_extraction_tests {
             content.full_content
         );
         assert!(
-            !content.full_content.contains("StructureDefinition/vitalsigns"),
+            !content
+                .full_content
+                .contains("StructureDefinition/vitalsigns"),
             "{}",
             content.full_content
         );
@@ -4027,7 +4029,11 @@ mod fts_extraction_tests {
             "identifier": [{"system": "urn:oid:2.16.840.1.113883.4.1", "value": "999-11-2222"}]
         }));
 
-        assert!(content.full_content.contains("urn:oid:2.16.840.1.113883.4.1"));
+        assert!(
+            content
+                .full_content
+                .contains("urn:oid:2.16.840.1.113883.4.1")
+        );
         assert!(content.full_content.contains("999-11-2222"));
     }
 

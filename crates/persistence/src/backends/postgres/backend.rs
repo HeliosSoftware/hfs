@@ -1308,7 +1308,10 @@ mod tests {
         let cfg = PostgresConfig::default();
         let opts = startup_options(&cfg);
         assert!(opts.contains("-c statement_timeout=30000"), "{opts}");
-        assert!(opts.contains("-c plan_cache_mode=force_custom_plan"), "{opts}");
+        assert!(
+            opts.contains("-c plan_cache_mode=force_custom_plan"),
+            "{opts}"
+        );
     }
 
     #[test]
