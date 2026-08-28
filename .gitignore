@@ -33,4 +33,3 @@ __pycache__/
 # purpose: they are personal working material, not project documentation, and
 # they should never reach a PR. `tmp/` is the intended home for them.
 /tmp/
-/edson/
