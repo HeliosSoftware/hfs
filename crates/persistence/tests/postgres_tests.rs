@@ -1488,7 +1488,10 @@ mod postgres_integration {
             .unwrap();
         assert_eq!(v3.version_id(), "3");
 
-        backend.delete(&tenant, "Patient", created.id()).await.unwrap();
+        backend
+            .delete(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
 
         let mut versions = backend
             .list_versions(&tenant, "Patient", created.id())
@@ -1542,9 +1545,13 @@ mod postgres_integration {
                 id.clone(),
             );
             let updater = tokio::spawn(async move {
-                b1.update(&t1, &created, json!({"resourceType": "Patient", "active": false}))
-                    .await
-                    .map(|_| ())
+                b1.update(
+                    &t1,
+                    &created,
+                    json!({"resourceType": "Patient", "active": false}),
+                )
+                .await
+                .map(|_| ())
             });
             let deleter = tokio::spawn(async move { b2.delete(&t2, "Patient", &id1).await });
 
@@ -1552,12 +1559,17 @@ mod postgres_integration {
                 match outcome {
                     Ok(())
                     | Err(StorageError::Resource(ResourceError::NotFound { .. }))
-                    | Err(StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })) => {}
+                    | Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                        ..
+                    })) => {}
                     other => panic!("concurrent update/delete produced {:?}", other),
                 }
             }
 
-            let versions = backend.list_versions(&tenant, "Patient", &id2).await.unwrap();
+            let versions = backend
+                .list_versions(&tenant, "Patient", &id2)
+                .await
+                .unwrap();
             let mut unique = versions.clone();
             unique.sort();
             unique.dedup();

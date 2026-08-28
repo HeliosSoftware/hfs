@@ -705,7 +705,6 @@ impl IndexRow {
     }
 }
 
-
 /// The identity of a `search_index` row, for the de-duplication in
 /// [`dedup_rows`].
 ///
@@ -1309,7 +1308,6 @@ mod tests {
         );
     }
 
-
     /// A row that repeats one already in the list is dropped, and the survivors
     /// keep their original order — the order the unbatched path appended in.
     #[test]
@@ -1384,7 +1382,9 @@ mod tests {
             ("value_token_system", |r| {
                 r.value_token_system = Some("s".into())
             }),
-            ("value_token_code", |r| r.value_token_code = Some("c".into())),
+            ("value_token_code", |r| {
+                r.value_token_code = Some("c".into())
+            }),
             ("value_token_display", |r| {
                 r.value_token_display = Some("d".into())
             }),
@@ -1415,7 +1415,9 @@ mod tests {
             ("value_quantity_canonical_unit", |r| {
                 r.value_quantity_canonical_unit = Some("g".into())
             }),
-            ("value_reference", |r| r.value_reference = Some("P/1".into())),
+            ("value_reference", |r| {
+                r.value_reference = Some("P/1".into())
+            }),
             ("value_reference_display", |r| {
                 r.value_reference_display = Some("d".into())
             }),
@@ -1427,7 +1429,9 @@ mod tests {
             }),
             ("value_uri", |r| r.value_uri = Some("http://x".into())),
             ("is_contained", |r| r.is_contained = true),
-            ("contained_type", |r| r.contained_type = Some("Coverage".into())),
+            ("contained_type", |r| {
+                r.contained_type = Some("Coverage".into())
+            }),
             ("contained_local_id", |r| {
                 r.contained_local_id = Some("cov".into())
             }),

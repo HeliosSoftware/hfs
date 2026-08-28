@@ -225,8 +225,10 @@ where
                 Some(current) => format!(
                     "If-Match precondition failed: no supplied entity-tag matches the current version W/\"{current}\""
                 ),
-                None => "If-Match precondition failed: the resource has no current version to match"
-                    .to_string(),
+                None => {
+                    "If-Match precondition failed: the resource has no current version to match"
+                        .to_string()
+                }
             };
             return Err(RestError::PreconditionFailed { message });
         }

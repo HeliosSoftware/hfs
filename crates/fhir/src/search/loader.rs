@@ -831,7 +831,6 @@ mod tests {
         );
     }
 
-
     /// The spec bundle really is the source of the `phonetic` parameters, and
     /// after the exclusion neither the registry nor the seeder sees one.
     ///
