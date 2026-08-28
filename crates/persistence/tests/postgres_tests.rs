@@ -187,23 +187,35 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        // Default string search is starts-with. `LIKE`, not `ILIKE`: both the stored
-        // column and the bound pattern are already case-folded by `fold_text`, and
-        // `ILIKE` cannot use a btree index (#224). The raw-column fallback is wrapped
-        // in `lower()` so un-backfilled rows keep matching case-insensitively.
+        // Default string search is starts-with, emitted since schema v33 as an
+        // explicit bytewise range on the folded expression rather than a `LIKE`:
+        // a `LIKE` whose pattern is a bind parameter cannot be turned into an
+        // index range by the planner, so the bounds are derived in Rust. Never
+        // `ILIKE`, which cannot use a btree at all (#224); both the stored column
+        // and the bound values are already case-folded by `fold_text`, and the
+        // raw-column fallback is wrapped in `lower()` so un-backfilled rows keep
+        // matching case-insensitively.
         assert!(
             fragment
                 .sql
-                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE"),
+                .contains("COALESCE(value_string_folded, lower(value_string)) ~>=~ $3")
+                && fragment
+                    .sql
+                    .contains("COALESCE(value_string_folded, lower(value_string)) ~<~ $4"),
             "string search must target the indexed folded expression: {}",
             fragment.sql
         );
         assert!(!fragment.sql.contains("ILIKE"));
         assert!(fragment.sql.contains("param_name = 'name'"));
-        // Parameter should be "Smith%"
-        match &fragment.params[0] {
-            SqlParam::Text(s) => assert!(s.ends_with('%')),
-            _ => panic!("Expected Text param"),
+        // Two bounds, both folded: the prefix itself and the exclusive successor
+        // of its last character.
+        assert_eq!(fragment.params.len(), 2);
+        match (&fragment.params[0], &fragment.params[1]) {
+            (SqlParam::Text(lo), SqlParam::Text(hi)) => {
+                assert_eq!(lo, "smith");
+                assert_eq!(hi, "smiti");
+            }
+            other => panic!("Expected two Text params, got {:?}", other),
         }
     }
 

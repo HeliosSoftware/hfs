@@ -608,9 +608,21 @@ JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Encounter'
 WHERE r.is_deleted = FALSE
 ORDER BY c.last_updated DESC, c.resource_id ASC;
 ROLLBACK;
+-- Backstop, for the reason section AU's carries one: the ROLLBACK above undoes
+-- the CREATE only if the BEGIN actually opened a transaction, and any
+-- unterminated statement anywhere above folds the BEGIN into itself, leaving
+-- the CREATE INDEX to run in autocommit. That is not hypothetical — it is what
+-- leaked `idx_search_reference_v26` into three measured windows. This
+-- counterfactual had no backstop; it does now.
+DROP INDEX IF EXISTS idx_search_token_v24;
 
 \echo ''
-\echo '######## AC. v30 token index set (must print idx_search_token_code, _code_recent, _system) ########'
+\echo '######## AC. v31 token index set (must print idx_search_token_code and _code_recent, and NOT _system) ########'
+-- v30 created `idx_search_token_system` and v31 dropped it again, so the live
+-- set is exactly two indexes. `idx_search_token_code_recent` must show
+-- `last_updated DESC, resource_id` as KEY columns and BOTH `value_token_code`
+-- and `value_token_system` in the INCLUDE (TRAP 15: read the shape from here,
+-- never from `create_indexes`).
 SELECT indexname, indexdef FROM pg_indexes
 WHERE tablename = 'search_index' AND indexname LIKE 'idx_search_token%'
 ORDER BY indexname;
