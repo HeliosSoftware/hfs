@@ -101,6 +101,66 @@ test("every page <h1> uses the canonical .page-head__title", async ({ page, requ
   expect(offenders, `page titles off the canonical class:\n${offenders.join("\n")}`).toEqual([]);
 });
 
+test("every rendered table uses the canonical .data-table", async ({ page, request }) => {
+  const offenders: string[] = [];
+  for (const route of [...ROUTES, await seedBulkImportDetail(request)]) {
+    await page.goto(route, { waitUntil: "networkidle" });
+    const tables = await page.$$eval("table:not(.data-table)", (nodes) =>
+      nodes.map((node) => {
+        const id = node.id ? `#${node.id}` : "";
+        const classes = Array.from(node.classList)
+          .map((name) => `.${name}`)
+          .join("");
+        return `${node.tagName.toLowerCase()}${id}${classes}`;
+      }),
+    );
+    for (const table of tables) offenders.push(`${route}: ${table}`);
+  }
+  expect(offenders, `tables off the canonical class:\n${offenders.join("\n")}`).toEqual([]);
+});
+
+test("data tables share one alignment contract", async ({ page }) => {
+  await page.goto("/ui");
+  await page.evaluate(() => {
+    const probe = document.createElement("table");
+    probe.id = "data-table-contract";
+    probe.className = "data-table";
+    probe.innerHTML = `
+      <thead>
+        <tr>
+          <th data-probe="ordinary-header">Name</th>
+          <th class="col-num" data-probe="numeric-header">Count</th>
+          <th class="col-actions" data-probe="actions-header">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td data-probe="ordinary-cell">Example</td>
+          <td class="col-num" data-probe="numeric-cell">123</td>
+          <td class="col-actions" data-probe="actions-cell"></td>
+        </tr>
+        <tr class="data-table__empty">
+          <td class="col-actions" colspan="3" data-probe="empty-cell">No results</td>
+        </tr>
+      </tbody>
+    `;
+    document.body.append(probe);
+  });
+
+  const probe = page.locator("#data-table-contract");
+  for (const name of ["ordinary-header", "ordinary-cell", "numeric-header", "numeric-cell"]) {
+    await expect(probe.locator(`[data-probe='${name}']`)).toHaveCSS("text-align", "left");
+  }
+  for (const name of ["numeric-header", "numeric-cell"]) {
+    await expect(probe.locator(`[data-probe='${name}']`)).toHaveCSS("font-variant-numeric", "tabular-nums");
+  }
+  for (const name of ["actions-header", "actions-cell"]) {
+    const action = probe.locator(`[data-probe='${name}']`);
+    await expect(action).toHaveCSS("text-align", "right");
+  }
+  await expect(probe.locator("[data-probe='empty-cell']")).toHaveCSS("text-align", "center");
+});
+
 test("ordinary actions resolve to the canonical button scale on every page", async ({ page, request }) => {
   const offenders: string[] = [];
   const primaryColors = new Map<string, string[]>();

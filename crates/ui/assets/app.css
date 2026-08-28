@@ -1502,11 +1502,10 @@ select.field__input {
 }
 
 .col-num {
-  text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-.col-actions {
+.data-table .col-actions {
   text-align: right;
   width: 64px;
 }
@@ -2610,6 +2609,7 @@ details.json-fold[open] > summary .icon {
   padding: 9px 14px;
   border-bottom: 1px solid var(--surface-border);
   color: var(--text);
+  text-align: left;
   vertical-align: top;
 }
 
@@ -2617,7 +2617,7 @@ details.json-fold[open] > summary .icon {
   border-bottom: 0;
 }
 
-.data-table__empty td,
+.data-table .data-table__empty td,
 .empty-state {
   margin: 0;
   color: var(--muted);
