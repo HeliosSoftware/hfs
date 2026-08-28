@@ -270,8 +270,8 @@ fn view_box_width(template: &str) -> i64 {
 
 #[test]
 fn chart_geometry_matches_hfs() {
-    // `edson/docs/hts-ui-design.md` §9.0 defers the `helios-ui-chrome`
-    // extraction, so `crates/hts-ui/src/chart.rs` is a *copy* of HFS's
+    // Extracting a shared `helios-ui-chrome` crate is deferred as its own
+    // piece of work, so `crates/hts-ui/src/chart.rs` is a *copy* of HFS's
     // chart geometry rather than a shared dependency. That copy is only
     // safe while it stays identical: both charts render against the same
     // `.chart` / `.grid-line` / `.axis-label` rules in the one shared

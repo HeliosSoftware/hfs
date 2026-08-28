@@ -841,8 +841,8 @@ files-empty = Der Auftrag hat keine Ausgabedateien erzeugt.
 
 ## Administrative HTS-UI (crates/hts-ui) — Phase-1-Stubs
 ##
-## Der vollständige Katalog wird in Phase 1.4 / Phase 2 ergänzt, entsprechend
-## `edson/docs/hts-ui-design.md` §7. Diese Stubs decken Base-Layout,
+## Schlüssel für die HTS-UI folgen der Konvention
+## hts-<seite>-<rolle>-<control>. Diese Stubs decken Base-Layout,
 ## Seitennavigation und den Dashboard-Platzhalter der Phase-1-Blocker-Slice ab.
 ## Sie müssen paritätisch zu en/es/main.ftl bleiben.
 

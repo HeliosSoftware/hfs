@@ -74,8 +74,10 @@
       fieldset never lands in the DOM and Playwright times out looking
       for `Target code`. `hx-params="none"` short-circuits htmx's
       FormData collection for these two triggers so the URL is emitted
-      verbatim. See edson/docs/hts-ui-cm139-diagnosis.md for the wire
-      trace and htmx-source references.
+      verbatim. Without it htmx appends the form's own fields, producing a
+      duplicate scalar that `Query<TranslateInputForm>` rejects with HTTP
+      400 — and since htmx's default 4xx handler is `swap: false`, the
+      failure is silent.
 
       `hx-select="#hts-workbench-input"` is equally critical: the GET
       handler (`translate_input` in crates/hts-ui/src/concept_maps.rs)

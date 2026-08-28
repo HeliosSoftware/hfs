@@ -95,9 +95,10 @@ where
     let cors = build_cors(config);
 
     // Optional HTS administrative UI (crates/hts-ui) mounted at `/ui` so
-    // routes resolve as `/ui/hts`, `/ui/hts/assets/*`, etc. — matching the
-    // design doc `edson/docs/hts-ui-design.md` §5.1. Off by default; opt in
-    // with `HTS_UI_ENABLED=1`.
+    // routes resolve as `/ui/hts`, `/ui/hts/assets/*`, etc. The crate owns
+    // the `/hts` prefix internally so this mount point stays `/ui`, the same
+    // place HFS mounts its own UI. Off by default; opt in with
+    // `HTS_UI_ENABLED=1`.
     //
     // Upstream URL policy (design doc §7 degraded state contract):
     //   1. `HTS_UI_UPSTREAM_URL` when set — lets a developer point the UI at

@@ -15,7 +15,8 @@ use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
 
 /// Test-only mount: identical to how the `hts` binary mounts the router at
-/// `/ui`, so URLs match `edson/docs/hts-ui-design.md` §5.1. Pointed at a
+/// `/ui`, so URLs resolve as `/ui/hts/...` exactly as they do in the
+/// deployed binary. Pointed at a
 /// closed loopback port so upstream fetches fail deterministically — the
 /// dashboard renders the degraded banner alongside every card, which is
 /// exactly what the Phase 1 shell-blocker test expects.
@@ -103,9 +104,8 @@ async fn home_serves_full_page_at_ui_hts() {
 async fn home_trailing_slash_redirects_to_canonical() {
     // `/ui/hts/` (trailing slash) must 308-redirect to the canonical
     // `/ui/hts`. Axum matches paths exactly, so without an explicit route
-    // the trailing-slash variant would 404 — which is exactly what
-    // `edson/docs/hts-demo.md` (Phase 4) tried to describe as "redirects
-    // from /ui/hts/". Locked here so any regression fails the ring.
+    // the trailing-slash variant would 404. Locked here so any regression
+    // fails the ring.
     let response = app()
         .oneshot(Request::get("/ui/hts/").body(Body::empty()).unwrap())
         .await

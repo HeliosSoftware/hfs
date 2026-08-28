@@ -841,8 +841,8 @@ files-empty = El trabajo no produjo archivos de salida.
 
 ## UI administrativa de HTS (crates/hts-ui) — stubs de Phase 1
 ##
-## El catálogo completo se completa en Phase 1.4 / Phase 2 según
-## `edson/docs/hts-ui-design.md` §7. Estos stubs cubren el layout base, la nav
+## Las claves de la UI de HTS siguen la convención
+## hts-<pagina>-<rol>-<control>. Estos stubs cubren el layout base, la nav
 ## lateral y el placeholder del dashboard de la Phase 1 blocker slice. Deben
 ## mantenerse en paridad con en/de/main.ftl.
 

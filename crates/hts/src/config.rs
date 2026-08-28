@@ -119,7 +119,9 @@ pub struct HtsConfig {
     /// contract, and operators who deploy behind an API gateway may not want
     /// an HTML surface listening at all. `HTS_UI_ENABLED=1` opts in.
     ///
-    /// Design doc: `edson/docs/hts-ui-design.md` §7 / §12 acceptance.
+    /// Off by default because a terminology server is an API product first:
+    /// the HTML surface is an operator convenience, not part of the FHIR
+    /// contract.
     #[arg(long, env = "HTS_UI_ENABLED", default_value = "false")]
     pub ui_enabled: bool,
 }

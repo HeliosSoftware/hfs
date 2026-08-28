@@ -47,8 +47,8 @@
   {% endif %}
 
   {#--
-    One row of four tiles, per the approved V3 "Ops console" mockup
-    (`edson/docs/screens/hts-variants/*/home-v3.png`).
+    One row of four tiles, per the approved "Ops console" layout: Status,
+    Uptime, Loaded code systems and Requests, each with a `.stat__sub`.
 
     Until 2026-08-28 this was **eight** tiles across three rows: Backend and
     FHIR version stood alone beside Status, Bundled data beside Loaded
@@ -149,8 +149,10 @@
     team-approved design and explicit sign-off before any `crates/hts` work.
     "Loaded content" is cheap (a GROUP BY over `concepts`, ~29 ms, no schema
     change); "Recent imports" is blocked, because three of its five columns do
-    not exist and creating them forces a re-import on existing deployments.
-    Full analysis and per-table steps: edson/docs/hts-ui-improvement-plan.md §14.
+    not exist (which code system a file produced, its concept count, and
+    whether it succeeded), and creating them needs a schema migration that
+    forces a re-import on every existing deployment while still leaving the
+    multi-GB SNOMED/LOINC/RxNorm rows empty.
   --#}
   {% include "partials/hts-home-chart.html" %}
 

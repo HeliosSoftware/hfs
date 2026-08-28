@@ -844,9 +844,7 @@ files-empty = The job produced no output files.
 
 ## HTS administrative UI (crates/hts-ui) — Phase 1 scaffold stubs
 ##
-## The full catalog for the HTS UI is filled in during Phase 1.4 / Phase 2
-## slices per `edson/docs/hts-ui-design.md` §7 (Fluent convention:
-## hts-<page>-<role>-<control>). These stubs cover the base layout, sidebar
+## Keys for the HTS UI follow the convention hts-<page>-<role>-<control>. These stubs cover the base layout, sidebar
 ## nav, and the dashboard scaffold placeholder rendered by the Phase 1 blocker
 ## slice. They must be kept in parity with es/de/main.ftl.
 

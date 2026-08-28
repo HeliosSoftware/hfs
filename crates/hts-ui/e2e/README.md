@@ -20,9 +20,8 @@ crates/hts-ui/e2e/
 └── README.md                (this file)
 ```
 
-The full spec inventory (dashboard, resource browsers, ops workbench,
-import, diagnostics) lives in `edson/docs/hts-ui-design.md` §7. Each Phase 2
-slice adds one .spec.ts file next to its page.
+Each page gets one .spec.ts file next to it; the inventory is simply the
+contents of `tests/`.
 
 ### Required seed fixtures
 
@@ -70,9 +69,8 @@ the seed lands:
     F11 neutral no-matches state renders and is NOT the error partial.
 
 Until the seed loader ships, run the Playwright ring against a local
-`hts` populated by hand (e.g. `curl -XPUT` the fixtures from
-`edson/docs/hts-details.md`) or skip the specs that reference the ids
-above with `--grep-invert`.
+`hts` populated by hand (`curl -XPUT` the fixtures `seed.mjs` creates) or
+skip the specs that reference the ids above with `--grep-invert`.
 
 ## Prereqs
 
@@ -108,12 +106,10 @@ this to run one browser suite across sqlite / postgres in parallel).
 - **chromium** — the JS-enabled ring: theme toggle, htmx interactions, axe-core
   a11y checks, no-runtime-CDN invariants.
 - **nojs** — Chromium with `javaScriptEnabled: false`. Every page must render
-  and every action must succeed with real form POSTs, per
-  `edson/docs/hts-ui-design.md` §8 nojs contract.
+  and every action must succeed with real form POSTs. Every control is a
+  real `<a>` or `<form>` first; htmx only upgrades it.
 
 ## Design references
 
-- [edson/docs/hts-ui-design.md](../../../edson/docs/hts-ui-design.md) — full UX
-  design (§7 per-page, §11 error strategy, §12 acceptance).
 - [.claude/skills/hts-api-skill/ui-design-map.md](../../../.claude/skills/hts-api-skill/ui-design-map.md)
   — per-operation UI surface field / fragment matrix.

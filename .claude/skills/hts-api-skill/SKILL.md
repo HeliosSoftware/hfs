@@ -19,10 +19,10 @@ description: >-
 # hts-api-skill
 
 This skill is a UI-builder's expert overlay on the Helios Terminology Server
-(HTS) HTTP surface. The authoritative code-first API reference lives at
-[edson/docs/hts-details.md](../../edson/docs/hts-details.md); this skill
-distills the parts a UI author needs and adds `crates/ui`-specific integration
-guidance derived from the code that already ships.
+(HTS) HTTP surface. It is **self-contained**: everything a UI author needs is
+here, and the source of truth for anything it does not cover is the code
+itself — [crates/hts/src/server.rs](../../crates/hts/src/server.rs) is the
+route table, and `crates/hts/src/operations/` holds each handler.
 
 ## 1. When to use
 
@@ -62,8 +62,8 @@ adds only the HTS-specific surface.
 
 ## 2. Authoritative sources
 
-- **Canonical API reference (all 42 routes, params, error mapping, gaps):**
-  [edson/docs/hts-details.md](../../edson/docs/hts-details.md)
+- **Canonical route table:** [crates/hts/src/server.rs](../../crates/hts/src/server.rs)
+  — every route HTS answers, in one `create_app` function
 - **Crate README:** [crates/hts/README.md](../../crates/hts/README.md)
 - **Server-side truth (routes and wiring):**
   [crates/hts/src/server.rs](../../crates/hts/src/server.rs),
@@ -75,15 +75,16 @@ adds only the HTS-specific surface.
 - **Available library clients** (server-side reuse candidates):
   [crates/fhirpath/src/terminology_client.rs](../../crates/fhirpath/src/terminology_client.rs),
   [crates/rest/src/terminology.rs](../../crates/rest/src/terminology.rs)
-- **Local run recipe:** [edson/docs/start-app.md](../../edson/docs/start-app.md)
+- **Local run recipe:** [run-hts-server](../run-hts-server/SKILL.md), or
+  [run-hfs-and-hts](../run-hfs-and-hts/SKILL.md) to wire both servers together
 - **In-skill deep tables:** [endpoints-quickref.md](endpoints-quickref.md),
   [ui-design-map.md](ui-design-map.md)
 
 ## 3. Operation cheat-sheet
 
 One row per operation family. Full route matrix in
-[endpoints-quickref.md](endpoints-quickref.md); full parameter matrices in
-[edson/docs/hts-details.md](../../edson/docs/hts-details.md).
+[endpoints-quickref.md](endpoints-quickref.md); the parameters each handler
+actually reads are in `crates/hts/src/operations/`.
 
 | Op | Primary route | UI surface |
 |---|---|---|
@@ -175,10 +176,9 @@ when transport status is 4xx/5xx.
 
 ## 5. Auth gaps the UI must handle
 
-HTS has **no built-in authentication or authorization middleware**
-([edson/docs/hts-details.md §Authentication](../../edson/docs/hts-details.md)).
-Any HTS deployment relies on a reverse proxy, service mesh, or private
-network boundary.
+HTS has **no built-in authentication or authorization middleware** — there is
+no auth layer in `create_app`. Any HTS deployment relies on a reverse proxy,
+service mesh, or private network boundary.
 
 UI implications:
 
@@ -305,21 +305,24 @@ partials, not a shared toast. For HTS:
 
 Everything else in [ui-design-map.md](ui-design-map.md) is greenfield.
 
-### 6.8 UI patterns anchored in the design doc
+### 6.8 UI patterns, as shipped
 
-Authoritative reuse strategy, page tree, and HTMX patterns for the HTS
-administrative console now live in
-[edson/docs/hts-ui-design.md](../../edson/docs/hts-ui-design.md):
+The console exists now, so the patterns below are best read from the code that
+implements them rather than restated here:
 
-1. Unified operation workbench template convention — design doc §6.1
-2. Unified resource browser — §6.2
-3. Unified concept renderer partial — §6.3
-4. Click-to-load pagination as the default (HTS omits reliable `_total`) — §8
-5. `hx-swap-oob` streaming for `$batch-validate-code` — §6.1 / §8
-6. Shared-chrome extraction sequenced under #543 — §9 / §12
+1. **Operation workbench** — one input partial per operation, swapped into a
+   shared region: `crates/hts-ui/templates/partials/hts-cs-*-input.html`
+2. **Resource browser** — a filter toolbar over a `.data-table`, rows fetched
+   from a `/rows` fragment: `templates/pages/cs-browser.html`
+3. **Concept renderer** — `templates/partials/hts-concept-identity.html`
+4. **Click-to-load pagination**, because `Bundle.total` echoes the page size
+   rather than the store size: `templates/partials/hts-cs-rows.html`
+5. **Chrome parity with HFS** — same stylesheet, same topbar, same nav
+   vocabulary: `templates/layouts/base.html` beside `crates/ui`'s
 
-Do not duplicate those sections here; keep this skill a distillation and link
-out. Per-operation field matrices remain in [ui-design-map.md](ui-design-map.md).
+Extracting a shared `helios-ui-chrome` crate is deferred as its own piece of
+work; until then `tests/chrome_parity.rs` guards the duplication.
+Per-operation field matrices remain in [ui-design-map.md](ui-design-map.md).
 
 ## 7. UI design map (summary)
 
@@ -350,7 +353,7 @@ For starting `hts` alone, or `hfs` + `hts` together wired via
 both cover the bundled `crates/hts/terminology-data` seed set via
 `HTS_BOOTSTRAP_DIR`. The full Rust + MinGW toolchain setup for this
 Windows machine lives at
-[edson/docs/start-app.md](../../edson/docs/start-app.md).
+[run-hts-server](../run-hts-server/SKILL.md).
 
 Sanity: `Invoke-WebRequest http://127.0.0.1:8090/metadata?mode=terminology`
 should return a TerminologyCapabilities resource.
@@ -394,7 +397,7 @@ Before requesting review on any `/ui/hts/*` change:
 
 ## 10. Gaps and known drift (call out in review)
 
-Drawn from [edson/docs/hts-details.md](../../edson/docs/hts-details.md) §Implementation gaps.
+Verified against the handlers in `crates/hts/src/operations/`.
 Any UI that surfaces these must reflect the reality, not the advertised metadata:
 
 - `$versions` is advertised at server-level in CapabilityStatement but has
@@ -419,11 +422,11 @@ Any UI that surfaces these must reflect the reality, not the advertised metadata
 
 - [endpoints-quickref.md](endpoints-quickref.md) — grouped 42-route matrix
 - [ui-design-map.md](ui-design-map.md) — per-operation UI surfaces
-- [edson/docs/hts-details.md](../../edson/docs/hts-details.md) — full API
+- [crates/hts/src/server.rs](../../crates/hts/src/server.rs) — the route table
   reference (parameter matrices, error mapping, bundled data, source map)
 - [crates/hts/README.md](../../crates/hts/README.md) — crate README
 - [.claude/skills/work-with-hts/SKILL.md](../work-with-hts/SKILL.md)
 - [.claude/skills/work-with-ui/SKILL.md](../work-with-ui/SKILL.md)
 - [.claude/skills/frontend-design/SKILL.md](../frontend-design/SKILL.md)
 - [.claude/skills/test-hfs/SKILL.md](../test-hfs/SKILL.md)
-- [edson/docs/start-app.md](../../edson/docs/start-app.md) — local setup
+- [run-hts-server](../run-hts-server/SKILL.md) — local setup

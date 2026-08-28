@@ -623,8 +623,7 @@ async fn translate_tab_htmx_returns_full_page_for_region_swap() {
     // form value onto the `hx-get` URL. Without it the wire becomes
     // `?direction=reverse&direction=reverse` and axum's
     // `Query<TranslateInputForm>` rejects the duplicate scalar field
-    // with HTTP 400, silently skipping the swap. Full wire trace in
-    // `edson/docs/hts-ui-cm139-diagnosis.md`.
+    // with HTTP 400, silently skipping the swap.
     assert!(
         html.contains("hx-params=\"none\""),
         "direction radios must set hx-params=\"none\" to avoid duplicating direction on the URL",

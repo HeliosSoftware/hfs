@@ -16,8 +16,10 @@
 //!
 //! [`router`] returns an [`axum::Router`] meant to be mounted at `/ui` in the
 //! HTS binary. The router uses the `/hts` prefix internally, so the resulting
-//! URL space is `/ui/hts`, `/ui/hts/code-systems`, etc. — matching the design
-//! document at `edson/docs/hts-ui-design.md` §5.1.
+//! URL space is `/ui/hts`, `/ui/hts/code-systems`,
+//! `/ui/hts/code-systems/{id}`, `/ui/hts/value-sets`, `/ui/hts/concept-maps`,
+//! `/ui/hts/import` and `/ui/hts/capability-statement` — one page tree under
+//! the same `/ui` mount point HFS uses.
 //!
 //! # Upstream contract
 //!

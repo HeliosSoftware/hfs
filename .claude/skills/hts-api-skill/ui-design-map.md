@@ -1,8 +1,8 @@
 # HTS UI design map
 
 > **Reuse strategy:** the authoritative component-reuse plan (unified operation
-> workbench, resource browser, and concept renderer) now lives in
-> [edson/docs/hts-ui-design.md](../../edson/docs/hts-ui-design.md) §6 and §8.
+> workbench, resource browser, and concept renderer) is best read from the
+> shipped templates under `crates/hts-ui/templates/`.
 > This file remains the per-operation field / fragment matrix.
 
 Per-operation UI surface guidance for the future `/ui/hts/*` pages under
@@ -87,8 +87,7 @@ Framework conventions (Askama layout, HxRequest, i18n) are in
 
 ## 5. ValueSet `$expand` — `/ui/hts/value-sets/{id}/expand`
 
-> **v1 authoritative design:** [edson/docs/hts-ui-design.md](../../edson/docs/hts-ui-design.md) §7.4 + §7.4.1.
-> Slice C ships the instance-scoped Expand tab only. The three-way source
+> **As shipped:** the instance-scoped Expand tab only. The three-way source
 > selector (canonical / instance / inline JSON) and the repeatable
 > `designation[]` filter defer to Slice E's standalone Operations
 > workbench (§7.6). The `Validate` tab in the earlier §6 draft below is
@@ -109,8 +108,7 @@ Framework conventions (Askama layout, HxRequest, i18n) are in
 
 ## 6. ValueSet `$validate-code` — deferred to Slice E
 
-> **v1 authoritative design:** [edson/docs/hts-ui-design.md](../../edson/docs/hts-ui-design.md) §7.4 + §7.6.
-> The Slice C `Validate` tab was dropped from §7.4 during the Opus 4.7
+> **As shipped:** the `Validate` tab was dropped from §7.4 during the Opus 4.7
 > advisor triage (F9). VS `$validate-code` reaches its UI through Slice
 > E's standalone Operations workbench at
 > `/ui/hts/operations?op=validate-code&resource=ValueSet`. The dedicated
@@ -128,8 +126,7 @@ Framework conventions (Askama layout, HxRequest, i18n) are in
 
 ## 7. UI-fabricated batch validate — `/ui/hts/operations` (op = **`batch-validate`**)
 
-> **v1 authoritative design:** [edson/docs/hts-ui-design.md](../../edson/docs/hts-ui-design.md) §7.6 + §7.6.1.
-> Slice E renamed this op from `batch-validate-code` to **`batch-validate`** (F18 triage) because
+> **As shipped:** renamed this op from `batch-validate-code` to **`batch-validate`** (F18 triage) because
 > HTS's `$batch-validate-code` route is intentionally not used — the surface is a UI-fabricated
 > fan-out over parallel `$validate-code` calls. Transport is client-side polling (F1 = D), not
 > OOB streaming, to preserve the "only vendored htmx" invariant.
@@ -172,8 +169,7 @@ Framework conventions (Askama layout, HxRequest, i18n) are in
 
 ## 10. Root batch workbench — `/ui/hts/batch` (v2 — **deferred**)
 
-> **v1 status:** deferred. Per [edson/docs/hts-ui-design.md §7.10](../../edson/docs/hts-ui-design.md)
-> the root batch page is not exposed in the v1 nav (which is limited to three entry URLs); the
+> **v1 status:** deferred — the root batch page is not exposed in the nav (which is limited to three entry URLs); the
 > field / fragment matrix below stays as a v2 reference sketch.
 
 | | |
@@ -194,7 +190,7 @@ Framework conventions (Askama layout, HxRequest, i18n) are in
 | Inputs | File upload (JSON only) or paste-in Bundle editor; import-mode label ("bundle-import — non-FHIR summary response") |
 | Output | Non-FHIR JSON: `{ code_systems, value_sets, concept_maps, concepts, errors[] }` |
 | Fragment | `partials/hts-import-summary.html` — count cards + non-fatal error list |
-| Edge cases | XML upload is **not** supported; response is not a FHIR resource — do not run OperationOutcome parsing on it; HTTP 207 = partial success (errors present); 400 = bad JSON / non-Bundle root; bundled data catalog lives at `crates/hts/terminology-data/` and is documented in [edson/docs/hts-details.md §Bundled terminology data](../../edson/docs/hts-details.md) |
+| Edge cases | XML upload is **not** supported; response is not a FHIR resource — do not run OperationOutcome parsing on it; HTTP 207 = partial success (errors present); 400 = bad JSON / non-Bundle root; bundled data catalog lives at `crates/hts/terminology-data/`, and the import path that consumes it is `crates/hts/src/import/` |
 
 ## 12. Bootstrap ledger — `/ui/hts/bootstrap`
 

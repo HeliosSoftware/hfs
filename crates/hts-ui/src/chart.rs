@@ -8,8 +8,9 @@
 //! visually identical cards against the *same* `.chart` / `.grid-line` /
 //! `.axis-label` rules in the shared `app.css`.
 //!
-//! Extracting a `helios-ui-chrome` crate is deliberately deferred — see
-//! `edson/docs/hts-ui-design.md` §9.0 — so the duplication is guarded by a
+//! Extracting a shared `helios-ui-chrome` crate is deliberately deferred: it
+//! is its own piece of work and is not a prerequisite for this console, so
+//! the duplication is guarded by a
 //! test instead: `tests/chrome_parity.rs::chart_geometry_matches_hfs` reads
 //! HFS's `lib.rs` and `pages/index.html` off disk, extracts their plot
 //! constants and viewBox, and asserts they still equal this module's. Drift

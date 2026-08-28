@@ -7,8 +7,8 @@ import { expect, test } from "@playwright/test";
 //
 // Formerly `dashboard.spec.ts` (renamed 2026-08-20 alongside the Fluent
 // `hts-nav-dashboard` → `hts-nav-home` collapse and the module rename
-// `crates/hts-ui/src/dashboard.rs` → `home.rs` for HFS parity — see
-// `edson/docs/hts-ui-design.md` §7.1).
+// `crates/hts-ui/src/dashboard.rs` → `home.rs`, both for HFS parity: HFS
+// calls its landing page Home, so HTS does too).
 
 test.describe("HTS home (Phase 2 Slice A)", () => {
   test("responds at /ui/hts and renders the Home heading", async ({ page }) => {

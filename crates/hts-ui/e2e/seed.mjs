@@ -2,8 +2,8 @@
 // referenced by the browser + workbench specs. Runs AFTER boot.mjs makes
 // /ui/hts respond 200 and BEFORE any test executes.
 //
-// The design (edson/docs/hts-ui-design.md §7) does not require these fixtures
-// at server boot; boot.mjs deliberately keeps the SQLite empty and this
+// These fixtures are not required at server boot: boot.mjs deliberately
+// keeps the SQLite empty and this
 // script is the e2e harness that populates it via the well-known
 // `POST /import` endpoint (see crates/hts/README.md §"Import a FHIR Bundle").
 //
@@ -224,7 +224,7 @@ function buildSeedBundle() {
   });
 
   // -- ex-vs-batch-mixed: target ValueSet for the operations workbench
-  //    $batch-validate-code demo (edson/docs/hts-demo.md §3.6). Composes
+  //    $batch-validate-code demo. Composes
   //    both example CodeSystems so a single batch job exercises
   //    cross-system validation in one submission (rows sourced from
   //    ex-cs-1 AND ex-cs-source resolve against the same envelope).

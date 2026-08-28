@@ -1,6 +1,5 @@
-//! Route-enumerator + fixture matrix for the HTS UI, matching the
-//! "shared guards extended to /ui/hts" charter of `edson/docs/hts-ui-design.md`
-//! §12 Phase 1 acceptance.
+//! Route-enumerator + fixture matrix for the HTS UI, extending the shared
+//! route guards `crates/ui` already applies to `/ui` across `/ui/hts` too.
 //!
 //! The purpose is not to duplicate per-handler tests but to catch the class
 //! of regressions where a page is added, its route is registered, but the

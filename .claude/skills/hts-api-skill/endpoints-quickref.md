@@ -1,8 +1,9 @@
 # HTS endpoints quick reference
 
 All 42 method/path pairs registered by the HTS binary, grouped by resource
-family. Full parameter matrices and behavior notes live in
-[../../edson/docs/hts-details.md](../../edson/docs/hts-details.md).
+family. The registration itself is one function — `create_app` in
+[crates/hts/src/server.rs](../../crates/hts/src/server.rs) — and each handler's
+parameters are in `crates/hts/src/operations/`.
 
 Legend:
 - **Body shape**: `-` (no body) / `Params` (FHIR `Parameters` resource) /
@@ -11,13 +12,12 @@ Legend:
   `json-only` means the handler ignores XML negotiation
 - **Auth**: none at HTS itself — see [SKILL.md §5](SKILL.md#5-auth-gaps-the-ui-must-handle)
 - Instance operation routes are registered **before** generic `/{id}` CRUD
-  so the operation suffix is not captured as an id
-  ([edson/docs/hts-details.md §Route ordering](../../edson/docs/hts-details.md))
+  so the operation suffix is not captured as an id (visible in the order of
+  the `.route(...)` calls in `create_app`)
 
 Route count: **42**
-(5 utility + 13 CodeSystem + 14 ValueSet + 10 ConceptMap; matches the total
-in [edson/docs/hts-details.md](../../edson/docs/hts-details.md) §Executive
-summary).
+(5 utility + 13 CodeSystem + 14 ValueSet + 10 ConceptMap; count them in
+`create_app` if you need to confirm it after a change).
 
 ---
 
@@ -197,9 +197,7 @@ client, not a browser-side reqwest.
 
 ## Recognized-but-unimplemented parameters (partial list)
 
-Details in
-[edson/docs/hts-details.md §CodeSystem APIs](../../edson/docs/hts-details.md)
-and §ValueSet APIs:
+Details, per handler, in `crates/hts/src/operations/`:
 
 - `$lookup` `expression` — 501
 - `$lookup` GET `useSupplement` — string-coerced ineffective

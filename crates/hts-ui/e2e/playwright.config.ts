@@ -35,8 +35,8 @@ export default defineConfig({
       use: { ...devices["Desktop Chrome"] },
     },
     {
-      // The design's core promise: the UI works with JavaScript disabled
-      // (`edson/docs/hts-ui-design.md` §8 nojs contract).
+      // The design's core promise: the UI works with JavaScript disabled.
+      // Every control is a real <a> or <form> first; htmx only upgrades it.
       name: "nojs",
       testMatch: "**/nojs/**/*.spec.ts",
       use: { ...devices["Desktop Chrome"], javaScriptEnabled: false },
