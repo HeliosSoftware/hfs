@@ -2867,12 +2867,81 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
 /// apart. p99 over a population that is half substring search is set entirely
 /// by the substring half.
 ///
-/// A leading `%` cannot seek a btree, so nothing in this migration or the next
-/// one changes that. The real answer is a trigram GIN, and it does not fit: the
-/// benchmark host has 11 GB of RAM against a 15.7 GB working set, and a
-/// `gin_trgm_ops` index over 205,918 folded strings would be tens to hundreds
-/// of megabytes of *additional* resident index competing with the working set
-/// this change just relieved. Not worth it for a benchmark shape.
+/// A leading `%` cannot seek a btree. The answer is a trigram GIN, and the
+/// first version of this docstring dismissed one on size — sized, wrongly,
+/// against a 22.6M-row table. It is built over the **205,918 rows that have a
+/// string value**, and it is small:
+///
+/// ```text
+/// gin_trgm_ops, 205,918 rows shaped like the real population    5,992 kB
+/// same, plus btree_gin on (tenant_id, resource_type, param_name) 3,216 kB
+/// adversarial upper bound: 205,918 all-distinct 65-char values     37 MB
+/// idx_search_string, same rows, for scale                        8,200 kB
+/// ```
+///
+/// It is smaller than the btree indexes it sits beside. The measurement that
+/// mattered was never taken.
+///
+/// ## The trigram index, and why `:contains` also loses the conjunct
+///
+/// Adding the index is not enough — the planner ignored it, for exactly the
+/// reason section 1 gives. With the conjunct still in place the btree slice scan
+/// is costed at 8.45 (rows=1) against the GIN path's 8,573, so the trigram index
+/// sat unused just as the pattern index had. Two changes make it reachable:
+///
+/// - **Drop the conjunct here too.** `~~` is strict in the COALESCE, so it
+///   proves both this index's predicate and the btree pattern index's, exactly
+///   as `~>=~` does for starts-with.
+/// - **`btree_gin` for the three scalar columns.** With `tenant_id`,
+///   `resource_type` and `param_name` inside the GIN index, the whole predicate
+///   becomes one Index Cond and the scan costs **108** instead of 8,573 —
+///   the difference between chosen and merely available.
+///
+/// Measured on the 22.6M-row reproduction, `Patient?address:contains=Springfield`:
+///
+/// ```text
+///                                       buffers    time
+/// before (btree slice scan)               1,709   1.03 ms
+/// v33    (trigram bitmap scan)              58   0.41 ms
+/// zero-match term ("NON-EXISTS")             28   0.25 ms   (was 1,709)
+/// broad term matching the whole slice        93   (warm)    (was 725)
+/// 2-character term (no full trigram)      1,715             unchanged, correctly
+/// ```
+///
+/// Run 33179839720 measured the pre-v33 shape at 5,138 buffers / 10.5 ms on the real
+/// dataset (section AJ), against 1,709 / 1.03 ms locally, so the local ratios
+/// understate what the host should see.
+///
+/// ## What the trigram index costs to write
+///
+/// This is the axis the round has been fighting, so it is measured rather than
+/// argued. 206,000 string index rows inserted in 500-row batches, median of
+/// three runs, against the rest of this round's index set:
+///
+/// ```text
+/// without the trigram index                    2.10 s
+/// with it, fastupdate = on (the default)       3.38 s   +1.28 s
+/// with it, fastupdate = off                   11.92 s   5.7x — never do this
+/// ```
+///
+/// **+6.2 microseconds per string index row**, and only string rows pay it:
+/// 205,918 of 22,644,934, **0.9%**. The other 99.1% never touch this index,
+/// because the partial predicate keeps them out. Against run 33179839720's
+/// import suite — 1,000 bundles in **8m34s** — the whole added cost is 1.28 s,
+/// **+0.25%**. `fastupdate = on` is set explicitly on the index rather than left
+/// to the default, because the 5.7x cliff is too expensive to leave to a
+/// server-wide setting somebody may change.
+///
+/// ## When `pg_trgm` is not available
+///
+/// Both extensions are `trusted = true` in PostgreSQL 13+, so a database owner
+/// installs them without superuser, and the benchmark's `postgres:18` image
+/// ships both as contrib. A locked-down deployment can still refuse. That path
+/// is warned about and skipped, not fatal: the substring form's strict `~~` also
+/// proves `idx_search_string_folded_pattern`'s predicate, so it degrades to a
+/// parameter-slice scan measured at 1,709 buffers — the pre-v33 plan exactly.
+/// A search parameter shorter than one full trigram degrades the same way, which
+/// PostgreSQL decides for itself (measured above at 1,715 buffers for `%bo%`).
 ///
 /// ## Why the v24 `INCLUDE (resource_id, last_updated)` is dropped
 ///
@@ -2942,7 +3011,46 @@ async fn migrate_v32_to_v33(client: &deadpool_postgres::Client) -> StorageResult
             .map_err(|e| pg_error(format!("Migration v32->v33 failed: {}", e)))?;
     }
 
-    // The rebuilt index carries the statistics for its expression, and the
+    // The trigram index for `:contains` / `:text`. Best-effort as a unit: both
+    // extensions are `trusted = true` in PostgreSQL 13+, so a database owner can
+    // install them without superuser, but a locked-down deployment may still
+    // refuse — and `pg_trgm` failing makes the `CREATE INDEX` fail too. Where
+    // that happens the substring form falls back to `idx_search_string_folded_pattern`,
+    // which its strict `~~` also proves, at parity with the pre-v33 plan
+    // (measured: 1,709 buffers either way). Search stays correct; only
+    // `:contains` stays slow.
+    //
+    // `btree_gin` is what makes the planner willing: with the three scalar
+    // columns in the index, the whole predicate is one Index Cond and the scan
+    // costs 108 instead of 8,573, which is the difference between the trigram
+    // path being chosen and being available-but-ignored.
+    //
+    // `fastupdate` is set explicitly rather than left to the default. It is the
+    // default today, and it must stay on: the same 206k inserts take 3.38 s with
+    // it and 11.92 s without — 5.7x, on the write path this whole round has been
+    // fighting.
+    let trigram_stmts = [
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+        "CREATE EXTENSION IF NOT EXISTS btree_gin",
+        "CREATE INDEX IF NOT EXISTS idx_search_string_trgm
+         ON search_index USING gin (tenant_id, resource_type, param_name,
+                                    (COALESCE(value_string_folded, lower(value_string))) gin_trgm_ops)
+         WITH (fastupdate = on)
+         WHERE COALESCE(value_string_folded, lower(value_string)) IS NOT NULL",
+    ];
+    for sql in trigram_stmts {
+        if let Err(e) = client.execute(sql, &[]).await {
+            tracing::warn!(
+                "Migration v32->v33: trigram index unavailable, `:contains` string \
+                 search falls back to a parameter-slice scan (search remains \
+                 correct): {}",
+                e
+            );
+            break;
+        }
+    }
+
+    // The rebuilt indexes carry the statistics for their expression, and the
     // planner needs them for the new range predicate. Best-effort: a failure
     // here costs plan quality, not correctness.
     if let Err(e) = client.execute("ANALYZE search_index", &[]).await {

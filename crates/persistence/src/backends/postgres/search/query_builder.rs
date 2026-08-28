@@ -57,12 +57,11 @@ fn like_escape(value: &str) -> String {
 /// supply the `(tenant, type, param)` prefix — `idx_search_string`, 50 MB —
 /// filtering the rest. See `schema.rs::migrate_v32_to_v33` for the plans.
 ///
-/// v33 moves the reachability proof into the operator instead: `~>=~` is strict
-/// in the expression, so it implies the index's new
+/// v33 moves the reachability proof into the operator instead: `~>=~` and `~~`
+/// are both strict in the expression, so either implies the index's new
 /// `COALESCE(…) IS NOT NULL` predicate on its own, and the conjunct — with its
-/// wrong estimate — is gone. `:contains`/`:text` keep the conjunct deliberately:
-/// a leading `%` cannot seek, so for them the small index and its cheap slice
-/// scan is the better plan and this must not push them onto the wider one.
+/// wrong estimate — is gone from every modifier that reads this expression.
+/// `:exact` never had it (`value_string = $n` is strict on the bare column).
 const FOLDED_STRING_EXPR: &str = "COALESCE(value_string_folded, lower(value_string))";
 
 /// The exclusive upper bound of the byte-ordered range that holds exactly the
@@ -815,9 +814,9 @@ impl PostgresQueryBuilder {
     /// The three FHIR modifiers land on three different index shapes:
     /// - default (starts-with) — a bytewise range on `FOLDED_STRING_EXPR`, which
     ///   `idx_search_string_folded_pattern` seeks. Two bind parameters.
-    /// - `:contains`/`:text` — a substring `LIKE`, which nothing can seek; it
-    ///   keeps the `value_string IS NOT NULL` conjunct so it stays on the small
-    ///   `idx_search_string` slice scan instead of the wider pattern index.
+    /// - `:contains`/`:text` — a substring `LIKE`, which no btree can seek;
+    ///   served by the trigram GIN index `idx_search_string_trgm` (v33), and by
+    ///   the btree pattern index where `pg_trgm` is unavailable.
     /// - `:exact` — `value_string = $n` on the bare column, served by
     ///   `idx_search_string`.
     fn build_string_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
@@ -845,14 +844,20 @@ impl PostgresQueryBuilder {
                 // Match the accent-folded column (falling back to the raw column
                 // for not-yet-reindexed rows) against a folded pattern.
                 //
-                // A leading `%` is not btree-sargable; this stays a scan unless the
-                // optional pg_trgm index is present. It is at least now scoped to
-                // one parameter's slice of the index rather than the whole table.
+                // A leading `%` is not btree-sargable, so this is served by the
+                // trigram GIN index v33 adds — which is why the
+                // `value_string IS NOT NULL` conjunct is absent here too. It cost
+                // the same 200x row-estimate error it cost the starts-with form,
+                // and on that estimate the planner never costed the GIN scan
+                // competitively. `~~` is strict in the COALESCE, so it proves both
+                // the trigram index's predicate and the btree pattern index's
+                // without help. Where the extension is unavailable the btree
+                // pattern index serves it at parity with the pre-v33 plan.
                 Some(SearchModifier::Contains | SearchModifier::Text) => {
                     next += 1;
                     SqlFragment::with_params(
                         format!(
-                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string IS NOT NULL AND {} LIKE ${} ESCAPE '\\')",
+                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
                             param.name, FOLDED_STRING_EXPR, next
                         ),
                         vec![SqlParam::text(&format!(
@@ -891,13 +896,14 @@ impl PostgresQueryBuilder {
                         }
                         // No upper bound exists: an empty search value (which
                         // matches every indexed value) or an all-`char::MAX`
-                        // prefix. Fall back to the pre-v33 `LIKE` form, which
-                        // needs the explicit conjunct to reach a partial index.
+                        // prefix. Fall back to the `LIKE` form. The strict `~~`
+                        // still proves the index predicate, so this needs no
+                        // conjunct either.
                         None => {
                             next += 1;
                             SqlFragment::with_params(
                                 format!(
-                                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string IS NOT NULL AND {} LIKE ${} ESCAPE '\\')",
+                                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
                                     param.name, FOLDED_STRING_EXPR, next
                                 ),
                                 vec![SqlParam::text(&format!("{}%", like_escape(&folded)))],
@@ -2930,19 +2936,18 @@ mod tests {
     #[test]
     fn empty_string_value_falls_back_to_the_like_form() {
         // `name=` matches every indexed value; there is no prefix to bound, so
-        // the pre-v33 `LIKE '%'` form is emitted — and it needs the explicit
-        // conjunct to reach a partial index.
+        // the `LIKE '%'` form is emitted. The strict `~~` proves the index
+        // predicate on its own, so it carries no conjunct either.
         let query = SearchQuery::new("Patient").with_parameter(string_param("name", None, ""));
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
 
         assert!(
-            frag.sql.contains(
-                "value_string IS NOT NULL AND \
-                 COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"
-            ),
+            frag.sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"),
             "{}",
             frag.sql
         );
+        assert!(!frag.sql.contains("IS NOT NULL"), "{}", frag.sql);
         match &frag.params[0] {
             SqlParam::Text(p) => assert_eq!(p, "%"),
             other => panic!("expected a text param, got {:?}", other),
@@ -3014,10 +3019,12 @@ mod tests {
             frag.sql
         );
 
-        // `:contains`/`:text` keep it. A leading `%` cannot seek either index,
-        // so dropping the conjunct would only move an unavoidable full-slice
-        // scan from the 50 MB `idx_search_string` onto the wide covering one —
-        // measured 1,709 -> 2,169 buffers.
+        // `:contains`/`:text` lose it too. `~~` is strict in the COALESCE, so
+        // it proves the predicate of both the trigram GIN index and the btree
+        // pattern index; carrying the conjunct as well only reintroduced the
+        // estimate error, and on that estimate the planner never costed the GIN
+        // scan competitively (measured: 1,709 buffers on the btree slice scan
+        // versus 58 once the conjunct is gone and the GIN index exists).
         for modifier in [Some(SearchModifier::Contains), Some(SearchModifier::Text)] {
             let query = SearchQuery::new("Patient").with_parameter(string_param(
                 "name",
@@ -3028,10 +3035,16 @@ mod tests {
                 PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
             assert!(
                 frag.sql.contains(
-                    "value_string IS NOT NULL AND \
-                     COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"
+                    "COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"
                 ),
-                "modifier {:?} must keep the v24 form: {}",
+                "modifier {:?} must match the folded expression: {}",
+                modifier,
+                frag.sql
+            );
+            assert!(
+                !frag.sql.contains("IS NOT NULL"),
+                "modifier {:?} must not carry the conjunct — it is what kept the \
+                 planner off the trigram index: {}",
                 modifier,
                 frag.sql
             );
