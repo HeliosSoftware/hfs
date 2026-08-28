@@ -29,7 +29,7 @@ language-en = Englisch
 language-es = Spanisch
 language-de = Deutsch
 user-menu-label = Kontomenü
-user-local = Lokaler Benutzer
+user-anonymous = Anonymer Benutzer
 user-local-hint = Authentifizierung ist deaktiviert
 user-logout = Abmelden
 
@@ -113,6 +113,7 @@ nav-tenants = Mandanten
 ## Mandantenverwaltung (/ui/tenants)
 
 tenants-title = Mandantenverwaltung
+tenants-lede = Tenants anlegen, prüfen und löschen, zwischen denen dieser Server Daten isoliert.
 tenants-unavailable = Die Mandantenregistrierung ist auf diesem Speicher-Backend nicht verfügbar.
 tenants-stat-total = Mandanten gesamt
 tenants-stat-total-sub = { $count ->
@@ -566,6 +567,8 @@ batch-read-failed = Die Datei konnte nicht gelesen werden.
 ## Bulk Import workspace (#527)
 
 bulk-import-title = Massenimport
+bulk-import-lede = Vorkoordinierte FHIR-Datensätze mit der Bulk-Data-Operation $bulk-submit an einen Data Recipient senden.
+bulk-import-detail-lede = Manifeste, Status und Ausführungsprotokoll dieser Übermittlung.
 bulk-import-new = Neue Submission
 bulk-import-create-title = Bulk Submission anlegen
 bulk-import-field-name = Name der Submission
@@ -687,6 +690,7 @@ subs-state-off = aus
 ## Bulk Export workspace (#537)
 
 bulk-export-title = Massenexport
+bulk-export-lede = Daten mit der FHIR-Bulk-Data-Operation $export als NDJSON-Dateien aus diesem Server exportieren.
 bulk-export-active-title = Aktive Exporte
 bulk-export-active-link = Aktive Exporte
 bulk-export-new = Neuer Export

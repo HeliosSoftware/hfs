@@ -26,10 +26,10 @@
                     address one specific dialog (e.g. Add Manifest's
                     data-bulk-import-add-manifest).
 -->
-{% macro modal(trigger_label, title_id, title_text, marker="") %}
-<details class="addbox addbox--modal"{% if !marker.is_empty() %} {{ marker }}{% endif %}>
-  <summary class="btn btn--primary">
-    {% include "icons/plus.svg" %}
+{% macro modal(trigger_label, title_id, title_text, marker="", icon="plus", primary=true, open=false) %}
+<details class="addbox addbox--modal"{% if !marker.is_empty() %} {{ marker }}{% endif %}{% if open %} open{% endif %}>
+  <summary class="{% if primary %}btn btn--primary{% else %}btn{% endif %}">
+    {% if icon == "pencil" %}{% include "icons/pencil.svg" %}{% else %}{% include "icons/plus.svg" %}{% endif %}
     {{ trigger_label }}
   </summary>
   <div class="addbox__panel" role="dialog" aria-modal="true" aria-labelledby="{{ title_id }}">
@@ -55,10 +55,11 @@
   initial_focus marks the field addbox.js moves focus to when the dialog
   opens (data-addbox-initial-focus) — set it on a dialog's first field.
 -->
-{% macro field(label, name, kind, required=false, placeholder="", hint="", initial_focus=false) %}
+{% macro field(label, name, kind, required=false, placeholder="", hint="", initial_focus=false, value="") %}
 <label class="field">
   <span class="field__label">{{ label }}</span>
   <input class="field__input" type="{{ kind }}" name="{{ name }}"
+         {% if !value.is_empty() %}value="{{ value }}"{% endif %}
          {% if required %}required{% endif %}
          {% if !placeholder.is_empty() %}placeholder="{{ placeholder }}"{% endif %}
          autocomplete="off"{% if initial_focus %} data-addbox-initial-focus{% endif %}>

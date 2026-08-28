@@ -1,0 +1,48 @@
+{#
+  The authentication section shared by the New Submission and Edit Submission
+  dialogs (#761): the scope radios with their hints, Client ID / Token URL
+  with theirs, the JWKS registration pointer, and the Test authentication
+  round trip. Including pages bind, with {% let %}:
+    auth_value           — "none" | "backend-services", selects the radio
+    client_id_value      — prefill for Client ID ("" on create)
+    token_url_value      — prefill for Token URL ("" on create)
+    test_auth_result_id  — unique id for the htmx outcome target
+#}
+<fieldset class="field">
+  <legend class="field__label">{{ i18n.t("bulk-import-auth") }}</legend>
+  <span class="field__hint">{{ i18n.t("bulk-import-auth-hint") }}</span>
+  <label class="field">
+    <input type="radio" name="auth" value="none"{% if auth_value == "none" %} checked{% endif %}>
+    {{ i18n.t("bulk-import-auth-none") }}
+    <span class="field__hint">{{ i18n.t("bulk-import-auth-none-hint") }}</span>
+  </label>
+  <label class="field">
+    <input type="radio" name="auth" value="backend-services"{% if auth_value == "backend-services" %} checked{% endif %}>
+    {{ i18n.t("bulk-import-auth-backend") }}
+    <span class="field__hint">{{ i18n.t("bulk-import-auth-backend-hint") }}</span>
+  </label>
+  <label class="field">
+    <span class="field__label">{{ i18n.t("bulk-import-field-client-id") }}</span>
+    <input class="field__input" type="text" name="client_id" autocomplete="off"{% if !client_id_value.is_empty() %} value="{{ client_id_value }}"{% endif %}>
+    <span class="field__hint">{{ i18n.t("bulk-import-field-client-id-hint") }}</span>
+  </label>
+  <label class="field">
+    <span class="field__label">{{ i18n.t("bulk-import-field-token-url") }}</span>
+    <input class="field__input" type="url" name="token_url" autocomplete="off"{% if !token_url_value.is_empty() %} value="{{ token_url_value }}"{% endif %}>
+    <span class="field__hint">{{ i18n.t("bulk-import-field-token-url-hint") }}</span>
+  </label>
+  <p class="field__hint">
+    {{ i18n.t("bulk-import-jwks-hint") }}
+    <a href="/.well-known/bulk-submit-jwks.json" target="_blank" rel="noopener">
+      /.well-known/bulk-submit-jwks.json
+    </a>
+  </p>
+  <button type="submit" class="btn"
+          formaction="/ui/bulk-import/test-auth"
+          hx-post="/ui/bulk-import/test-auth"
+          hx-target="#{{ test_auth_result_id }}"
+          hx-swap="innerHTML">
+    {{ i18n.t("bulk-import-test-auth") }}
+  </button>
+  <div id="{{ test_auth_result_id }}" role="status"></div>
+</fieldset>

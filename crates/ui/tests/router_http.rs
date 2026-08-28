@@ -2117,7 +2117,7 @@ async fn user_menu_carries_language_and_the_signed_out_state() {
     // English is the negotiated default: its option is current, once.
     assert!(html.contains(r#"href="?lang=en" aria-current="true""#));
     assert!(!html.contains(r#"href="?lang=es" aria-current="true""#));
-    assert!(html.contains("Local user"));
+    assert!(html.contains("Anonymous user"));
     assert!(html.contains("Authentication is disabled"));
     assert!(!html.contains("/ui/logout"));
 }
