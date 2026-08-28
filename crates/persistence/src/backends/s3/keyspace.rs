@@ -394,6 +394,18 @@ impl S3Keyspace {
     /// same structural argument applies — index objects sit under a `queue/`,
     /// `tokens/`, or `submissions/` segment of `_system.bulk-submit/`, whereas
     /// every tenant-scoped key lives under a `resources/`, `history/`, or `bulk/`
+    /// Key for one provider-side Bulk Submit submission (#772). Tenant-scoped:
+    /// it lives under the tenant's `bulk/` segment beside the consumer-side
+    /// submit state, so tenant deletion and IAM prefixes cover it.
+    pub fn bulk_provider_key(&self, object_id: &str) -> String {
+        self.join(&["bulk", "provider-submissions", &format!("{object_id}.json")])
+    }
+
+    /// Prefix holding every provider-side submission of the tenant.
+    pub fn bulk_provider_prefix(&self) -> String {
+        self.join(&["bulk", "provider-submissions", "/"])
+    }
+
     /// sub-prefix of its tenant segment, so even a tenant named
     /// `_system.bulk-submit` cannot reach one. (`_system.bulk-submit` is also in
     /// [`RESERVED_TENANT_SEGMENTS`](crate::tenant::RESERVED_TENANT_SEGMENTS), as

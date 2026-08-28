@@ -1570,6 +1570,13 @@ impl ResourceStorage for MongoBackend {
                 .await
                 .or_query_error(&format!("purge delete ({collection})"))?;
         }
+        // Provider-side Bulk Submit submissions are tenant-keyed documents (#772).
+        db.collection::<Document>(
+            crate::backends::mongodb::bulk_provider::BULK_PROVIDER_COLLECTION,
+        )
+        .delete_many(doc! { "tenant_id": id })
+        .await
+        .or_query_error("purge delete (bulk_provider_submissions)")?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
         // do not reach them — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313).

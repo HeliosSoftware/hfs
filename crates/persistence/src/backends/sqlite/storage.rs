@@ -1006,6 +1006,12 @@ impl ResourceStorage for SqliteBackend {
         // them, which belong to this tenant (issue #313). Same transaction: this
         // connection already holds the write lock, and a second one would
         // deadlock against it.
+        // Provider-side Bulk Submit submissions are tenant-keyed rows (#772).
+        tx.execute(
+            "DELETE FROM bulk_provider_submissions WHERE tenant_id = ?1",
+            params![id],
+        )
+        .or_query_error("purge provider submissions")?;
         let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
         tx.commit().or_query_error("purge commit")?;
         if settings > 0 {

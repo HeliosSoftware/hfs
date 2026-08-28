@@ -72,7 +72,7 @@ use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, TypeCount,
 };
-use helios_persistence::core::{ResourceStorage, SettingsStore};
+use helios_persistence::core::{BulkProviderStore, ResourceStorage, SettingsStore};
 use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -147,6 +147,10 @@ struct WebState {
     /// when the backend has no settings store; the selector then applies
     /// per-page only.
     settings: Option<Arc<dyn SettingsStore>>,
+    /// Provider-side Bulk Submit submissions (#772): tenant-scoped, shared by
+    /// the tenant's operators. None when the backend has no store; the Bulk
+    /// Import workspace then reports itself unavailable.
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 }
 
 /// The settings keys holding the user's FHIR-version and tenant choices, and
@@ -850,6 +854,7 @@ pub fn mount(
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
     public_base_url: String,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> Router {
     mount_with_body_limit(
         fhir_app,
@@ -865,6 +870,7 @@ pub fn mount(
         terminology,
         public_base_url,
         10 * 1024 * 1024,
+        bulk_provider,
     )
 }
 
@@ -884,6 +890,7 @@ pub fn mount_with_body_limit(
     terminology: Option<String>,
     public_base_url: String,
     max_body_size: usize,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> Router {
     mount_with_body_limit_and_tenant_routing(
         fhir_app,
@@ -900,6 +907,7 @@ pub fn mount_with_body_limit(
         public_base_url,
         max_body_size,
         false,
+        bulk_provider,
     )
 }
 
@@ -920,6 +928,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
     public_base_url: String,
     max_body_size: usize,
     tenant_path_routing: bool,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url,
@@ -941,6 +950,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
         public_base_url,
         max_body_size,
         tenant_path_routing,
+        bulk_provider,
     )
 }
 
@@ -962,6 +972,7 @@ pub fn mount_with_conformance_source(
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
     public_base_url: String,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> Router {
     mount_with_conformance_source_and_body_limit(
         fhir_app,
@@ -976,6 +987,7 @@ pub fn mount_with_conformance_source(
         terminology,
         public_base_url,
         10 * 1024 * 1024,
+        bulk_provider,
     )
 }
 
@@ -995,6 +1007,7 @@ pub fn mount_with_conformance_source_and_body_limit(
     terminology: Option<String>,
     public_base_url: String,
     max_body_size: usize,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> Router {
     mount_with_conformance_source_and_body_limit_and_tenant_routing(
         fhir_app,
@@ -1010,6 +1023,7 @@ pub fn mount_with_conformance_source_and_body_limit(
         public_base_url,
         max_body_size,
         false,
+        bulk_provider,
     )
 }
 
@@ -1030,6 +1044,7 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
     public_base_url: String,
     max_body_size: usize,
     tenant_path_routing: bool,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> Router {
     let nl_enabled = nl.enabled;
     let mut parsed_public_base = reqwest::Url::parse(&public_base_url)
@@ -1196,6 +1211,7 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         tenants,
         provisioning: Default::default(),
         settings,
+        bulk_provider,
         data_dir,
         fhir_version,
         default_tenant,

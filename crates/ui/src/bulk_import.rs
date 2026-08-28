@@ -8,10 +8,11 @@
 //! resource to the recipient (the exact vocabulary HFS's own consumer side
 //! parses), and every attempt is appended to the submission's log.
 //!
-//! State lives in the per-user settings document under the reserved
-//! `byTenant.<tenant>.bulkImport` subtree, object-keyed by id so single-entry
-//! merge patches never clobber siblings. The log is a bounded array — the
-//! settings document has a hard size cap.
+//! State lives in the tenant-scoped provider store
+//! ([`BulkProviderStore`](helios_persistence::core::BulkProviderStore), #772):
+//! one whole JSON document per submission, written under optimistic
+//! versioning and visible to every operator of the tenant. The log is a
+//! bounded array so a chatty run cannot grow a document without limit.
 
 use askama::Template;
 use axum::{
@@ -25,9 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::i18n::{I18n, RequestLocale};
-use crate::{
-    RequestTenant, RequestVersion, WebState, current_status, query_value, render, settings_user_key,
-};
+use crate::{RequestTenant, RequestVersion, WebState, current_status, query_value, render};
 
 fn public_url_with_segments<'a>(
     public_base_url: &str,
@@ -136,137 +135,82 @@ pub struct Manifest {
     pub aborted_at: String,
 }
 
-/// The `byTenant.<tenant>.bulkImport.submissions` object for this user.
-async fn load_submissions(
-    state: &WebState,
-    user_key: &str,
-    tenant: &str,
-) -> serde_json::Map<String, Value> {
-    let Some(store) = &state.settings else {
-        return serde_json::Map::new();
-    };
-    store
-        .get_settings(user_key)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|s| {
-            s.document
-                .get("byTenant")?
-                .get(tenant)?
-                .get("bulkImport")?
-                .get("submissions")?
-                .as_object()
-                .cloned()
-        })
-        .unwrap_or_default()
+/// The tenant context provider-store calls run under. `/ui` sits outside
+/// the auth layer today (#320), so the effective tenant is the request's.
+fn tenant_ctx(rt: &RequestTenant) -> helios_persistence::tenant::TenantContext {
+    helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new(&rt.id),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    )
 }
 
-/// Merge-patches one submission entry (or removes it when `value` is `Null`).
-async fn patch_submission(
-    state: &WebState,
-    user_key: &str,
-    tenant: &str,
-    id: &str,
-    value: Value,
-) -> Result<(), String> {
-    let Some(store) = &state.settings else {
-        return Err("settings store unavailable".to_string());
+/// Every submission of the tenant, with ids — the list page's view. Entries
+/// that fail to decode are skipped rather than sinking the page.
+async fn load_all(state: &WebState, rt: &RequestTenant) -> Vec<(String, Submission)> {
+    let Some(store) = &state.bulk_provider else {
+        return Vec::new();
     };
-    let patch = json!({
-        "byTenant": { tenant: { "bulkImport": { "submissions": { id: value } } } }
-    });
-    store
-        .patch_settings(user_key, patch, None)
+    match store.list_provider_submissions(&tenant_ctx(rt)).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|row| {
+                let parsed = serde_json::from_value(row.document).ok()?;
+                Some((row.id, parsed))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to list bulk-import submissions");
+            Vec::new()
+        }
+    }
+}
+
+/// One submission plus the stored version its next write must match.
+async fn load_one(state: &WebState, rt: &RequestTenant, id: &str) -> Option<(Submission, i64)> {
+    let store = state.bulk_provider.as_ref()?;
+    let row = store
+        .get_provider_submission(&tenant_ctx(rt), id)
         .await
-        .map(|_| ())
+        .ok()
+        .flatten()?;
+    let parsed = serde_json::from_value(row.document).ok()?;
+    Some((parsed, row.version))
+}
+
+/// Persists one submission as a whole document under optimistic versioning
+/// (#766, reworked per #772: the provider store replaced the per-user
+/// settings subtree, so there is no merge-patch to race and no
+/// delete-then-write window). `expected` of `Some(0)` asserts creation.
+async fn save(
+    state: &WebState,
+    rt: &RequestTenant,
+    id: &str,
+    submission: &Submission,
+    expected: Option<i64>,
+) -> Result<i64, String> {
+    let Some(store) = &state.bulk_provider else {
+        return Err("bulk provider store unavailable".to_string());
+    };
+    let document = serde_json::to_value(submission).map_err(|e| e.to_string())?;
+    store
+        .put_provider_submission(&tenant_ctx(rt), id, document, expected)
+        .await
+        .map(|stored| stored.version)
         .map_err(|e| e.to_string())
 }
 
-/// Every field of the serialized `Submission`, and of a serialized `Manifest`
-/// inside its map. `store_submission` forces each one to be present in the
-/// patch (absent → explicit null) so a cleared skip-serialized field deletes
-/// its stored value instead of silently surviving the merge.
-const SUBMISSION_FIELDS: &[&str] = &[
-    "name",
-    "recipientBaseUrl",
-    "auth",
-    "submitterSystem",
-    "submitterValue",
-    "pollUrl",
-    "progress",
-    "result",
-    "clientId",
-    "tokenUrl",
-    "status",
-    "createdAt",
-    "manifests",
-    "log",
-];
-const MANIFEST_FIELDS: &[&str] = &[
-    "manifestUrl",
-    "fhirBaseUrl",
-    "outputFormat",
-    "fileRequestHeaders",
-    "createdAt",
-    "lastSubmittedAt",
-    "abortedAt",
-];
-
-/// Persists one submission as a **single** merge patch.
-///
-/// The prior shape deleted the entry and wrote it back in two patches; between
-/// them the submission did not exist, so a failed second patch — or a
-/// concurrent handler's write landing in the gap — destroyed it outright
-/// (#766). One patch has no gap. What the two-step bought is reproduced
-/// inside the single patch instead: RFC 7386 replaces arrays (the log)
-/// wholesale but merges maps key-by-key, so a manifest removed from the map
-/// rides along as an explicit null, and every skip-serialized field that is
-/// currently empty is forced to null so its stored value is deleted rather
-/// than left behind.
-async fn store_submission(
+/// Saves and, on failure, logs — for the paths whose response is a redirect
+/// either way. A version conflict here means another handler (usually the 5s
+/// status poller) wrote first; the caller's state is stale and the next
+/// load/poll re-derives it, so the lost write is benign but still logged.
+async fn save_or_warn(
     state: &WebState,
-    user_key: &str,
-    tenant: &str,
+    rt: &RequestTenant,
     id: &str,
     submission: &Submission,
-    removed_manifests: &[String],
-) -> Result<(), String> {
-    let mut value = serde_json::to_value(submission).map_err(|e| e.to_string())?;
-    if let Some(entry) = value.as_object_mut() {
-        for field in SUBMISSION_FIELDS {
-            entry.entry(*field).or_insert(Value::Null);
-        }
-        if let Some(manifests) = entry.get_mut("manifests").and_then(|m| m.as_object_mut()) {
-            for manifest in manifests.values_mut() {
-                if let Some(m) = manifest.as_object_mut() {
-                    for field in MANIFEST_FIELDS {
-                        m.entry(*field).or_insert(Value::Null);
-                    }
-                }
-            }
-            for mid in removed_manifests {
-                manifests.insert(mid.clone(), Value::Null);
-            }
-        }
-    }
-    patch_submission(state, user_key, tenant, id, value).await
-}
-
-/// Stores and, on failure, logs — for the paths whose response is a redirect
-/// either way. The write failing must at least reach the server log; it used
-/// to be discarded at nine of ten call sites (#766).
-async fn store_or_warn(
-    state: &WebState,
-    user_key: &str,
-    tenant: &str,
-    id: &str,
-    submission: &Submission,
-    removed_manifests: &[String],
+    expected: Option<i64>,
 ) {
-    if let Err(e) =
-        store_submission(state, user_key, tenant, id, submission, removed_manifests).await
-    {
+    if let Err(e) = save(state, rt, id, submission, expected).await {
         tracing::warn!(submission = %id, error = %e, "failed to persist bulk-import submission");
     }
 }
@@ -368,10 +312,6 @@ struct TestAuthResult {
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn parse_submission(value: &Value) -> Submission {
-    serde_json::from_value(value.clone()).unwrap_or_default()
-}
-
 fn is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "stopped")
 }
@@ -386,20 +326,17 @@ pub async fn page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
 ) -> Response {
     let i18n = I18n::new(locale);
     let status = current_status(&state, rv.0, &rt);
-    let available = state.settings.is_some();
-    let user_key = settings_user_key(principal.as_deref());
+    let available = state.bulk_provider.is_some();
 
     let mut rows = Vec::new();
     if available {
-        let map = load_submissions(&state, &user_key, &rt.id).await;
-        for (id, value) in &map {
-            let s = parse_submission(value);
+        for (id, s) in load_all(&state, &rt).await {
             rows.push(SubmissionRow {
-                id: id.clone(),
+                id,
                 status_label: status_label(&i18n, &s.status),
                 created_date: s.created_at.clone(),
                 manifest_count: s.manifests.len(),
@@ -442,10 +379,9 @@ pub struct CreateForm {
 pub async fn create(
     State(state): State<WebState>,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     axum::Form(form): axum::Form<CreateForm>,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
     // The user may pin the submission id (it must be unique per submitter,
     // coordinated with the recipient); empty generates one.
     let id = match form.submission_id.trim() {
@@ -475,18 +411,10 @@ pub async fn create(
         manifests: serde_json::Map::new(),
         log: Vec::new(),
     };
-    match store_submission(&state, &user_key, &rt.id, &id, &submission, &[]).await {
-        Ok(()) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
+    match save(&state, &rt, &id, &submission, Some(0)).await {
+        Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
-}
-
-/// Loads one submission or answers with the list page redirect.
-async fn load_one(state: &WebState, user_key: &str, tenant: &str, id: &str) -> Option<Submission> {
-    load_submissions(state, user_key, tenant)
-        .await
-        .get(id)
-        .map(parse_submission)
 }
 
 /// `GET /ui/bulk-import/{id}` — the submission detail.
@@ -495,15 +423,14 @@ pub async fn detail(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
     let i18n = I18n::new(locale);
     let status = current_status(&state, rv.0, &rt);
-    let user_key = settings_user_key(principal.as_deref());
 
-    let Some(s) = load_one(&state, &user_key, &rt.id, &id).await else {
+    let Some((s, _sv)) = load_one(&state, &rt, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
 
@@ -609,11 +536,17 @@ fn render_detail_page(
 pub async fn delete(
     State(state): State<WebState>,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
-    let _ = patch_submission(&state, &user_key, &rt.id, &id, Value::Null).await;
+    if let Some(store) = &state.bulk_provider {
+        if let Err(e) = store
+            .delete_provider_submission(&tenant_ctx(&rt), &id)
+            .await
+        {
+            tracing::warn!(submission = %id, error = %e, "failed to delete bulk-import submission");
+        }
+    }
     Redirect::to("/ui/bulk-import").into_response()
 }
 
@@ -635,12 +568,11 @@ pub async fn edit(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
     axum::Form(form): axum::Form<EditSubmissionForm>,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
-    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
     let auth = if form.auth == "backend-services" {
@@ -648,8 +580,9 @@ pub async fn edit(
     } else {
         "none"
     };
-    let name = form.name.trim().to_string();
-    let (client_id, token_url) = if auth == "backend-services" {
+    s.name = form.name.trim().to_string();
+    s.auth = auth.to_string();
+    (s.client_id, s.token_url) = if auth == "backend-services" {
         (
             form.client_id.trim().to_string(),
             form.token_url.trim().to_string(),
@@ -657,33 +590,16 @@ pub async fn edit(
     } else {
         (String::new(), String::new())
     };
-    let tenant_id = rt.id.clone();
-    let submission_key = id.clone();
-    let patch = json!({
-        "byTenant": { tenant_id: { "bulkImport": { "submissions": { submission_key: {
-            "name": name,
-            "auth": auth,
-            "clientId": if client_id.is_empty() { Value::Null } else { json!(client_id.clone()) },
-            "tokenUrl": if token_url.is_empty() { Value::Null } else { json!(token_url.clone()) }
-        } } } } }
-    });
-    let Some(store) = &state.settings else {
-        return (StatusCode::BAD_GATEWAY, "settings store unavailable").into_response();
-    };
-    match store.patch_settings(&user_key, patch, None).await {
+    match save(&state, &rt, &id, &s, Some(sv)).await {
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
         Err(e) => {
-            s.name = form.name.trim().to_string();
-            s.auth = auth.to_string();
-            s.client_id = client_id;
-            s.token_url = token_url;
             let i18n = I18n::new(locale);
             let mut response = render_detail_page(
                 i18n,
                 current_status(&state, rv.0, &rt),
                 id,
                 s,
-                Some(e.to_string()),
+                Some(e),
                 true,
                 "recent",
             );
@@ -708,12 +624,11 @@ pub struct ManifestForm {
 pub async fn add_manifest(
     State(state): State<WebState>,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
     axum::Form(form): axum::Form<ManifestForm>,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
-    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
     if is_terminal(&s.status) {
@@ -731,7 +646,7 @@ pub async fn add_manifest(
     let mid = uuid::Uuid::new_v4().to_string();
     s.manifests
         .insert(mid, serde_json::to_value(&manifest).unwrap_or(Value::Null));
-    store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
+    save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
@@ -739,13 +654,12 @@ pub async fn add_manifest(
 pub async fn delete_manifest(
     State(state): State<WebState>,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path((id, mid)): Path<(String, String)>,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
-    if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
+    if let Some((mut s, sv)) = load_one(&state, &rt, &id).await {
         s.manifests.remove(&mid);
-        store_or_warn(&state, &user_key, &rt.id, &id, &s, &[mid.clone()]).await;
+        save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
@@ -1123,18 +1037,17 @@ async fn poll_status(submission: &mut Submission) {
 pub async fn submit_manifest(
     State(state): State<WebState>,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path((id, mid)): Path<(String, String)>,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
-    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
     if is_terminal(&s.status) || !manifest_can_submit(&s, &mid) {
         return conflict("manifest is not eligible for submission");
     }
     submit_with_id(&mut s, &id, Some(&mid)).await;
-    store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
+    save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
@@ -1142,18 +1055,17 @@ pub async fn submit_manifest(
 pub async fn submit_all(
     State(state): State<WebState>,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
-    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
     if is_terminal(&s.status) || !s.manifests.keys().any(|mid| manifest_can_submit(&s, mid)) {
         return conflict("submission has no eligible manifests");
     }
     submit_with_id(&mut s, &id, None).await;
-    store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
+    save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
@@ -1258,31 +1170,30 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
 pub async fn abort(
     State(state): State<WebState>,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
 ) -> Response {
-    set_status(state, rt, principal, id, "stopped").await
+    set_status(state, rt, _principal, id, "stopped").await
 }
 
 /// `POST /ui/bulk-import/{id}/complete` — status-only kick-off, `completed`.
 pub async fn complete(
     State(state): State<WebState>,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
 ) -> Response {
-    set_status(state, rt, principal, id, "completed").await
+    set_status(state, rt, _principal, id, "completed").await
 }
 
 async fn set_status(
     state: WebState,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     id: String,
     status: &str,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
-    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
     if !matches!(s.status.as_str(), "in-progress" | "failed") {
@@ -1308,7 +1219,7 @@ async fn set_status(
             push_log(&mut s, format!("Status change failed: {e}"));
         }
     }
-    store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
+    save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
@@ -1332,17 +1243,16 @@ pub async fn status_fragment(
     State(state): State<WebState>,
     locale: RequestLocale,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let user_key = settings_user_key(principal.as_deref());
-    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if !s.poll_url.is_empty() {
         poll_status(&mut s).await;
-        store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
+        save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
     render(StatusCard {
         i18n,
@@ -1385,12 +1295,11 @@ pub async fn empty_manifest() -> Response {
 pub async fn replace_manifest(
     State(state): State<WebState>,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path((id, mid)): Path<(String, String)>,
     axum::Form(form): axum::Form<ManifestForm>,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
-    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
     if is_terminal(&s.status) || !manifest_can_abort(&s, &mid) {
@@ -1447,7 +1356,7 @@ pub async fn replace_manifest(
                 push_log(&mut s, format!("Replacement failed: {e}"));
             }
         }
-        store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
+        save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
@@ -1457,11 +1366,10 @@ pub async fn replace_manifest(
 pub async fn abort_manifest(
     State(state): State<WebState>,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
+    _principal: Option<Extension<helios_auth::Principal>>,
     Path((id, mid)): Path<(String, String)>,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
-    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
     if is_terminal(&s.status) || !manifest_can_abort(&s, &mid) {
@@ -1496,7 +1404,7 @@ pub async fn abort_manifest(
                 push_log(&mut s, format!("Abort failed: {e}"));
             }
         }
-        store_or_warn(&state, &user_key, &rt.id, &id, &s, &[]).await;
+        save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }

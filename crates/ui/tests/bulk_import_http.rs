@@ -13,16 +13,23 @@ use helios_fhir::FhirVersion;
 use helios_persistence::{
     StorageResult,
     backends::sqlite::SqliteBackend,
-    core::{SettingsStore, StoredUserSettings},
+    core::{BulkProviderStore, SettingsStore, StoredUserSettings},
     error::BackendError,
 };
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+fn backing_stores() -> (Arc<dyn SettingsStore>, Arc<dyn BulkProviderStore>) {
+    let backend = Arc::new({
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+        backend.init_schema().expect("init schema");
+        backend
+    });
+    (backend.clone(), backend)
+}
+
 fn settings_store() -> Arc<dyn SettingsStore> {
-    let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
-    backend.init_schema().expect("init schema");
-    Arc::new(backend)
+    backing_stores().0
 }
 
 /// One test's world: the settings store and the recipient base the router is
@@ -30,62 +37,66 @@ fn settings_store() -> Arc<dyn SettingsStore> {
 /// that need the kickoff to reach their mock recipient mount with its URL.
 struct Ctx {
     settings: Arc<dyn SettingsStore>,
+    bulk_provider: Arc<dyn BulkProviderStore>,
     recipient: String,
 }
 
 fn ctx(recipient: &str) -> Ctx {
+    let (settings, bulk_provider) = backing_stores();
     Ctx {
-        settings: settings_store(),
+        settings,
+        bulk_provider,
         recipient: recipient.to_string(),
     }
 }
 
-struct FailNextPatchStore {
-    inner: Arc<dyn SettingsStore>,
+struct FailNextPutStore {
+    inner: Arc<dyn BulkProviderStore>,
     fail: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
-impl SettingsStore for FailNextPatchStore {
-    async fn get_settings(&self, user_key: &str) -> StorageResult<Option<StoredUserSettings>> {
-        self.inner.get_settings(user_key).await
+impl BulkProviderStore for FailNextPutStore {
+    async fn list_provider_submissions(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+    ) -> StorageResult<Vec<helios_persistence::core::StoredProviderSubmission>> {
+        self.inner.list_provider_submissions(tenant).await
     }
 
-    async fn put_settings(
+    async fn get_provider_submission(
         &self,
-        user_key: &str,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
+    ) -> StorageResult<Option<helios_persistence::core::StoredProviderSubmission>> {
+        self.inner.get_provider_submission(tenant, id).await
+    }
+
+    async fn put_provider_submission(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
         document: serde_json::Value,
         if_match_version: Option<i64>,
-    ) -> StorageResult<StoredUserSettings> {
-        self.inner
-            .put_settings(user_key, document, if_match_version)
-            .await
-    }
-
-    async fn patch_settings(
-        &self,
-        user_key: &str,
-        merge_patch: serde_json::Value,
-        if_match_version: Option<i64>,
-    ) -> StorageResult<StoredUserSettings> {
+    ) -> StorageResult<helios_persistence::core::StoredProviderSubmission> {
         if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return Err(BackendError::Unavailable {
-                backend_name: "test-settings".to_string(),
+                backend_name: "test-provider".to_string(),
                 message: "forced edit failure".to_string(),
             }
             .into());
         }
         self.inner
-            .patch_settings(user_key, merge_patch, if_match_version)
+            .put_provider_submission(tenant, id, document, if_match_version)
             .await
     }
 
-    async fn delete_settings(&self, user_key: &str) -> StorageResult<bool> {
-        self.inner.delete_settings(user_key).await
-    }
-
-    async fn purge_tenant_settings(&self, tenant_id: &str) -> StorageResult<u64> {
-        self.inner.purge_tenant_settings(tenant_id).await
+    async fn delete_provider_submission(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
+    ) -> StorageResult<bool> {
+        self.inner.delete_provider_submission(tenant, id).await
     }
 }
 
@@ -103,6 +114,7 @@ fn app(ctx: &Ctx) -> Router {
         FhirVersion::R4,
         None,
         ctx.recipient.clone(),
+        Some(Arc::clone(&ctx.bulk_provider)),
     )
 }
 
@@ -121,6 +133,7 @@ fn app_with_path_tenant(ctx: &Ctx, tenant: &str) -> Router {
         ctx.recipient.clone(),
         10 * 1024 * 1024,
         true,
+        Some(Arc::clone(&ctx.bulk_provider)),
     )
 }
 
@@ -169,16 +182,20 @@ async fn create_submission(ctx: &Ctx) -> String {
 
 async fn set_submission_status(ctx: &Ctx, detail_path: &str, status: &str) {
     let id = detail_path.rsplit('/').next().expect("submission id");
-    ctx.settings
-        .patch_settings(
-            "l2:",
-            serde_json::json!({
-                "byTenant": { "default": { "bulkImport": { "submissions": {
-                    id: { "status": status }
-                } } } }
-            }),
-            None,
-        )
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("default"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    let stored = ctx
+        .bulk_provider
+        .get_provider_submission(&tenant, id)
+        .await
+        .expect("read submission")
+        .expect("submission exists");
+    let mut document = stored.document;
+    document["status"] = serde_json::json!(status);
+    ctx.bulk_provider
+        .put_provider_submission(&tenant, id, document, Some(stored.version))
         .await
         .expect("seed submission state");
 }
@@ -407,14 +424,16 @@ async fn editing_a_submission_changes_only_local_display_and_auth_fields() {
 
 #[tokio::test]
 async fn a_failed_edit_reopens_the_dialog_with_attempted_values_and_preserves_storage() {
-    let backing = settings_store();
+    let (settings, backing) = backing_stores();
     let setup = Ctx {
-        settings: Arc::clone(&backing),
+        settings: Arc::clone(&settings),
+        bulk_provider: Arc::clone(&backing),
         recipient: "http://localhost:9/".to_string(),
     };
     let detail_path = create_submission(&setup).await;
     let ctx = Ctx {
-        settings: Arc::new(FailNextPatchStore {
+        settings,
+        bulk_provider: Arc::new(FailNextPutStore {
             inner: backing,
             fail: std::sync::atomic::AtomicBool::new(true),
         }),
@@ -711,9 +730,14 @@ async fn terminal_and_row_state_guards_reject_direct_posts_without_side_effects(
 
     post_form(&ctx, &format!("{detail_path}/complete"), "").await;
     let before_terminal = received.lock().unwrap().len();
-    let settings_before = ctx
-        .settings
-        .get_settings("l2:")
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("default"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    let submission_id = detail_path.rsplit('/').next().unwrap();
+    let stored_before = ctx
+        .bulk_provider
+        .get_provider_submission(&tenant, submission_id)
         .await
         .unwrap()
         .unwrap()
@@ -737,14 +761,14 @@ async fn terminal_and_row_state_guards_reject_direct_posts_without_side_effects(
         assert_eq!(status, StatusCode::CONFLICT, "{uri}");
     }
     assert_eq!(received.lock().unwrap().len(), before_terminal);
-    let settings_after = ctx
-        .settings
-        .get_settings("l2:")
+    let stored_after = ctx
+        .bulk_provider
+        .get_provider_submission(&tenant, submission_id)
         .await
         .unwrap()
         .unwrap()
         .document;
-    assert_eq!(settings_after, settings_before);
+    assert_eq!(stored_after, stored_before);
 
     let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Completed"));
@@ -834,6 +858,7 @@ async fn the_page_degrades_without_a_settings_store() {
         FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     );
     let res = app
         .clone()
@@ -946,6 +971,7 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
     // recipient: the kick-off must reach this phase's capturing mock.
     let ctx = Ctx {
         settings: Arc::clone(&ctx.settings),
+        bulk_provider: Arc::clone(&ctx.bulk_provider),
         recipient: recipient_url.clone(),
     };
     let (_, detail_path, _) = post_form(
