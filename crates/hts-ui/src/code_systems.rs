@@ -199,7 +199,7 @@ impl BrowserRowsView {
             )));
         }
         match &self.result {
-            Err(UpstreamError::Outcome { outcome, .. }) => Some(outcome.clone()),
+            Err(UpstreamError::Outcome { outcome, .. }) => Some((**outcome).clone()),
             Err(UpstreamError::HttpStatus { status, .. }) => Some(OutcomeView {
                 severity: "error".to_owned(),
                 code: match *status {
@@ -358,7 +358,7 @@ impl<'a> DetailPageTemplate<'a> {
                 code: "not-found".to_owned(),
                 ..OutcomeView::default()
             }),
-            Err(UpstreamError::Outcome { outcome, .. }) => Some(outcome.clone()),
+            Err(UpstreamError::Outcome { outcome, .. }) => Some((**outcome).clone()),
             Err(UpstreamError::HttpStatus { status, .. }) => Some(OutcomeView {
                 severity: "error".to_owned(),
                 code: match *status {
@@ -515,7 +515,7 @@ impl WorkbenchResultView {
         let mut view = Self::empty(op);
         view.request_url = request_url;
         match err {
-            UpstreamError::Outcome { outcome, .. } => view.outcome = Some(outcome.clone()),
+            UpstreamError::Outcome { outcome, .. } => view.outcome = Some((**outcome).clone()),
             UpstreamError::NotFound { .. } => {
                 view.outcome = Some(OutcomeView {
                     severity: "error".to_owned(),

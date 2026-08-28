@@ -246,7 +246,9 @@ pub enum UpstreamError {
         op: &'static str,
         url: String,
         status: u16,
-        outcome: OutcomeView,
+        /// Boxed to keep `Result<_, UpstreamError>` below clippy's
+        /// `result_large_err` size threshold.
+        outcome: Box<OutcomeView>,
     },
 
     #[error("upstream `{op}` at {url} returned an unrecognized body: {message}")]
@@ -1425,10 +1427,7 @@ fn is_loopback_base_url(base_url: &str) -> bool {
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(base_url);
-    let host = after_scheme
-        .split(|c: char| c == '/' || c == '?' || c == '#')
-        .next()
-        .unwrap_or("");
+    let host = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     let host = if let Some(rest) = host.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
     } else {
@@ -2455,7 +2454,7 @@ fn status_to_error(op: &'static str, url: &str, status: u16, body: &Value) -> Up
             op,
             url: url.to_owned(),
             status,
-            outcome: OutcomeView::from_body(body),
+            outcome: Box::new(OutcomeView::from_body(body)),
         }
     } else {
         UpstreamError::HttpStatus {
@@ -2737,16 +2736,11 @@ impl ConceptMapSummary {
 /// Direction the operator submitted on the Translate tab. Governs which
 /// FHIR parameters the wire body carries and whether `reverse=true` is
 /// attached (hts-details.md §`$translate`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TranslateDirection {
+    #[default]
     Forward,
     Reverse,
-}
-
-impl Default for TranslateDirection {
-    fn default() -> Self {
-        Self::Forward
-    }
 }
 
 impl TranslateDirection {
@@ -2801,17 +2795,12 @@ pub struct TranslateParams {
 /// build compiled for R5 can still be pointed at an R4 HTS via
 /// `HTS_UI_UPSTREAM_URL`, so the field name is not knowable at compile
 /// time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MappingKind {
     Equivalence,
     Relationship,
+    #[default]
     Unknown,
-}
-
-impl Default for MappingKind {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl MappingKind {
@@ -5427,7 +5416,7 @@ impl UpstreamClient {
                 Ok(result) => row.outcome = result.outcome,
                 Err(err) => match &err {
                     UpstreamError::Outcome { outcome, .. } => {
-                        row.outcome_error = Some(outcome.clone())
+                        row.outcome_error = Some((**outcome).clone())
                     }
                     UpstreamError::NotFound { .. } => {
                         row.outcome_error = Some(OutcomeView {

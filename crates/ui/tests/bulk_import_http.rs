@@ -287,7 +287,45 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
     assert!(html.contains(r#"<span>Status</span><div>Not Started</div>"#));
     assert!(html.contains(r#"<span>Authentication</span><div>"#));
 
-    assert!(html.contains(r#"<a class="back-link" href="/ui/bulk-import">"#));
+    let assert_back_link =
+        |localized_html: &str, label: &str| {
+            let marker = r#"<a class="back-link" href="/ui/bulk-import">"#;
+            let start = localized_html.find(marker).expect("shared back link");
+            let end = start
+                + localized_html[start..]
+                    .find("</a>")
+                    .expect("back link closing tag")
+                + "</a>".len();
+            let back_link = &localized_html[start..end];
+
+            assert!(back_link.contains(
+                r#"<span aria-hidden="true"><svg width="5" height="8" viewBox="0 0 5 8""#
+            ));
+            assert!(back_link.contains(&format!("<span>{label}</span>")));
+            assert_eq!(back_link.matches("<span").count(), 2);
+            assert!(
+                !back_link.contains('‹'),
+                "spacing must come from CSS, not the former literal chevron and space"
+            );
+        };
+    assert_back_link(&html, "All Submissions");
+    let header_start = html
+        .find(r#"<header class="page-head page-head--back-link">"#)
+        .expect("shared back-link header");
+    let header_end = header_start
+        + html[header_start..]
+            .find("</header>")
+            .expect("page header closing tag");
+    let header = &html[header_start..header_end];
+    let back_link_position = header.find(r#"class="back-link""#).unwrap();
+    let copy_position = header.find(r#"class="page-head__copy""#).unwrap();
+    let action_position = header.find(r#"class="page-head__action""#).unwrap();
+    assert!(back_link_position < copy_position && copy_position < action_position);
+    for (lang, label) in [("es", "Todas las submissions"), ("de", "Alle Submissions")] {
+        let (status, localized_html) = get(&ctx, &format!("{detail_path}?lang={lang}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_back_link(&localized_html, label);
+    }
     assert!(html.contains("bulk-import-summary__actions"));
     let actions = ["Edit", "Delete", "Abort", "Complete"];
     let mut cursor = 0;
@@ -401,8 +439,10 @@ async fn editing_a_submission_changes_only_local_display_and_auth_fields() {
     assert!(!html.contains("evil.example"));
     assert!(html.contains(r#"value="After""#));
     assert!(html.contains(r#"value="none" checked"#));
-    assert!(html.contains(r#"name="client_id" autocomplete="off" value="""#));
-    assert!(html.contains(r#"name="token_url" autocomplete="off" value="""#));
+    // A cleared credential renders with no value attribute at all - the
+    // shared fieldset omits it when empty rather than emitting value="".
+    assert!(html.contains(r#"name="client_id" autocomplete="off">"#));
+    assert!(html.contains(r#"name="token_url" autocomplete="off">"#));
 }
 
 #[tokio::test]

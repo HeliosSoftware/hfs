@@ -195,7 +195,7 @@ fn degraded_reason(err: &UpstreamError) -> Option<&'static str> {
 /// `None` for the connection-class errors that the degraded banner owns.
 fn outcome_for(err: &UpstreamError) -> Option<OutcomeView> {
     match err {
-        UpstreamError::Outcome { outcome, .. } => Some(outcome.clone()),
+        UpstreamError::Outcome { outcome, .. } => Some((**outcome).clone()),
         UpstreamError::NotFound { .. } => Some(OutcomeView {
             severity: "error".to_owned(),
             code: "not-found".to_owned(),

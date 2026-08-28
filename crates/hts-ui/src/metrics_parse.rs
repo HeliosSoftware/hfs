@@ -391,6 +391,6 @@ valid_counter 7
 ";
         let map = parse(text);
         assert_eq!(sum_counter(&map, "valid_counter"), Some(7.0));
-        assert!(map.get("garbled").is_none());
+        assert!(!map.contains_key("garbled"));
     }
 }
