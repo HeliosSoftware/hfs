@@ -1,0 +1,21 @@
+<!--
+  Out-of-band swap target for the Add Tenant dialog's own submit error (#681
+  adenda). The container lives inside `.addbox__panel`, below the form
+  (`tenants.html`), so a failed create (invalid id, duplicate, already being
+  provisioned) shows where the dialog is, instead of the ordinary rows
+  banner (`partials/tenant_rows.html`), which sits in `#tenant-rows` behind
+  the modal scrim and was unreadable while the dialog was open.
+
+  `hx-swap-oob="true"` lets `tenants::create_response`
+  (`crates/ui/src/tenants.rs`) return this alongside the ordinary rows
+  fragment in one response, matched into the page by `id` regardless of the
+  request's `hx-target` — no second round trip, and no duplicated markup for
+  the rows partial to grow a second error slot. `None` (the success and
+  no-error paths) still swaps the container, emptied, so a stale message from
+  an earlier failed attempt in the same dialog session does not linger.
+-->
+{% if let Some(msg) = message %}
+<div id="tenant-add-error" class="alert" role="alert" hx-swap-oob="true">{{ msg }}</div>
+{% else %}
+<div id="tenant-add-error" hx-swap-oob="true"></div>
+{% endif %}

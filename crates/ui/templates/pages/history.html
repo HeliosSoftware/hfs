@@ -2,8 +2,6 @@
 
 {% block title %}{{ i18n.t("history-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
-{% block content_class %} content--wide{% endblock %}
-
 {% block content %}
 <!--
   History & Versions (#236), following the Figma "History & Versions" frame: the
@@ -18,7 +16,7 @@
   <p class="page-head__lede">{{ i18n.t("history-lede") }}</p>
 </section>
 
-<div class="history" id="history"
+<div id="history"
      data-msg-load-error="{{ i18n.t("history-load-error") }}"
      data-msg-current="{{ i18n.t("history-current") }}"
      data-msg-not-found="{{ i18n.t("history-not-found") }}">
@@ -47,11 +45,11 @@
         <span class="icon">{% include "icons/history.svg" %}</span>
         <span id="history-subject">{{ i18n.t("history-pick-instance") }}</span>
       </div>
-      <div class="history__rail-path mono" id="history-path"></div>
+      <div class="history__rail-path" id="history-path"></div>
       <div class="history__versions" id="history-versions"></div>
     </aside>
 
-    <div class="history__main">
+    <div>
       <!-- Comparison controls: which two versions, and whether to show the
            metadata churn (versionId/lastUpdated move on every version). -->
       <div class="history__controls" id="history-controls" hidden>
@@ -71,7 +69,7 @@
       </div>
 
       <!-- The rendered diff drops in here on every selection change. -->
-      <div class="history__diff" id="history-diff">
+      <div id="history-diff">
         <p class="history__empty">{{ i18n.t("history-empty") }}</p>
       </div>
     </div>

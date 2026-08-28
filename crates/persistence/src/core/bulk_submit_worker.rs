@@ -44,8 +44,22 @@ pub struct ManifestLease {
     pub worker_id: WorkerId,
     /// When the lease expires if not renewed.
     pub lease_expiry: DateTime<Utc>,
+    /// The duration the lease was claimed for; each heartbeat renews by this
+    /// much, so short test leases stay short instead of jumping to a
+    /// constant.
+    pub lease_duration: Duration,
     /// Monotonically increasing token, bumped on every claim.
     pub fencing_token: u64,
+}
+
+impl ManifestLease {
+    /// The expiry a successful heartbeat renews to: now plus the duration the
+    /// lease was claimed with. Shared by every backend's `heartbeat`.
+    pub fn renewed_expiry(&self) -> DateTime<Utc> {
+        Utc::now()
+            + chrono::Duration::from_std(self.lease_duration)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60))
+    }
 }
 
 /// The worker's view of a claimed manifest: everything needed to fetch + ingest it.
@@ -434,11 +448,14 @@ where
         let opts = BulkProcessingOptions::new().with_import_mode(import_mode);
         let mut processed: u64 = 0;
         let mut failed: u64 = 0;
+        let mut lease_expiry = lease.lease_expiry;
 
         // 2. Ingest each output file via the existing streaming engine.
         for file in &manifest.output {
-            if let Err(LeaseError::LeaseLost { .. }) = self.jobs.heartbeat(&lease).await {
-                return Ok(());
+            match self.jobs.heartbeat(&lease).await {
+                Ok(expiry) => lease_expiry = expiry,
+                Err(LeaseError::LeaseLost { .. }) => return Ok(()),
+                Err(LeaseError::Storage(_)) => {}
             }
             let resource_type = file
                 .resource_type
@@ -468,18 +485,41 @@ where
                 }
             };
 
-            match self
-                .jobs
-                .process_ndjson_stream(
-                    &lease.tenant,
-                    &lease.submission_id,
-                    &lease.manifest_id,
-                    &resource_type,
-                    stream,
-                    &opts,
-                )
-                .await
-            {
+            // Per-file options: the file url is part of every entry result's
+            // identity, since line numbers restart in each file (#457).
+            let file_opts = opts.clone().with_file_url(&file.url);
+            // The lease must stay heartbeated *through* a file, not only
+            // between files: a single file whose ingest outlives the lease
+            // would otherwise expire mid-stream, get reclaimed, and restart
+            // the manifest from its first file — an unbounded silent loop,
+            // since the re-ingested entries upsert idempotently and no error
+            // is ever recorded.
+            let ingest = self.jobs.process_ndjson_stream(
+                &lease.tenant,
+                &lease.submission_id,
+                &lease.manifest_id,
+                &resource_type,
+                stream,
+                &file_opts,
+            );
+            tokio::pin!(ingest);
+            let outcome = loop {
+                let remaining = (lease_expiry - Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(1));
+                let wait = (remaining / 3).clamp(Duration::from_secs(1), Duration::from_secs(60));
+                tokio::select! {
+                    r = &mut ingest => break r,
+                    _ = tokio::time::sleep(wait) => {
+                        match self.jobs.heartbeat(&lease).await {
+                            Ok(expiry) => lease_expiry = expiry,
+                            Err(LeaseError::LeaseLost { .. }) => return Ok(()),
+                            Err(LeaseError::Storage(_)) => {}
+                        }
+                    }
+                }
+            };
+            match outcome {
                 Ok(result) => {
                     processed += result.counts.success + result.counts.skipped;
                     failed += result.counts.error_count();

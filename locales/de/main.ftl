@@ -17,6 +17,7 @@ app-tagline = Ein schneller, versionsübergreifender FHIR-Server
 
 nav-dashboard = Übersicht
 nav-terminology = Terminologie
+nav-terminology-new-window = Terminologie (wird in einem neuen Tab geöffnet)
 nav-resources = Ressourcen
 nav-settings = Einstellungen
 nav-signout = Abmelden
@@ -27,6 +28,10 @@ language-label = Sprache
 language-en = Englisch
 language-es = Spanisch
 language-de = Deutsch
+user-menu-label = Kontomenü
+user-local = Lokaler Benutzer
+user-local-hint = Authentifizierung ist deaktiviert
+user-logout = Abmelden
 
 ## Startseite
 
@@ -50,6 +55,17 @@ resource-count = { $count ->
 
 ## Terminologie durchsuchen
 
+terminology-heading = Terminologieserver
+terminology-lede = Verbinden Sie HFS mit einem FHIR-Terminologieserver.
+terminology-configured-heading = Terminologieserver konfiguriert
+terminology-configured-body = HFS_TERMINOLOGY_SERVER verweist auf eine gültige Server-URL.
+terminology-configured-open = Terminologieserver öffnen
+terminology-invalid-heading = HFS_TERMINOLOGY_SERVER ist ungültig.
+terminology-invalid-body = Verwenden Sie eine absolute HTTP- oder HTTPS-URL mit einem Host. Pfade und ein abschließender Schrägstrich sind zulässig. Fügen Sie keine Zugangsdaten, Abfrageparameter oder Fragmente ein.
+terminology-invalid-note = Aktualisieren Sie die Umgebungsvariable und starten Sie HFS neu.
+terminology-setup-heading = Terminologieserver verbinden
+terminology-setup-body = Setzen Sie HFS_TERMINOLOGY_SERVER auf die Basis-URL des FHIR-Terminologieservers, den HFS verwenden soll.
+terminology-setup-note = Setzen Sie die Variable in der Umgebung, die HFS startet, und starten Sie den Server danach neu.
 terminology-search-label = CodeSystems und ValueSets durchsuchen
 terminology-search-placeholder = z. B. 73211009, „Diabetes“, http://snomed.info/sct
 terminology-display-language = Anzeigesprache
@@ -66,14 +82,15 @@ action-retry = Erneut versuchen
 
 error-not-found = Die angeforderte Ressource wurde nicht gefunden.
 error-unauthorized = Sie sind nicht berechtigt, diese Aktion auszuführen.
-error-generic = Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.
+error-generic = Etwas ist schiefgelaufen. Versuchen Sie es erneut.
 
 ## Dashboard-Gerüst (Figma „Dashboard V1.1“)
 
 nav-section-work = Arbeit
 nav-section-batch-data = Batch & Daten
+nav-section-sql-on-fhir = SQL on FHIR
 nav-section-server = Server
-nav-section-conditional = Bedingt
+nav-section-tools = Werkzeuge
 
 nav-home = Startseite
 nav-search = Suche
@@ -83,10 +100,13 @@ nav-compartments = Compartments
 nav-batch-transaction = Batch / Transaktion
 nav-import = Importieren
 nav-export = Exportieren
-nav-sql-on-fhir = SQL-on-FHIR
+nav-sql-view-definitions = View-Definitionen
+nav-sql-queries = SQL-Abfragen
+nav-sql-views = SQL-Views
+nav-sql-export = SQL-Export
+nav-sql-files = Dateien
 nav-capability-conformance = Capability & Konformität
 nav-search-parameters = Suchparameter
-nav-admin-ops = Admin / Betrieb
 nav-subscriptions = Abonnements
 nav-tenants = Mandanten
 
@@ -117,6 +137,9 @@ tenants-empty = Keine Mandanten gefunden.
 tenants-unregistered = nicht registriert
 tenants-delete = Mandant löschen
 tenants-delete-confirm = Mandant „{ $id }" abmelden? Die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
+tenants-row-provisioning = Wird bereitgestellt … das kann einen Moment dauern.
+tenants-row-failed = Der Mandant konnte nicht bereitgestellt werden.
+tenants-dismiss = Verwerfen
 
 tenant-heading = Tenants
 tenant-all = Alle Tenants
@@ -130,17 +153,28 @@ fhir-version = FHIR { $version }
 fhir-version-heading = FHIR-Version
 
 card-resource-types = Ressourcentypen
-card-resource-types-sub = aktiviert für { $version }
+card-resource-types-sub = verwendet für { $version }
 card-stored-resources = Gespeicherte Ressourcen
 card-stored-resources-sub = im aktiven Tenant
 card-export-jobs = Export-Jobs
 card-export-jobs-sub = laufend ({ $queued } in der Warteschlange)
-card-uptime = Verfügbarkeit
-card-uptime-sub = letzte 30 Tage
+card-import-jobs = Import-Jobs
+card-import-jobs-sub = aktiv
+card-jobs-unavailable = nicht verfügbar
+card-uptime = Betriebszeit
+card-uptime-sub = seit Prozessstart
 
 chart-title = FHIR-Ressourcen im Zeitverlauf
-chart-expand = Diagramm vergrößern
 chart-window = Zeitfenster des Diagramms
+chart-pick-heading = Dargestellte Ressourcentypen
+chart-pick-all = Alle Ressourcentypen anzeigen
+chart-pick-filter = Typen filtern
+chart-empty = Noch nichts darzustellen — gespeicherte Ressourcen erscheinen hier, sobald sie angelegt werden.
+chart-sample-note = Beispieldaten: in diesem Build ist kein Live-Metrikanbieter registriert.
+chart-table-toggle = Als Tabelle anzeigen
+chart-table-when = Zeitpunkt
+chart-focus-series = Diese Serie fokussieren
+chart-unfocus-series = Alle Serien anzeigen
 
 ## Fußzeile
 
@@ -256,7 +290,7 @@ cmp-new = Neue Compartment-Definition
 cmp-edit = Bearbeiten
 cmp-delete = Löschen
 cmp-delete-confirm = Diese Compartment-Definition löschen? Ihre Compartment-Routen funktionieren dann nicht mehr.
-crud-delete-failed = Löschen fehlgeschlagen
+crud-delete-failed = Das Element konnte nicht gelöscht werden.
 
 ## Compartment-Ansicht & Tester (#237)
 
@@ -309,6 +343,7 @@ queries-recent = Zuletzt
 queries-recent-heading = Letzte Suchen
 queries-recent-empty = Noch keine letzten Suchen — führe eine aus, um sie hier einzutragen.
 queries-invalid-url = Gib eine Suche wie GET /Patient?name=smith ein — der Ressourcentyp kommt aus dem Pfad.
+queries-invalid-fhir-escape = Diese Abfrage enthält eine ungültige FHIR-Escapesequenz. Korrigiere den maskierten Wert, bevor du ihn visuell bearbeitest.
 
 queries-conditions = Bedingungen
 queries-add-condition = Bedingung hinzufügen
@@ -320,10 +355,12 @@ queries-or = + oder
 plain-pill = In einfachen Worten
 plain-find = Finde {"{type}"}-Einträge
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
+plain-clause-no-value = {"{path}"} {"{verb}"}
 plain-and = und
 plain-or = oder
 plain-arrow = {" "}→
 plain-has = die ein verknüpftes {"{type}"} haben, dessen {"{param}"} {"{verb}"} {"{value}"}
+plain-has-no-value = die ein verknüpftes {"{type}"} haben, dessen {"{param}"} {"{verb}"}
 plain-include = Zusätzlich wird der {"{param}"} jedes {"{type}"} zurückgegeben{"{target}"}
 plain-revinclude = Plus jedes {"{type}"}, dessen {"{param}"} hierher zeigt
 plain-iterate = (wiederholt)
@@ -333,6 +370,8 @@ plain-verb-is = ist
 plain-verb-contains = enthält
 plain-verb-exact = ist genau
 plain-verb-missing = ist vorhanden/fehlt
+plain-verb-missing-true = fehlt
+plain-verb-missing-false = ist vorhanden
 plain-verb-not = ist nicht
 plain-verb-text = entspricht dem Text
 plain-verb-in = ist im Value Set
@@ -387,6 +426,7 @@ queries-open-tab = In neuem Tab öffnen
 queries-col-updated = Aktualisiert
 queries-prev = Zurück
 queries-next = Weiter
+queries-results-fetch-error = Ergebnisse von { $origin } konnten nicht geladen werden. Prüfen Sie HFS_BASE_URL und versuchen Sie es erneut.
 
 queries-rail-heading = Ressourcentypen
 queries-rail-filter = Typen filtern
@@ -466,6 +506,7 @@ editor-primitive-extension-hint = Dieser Wert trägt eigene Extensions (ein `_`-
 
 editor-collapse-all = Alle einklappen
 editor-expand-all = Alle ausklappen
+json-view-toggle-fold = JSON-Abschnitt umschalten
 editor-edit-raw = Rohtext bearbeiten
 editor-versions = Versionen
 editor-versions-none = Keine früheren Versionen.
@@ -475,14 +516,325 @@ editor-versions-none = Keine früheren Versionen.
 
 resources-heading = Ressourcen
 resources-lede = FHIR-Ressourcen durchsuchen, suchen, erstellen und bearbeiten. In natürlicher Sprache suchen oder die Abfrage selbst bauen, dann ein Ergebnis zum Bearbeiten öffnen.
-resources-create = Neu erstellen
+resources-create = Ressource erstellen
+resources-create-typed = { $type } erstellen
+resources-create-invalid-type = Dieser Ressourcentyp ist in der ausgewählten FHIR-Version nicht verfügbar. Korrigieren Sie die Abfrage oder wählen Sie einen Typ aus der Liste.
+resources-create-not-advertised = Dieser Server erlaubt das Erstellen dieses Ressourcentyps nicht. Sie können ihn weiterhin durchsuchen.
+resources-create-schema-unavailable = Für diesen Ressourcentyp gibt es in der ausgewählten FHIR-Version kein Editorschema. Die UI kann ihn deshalb nicht sicher erstellen.
+resources-create-metadata-unavailable = Die Serverfähigkeiten sind nicht verfügbar. Das Erstellen bleibt deaktiviert, bis die UI sie prüfen kann.
 resources-save-blocked = Beheben Sie die Validierungsprobleme vor dem Speichern.
 resources-save-invalid = Das JSON ist ungültig — beheben Sie es vor dem Speichern.
 resources-edit-title = Ressource bearbeiten
 resources-tab-edit = Bearbeiten
 resources-tab-history = Verlauf
 resources-types-heading = Ressourcentypen
+rail-all-types-heading = Alle Typen
 
 queries-saved-group = Gespeichert
 
 nav-collapse = Menü einklappen
+
+batch-heading = Batch / Transaction
+batch-lede = Lade ein FHIR-Bundle hoch, prüfe die auszuführenden Aktionen, führe es gegen diesen Server aus und lies das Ergebnis jedes Eintrags.
+batch-upload = Hochladen
+batch-drop-hint = Bundle-JSON-Datei hier ablegen
+batch-drop-browse = oder klicken zum Durchsuchen
+batch-invalid-json = Diese Datei ist kein gültiges JSON.
+batch-not-a-bundle = Dieses JSON ist kein FHIR-Bundle.
+batch-bad-type = Hier lassen sich nur Bundles vom Typ batch oder transaction ausführen.
+batch-request = Anfrage
+batch-entries = Einträge
+batch-semantics-batch = Batch: Einträge laufen unabhängig — ein fehlgeschlagener Eintrag stoppt die anderen nicht und macht sie nicht rückgängig.
+batch-semantics-transaction = Transaction: alles oder nichts — schlägt ein Eintrag fehl, rollt der Server das gesamte Bundle zurück.
+batch-tab-actions = Aktionen
+batch-tab-json = Bundle-JSON
+batch-no-body = (kein Body — dieser Eintrag adressiert nur eine Ressource)
+batch-cancel = Abbrechen
+batch-execute = Ausführen
+batch-plan-heading = Ausführungsplan
+batch-done = Fertig
+batch-response-heading = Ergebnisse pro Aktion
+batch-sum-created = erstellt
+batch-sum-updated = aktualisiert
+batch-sum-other = gelesen/sonstige
+batch-sum-failed = fehlgeschlagen
+batch-request-failed = Die Anfrage ist fehlgeschlagen.
+batch-reading = Bundle wird gelesen…
+batch-executing = Wird ausgeführt…
+batch-read-failed = Die Datei konnte nicht gelesen werden.
+
+## Bulk Import workspace (#527)
+
+bulk-import-title = Massenimport
+bulk-import-new = Neue Submission
+bulk-import-create-title = Bulk Submission anlegen
+bulk-import-field-name = Name der Submission
+bulk-import-auth = Authentifizierung
+bulk-import-auth-hint = Wie gegenüber dem Empfängerserver authentifiziert wird.
+bulk-import-auth-none = Keine
+bulk-import-auth-none-hint = Es wird kein Authorization-Header gesendet.
+bulk-import-auth-backend = Backend-Services-Authentifizierung
+bulk-import-auth-backend-hint = Holt ein Zugriffstoken und sendet es als Bearer im Authorization-Header.
+bulk-import-field-client-id = Client-ID
+bulk-import-field-client-id-hint = Registrieren Sie diesen Datenanbieter beim Empfänger und erhalten Sie eine Client-ID.
+bulk-import-field-token-url = Token-URL
+bulk-import-field-token-url-hint = Token-Endpunkt-URL des Autorisierungsservers.
+bulk-import-jwks-hint = Registrieren Sie den öffentlichen Schlüssel dieses Servers beim Empfänger über die JWKS-URL:
+bulk-import-test-auth = Authentifizierung testen
+bulk-import-test-auth-ok = Authentifizierung erfolgreich.
+bulk-import-create-submit = Submission anlegen
+bulk-import-unavailable = Das Storage-Backend hostet keinen Settings-Store; Submissions können nicht gespeichert werden.
+bulk-import-submissions = Submissions
+bulk-import-records = Einträge
+bulk-import-col-name = Name
+bulk-import-col-status = Status
+bulk-import-col-created = Erstellt
+bulk-import-col-manifests = Manifeste
+bulk-import-col-destination = Ziel
+bulk-import-empty = Noch keine Submissions. Legen Sie eine an, um zu beginnen.
+bulk-import-all = Alle Submissions
+bulk-import-status-not-started = Nicht gestartet
+bulk-import-status-in-progress = In Bearbeitung
+bulk-import-status-stopped = Angehalten
+bulk-import-status-completed = Abgeschlossen
+bulk-import-status-failed = Fehlgeschlagen
+bulk-import-detail-recipient = Datenempfänger
+bulk-import-detail-id = Submission-ID
+bulk-import-detail-submitter = Einreicher
+bulk-import-detail-created = Erstellt
+bulk-import-detail-status = Status
+bulk-import-detail-auth = Authentifizierung
+bulk-import-abort = Abbrechen
+bulk-import-complete = Abschließen
+bulk-import-delete = Löschen
+bulk-import-edit = Bearbeiten
+bulk-import-edit-title = Submission bearbeiten
+bulk-import-edit-submit = Änderungen speichern
+bulk-import-add-manifest = Manifest hinzufügen
+bulk-import-add-manifest-title = Manifest hinzufügen
+bulk-import-add-manifest-submit = Hinzufügen
+bulk-import-field-manifest-url = Manifest-URL
+bulk-import-field-manifest-url-hint = URL eines Bulk-Export-Manifests mit einem vorkoordinierten FHIR-Datensatz.
+bulk-import-field-fhir-base = FHIR-Basis-URL
+bulk-import-field-fhir-base-hint = Basis-URL, die der Empfänger beim Auflösen relativer Referenzen verwendet. Leer lassen, um die Basis-URL des Manifests zu verwenden.
+bulk-import-field-output-format = Format
+bulk-import-field-output-format-hint = Das Format der Bulk-Data-Dateien im Manifest.
+bulk-import-field-headers = Header für Dateiabrufe
+bulk-import-field-headers-hint = HTTP-Header, die der Empfänger beim Abruf einer Datendatei verwenden soll, je Zeile "Name: Wert".
+bulk-import-manifests = Manifeste
+bulk-import-manifest-actions = Manifest-Aktionen
+bulk-import-no-manifests = Noch keine Manifeste. Fügen Sie eines hinzu, um Daten zu übermitteln.
+bulk-import-submit = Übermitteln
+bulk-import-submit-all = Alle übermitteln
+bulk-import-sort = Sortieren
+bulk-import-sort-recent = Neueste zuerst
+bulk-import-sort-oldest = Älteste zuerst
+bulk-import-remove = Entfernen
+bulk-import-log = Submission-Protokoll
+bulk-import-log-empty = Noch nichts übermittelt.
+bulk-import-field-submitter-system = Einreicher-System
+bulk-import-field-submitter-value = Einreicher-Wert
+bulk-import-field-submitter-hint = Muss einem beim Empfänger registrierten Identifier entsprechen (außerhalb des Protokolls abgestimmt). Leer lassen für die generierten Standardwerte.
+bulk-import-field-submission-id = Submission-ID
+bulk-import-field-submission-id-hint = Eindeutig je Einreicher. Leer lassen, um eine UUID zu generieren.
+bulk-import-processing = Verarbeitung
+bulk-import-processing-waiting = Warten auf den ersten Statusbericht des Empfängers …
+bulk-import-result = Ergebnis
+bulk-import-result-finished = Verarbeitung abgeschlossen um
+bulk-import-result-outputs = Ausgabedateien
+bulk-import-result-errors = Fehlerdateien
+bulk-import-abort-manifest = Abbrechen
+ui-cancel = Abbrechen
+ui-close = Schließen
+editor-orphans-title = Diese Probleme haben noch kein Feld — fügen Sie die Elemente hinzu, um sie zu beheben
+editor-hint-date = FHIR date: YYYY, YYYY-MM oder YYYY-MM-DD
+editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD oder ein vollständiger Zeitstempel mit Zeitzone (2024-05-17T14:30:00+02:00)
+editor-hint-time = FHIR time: HH:MM:SS
+editor-hint-instant = FHIR instant: vollständiger Zeitstempel mit Zeitzone, z. B. 2024-05-17T14:30:00.000Z
+
+## Abonnement-Seite (#580)
+
+subs-title = Abonnements
+subs-lede = Schreibgeschützte Sicht auf die Abonnement-Engine: jedes registrierte Abonnement, sein Kanal, Live-Status und Zustellzähler.
+subs-unavailable = Die Abonnement-Engine ist auf diesem Server nicht aktiviert.
+subs-empty = Für diesen Mandanten sind keine Abonnements registriert.
+subs-card-failing = Fehlgeschlagen
+subs-card-failing-sub = braucht Aufmerksamkeit
+subs-card-idle = Inaktiv
+subs-card-idle-sub = keine Clients
+subs-card-active = Aktiv
+subs-card-active-sub = wird zugestellt
+subs-card-delivered = Zugestellt in 24 h
+subs-card-delivered-sub = { $rate }% beim ersten Versuch
+subs-card-delivered-none = keine Zustellungen im Fenster
+subs-table-heading = Abonnements
+subs-sort = Sortieren
+subs-sort-status = Status
+subs-sort-sent = Meistgesendet
+subs-sort-fails = Fehlerserie
+subs-col-subscription = Abonnement
+subs-col-channel = Kanal
+subs-col-status = Status
+subs-col-last24 = Letzte 24 h
+subs-col-sent = Gesendet
+subs-col-fails = Fehlerserie
+subs-state-active = aktiv
+subs-state-error = Fehler
+subs-state-idle = 0 Clients
+subs-state-requested = angefragt
+subs-state-off = aus
+
+## Bulk Export workspace (#537)
+
+bulk-export-title = Massenexport
+bulk-export-active-title = Aktive Exporte
+bulk-export-active-link = Aktive Exporte
+bulk-export-new = Neuer Export
+bulk-export-unavailable = Das Storage-Backend hostet keinen Settings-Store; Exportaufträge können nicht verfolgt werden.
+bulk-export-scope = Was möchten Sie exportieren?
+bulk-export-scope-system = Alles
+bulk-export-scope-system-hint = Der gesamte Server — jeder unten ausgewählte Ressourcentyp.
+bulk-export-scope-patient = Patienten
+bulk-export-scope-patient-hint = Jeder Patient und die zugehörigen Datensätze. Nichts Patientenfremdes.
+bulk-export-scope-group = Gruppe
+bulk-export-scope-group-hint = Nur die Mitglieder einer bereits definierten Kohorte.
+bulk-export-field-group-id = Gruppen-ID
+bulk-export-field-group-id-hint = Erforderlich für den Gruppen-Umfang: die ID der zu exportierenden FHIR-Group.
+bulk-export-field-name = Name
+bulk-export-field-name-placeholder = Diabetes-Register 2024
+bulk-export-types = Ressourcentypen
+bulk-export-types-hint = Nichts ankreuzen, um alle Typen zu exportieren.
+bulk-export-narrow = Eingrenzen
+bulk-export-field-elements = FHIR-Elemente
+bulk-export-field-type-filter = Typfilter
+bulk-export-field-since = Seit
+bulk-export-since-all = Gesamter Zeitraum
+bulk-export-since-day = Letzter Tag
+bulk-export-since-week = Letzte 7 Tage
+bulk-export-since-month = Letzte 4 Wochen
+bulk-export-since-custom = Benutzerdefiniert
+bulk-export-field-since-custom = Benutzerdefinierter Zeitpunkt
+bulk-export-field-since-custom-hint = Gilt, wenn Seit auf Benutzerdefiniert steht. RFC 3339, z. B. 2026-08-01T00:00:00Z.
+bulk-export-start = Export starten
+bulk-export-running = laufend
+bulk-export-clear = Leeren
+bulk-export-files-word = Dateien
+bulk-export-exports-word = Exporte
+bulk-export-none = Noch keine Exporte. Starten Sie einen auf der Massenexport-Seite.
+bulk-export-status-in-progress = Läuft
+bulk-export-status-complete = Abgeschlossen
+bulk-export-status-failed = Fehlgeschlagen
+bulk-export-status-cancelled = Abgebrochen
+bulk-export-progress = Fortschritt
+bulk-export-progress-waiting = Warten auf den ersten Statusbericht …
+bulk-export-files = Dateien
+bulk-export-finished-in = fertig in
+bulk-export-error = Fehler
+bulk-export-cancel = Abbrechen
+bulk-export-retry = Erneut versuchen
+
+# CapabilityStatement-Seite (#653)
+cap-title = Capability Statement
+cap-lede = Was dieser Server aktuell leistet, für den gewählten Tenant und die FHIR-Version — live aus /metadata zusammengesetzt.
+cap-summary-heading = Server-Übersicht
+cap-summary-description = Beschreibung
+cap-summary-url = Basis-URL
+cap-summary-fhir-version = FHIR-Version
+cap-summary-status = Status
+cap-summary-kind = Art
+cap-summary-date = Datum
+cap-summary-formats = Formate
+cap-interactions-heading = System-Interaktionen
+cap-transaction-note = transaction wird angeboten, weil das aktive Backend atomare Transaktionen unterstützt; batch ist immer verfügbar.
+cap-operations-heading = Operationen
+cap-col-operation = Operation
+cap-col-definition = Definition
+cap-resources-heading = Fähigkeiten pro Ressource
+cap-filter-placeholder = Typen filtern…
+cap-col-type = Typ
+cap-col-interactions = Interaktionen
+cap-col-search-params = Suchparameter
+cap-col-includes = Includes
+cap-col-revincludes = Revincludes
+cap-resources-empty = Kein Ressourcentyp entspricht dem Filter.
+cap-raw-toggle = Rohes CapabilityStatement (JSON)
+cap-unavailable = Das CapabilityStatement konnte nicht vom Server geladen werden — der Selbstaufruf benötigt bei aktivierter Authentifizierung eventuell ein Ausgangs-Token.
+
+## Stubs der SQL-on-FHIR-Sektion (#649)
+
+
+sql-vd-title = View-Definitionen
+sql-vd-lede = Erstelle und verwalte die ViewDefinitions, mit denen SQL on FHIR Ressourcen abflacht.
+
+sql-queries-title = SQL-Abfragen
+sql-queries-lede = Führe SQL-on-FHIR-Abfragen gegen diesen Server aus.
+
+sql-views-title = SQL-Views
+sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
+
+sql-export-title = SQL-Export
+sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
+
+sql-files-title = Dateien
+sql-files-lede = Manifeste und Ausgabedateien der SQL-Exporte.
+
+## View-Definitionen-Arbeitsbereich (#649)
+
+vd-new = Neu erstellen
+vd-new-title = Neue View-Definition
+vd-rail-label = View-Definitionen
+vd-rail-heading = View-Definitionen
+vd-filter = Views filtern
+vd-none = Noch keine View-Definitionen.
+vd-empty-lede = Lege mit „Neu erstellen" die erste ViewDefinition an.
+vd-degraded = Die Liste der View-Definitionen konnte nicht geladen werden.
+vd-saved = Gespeichert.
+vd-run = Ausführen
+vd-run-failed = Die View konnte nicht ausgeführt werden.
+vd-save = Speichern
+vd-duplicate = Duplizieren
+vd-delete = Löschen
+vd-delete-confirm = View-Definition „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
+vd-delete-failed = Die View-Definition konnte nicht gelöscht werden.
+vd-json-heading = Definition (JSON)
+vd-results-heading = Ergebnisse
+vd-results-empty = Die View hat keine Zeilen erzeugt.
+
+## SQL-Abfragen- / SQL-Views-Arbeitsbereiche (#649)
+
+sql-queries-new-title = Neue SQL-Abfrage
+sql-views-new-title = Neue SQL-View
+lib-filter = Bibliotheken filtern
+lib-none = Noch keine Bibliotheken.
+lib-empty-lede = Lege mit „Neu erstellen" die erste Bibliothek an.
+lib-degraded = Die Bibliotheksliste konnte nicht geladen werden.
+lib-sql-heading = SQL
+lib-delete-confirm = „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
+lib-delete-failed = Die Bibliothek konnte nicht gelöscht werden.
+
+## SQL-Export- und Dateien-Seiten (#649)
+
+export-start-failed = Der Export konnte nicht gestartet werden.
+export-started = Export gestartet.
+export-cancelled = Abbruch angefordert.
+export-job-heading = Exportauftrag
+export-job-id = Auftrags-ID
+export-job-state = Status
+export-state-running = Läuft
+export-state-done = Abgeschlossen
+export-state-unknown = Unbekannter Auftrag — möglicherweise abgebrochen oder bereinigt.
+export-refresh = Aktualisieren
+export-cancel = Auftrag abbrechen
+export-view-files = Dateien anzeigen
+export-new-heading = Neuer Export
+export-no-subjects = Noch nichts zu exportieren — lege zuerst eine ViewDefinition an.
+export-format = Ausgabeformat
+export-start = Export starten
+files-job-heading = Exportauftrag
+files-load = Manifest laden
+files-error = Das Manifest konnte nicht geladen werden.
+files-outputs-heading = Ausgaben
+files-col-output = Ausgabe
+files-col-downloads = Downloads
+files-shard = Datei { $n }
+files-empty = Der Auftrag hat keine Ausgabedateien erzeugt.

@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ i18n.t("app-title") }}{% endblock %}</title>
+  <link rel="icon" type="image/png" href="/ui/assets/logo.png">
   <link rel="stylesheet" href="/ui/assets/app.css">
   <!-- The effective tenant for browser-issued FHIR calls (#344). -->
   <meta name="hfs-tenant" content="{{ status.tenant_id() }}">
@@ -12,16 +13,22 @@
   <script src="/ui/assets/theme.js"></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
+  <!-- The shared busy states (#679); ahead of every page script by defer's
+       document order, because page scripts call into window.hfsBusy. -->
+  <script src="/ui/assets/busy.js" defer></script>
+  <script src="/ui/assets/addbox.js" defer></script>
+  <script src="/ui/assets/dashboard.js" defer></script>
+  <script src="/ui/assets/editor-sync.js" defer></script>
 </head>
 <body class="{% block body_class %}{% endblock %}">
   <aside class="sidebar" id="sidebar">
-    <div class="brand">
+    <a class="brand" href="/ui" aria-label="{{ i18n.t("app-title") }} hfs v{{ status.version }} — {{ i18n.t("nav-home") }}">
       <img class="brand__logo" src="/ui/assets/logo.png" alt="">
       <div class="brand__text">
         <span class="brand__name">{{ i18n.t("app-title") }}</span>
         <span class="brand__version">hfs v{{ status.version }}</span>
       </div>
-    </div>
+    </a>
 
     <!--
       Tenant selector (#344). A <details> disclosure — works without
@@ -30,6 +37,7 @@
       lazily fetched from the registry by htmx when the menu first opens; with
       JavaScript disabled the panel offers the tenant-maintenance page instead.
     -->
+    {% if status.show_tenant_picker() %}
     <details class="menu">
       <summary class="selector">
         <span class="avatar">{{ status.tenant_initials() }}</span>
@@ -49,6 +57,7 @@
         </div>
       </div>
     </details>
+    {% endif %}
 
     <hr class="divider">
 
@@ -69,64 +78,96 @@
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-resources") }}</span>
       </a>
-      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-compartments") }}">
-        <span class="icon">{% include "icons/compartments.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-compartments") }}</span>
-      </a>
-
       <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-batch-transaction") }}">
+      <a class="nav-item" href="/ui/batch"{% if active_page == "batch" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-batch-transaction") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-batch-transaction") }}</span>
-      </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-import") }}">
+      </a>
+      <a class="nav-item" href="/ui/bulk-import"{% if active_page == "bulk-import" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-import") }}">
         <span class="icon">{% include "icons/import.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-import") }}</span>
-      </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-export") }}">
+      </a>
+      <a class="nav-item" href="/ui/bulk-export"{% if active_page == "bulk-export" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-export") }}">
         <span class="icon">{% include "icons/export.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-export") }}</span>
-      </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-sql-on-fhir") }}">
+      </a>
+      <!--
+        SQL on FHIR (#649): its own top-level section, a peer of Work / Batch &
+        Data / Server, replacing the single dead placeholder that used to sit
+        inside Batch & Data. Every child is a real route — the pages behind
+        them arrive in follow-up changes, starting with the ViewDefinition
+        Editor. The child is labeled "SQL Export" (not "Export") because the
+        sidebar already carries Batch & Data's FHIR Bulk Data Export, a
+        different operation.
+      -->
+      <div class="nav__section">{{ i18n.t("nav-section-sql-on-fhir") }}</div>
+      <a class="nav-item" href="/ui/sql/view-definitions"{% if active_page == "sql-view-definitions" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-sql-view-definitions") }}">
         <span class="icon">{% include "icons/grid.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-sql-on-fhir") }}</span>
-      </span>
+        <span class="nav-item__label">{{ i18n.t("nav-sql-view-definitions") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/sql/queries"{% if active_page == "sql-queries" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-sql-queries") }}">
+        <span class="icon">{% include "icons/code.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-sql-queries") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/sql/views"{% if active_page == "sql-views" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-sql-views") }}">
+        <span class="icon">{% include "icons/layers-platforms.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-sql-views") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/sql/export"{% if active_page == "sql-export" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-sql-export") }}">
+        <span class="icon">{% include "icons/export.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-sql-export") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/sql/files"{% if active_page == "sql-files" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-sql-files") }}">
+        <span class="icon">{% include "icons/copy.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-sql-files") }}</span>
+      </a>
 
       <div class="nav__section">{{ i18n.t("nav-section-server") }}</div>
       <a class="nav-item" href="/ui/tenants"{% if active_page == "tenants" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-tenants") }}">
         <span class="icon">{% include "icons/building.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-tenants") }}</span>
       </a>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-capability-conformance") }}">
+      <a class="nav-item" href="/ui/capability-statement"{% if active_page == "capability-statement" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-capability-conformance") }}">
         <span class="icon">{% include "icons/shield.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-capability-conformance") }}</span>
-      </span>
+      </a>
       <a class="nav-item" href="/ui/search-parameters"{% if active_page == "search-parameters" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-search-parameters") }}">
         <span class="icon">{% include "icons/search.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-search-parameters") }}</span>
       </a>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-admin-ops") }}">
-        <span class="icon">{% include "icons/sliders.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-admin-ops") }}</span>
-      </span>
+      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-compartments") }}">
+        <span class="icon">{% include "icons/compartments.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-compartments") }}</span>
+      </a>
 
-      <div class="nav__section">{{ i18n.t("nav-section-conditional") }}</div>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-terminology") }}">
+      <div class="nav__section">{{ i18n.t("nav-section-tools") }}</div>
+      {% if let Some(url) = status.terminology_url() %}
+      <a class="nav-item" href="{{ url }}" target="_blank" rel="noopener noreferrer" hx-boost="false"
+         aria-label="{{ i18n.t("nav-terminology-new-window") }}" title="{{ i18n.t("nav-terminology-new-window") }}">
         <span class="icon">{% include "icons/book.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
-      </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-subscriptions") }}">
+      </a>
+      {% else %}
+      <a class="nav-item" href="/ui/terminology"{% if active_page == "terminology" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-terminology") }}">
+        <span class="icon">{% include "icons/book.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
+      </a>
+      {% endif %}
+      <!-- Visible only when the subscriptions engine is advertised (#580). -->
+      {% if status.subscriptions_enabled() %}
+      <a class="nav-item" href="/ui/subscriptions"{% if active_page == "subscriptions" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-subscriptions") }}">
         <span class="icon">{% include "icons/sync.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-subscriptions") }}</span>
-      </span>
+      </a>
+      {% endif %}
     </nav>
 
     <!--
       FHIR version selector (#343). A <details> disclosure like the tenant
-      selector, so it works without JavaScript. The label is the server's
-      default version; each option re-loads the current page with `?version=` —
-      the pages with a version dimension (SearchParameters, Compartments)
-      switch, the rest ignore it.
+      selector, so it works without JavaScript. The label is the effective
+      version for this request — the user's stored choice when one is set,
+      else the server default (#553); each option POSTs /ui/version to
+      persist a new choice and reloads the current page.
     -->
     <div class="sidebar__foot">
       <details class="menu menu--up">
@@ -165,16 +206,9 @@
   <div class="pane">
     <header class="topbar">
       <div class="topbar__tools">
-        <!--
-          Language switcher: real links, so it works without JavaScript. ?lang=
-          overrides the negotiated locale and the middleware persists the choice
-          in the hfs_lang cookie (see crates/ui/src/i18n.rs).
-        -->
-        <nav class="lang-switcher" aria-label="{{ i18n.t("language-label") }}">
-          <a href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %}>{{ i18n.t("language-en") }}</a>
-          <a href="?lang=es"{% if i18n.lang() == "es" %} aria-current="true"{% endif %}>{{ i18n.t("language-es") }}</a>
-          <a href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %}>{{ i18n.t("language-de") }}</a>
-        </nav>
+        <!-- The theme toggle stays in the topbar (#725): it is a one-click,
+             instant-feedback control, and a click deeper behind the menu
+             would slow the most common visit-time adjustment. -->
         <div class="theme-toggle" role="group" aria-label="{{ i18n.t("theme-label") }}">
           <button type="button" data-set-theme="light" aria-label="{{ i18n.t("theme-light") }}">
             {% include "icons/sun.svg" %}
@@ -183,12 +217,61 @@
             {% include "icons/moon.svg" %}
           </button>
         </div>
-        <span class="topbar__avatar">K</span>
+
+        <!--
+          The user menu (#725): identity, language, and session actions behind
+          the avatar — a <details> disclosure like the tenant (#344) and
+          version (#343) selectors, so it works without JavaScript. The
+          language options are real ?lang= links; the middleware persists the
+          choice in the hfs_lang cookie (see crates/ui/src/i18n.rs).
+
+          Avatar fallback chain: IdP photo → initials → generic user icon.
+          /ui has no signed-in principal yet (#320), so today the icon and
+          the local-operator row render; the other states are wired to
+          Status::user_* and light up when the login flow and the claim
+          inventory (#724) land.
+        -->
+        <details class="menu menu--user">
+          <summary class="topbar__avatar" aria-label="{{ i18n.t("user-menu-label") }}">
+            {% if let Some(photo) = status.user_photo() %}
+            <img class="topbar__avatar-img" src="{{ photo }}" alt="">
+            {% else %}
+            {% if let Some(initials) = status.user_initials() %}{{ initials }}{% else %}<span class="icon">{% include "icons/user.svg" %}</span>{% endif %}
+            {% endif %}
+          </summary>
+          <!-- Account-card layout (#725, proposal B): centered identity,
+               language as a segmented row, Sign out full width. -->
+          <div class="menu__panel menu__panel--right">
+            <div class="user-menu__id">
+              <span class="user-menu__avatar" aria-hidden="true">
+                {% if let Some(photo) = status.user_photo() %}
+                <img class="topbar__avatar-img" src="{{ photo }}" alt="">
+                {% else %}
+                {% if let Some(initials) = status.user_initials() %}{{ initials }}{% else %}<span class="icon">{% include "icons/user.svg" %}</span>{% endif %}
+                {% endif %}
+              </span>
+              <div class="user-menu__name">{% if let Some(name) = status.user_display() %}{{ name }}{% else %}{{ i18n.t("user-local") }}{% endif %}</div>
+              <div class="user-menu__hint">{% if let Some(secondary) = status.user_secondary() %}{{ secondary }}{% else %}{{ i18n.t("user-local-hint") }}{% endif %}</div>
+            </div>
+            <div class="menu__heading">{{ i18n.t("language-label") }}</div>
+            <div class="user-menu__seg">
+              <a href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-en") }}">EN</a>
+              <a href="?lang=es"{% if i18n.lang() == "es" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-es") }}">ES</a>
+              <a href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-de") }}">DE</a>
+            </div>
+            {% if status.user_can_logout() %}
+            <a class="user-menu__out" href="/ui/logout">
+              <span class="icon">{% include "icons/logout.svg" %}</span> {{ i18n.t("user-logout") }}
+            </a>
+            {% endif %}
+          </div>
+        </details>
       </div>
     </header>
     <main class="content{% block content_class %}{% endblock %}">
       {% block content %}{% endblock %}
     </main>
   </div>
+  <script src="/ui/assets/json-view.js" defer></script>
 </body>
 </html>

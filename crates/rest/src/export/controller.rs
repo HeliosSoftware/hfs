@@ -11,49 +11,43 @@ pub type JobId = String;
 
 /// A single named ViewDefinition to be run as part of an export job.
 ///
-/// Per the SQL-on-FHIR v2 spec, `$viewdefinition-export` accepts `view` 1..*,
-/// each with an optional `name` plus either `viewResource` or `viewReference`.
-/// The kickoff handler resolves references and packages each view here.
+/// `$sql-export` accepts `subject` 1..*, each with an optional `name` plus one
+/// of `subjectCanonical`, `subjectReference` or `subjectResource`. The kick-off
+/// handler resolves the subject and packages each view here.
 #[derive(Debug, Clone)]
 pub struct NamedView {
-    /// `view.name` from the spec — drives `output.name` in the manifest.
+    /// `subject.name` from the spec — drives `output.name` in the manifest.
     pub name: String,
     /// The resolved ViewDefinition JSON.
     pub view: Value,
 }
 
-/// One table source for a SQL query export: a resolved ViewDefinition that is
-/// materialized under `label` for the SQL to query against. Table sources do
-/// not produce their own `output` entries in the manifest.
-#[derive(Debug, Clone)]
-pub struct SqlTableSource {
-    /// Table alias the SQL references (the `relatedArtifact.label`).
-    pub label: String,
-    /// The resolved ViewDefinition JSON.
-    pub view: Value,
-}
-
-/// A single named SQL query to be run as part of a `$sqlquery-export` job.
+/// A single named SQL query to be run as part of a `$sql-export` job.
 ///
-/// The kickoff handler resolves the Library and its `depends-on`
-/// ViewDefinitions, validates the SQL, and binds `Library.parameter` values
-/// before submitting, so the background job only materializes and executes.
+/// The kickoff handler resolves the Library's full dependency graph (Phase 1
+/// of the two-phase resolver in `crate::handlers::sof::graph` — every
+/// ViewDefinition and SQLView Library it reaches, at any depth), validates
+/// the SQL, and binds `Library.parameter` values before submitting, so the
+/// background job only materializes the plan (Phase 2) and executes.
 #[derive(Debug, Clone)]
 pub struct NamedSqlQuery {
-    /// `query.name` from the spec — drives `output.name` in the manifest.
+    /// `subject.name` from the spec — drives `output.name` in the manifest.
     pub name: String,
     /// The validated (SELECT-only) SQL text from the Library.
     pub sql: String,
-    /// Resolved table sources, in `relatedArtifact` declaration order.
-    pub tables: Vec<SqlTableSource>,
+    /// The subject's fully-resolved dependency graph, ready for Phase 2
+    /// materialization. Not part of the crate's public API — the plan
+    /// structure is an internal contract between the kickoff handler and the
+    /// background export worker.
+    pub(crate) plan: crate::handlers::sof::graph::GraphPlan,
     /// Bound `Library.parameter` values for the SQL's `:name` placeholders.
     pub bindings: Vec<helios_sof::sqlquery::BoundParam>,
 }
 
-/// Execution caps for SQL query export work. Mirrors the `$sqlquery-run`
+/// Execution caps for SQL query export work. Mirrors the `$sql-run`
 /// server configuration so exports and synchronous runs enforce the same
 /// resource limits.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SqlExportLimits {
     /// Maximum rows materialized per depends-on ViewDefinition.
     pub max_source_rows_per_vd: usize,
@@ -63,27 +57,44 @@ pub struct SqlExportLimits {
     pub timeout_secs: u64,
 }
 
-/// The work an export job performs — one variant per kick-off operation.
-#[derive(Debug, Clone)]
-pub enum ExportWork {
-    /// `$viewdefinition-export`: run each named ViewDefinition. Spec is
-    /// `1..*`; running produces one or more output entries per view in the
-    /// manifest.
-    Views(Vec<NamedView>),
-    /// `$sqlquery-export`: materialize each query's table sources and run
-    /// its SQL. One or more output entries per query in the manifest.
-    SqlQueries {
-        /// The set of (named) queries to run. Spec is `1..*`.
-        queries: Vec<NamedSqlQuery>,
-        /// Execution caps shared by every query in the job.
-        limits: SqlExportLimits,
-    },
+/// The work an export job performs.
+///
+/// `$sql-export` takes a repeating `subject` parameter carrying "any mixture of
+/// ViewDefinitions, SQLQuery Libraries and SQLView Libraries", so one job holds
+/// both kinds rather than one kind per job. That mixture is the point of the
+/// operation: every subject is computed against a single snapshot of the data,
+/// so a view output and a query output can be joined on a shared key without a
+/// skew window — which two separate jobs, seeing the data at two different
+/// moments, cannot offer.
+#[derive(Debug, Clone, Default)]
+pub struct ExportWork {
+    /// ViewDefinition subjects. Each produces one output entry in the manifest.
+    pub views: Vec<NamedView>,
+    /// SQLQuery / SQLView Library subjects. Each produces one output entry.
+    pub queries: Vec<NamedSqlQuery>,
+    /// Execution caps shared by every query in the job. Ignored when
+    /// [`queries`](Self::queries) is empty.
+    pub limits: SqlExportLimits,
+}
+
+impl ExportWork {
+    /// Total number of subjects, which is also the number of `output` entries
+    /// the manifest will carry.
+    pub fn subject_count(&self) -> usize {
+        self.views.len() + self.queries.len()
+    }
+
+    /// Whether the job names no subjects at all. `subject` is `1..*`, so a
+    /// request that produces this is rejected with `400 Bad Request`.
+    pub fn is_empty(&self) -> bool {
+        self.subject_count() == 0
+    }
 }
 
 /// Input task for a new export job.
 #[derive(Debug, Clone)]
 pub struct ExportTask {
-    /// The work to perform (views or SQL queries).
+    /// The subjects to compute, in any mixture of views and queries.
     pub work: ExportWork,
     /// Tenant that owns this export.
     pub tenant: TenantContext,
@@ -236,5 +247,11 @@ pub trait ExportJobController: Send + Sync + 'static {
     ///
     /// Returns `None` if `tenant_id` does not match the submitting tenant, or if
     /// the sink fails to produce a URL (e.g. an S3 pre-signing error).
-    fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String>;
+    fn download_url(
+        &self,
+        tenant_id: &str,
+        public_base_url: &str,
+        job_id: &str,
+        filename: &str,
+    ) -> Option<String>;
 }

@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Downloads](https://pepy.tech/badge/pysof)](https://pepy.tech/project/pysof)
 
-**High-performance FHIR data transformation for Python.** Transform FHIR resources into tabular formats (CSV, JSON, Parquet) using declarative ViewDefinitions from the [SQL on FHIR specification](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/).
+**High-performance FHIR data transformation for Python.** Transform FHIR resources into tabular formats (CSV, JSON, Parquet) using declarative ViewDefinitions from the [SQL on FHIR specification](http://hl7.org/fhir/uv/sql-on-fhir/).
 
 Built in Rust for speed, exposed to Python with a simple, Pythonic API. Part of the [Helios FHIR Server](https://github.com/HeliosSoftware/hfs) project.
 
@@ -17,7 +17,8 @@ Built in Rust for speed, exposed to Python with a simple, Pythonic API. Part of 
 - 📦 **Streaming Support**: Memory-efficient chunked processing for large NDJSON files
 - 🌐 **Multi-Version FHIR**: Supports R4, R4B, R5, and R6 (based on build features)
 - 🎯 **Type-Safe**: Leverages Rust's type safety with a Pythonic interface
-- ⚡ **GIL-Free**: Python GIL released during processing for true parallelism
+- ⚡ **GIL-Friendly**: the GIL is released during parsing and processing, so other Python threads stay responsive
+- 📨 **Flexible Input**: ViewDefinitions and Bundles as Python dicts or pre-serialized JSON (`str`/`bytes`)
 
 ## 🎯 Why pysof?
 
@@ -285,18 +286,46 @@ pysof automatically processes FHIR resources in parallel using rayon:
 - **5-7x speedup** on typical batch workloads with multi-core CPUs
 - **Streaming benefits**: `ChunkedProcessor` and `process_ndjson_to_file` also use parallel processing
 - **Zero configuration** - parallelization is always enabled
-- **Python GIL released** during processing for true parallel execution
+- **Python GIL released** during parsing and processing, so other Python threads stay responsive
+
+Because each call already fans out across all cores via rayon's shared thread
+pool, running pysof from multiple Python threads does **not** multiply
+throughput — one call can saturate the machine. Use Python threads for
+concurrency (overlapping I/O, serving requests), not to speed up transforms.
+
+### Pass Pre-Serialized JSON for Maximum Speed
+
+If your data is already JSON text (from a file, an HTTP body, a database), pass
+the `str` or `bytes` directly instead of `json.loads`-ing it first:
+
+```python
+view_json: str = load_view_definition_text()
+bundle_json: bytes = fetch_bundle_bytes()
+
+result = pysof.run_view_definition(view_json, bundle_json, "csv")
+```
+
+This skips the Python-dict conversion entirely and parses the JSON with the
+GIL released — measured 20-27% faster per call on large bundles, with GIL hold
+time dropping from tens of milliseconds to microseconds.
 
 ### Performance Benchmarks
 
-| Mode | Dataset | Time | Memory | Notes |
-|------|---------|------|--------|-------|
-| **Batch** | 10k Patients | ~2.7s | 1.6 GB | All resources in memory |
-| **Streaming** | 10k Patients | ~0.9s | 45 MB | 35x less memory, 2.9x faster |
-| **Batch** | 93k Encounters | ~4s | 3.9 GB | All resources in memory |
-| **Streaming** | 93k Encounters | ~2.8s | 25 MB | 155x less memory, 1.4x faster |
+Measured with `scripts/bench_threading.py` (a 7-column Patient ViewDefinition;
+Windows 11, 12 logical CPUs, Python 3.11, release build with mimalloc):
 
-Streaming mode (`ChunkedProcessor`, `process_ndjson_to_file`) is recommended for large NDJSON files.
+| Path | Dataset | Throughput |
+|------|---------|-----------|
+| **Batch** (dict input) | 2,000-patient bundle | ~28k patients/sec |
+| **Batch** (JSON `str` input) | 2,000-patient bundle | ~31k patients/sec |
+| **Streaming** (`process_ndjson_to_file`) | 5,000-patient NDJSON | ~31k patients/sec |
+
+Numbers vary with hardware and ViewDefinition complexity — re-run
+`scripts/bench_threading.py` on your target machine.
+
+Streaming mode (`ChunkedProcessor`, `process_ndjson_to_file`) keeps memory
+bounded by `chunk_size` regardless of input size, so it is recommended for
+large NDJSON files; batch mode holds the whole bundle and result in memory.
 
 ### Controlling Thread Count (RAYON_NUM_THREADS)
 

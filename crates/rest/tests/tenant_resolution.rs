@@ -386,6 +386,29 @@ mod combined_mode {
         let impl_url = body["implementation"]["url"].as_str().unwrap();
         assert_eq!(impl_url, "http://localhost:8080");
     }
+
+    #[cfg(feature = "subscriptions")]
+    #[tokio::test]
+    async fn websocket_namespace_is_reachable_by_header_and_url_path() {
+        let config = MultitenancyConfig {
+            routing_mode: TenantRoutingMode::Both,
+            ..Default::default()
+        };
+        let (server, _backend) = create_test_server(config).await;
+
+        for path in ["/ws/subscriptions/bind", "/acme/ws/subscriptions/bind"] {
+            let mut request = server.get(path);
+            if path.starts_with("/ws/") {
+                request = request.add_header(X_TENANT_ID, HeaderValue::from_static("acme"));
+            }
+
+            // Without upgrade headers, reaching the WebSocket extractor
+            // deterministically yields 400 in this in-process test transport.
+            // A namespace misclassified as tenant falls through to a FHIR read
+            // route and returns 404 instead.
+            assert_eq!(request.await.status_code(), StatusCode::BAD_REQUEST);
+        }
+    }
 }
 
 // =============================================================================

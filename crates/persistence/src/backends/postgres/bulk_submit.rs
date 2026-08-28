@@ -504,6 +504,7 @@ impl BulkSubmitProvider for PostgresBackend {
             total_entries: 0,
             processed_entries: 0,
             failed_entries: 0,
+            lease_expiry: None,
         })
     }
 
@@ -518,7 +519,7 @@ impl BulkSubmitProvider for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries
+                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry
                  FROM bulk_manifests
                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
                 &[
@@ -543,6 +544,7 @@ impl BulkSubmitProvider for PostgresBackend {
         let total: i32 = row.get(4);
         let processed: i32 = row.get(5);
         let failed: i32 = row.get(6);
+        let lease_expiry: Option<chrono::DateTime<Utc>> = row.get(7);
 
         let status: ManifestStatus = status_str
             .parse()
@@ -557,6 +559,7 @@ impl BulkSubmitProvider for PostgresBackend {
             total_entries: total as u64,
             processed_entries: processed as u64,
             failed_entries: failed as u64,
+            lease_expiry,
         }))
     }
 
@@ -685,14 +688,21 @@ impl BulkSubmitProvider for PostgresBackend {
                 error_count += 1;
             }
 
-            self.store_entry_result(tenant, submission_id, manifest_id, &entry_result)
-                .await?;
+            self.store_entry_result(
+                tenant,
+                submission_id,
+                manifest_id,
+                options.file_url.as_deref().unwrap_or(""),
+                &entry_result,
+            )
+            .await?;
 
             results.push(entry_result);
         }
 
-        // Update manifest counts
+        // Update manifest counts, on a fresh client for the tail statements.
         let now = Utc::now();
+        let client = self.get_client().await?;
         client
             .execute(
                 "UPDATE bulk_manifests SET
@@ -956,6 +966,7 @@ impl PostgresBackend {
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
+        file_url: &str,
         result: &BulkEntryResult,
     ) -> StorageResult<()> {
         let client = self.get_client().await?;
@@ -965,14 +976,24 @@ impl PostgresBackend {
 
         client
             .execute(
+                // Upsert: the worker re-fetches a whole file after a transient
+                // failure, and the retry must overwrite its own earlier rows
+                // instead of colliding with them (#457).
                 "INSERT INTO bulk_entry_results
-                 (tenant_id, submitter, submission_id, manifest_id, line_number, resource_type, resource_id, created, outcome, operation_outcome)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                 (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url, line_number)
+                 DO UPDATE SET resource_type = EXCLUDED.resource_type,
+                               resource_id = EXCLUDED.resource_id,
+                               created = EXCLUDED.created,
+                               outcome = EXCLUDED.outcome,
+                               operation_outcome = EXCLUDED.operation_outcome",
                 &[
                     &tenant_id,
                     &submission_id.submitter.as_str(),
                     &submission_id.submission_id.as_str(),
                     &manifest_id,
+                    &file_url,
                     &(result.line_number as i32),
                     &result.resource_type.as_str(),
                     &result.resource_id,
@@ -1323,14 +1344,14 @@ impl SubmitClaimStrategy for PostgresBackend {
             manifest_id,
             worker_id: worker_id.clone(),
             lease_expiry,
+            lease_duration,
             fencing_token: new_token as u64,
         }))
     }
 
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
         let client = self.get_client().await.map_err(LeaseError::Storage)?;
-        let now = Utc::now();
-        let new_expiry = now + chrono::Duration::seconds(60);
+        let new_expiry = lease.renewed_expiry();
         let affected = client
             .execute(
                 "UPDATE bulk_manifests SET lease_expiry = $1

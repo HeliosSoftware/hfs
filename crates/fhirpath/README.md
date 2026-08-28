@@ -263,7 +263,7 @@ The SQL on FHIR specification leverages FHIRPath to define flattened tabular vie
 ```
 
 **Relevant Specification Link:**
-- [SQL on FHIR](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/)
+- [SQL on FHIR](http://hl7.org/fhir/uv/sql-on-fhir/)
 
 ## Features Implemented
 

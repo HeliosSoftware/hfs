@@ -57,6 +57,7 @@ const EXEMPT_PATHS: &[&str] = &[
     "/_liveness",
     "/_readiness",
     "/.well-known/smart-configuration",
+    "/.well-known/bulk-submit-jwks.json",
     "/$versions",
 ];
 
@@ -383,7 +384,7 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
     //
     // This MUST stay an explicit allowlist. Returning None for *any* $-suffixed
     // path would silently remove the only authorization check from every
-    // SQL-on-FHIR operation ($viewdefinition-run, $sqlquery-run, and their
+    // SQL-on-FHIR operation ($sql-run, $sql-run, and their
     // -export variants) and the subscription operations — none of which run a
     // handler-level scope check. That would let any authenticated token execute
     // arbitrary ViewDefinitions and SQL.
@@ -820,17 +821,17 @@ mod tests {
     #[test]
     fn test_sof_and_subscription_ops_still_require_scope() {
         assert_eq!(
-            extract_operation("/ViewDefinition/$viewdefinition-run", "POST"),
+            extract_operation("/ViewDefinition/$sql-run", "POST"),
             Some(("ViewDefinition".to_string(), FhirOperation::Create)),
             "SQL-on-FHIR run must still be scope-checked by the middleware"
         );
         assert_eq!(
-            extract_operation("/Library/$sqlquery-run", "POST"),
+            extract_operation("/Library/$sql-run", "POST"),
             Some(("Library".to_string(), FhirOperation::Create)),
             "SQL query run must still be scope-checked by the middleware"
         );
         assert_eq!(
-            extract_operation("/ViewDefinition/123/$viewdefinition-export", "POST"),
+            extract_operation("/ViewDefinition/123/$sql-export", "POST"),
             Some(("ViewDefinition".to_string(), FhirOperation::Create)),
         );
         assert!(

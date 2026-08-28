@@ -1,28 +1,52 @@
 {% extends "layouts/base.html" %}
 
 {% block content %}
-<h1 class="page-title">{{ i18n.t("nav-home") }}</h1>
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("nav-home") }}</h1>
+</section>
 
-<section class="stat-grid">
+<section class="stat-grid stat-grid--5">
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("card-resource-types") }}</span>
     <span class="stat__value">{{ metrics.resource_types }}</span>
-    <span class="stat__sub">{{ i18n.t_arg("card-resource-types-sub", "version", metrics.fhir_version.to_string()) }}</span>
+    {# The effective request version, same source as the sidebar selector —
+       never the snapshot's boot-time default (#553). #}
+    <span class="stat__sub">{{ i18n.t_arg("card-resource-types-sub", "version", status.fhir_version_label().to_string()) }}</span>
   </article>
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("card-stored-resources") }}</span>
     <span class="stat__value">{{ metrics.stored_resources }}</span>
     <span class="stat__sub">{{ i18n.t("card-stored-resources-sub") }}</span>
   </article>
-  <article class="card stat">
+  <a class="card stat stat--link" href="/ui/bulk-export">
     <span class="stat__label">{{ i18n.t("card-export-jobs") }}</span>
-    <span class="stat__value">{{ metrics.export_jobs }}</span>
-    <span class="stat__sub">{{ i18n.t_arg("card-export-jobs-sub", "queued", metrics.export_jobs_queued) }}</span>
-  </article>
+    {% if let Some(jobs) = metrics.export_jobs %}
+    <span class="stat__value">{{ jobs.running }}</span>
+    <span class="stat__sub">{{ i18n.t_arg("card-export-jobs-sub", "queued", jobs.queued) }}</span>
+    {% else %}
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("card-jobs-unavailable") }}">&mdash;</span>
+    <span class="stat__sub">{{ i18n.t("card-jobs-unavailable") }}</span>
+    {% endif %}
+  </a>
+  <a class="card stat stat--link" href="/ui/bulk-import">
+    <span class="stat__label">{{ i18n.t("card-import-jobs") }}</span>
+    {% if let Some(active) = metrics.import_jobs %}
+    <span class="stat__value">{{ active }}</span>
+    <span class="stat__sub">{{ i18n.t("card-import-jobs-sub") }}</span>
+    {% else %}
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("card-jobs-unavailable") }}">&mdash;</span>
+    <span class="stat__sub">{{ i18n.t("card-jobs-unavailable") }}</span>
+    {% endif %}
+  </a>
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("card-uptime") }}</span>
-    <span class="stat__value">{{ metrics.uptime_percent }}<span class="stat__unit">%</span></span>
+    {% if let Some(uptime) = metrics.uptime %}
+    <span class="stat__value">{{ uptime }}</span>
     <span class="stat__sub">{{ i18n.t("card-uptime-sub") }}</span>
+    {% else %}
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("card-jobs-unavailable") }}">&mdash;</span>
+    <span class="stat__sub">{{ i18n.t("card-jobs-unavailable") }}</span>
+    {% endif %}
   </article>
 </section>
 
@@ -31,12 +55,12 @@
     <div>
       <span class="stat__label">{{ i18n.t("chart-title") }}</span>
       <span class="stat__value">{{ metrics.chart_total }}</span>
-      <span class="stat__sub">{{ chart.selected_type }}</span>
+      <span class="stat__sub">{{ chart.types_label }}</span>
     </div>
     <div class="chart-card__tools">
       <!--
         Time-window selector. Each option is a plain link that re-renders the page
-        with the chart sampled over that window (keeping the charted type), so it
+        with the chart sampled over that window (keeping the charted set), so it
         works without JavaScript. Window spans and bucket widths are paired in
         helios_observability::dashboard::DashboardWindow.
       -->
@@ -49,51 +73,162 @@
         >{{ w.label }}</a>
         {% endfor %}
       </nav>
-      <span class="pill">
-        <span class="icon">{% include "icons/layers-platforms.svg" %}</span>
-        {{ chart.selected_type }}
-        <span class="icon">{% include "icons/chevron-down.svg" %}</span>
-      </span>
-      <button type="button" class="pill pill--square" aria-label="{{ i18n.t("chart-expand") }}">
-        <span class="icon">{% include "icons/expand.svg" %}</span>
-      </button>
+      <!--
+        The type picker (#555, mockup resPick): every stored type, as checkbox
+        rows. Each option is a plain link that toggles the type in or out of
+        the charted set — the same progressive-enhancement contract as the
+        window selector.
+      -->
+      <details class="menu chart-pick">
+        <!-- The aria-label keeps the summary named even when pick_label is
+             empty (a backend with no count read path offers zero types). -->
+        <summary class="pill" aria-label="{{ i18n.t("chart-pick-heading") }}">
+          <span class="icon">{% include "icons/layers-platforms.svg" %}</span>
+          {{ chart.pick_label }}
+          <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+        </summary>
+        <div class="menu__panel menu__panel--right">
+          <div class="menu__heading">{{ i18n.t("chart-pick-heading") }}</div>
+          <!--
+            "View all resources" (#599): with no JS, a plain link back to `/ui`
+            with `?all=1` toggled, so a type with no data can still be picked
+            (and charts as a flat zero line). Same checkbox-row styling as the
+            options below, rendered as a link with `aria-pressed` rather than
+            a real `<input type="checkbox">` since it has no enclosing form.
+          -->
+          <a class="menu__option chart-pick__option chart-pick__option--all{% if all_types %} chart-pick__option--on{% endif %}"
+             href="{{ all_types_href }}" aria-pressed="{% if all_types %}true{% else %}false{% endif %}">
+            <span class="chart-pick__box" aria-hidden="true">{% if all_types %}✓{% endif %}</span>
+            <span class="chart-pick__name">{{ i18n.t("chart-pick-all") }}</span>
+          </a>
+          <div class="menu__search">
+            <input type="search" placeholder="{{ i18n.t("chart-pick-filter") }}"
+                   aria-label="{{ i18n.t("chart-pick-filter") }}" data-pick-filter>
+          </div>
+          <div class="chart-pick__list">
+            {% if picker.is_empty() %}
+            <p class="chart-pick__none">{{ i18n.t("chart-empty") }}</p>
+            {% endif %}
+            {% for option in picker %}
+            <a class="menu__option chart-pick__option{% if option.selected %} chart-pick__option--on{% endif %}"
+               href="{{ option.href }}" data-pick-name="{{ option.resource_type }}">
+              <span class="chart-pick__box" aria-hidden="true">{% if option.selected %}✓{% endif %}</span>
+              <span class="chart-pick__name">{{ option.resource_type }}</span>
+              <span class="chart-pick__count">{{ option.total }}</span>
+            </a>
+            {% endfor %}
+          </div>
+        </div>
+      </details>
     </div>
   </header>
 
+  {% if sample_data %}
+  <p class="notice notice--warn">{{ i18n.t("chart-sample-note") }}</p>
+  {% endif %}
+
+  {% if !chart.has_data %}
+  <div class="chart-empty">{{ i18n.t("chart-empty") }}</div>
+  {% else %}
   <!--
-    Server-rendered from the live per-type cumulative counts (default tenant),
+    Server-rendered from the live per-type cumulative counts (active tenant),
     supplied via helios_observability::dashboard. Axis geometry is computed in
-    the handler; see crates/ui/src/lib.rs::build_chart.
+    the handler; see crates/ui/src/lib.rs::build_chart. The wrapper hosts the
+    tooltip (assets/dashboard.js) — a hover readout layered on top; the chart
+    is complete without it.
   -->
-  <svg class="chart" viewBox="0 0 1060 300" role="img" aria-hidden="true">
-    {% for tick in chart.y_ticks %}
-    <line class="grid-line" x1="40" y1="{{ tick.pos }}" x2="1060" y2="{{ tick.pos }}" />
-    <text class="axis-label" x="0" y="{{ tick.label_y }}">{{ tick.label }}</text>
-    {% endfor %}
-    {% if chart.has_data %}
-    <polyline class="series" points="{{ chart.polyline }}" />
-    {% endif %}
-    {% for tick in chart.x_ticks %}
-    <text class="axis-label" x="{{ tick.pos }}" y="{{ tick.label_y }}">{{ tick.label }}</text>
-    {% endfor %}
-  </svg>
+  <div class="chart-wrap" id="chart-wrap">
+    <!-- role=group, not img: the plotted lines are focus links (#602), and
+         an image must not contain interactive controls (axe
+         nested-interactive). The name stays on the group. -->
+    <svg class="chart" viewBox="0 0 1060 {{ chart.height }}" role="group"
+         aria-label="{{ i18n.t("chart-title") }} — {{ chart.types_label }}">
+      <defs>
+        <!-- Under a legend focus the y axis fits the focused series; receded
+             series keep their true values and clip where they exceed it. -->
+        <clipPath id="chart-plot">
+          <rect x="40" y="0" width="1020" height="{{ chart.height }}" />
+        </clipPath>
+      </defs>
+      {% for tick in chart.y_ticks %}
+      <line class="grid-line" x1="40" y1="{{ tick.pos }}" x2="1060" y2="{{ tick.pos }}" />
+      <text class="axis-label" x="0" y="{{ tick.label_y }}">{{ tick.label }}</text>
+      {% endfor %}
+      {% for s in chart.series %}
+      {% if let Some(href) = s.href %}
+      <!-- The line is the same focus link as its legend entry — a native SVG
+           anchor, no script. The transparent twin widens the hit area. -->
+      <a href="{{ href }}"
+         aria-label="{{ s.resource_type }} — {% if s.focused %}{{ i18n.t("chart-unfocus-series") }}{% else %}{{ i18n.t("chart-focus-series") }}{% endif %}">
+        <polyline class="series series--{{ s.color }}{{ s.emphasis }}"
+                  data-series="{{ s.resource_type }}"
+                  clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+        <polyline class="series-hit" clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+      </a>
+      {% else %}
+      <polyline class="series series--{{ s.color }}{{ s.emphasis }}"
+                data-series="{{ s.resource_type }}"
+                clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+      {% endif %}
+      {% endfor %}
+      {% for tick in chart.x_ticks %}
+      <text class="axis-label" x="{{ tick.pos }}" y="{{ tick.label_y }}">{{ tick.label }}</text>
+      {% endfor %}
+    </svg>
+    <div class="chart-tip" id="chart-tip" hidden></div>
+  </div>
+  <script type="application/json" id="chart-data">{{ chart.tip_json|safe }}</script>
+
+  <!-- The same numbers as text: the sampled buckets, one column per series. -->
+  <details class="chart-table">
+    <summary>{{ i18n.t("chart-table-toggle") }}</summary>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>{{ i18n.t("chart-table-when") }}</th>
+            {% for s in chart.series %}<th>{{ s.resource_type }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in chart.table %}
+          <tr>
+            <td>{{ row.label }}</td>
+            {% for v in row.values %}<td class="col-num">{{ v }}</td>{% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  {% endif %}
 
   <!--
-    Legend doubles as the per-type series selector: each link re-renders the
-    page with that resource type charted (progressive enhancement — works
-    without JavaScript; htmx can swap it in a follow-up).
+    Legend: one entry per plotted series, colored to match its line. While
+    more than one series is plotted, an entry is a link that focuses that
+    series — the y axis re-fits it and the others recede (#602); clicking
+    the focused entry restores the shared view. Types are added and removed
+    through the picker above, never here.
   -->
   <ul class="chart-legend">
     {% for item in legend %}
     <li>
-      <a
-        class="chart-legend__item{% if item.active %} chart-legend__item--active{% endif %}"
-        href="{{ item.href }}"
-        {% if item.active %}aria-current="true"{% endif %}
-      >
-        <span class="chart-legend__type">{{ item.resource_type }}</span>
+      {% if let Some(href) = item.href %}
+      <a class="chart-legend__item{% if item.focused %} chart-legend__item--focused{% endif %}"
+         href="{{ href }}"
+         {% if item.focused %}aria-current="true"{% endif %}
+         title="{% if item.focused %}{{ i18n.t("chart-unfocus-series") }}{% else %}{{ i18n.t("chart-focus-series") }}{% endif %}">
+        <span class="chart-legend__dot chart-legend__dot--{{ item.color }}" aria-hidden="true"></span>
+        <span>{{ item.resource_type }}</span>
         <span class="chart-legend__total">{{ item.total }}</span>
       </a>
+      {% else %}
+      <span class="chart-legend__item chart-legend__item--active">
+        <span class="chart-legend__dot chart-legend__dot--{{ item.color }}" aria-hidden="true"></span>
+        <span>{{ item.resource_type }}</span>
+        <span class="chart-legend__total">{{ item.total }}</span>
+      </span>
+      {% endif %}
     </li>
     {% endfor %}
   </ul>

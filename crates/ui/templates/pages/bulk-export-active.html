@@ -1,0 +1,26 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("bulk-export-active-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
+
+{% block content %}
+<header class="page-head page-head--row">
+  <div>
+    <a class="back-link" href="/ui/bulk-export">‹ {{ i18n.t("bulk-export-title") }}</a>
+    <h1 class="page-head__title">{{ i18n.t("bulk-export-active-title") }}</h1>
+    <p class="page-head__lede">{{ total }} {{ i18n.t("bulk-export-exports-word") }} · {{ running }} {{ i18n.t("bulk-export-running") }}</p>
+  </div>
+  <a class="btn btn--primary" href="/ui/bulk-export">
+    <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("bulk-export-new") }}
+  </a>
+</header>
+
+{% if cards.is_empty() %}
+<div class="card notice">{{ i18n.t("bulk-export-none") }}</div>
+{% endif %}
+
+{% for card in cards %}
+{% include "partials/bulk_export_card.html" %}
+{% endfor %}
+{% endblock %}

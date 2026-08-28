@@ -21,6 +21,12 @@ use helios_persistence::core::BackendKind;
 #[path = "transactions/if_match_suite.rs"]
 mod if_match_suite;
 
+/// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
+/// verbatim with the SQLite and MongoDB suites. Declared at the top level for
+/// the same `#[path]` resolution reason as `if_match_suite` above.
+#[path = "multitenancy/tenant_id_fidelity_suite.rs"]
+mod tenant_id_fidelity_suite;
+
 /// The backend-agnostic full-text purge-completeness scenarios (issue #386),
 /// shared verbatim with the SQLite suite that owns the file.
 ///
@@ -34,6 +40,28 @@ mod if_match_suite;
 /// `if_match_suite` above.
 #[path = "search/fts_purge_suite.rs"]
 mod fts_purge_suite;
+
+/// The backend-agnostic `Resource`-level meta-parameter scenarios (#523),
+/// shared verbatim with the SQLite suite that owns the file.
+///
+/// `_source` matched nothing on every index-backed backend until the extractor
+/// stopped evaluating the spec's `Resource.meta.source` verbatim. Running one
+/// scenario on both engines is what keeps that honest — the SQLite-only
+/// `meta_params_tests.rs` from #474 cannot see an extraction bug, because a
+/// dropped filter and a correct filter over a missing index row look identical
+/// from there.
+///
+/// Declared at the top level for the same `#[path]` resolution reason as
+/// `if_match_suite` above.
+#[path = "search/meta_params_suite.rs"]
+mod meta_params_suite;
+
+/// The backend-agnostic day-precision date-boundary suite (issue #519):
+/// the #456 boundary table, which #463 fixed and pinned for SQLite only.
+/// Declared at the top level for the same `#[path]` resolution reason as
+/// `if_match_suite` above.
+#[path = "search/date_boundary_suite.rs"]
+mod date_boundary_suite;
 
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
@@ -2051,6 +2079,15 @@ mod postgres_integration {
         assert_eq!(result.resources.items[0].id(), "p1");
     }
 
+    /// The backend-agnostic meta-parameter scenario (#523), shared verbatim
+    /// with the SQLite suite that owns the file.
+    #[tokio::test]
+    async fn postgres_integration_search_by_meta_parameters() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("meta-params");
+        crate::meta_params_suite::meta_parameters_match_only_their_carrier(&backend, &tenant).await;
+    }
+
     #[tokio::test]
     async fn postgres_integration_string_search_is_accent_insensitive() {
         use helios_persistence::core::SearchProvider;
@@ -2330,8 +2367,10 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_integration_search_missing_modifier() {
         use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
         use helios_persistence::types::{
-            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+            ContainedMode, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
         };
 
         let backend = create_backend().await;
@@ -2355,6 +2394,23 @@ mod postgres_integration {
             )
             .await
             .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "container-no-gender",
+                    "contained": [{
+                        "resourceType": "Patient",
+                        "id": "contained-with-gender",
+                        "gender": "female"
+                    }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
 
         let missing = |present: &str| {
             SearchQuery::new("Patient").with_parameter(SearchParameter {
@@ -2368,13 +2424,18 @@ mod postgres_integration {
         };
 
         let result = backend.search(&tenant, &missing("true")).await.unwrap();
-        let ids: Vec<String> = result
+        let mut ids: Vec<String> = result
             .resources
             .items
             .iter()
             .map(|r| r.id().to_string())
             .collect();
-        assert_eq!(ids, vec!["no-gender"], "gender:missing=true → no-gender");
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["container-no-gender", "no-gender"],
+            "gender:missing=true must ignore gender indexed only from contained resources"
+        );
 
         let result = backend.search(&tenant, &missing("false")).await.unwrap();
         let ids: Vec<String> = result
@@ -2388,6 +2449,45 @@ mod postgres_integration {
             vec!["with-gender"],
             "gender:missing=false → with-gender"
         );
+
+        for (name, param_type) in [
+            ("_id", SearchParamType::Token),
+            ("_lastUpdated", SearchParamType::Date),
+        ] {
+            let query = |is_missing| {
+                SearchQuery::new("Patient").with_parameter(SearchParameter {
+                    name: name.to_string(),
+                    param_type,
+                    modifier: Some(SearchModifier::Missing),
+                    values: vec![SearchValue::boolean(is_missing)],
+                    chain: vec![],
+                    components: vec![],
+                })
+            };
+
+            let missing = backend.search(&tenant, &query(true)).await.unwrap();
+            assert!(missing.resources.items.is_empty(), "{name}:missing=true");
+
+            let present = backend.search(&tenant, &query(false)).await.unwrap();
+            let mut ids: Vec<&str> = present.resources.items.iter().map(|r| r.id()).collect();
+            ids.sort();
+            assert_eq!(
+                ids,
+                vec!["container-no-gender", "no-gender", "with-gender"],
+                "{name}:missing=false"
+            );
+        }
+
+        let mut contained_missing = missing("true");
+        contained_missing.contained = ContainedMode::On;
+        let error = backend
+            .search(&tenant, &contained_missing)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Search(SearchError::QueryParseError { .. })
+        ));
     }
 
     #[tokio::test]
@@ -3650,6 +3750,118 @@ mod postgres_integration {
         assert_eq!(result.resources.items[0].id(), "date-1");
     }
 
+    /// Dates carrying a negative UTC offset must index as the instant they name.
+    ///
+    /// The writer treated `2019-05-04T12:12:29-07:00` as zone-less, appended
+    /// `+00:00`, and the resulting `...-07:00+00:00` failed to parse — at which
+    /// point it silently indexed `Utc::now()`. Every date search over such a row
+    /// was then answered against the ingestion time: `gt<any past date>` matched
+    /// and `lt` did not (#494). The sibling test above uses a date-only
+    /// `birthDate`, the one shape that always worked, which is how this survived.
+    #[tokio::test]
+    async fn postgres_integration_search_date_negative_utc_offset() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        for (id, effective) in [
+            ("obs-2019", "2019-05-04T12:12:29-07:00"),
+            ("obs-2025", "2025-05-04T12:12:29-07:00"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": {"coding": [{"code": "8867-4"}]},
+                        "effectiveDateTime": effective
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let date_query = |prefix: SearchPrefix, value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "date".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        fn ids(items: &[helios_persistence::types::StoredResource]) -> Vec<String> {
+            let mut v: Vec<String> = items.iter().map(|r| r.id().to_string()).collect();
+            v.sort();
+            v
+        }
+
+        // Before the fix both rows carried the ingestion timestamp, so `gt` on a
+        // past date matched both and `lt` matched neither.
+        let after = backend
+            .search(
+                &tenant,
+                &date_query(SearchPrefix::Gt, "2023-01-01T00:00:00+00:00"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&after.resources.items),
+            vec!["obs-2025"],
+            "gt must exclude the 2019 row"
+        );
+
+        let before = backend
+            .search(
+                &tenant,
+                &date_query(SearchPrefix::Lt, "2023-01-01T00:00:00+00:00"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&before.resources.items),
+            vec!["obs-2019"],
+            "lt must find the 2019 row"
+        );
+
+        // Pin the offset arithmetic, not just parseability: 12:12:29-07:00 is
+        // 19:12:29Z, so this one-hour window brackets it. A fix that merely
+        // stripped the offset would store 12:12:29Z and fall outside.
+        let bracketed = backend
+            .search(
+                &tenant,
+                &date_query(SearchPrefix::Gt, "2019-05-04T19:00:00+00:00").with_parameter(
+                    SearchParameter {
+                        name: "date".to_string(),
+                        param_type: SearchParamType::Date,
+                        modifier: None,
+                        values: vec![SearchValue::new(
+                            SearchPrefix::Lt,
+                            "2019-05-04T20:00:00+00:00",
+                        )],
+                        chain: vec![],
+                        components: vec![],
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&bracketed.resources.items),
+            vec!["obs-2019"],
+            "-07:00 must convert to 19:12:29Z"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_search_reference() {
         use helios_persistence::core::SearchProvider;
@@ -3723,6 +3935,96 @@ mod postgres_integration {
         let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
         assert!(ids.contains(&"obs-1"));
         assert!(ids.contains(&"obs-2"));
+    }
+
+    /// A bare logical id must match a stored `Patient/<id>` reference.
+    ///
+    /// `Observation?patient=<id>` is the primary form in the spec and the shape
+    /// Inferno uses throughout, but Postgres compared the raw search value
+    /// against the stored `Patient/<id>` and so matched nothing — every clinical
+    /// search returned an empty Bundle (#490). The sibling test above covers the
+    /// `Type/id` form, which always worked; only that form was ever asserted,
+    /// which is how the gap survived.
+    #[tokio::test]
+    async fn postgres_integration_search_reference_bare_id() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        for (id, subject) in [
+            ("obs-1", "Patient/patient-1"),
+            ("obs-2", "Patient/patient-1"),
+            ("obs-3", "Patient/patient-2"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "subject": {"reference": subject},
+                        "code": {"coding": [{"code": "8867-4"}]},
+                        "status": "final"
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let bare_id = |modifier: Option<SearchModifier>| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier,
+                values: vec![SearchValue::eq("patient-1")],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        for (label, query) in [
+            ("bare id", bare_id(None)),
+            (
+                ":Type + bare id",
+                bare_id(Some(SearchModifier::Type("Patient".to_string()))),
+            ),
+        ] {
+            let result = backend.search(&tenant, &query).await.unwrap();
+            let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                vec!["obs-1", "obs-2"],
+                "{label} must match Patient/patient-1 and not the decoy patient-2"
+            );
+        }
+
+        // The suffix match must not become a wildcard: `subject=%` matches the
+        // literal id `%`, i.e. nothing, rather than every reference.
+        let wildcard = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("%")],
+            chain: vec![],
+            components: vec![],
+        });
+        assert!(
+            backend
+                .search(&tenant, &wildcard)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .is_empty(),
+            "a LIKE metacharacter must be matched literally, not as a wildcard"
+        );
     }
 
     #[tokio::test]
@@ -4655,6 +4957,13 @@ mod postgres_integration {
                 .unwrap();
         }
         assert_eq!(backend.count_active_exports(&tenant).await.unwrap(), 2);
+        assert_eq!(
+            backend
+                .count_exports_by_status(&tenant, ExportStatus::Accepted)
+                .await
+                .unwrap(),
+            2
+        );
 
         // Nothing is expired yet.
         let expired_now = backend
@@ -5255,14 +5564,6 @@ mod postgres_integration {
     }
 
     pg_if_match_test!(
-        postgres_integration_batch_put_honors_stale_if_match,
-        batch_put_honors_stale_if_match
-    );
-    pg_if_match_test!(
-        postgres_integration_batch_put_accepts_matching_if_match,
-        batch_put_accepts_matching_if_match
-    );
-    pg_if_match_test!(
         postgres_integration_multi_valued_if_match_matches_any_member,
         multi_valued_if_match_matches_any_member
     );
@@ -5273,34 +5574,6 @@ mod postgres_integration {
     pg_if_match_test!(
         postgres_integration_strong_form_if_match_matches_weak_etag,
         strong_form_if_match_matches_weak_etag
-    );
-    pg_if_match_test!(
-        postgres_integration_if_match_on_absent_resource_fails_instead_of_creating,
-        if_match_on_absent_resource_fails_instead_of_creating
-    );
-    pg_if_match_test!(
-        postgres_integration_star_if_match_requires_an_existing_resource,
-        star_if_match_requires_an_existing_resource
-    );
-    pg_if_match_test!(
-        postgres_integration_malformed_if_match_fails_closed,
-        malformed_if_match_fails_closed
-    );
-    pg_if_match_test!(
-        postgres_integration_batch_put_if_match_on_deleted_resource_fails,
-        batch_put_if_match_on_deleted_resource_fails
-    );
-    pg_if_match_test!(
-        postgres_integration_batch_delete_if_match_on_deleted_resource_fails,
-        batch_delete_if_match_on_deleted_resource_fails
-    );
-    pg_if_match_test!(
-        postgres_integration_batch_delete_honors_stale_if_match,
-        batch_delete_honors_stale_if_match
-    );
-    pg_if_match_test!(
-        postgres_integration_batch_delete_accepts_matching_if_match,
-        batch_delete_accepts_matching_if_match
     );
     pg_if_match_test!(
         postgres_integration_transaction_delete_honors_stale_if_match,
@@ -5452,6 +5725,59 @@ mod postgres_integration {
             &probe,
             &tenant,
             &reindex,
+        )
+        .await;
+    }
+
+    // ========================================================================
+    // Issue #447 — tenant-id fidelity, on a real PostgreSQL instance
+    //
+    // The #447 defect is S3's: it *derives* a key prefix from the tenant id and
+    // the derivation was many-to-one. PostgreSQL derives nothing — `tenant_id`
+    // is a `TEXT` column in each composite primary key, bound and compared with
+    // `=` — so the scoping is the identity mapping and the defect cannot occur
+    // here.
+    //
+    // That is a code reading, and a code reading is precisely what let the same
+    // defect class sit undiscovered in the two backends that *do* derive (#384
+    // on Elasticsearch, #447 on S3). So it is checked rather than asserted in
+    // prose, against a real server: bound parameters, collation, and index
+    // behaviour are properties of the engine, not of the Rust.
+    //
+    // Each test takes a unique base id — the whole binary shares one container
+    // database, and the scenarios derive fixed resource ids from it.
+    // ========================================================================
+
+    fn unique_base(label: &str) -> String {
+        format!("{}_{}", label, uuid::Uuid::new_v4().simple())
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_day_precision_date_boundaries() {
+        let backend = create_backend().await;
+        super::date_boundary_suite::day_precision_boundaries(
+            &backend,
+            &unique_base("date_boundary"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_distinct_tenant_ids_never_share_data() {
+        let backend = create_backend().await;
+        super::tenant_id_fidelity_suite::distinct_tenant_ids_never_share_data(
+            &backend,
+            &unique_base("fidelity"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_purging_one_tenant_leaves_the_look_alikes_intact() {
+        let backend = create_backend().await;
+        super::tenant_id_fidelity_suite::purging_one_tenant_leaves_the_look_alikes_intact(
+            &backend,
+            &unique_base("fidelity_purge"),
         )
         .await;
     }

@@ -1,5 +1,14 @@
 // Serde traits used in custom Deserialize implementations
 
+/// Re-export of [`erased_serde`] for the `FhirSerde` derive.
+///
+/// The derive routes every FHIR type through a type-erased `Deserializer` /
+/// `Serializer` so the generated bodies are emitted once per FHIR type rather
+/// than once per `(type, Deserializer)` / `(type, Serializer)` pair. Generated
+/// code names it as `::helios_serde_support::erased_serde::…`, which keeps the
+/// dependency in this crate instead of every crate that uses the derive.
+pub use erased_serde;
+
 /// Helper that accepts either a single value or an array when deserializing.
 ///
 /// FHIR allows most repeatable elements to appear either once or multiple times

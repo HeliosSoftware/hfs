@@ -206,32 +206,44 @@ jobs:
           SUITE=${{ matrix.suite_id }}
           echo "TEST_GROUP_ID=${SUITE}-${SUITE}_fhir_api" >> $GITHUB_ENV
 
+          # An entry here must suppress a real failure in the suite it is emitted
+          # for. Emitting an id that the suite does not contain, or one that now
+          # passes, silently swallows a future regression on that test — see #492
+          # and the "Report omissions that suppressed nothing" step below, which
+          # surfaces both cases in the job summary so this list gets pruned
+          # rather than accreting.
+
           # CapabilityStatement tests: server doesn't yet declare US Core profiles/instantiates
           OMITTED="\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-us_core_conformance_support\""
-          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-us_core_profile_support\""
-          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-us_core_instantiate\""
           # TLS test: HFS does not serve HTTPS
           OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-standalone_auth_tls\""
-          # DataAbsentReason: test data does not include DAR extensions/code systems
-          # Note: Inferno uses "us_core_311" naming for this group across all US Core versions
-          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-us_core_311_data_absent_reason-us_core_311_data_absent_reason_extension\""
-          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-us_core_311_data_absent_reason-us_core_311_data_absent_reason_code_system\""
+
+          # us_core_profile_support / us_core_instantiate do not exist in the
+          # v3.1.1 suite. They were previously emitted unconditionally, so two
+          # of the six copies matched nothing (#492).
+          case "$SUITE" in
+            us_core_v400|us_core_v501|us_core_v610|us_core_v700|us_core_v800)
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-us_core_profile_support\""
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-us_core_instantiate\""
+              ;;
+          esac
+
           # smokingstatus/simple-observation: shared test data references SNOMED CT US-edition version (731000124108) not in International Edition; Inferno validator can't resolve it.
           # The offending bundle (uscore_bundle_patient_client_test.json) is loaded for every suite, so omit across all versions.
           OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_smokingstatus-${SUITE}_smokingstatus_validation_test\""
-          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_simple_observation-${SUITE}_simple_observation_validation_test\""
+
+          # The simple_observation group is only present from v6.1.0 onward; the
+          # v3.1.1/v4.0.0/v5.0.1 copies matched nothing (#492).
+          case "$SUITE" in
+            us_core_v610|us_core_v700|us_core_v800)
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_simple_observation-${SUITE}_simple_observation_validation_test\""
+              ;;
+          esac
 
           case "$SUITE" in
             us_core_v501|us_core_v610|us_core_v700|us_core_v800)
               # ServiceRequest uses US-edition SNOMED code (467771000124109) not in International Edition; Inferno validator can't resolve it
               OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_service_request-${SUITE}_service_request_validation_test\""
-              ;;
-          esac
-
-          case "$SUITE" in
-            us_core_v610|us_core_v700|us_core_v800)
-              # No Practitioner references found in test data for these versions
-              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_practitioner-${SUITE}_practitioner_address_test\""
               ;;
           esac
 
@@ -649,6 +661,82 @@ jobs:
           fi
 
           echo "All tests passed (with $OMITTED_COUNT omitted)"
+
+      # An omission that suppresses nothing is worse than no omission: it is a
+      # test that would go red on a real regression and be swallowed instead.
+      # The list had accreted 20 such entries before #492 pruned them, and the
+      # only reason that was discoverable was a manual audit against a nightly's
+      # results. Surface both failure shapes every run so the next one is cheap:
+      #
+      #   stale  - the id ran and did not fail, so the omission changed nothing
+      #   absent - the id is not in this suite at all, so it never could
+      #
+      # Deliberately a warning, not a gate. A stale omission is not a broken
+      # build, and failing on it would make a *fixed* test turn CI red — exactly
+      # the backwards incentive that grew this list. It also cannot gate safely
+      # for another reason: the list is shared across all five backend legs, and
+      # an id that passes on one backend may still be suppressing a real failure
+      # on another. Pruning needs agreement across the matrix, which a per-job
+      # gate cannot see. The job summary can.
+      - name: Report omissions that suppressed nothing
+        if: always()
+        run: |
+          if [ ! -f inferno-results/results.json ]; then
+            echo "No results file; skipping omit-list audit"
+            exit 0
+          fi
+          # Read the file directly rather than via `echo "$RESULTS"`. The results
+          # carry `\n` inside `result_message`, and an `echo` that interprets
+          # escapes (zsh, or bash's `echo -e`) expands them mid-string and makes
+          # the JSON unparseable. Passing the filename sidesteps the question.
+          LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
+
+          STALE=$(jq -r --argjson omit "$OMITTED_TESTS" \
+            "$LATEST | .[] | select((.test_id | IN(\$omit[])) and .result != \"fail\" and .result != \"error\") | \"\(.test_id) — \(.result)\"" \
+            inferno-results/results.json)
+          ABSENT=$(jq -r --argjson omit "$OMITTED_TESTS" \
+            "[$LATEST | .[].test_id] as \$present | \$omit[] | select([.] | inside(\$present) | not)" \
+            inferno-results/results.json)
+
+          if [ -z "$STALE" ] && [ -z "$ABSENT" ]; then
+            echo "Every omitted id suppressed a real failure — nothing to prune."
+            {
+              echo "### Omit-list audit"
+              echo ""
+              echo ":white_check_mark: Every omitted id suppressed a real failure."
+            } >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          {
+            echo "### Omit-list audit — entries that suppressed nothing"
+            echo ""
+            echo "These ids are in \`OMITTED_TESTS\` but swallowed no failure in this run."
+            echo "Confirm across the other backend legs before pruning (see #492)."
+            echo ""
+          } >> $GITHUB_STEP_SUMMARY
+
+          if [ -n "$STALE" ]; then
+            echo "::warning::Omitted tests that did not fail (candidates for pruning):"
+            echo "$STALE" | sed 's/^/  /'
+            {
+              echo "**Stale — ran and did not fail:**"
+              echo ""
+              echo "$STALE" | sed 's/^/- /'
+              echo ""
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -n "$ABSENT" ]; then
+            echo "::warning::Omitted ids not present in this suite at all:"
+            echo "$ABSENT" | sed 's/^/  /'
+            {
+              echo "**Absent — no such test in this suite:**"
+              echo ""
+              echo "$ABSENT" | sed 's/^/- /'
+              echo ""
+            } >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Generate test summary
         if: always()

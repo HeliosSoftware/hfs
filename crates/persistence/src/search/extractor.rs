@@ -2,9 +2,11 @@
 //!
 //! Uses FHIRPath expressions to extract searchable values from FHIR resources.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
+use helios_fhir::search::ABSTRACT_BASE_TYPES;
 use helios_fhirpath::EvaluationContext;
 use helios_fhirpath_support::EvaluationResult;
 use parking_lot::RwLock;
@@ -137,14 +139,22 @@ impl SearchParameterExtractor {
             }
         }
 
-        // Also extract common Resource-level parameters
-        let common_params = {
-            let registry = self.registry.read();
-            registry.get_active_params("Resource")
-        };
+        // Also extract the parameters registered against an abstract base. The
+        // registry buckets parameters by each declared `base`, so a definition
+        // with `base: ["DomainResource"]` (`_text`) lands in its own bucket and
+        // is invisible to a lookup of "Resource" alone — both bases have to be
+        // consulted, or half of `ABSTRACT_BASE_TYPES` is dead weight.
+        let mut seen: HashSet<String> = params.iter().map(|p| p.code.clone()).collect();
+        for base in ABSTRACT_BASE_TYPES {
+            let common_params = {
+                let registry = self.registry.read();
+                registry.get_active_params(base)
+            };
 
-        for param in &common_params {
-            if !params.iter().any(|p| p.code == param.code) {
+            for param in &common_params {
+                if !seen.insert(param.code.clone()) {
+                    continue;
+                }
                 match self.extract_for_param(resource, param) {
                     Ok(values) => results.extend(values),
                     Err(e) => {
@@ -207,6 +217,10 @@ impl SearchParameterExtractor {
         resource: &Value,
         param: &SearchParameterDefinition,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
+        if NON_INDEXABLE_PARAM_CODES.contains(&param.code.as_str()) {
+            return Ok(Vec::new());
+        }
+
         // Composite parameters are indexed component-by-component, with all the
         // components of one composite instance sharing a `composite_group`.
         if matches!(param.param_type, SearchParamType::Composite) {
@@ -328,18 +342,29 @@ impl SearchParameterExtractor {
     ///
     /// This method extracts only the parts that start with the given resource type and
     /// simplifies common patterns that use `resolve()`.
+    ///
+    /// Parts prefixed with an abstract base type (`Resource.`, `DomainResource.`)
+    /// apply to every resource, so the prefix is stripped instead of being matched
+    /// literally — see [`strip_abstract_base_prefix`].
     fn filter_expression_for_resource(&self, expression: &str, resource_type: &str) -> String {
-        // Split by | and filter to parts starting with our resource type
-        let parts: Vec<String> = expression
-            .split('|')
-            .map(|p| p.trim())
-            .filter(|p| {
+        // Split into union members at top level only, then keep the ones that
+        // apply to this resource type.
+        let parts: Vec<String> = split_union_members(expression)
+            .into_iter()
+            .filter_map(|p| {
+                // Abstract-base parts first: when `resource_type` is itself
+                // "Resource", the literal prefix match below would keep the
+                // unevaluable form.
+                if let Some(rest) = strip_abstract_base_prefix(p) {
+                    return Some(rest.into_owned());
+                }
                 // Check if this part starts with our resource type
-                p.starts_with(resource_type)
+                let matches_type = p.starts_with(resource_type)
                     && (p.len() == resource_type.len()
-                        || p.chars().nth(resource_type.len()) == Some('.'))
+                        || p.chars().nth(resource_type.len()) == Some('.'));
+                matches_type.then(|| p.to_string())
             })
-            .map(|p| self.simplify_resolve_pattern(p))
+            .map(|p| self.simplify_resolve_pattern(&p))
             .collect();
 
         if parts.is_empty() {
@@ -396,6 +421,133 @@ impl SearchParameterExtractor {
         // Convert EvaluationResult back to JSON values
         evaluation_result_to_json_values(&result)
     }
+}
+
+/// Search parameters whose spec `expression` names an element that is *not*
+/// the data they filter on. They must never produce index rows, whatever the
+/// expression says.
+///
+/// `_in` (R5/R6) is the whole set today. It carries `expression:
+/// "Resource.id"`, but the parameter means "this resource is a member of the
+/// referenced List or Group" — the id is a placeholder, not a filter target.
+/// Indexing it writes one reference row per resource pointing at the resource
+/// itself, so `?_in=42` would match `Patient/42` through the ordinary bare-id
+/// reference branch and answer a membership question with an identity test,
+/// while every reindex adds a junk row per resource. Membership resolution is
+/// not implemented (#638); `helios-rest` rejects `_in` outright rather than
+/// answer it wrongly.
+///
+/// This list is deliberately about *expressions that lie*, not about
+/// `_`-prefixed parameters in general: `_id`, `_lastUpdated` and the `meta`
+/// set carry truthful expressions and are indexed normally, and the
+/// `SearchParamType::Special` parameters (`_filter`, `_has`, `_text`, …) ship
+/// with an empty expression and are already skipped below.
+const NON_INDEXABLE_PARAM_CODES: [&str; 1] = ["_in"];
+
+/// Splits a FHIRPath expression into its top-level union (`|`) members.
+///
+/// A plain `split('|')` also cuts inside string literals and parentheses, and
+/// the fragments it leaves are not parseable FHIRPath. That used to be
+/// harmless — an unbalanced fragment matched no resource-type prefix and was
+/// dropped — but the abstract-base strip accepts a fragment on its prefix
+/// alone, so `Resource.x.where(v = 'a|b')` would hand the evaluator
+/// `x.where(v = 'a`, whose parse error aborts extraction for *every* member of
+/// that parameter, concrete ones included.
+///
+/// A `|` inside `(...)`, `[...]`, `'...'` (with `\'` escapes) or a backtick
+/// delimited identifier therefore stays part of its member. Members are
+/// returned trimmed.
+fn split_union_members(expression: &str) -> Vec<&str> {
+    let bytes = expression.as_bytes();
+    let mut members = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                // Skip an escaped character whole, so `\'` does not close the
+                // literal and `\\` does not swallow the quote that follows.
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'`' => quote = Some(c),
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
+                // `depth <= 0` rather than `== 0`: an expression with more
+                // closing than opening parens must still split into members
+                // rather than collapsing into one.
+                b'|' if depth <= 0 => {
+                    members.push(expression[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    members.push(expression[start..].trim());
+    members
+}
+
+/// Strips a leading abstract base type from one union member of a FHIRPath
+/// expression, returning the resource-relative remainder.
+///
+/// The `Resource`-level SearchParameters carry expressions like
+/// `Resource.meta.source` (`_source`) and `Resource.id` (`_id`). Evaluated
+/// against a concrete resource these resolve to nothing — FHIRPath matches the
+/// leading identifier against the resource's own type, so `Patient.meta.source`
+/// and `meta.source` both work but `Resource.meta.source` yields an empty
+/// collection, and the parameter is never indexed (#523). Since these
+/// expressions apply to every resource, the prefix is dropped and the rest is
+/// evaluated relative to the resource.
+///
+/// Leading parentheses are carried across, so a parenthesized member
+/// (`(Resource.meta.source)`) strips to `(meta.source)` rather than falling
+/// through and silently extracting nothing. The closing parens sit in the
+/// untouched remainder, so the member stays balanced.
+///
+/// Returns `None` for parts that are not abstract-base-prefixed, so concrete
+/// prefixes (`Patient.name`) keep their normal filtering behaviour. The common
+/// case borrows from `part`; only the forms needing reassembly allocate.
+fn strip_abstract_base_prefix(part: &str) -> Option<Cow<'_, str>> {
+    let open = part.len() - part.trim_start_matches('(').len();
+    let (parens, body) = part.split_at(open);
+    let body = body.trim_start();
+
+    for base in ABSTRACT_BASE_TYPES {
+        let Some(rest) = body.strip_prefix(base) else {
+            continue;
+        };
+        let stripped: Cow<'_, str> = if let Some(path) = rest.strip_prefix('.') {
+            Cow::Borrowed(path)
+        } else if rest.is_empty() {
+            // The bare type name selects the resource itself (composite base
+            // expressions use this form, e.g. `Observation`).
+            Cow::Borrowed("$this")
+        } else if rest.starts_with(')') {
+            Cow::Owned(format!("$this{rest}"))
+        } else {
+            // A concrete type that merely starts with the same letters
+            // (`ResourceThing.name`) is not an abstract base.
+            continue;
+        };
+        return Some(if parens.is_empty() {
+            stripped
+        } else {
+            Cow::Owned(format!("{parens}{stripped}"))
+        });
+    }
+    None
 }
 
 /// Rewrites FHIRPath choice-type casts to concrete element names.
@@ -591,7 +743,11 @@ mod tests {
     }
 
     fn create_test_extractor() -> SearchParameterExtractor {
-        let loader = SearchParameterLoader::new(FhirVersion::R4);
+        create_test_extractor_for(FhirVersion::R4)
+    }
+
+    fn create_test_extractor_for(version: FhirVersion) -> SearchParameterExtractor {
+        let loader = SearchParameterLoader::new(version);
         let mut registry = SearchParameterRegistry::new();
 
         // Load minimal fallback
@@ -617,6 +773,131 @@ mod tests {
         }
 
         SearchParameterExtractor::new(Arc::new(RwLock::new(registry)))
+    }
+
+    /// Same as [`create_test_extractor_for`], but also loads the custom
+    /// SearchParameter files from the workspace `data/` directory (e.g.
+    /// `sql-on-fhir-search-parameters.json`), the same additive source a
+    /// real backend loads on startup.
+    fn create_test_extractor_with_custom_for(version: FhirVersion) -> SearchParameterExtractor {
+        let loader = SearchParameterLoader::new(version);
+        let mut registry = SearchParameterRegistry::new();
+
+        if let Ok(params) = loader.load_embedded() {
+            for param in params {
+                let _ = registry.register(param);
+            }
+        }
+
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+
+        if let Ok(params) = loader.load_from_spec_file(&data_dir) {
+            for param in params {
+                let _ = registry.register(param);
+            }
+        }
+
+        if let Ok(params) = loader.load_custom_from_directory(&data_dir) {
+            for param in params {
+                let _ = registry.register(param);
+            }
+        }
+
+        SearchParameterExtractor::new(Arc::new(RwLock::new(registry)))
+    }
+
+    /// Regression test for the composite `context-type-quantity` and
+    /// `context-type-value` ViewDefinition SearchParameters: their
+    /// `component.definition` values must resolve to registered parameters
+    /// through the real registry (`get_by_url` is an exact-match lookup), or
+    /// the extractor silently drops every component of the composite and no
+    /// rows get indexed at all. This exercises the real registry (embedded +
+    /// spec + custom) and the real extractor end-to-end against a
+    /// `ViewDefinition` whose `useContext` matches both composites.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn view_definition_composite_context_params_index_matching_use_context() {
+        let extractor = create_test_extractor_with_custom_for(FhirVersion::R4);
+
+        let view_definition = json!({
+            "resourceType": "ViewDefinition",
+            "id": "test-view",
+            "status": "active",
+            "resource": "Patient",
+            "select": [{"column": [{"path": "id", "name": "id"}]}],
+            "useContext": [
+                {
+                    "code": {
+                        "system": "http://terminology.hl7.org/CodeSystem/usage-context-type",
+                        "code": "focus"
+                    },
+                    "valueCodeableConcept": {
+                        "coding": [{
+                            "system": "http://snomed.info/sct",
+                            "code": "263495000",
+                            "display": "Gender"
+                        }]
+                    }
+                },
+                {
+                    "code": {
+                        "system": "http://terminology.hl7.org/CodeSystem/usage-context-type",
+                        "code": "age"
+                    },
+                    "valueQuantity": {
+                        "value": 42,
+                        "unit": "years",
+                        "system": "http://unitsofmeasure.org",
+                        "code": "a"
+                    }
+                }
+            ]
+        });
+
+        let values = extractor
+            .extract(&view_definition, "ViewDefinition")
+            .expect("extraction should succeed");
+
+        let context_type_quantity: Vec<_> = values
+            .iter()
+            .filter(|v| v.param_name == "context-type-quantity")
+            .collect();
+        assert!(
+            !context_type_quantity.is_empty(),
+            "context-type-quantity should index rows for a useContext with a Quantity value; \
+             an empty result means its component.definition failed to resolve in the registry"
+        );
+
+        let context_type_value: Vec<_> = values
+            .iter()
+            .filter(|v| v.param_name == "context-type-value")
+            .collect();
+        assert!(
+            !context_type_value.is_empty(),
+            "context-type-value should index rows for a useContext with a CodeableConcept value; \
+             an empty result means its component.definition failed to resolve in the registry"
+        );
+
+        // Every row from these composites must carry the composite's own
+        // core canonical URL (the component `definition` URLs are only used
+        // internally to resolve each sub-expression's type).
+        for value in context_type_quantity
+            .iter()
+            .chain(context_type_value.iter())
+        {
+            assert!(
+                value
+                    .param_url
+                    .starts_with("http://hl7.org/fhir/SearchParameter/ViewDefinition-"),
+                "composite row should carry the core canonical URL, got: {}",
+                value.param_url
+            );
+            assert!(value.composite_group.is_some());
+        }
     }
 
     #[test]
@@ -905,6 +1186,302 @@ mod tests {
         assert_eq!(careplan_filtered, "CarePlan.subject");
         let obs_filtered = extractor.filter_expression_for_resource(patient_expr, "Observation");
         assert_eq!(obs_filtered, "Observation.subject");
+    }
+
+    #[test]
+    fn test_filter_expression_strips_abstract_base_prefix() {
+        let extractor = create_test_extractor();
+
+        // `Resource.`-prefixed expressions apply to every resource; the prefix
+        // has to go, or FHIRPath resolves nothing against a concrete resource.
+        assert_eq!(
+            extractor.filter_expression_for_resource("Resource.meta.source", "Patient"),
+            "meta.source"
+        );
+        assert_eq!(
+            extractor.filter_expression_for_resource("Resource.id", "Observation"),
+            "id"
+        );
+        assert_eq!(
+            extractor.filter_expression_for_resource("DomainResource.meta.tag", "Patient"),
+            "meta.tag"
+        );
+
+        // Also when the resource type is itself the abstract base.
+        assert_eq!(
+            extractor.filter_expression_for_resource("Resource.meta.source", "Resource"),
+            "meta.source"
+        );
+
+        // A bare abstract base selects the resource itself. No shipped parameter
+        // uses that form, but a composite base expression could; assert the
+        // substitution and that the evaluator actually resolves it.
+        assert_eq!(
+            extractor.filter_expression_for_resource("Resource", "Patient"),
+            "$this"
+        );
+        let patient = json!({"resourceType": "Patient", "id": "p1"});
+        let this = extractor.evaluate_fhirpath(&patient, "$this").unwrap();
+        assert_eq!(this.len(), 1);
+        assert_eq!(this[0]["id"], "p1");
+
+        // A concrete type that merely starts with the same letters is untouched.
+        assert_eq!(
+            extractor.filter_expression_for_resource("ResourceThing.name", "ResourceThing"),
+            "ResourceThing.name"
+        );
+
+        // Union members are handled independently.
+        assert_eq!(
+            extractor.filter_expression_for_resource(
+                "Patient.name | Resource.meta.source | Observation.code",
+                "Patient"
+            ),
+            "Patient.name | meta.source"
+        );
+
+        // A parenthesized member keeps its parens and stays balanced. Before
+        // this, `(Resource.meta.source)` matched neither branch, the whole
+        // expression came back unchanged, and it evaluated to nothing — the
+        // #523 symptom, silently.
+        assert_eq!(
+            extractor.filter_expression_for_resource("(Resource.meta.source)", "Patient"),
+            "(meta.source)"
+        );
+        assert_eq!(
+            extractor.filter_expression_for_resource("((Resource.meta.source))", "Patient"),
+            "((meta.source))"
+        );
+        assert_eq!(
+            extractor.filter_expression_for_resource("(Resource)", "Patient"),
+            "($this)"
+        );
+        let source_carrier = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "meta": {"source": "http://example.org/src"}
+        });
+        let evaluated = extractor
+            .evaluate_fhirpath(&source_carrier, "(meta.source)")
+            .expect("the stripped form must parse and evaluate");
+        assert_eq!(evaluated.len(), 1);
+    }
+
+    /// `|` inside a string literal or parentheses is data, not a union
+    /// separator.
+    #[test]
+    fn union_split_respects_literals_and_parens() {
+        assert_eq!(
+            split_union_members("Patient.name | Observation.code"),
+            vec!["Patient.name", "Observation.code"]
+        );
+        assert_eq!(
+            split_union_members("Patient.telecom.where(system = 'a|b')"),
+            vec!["Patient.telecom.where(system = 'a|b')"]
+        );
+        assert_eq!(
+            split_union_members("Patient.a.where(v = 'x|y') | Observation.b"),
+            vec!["Patient.a.where(v = 'x|y')", "Observation.b"]
+        );
+        // An escaped quote does not end the literal.
+        assert_eq!(
+            split_union_members(r"Patient.a.where(v = 'it\'s|fine')"),
+            vec![r"Patient.a.where(v = 'it\'s|fine')"]
+        );
+        // Backtick-delimited identifiers behave like literals.
+        assert_eq!(
+            split_union_members("Patient.`odd|name`"),
+            vec!["Patient.`odd|name`"]
+        );
+    }
+
+    /// A `|` inside a `Resource.`-prefixed member used to be split anyway,
+    /// handing the evaluator an unbalanced fragment. The parse error aborts
+    /// `extract_for_param`, so **every** member of that parameter — the
+    /// concrete ones included — stopped being indexed.
+    #[test]
+    fn literal_pipe_in_abstract_member_does_not_break_extraction() {
+        let extractor = create_test_extractor();
+
+        let expr = "Patient.name | Resource.meta.tag.where(code = 'a|b')";
+        let filtered = extractor.filter_expression_for_resource(expr, "Patient");
+        assert_eq!(filtered, "Patient.name | meta.tag.where(code = 'a|b')");
+
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "name": [{"family": "Smith"}],
+            "meta": {"tag": [{"code": "a|b"}]}
+        });
+        // The whole filtered expression must parse; the pre-fix fragment
+        // `meta.tag.where(code = 'a` does not.
+        let values = extractor
+            .evaluate_fhirpath(&patient, &filtered)
+            .expect("the filtered expression must parse");
+        assert!(!values.is_empty());
+    }
+
+    /// The `DomainResource` half of `ABSTRACT_BASE_TYPES` has to be reachable:
+    /// the registry buckets a definition under each declared `base`, so
+    /// `base: ["DomainResource"]` lands in its own bucket that a lookup of
+    /// `"Resource"` alone never sees.
+    #[test]
+    fn domain_resource_based_parameters_are_extracted() {
+        let extractor = create_test_extractor();
+        {
+            let mut registry = extractor.registry.write();
+            registry
+                .register(
+                    SearchParameterDefinition::new(
+                        "http://example.org/SearchParameter/DomainResource-narrative-status",
+                        "narrative-status",
+                        SearchParamType::Token,
+                        "DomainResource.text.status",
+                    )
+                    .with_base(vec!["DomainResource"]),
+                )
+                .expect("register DomainResource-based parameter");
+        }
+
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "text": {"status": "generated", "div": "<div>x</div>"}
+        });
+
+        let values = extractor.extract(&patient, "Patient").unwrap();
+        let found: Vec<_> = values
+            .iter()
+            .filter(|v| v.param_name == "narrative-status")
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "a DomainResource-based parameter should be indexed, got {values:?}"
+        );
+    }
+
+    /// `_in` (R5/R6) carries the spec's placeholder `Resource.id` expression.
+    /// Indexing it writes one self-referential row per resource, and
+    /// `?_in=42` then matches `Patient/42` through the ordinary bare-id
+    /// reference branch — a membership question answered with an identity
+    /// test. `_language`, whose expression is truthful, must still be indexed.
+    #[cfg(feature = "R5")]
+    #[test]
+    fn r5_membership_parameter_is_not_indexed_but_language_is() {
+        let extractor = create_test_extractor_for(FhirVersion::R5);
+
+        // Both are registered on R5; only one of them may reach the index.
+        {
+            let registry = extractor.registry.read();
+            for code in ["_in", "_language"] {
+                assert!(
+                    registry.get_param("Resource", code).is_some(),
+                    "{code} should be a registered R5 Resource-level parameter"
+                );
+            }
+        }
+
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "language": "en-US"
+        });
+
+        let values = extractor.extract(&patient, "Patient").unwrap();
+
+        assert!(
+            !values.iter().any(|v| v.param_name == "_in"),
+            "_in must never be indexed, got {:?}",
+            values
+                .iter()
+                .filter(|v| v.param_name == "_in")
+                .collect::<Vec<_>>()
+        );
+
+        let language: Vec<_> = values
+            .iter()
+            .filter(|v| v.param_name == "_language")
+            .collect();
+        assert_eq!(
+            language.len(),
+            1,
+            "_language should be indexed exactly once"
+        );
+        match &language[0].value {
+            IndexValue::Token { code, .. } => assert_eq!(code, "en-US"),
+            other => panic!("_language should index as a token, got {other:?}"),
+        }
+    }
+
+    /// Every `Resource`-level meta parameter must produce a positive index row —
+    /// the failure in #523 was silent, because an unindexed parameter simply
+    /// matches nothing (or, on backends that drop it, everything).
+    #[test]
+    fn test_extract_meta_level_parameters() {
+        let extractor = create_test_extractor();
+
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "meta": {
+                "source": "http://example.org/src",
+                "profile": ["http://example.org/StructureDefinition/my-patient"],
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "tag": [{"system": "http://example.org/tags", "code": "t1"}],
+                "security": [{"system": "http://example.org/labels", "code": "R"}]
+            }
+        });
+
+        let values = extractor.extract(&patient, "Patient").unwrap();
+        let find = |name: &str| -> Vec<&ExtractedValue> {
+            values.iter().filter(|v| v.param_name == name).collect()
+        };
+
+        let source = find("_source");
+        assert_eq!(source.len(), 1, "_source should be indexed exactly once");
+        match &source[0].value {
+            IndexValue::Uri(value) => assert_eq!(value, "http://example.org/src"),
+            other => panic!("_source should index as a URI, got {:?}", other),
+        }
+
+        match &find("_profile")[..] {
+            [v] => match &v.value {
+                IndexValue::Uri(value) => {
+                    assert_eq!(value, "http://example.org/StructureDefinition/my-patient")
+                }
+                other => panic!("_profile should index as a URI, got {:?}", other),
+            },
+            other => panic!("_profile should be indexed exactly once, got {:?}", other),
+        }
+
+        match &find("_tag")[..] {
+            [v] => match &v.value {
+                IndexValue::Token { system, code, .. } => {
+                    assert_eq!(system.as_deref(), Some("http://example.org/tags"));
+                    assert_eq!(code, "t1");
+                }
+                other => panic!("_tag should index as a token, got {:?}", other),
+            },
+            other => panic!("_tag should be indexed exactly once, got {:?}", other),
+        }
+
+        match &find("_security")[..] {
+            [v] => match &v.value {
+                IndexValue::Token { system, code, .. } => {
+                    assert_eq!(system.as_deref(), Some("http://example.org/labels"));
+                    assert_eq!(code, "R");
+                }
+                other => panic!("_security should index as a token, got {:?}", other),
+            },
+            other => panic!("_security should be indexed exactly once, got {:?}", other),
+        }
+
+        assert!(
+            !find("_lastUpdated").is_empty(),
+            "_lastUpdated should be indexed"
+        );
+        assert!(!find("_id").is_empty(), "_id should be indexed");
     }
 
     #[test]

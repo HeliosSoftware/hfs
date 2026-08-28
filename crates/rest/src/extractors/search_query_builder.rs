@@ -221,14 +221,64 @@ pub fn build_search_query_from_map(
     build_search_query(resource_type, &search_params, registry)
 }
 
+/// The `_`-prefixed global/result parameters this server actually honours.
+///
+/// Every other underscore name is unknown, exactly like a misspelled ordinary
+/// parameter: a blanket `starts_with('_')` bypass would wave through `_typo`
+/// and any future spec parameter this server has not implemented, so
+/// `Prefer: handling=strict` could never reject one and the self link would
+/// claim it had been applied (see issue #524).
+///
+/// Result/control parameters (`_count`, `_sort`, `_format`, …) are already
+/// filtered out of [`SearchParams::search_params`], but are listed here too so
+/// the set stays a complete statement of what the server honours and the check
+/// is correct for any caller.
+///
+/// `_query` is deliberately absent — named queries are not implemented, and
+/// [`crate::handlers`] rejects them outright.
+pub const GLOBAL_SEARCH_PARAMS: &[&str] = &[
+    // Filters over resource metadata / content.
+    "_id",
+    "_lastUpdated",
+    "_tag",
+    "_profile",
+    "_security",
+    "_source",
+    "_text",
+    "_content",
+    "_filter",
+    "_list",
+    "_has",
+    "_type",
+    // Result-shaping parameters.
+    "_contained",
+    "_containedType",
+    "_include",
+    "_revinclude",
+    "_sort",
+    "_count",
+    "_offset",
+    "_cursor",
+    "_total",
+    "_summary",
+    "_elements",
+    "_score",
+    "_format",
+    "_pretty",
+];
+
 /// Returns the names of search parameters that are not recognized for the given
-/// resource type (used to enforce `Prefer: handling=strict`).
+/// resource type.
 ///
 /// A parameter is "unknown" when its base name (after stripping any modifier and
-/// chain) is not registered for `resource_type` or for `Resource`, and is not a
-/// global parameter (those start with `_`, e.g. `_id`, `_text`, `_has`). Under
-/// lenient handling the server ignores such parameters; under strict handling
-/// the caller turns this list into a `400`.
+/// chain) is neither one of the [`GLOBAL_SEARCH_PARAMS`] this server honours nor
+/// registered for `resource_type` or for `Resource`.
+///
+/// Per FHIR search, an unsupported parameter may be ignored only under lenient
+/// handling and only if that is reported; under `Prefer: handling=strict` it is
+/// an error. Callers turn this list into a `400` under strict handling, and
+/// under lenient handling drop these parameters from both the executed query and
+/// the searchset self link.
 pub fn unknown_search_params(
     resource_type: &str,
     params: &SearchParams,
@@ -248,11 +298,8 @@ pub fn unknown_search_params(
             .split('.')
             .next()
             .unwrap_or(name);
-        // Global/result parameters (`_id`, `_text`, `_type`, …) are always allowed.
-        if base.starts_with('_') {
-            continue;
-        }
-        let known = registry.get_param(resource_type, base).is_some()
+        let known = GLOBAL_SEARCH_PARAMS.contains(&base)
+            || registry.get_param(resource_type, base).is_some()
             || registry.get_param("Resource", base).is_some();
         if !known {
             unknown.push(name.clone());
@@ -293,6 +340,37 @@ fn parse_search_parameter(
 
     // Check for chained parameters (e.g., "patient.name" or "subject:Patient.name")
     let (base_name, chain) = parse_chain(param_name);
+
+    // FHIR defines :missing as a single, case-sensitive boolean literal.
+    // Validate it before splitting comma-separated OR values so malformed
+    // inputs cannot silently become `missing=false` in a storage backend.
+    if matches!(modifier, Some(SearchModifier::Missing)) && !matches!(value, "true" | "false") {
+        return Err(RestError::InvalidParameter {
+            param: name.to_string(),
+            message: "the :missing modifier requires exactly 'true' or 'false'".to_string(),
+        });
+    }
+
+    // Full-text and other computed `_` parameters have no ordinary presence
+    // row in the search index. Treating them as index-backed would make
+    // `:missing=true` match every resource.
+    let registered = registry.get_param(resource_type, base_name).is_some()
+        || registry.get_param("Resource", base_name).is_some();
+    let has_presence_index = matches!(base_name, "_id" | "_lastUpdated")
+        || registered
+            && matches!(
+                base_name,
+                "_tag" | "_profile" | "_security" | "_source" | "_language"
+            );
+    if matches!(modifier, Some(SearchModifier::Missing))
+        && base_name.starts_with('_')
+        && !has_presence_index
+    {
+        return Err(RestError::InvalidParameter {
+            param: name.to_string(),
+            message: format!(":missing is not supported for parameter '{base_name}'"),
+        });
+    }
 
     // Parse the value(s) - multiple values separated by comma are ORed.
     // Prefix extraction (gt/lt/ge/le/sa/eb/ap/eq/ne) is only meaningful for
@@ -375,16 +453,6 @@ fn parse_search_parameter(
                     .collect();
             }
         }
-    }
-
-    // Handle :missing modifier specially
-    if param
-        .modifier
-        .as_ref()
-        .is_some_and(|m| *m == SearchModifier::Missing)
-    {
-        // The value should be "true" or "false"
-        param.values = vec![SearchValue::eq(value)];
     }
 
     Ok(param)
@@ -745,6 +813,18 @@ mod tests {
         // Escaped backslash is unescaped; other escapes (\|) are preserved.
         assert_eq!(split_unescaped_commas("a\\\\b"), vec!["a\\b"]);
         assert_eq!(split_unescaped_commas("sys\\|code"), vec!["sys\\|code"]);
+        assert_eq!(split_unescaped_commas("left\\$right"), vec!["left\\$right"]);
+        assert_eq!(split_unescaped_commas("a\\,b,c"), vec!["a,b", "c"]);
+        assert_eq!(split_unescaped_commas("a\\\\,b"), vec!["a\\", "b"]);
+        assert_eq!(
+            split_unescaped_commas("Muñoz\\,García"),
+            vec!["Muñoz,García"]
+        );
+        // Keep empty alternatives visible to validation instead of silently
+        // dropping them at this syntax boundary.
+        assert_eq!(split_unescaped_commas("a,,b"), vec!["a", "", "b"]);
+        assert_eq!(split_unescaped_commas(",a"), vec!["", "a"]);
+        assert_eq!(split_unescaped_commas("a,"), vec!["a", ""]);
         // Surrounding whitespace is trimmed.
         assert_eq!(split_unescaped_commas(" a , b "), vec!["a", "b"]);
     }
@@ -888,6 +968,94 @@ mod tests {
         assert_eq!(query.parameters.len(), 1);
         assert_eq!(query.parameters[0].name, "name");
         assert_eq!(query.parameters[0].modifier, Some(SearchModifier::Exact));
+    }
+
+    #[test]
+    fn test_missing_modifier_accepts_exact_boolean_literals() {
+        let registry = test_registry();
+
+        for value in ["true", "false"] {
+            let param =
+                parse_search_parameter("Patient", "birthdate:missing", value, &registry).unwrap();
+            assert_eq!(param.modifier, Some(SearchModifier::Missing));
+            assert_eq!(param.values.len(), 1);
+            assert_eq!(param.values[0].value, value);
+        }
+    }
+
+    #[test]
+    fn test_missing_modifier_rejects_non_boolean_literals() {
+        let registry = test_registry();
+
+        for value in ["", "TRUE", "False", "invalid", "true,false"] {
+            let error = parse_search_parameter("Patient", "birthdate:missing", value, &registry)
+                .unwrap_err();
+            assert!(
+                matches!(error, RestError::InvalidParameter { .. }),
+                "unexpected error for {value:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_modifier_rejects_composite_parameters() {
+        let mut registry = test_registry();
+        registry
+            .register(
+                SearchParameterDefinition::new(
+                    "http://hl7.org/fhir/SearchParameter/Observation-code-value-quantity",
+                    "code-value-quantity",
+                    SearchParamType::Composite,
+                    "ignored",
+                )
+                .with_base(vec!["Observation"]),
+            )
+            .unwrap();
+
+        let error = parse_search_parameter(
+            "Observation",
+            "code-value-quantity:missing",
+            "true",
+            &registry,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, RestError::InvalidParameter { .. }));
+    }
+
+    #[test]
+    fn test_missing_modifier_rejects_non_indexed_special_parameters() {
+        let registry = test_registry();
+
+        for name in ["_text:missing", "_content:missing"] {
+            let error = parse_search_parameter("Patient", name, "true", &registry).unwrap_err();
+            assert!(
+                matches!(error, RestError::InvalidParameter { .. }),
+                "unexpected error for {name}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_language_missing_requires_a_registered_search_parameter() {
+        let mut registry = test_registry();
+        assert!(parse_search_parameter("Patient", "_language:missing", "true", &registry).is_err());
+
+        registry
+            .register(
+                SearchParameterDefinition::new(
+                    "http://hl7.org/fhir/SearchParameter/Resource-language",
+                    "_language",
+                    SearchParamType::Token,
+                    "Resource.language",
+                )
+                .with_base(vec!["Resource"]),
+            )
+            .unwrap();
+
+        let param =
+            parse_search_parameter("Patient", "_language:missing", "true", &registry).unwrap();
+        assert_eq!(param.modifier, Some(SearchModifier::Missing));
     }
 
     #[test]
@@ -1063,6 +1231,47 @@ mod tests {
         let patient =
             parse_search_parameter("Observation", "patient", "Patient/1", &registry).unwrap();
         assert_eq!(patient.param_type, SearchParamType::Reference);
+    }
+
+    #[test]
+    fn test_unknown_search_params_flags_unhonoured_underscore_names() {
+        // Regression for #524: a blanket `starts_with('_')` bypass let every
+        // underscore name through, so strict handling could never reject one.
+        let registry = test_registry();
+        let unknown = |q: Vec<(&str, &str)>| {
+            let sp = SearchParams::from_pairs(
+                q.into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
+            unknown_search_params("Patient", &sp, &registry)
+        };
+
+        // Underscore names the server does not implement are unknown.
+        assert_eq!(unknown(vec![("_typo", "x")]), vec!["_typo".to_string()]);
+        assert_eq!(
+            unknown(vec![("_whatever", "x")]),
+            vec!["_whatever".to_string()]
+        );
+        // …including with a modifier, which is stripped before the check.
+        assert_eq!(
+            unknown(vec![("_typo:exact", "x")]),
+            vec!["_typo:exact".to_string()]
+        );
+
+        // Every global parameter the server honours stays allowed, even though
+        // the test registry holds no `Resource`-level definitions.
+        for name in GLOBAL_SEARCH_PARAMS {
+            assert!(
+                unknown(vec![(name, "x")]).is_empty(),
+                "{name} must be treated as a known global parameter"
+            );
+        }
+
+        // Reverse chaining and ordinary registered parameters are unaffected.
+        assert!(unknown(vec![("_has:Observation:patient:code", "1")]).is_empty());
+        assert!(unknown(vec![("name", "Smith")]).is_empty());
+        assert_eq!(unknown(vec![("nope", "x")]), vec!["nope".to_string()]);
     }
 
     #[test]

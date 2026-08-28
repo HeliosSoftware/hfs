@@ -18,7 +18,7 @@ use crate::core::{
     ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
     RevincludeProvider, SearchProvider, SearchResult,
 };
-use crate::error::{BackendError, QueryErrorExt, StorageError, StorageResult};
+use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
     CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo,
@@ -34,6 +34,20 @@ fn internal_error(message: String) -> StorageError {
         message,
         source: None,
     })
+}
+
+fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
+    if query.contained != crate::types::ContainedMode::Off
+        && query
+            .parameters
+            .iter()
+            .any(|param| matches!(param.modifier, Some(crate::types::SearchModifier::Missing)))
+    {
+        return Err(StorageError::Search(SearchError::QueryParseError {
+            message: "SQLite does not support :missing with _contained=true or both".to_string(),
+        }));
+    }
+    Ok(())
 }
 
 /// Binds the cursor's boundary sort value as `?3`, typed per the sort key kind.
@@ -76,6 +90,8 @@ impl SearchProvider for SqliteBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        reject_contained_missing(query)?;
+
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
         if query.contained != crate::types::ContainedMode::Off {
@@ -342,6 +358,8 @@ impl SearchProvider for SqliteBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        reject_contained_missing(query)?;
+
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
@@ -743,8 +761,18 @@ impl ChainedSearchProvider for SqliteBackend {
             }
         };
 
-        // Build the SQL fragment
-        let search_value = SearchValue::eq(value);
+        // Build the SQL fragment. The chained value still carries its
+        // comparator prefix (`patient.birthdate=le1956-07-14`); strip it only
+        // when the terminal parameter's type admits one, so a string value
+        // like `family=Levine` is never misread as le + "vine" (#258).
+        let candidate = crate::types::SearchValue::parse(value);
+        let search_value = if candidate.prefix != crate::types::SearchPrefix::Eq
+            && candidate.prefix.is_valid_for(parsed.terminal_type)
+        {
+            candidate
+        } else {
+            SearchValue::eq(value)
+        };
         let fragment = match builder.build_forward_chain_sql(&parsed, &search_value) {
             Ok(f) => f,
             Err(e) => {
@@ -1301,8 +1329,8 @@ mod tests {
 
     fn create_test_backend() -> SqliteBackend {
         // Point at the workspace's data directory so the search-parameter
-        // registry loads the full FHIR spec (otherwise only the 5 minimal
-        // embedded params are available and chained-search tests fail to
+        // registry loads the full FHIR spec (otherwise only the handful of
+        // minimal embedded params are available and chained-search tests fail to
         // resolve param types like Observation.code → Token).
         let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -1919,6 +1947,60 @@ mod tests {
     // ========================================================================
     // ChainedSearchProvider Tests
     // ========================================================================
+
+    /// #258: a chained value keeps its comparator prefix when the terminal
+    /// parameter compares (dates), and never loses its head to one when it
+    /// does not (a family name starting with a valid prefix pair).
+    #[tokio::test]
+    async fn test_resolve_chain_comparator_prefix() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"id": "p1", "birthDate": "1950-04-12", "name": [{"family": "Levine"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // The comparator reaches the date comparison: le on a later date
+        // matches, gt1900 matches everyone, le on an earlier date excludes.
+        let ids = backend
+            .resolve_chain(&tenant, "Observation", "subject.birthdate", "le1956-07-14")
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["o1".to_string()], "le includes the 1950 birth");
+        let ids = backend
+            .resolve_chain(&tenant, "Observation", "subject.birthdate", "gt1900-01-01")
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["o1".to_string()], "gt1900 matches every patient");
+        let ids = backend
+            .resolve_chain(&tenant, "Observation", "subject.birthdate", "le1940-01-01")
+            .await
+            .unwrap();
+        assert!(ids.is_empty(), "le on an earlier date excludes");
+
+        // A string value beginning with a valid prefix pair stays whole:
+        // family=Levine must not become le + "vine".
+        let ids = backend
+            .resolve_chain(&tenant, "Observation", "subject.family", "Levine")
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["o1".to_string()], "Levine matches, unclipped");
+    }
 
     #[tokio::test]
     async fn test_resolve_chain_simple() {

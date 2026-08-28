@@ -86,24 +86,111 @@
     });
     return fetch("/ui/editor/render", { method: "POST", body: form })
       .then(function (r) { return r.text(); })
-      .then(function (html) { editorBody.innerHTML = html; });
+      .then(function (html) {
+        var state = captureEditorState();
+        editorBody.innerHTML = html;
+        restoreEditorState(state);
+      });
+  }
+
+  /* Keeps the user's place across the modal editor's full re-render (#547):
+   * the focused field and caret, any open add-picker with its filter text,
+   * and the tree scroll. The server marks the node a mutation created via
+   * data-focus on #editor-form; the caret goes there first. */
+  function captureEditorState() {
+    var state = { focus: null, pickers: [], scroll: 0, rawOpen: false };
+    var rawPane = editorBody.querySelector("#editor-json-raw");
+    state.rawOpen = !!(rawPane && !rawPane.hidden);
+    var tree = editorBody.querySelector(".editor-tree");
+    if (tree) state.scroll = tree.scrollTop;
+    var active = document.activeElement;
+    if (active && editorBody.contains(active) && active.dataset && active.dataset.set) {
+      state.focus = { path: active.dataset.set, start: active.selectionStart, end: active.selectionEnd };
+    }
+    editorBody.querySelectorAll("details.editor-add[open]").forEach(function (box) {
+      var row = box.closest("[data-path]");
+      var filter = box.querySelector(".editor-add__filter");
+      state.pickers.push({
+        path: row ? row.dataset.path : "",
+        filter: filter ? filter.value : "",
+        focusFilter: filter === document.activeElement,
+      });
+    });
+    return state;
+  }
+
+  function editorNodeBy(attr, path) {
+    var nodes = editorBody.querySelectorAll("[" + attr + "]");
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].getAttribute(attr) === path) return nodes[i];
+    }
+    return null;
+  }
+
+  function restoreEditorState(state) {
+    // Raw mode survives the swap: the fresh textarea already carries the
+    // updated document, so a guided edit refreshes the JSON in place instead
+    // of kicking the user back to the fold view.
+    if (state.rawOpen) {
+      var rawPane = editorBody.querySelector("#editor-json-raw");
+      var viewEl = editorBody.querySelector("#json-view");
+      var toggle = editorBody.querySelector("#editor-json-edit");
+      if (rawPane && viewEl) {
+        rawPane.hidden = false;
+        viewEl.hidden = true;
+        if (toggle) toggle.classList.add("editor-json__act--on");
+      }
+    }
+    state.pickers.forEach(function (saved) {
+      var row = saved.path ? editorNodeBy("data-path", saved.path) : editorBody;
+      if (!row) return;
+      var box = row.querySelector("details.editor-add");
+      if (!box) return;
+      box.setAttribute("open", "");
+      var filter = box.querySelector(".editor-add__filter");
+      if (filter && saved.filter) {
+        filter.value = saved.filter;
+        filter.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      if (saved.focusFilter && filter) filter.focus();
+    });
+
+    var formEl = editorBody.querySelector("#editor-form");
+    var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
+    var target = createdPath ? editorNodeBy("data-set", createdPath) : null;
+    if (target) {
+      target.focus();
+      if (target.select) target.select();
+    } else if (state.focus) {
+      target = editorNodeBy("data-set", state.focus.path);
+      if (target) {
+        target.focus();
+        if (target.setSelectionRange && state.focus.start !== null) {
+          try { target.setSelectionRange(state.focus.start, state.focus.end); } catch (ignored) {}
+        }
+      }
+    }
+
+    var tree = editorBody.querySelector(".editor-tree");
+    if (tree) tree.scrollTop = state.scroll;
   }
 
   /* Delegated editor interactions within the modal body. */
   editorBody.addEventListener("click", function (event) {
-    var arrow = event.target.closest("[data-fold]");
-    if (arrow) { toggleFold(arrow.dataset.fold); return; }
-    var foldAllBtn = event.target.closest("[data-json-fold]");
-    if (foldAllBtn) { setAllFolds(foldAllBtn.dataset.jsonFold === "all"); return; }
     if (event.target.id === "editor-json-edit") {
       var raw = editorBody.querySelector("#editor-json-raw");
       var viewEl = editorBody.querySelector("#json-view");
       if (!raw || !viewEl) return;
       if (raw.hidden) { raw.hidden = false; viewEl.hidden = true; event.target.classList.add("editor-json__act--on"); }
       else {
+        // Same as the standalone page: close the pane before the round trip
+        // so the raw-mode persistence reads this re-render as leaving raw.
         var src = editorBody.querySelector("#editor-source");
         var fld = editorBody.querySelector("#editor-doc");
         if (src && fld) fld.value = src.value;
+        raw.hidden = true;
+        viewEl.hidden = false;
+        event.target.classList.remove("editor-json__act--on");
         editorSend("");
       }
       return;
@@ -176,6 +263,8 @@
   editorBody.addEventListener("blur", function (event) {
     var input = event.target.closest("[data-set]");
     if (!input) return;
+    // An unchanged value needs no round trip (#547).
+    if (input.value === input.defaultValue) return;
     editorSend("set", { path: input.dataset.set, value: input.value });
   }, true);
 
@@ -187,30 +276,6 @@
       item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) < 0;
     });
   });
-
-  /* JSON fold helpers, scoped to the modal body. */
-  function toggleFold(foldId) {
-    var opener = editorBody.querySelector('.json-line[data-fold-id="' + foldId + '"]');
-    if (!opener) return;
-    opener.classList.toggle("json-line--collapsed", !opener.classList.contains("json-line--collapsed"));
-    reflowFolds();
-  }
-  function setAllFolds(collapse) {
-    editorBody.querySelectorAll(".json-line--foldable").forEach(function (o) {
-      if (o.dataset.parents) o.classList.toggle("json-line--collapsed", collapse);
-    });
-    reflowFolds();
-  }
-  function reflowFolds() {
-    editorBody.querySelectorAll(".json-line").forEach(function (line) {
-      var parents = (line.dataset.parents || "").split(" ");
-      line.hidden = parents.some(function (p) {
-        if (!p) return false;
-        var o = editorBody.querySelector('.json-line[data-fold-id="' + p + '"]');
-        return o && o.classList.contains("json-line--collapsed");
-      });
-    });
-  }
 
   function openResource(type, id) {
     current = { type: type, id: id };
@@ -224,6 +289,11 @@
   }
 
   function openNew(type) {
+    if (
+      !type ||
+      root.dataset.createEligible !== "true" ||
+      root.dataset.createTarget !== type
+    ) return;
     current = { type: type, id: "" };
     subject.textContent = type + " · " + "new";
     openModal();
@@ -231,19 +301,21 @@
     renderEditor({ resourceType: type });
   }
 
-  /* Clicking a result row opens it. The results table (from saved-queries.js)
-   * renders id links as `/{type}/{id}`; intercept them into the modal. The
-   * results live in the content column, not under `root` (the type panel), so
-   * the listener is on the document. */
+  /* Clicking a result row opens it. The href remains the server-provided
+   * public URL, which may include a path prefix or tenant segment. Use the
+   * trusted resource identity attached by saved-queries.js instead of parsing
+   * that deployment-specific URL. The results live in the content column, not
+   * under `root` (the type panel), so the listener is on the document. */
   document.addEventListener(
     "click",
     function (event) {
       var link = event.target.closest("#query-results-body a.url");
       if (!link) return;
-      var m = /^\/([A-Za-z]+)\/([^/?]+)/.exec(link.getAttribute("href") || "");
-      if (!m) return;
+      var type = link.dataset.resourceType || "";
+      var id = link.dataset.resourceId || "";
+      if (!/^[A-Za-z]+$/.test(type) || !/^[A-Za-z0-9.-]{1,64}$/.test(id)) return;
       event.preventDefault();
-      openResource(m[1], m[2]);
+      openResource(type, id);
     },
     true
   );
@@ -251,7 +323,10 @@
   var createBtn = document.getElementById("resource-create");
   if (createBtn) {
     createBtn.addEventListener("click", function () {
-      openNew(root.dataset.selectedType || createBtn.dataset.type || "Patient");
+      // `panel.dataset.selectedType` (the rail's `<aside>`) is the single
+      // source of truth for the selected type (#605) — the button carries no
+      // type of its own any more.
+      openNew(root.dataset.selectedType);
     });
   }
 
@@ -297,6 +372,8 @@
           subject.textContent = current.type + "/" + current.id;
           say(messages.msgSaved, "ok");
           renderEditor(res.body);
+          // The results table behind the modal is now stale — let it catch up.
+          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
         })
         .catch(function () { say(messages.msgLoadError, "error"); });
     });
@@ -307,8 +384,12 @@
     if (!window.confirm(messages.msgConfirmDelete)) return;
     fetch("/" + current.type + "/" + current.id, { method: "DELETE", headers: fhirHeaders() })
       .then(function (r) {
-        if (r.ok || r.status === 204) { closeModal(); location.reload(); }
-        else say(String(r.status), "error");
+        if (r.ok || r.status === 204) {
+          closeModal();
+          // No full reload: the table and counts refresh in place, keeping
+          // the rail selection and scroll where the user left them.
+          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
+        } else say(String(r.status), "error");
       })
       .catch(function () { say(messages.msgLoadError, "error"); });
   });

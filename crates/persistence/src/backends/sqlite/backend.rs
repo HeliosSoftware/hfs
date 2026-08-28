@@ -764,8 +764,7 @@ impl SqliteBackend {
             SearchParamType::Number => vec!["missing"],
             SearchParamType::Quantity => vec!["missing"],
             SearchParamType::Uri => vec!["contains", "below", "above", "missing"],
-            SearchParamType::Composite => vec!["missing"],
-            SearchParamType::Special => vec![],
+            SearchParamType::Composite | SearchParamType::Special => vec![],
         }
     }
 }
@@ -905,5 +904,9 @@ mod tests {
         let uri_mods = SqliteBackend::modifiers_for_type(SearchParamType::Uri);
         assert!(uri_mods.contains(&"below"));
         assert!(uri_mods.contains(&"above"));
+
+        // FHIR excludes composite/combination parameters from `:missing`.
+        assert!(SqliteBackend::modifiers_for_type(SearchParamType::Composite).is_empty());
+        assert!(SqliteBackend::modifiers_for_type(SearchParamType::Special).is_empty());
     }
 }

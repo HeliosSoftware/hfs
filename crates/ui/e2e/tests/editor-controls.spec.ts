@@ -18,10 +18,39 @@ test("collapse-all and expand-all fold the JSON view", async ({ resources }) => 
     address: [{ city: "Springfield" }],
   });
 
+  await expect(ed.root.locator("#json-view")).toHaveCount(1);
+  await expect(ed.root.locator('.json-line[data-jpath="name.0.family"]')).toHaveCount(1);
+
   await ed.collapseAll();
   expect(await ed.hiddenLineCount()).toBeGreaterThan(0);
+  await expect(
+    ed.root.locator('.json-line--foldable[data-parents=""]'),
+  ).not.toHaveClass(/json-line--collapsed/);
   await ed.expandAll();
   expect(await ed.hiddenLineCount()).toBe(0);
+});
+
+test("individual folds remain scoped and keyboard-accessible after a second server swap", async ({ page }) => {
+  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+  const ed = new Editor(page, page.locator("#editor-body"));
+  await ed.applyJson({ resourceType: "Patient", name: [{ family: "First", given: ["A"] }] });
+
+  const nested = ed.root.locator('.json-line--foldable:not([data-parents=""]) [data-fold]').first();
+  await nested.focus();
+  await page.keyboard.press("Space");
+  await expect(nested).toHaveAttribute("aria-expanded", "false");
+  expect(await ed.hiddenLineCount()).toBeGreaterThan(0);
+  await page.keyboard.press("Space");
+  await expect(nested).toHaveAttribute("aria-expanded", "true");
+
+  // This performs another real /ui/editor/render replacement. Delegation must
+  // bind to the new fragment without an initializer or load-order hook.
+  await ed.applyJson({ resourceType: "Patient", address: [{ city: "Second" }] });
+  await expect(ed.root.locator("#json-view")).toHaveCount(1);
+  const rootFold = ed.root.locator('.json-line--foldable[data-parents=""] [data-fold]');
+  await rootFold.click();
+  await expect(rootFold).toHaveAttribute("aria-expanded", "false");
+  expect(await ed.hiddenLineCount()).toBeGreaterThan(0);
 });
 
 test("add-node adds a top-level field to the document", async ({ resources }) => {
@@ -30,7 +59,7 @@ test("add-node adds a top-level field to the document", async ({ resources }) =>
   const ed = resources.modal.editor;
   expect(await ed.currentDoc()).not.toHaveProperty("gender");
 
-  await ed.addPanel.locator("summary").first().click();
+  await ed.openAddPanel();
   await ed.addFilter().fill("gender");
   await ed.addItem("gender").click();
 
@@ -55,12 +84,14 @@ test("the value[x] choice select adds the chosen variant", async ({ resources, p
   await resources.openCreate("Observation");
   const ed = resources.modal.editor;
 
-  // The value[x] choice select lives inside a collapsed add-node <details>;
-  // open it first, then pick a concrete arm.
+  // The value[x] choice select lives inside the add-node <details>, which
+  // auto-opens on an empty document (#547) -- open it only when closed.
   const panel = ed.root.locator(".editor-add", {
     has: page.locator("select[data-declarer='value']"),
   });
-  await panel.locator("summary").click();
+  if ((await panel.getAttribute("open")) === null) {
+    await panel.locator("summary").click();
+  }
   const choose = panel.locator("select[data-declarer='value']");
   const arms = await choose.locator("option").allInnerTexts();
   const arm = arms.find((a) => /string/i.test(a)) ?? arms[1];
@@ -76,7 +107,7 @@ test("an ad-hoc extension can be attached by URL", async ({ resources }) => {
   await resources.openCreate();
   const ed = resources.modal.editor;
 
-  await ed.addPanel.locator("summary").first().click();
+  await ed.openAddPanel();
   const ext = ed.root.locator(".editor-add__ext").first();
   await ext.locator(".editor-add__ext-url").fill("http://example.org/fhir/StructureDefinition/e2e");
   // The ad-hoc button is the plain .btn; profiled-extension entries carry

@@ -1,7 +1,7 @@
 //! Unit tests for parameter validation and filtering functionality
 //!
 //! This module tests the query parameter validation, parsing, and result filtering
-//! logic for the $viewdefinition-run operation.
+//! logic for the $sql-run operation.
 
 use chrono::{DateTime, Utc};
 use helios_sof::ContentType;
@@ -108,8 +108,8 @@ fn apply_result_filtering(
     match params.format {
         ContentType::Json | ContentType::NdJson => apply_json_filtering(output_data, params),
         ContentType::Csv | ContentType::CsvWithHeader => apply_csv_filtering(output_data, params),
-        ContentType::Parquet => {
-            // Parquet filtering is not implemented in this scope
+        ContentType::Parquet | ContentType::ArrowIpc => {
+            // Columnar-format filtering is not implemented in this scope
             Ok(output_data)
         }
     }

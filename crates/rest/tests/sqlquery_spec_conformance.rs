@@ -1,12 +1,12 @@
-//! `$sqlquery-run` conformance tests against the SoF v2 reference scenarios.
+//! `$sql-run` conformance tests against the SoF v2 reference scenarios.
 //!
 //! The SQL-on-FHIR v2 IG does not ship declarative JSON test fixtures for
-//! `$sqlquery-run` the way it does for ViewDefinition (see
-//! `crates/sof/tests/sql-on-fhir-v2/tests/*.json`). The closest upstream
+//! `$sql-run` the way it does for ViewDefinition (see
+//! `crates/sof/tests/sql-on-fhir/tests/*.json`). The closest upstream
 //! reference is `HL7/sql-on-fhir:sof-js/tests/server/sql.test.js`, a
 //! JavaScript/Bun test suite that drives a live HTTP server. This file
 //! ports those scenarios to Rust integration tests against our own
-//! `$sqlquery-run` REST handler so they run in CI alongside the rest of
+//! `$sql-run` REST handler so they run in CI alongside the rest of
 //! our test suite.
 //!
 //! Each test below carries a `// sof-js:` comment naming the equivalent
@@ -133,7 +133,7 @@ mod sqlquery_spec_conformance_tests {
     fn run_body_inline(lib: Value, format: &str, inner_params: Option<Value>) -> Value {
         let mut entries = vec![
             json!({"name": "_format", "valueCode": format}),
-            json!({"name": "queryResource", "resource": lib}),
+            json!({"name": "subjectResource", "resource": lib}),
         ];
         if let Some(p) = inner_params {
             entries.push(json!({"name": "parameters", "resource": p}));
@@ -174,15 +174,21 @@ mod sqlquery_spec_conformance_tests {
     // `issue[0].code` values, not just HTTP statuses.
     // =========================================================================
 
-    /// sof-js: `unknown Library id on instance route returns 404`.
+    /// A subject that cannot be resolved is 404: it is the thing the operation
+    /// is about, so the operation cannot proceed without it. (Contrast an
+    /// unresolvable `patient`/`group`, which merely scopes the data and is 400.)
     #[tokio::test]
     async fn unknown_library_returns_operation_outcome_not_found() {
         let (server, _) = create_test_server().await;
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [{"name": "_format", "valueCode": "json"}]
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "subjectReference",
+                 "valueReference": {"reference": "Library/does-not-exist"}}
+            ]
         });
-        let response = post(&server, "/Library/does-not-exist/$sqlquery-run", &body).await;
+        let response = post(&server, "/$sql-run", &body).await;
         response.assert_status(StatusCode::NOT_FOUND);
         let body: Value = response.json();
         assert_eq!(issue_code(&body), "not-found");
@@ -199,7 +205,7 @@ mod sqlquery_spec_conformance_tests {
             vec![],
         );
         let body = run_body_inline(lib, "json", None);
-        let response = post(&server, "/$sqlquery-run", &body).await;
+        let response = post(&server, "/$sql-run", &body).await;
         response.assert_status(StatusCode::NOT_FOUND);
         let body: Value = response.json();
         assert_eq!(issue_code(&body), "not-found");
@@ -221,7 +227,7 @@ mod sqlquery_spec_conformance_tests {
             "parameter": [{"name": "unknown_param", "valueString": "x"}]
         });
         let body = run_body_inline(lib, "json", Some(inner_params));
-        let response = post(&server, "/$sqlquery-run", &body).await;
+        let response = post(&server, "/$sql-run", &body).await;
         response.assert_status(StatusCode::BAD_REQUEST);
         let body: Value = response.json();
         assert_eq!(issue_code(&body), "invalid");
@@ -246,7 +252,7 @@ mod sqlquery_spec_conformance_tests {
             "parameter": [{"name": "name", "valueInteger": 42}]
         });
         let body = run_body_inline(lib, "json", Some(inner_params));
-        let response = post(&server, "/$sqlquery-run", &body).await;
+        let response = post(&server, "/$sql-run", &body).await;
         response.assert_status(StatusCode::BAD_REQUEST);
         let body: Value = response.json();
         assert_eq!(issue_code(&body), "invalid");
@@ -262,7 +268,7 @@ mod sqlquery_spec_conformance_tests {
         let vd = seed_boolean_view(&backend).await;
         let lib = library("SELECT no_such_column FROM t", &vd, "t", vec![]);
         let body = run_body_inline(lib, "json", None);
-        let response = post(&server, "/$sqlquery-run", &body).await;
+        let response = post(&server, "/$sql-run", &body).await;
         response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
         let body: Value = response.json();
         assert_eq!(issue_code(&body), "processing");
@@ -284,7 +290,7 @@ mod sqlquery_spec_conformance_tests {
         let vd = seed_boolean_view(&backend).await;
         let lib = library("SELECT patient_id, active FROM t", &vd, "t", vec![]);
         let body = run_body_inline(lib, "fhir", None);
-        let response = post(&server, "/$sqlquery-run", &body).await;
+        let response = post(&server, "/$sql-run", &body).await;
         response.assert_status(StatusCode::OK);
         let body: Value = response.json();
         assert_eq!(body["resourceType"], json!("Parameters"));
@@ -327,7 +333,7 @@ mod sqlquery_spec_conformance_tests {
             vec![],
         );
         let body = run_body_inline(lib, "fhir", None);
-        let response = post(&server, "/$sqlquery-run", &body).await;
+        let response = post(&server, "/$sql-run", &body).await;
         response.assert_status(StatusCode::OK);
         let body: Value = response.json();
         assert_eq!(body["resourceType"], json!("Parameters"));
@@ -357,9 +363,9 @@ mod sqlquery_spec_conformance_tests {
         // No `_format` in body or query string, no `Accept` header.
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [{"name": "queryResource", "resource": lib}]
+            "parameter": [{"name": "subjectResource", "resource": lib}]
         });
-        let response = post(&server, "/$sqlquery-run", &body).await;
+        let response = post(&server, "/$sql-run", &body).await;
         response.assert_status(StatusCode::OK);
         let ct = response
             .headers()

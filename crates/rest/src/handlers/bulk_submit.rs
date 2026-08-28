@@ -20,8 +20,8 @@ use axum::{
 };
 use helios_auth::Principal;
 use helios_persistence::core::{
-    ExportPartKey, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestFetchParams, ManifestStatus,
-    ResourceStorage, SubmissionId, SubmissionStatus, submission_output_job_id,
+    DownloadUrl, ExportPartKey, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestFetchParams,
+    ManifestStatus, ResourceStorage, SubmissionId, SubmissionStatus, submission_output_job_id,
 };
 use serde_json::{Value, json};
 
@@ -38,8 +38,21 @@ const SUBMIT_SCOPE: &str = "bulk-submit";
 /// Query parameter selecting a status-manifest page (1-based).
 const PAGE_PARAM: &str = "page";
 
+fn external_download_url(download: &DownloadUrl) -> Option<String> {
+    (!download.requires_access_token).then(|| download.url.clone())
+}
+
+fn advertised_download_url(download: &DownloadUrl, fallback: impl FnOnce() -> String) -> String {
+    external_download_url(download).unwrap_or_else(fallback)
+}
+
 /// The code system for the `submissionStatus` Coding (per the IG).
 const SUBMISSION_STATUS_SYSTEM: &str = "http://hl7.org/fhir/event-status";
+/// The pre-STU4 draft's status system, still sent by providers tracking the
+/// older spec (the SMART reference provider among them). Accepted leniently;
+/// its `complete`/`aborted` codes map onto `completed`/`stopped`.
+const LEGACY_SUBMISSION_STATUS_SYSTEM: &str =
+    "http://hl7.org/fhir/uv/bulkdata/ValueSet/submission-status";
 
 fn not_implemented() -> RestError {
     RestError::NotImplemented {
@@ -259,7 +272,9 @@ fn parse_submit_request(body: &Value) -> RestResult<SubmitRequest> {
                 // Bulk Data submission-status system.
                 if let Some(coding) = p.get("valueCoding") {
                     if let Some(system) = coding.get("system").and_then(|v| v.as_str()) {
-                        if system != SUBMISSION_STATUS_SYSTEM {
+                        if system != SUBMISSION_STATUS_SYSTEM
+                            && system != LEGACY_SUBMISSION_STATUS_SYSTEM
+                        {
                             return Err(bad_request(format!(
                                 "submissionStatus.system must be '{SUBMISSION_STATUS_SYSTEM}', got '{system}'"
                             )));
@@ -273,7 +288,13 @@ fn parse_submit_request(body: &Value) -> RestResult<SubmitRequest> {
                     .map(String::from)
                     .or_else(|| scalar(p));
                 if let Some(code) = code {
-                    req.submission_status = code;
+                    // Providers tracking the pre-STU4 draft (the SMART
+                    // reference among them) code these two differently.
+                    req.submission_status = match code.as_str() {
+                        "complete" => "completed".to_string(),
+                        "aborted" => "stopped".to_string(),
+                        _ => code,
+                    };
                 }
             }
             "manifestUrl" => req.manifest_url = scalar(p),
@@ -382,7 +403,7 @@ where
         });
     }
 
-    let request_url = format!("{}/$bulk-submit", state.base_url().trim_end_matches('/'));
+    let request_url = state.public_url_for_request(&tenant, ["$bulk-submit"]);
     // Capture `Prefer: handling=` before consuming the body.
     let strict = request
         .headers()
@@ -597,11 +618,7 @@ where
         .ensure_poll_token(ctx, &sub_id)
         .await
         .map_err(RestError::from)?;
-    let status_url = format!(
-        "{}/bulk-submit-status/{}",
-        state.base_url().trim_end_matches('/'),
-        token
-    );
+    let status_url = state.public_url_for_request(&tenant, ["bulk-submit-status", token.as_str()]);
     Response::builder()
         .status(StatusCode::ACCEPTED)
         .header("Content-Location", status_url)
@@ -676,7 +693,7 @@ fn parse_page_param(query: Option<&str>) -> RestResult<usize> {
 pub async fn bulk_submit_poll_handler<S>(
     State(state): State<AppState<S>>,
     Path(token): Path<String>,
-    _tenant: TenantExtractor,
+    tenant: TenantExtractor,
     PeerIp(peer): PeerIp,
     request: Request,
 ) -> RestResult<Response>
@@ -716,6 +733,12 @@ where
             id: token.clone(),
         });
     }
+    if target.tenant.tenant_id().as_str() != tenant.tenant_id() {
+        return Err(RestError::NotFound {
+            resource_type: "bulk-submit-status".to_string(),
+            id: token.clone(),
+        });
+    }
     let ctx = &target.tenant;
     let sub_id = &target.submission_id;
     let page = parse_page_param(request.uri().query())?;
@@ -742,9 +765,31 @@ where
         } else {
             (manifests.iter().filter(|m| m.status.is_terminal()).count() * 100) / manifests.len()
         };
+        // A `processing` manifest whose lease expired several lease-durations
+        // ago has a worker that stopped heartbeating and no healthy worker
+        // reclaiming it (#646). Say so: the old answer was a quiet
+        // "processing" forever, indistinguishable from progress. State is not
+        // mutated — a remote worker deployment may still legitimately pick
+        // the manifest back up, and the reclaim path stays the authority.
+        let stall_after = chrono::Duration::seconds((cfg.lease_duration_secs as i64) * 3);
+        let now = chrono::Utc::now();
+        let stalled = manifests.iter().any(|m| {
+            m.status == helios_persistence::core::ManifestStatus::Processing
+                && m.lease_expiry.is_some_and(|e| now - e > stall_after)
+        });
+        let progress = if stalled {
+            tracing::warn!(
+                submission = %sub_id,
+                "bulk-submit ingestion appears stalled: a processing manifest's \
+                 worker lease expired without renewal or reclaim"
+            );
+            format!("stalled at {pct}% - a worker stopped without handoff; see server logs")
+        } else {
+            format!("processing {pct}% complete")
+        };
         return Response::builder()
             .status(StatusCode::ACCEPTED)
-            .header("X-Progress", format!("processing {pct}% complete"))
+            .header("X-Progress", progress)
             .header("Retry-After", cfg.retry_after_secs.to_string())
             .body(Body::empty())
             .map_err(|e| RestError::InternalError {
@@ -763,7 +808,6 @@ where
         .map_err(RestError::from)?;
     let job_id = submission_output_job_id(sub_id);
     let ttl = Duration::from_secs(cfg.file_url_ttl_secs);
-    let base = state.base_url().trim_end_matches('/');
 
     // Slice the artifact rows into the requested page. Backends return them in a
     // stable order (`ORDER BY id`) and rows are append-only until the whole
@@ -819,14 +863,13 @@ where
         // submit ownership + `system/bulk-submit` — never the export-file surface.
         // Pre-signed URLs (S3) are capability URLs and are used as-is.
         requires_token |= dl.requires_access_token;
-        let url = if dl.requires_access_token {
-            format!(
-                "{base}/bulk-submit-file/{token}/{resource_type}-{}",
-                f.part_index
+        let url = advertised_download_url(&dl, || {
+            let part = format!("{resource_type}-{}", f.part_index);
+            state.public_url_for_request(
+                &tenant,
+                ["bulk-submit-file", token.as_str(), part.as_str()],
             )
-        } else {
-            dl.url
-        };
+        });
         let url = serde_json::Value::String(url);
         match f.file_type.as_str() {
             "output" => {
@@ -869,9 +912,14 @@ where
     // A single `next` link chains to the following page; the last page has none.
     let mut link_arr = Vec::new();
     if page < total_pages {
+        let query = format!("{PAGE_PARAM}={}", page + 1);
         link_arr.push(json!({
             "relation": "next",
-            "url": format!("{base}/bulk-submit-status/{token}?{PAGE_PARAM}={}", page + 1),
+            "url": state.public_url_for_request_with_query(
+                &tenant,
+                ["bulk-submit-status", token.as_str()],
+                Some(&query),
+            ),
         }));
     }
 
@@ -912,7 +960,7 @@ fn severity_array(cs: &Value) -> Value {
 pub async fn bulk_submit_cancel_handler<S>(
     State(state): State<AppState<S>>,
     Path(token): Path<String>,
-    _tenant: TenantExtractor,
+    tenant: TenantExtractor,
     request: Request,
 ) -> RestResult<Response>
 where
@@ -947,6 +995,12 @@ where
             id: token.clone(),
         });
     }
+    if target.tenant.tenant_id().as_str() != tenant.tenant_id() {
+        return Err(RestError::NotFound {
+            resource_type: "bulk-submit-status".to_string(),
+            id: token.clone(),
+        });
+    }
     let ctx = &target.tenant;
     let sub_id = &target.submission_id;
 
@@ -975,7 +1029,7 @@ where
 pub async fn bulk_submit_file_handler<S>(
     State(state): State<AppState<S>>,
     Path((token, part)): Path<(String, String)>,
-    _tenant: TenantExtractor,
+    tenant: TenantExtractor,
     request: Request,
 ) -> RestResult<Response>
 where
@@ -1005,6 +1059,12 @@ where
             id: format!("{token}/{part}"),
         })?;
     if !owns_submission(principal.as_ref(), target.owner_subject.as_deref()) {
+        return Err(RestError::NotFound {
+            resource_type: "bulk-submit-file".to_string(),
+            id: format!("{token}/{part}"),
+        });
+    }
+    if target.tenant.tenant_id().as_str() != tenant.tenant_id() {
         return Err(RestError::NotFound {
             resource_type: "bulk-submit-file".to_string(),
             id: format!("{token}/{part}"),
@@ -1063,6 +1123,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn presigned_download_url_is_preserved_byte_for_byte() {
+        let url = "https://s3.example/object?X-Amz-Signature=a%2Fb&x=1";
+        let download = DownloadUrl {
+            url: url.to_string(),
+            requires_access_token: false,
+        };
+        assert_eq!(external_download_url(&download).as_deref(), Some(url));
+        assert_eq!(
+            advertised_download_url(&download, || "https://fallback.example".to_string()),
+            url
+        );
+
+        let protected = DownloadUrl {
+            url: "internal://artifact".to_string(),
+            requires_access_token: true,
+        };
+        assert_eq!(
+            advertised_download_url(&protected, || "https://public.example/artifact".to_string()),
+            "https://public.example/artifact"
+        );
+    }
+
     fn param(name: &str, key: &str, val: Value) -> Value {
         json!({ "name": name, key: val })
     }
@@ -1083,6 +1166,40 @@ mod tests {
         assert_eq!(req.submission_id, "sub-1");
         assert_eq!(req.submitter_key(), "http://ehr|ehr-1");
         assert_eq!(req.submission_status, "in-progress");
+    }
+
+    /// Providers on the pre-STU4 draft (the SMART reference among them) code
+    /// the status against the old ValueSet URL with `complete`/`aborted`.
+    /// Both are accepted and normalized onto the spec vocabulary.
+    #[test]
+    fn test_parse_legacy_status_vocabulary() {
+        for (legacy, normalized) in [("complete", "completed"), ("aborted", "stopped")] {
+            let body = json!({
+                "resourceType": "Parameters",
+                "parameter": [
+                    param("submitter", "valueIdentifier", json!({"system": "http://ehr", "value": "ehr-1"})),
+                    param("submissionId", "valueString", json!("sub-1")),
+                    param("submissionStatus", "valueCoding", json!({
+                        "system": LEGACY_SUBMISSION_STATUS_SYSTEM,
+                        "code": legacy
+                    })),
+                ]
+            });
+            let req = parse_submit_request(&body).expect("legacy accepted");
+            assert_eq!(req.submission_status, normalized);
+        }
+        // An unknown system is still rejected.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                param("submitter", "valueIdentifier", json!({"system": "http://ehr", "value": "ehr-1"})),
+                param("submissionId", "valueString", json!("sub-1")),
+                param("submissionStatus", "valueCoding", json!({
+                    "system": "http://example.org/other", "code": "completed"
+                })),
+            ]
+        });
+        assert!(parse_submit_request(&body).is_err());
     }
 
     #[test]

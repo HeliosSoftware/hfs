@@ -3,14 +3,7 @@
 //! This module implements the HTTP request handlers for all server endpoints,
 //! including the CapabilityStatement and ViewDefinition/$viewdefinition-run operations.
 
-use axum::{
-    Json,
-    extract::Query,
-    http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
-};
-use chrono::{DateTime, Utc};
-use helios_sof::{
+use crate::{
     ContentType, RunOptions, SofBundle, SofError, SofViewDefinition,
     create_bundle_from_resources_for_version as sof_create_bundle_from_resources_for_version,
     data_source::{DataSource, UniversalDataSource},
@@ -22,6 +15,14 @@ use helios_sof::{
     process_view_definition, run_view_definition_with_options,
     run_view_definition_with_options_remote,
 };
+use axum::{
+    Json,
+    extract::Query,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use tracing::{debug, info};
 
 use super::{
@@ -45,55 +46,60 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
     ))
 }
 
-/// Handler for POST /ViewDefinition/$viewdefinition-run - executes a ViewDefinition
+/// Handler for `POST /$sql-run` — evaluates a subject and returns the rows.
 ///
-/// The `$viewdefinition-run` operation on a ViewDefinition resource applies the view definition to
-/// transform FHIR resources into a tabular format and returns the results synchronously.
+/// `$sql-run` is invoked at the **system level** and names what it acts on
+/// through a subject parameter rather than through the request path. This
+/// stateless server accepts a ViewDefinition subject supplied inline; SQLQuery
+/// and SQLView subjects, which need a resolvable dependency graph, are not
+/// supported here.
 ///
 /// # Arguments
 /// * `params` - Query parameters for filtering, pagination, and output format
 /// * `headers` - HTTP headers including Accept for content negotiation
-/// * `body` - FHIR Parameters resource containing ViewDefinition and resources
+/// * `body` - FHIR Parameters resource containing the subject and resources
 ///
 /// # Body shapes
 ///
 /// The request body may be either:
 /// - A FHIR `Parameters` resource (full form, recommended), or
 /// - A bare `ViewDefinition` resource (shortcut — equivalent to a Parameters
-///   body with a single `viewResource` entry). Other operation parameters
+///   body with a single `subjectResource` entry). Other operation parameters
 ///   (`patient`, `group`, `_format`, `_limit`, `_since`, `header`, `source`)
 ///   must come from the query string when this shape is used.
 ///
-/// # Parameters (in specification order)
+/// # Parameters
 ///
 /// Parameters can be provided as query parameters or in the request body (FHIR Parameters resource).
 /// Parameters in request body take precedence over query parameters.
 ///
-/// | Name | Type | Use | Scope | Min | Max | Documentation |
-/// |------|------|-----|-------|-----|-----|---------------|
-/// | _format | code | in | type, instance | 0 | 1 | Output format - `application/json`, `application/x-ndjson`, `text/csv`, `application/octet-stream` (parquet). Defaults to `application/x-ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
-/// | header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
-/// | viewReference | Reference | in | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. (not yet supported) |
-/// | viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
-/// | patient | Reference | in | type, instance | 0 | * | Filter resources by patient. |
-/// | group | Reference | in | type, instance | 0 | * | Filter resources by group (resolved via `Group.member.entity` against inline resources). |
-/// | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. Supports file://, http(s)://, s3://, gs://, and azure:// URLs. |
-/// | _limit | integer | in | type, instance | 0 | 1 | Limits the number of results. (1-10000) |
-/// | _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
-/// | resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
+/// | Name | Type | Min | Max | Documentation |
+/// |------|------|-----|-----|---------------|
+/// | subjectResource | CanonicalResource | 0 | 1 | The ViewDefinition to execute, supplied inline. |
+/// | subjectCanonical | canonical | 0 | 1 | Canonical URL of the subject. **Rejected**: no resource store. |
+/// | subjectReference | Reference | 0 | 1 | Literal location of the subject. **Rejected**: no resource store. |
+/// | _format | code | 0 | 1 | Output format — `json`, `ndjson`, `csv`, `parquet`, `arrow`, `fhir`. Defaults to `ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
+/// | header | boolean | 0 | 1 | CSV only. `true` (default) returns a header row. |
+/// | patient | Reference | 0 | * | Restrict the resources feeding the view to these patients' compartments. |
+/// | group | Reference | 0 | * | Restrict to members of these Groups (resolved via `Group.member.entity` against inline resources). |
+/// | source | string | 0 | 1 | External data source. Supports file://, http(s)://, s3://, gs://, and azure:// URLs. |
+/// | _limit | integer | 0 | 1 | Maximum rows returned. (1-10000) |
+/// | _since | instant | 0 | 1 | Only resources modified after this time. (RFC3339) |
+/// | resource | Resource | 0 | * | FHIR resources to transform instead of using server data. A Bundle is unwrapped one level. |
 ///
 /// ## Query Parameters
-/// All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `resource` can be provided as POST query parameters
+/// All parameters except the subject trio, `patient`, `group`, and `resource`
+/// can be supplied on the query string.
 ///
 /// # Returns
-/// * `Ok(Response)` - The output of the operation is in the requested format, defined by the format parameter or accept header
+/// * `Ok(Response)` - The rows in the requested format, per `_format` or the Accept header
 /// * `Err(ServerError)` - Various errors for invalid input or processing failures
-pub async fn run_view_definition_handler(
+pub async fn sql_run_handler(
     Query(params): Query<RunQueryParams>,
     headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> ServerResult<Response> {
-    info!("Handling ViewDefinition/$viewdefinition-run request");
+    info!("Handling $sql-run request");
     debug!("Query params: {:?}", params);
 
     // SoF v2 PR #353: `_format` is `0..1` and defaults to `ndjson` when neither
@@ -126,14 +132,15 @@ pub async fn run_view_definition_handler(
         params.format = None;
     }
 
-    // GET / bodyless requests can't carry viewResource or resource. With no
-    // body to extract a ViewDefinition from and no viewReference support
-    // (sof-server is stateless), we reject early with a 400.
+    // GET / bodyless requests can't carry `subjectResource` or `resource`.
+    // Naming a subject by canonical URL or literal reference needs a store to
+    // resolve it against, which this stateless server does not have, so we
+    // reject early with a 400.
     let Some(Json(body)) = body else {
         return Err(ServerError::BadRequest(
-            "GET /ViewDefinition/$viewdefinition-run requires a 'viewReference' to be supported \
-             by the server; this stateless server does not resolve viewReference. Use POST \
-             with viewResource in a Parameters body instead."
+            "GET $sql-run requires the subject to be resolvable by canonical URL or reference; \
+             this stateless server resolves neither. Use POST with subjectResource in a \
+             Parameters body instead."
                 .to_string(),
         ));
     };
@@ -143,11 +150,11 @@ pub async fn run_view_definition_handler(
         validate_query_params(&params, accept_header).map_err(ServerError::BadRequest)?;
 
     // sof-server accepts two body shapes — match the HFS REST handler:
-    //   - A FHIR `Parameters` resource carrying `viewResource`, optional
+    //   - A FHIR `Parameters` resource carrying `subjectResource`, optional
     //     `resource` entries, and operation parameters (`_format`, `_limit`,
     //     `_since`, `patient`, `group`, `header`, `source`).
     //   - A bare `ViewDefinition` resource — equivalent to a `Parameters`
-    //     body with a single `viewResource` entry and no others.
+    //     body with a single `subjectResource` entry and no others.
     // The bare-ViewDefinition shortcut keeps the CLI/server ergonomic for
     // callers that just want to pipe a ViewDefinition without building a
     // Parameters wrapper. Other parameters (filters, limits, format) must
@@ -156,7 +163,7 @@ pub async fn run_view_definition_handler(
         body.get("resourceType").and_then(|v| v.as_str()) == Some("ViewDefinition");
     let extracted_params = if is_bare_view_definition {
         ExtractedParameters {
-            view_definition: Some(body),
+            subject_resource: Some(body),
             ..Default::default()
         }
     } else {
@@ -164,15 +171,22 @@ pub async fn run_view_definition_handler(
         extract_all_parameters(parameters).map_err(ServerError::BadRequest)?
     };
 
-    // Check for not-yet-implemented parameters
-    if extracted_params.view_reference.is_some() {
+    // `subjectCanonical` and `subjectReference` both need a store to resolve
+    // against. sof-server is stateless, so it supports `subjectResource` only.
+    // Per operations-capability.html#partial-operation-support, a server
+    // supporting a subset of an operation's parameters declares that in its own
+    // OperationDefinition rather than citing the guide's.
+    if extracted_params.subject_reference.is_some() || extracted_params.subject_canonical.is_some()
+    {
         return Err(ServerError::NotImplemented(
-            "The viewReference parameter is not yet implemented. Please provide the ViewDefinition directly using the viewResource parameter.".to_string()
+            "This stateless server resolves neither subjectCanonical nor subjectReference. \
+             Supply the subject inline with subjectResource."
+                .to_string(),
         ));
     }
 
     // Group filtering is wired through the compartment-aware filter (see
-    // helios_sof::compartment::resolve_group_members_to_patient_refs): each
+    // crate::compartment::resolve_group_members_to_patient_refs): each
     // supplied `Group/{id}` is resolved against Group resources in the
     // inline bundle, and its `member.entity` Patient references join the
     // effective patient-compartment set. Absent `patient` / `group`
@@ -182,7 +196,7 @@ pub async fn run_view_definition_handler(
     // not-found` per the SoF v2 spec error table.
 
     // For backward compatibility, extract the legacy tuple format
-    let view_def_json = extracted_params.view_definition;
+    let view_def_json = extracted_params.subject_resource;
     let resources_json = if extracted_params.resources.is_empty() {
         None
     } else {
@@ -264,12 +278,12 @@ pub async fn run_view_definition_handler(
     let patient_filter: Vec<String> = if !extracted_params.patient.is_empty() {
         extracted_params.patient
     } else {
-        helios_sof::split_csv_refs(validated_params.patient.as_deref())
+        crate::split_csv_refs(validated_params.patient.as_deref())
     };
     let group_filter: Vec<String> = if !extracted_params.group.is_empty() {
         extracted_params.group
     } else {
-        helios_sof::split_csv_refs(validated_params.group.as_deref())
+        crate::split_csv_refs(validated_params.group.as_deref())
     };
     let source_param = extracted_params.source.or(validated_params.source.clone());
 
@@ -299,14 +313,16 @@ pub async fn run_view_definition_handler(
         || extracted_params.compression.is_some()
     {
         // Create or update Parquet options from body parameters
-        let mut parquet_opts = validated_params.parquet_options.clone().unwrap_or_else(|| {
-            helios_sof::ParquetOptions {
-                row_group_size_mb: 256,
-                page_size_kb: 1024,
-                compression: "snappy".to_string(),
-                max_file_size_mb: None,
-            }
-        });
+        let mut parquet_opts =
+            validated_params
+                .parquet_options
+                .clone()
+                .unwrap_or_else(|| crate::ParquetOptions {
+                    row_group_size_mb: 256,
+                    page_size_kb: 1024,
+                    compression: "snappy".to_string(),
+                    max_file_size_mb: None,
+                });
 
         if let Some(max_size) = extracted_params.max_file_size {
             parquet_opts.max_file_size_mb = Some(max_size);
@@ -539,7 +555,7 @@ pub async fn run_view_definition_handler(
         // CSV-fragile (line-splits assumed no embedded newlines).
         // Remote `resolve()` (trusted-server prefetch) is configured via
         // SOF_RESOLVE_* env vars; when inactive this is a no-op fast path.
-        let remote_config = helios_sof::RemoteResolveConfig::from_env();
+        let remote_config = crate::RemoteResolveConfig::from_env();
         let filtered_output = if remote_config.is_active() {
             run_view_definition_with_options_remote(
                 view_definition,
@@ -575,17 +591,22 @@ pub async fn run_view_definition_handler(
                 .into_response());
         }
 
-        let response = if matches!(validated_params.format, ContentType::Parquet) {
-            // Add Content-Disposition for parquet so browsers download as
-            // `.parquet` rather than rendering octet-stream as binary noise.
+        let response = if matches!(
+            validated_params.format,
+            ContentType::Parquet | ContentType::ArrowIpc
+        ) {
+            // Add Content-Disposition for the binary columnar formats so
+            // browsers download a file rather than rendering binary noise.
+            let filename = if validated_params.format == ContentType::Parquet {
+                "attachment; filename=\"output.parquet\""
+            } else {
+                "attachment; filename=\"output.arrow\""
+            };
             (
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, mime_type),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        "attachment; filename=\"output.parquet\"",
-                    ),
+                    (header::CONTENT_DISPOSITION, filename),
                 ],
                 filtered_output,
             )
@@ -642,20 +663,79 @@ fn create_capability_statement() -> serde_json::Value {
         ],
         "rest": [{
             "mode": "server",
-            // System-level operation (audit item #6 + #7). sof-server is
-            // stateless, so:
-            // - System-level (`[base]/$viewdefinition-run`) and type-level
-            //   (`[base]/ViewDefinition/$viewdefinition-run`) are both
-            //   honored — they're aliases for the same handler.
-            // - Instance-level (`[base]/ViewDefinition/{id}/$viewdefinition-run`)
-            //   is rejected with a 400 because there's no resource store
-            //   to look up a stored ViewDefinition by id.
+            // `$sql-run` is a system-level operation, so it is declared in
+            // `rest.operation` rather than under a resource type.
+            //
+            // `definition` points at *this server's* OperationDefinition, not
+            // the guide's. Per operations-capability.html#partial-operation-support,
+            // citing the guide's definition asserts support for every parameter
+            // it declares; a server supporting a subset SHALL publish its own
+            // definition whose `base` is the guide's and cite that instead.
+            // sof-server is stateless, so it supports `subjectResource` only.
+            //
+            // `$sql-export` is absent because this server runs no async jobs.
             "operation": [{
-                "name": "viewdefinition-run",
-                "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run",
-                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, NDJSON, Parquet, and FHIR Parameters (_format=fhir) output; flat formats may also be returned as a Binary resource envelope via 'Accept: application/fhir+json'. Invoked at the system level (POST /$viewdefinition-run) or type level (POST /ViewDefinition/$viewdefinition-run); the ViewDefinition must be supplied inline in the request body via 'viewResource' (no resource store, so 'viewReference' and instance-level URLs are not supported)."
+                "name": "sql-run",
+                "definition": "/OperationDefinition/sof-sql-run",
+                "documentation": "Execute a ViewDefinition supplied inline and return the rows. Supports CSV, JSON, NDJSON, Parquet, and FHIR Parameters (_format=fhir) output; flat formats may also be returned as a Binary resource envelope via 'Accept: application/fhir+json'. Invoked at the system level (POST /$sql-run). The subject must be supplied inline via 'subjectResource': with no resource store, neither 'subjectCanonical' nor 'subjectReference' can be resolved."
             }]
         }]
+    })
+}
+
+/// `GET /OperationDefinition/sof-sql-run`
+///
+/// This server's own `$sql-run` definition, declaring only the parameters it
+/// actually supports. `base` names the guide's definition, which is the
+/// mechanism base FHIR provides for advertising partial operation support (see
+/// operations-capability.html#partial-operation-support).
+///
+/// Omitted relative to the guide's definition, and rejected on request:
+/// - `subjectCanonical` / `subjectReference` — no resource store to resolve against
+/// - `context` — supporting artifacts only matter for SQLQuery/SQLView subjects
+/// - `source` — no external data sources
+pub async fn sql_run_operation_definition() -> ServerResult<impl IntoResponse> {
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/fhir+json")],
+        Json(create_sql_run_operation_definition()),
+    ))
+}
+
+/// Builds this server's `$sql-run` OperationDefinition. Split out from the
+/// handler so it can be asserted on directly.
+fn create_sql_run_operation_definition() -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "OperationDefinition",
+        "id": "sof-sql-run",
+        "url": "/OperationDefinition/sof-sql-run",
+        "name": "SQLRunSupported",
+        "title": "SQL Run (subset supported by sof-server)",
+        "status": "active",
+        "kind": "operation",
+        "code": "sql-run",
+        "base": crate::canonical::SQL_RUN_OPERATION_DEFINITION,
+        "system": true,
+        "type": false,
+        "instance": false,
+        "parameter": [
+            {
+                "name": "subjectResource",
+                "use": "in",
+                "min": 1,
+                "max": "1",
+                "type": "CanonicalResource",
+                "documentation": "Inline ViewDefinition to execute. Required here: this server resolves no subject by URL."
+            },
+            {"name": "resource", "use": "in", "min": 0, "max": "*", "type": "Resource"},
+            {"name": "_format", "use": "in", "min": 0, "max": "1", "type": "code"},
+            {"name": "header", "use": "in", "min": 0, "max": "1", "type": "boolean"},
+            {"name": "patient", "use": "in", "min": 0, "max": "*", "type": "Reference"},
+            {"name": "group", "use": "in", "min": 0, "max": "*", "type": "Reference"},
+            {"name": "_since", "use": "in", "min": 0, "max": "1", "type": "instant"},
+            {"name": "_limit", "use": "in", "min": 0, "max": "1", "type": "integer"},
+            {"name": "return", "use": "out", "min": 1, "max": "1", "type": "Binary"}
+        ]
     })
 }
 
@@ -724,6 +804,37 @@ fn parse_view_definition_for_version(
     sof_parse_view_definition_for_version(json, version).map_err(ServerError::from)
 }
 
+/// Maps a strict `Parameters` deserialization failure to the right status.
+///
+/// The whole wrapper deserializes in one pass, so a type mismatch *inside an
+/// inline ViewDefinition* also fails there — but that case is documented as
+/// `422 Unprocessable Entity` (audit item #9), not the wrapper's 400 (#670).
+/// Probe the raw JSON for inline ViewDefinitions and let the first one that
+/// fails its own parse speak, with the 422-mapped error; a wrapper that is
+/// malformed anywhere else keeps the 400.
+fn invalid_parameters_error(
+    json: &serde_json::Value,
+    version: helios_fhir::FhirVersion,
+    message: String,
+) -> ServerError {
+    for param in json
+        .get("parameter")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(resource) = param.get("resource") else {
+            continue;
+        };
+        if resource.get("resourceType").and_then(|t| t.as_str()) == Some("ViewDefinition")
+            && let Err(error) = parse_view_definition_for_version(resource.clone(), version)
+        {
+            return error;
+        }
+    }
+    ServerError::BadRequest(message)
+}
+
 /// Parse a Parameters resource from JSON
 fn parse_parameters(json: serde_json::Value) -> ServerResult<RunParameters> {
     // Validate that it's a Parameters resource
@@ -744,26 +855,46 @@ fn parse_parameters(json: serde_json::Value) -> ServerResult<RunParameters> {
     match newest_version {
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R4 Parameters: {}", e)))?;
+            let params = helios_fhir::r4::Parameters::deserialize(&json).map_err(|e| {
+                invalid_parameters_error(
+                    &json,
+                    newest_version,
+                    format!("Invalid R4 Parameters: {}", e),
+                )
+            })?;
             Ok(RunParameters::R4(params))
         }
         #[cfg(feature = "R4B")]
         helios_fhir::FhirVersion::R4B => {
-            let params: helios_fhir::r4b::Parameters = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R4B Parameters: {}", e)))?;
+            let params = helios_fhir::r4b::Parameters::deserialize(&json).map_err(|e| {
+                invalid_parameters_error(
+                    &json,
+                    newest_version,
+                    format!("Invalid R4B Parameters: {}", e),
+                )
+            })?;
             Ok(RunParameters::R4B(params))
         }
         #[cfg(feature = "R5")]
         helios_fhir::FhirVersion::R5 => {
-            let params: helios_fhir::r5::Parameters = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R5 Parameters: {}", e)))?;
+            let params = helios_fhir::r5::Parameters::deserialize(&json).map_err(|e| {
+                invalid_parameters_error(
+                    &json,
+                    newest_version,
+                    format!("Invalid R5 Parameters: {}", e),
+                )
+            })?;
             Ok(RunParameters::R5(params))
         }
         #[cfg(feature = "R6")]
         helios_fhir::FhirVersion::R6 => {
-            let params: helios_fhir::r6::Parameters = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R6 Parameters: {}", e)))?;
+            let params = helios_fhir::r6::Parameters::deserialize(&json).map_err(|e| {
+                invalid_parameters_error(
+                    &json,
+                    newest_version,
+                    format!("Invalid R6 Parameters: {}", e),
+                )
+            })?;
             Ok(RunParameters::R6(params))
         }
         // A `FhirVersion` variant can exist without helios-sof enabling the
@@ -948,88 +1079,6 @@ fn filter_resources_by_since(
     sof_filter_resources_by_since(resources, since).map_err(ServerError::from)
 }
 
-/// `GET /$sql-on-fhir-capabilities`
-///
-/// Returns a FHIR `Parameters` resource describing which SQL-on-FHIR
-/// features this server supports. Shape matches HFS REST's
-/// implementation so clients can use the same response decoder against
-/// either binary. Audit item #11.
-///
-/// sof-server is stateless, so:
-/// - `supportsViewDefinitionRun` = `true`
-/// - `supportsViewDefinitionExport` / `supportsSqlQueryRun` = `false`
-///   (no async export controller, no `$sqlquery-run` endpoint)
-/// - `supportsInDbRunner` = `false` (in-process FHIRPath evaluator only)
-/// - `supportsRelativeReference` / `supportsCanonicalReference` /
-///   `supportsAbsoluteReference` = `false` (no resource store, so
-///   `viewReference` in any shape is rejected with 501 — the
-///   capability block must reflect that truthfully).
-/// - `supportedFormat` = ndjson, json, csv, parquet, fhir (the formats the
-///   `$viewdefinition-run` handler actually emits).
-pub async fn sof_capabilities() -> ServerResult<impl IntoResponse> {
-    info!("Handling SQL-on-FHIR capabilities request");
-    let caps = serde_json::json!({
-        "resourceType": "Parameters",
-        "parameter": [
-            {"name": "supportsViewDefinitionRun", "valueBoolean": true},
-            {"name": "supportsViewDefinitionExport", "valueBoolean": false},
-            {"name": "supportsSqlQueryRun", "valueBoolean": false},
-            {"name": "supportsInDbRunner", "valueBoolean": false},
-            {"name": "supportsRelativeReference", "valueBoolean": false},
-            {"name": "supportsCanonicalReference", "valueBoolean": false},
-            {"name": "supportsAbsoluteReference", "valueBoolean": false},
-            {"name": "supportedFormat", "valueCode": "ndjson"},
-            {"name": "supportedFormat", "valueCode": "json"},
-            {"name": "supportedFormat", "valueCode": "csv"},
-            {"name": "supportedFormat", "valueCode": "parquet"},
-            {"name": "supportedFormat", "valueCode": "fhir"},
-            // Audit item #13: explicit declaration of the spec's
-            // OutputFormatCodes value-set binding (extensible).
-            // The bound codes (csv/ndjson/parquet/json/fhir) are listed
-            // at the canonical CodeSystem URL. The binding is
-            // `extensible`, so a client may use additional codes — but
-            // sof-server only accepts the five advertised above.
-            {
-                "name": "formatBinding",
-                "part": [
-                    {
-                        "name": "valueSet",
-                        "valueUri": "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes"
-                    },
-                    {"name": "strength", "valueCode": "extensible"}
-                ]
-            }
-        ]
-    });
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/fhir+json")],
-        Json(caps),
-    ))
-}
-
-/// Handler for instance-level `$viewdefinition-run` URLs
-/// (`/ViewDefinition/{id}/$viewdefinition-run`).
-///
-/// sof-server is stateless: it has no resource store, so there is no
-/// stored `ViewDefinition/{id}` to invoke. Per the SoF v2 spec the
-/// instance-level form infers the ViewDefinition from the URL path; since
-/// sof-server can't resolve that, we return `400 Bad Request` with a
-/// `not-supported` OperationOutcome rather than `404 Not Found` (which
-/// would imply the id is wrong rather than the form being unsupported).
-///
-/// Audit item #7: makes the instance-level limitation explicit instead
-/// of leaving clients to discover it via a routing 404.
-pub async fn instance_level_not_supported() -> ServerResult<Response> {
-    Err(ServerError::BadRequest(
-        "Instance-level $viewdefinition-run (/ViewDefinition/{id}/$viewdefinition-run) is not \
-         supported by this stateless server — there is no resource store to look up a stored \
-         ViewDefinition by id. Use POST /ViewDefinition/$viewdefinition-run with a 'viewResource' \
-         parameter (or a bare ViewDefinition body) instead."
-            .to_string(),
-    ))
-}
-
 /// Simple health check endpoint
 pub async fn health_check() -> impl IntoResponse {
     info!("Handling Health Check request");
@@ -1055,25 +1104,24 @@ mod tests {
         assert_eq!(cap_stmt["kind"], "instance");
         assert_eq!(cap_stmt["fhirVersion"], get_fhir_version_string());
 
-        // Audit item #6: the operation is published at the REST-system
-        // level (so it's reachable at both [base]/$viewdefinition-run and
-        // [base]/ViewDefinition/$viewdefinition-run).
+        // `$sql-run` is a system-level operation, so it is declared in
+        // `rest.operation` rather than under a resource type.
         let operations = &cap_stmt["rest"][0]["operation"];
         assert!(operations.as_array().is_some());
-        assert_eq!(operations[0]["name"], "viewdefinition-run");
+        assert_eq!(operations[0]["name"], "sql-run");
 
-        // Audit item #7: the documentation makes the stateless scope
-        // explicit — no viewReference, no instance-level invocation.
+        // The documentation makes the stateless scope explicit — the subject
+        // must come in inline, because nothing here can resolve a URL.
         let doc = operations[0]["documentation"]
             .as_str()
             .expect("documentation must be a string");
         assert!(
-            doc.contains("system level") && doc.contains("type level"),
-            "doc must mention which scopes are supported: {doc}"
+            doc.contains("system level"),
+            "doc must state the invocation scope: {doc}"
         );
         assert!(
-            doc.contains("viewResource"),
-            "doc must mention viewResource as the supply mechanism: {doc}"
+            doc.contains("subjectResource"),
+            "doc must mention subjectResource as the supply mechanism: {doc}"
         );
 
         // Audit item #11 partial: output formats are listed.
@@ -1134,28 +1182,58 @@ mod tests {
         );
     }
 
-    /// Audit item #7: instance-level URLs return a clear 400 explaining
-    /// the stateless limitation, not a 404 or 501. The handler is
-    /// route-agnostic (no path extractor) — axum routes ALL instance
-    /// URLs to it, and we just return the canned response.
+    /// This server supports a subset of `$sql-run`, so
+    /// operations-capability.html#partial-operation-support requires it to
+    /// publish its own OperationDefinition naming the guide's as `base`, and to
+    /// cite that from the CapabilityStatement rather than the guide's.
     #[tokio::test]
-    async fn test_instance_level_returns_bad_request() {
-        let result = instance_level_not_supported().await;
-        match result {
-            Err(ServerError::BadRequest(msg)) => {
-                assert!(
-                    msg.contains("Instance-level") && msg.contains("stateless"),
-                    "error message must explain the stateless limitation: {msg}"
-                );
-                assert!(
-                    msg.contains("viewResource"),
-                    "error message must point at the supported alternative: {msg}"
-                );
-            }
-            other => {
-                panic!("expected ServerError::BadRequest for instance-level URL, got {other:?}")
-            }
+    async fn test_sql_run_operation_definition_declares_supported_subset() {
+        let body = create_sql_run_operation_definition();
+
+        assert_eq!(body["resourceType"], "OperationDefinition");
+        assert_eq!(body["code"], "sql-run");
+        assert_eq!(
+            body["base"],
+            crate::canonical::SQL_RUN_OPERATION_DEFINITION,
+            "base must name the guide's definition so a client knows what this subsets"
+        );
+        // System level only.
+        assert_eq!(body["system"], true);
+        assert_eq!(body["type"], false);
+        assert_eq!(body["instance"], false);
+
+        let names: Vec<&str> = body["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"subjectResource"));
+        // The parameters this server cannot honor must be absent, which is how
+        // a client learns not to send them.
+        for unsupported in ["subjectCanonical", "subjectReference", "context", "source"] {
+            assert!(
+                !names.contains(&unsupported),
+                "{unsupported} is not supported and must not be declared: {names:?}"
+            );
         }
+    }
+
+    /// The CapabilityStatement must point at this server's own definition, not
+    /// the guide's — citing the guide's would assert full parameter support.
+    #[test]
+    fn test_capability_statement_declares_sql_run_at_system_level() {
+        let cs = create_capability_statement();
+        let ops = cs["rest"][0]["operation"].as_array().unwrap();
+        let sql_run = ops
+            .iter()
+            .find(|o| o["name"] == "sql-run")
+            .expect("$sql-run must be declared in rest.operation");
+        assert_eq!(sql_run["definition"], "/OperationDefinition/sof-sql-run");
+        assert!(
+            !ops.iter().any(|o| o["name"] == "sql-export"),
+            "this server runs no async jobs, so it must not advertise $sql-export"
+        );
     }
 
     #[cfg(feature = "R4")]

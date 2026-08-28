@@ -136,11 +136,22 @@ pub struct EditorBody {
     pub pretty: String,
     /// The foldable, line-numbered JSON view shown beside the guided form.
     pub json_lines: Vec<crate::json_view::JsonLine>,
+    /// Shared JSON-view partial options. Editor hosts keep the legacy id and
+    /// path metadata used by editor-sync.js.
+    pub json_view_id: &'static str,
+    pub json_view_paths: bool,
     pub error_count: usize,
     /// Issues the validator reported against a path no row owns (an invariant
     /// on a backbone element, say). Surfaced rather than swallowed.
     pub orphan_errors: Vec<String>,
     pub parse_error: Option<String>,
+    /// Dotted path of the node the last mutation created, so the client can
+    /// put the caret straight into it after the swap (#547). Empty when the
+    /// mutation created nothing.
+    pub focus_path: String,
+    /// Whether the root add-picker opens by itself — a document with no
+    /// elements gives the user nothing else to act on (#547).
+    pub auto_open_add: bool,
 }
 
 #[derive(Deserialize)]
@@ -184,7 +195,7 @@ pub async fn page(
     Query(query): Query<EditorQuery>,
 ) -> Response {
     render(EditorPage {
-        status: crate::current_status(state.version, rv.0, &rt),
+        status: crate::current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "editor",
         resource_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
@@ -198,10 +209,13 @@ pub async fn page(
 pub async fn render_body(
     State(_state): State<WebState>,
     locale: RequestLocale,
+    rv: RequestVersion,
     Form(form): Form<EditorForm>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let registry = packs::core_registry(helios_fhir::FhirVersion::default());
+    // The sidebar's FHIR version picks the schema pack (#488): an R4B build
+    // edits against R4B schemas — and offers R4B's extension catalogue.
+    let registry = packs::core_registry(rv.0);
 
     let mut document: Value = match serde_json::from_str(&form.doc) {
         Ok(value) => value,
@@ -214,9 +228,13 @@ pub async fn render_body(
                 document: form.doc.clone(),
                 pretty: form.doc,
                 json_lines: Vec::new(),
+                json_view_id: "json-view",
+                json_view_paths: true,
                 error_count: 0,
                 orphan_errors: Vec::new(),
                 parse_error: Some(error.to_string()),
+                focus_path: String::new(),
+                auto_open_add: false,
             });
         }
     };
@@ -227,9 +245,17 @@ pub async fn render_body(
         .unwrap_or("Patient")
         .to_string();
 
-    apply(&*registry, &resource_type, &mut document, &form);
+    let created = apply(&*registry, &resource_type, &mut document, &form);
 
-    render(build_body(i18n, registry, resource_type, document, None))
+    render(build_body(
+        i18n,
+        registry,
+        rv.0,
+        resource_type,
+        document,
+        None,
+        created,
+    ))
 }
 
 /// Applies one mutation to the document.
@@ -238,12 +264,12 @@ fn apply(
     resource_type: &str,
     document: &mut Value,
     form: &EditorForm,
-) {
+) -> Option<editor::Path> {
     let path = editor::path_from_string(&form.path);
 
     match form.op.as_str() {
         "add" if !form.slice.is_empty() => {
-            editor::add_slice_element(
+            return editor::add_slice_element(
                 resolver,
                 resource_type,
                 document,
@@ -253,10 +279,10 @@ fn apply(
             );
         }
         "add" => {
-            editor::add_element(resolver, resource_type, document, &path, &form.name);
+            return editor::add_element(resolver, resource_type, document, &path, &form.name);
         }
         "choose" => {
-            editor::choose_type(
+            return editor::choose_type(
                 resolver,
                 resource_type,
                 document,
@@ -271,7 +297,7 @@ fn apply(
             } else {
                 form.url.trim()
             };
-            editor::add_extension(
+            return editor::add_extension(
                 resolver,
                 resource_type,
                 document,
@@ -284,20 +310,23 @@ fn apply(
             editor::remove_at(document, &path);
         }
         "set" => {
-            editor::set_value(document, &path, &form.value);
+            editor::set_value(resolver, resource_type, document, &path, &form.value);
         }
         // No op: a plain re-render (the first load, or a mode switch).
         _ => {}
     }
+    None
 }
 
 /// Validates, flattens, and packages the editor body.
 fn build_body(
     i18n: I18n,
     registry: Arc<helios_fhir_validator::SchemaRegistry>,
+    version: helios_fhir::FhirVersion,
     resource_type: String,
     document: Value,
     parse_error: Option<String>,
+    created: Option<editor::Path>,
 ) -> EditorBody {
     // The cheap pass, on every mutation. Pure, no I/O — this is what makes
     // continuous validation affordable at all.
@@ -307,13 +336,16 @@ fn build_body(
         mut errors,
         deferred,
     } = validator.validate_sync(&document, &ValidationOptions::default());
+    // The editor's issue count blocks saving, so only error-severity issues
+    // belong in it — warnings (e.g. extension context, #615) are $validate
+    // guidance, not save blockers.
+    errors.retain(|e| e.severity == helios_fhir_validator::Severity::Error);
 
     // Required-binding checks against the embedded core value sets (offline, no
     // terminology server), so an out-of-value-set code — e.g. gender
     // "masculino" — surfaces in the editor exactly as it does at `$validate`.
     errors.extend(
-        helios_fhir_validator::core_terminology(helios_fhir::FhirVersion::default())
-            .required_binding_errors(&deferred),
+        helios_fhir_validator::core_terminology(version).required_binding_errors(&deferred),
     );
 
     // Anchor each issue to its node. The validator reports `Patient.name.0.given`
@@ -346,25 +378,49 @@ fn build_body(
     // Anything that did not land on a row still has to be seen.
     let claimed: std::collections::HashSet<&str> =
         rows.iter().map(|row| row.path.as_str()).collect();
-    let orphan_errors = by_path
+    let mut orphan_errors: Vec<String> = by_path
         .iter()
         .filter(|(path, _)| !claimed.contains(path.as_str()) && !path.is_empty())
         .flat_map(|(path, messages)| {
-            messages
-                .iter()
-                .map(move |message| format!("{path}: {message}"))
+            messages.iter().map(move |message| {
+                // The validator's message usually opens with the element name
+                // ("priority is required"); prefixing the path then reads
+                // "priority: priority is required". Only prefix when the
+                // message doesn't already carry the leaf name.
+                let leaf = path.rsplit('.').next().unwrap_or(path);
+                if message.starts_with(leaf) {
+                    message.clone()
+                } else {
+                    format!("{path}: {message}")
+                }
+            })
         })
         .collect();
+    orphan_errors.sort();
+    orphan_errors.dedup();
+
+    // A document with nothing beyond resourceType leaves the user nothing to
+    // act on except adding elements — open the root picker for them (#547).
+    let auto_open_add = document
+        .as_object()
+        .map(|o| o.keys().all(|k| k == "resourceType"))
+        .unwrap_or(false);
 
     EditorBody {
         i18n,
         document: serde_json::to_string(&document).unwrap_or_default(),
         pretty: serde_json::to_string_pretty(&document).unwrap_or_default(),
         json_lines: crate::json_view::lines(&document),
+        json_view_id: "json-view",
+        json_view_paths: true,
         error_count: errors.len(),
         orphan_errors,
         rows,
         parse_error,
+        focus_path: created
+            .map(|path| editor::path_to_string(&path))
+            .unwrap_or_default(),
+        auto_open_add,
     }
 }
 
@@ -421,7 +477,7 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
         Step::Index(_) => None,
     });
 
-    let schema = editor::schema_at(resolver, resource_type, path);
+    let schema = editor::schema_at_in(resolver, resource_type, Some(document), path);
     let is_primitive = node.is_string() || node.is_boolean() || node.is_number();
 
     // An extended primitive lives in two JSON keys — `birthDate` and
@@ -480,7 +536,8 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
             .unwrap_or(false),
         slice: match path.split_last() {
             Some((Step::Index(_), parent_path)) => {
-                editor::slice_label(resolver, resource_type, parent_path, node).unwrap_or_default()
+                editor::slice_label(resolver, resource_type, document, parent_path, node)
+                    .unwrap_or_default()
             }
             _ => String::new(),
         },
@@ -519,14 +576,13 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
                 .as_ref()
                 .and_then(|schema| schema.type_.clone())
                 .unwrap_or_default();
-            let contexts = [
-                resource_type,
-                dotted.as_str(),
-                type_context.as_str(),
-                "Element",
-                "Resource",
-                "DomainResource",
-            ];
+            // The abstract bases come from the shared list so this stays one
+            // statement of that set rather than a third hand-copy of it.
+            let contexts: Vec<&str> = [resource_type, dotted.as_str(), type_context.as_str()]
+                .into_iter()
+                .chain(["Element"])
+                .chain(helios_fhir::search::ABSTRACT_BASE_TYPES)
+                .collect();
             registry
                 .extensions_applicable(&contexts)
                 .into_iter()

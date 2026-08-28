@@ -473,6 +473,7 @@ impl BulkSubmitProvider for SqliteBackend {
             total_entries: 0,
             processed_entries: 0,
             failed_entries: 0,
+            lease_expiry: None,
         })
     }
 
@@ -486,7 +487,7 @@ impl BulkSubmitProvider for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
 
         let result = conn.query_row(
-            "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries
+            "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry
              FROM bulk_manifests
              WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
             params![tenant_id, &submission_id.submitter, &submission_id.submission_id, manifest_id],
@@ -499,6 +500,7 @@ impl BulkSubmitProvider for SqliteBackend {
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         );
@@ -512,6 +514,7 @@ impl BulkSubmitProvider for SqliteBackend {
                 total,
                 processed,
                 failed,
+                lease_expiry,
             )) => {
                 let status: ManifestStatus = status_str.parse().map_err(|_| {
                     internal_error(format!("Invalid manifest status: {}", status_str))
@@ -530,6 +533,11 @@ impl BulkSubmitProvider for SqliteBackend {
                     total_entries: total as u64,
                     processed_entries: processed as u64,
                     failed_entries: failed as u64,
+                    lease_expiry: lease_expiry.and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|d| d.with_timezone(&Utc))
+                    }),
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -589,7 +597,6 @@ impl BulkSubmitProvider for SqliteBackend {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
-        let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
         // Verify manifest exists
@@ -606,18 +613,25 @@ impl BulkSubmitProvider for SqliteBackend {
             ));
         }
 
-        // Update manifest status to processing
-        conn.execute(
-            "UPDATE bulk_manifests SET status = 'processing'
-             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
-            params![
-                tenant_id,
-                &submission_id.submitter,
-                &submission_id.submission_id,
-                manifest_id
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
+        // Update manifest status to processing. The connection is scoped to
+        // this one statement: a pooled sync connection held across the entry
+        // loop's awaits is what deadlocked two concurrent workers (#646) —
+        // every per-entry storage call takes its own connection, and the held
+        // one starved them under load.
+        {
+            let conn = self.get_connection()?;
+            conn.execute(
+                "UPDATE bulk_manifests SET status = 'processing'
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
+                params![
+                    tenant_id,
+                    &submission_id.submitter,
+                    &submission_id.submission_id,
+                    manifest_id
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
+        }
 
         let mut results = Vec::new();
         let mut error_count = 0u32;
@@ -671,15 +685,24 @@ impl BulkSubmitProvider for SqliteBackend {
                 error_count += 1;
             }
 
-            // Store the result
-            self.store_entry_result(tenant, submission_id, manifest_id, &entry_result)
-                .await?;
+            // Store the result, keyed by the file it came from (#457): line
+            // numbers restart per file, so the file is part of the identity.
+            self.store_entry_result(
+                tenant,
+                submission_id,
+                manifest_id,
+                options.file_url.as_deref().unwrap_or(""),
+                &entry_result,
+            )
+            .await?;
 
             results.push(entry_result);
         }
 
-        // Update manifest counts
+        // Update manifest counts, on a fresh connection: the loop above is
+        // long and its per-entry calls pool their own.
         let now = Utc::now().to_rfc3339();
+        let conn = self.get_connection()?;
         conn.execute(
             "UPDATE bulk_manifests SET
                 total_entries = total_entries + ?1,
@@ -937,6 +960,7 @@ impl SqliteBackend {
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
+        file_url: &str,
         result: &BulkEntryResult,
     ) -> StorageResult<()> {
         let conn = self.get_connection()?;
@@ -947,15 +971,19 @@ impl SqliteBackend {
             .as_ref()
             .and_then(|o| serde_json::to_vec(o).ok());
 
+        // OR REPLACE: the worker re-fetches a whole file after a transient
+        // failure, and the retry must overwrite its own earlier rows instead
+        // of colliding with them (#457).
         conn.execute(
-            "INSERT INTO bulk_entry_results
-             (tenant_id, submitter, submission_id, manifest_id, line_number, resource_type, resource_id, created, outcome, operation_outcome)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT OR REPLACE INTO bulk_entry_results
+             (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 tenant_id,
                 &submission_id.submitter,
                 &submission_id.submission_id,
                 manifest_id,
+                file_url,
                 result.line_number as i64,
                 &result.resource_type,
                 &result.resource_id,
@@ -1316,14 +1344,14 @@ impl SubmitClaimStrategy for SqliteBackend {
             manifest_id,
             worker_id: worker_id.clone(),
             lease_expiry,
+            lease_duration,
             fencing_token: new_token as u64,
         }))
     }
 
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
         let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        let now = Utc::now();
-        let new_expiry = now + chrono::Duration::seconds(60);
+        let new_expiry = lease.renewed_expiry();
         let affected = conn
             .execute(
                 "UPDATE bulk_manifests SET lease_expiry = ?1
@@ -2055,6 +2083,49 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.is_success()));
         assert!(results.iter().all(|r| r.created));
+    }
+
+    /// #457: a manifest with several output files restarts line numbers in
+    /// each file, so the stored entry-result key must include the file — the
+    /// old key collided on every file after the first.
+    #[tokio::test]
+    async fn test_process_entries_from_multiple_files_do_not_collide() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let sub_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+
+        for (file, family) in [
+            ("http://provider/Patient.ndjson", "FromPatients"),
+            ("http://provider/Practitioner.ndjson", "FromPractitioners"),
+        ] {
+            // Both files start at line 1 — the collision of the old key.
+            let entries = vec![NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": family}]}),
+            )];
+            let options = BulkProcessingOptions::new().with_file_url(file);
+            let results = backend
+                .process_entries(&tenant, &sub_id, &manifest.manifest_id, entries, &options)
+                .await
+                .unwrap_or_else(|e| panic!("file {file} must ingest: {e}"));
+            assert!(results.iter().all(|r| r.is_success()), "{file}");
+        }
+
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.success, 2, "one stored entry result per file");
     }
 
     #[tokio::test]

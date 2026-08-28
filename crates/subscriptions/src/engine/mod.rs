@@ -48,7 +48,7 @@ pub struct SubscriptionEngine {
     email_channel: Option<Arc<EmailChannel>>,
     messaging_channel: Option<Arc<MessagingChannel>>,
     config: SubscriptionConfig,
-    base_url: String,
+    public_base_url_for_tenant: Arc<dyn Fn(&str) -> String + Send + Sync>,
     /// Storage handle used to write a server-driven status transition back into
     /// the stored `Subscription` resource. `None` leaves every transition
     /// in-memory only, which is the pre-#357 behaviour.
@@ -58,6 +58,9 @@ pub struct SubscriptionEngine {
     /// a subscriber outage) cannot drain the primary backend's connection pool
     /// and take reads down with it.
     status_write_slots: Arc<Semaphore>,
+    /// Rolling per-subscription delivery counters (#586) — the operator page's
+    /// last-24-hours figures. In-memory, like the rest of the engine's state.
+    delivery_stats: Arc<crate::delivery_stats::DeliveryStats>,
 }
 
 fn calculate_handshake_retry_delay(
@@ -89,6 +92,19 @@ impl SubscriptionEngine {
         base_url: String,
         outbound_auth: Arc<dyn OutboundAuthProvider>,
     ) -> Self {
+        let resolver: Arc<dyn Fn(&str) -> String + Send + Sync> =
+            Arc::new(move |_| base_url.clone());
+        Self::with_outbound_auth_and_url_resolver(config, resolver, false, outbound_auth)
+    }
+
+    /// Creates an engine whose background notifications resolve a canonical
+    /// public base for each subscription tenant.
+    pub fn with_outbound_auth_and_url_resolver(
+        config: SubscriptionConfig,
+        public_base_url_for_tenant: Arc<dyn Fn(&str) -> String + Send + Sync>,
+        resolve_default_message_source: bool,
+        outbound_auth: Arc<dyn OutboundAuthProvider>,
+    ) -> Self {
         let topic_registry = Arc::new(InMemoryTopicRegistry::new());
         let manager = Arc::new(SubscriptionManager::new(
             Arc::clone(&topic_registry),
@@ -110,10 +126,13 @@ impl SubscriptionEngine {
             None => None,
         };
         let messaging_channel = config.messaging.as_ref().map(|settings| {
-            Arc::new(
-                MessagingChannel::new(settings.source_endpoint.clone(), Arc::clone(&outbound_auth))
-                    .with_private_endpoints_allowed(settings.allow_private_endpoints),
-            )
+            let mut channel =
+                MessagingChannel::new(settings.source_endpoint.clone(), Arc::clone(&outbound_auth));
+            if resolve_default_message_source {
+                channel =
+                    channel.with_source_endpoint_resolver(Arc::clone(&public_base_url_for_tenant));
+            }
+            Arc::new(channel.with_private_endpoints_allowed(settings.allow_private_endpoints))
         });
 
         let status_write_slots = Arc::new(Semaphore::new(config.status_write_concurrency.max(1)));
@@ -130,9 +149,10 @@ impl SubscriptionEngine {
             email_channel,
             messaging_channel,
             config,
-            base_url,
+            public_base_url_for_tenant,
             status_store: None,
             status_write_slots,
+            delivery_stats: Arc::new(crate::delivery_stats::DeliveryStats::new()),
         }
     }
 
@@ -179,6 +199,12 @@ impl SubscriptionEngine {
     }
 
     /// Returns a reference to the WebSocket binding token manager.
+    /// The rolling delivery counters (#586) — the operator page reads its
+    /// last-24-hours figures from here.
+    pub fn delivery_stats(&self) -> &Arc<crate::delivery_stats::DeliveryStats> {
+        &self.delivery_stats
+    }
+
     pub fn ws_token_manager(&self) -> &Arc<WsBindingTokenManager> {
         &self.ws_token_manager
     }
@@ -250,11 +276,12 @@ impl SubscriptionEngine {
             };
 
             // Build notification bundle.
+            let public_base_url = (self.public_base_url_for_tenant)(&subscription.tenant_id);
             let bundle = match notification::build_event_notification(
                 &subscription,
                 event_data,
                 event.resource.as_ref(),
-                &self.base_url,
+                &public_base_url,
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -577,7 +604,8 @@ impl SubscriptionEngine {
         let handshake_max_attempts = self.config.handshake_max_attempts.max(1);
 
         // Build handshake notification.
-        let handshake_bundle = match notification::build_handshake(subscription, &self.base_url) {
+        let public_base_url = (self.public_base_url_for_tenant)(&subscription.tenant_id);
+        let handshake_bundle = match notification::build_handshake(subscription, &public_base_url) {
             Ok(b) => b,
             Err(e) => {
                 warn!(
@@ -802,8 +830,11 @@ impl SubscriptionEngine {
 
         let mut attempt: u32 = 0;
         loop {
+            let now = chrono::Utc::now().timestamp();
             match dispatcher.dispatch(subscription, bundle).await {
                 Ok(DispatchResult::Success) => {
+                    self.delivery_stats
+                        .record_success(tenant_id, sub_id, attempt == 0, now);
                     self.manager.reset_failures(tenant_id, sub_id);
                     info!(
                         tenant_id,
@@ -827,6 +858,7 @@ impl SubscriptionEngine {
                         error = %msg,
                         "Permanent delivery error"
                     );
+                    self.delivery_stats.record_failure(tenant_id, sub_id, now);
                     self.handle_delivery_failure(tenant_id, sub_id).await;
                     return;
                 }
@@ -844,6 +876,7 @@ impl SubscriptionEngine {
                             error = %msg,
                             "Max retries exhausted"
                         );
+                        self.delivery_stats.record_failure(tenant_id, sub_id, now);
                         self.handle_delivery_failure(tenant_id, sub_id).await;
                         return;
                     }
@@ -871,6 +904,7 @@ impl SubscriptionEngine {
                         error = %e,
                         "Dispatch error"
                     );
+                    self.delivery_stats.record_failure(tenant_id, sub_id, now);
                     self.handle_delivery_failure(tenant_id, sub_id).await;
                     return;
                 }
@@ -1114,6 +1148,39 @@ mod tests {
             ..Default::default()
         };
         SubscriptionEngine::new(config, base_url.to_string())
+    }
+
+    #[test]
+    fn canonical_public_base_resolves_for_background_tenant() {
+        let resolver: Arc<dyn Fn(&str) -> String + Send + Sync> =
+            Arc::new(|tenant| format!("https://public.example/fhir/{tenant}"));
+        let engine = SubscriptionEngine::with_outbound_auth_and_url_resolver(
+            SubscriptionConfig::default(),
+            resolver,
+            false,
+            Arc::new(NoOpOutboundAuthProvider),
+        );
+        assert_eq!(
+            (engine.public_base_url_for_tenant)("acme"),
+            "https://public.example/fhir/acme"
+        );
+
+        let config = SubscriptionConfig {
+            messaging: Some(crate::config::MessagingSettings {
+                source_endpoint: "https://fallback.example/fhir".to_string(),
+                allow_private_endpoints: false,
+            }),
+            ..Default::default()
+        };
+        let resolver: Arc<dyn Fn(&str) -> String + Send + Sync> =
+            Arc::new(|tenant| format!("https://public.example/fhir/{tenant}"));
+        let engine = SubscriptionEngine::with_outbound_auth_and_url_resolver(
+            config,
+            resolver,
+            true,
+            Arc::new(NoOpOutboundAuthProvider),
+        );
+        assert!(engine.messaging_channel.is_some());
     }
 
     fn encounter_topic() -> TopicDefinition {

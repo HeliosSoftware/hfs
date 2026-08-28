@@ -1,4 +1,5 @@
 {% extends "layouts/base.html" %}
+{% import "partials/dialog.html" as dialog %}
 
 {% block title %}{{ i18n.t("tenants-title") }} — {{ i18n.t("app-title") }}{% endblock %}
 
@@ -6,7 +7,7 @@
 
 {% block content %}
 <header class="page-head">
-  <h1 class="page-title">{{ i18n.t("tenants-title") }}</h1>
+  <h1 class="page-head__title">{{ i18n.t("tenants-title") }}</h1>
 </header>
 
 {% if !available %}
@@ -44,40 +45,48 @@
     </label>
 
     <!--
-      Add-tenant slide-over. A native <details> disclosure so it opens without
-      JavaScript; the form posts through htmx and swaps the refreshed table back
-      into #tenant-rows. On error the same fragment returns with a banner.
+      Add-tenant dialog (#681: now the same centered-modal presentation as the
+      Bulk Import dialogs, previously an anchored popover). A native <details>
+      disclosure so it opens without JavaScript; the form posts through htmx
+      and swaps the refreshed table back into #tenant-rows. On error the
+      response also carries an out-of-band swap for #tenant-add-error below
+      (#681 adenda), so the submit error shows inside the panel — behind the
+      scrim, the ordinary #tenant-rows banner is not visible.
+
+      The name/id fields stay outside the shared field() macro (partials/
+      dialog.html): they carry data-tenant-name/data-tenant-id for the
+      slug-mirror script (#582), which is more than the macro's standard
+      label+input+hint case covers.
     -->
-    <details class="addbox">
-      <summary class="button button--primary">
-        {% include "icons/plus.svg" %}
-        {{ i18n.t("tenants-add") }}
-      </summary>
-      <div class="addbox__panel">
-        <div class="addbox__title">{{ i18n.t("tenants-add-title") }}</div>
+    {% call dialog::modal(i18n.t("tenants-add"), "tenants-add-dialog-title", i18n.t("tenants-add-title")) %}
         <form
           hx-post="/ui/tenants"
           hx-target="#tenant-rows"
           hx-swap="innerHTML"
+          hx-disabled-elt="find button[type=submit]"
         >
-          <label class="field">
-            <span class="field__label">{{ i18n.t("tenants-field-id") }}</span>
-            <input class="field__input" type="text" name="id" required autocomplete="off"
-                   placeholder="acme-health">
-            <span class="field__hint">{{ i18n.t("tenants-field-id-hint") }}</span>
-          </label>
           <label class="field">
             <span class="field__label">{{ i18n.t("tenants-field-name") }}</span>
             <input class="field__input" type="text" name="display_name" autocomplete="off"
-                   placeholder="Acme Health">
+                   placeholder="Acme Health" data-tenant-name>
             <span class="field__hint">{{ i18n.t("tenants-field-name-hint") }}</span>
           </label>
+          <label class="field">
+            <span class="field__label">{{ i18n.t("tenants-field-id") }}</span>
+            <input class="field__input" type="text" name="id" required autocomplete="off"
+                   placeholder="acme-health" data-tenant-id>
+            <span class="field__hint">{{ i18n.t("tenants-field-id-hint") }}</span>
+          </label>
+          <!-- Out-of-band target for the submit error (#681 adenda); see
+               partials/tenant_add_error.html. Empty on first render, and kept
+               above the action row so the buttons stay the panel's last row. -->
+          <div id="tenant-add-error"></div>
           <div class="addbox__actions">
-            <button type="submit" class="button button--primary">{{ i18n.t("tenants-add-submit") }}</button>
+            <button type="button" class="btn" data-addbox-close>{{ i18n.t("ui-cancel") }}</button>
+            <button type="submit" class="btn btn--primary">{{ i18n.t("tenants-add-submit") }}</button>
           </div>
         </form>
-      </div>
-    </details>
+    {% endcall %}
   </div>
 
   <div id="tenant-rows">
@@ -85,4 +94,5 @@
   </div>
 </section>
 {% endif %}
+<script src="/ui/assets/tenants.js" defer></script>
 {% endblock %}

@@ -90,17 +90,33 @@ impl S3Backend {
     /// [`supports_user_settings`](Self::supports_user_settings) and
     /// `ResourceStorage::supports_tenant_registry`.
     ///
+    /// `BulkSubmitRestWorker` rides that same axis and so is *also* mode
+    /// dependent: the `$bulk-submit` worker's claim queue and poll-token index
+    /// span tenants (see [`crate::backends::s3::submit_worker`]), which
+    /// bucket-per-tenant with no `default_system_bucket` has nowhere to keep.
+    /// Synchronous ingestion (`BulkSubmitIngest`) is tenant-scoped throughout
+    /// and stays in [`base_capabilities`](Self::base_capabilities).
+    ///
     /// The `match` is exhaustive without a wildcard arm on purpose, so adding a
     /// third `S3TenancyMode` is a compile error here rather than a silently
     /// stale claim.
     pub fn declared_capabilities_for(mode: &S3TenancyMode) -> Vec<BackendCapability> {
-        let tenancy = match mode {
-            S3TenancyMode::PrefixPerTenant { .. } => BackendCapability::SharedSchema,
-            S3TenancyMode::BucketPerTenant { .. } => BackendCapability::DatabasePerTenant,
+        let (tenancy, cross_tenant_state) = match mode {
+            S3TenancyMode::PrefixPerTenant { .. } => (BackendCapability::SharedSchema, true),
+            S3TenancyMode::BucketPerTenant {
+                default_system_bucket,
+                ..
+            } => (
+                BackendCapability::DatabasePerTenant,
+                default_system_bucket.is_some(),
+            ),
         };
 
         let mut capabilities = Self::base_capabilities();
         capabilities.push(tenancy);
+        if cross_tenant_state {
+            capabilities.push(BackendCapability::BulkSubmitRestWorker);
+        }
         capabilities
     }
 

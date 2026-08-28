@@ -33,6 +33,34 @@ fi
 echo "Loading Inferno test data into HFS at ${HFS_URL}..."
 echo ""
 
+# Does this server support transaction bundles?
+#
+# Not every backend can. A transaction is all-or-nothing, which S3 cannot
+# provide — it has no atomic multi-object operation — so an s3-elasticsearch
+# deployment declines them rather than committing partially (#489). The
+# fixtures are all transaction bundles, so on those backends they are rewritten
+# to batch bundles first (see to_batch.jq).
+#
+# Asked, not assumed: the CapabilityStatement is derived from the configured
+# backend, so this stays correct as backends are added without the loader
+# needing to know their names.
+TRANSFORM=""
+SUPPORTS_TRANSACTION=$(curl -s "${HFS_URL}/metadata" \
+    | jq -r 'try ([.rest[]?.interaction[]?.code] | index("transaction") != null) catch false' 2>/dev/null)
+
+if [ "$SUPPORTS_TRANSACTION" = "true" ]; then
+    echo "Server advertises 'transaction'; loading bundles as-is."
+else
+    TRANSFORM="$SCRIPT_DIR/to_batch.jq"
+    if [ ! -f "$TRANSFORM" ]; then
+        echo "ERROR: server does not support transactions and $TRANSFORM is missing"
+        exit 1
+    fi
+    echo "Server does not advertise 'transaction'; rewriting bundles to batch."
+    echo "  (urn:uuid references are resolved client-side; POST becomes PUT)"
+fi
+echo ""
+
 FAILED=0
 SUCCESS=0
 SKIPPED=0
@@ -47,7 +75,11 @@ for FILE in "$SCRIPT_DIR"/*.json; do
 
     if [ "$BUNDLE_TYPE" = "transaction" ]; then
         ENDPOINT="/"
-        echo "  Type: transaction bundle -> POST $ENDPOINT"
+        if [ -n "$TRANSFORM" ]; then
+            echo "  Type: transaction bundle -> rewritten to batch -> POST $ENDPOINT"
+        else
+            echo "  Type: transaction bundle -> POST $ENDPOINT"
+        fi
     elif [ "$RESOURCE_TYPE" = "SearchParameter" ]; then
         ENDPOINT="/SearchParameter"
         echo "  Type: SearchParameter -> POST $ENDPOINT"
@@ -60,9 +92,24 @@ for FILE in "$SCRIPT_DIR"/*.json; do
         continue
     fi
 
+    # Rewrite only transaction bundles; SearchParameter and Group posts are
+    # single resources and unaffected.
+    PAYLOAD="$FILE"
+    if [ -n "$TRANSFORM" ] && [ "$BUNDLE_TYPE" = "transaction" ]; then
+        PAYLOAD=$(mktemp)
+        if ! jq -f "$TRANSFORM" "$FILE" > "$PAYLOAD"; then
+            echo "  FAILED (could not rewrite $FILENAME to batch)"
+            rm -f "$PAYLOAD"
+            FAILED=$((FAILED + 1))
+            continue
+        fi
+    fi
+
     RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${HFS_URL}${ENDPOINT}" \
         -H "Content-Type: application/fhir+json" \
-        -d @"$FILE")
+        --data-binary @"$PAYLOAD")
+
+    [ "$PAYLOAD" != "$FILE" ] && rm -f "$PAYLOAD"
 
     HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
     BODY=$(echo "$RESPONSE" | sed '$d')
@@ -85,5 +132,42 @@ if [ "$FAILED" -eq 1 ]; then
     echo "One or more files failed to load"
     exit 1
 fi
+
+# Verify every resource the fixtures address by a concrete id is retrievable.
+#
+# A 2xx on the bundle POST is not proof the data landed where the tests expect.
+# The batch rewrite once relocated `Patient/85`, `/355`, `/907`, `/908` and
+# `/999` onto uuid ids: every POST still returned 2xx, resource counts were
+# unchanged, and Inferno still "passed" — because tests for a missing patient
+# *skip*, and the gate ignores skips (#491). This asserts the ids directly, so
+# that failure mode is loud instead of silent.
+#
+# Derived from the fixtures rather than hardcoded, so it keeps covering whatever
+# ids they use. Only `PUT Type/id` entries are checked: POST-created resources
+# get server-assigned ids that nothing addresses by name.
+echo ""
+echo "Verifying fixture-addressed resources are retrievable..."
+MISSING=0
+CHECKED=0
+for FILE in "$SCRIPT_DIR"/*.json; do
+    [ "$(jq -r '.type // empty' "$FILE")" = "transaction" ] || continue
+    while IFS= read -r URL; do
+        [ -n "$URL" ] || continue
+        CHECKED=$((CHECKED + 1))
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" "${HFS_URL}/${URL}")
+        if [ "$CODE" != "200" ]; then
+            echo "  MISSING: $URL (HTTP $CODE)"
+            MISSING=$((MISSING + 1))
+        fi
+    done <<EOF
+$(jq -r '.entry[]? | select(.request.method == "PUT" and (.request.url | test("^[A-Za-z]+/[^/?]+$"))) | .request.url' "$FILE" | sort -u)
+EOF
+done
+
+if [ "$MISSING" -gt 0 ]; then
+    echo "$MISSING of $CHECKED fixture-addressed resources are not retrievable"
+    exit 1
+fi
+echo "  All $CHECKED fixture-addressed resources retrievable"
 
 echo "All test data loaded successfully"

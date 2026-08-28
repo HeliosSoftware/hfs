@@ -1,5 +1,5 @@
 import { test, expect } from "../pages/fixtures";
-import { createResource } from "../pages/api";
+import { createResource, waitSearchable } from "../pages/api";
 
 // The SearchParameter registry viewer (/ui/search-parameters): the htmx filter
 // rail, the type/source facet chips, row selection into the detail panel, and
@@ -57,10 +57,16 @@ test("a stored parameter can be created, offers Edit, and deletes", async ({
     base: ["Patient"],
     expression: "Patient.identifier",
   });
+  // The page lists via FHIR search; on the ES composites the write is not
+  // searchable until the index refreshes, and the refetched snapshot would
+  // cache without it.
+  await waitSearchable(request, "SearchParameter", id);
 
   // refresh=1 drops the server's cached snapshot so the new parameter shows.
   await searchParameters.goto(`?refresh=1&sel=${encodeURIComponent(url)}`);
-  await expect(page.locator(".page-head__actions a.btn--primary")).toHaveAttribute(
+  // The primary action sits in the page-head row next to the title (the
+  // Resources pattern), not in a standalone actions block under the lede.
+  await expect(page.locator(".page-head--row > a.btn--primary")).toHaveAttribute(
     "href",
     "/ui/editor?type=SearchParameter",
   );
@@ -77,4 +83,55 @@ test("a stored parameter can be created, offers Edit, and deletes", async ({
     headers: { Accept: "application/fhir+json" },
   });
   expect([404, 410]).toContain(res.status());
+});
+
+// #679: the conformance delete rides the shared busy helper. A failed DELETE
+// must re-enable the button next to its inline error — the old ad-hoc code
+// did, and the helper must not regress it into a permanently dead control.
+test("a failed delete shows the busy state, then re-enables the button", async ({
+  page,
+  searchParameters,
+  request,
+}) => {
+  const stamp = Date.now();
+  const url = `http://example.org/e2e/SearchParameter/busy-${stamp}`;
+  const id = await createResource(request, "SearchParameter", {
+    url,
+    name: "e2eBusyDelete",
+    code: `e2e-busy-${stamp}`,
+    status: "active",
+    type: "token",
+    base: ["Patient"],
+    expression: "Patient.identifier",
+  });
+  await waitSearchable(request, "SearchParameter", id);
+  await searchParameters.goto(`?refresh=1&sel=${encodeURIComponent(url)}`);
+
+  let release!: () => void;
+  const parked = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(new RegExp(`/SearchParameter/${id}$`), async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue().catch(() => {});
+    await parked;
+    await route
+      .fulfill({
+        status: 500,
+        contentType: "application/fhir+json",
+        body: JSON.stringify({
+          resourceType: "OperationOutcome",
+          issue: [{ severity: "error", code: "exception", diagnostics: "boom" }],
+        }),
+      })
+      .catch(() => {});
+  });
+
+  page.once("dialog", (d) => d.accept());
+  const del = page.locator(".detail__actions [data-crud-delete]");
+  await del.click();
+  await expect(del).toHaveAttribute("aria-busy", "true");
+  await expect(del).toBeDisabled();
+
+  release();
+  await expect(page.locator(".detail__actions .alert")).toBeVisible();
+  await expect(del).toBeEnabled();
+  await expect(del).not.toHaveAttribute("aria-busy", "true");
 });

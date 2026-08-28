@@ -1,4 +1,8 @@
 import { test, expect } from "../pages/fixtures";
+import {
+  CANONICAL_BUTTON_GEOMETRY,
+  readButtonGeometries,
+} from "../pages/button-geometry";
 
 // Tenant maintenance (/ui/tenants): the htmx add-tenant slide-over, the live
 // search filter, and per-row delete (hx-confirm). Skips itself if this backend
@@ -16,10 +20,22 @@ test.describe("tenants", () => {
     }
   });
 
-  test("adding a tenant slides it into the table", async ({ tenants }) => {
+  test("provisioning shows a spinner row until the tenant is ready", async ({ tenants }) => {
     const id = `e2e-add-${Date.now().toString(36)}`;
-    await tenants.addTenant(id, "E2E Added");
-    await expect(tenants.row(id)).toBeVisible();
+    await tenants.addToggle.click();
+    await tenants.addForm.locator("input[name=display_name]").fill("E2E Added");
+    await tenants.addForm.locator("input[name=id]").fill(id);
+    await tenants.addForm.locator("button[type=submit]").click();
+    // The panel closes as soon as the server accepts the job…
+    await expect(tenants.addForm).toBeHidden();
+    // …and the table reports the in-flight job, surviving a reload.
+    const row = tenants.row(id);
+    await expect(row.locator(".spinner")).toBeVisible();
+    await tenants.page.reload();
+    await expect(tenants.row(id).locator(".spinner")).toBeVisible();
+    // Eventually the job settles into a normal row.
+    await expect(tenants.row(id).locator("[hx-delete]")).toBeVisible({ timeout: 240_000 });
+    await expect(tenants.row(id).locator(".spinner")).toHaveCount(0);
   });
 
   test("the search box filters the table (htmx)", async ({ page, tenants }) => {
@@ -31,6 +47,63 @@ test.describe("tenants", () => {
     await expect(tenants.row(id)).toBeVisible();
     await tenants.search.fill("zzz-no-such-tenant");
     await expect(tenants.row(id)).toBeHidden();
+  });
+
+  test("a successful create clears the form and collapses the panel", async ({ tenants }) => {
+    const id = `e2e-reset-${Date.now().toString(36)}`;
+    await tenants.addTenant(id, "Resettable");
+    await expect(tenants.row(id)).toBeVisible();
+    // addTenant() collapses the panel if it is still open; after this change
+    // the server-side success trigger already did that.
+    await tenants.addToggle.click();
+    await expect(tenants.addForm.locator("input[name=id]")).toHaveValue("");
+    await expect(tenants.addForm.locator("input[name=display_name]")).toHaveValue("");
+  });
+
+  test("a failed create keeps the typed values next to the error banner", async ({ page, tenants }) => {
+    const id = `e2e-dup-${Date.now().toString(36)}`;
+    await tenants.addTenant(id, "First");
+    await expect(tenants.row(id)).toBeVisible();
+    await tenants.addToggle.click();
+    await tenants.addForm.locator("input[name=id]").fill(id);
+    await tenants.addForm.locator("input[name=display_name]").fill("Second");
+    await tenants.addForm.locator("button[type=submit]").click();
+    // The dialog's own submit error (#681 adenda): rendered inside the panel
+    // via an out-of-band swap, not the page-level #tenant-rows banner, which
+    // sits behind the modal scrim while the dialog is open.
+    await expect(page.locator("#tenant-add-error")).toContainText("already exists");
+    await expect(tenants.addForm.locator("input[name=id]")).toHaveValue(id);
+    await expect(tenants.addForm.locator("input[name=display_name]")).toHaveValue("Second");
+  });
+
+  test("typing a display name mirrors a slug into the tenant id", async ({ tenants }) => {
+    await tenants.addToggle.click();
+    const actionMetrics = await readButtonGeometries(
+      tenants.addForm.locator(".addbox__actions .btn"),
+    );
+    expect(actionMetrics).toHaveLength(2);
+    for (const geometry of actionMetrics) expect(geometry).toEqual(CANONICAL_BUTTON_GEOMETRY);
+    await tenants.addForm.locator("input[name=display_name]").fill("Acme Health");
+    await expect(tenants.addForm.locator("input[name=id]")).toHaveValue("acme-health");
+    await tenants.addForm.locator("input[name=display_name]").fill("  Ünïcode & Co.  ");
+    await expect(tenants.addForm.locator("input[name=id]")).toHaveValue("unicode-co");
+  });
+
+  test("editing the tenant id by hand stops the mirror", async ({ tenants }) => {
+    await tenants.addToggle.click();
+    await tenants.addForm.locator("input[name=display_name]").fill("Acme Health");
+    await tenants.addForm.locator("input[name=id]").fill("acme");
+    await tenants.addForm.locator("input[name=display_name]").fill("Acme Health Europe");
+    await expect(tenants.addForm.locator("input[name=id]")).toHaveValue("acme");
+  });
+
+  test("clearing the tenant id re-arms the mirror", async ({ tenants }) => {
+    await tenants.addToggle.click();
+    await tenants.addForm.locator("input[name=display_name]").fill("Acme Health");
+    await tenants.addForm.locator("input[name=id]").fill("acme");
+    await tenants.addForm.locator("input[name=id]").fill("");
+    await tenants.addForm.locator("input[name=display_name]").fill("Acme Health Europe");
+    await expect(tenants.addForm.locator("input[name=id]")).toHaveValue("acme-health-europe");
   });
 
   test("deleting a tenant deregisters it", async ({ page, tenants }) => {

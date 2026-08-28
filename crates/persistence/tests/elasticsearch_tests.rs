@@ -421,11 +421,15 @@ mod parameter_handler_tests {
         }
 
         #[test]
-        fn test_not_modifier() {
+        fn test_not_modifier_builds_positive_clause() {
+            // The negation is applied once by the query builder, around the OR
+            // of every value (#473) — the per-value clause stays positive.
             let param = make_param("gender", SearchParamType::Token, Some(SearchModifier::Not));
             let clause = token::build_clause(&param, "male").unwrap();
             let s = serde_json::to_string(&clause).unwrap();
-            assert!(s.contains("must_not"));
+            assert!(!s.contains("must_not"));
+            assert!(s.contains("search_params.token.code"));
+            assert!(s.contains("male"));
         }
 
         #[test]
@@ -591,6 +595,12 @@ mod parameter_handler_tests {
 ///
 /// Skip if no Docker:
 ///   cargo test -p helios-persistence --features elasticsearch -- --skip es_integration
+/// The backend-agnostic day-precision date-boundary suite (issue #519) — the
+/// #456 table that #463 pinned for SQLite only; the ES date handler was
+/// explicitly unverified. `#[path]`-included like the other shared suites.
+#[path = "search/date_boundary_suite.rs"]
+mod date_boundary_suite;
+
 #[cfg(test)]
 mod es_integration {
     use std::path::PathBuf;
@@ -738,6 +748,13 @@ mod es_integration {
 
     fn create_tenant(id: &str) -> TenantContext {
         TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
+    }
+
+    /// #519: the #456 boundary table over the real ES search path.
+    #[tokio::test]
+    async fn es_day_precision_date_boundaries() {
+        let backend = create_backend().await;
+        super::date_boundary_suite::day_precision_boundaries(&backend, "date-boundary-519").await;
     }
 
     // ========================================================================
@@ -1712,6 +1729,96 @@ mod es_integration {
     // ========================================================================
 
     #[tokio::test]
+    async fn es_integration_search_missing_modifier() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("missing-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "with-birthdate",
+                    "birthDate": "1980-01-15"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "without-birthdate"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .refresh_index("missing-tenant", "Patient")
+            .await
+            .unwrap();
+
+        let query = |value: &str| {
+            SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "birthdate".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: Some(SearchModifier::Missing),
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        let missing = backend.search(&tenant, &query("true")).await.unwrap();
+        let missing_ids: Vec<&str> = missing.resources.items.iter().map(|r| r.id()).collect();
+        assert_eq!(missing_ids, vec!["without-birthdate"]);
+
+        let present = backend.search(&tenant, &query("false")).await.unwrap();
+        let present_ids: Vec<&str> = present.resources.items.iter().map(|r| r.id()).collect();
+        assert_eq!(present_ids, vec!["with-birthdate"]);
+
+        for (name, param_type) in [
+            ("_id", SearchParamType::Token),
+            ("_lastUpdated", SearchParamType::Date),
+        ] {
+            let metadata_query = |is_missing| {
+                SearchQuery::new("Patient").with_parameter(SearchParameter {
+                    name: name.to_string(),
+                    param_type,
+                    modifier: Some(SearchModifier::Missing),
+                    values: vec![SearchValue::boolean(is_missing)],
+                    chain: vec![],
+                    components: vec![],
+                })
+            };
+
+            let missing = backend
+                .search(&tenant, &metadata_query(true))
+                .await
+                .unwrap();
+            assert!(missing.resources.items.is_empty(), "{name}:missing=true");
+
+            let present = backend
+                .search(&tenant, &metadata_query(false))
+                .await
+                .unwrap();
+            let mut ids: Vec<&str> = present.resources.items.iter().map(|r| r.id()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["with-birthdate", "without-birthdate"]);
+        }
+    }
+
+    #[tokio::test]
     async fn es_integration_search_by_name() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{
@@ -2092,6 +2199,119 @@ mod es_integration {
             result.resources.items.len(),
             2,
             "Should find 2 patients with code 12345"
+        );
+    }
+
+    /// `:not` means "no value of the parameter matches" (#473). Three cases
+    /// that a per-value or per-row negation gets wrong:
+    /// resources whose element is absent must be returned; a multi-valued
+    /// element must not leak back in through its other values; and `:not=a,b`
+    /// is `NOT (a OR b)`, not `NOT a OR NOT b`.
+    #[tokio::test]
+    async fn es_integration_search_token_not_modifier() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let communication = |codes: &[&str]| {
+            codes
+                .iter()
+                .map(|code| {
+                    json!({ "language": { "coding": [{
+                        "system": "urn:ietf:bcp:47",
+                        "code": code
+                    }]}})
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (id, langs) in [
+            ("lang-en", vec!["en-US"]),
+            // Multi-valued: holds the excluded code AND another one.
+            ("lang-en-es", vec!["en-US", "es"]),
+            ("lang-fr", vec!["fr"]),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "communication": communication(&langs)
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // No communication element at all — has no value, so it matches :not.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "lang-none" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let query = |values: Vec<SearchValue>| {
+            SearchQuery::new("Patient")
+                .with_parameter(SearchParameter {
+                    name: "language".to_string(),
+                    param_type: SearchParamType::Token,
+                    modifier: Some(SearchModifier::Not),
+                    values,
+                    chain: vec![],
+                    components: vec![],
+                })
+                .with_count(100)
+        };
+
+        let ids = |result: &helios_persistence::core::SearchResult| {
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        let result = backend
+            .search(&tenant, &query(vec![SearchValue::token(None, "en-US")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&result),
+            vec!["lang-fr", "lang-none"],
+            "language:not=en-US excludes both en-US patients (incl. the one that also has 'es') \
+             and returns the patient with no communication element"
+        );
+
+        let result = backend
+            .search(
+                &tenant,
+                &query(vec![
+                    SearchValue::token(None, "en-US"),
+                    SearchValue::token(None, "fr"),
+                ]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&result),
+            vec!["lang-none"],
+            "language:not=en-US,fr is NOT (en-US OR fr) — only the patient with no language remains"
         );
     }
 
@@ -2661,8 +2881,8 @@ mod es_integration {
     async fn es_integration_contained_search() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{
-            ContainedMode, ContainedReturn, SearchParamType, SearchParameter, SearchQuery,
-            SearchValue,
+            ContainedMode, ContainedReturn, SearchModifier, SearchParamType, SearchParameter,
+            SearchQuery, SearchValue,
         };
 
         let backend = create_backend().await;
@@ -2678,12 +2898,20 @@ mod es_integration {
                     "status": "final",
                     "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
                     "subject": { "reference": "#p1" },
-                    "contained": [{
-                        "resourceType": "Patient",
-                        "id": "p1",
-                        "name": [{ "family": "Smith", "given": ["Contained"] }],
-                        "gender": "male"
-                    }]
+                    "contained": [
+                        {
+                            "resourceType": "Patient",
+                            "id": "p1",
+                            "name": [{ "family": "Smith", "given": ["Contained"] }],
+                            "gender": "male"
+                        },
+                        {
+                            "resourceType": "Patient",
+                            "id": "p2",
+                            "name": [{ "family": "Jones", "given": ["Contained"] }],
+                            "birthDate": "1980-01-15"
+                        }
+                    ]
                 }),
                 FhirVersion::default(),
             )
@@ -2765,6 +2993,32 @@ mod es_integration {
         let mut both_urls: Vec<String> = both.resources.items.iter().map(|r| r.url()).collect();
         both_urls.sort();
         assert_eq!(both_urls, vec!["Observation/obs1", "Patient/top1"]);
+
+        let missing_query = |is_missing| {
+            let mut q = SearchQuery::new("Patient");
+            q.contained = ContainedMode::On;
+            q.contained_return = ContainedReturn::Contained;
+            q.parameters.push(SearchParameter {
+                name: "birthdate".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: Some(SearchModifier::Missing),
+                values: vec![SearchValue::boolean(is_missing)],
+                chain: vec![],
+                components: vec![],
+            });
+            q
+        };
+
+        let missing = backend.search(&tenant, &missing_query(true)).await.unwrap();
+        let missing_ids: Vec<&str> = missing.resources.items.iter().map(|r| r.id()).collect();
+        assert_eq!(missing_ids, vec!["p1"]);
+
+        let present = backend
+            .search(&tenant, &missing_query(false))
+            .await
+            .unwrap();
+        let present_ids: Vec<&str> = present.resources.items.iter().map(|r| r.id()).collect();
+        assert_eq!(present_ids, vec!["p2"]);
     }
 
     #[tokio::test]

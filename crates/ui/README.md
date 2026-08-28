@@ -1,12 +1,13 @@
 # helios-ui — HTMX-first web UI for HFS
 
-This crate is the foundation for a server-rendered, **HTMX-first** web UI for the
-Helios FHIR Server. It is a thin Axum library crate that owns templates, static
-assets, and view handlers, and is mounted by the `hfs` binary as a sub-router
-under `/ui`.
+A server-rendered, **HTMX-first** web UI for the Helios FHIR Server. It is a thin
+Axum library crate that owns templates, static assets, and view handlers, and is
+mounted by the `hfs` binary as a sub-router under `/ui`.
 
 This document is both the discussion doc and the **rules of the road**: when we
-build UI in this codebase, this is where things go and why.
+build UI in this codebase, this is where things go and why. For the operational
+summary — routes, config, test commands — see the `/work-with-ui` skill
+(`.claude/skills/work-with-ui/SKILL.md`).
 
 ---
 
@@ -17,18 +18,24 @@ partial page updates. Handlers return **full pages** on hard navigations and
 **HTML fragments** on `HX-Request`s. State lives on the server; the client stays
 thin.
 
+**There is no React, Vue, Svelte, Alpine, or jQuery here — and no bundler, no
+npm dependency, and no build step for the browser code.** The only vendored
+third-party script is htmx itself; everything else under `assets/` is
+hand-written vanilla JS in an IIFE. Do not introduce a framework.
+
 Why, over a SPA + JSON API:
 
 - **Stays close to the FHIR logic we already have.** The UI calls into the
-  existing workspace crates (`helios-rest`, `helios-persistence`, `helios-hts`,
-  …) and renders the result. There is no second copy of the domain model in a
-  browser client, and no client-side view state to keep in sync.
+  existing workspace crates (`helios-fhir`, `helios-fhir-validator`,
+  `helios-persistence`, `helios-observability`) and renders the result. There is
+  no second copy of the domain model in a browser client, and no client-side view
+  state to keep in sync.
 - **No duplicated API surface.** We do not add a browser-facing JSON API.
   htmx consumes HTML fragments, so the FHIR REST surface stays clean and
   UI-agnostic.
 - **Progressive enhancement.** Because the server renders real HTML at real
-  URLs, the UI degrades to working full-page loads when JavaScript is absent
-  (see the `/ui/status` handler). See
+  URLs, the UI degrades to working full-page loads when JavaScript is absent —
+  asserted by the `nojs` Playwright project, not just promised. See
   [HATEOAS](https://htmx.org/essays/hateoas/) and
   [Hypermedia Systems](https://hypermedia.systems/).
 - **Locality of Behaviour.** Behavior is co-located with markup via `hx-*`
@@ -66,31 +73,124 @@ safe.
 
 ## Assets: vendored & embedded, never a runtime CDN
 
-htmx and CSS are **vendored** under `assets/` (pinned: `htmx.org@2.0.4`) and
-**embedded into the binary** at compile time with
-[rust-embed](https://docs.rs/rust-embed), served from `/ui/assets/*`.
+htmx, CSS, fonts, and the per-page scripts are **vendored** under `assets/`
+(htmx pinned at `htmx.org@2.0.4`) and **embedded into the binary** at compile
+time with [rust-embed](https://docs.rs/rust-embed), served from `/ui/assets/*`
+by [axum-embed](https://docs.rs/axum-embed) with br/gzip/deflate negotiation.
 
 **Never hotlink a CDN in production.** A healthcare server may run offline or
 air-gapped, and a runtime CDN dependency is a supply-chain risk. Embedding also
 keeps `hfs` a single self-contained binary — no asset directory to ship
-alongside it.
+alongside it. `e2e/tests/no-cdn.spec.ts` makes this executable: it fails if any
+page issues an off-origin request.
+
+`debug-embed` is on, so **debug builds embed too** — editing a file under
+`assets/` or `templates/` needs a rebuild to take effect. Assets are served with
+`Cache-Control: no-cache` plus a content-based `ETag`, so unchanged assets come
+back as a cheap `304` while a rebuilt one is always re-fetched rather than served
+stale.
 
 To update htmx, replace `assets/htmx.min.js` with the new pinned release and
 note the version bump in the commit.
 
+### Client-side scripts
+
+Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
+`json-view.js` and `busy.js` load from the shared layout because their behavior
+is used across workspaces — `busy.js` ahead of every page script (defer runs in
+document order) because page scripts call into it. `theme.js` loads **without
+`defer`**, before first paint, to avoid a flash of the wrong theme. `busy.js`
+is the crate's one exported global (`window.hfsBusy`): unlike the closed IIFEs
+it exists to be called by the others.
+
+| Asset | Owns |
+|---|---|
+| `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
+| `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
+| `saved-queries.js` | Saved queries, the visual search builder, and the `/_user/settings` read/modify/write cycle |
+| `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
+| `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
+| `resources.js` | The Resources workspace edit modal and "Create new" |
+| `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
+| `history.js` | Version selection and diff requests |
+| `nl-search.js` | Natural-language search mode (only loaded when configured) |
+| `resource-filter.js`, `conformance-crud.js` | The conformance viewers' rail filter and write half |
+
+`editor.js` is deliberately thin, and that is the architectural point: it does
+not model the resource, know what a choice type is, or understand cardinality.
+All of that lives in Rust behind `/ui/editor/render`, where it is tested.
+
 ---
+
+## Copy capitalization (#652)
+
+The English catalog (`locales/en/main.ftl`) follows one convention:
+
+- **Title Case** for page titles, section headings, card titles, nav entries,
+  tab labels, and action buttons/controls (`Server Dashboard`, `Add Tenant`,
+  `Save Changes`). Small words stay lowercase mid-title (`a, an, and, as, at,
+  by, for, from, in, of, on, or, the, to, with`); hyphenated compounds
+  capitalize both halves (`Per-Action Outcomes`).
+- **Sentence case** for anything that reads as a sentence or fragment:
+  ledes, help text, hints, subtitles, placeholders, confirmation prompts,
+  status values, and error messages — even when the key suffix says `-title`
+  or `-heading` (a full-sentence heading stays a sentence).
+- FHIR and spec spellings are verbatim, always: `FHIR`, `SQL on FHIR`,
+  `ViewDefinition`, `NDJSON`, env-var names.
+
+Spanish and German keep their own capitalization norms (both languages use
+sentence case where English uses Title Case); the convention above is for
+`en` only.
+
+## Required-field marker (#680)
+
+Required fields get an accent-colored asterisk, matching the marker already
+used by the resource editor's add-picker (`.editor-add__name em`). This is
+implemented as a single CSS `:has()` rule next to `.field__label` in
+`assets/app.css`, not per-field markup: the `required` attribute on the input
+is the source of truth, and the rule appends `*` after the field's visible
+label whenever it wraps a required input. The one field without a visible
+label — the search builder's query URL — is marked on its `query-builder__tag`
+chip instead. No template renders `*` for this; the only literal `<em>*</em>`
+in the codebase is the editor's own (unrelated) marker. Changing the
+convention later (e.g. an `(optional)` suffix instead) means editing only
+that one CSS rule.
+
+## Error wording (#677)
+
+Errors follow one convention across the Fluent catalogs
+(`locales/{en,es,de}/main.ftl`) and the OperationOutcome diagnostics that
+`crates/rest/src/error.rs` renders into them:
+
+- Full-sentence errors end with a terminal period; fragments, labels, and
+  status values (`Failed`, `failed`, `unavailable`) take none.
+- Operation failures use one shape: a full sentence naming the object, with
+  the cause after an em dash — `Could not add the tenant — that ID is
+  already in use.`
+- Interpolated values are single-quoted: `Content type 'text/csv' is not
+  supported.`
+- Duality: this convention governs what the user sees — the message catalogs
+  and the `diagnostics` field of returned `OperationOutcome`s, which reach
+  the browser verbatim. It does not apply to `RestError`'s `Display` impl in
+  `crates/rest/src/error.rs`, which stays in its own `Label: value` shape —
+  that form is for logs and traces, not the UI, and is intentionally
+  distinct.
 
 ## Rules of the road — where things go
 
 - `crates/ui/src/` — Axum handlers/routers returning `impl IntoResponse`
-  (HTML). **Thin:** parse request → call into `helios-rest` /
-  `helios-persistence` / `helios-hts` → render a template.
+  (HTML). **Thin:** parse request → call into the workspace → render a template.
+  Modules: `lib.rs` (router, dashboard, prefs, search), `editor.rs`,
+  `search_params.rs`, `compartments.rs`, `conformance.rs`, `history.rs`,
+  `tenants.rs`, `json_view.rs`, `i18n.rs`.
 - `crates/ui/templates/` — `.html` templates:
   - `layouts/` — shared document shells (`base.html`).
   - `pages/` — full documents (extend a layout).
   - `partials/` — HTMX-swappable fragments (no `<html>` wrapper).
-- `crates/ui/assets/` — vendored, pinned `htmx.min.js`, CSS, images. Embedded;
-  never fetched at runtime.
+  - `icons/` — Figma-exported SVGs, inlined with `{% include %}`.
+- `crates/ui/assets/` — vendored, pinned `htmx.min.js`, CSS, JS, fonts, images.
+  Embedded; never fetched at runtime.
+- `locales/<locale>/main.ftl` — **at the workspace root**, not in this crate.
 - Handlers branch on the **`HX-Request`** header to return a fragment vs. a full
   page (progressive enhancement).
 
@@ -103,12 +203,95 @@ note the version bump in the commit.
   persistence or terminology logic here.
 - **No new browser-facing JSON API** to feed the UI. htmx consumes HTML
   fragments, not JSON.
+- **No SPA framework, no bundler, no npm dependency** for browser code. (The
+  `e2e/` directory has a `package.json`, but that is test-only and never ships.)
 - **No inline `<script>` blobs or scattered JS.** Prefer `hx-*` attributes
   (Locality of Behaviour); where JS is truly needed, use small pinned assets.
+  Inert `type="application/json"` data carriers are the one allowed exception,
+  and `no-cdn.spec.ts` enforces the rest.
+- **No off-origin requests** — no CDN, no remote font, no remote image.
+- **No user-visible prose in templates** — templates hold Fluent catalog keys.
 - **`helios-rest`'s FHIR REST handlers stay UI-agnostic** — the UI depends on
   them, not the reverse.
 - **Don't couple templates to a single FHIR version** — go through the
   version-agnostic abstractions already in the workspace.
+- **No new component class for a primitive that already exists, and no
+  page-local CSS for a shared control.** The vocabulary below is the whole
+  list; `.button` next to `.btn` is how the Import page drifted off the design
+  (#543). `design-system.spec.ts` fails a page that uses an undefined class,
+  restyles a shared primitive, or defines a selector twice.
+
+---
+
+## Component vocabulary
+
+`assets/app.css` is one stylesheet in four cascade layers —
+`@layer tokens, base, components, pages` — so a page rule outranks a component
+rule by layer, never by accident of specificity or source order. `tokens` holds
+the custom properties, `base` element defaults, `components` the shared
+vocabulary, `pages` what is genuinely unique to one screen.
+
+These are the shared primitives. Before styling anything, reach for one; add to
+`pages` only what no other screen will ever want.
+
+| Class | What it is |
+|---|---|
+| `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current`, `.btn--icon` | The action button: 30px high, 12px horizontal padding, 12px type, and a 9px radius. Primary, danger, and current change emphasis only; `--icon` makes the control a 30px square with no horizontal padding. |
+| `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
+| `.panel` | Padding for a full-width card that hosts detail fields without rail behavior. |
+| `.kv-grid` | Responsive two-column key/value layout; collapses to one column on compact viewports. |
+| `.page-head`, `.page-head__title`, `.page-head__lede`, `.page-head--row` | Page heading block; the only `<h1>` treatment; `--row` puts an action on the right. |
+| `.back-link` | In-page return link with theme-safe normal, visited, hover, and focus states. |
+| `.table-wrap` > `.data-table`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper; empty-state row; footer with pagination. |
+| `.empty-state` | The same centered, muted empty treatment for non-table content. |
+| `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
+| `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
+| `.choice-grid`, `.choice-card`, `.choice-card__title`, `.choice-card__hint` | The radio-group treatment: one selectable card per choice, `:has(:checked)` accent (#735). |
+| `.progress`, `.progress__bar`, `.progress--complete`, `.progress--failed`, `.progress--cancelled` | Full-width job progress track; terminal states recolor the fill. |
+| `.job-card`, `.job-card__head`, `.job-card__name`, `.job-card__actions`, `.job-card__meta`, `.job-card__files` | One async job: name + action row, progress track, one meta line, download pills. |
+| `.form-legend`, `.field-row` | Standalone section heading between cards; uppercase-labelled fields side by side. |
+| `.menu`, `.menu__panel`, `.menu__heading`, `.menu__option` | The `<details>` dropdown (tenant/version selectors, Recent). |
+| `.notice`, `.notice--warn` | Inline banner. |
+| `.pill` | Large control chip (chart tools). |
+| `.tag`, `.tag--*` | Small status pill in tables and lists. |
+| `.chip` | Facet/filter chip row member. |
+| `.toolbar`, `.toolbar__title`, `.toolbar__search`, `.toolbar__count` | In-card section header with optional search. |
+| `.tabs`, `.tab`, `.tab--on` | Tab strip. |
+| `.filter-rail`, `.nav-panel` | Left rails: the filter list inside a page; the type panel flush against the sidebar. |
+| `.icon-button`, `.icon-button--danger` | Bare 30px-square icon action (table rows), with the action-button 9px radius. |
+| `.busy-status` > `.spinner` | Inline working state: the ring plus a short label, `role="status"` in the markup so it announces. |
+
+Starting a new page: copy `templates/pages/_scaffold.html` (or crib
+`tenants.html`, the smallest real page). Both compose only this vocabulary.
+
+Button emphasis never changes geometry: pair `.btn` with `--primary`,
+`--danger`, or `--current` for color and state, and add `--icon` only for a
+square icon-only action. Inputs keep their own field scale and do not dictate
+button height. The sole fixed-height exception is the open
+`.addbox--modal > summary.btn`: while its native `<details>` is open, that
+summary becomes the full-viewport backdrop (`height: auto`, zero padding and
+radius); its closed state and the actions inside the dialog use the canonical
+button scale.
+
+### Busy states
+
+One convention for "this control is doing something" (#679), in two lanes:
+
+- **Fetch-driven scripts** call `window.hfsBusy` (`assets/busy.js`).
+  `during(buttons, work)` disables the controls, stamps `aria-busy="true"`,
+  and clears when the promise `work()` returns settles — pass a *function*,
+  never a promise, so the re-entrancy guard runs before the request exists;
+  a `work()` that navigates away returns a promise that never settles.
+  `region(el, label)` reveals a pre-rendered `.busy-status` element and
+  labels its `[data-busy-label]`; `opts.region`/`opts.label` on `during` tie
+  one to the same lifetime. The CSS ring keys off `aria-busy`, so the
+  visuals cannot ship without the semantics; reduced motion gets the same
+  ring as a static glyph. The `::after` ring must keep `content: ""` — CSS
+  generated *text* would join the accessible name.
+- **htmx controls** use `hx-disabled-elt` (#581); `hx-indicator` is
+  deliberately absent (the tenants tests pin this). A pending state that
+  outlives the request belongs in the swapped fragment, like the tenants
+  provisioning row.
 
 ---
 
@@ -130,11 +313,9 @@ read access):
 - `assets/fonts/figtree-*.woff2` — vendored [Figtree](https://fonts.google.com/specimen/Figtree)
   variable font (OFL), embedded like every other asset.
 
-Light/dark theming is CSS custom properties on `:root` /
-`[data-theme="dark"]`; `assets/theme.js` (loaded without `defer`, before
-first paint) applies the stored or OS preference and handles the top-bar
-toggle. The metric cards and chart render sample values from
-`DashboardMetrics::sample()` until real read paths land (below).
+Light/dark theming is CSS custom properties on `:root` / `[data-theme="dark"]`.
+Both themes are held to WCAG 2.2 AA, `color-contrast` included, by the axe gate
+in `e2e/tests/a11y.spec.ts`.
 
 ## Fragment / partial conventions & progressive enhancement
 
@@ -142,13 +323,15 @@ toggle. The metric cards and chart render sample values from
 - A **partial** (`partials/`) returns just the fragment to be swapped — no
   `<html>`/`<head>` wrapper — and is `{% include %}`d into pages so the initial
   full-page render and the htmx swap render identical markup.
-- Handlers that back an htmx swap should also work as a **hard navigation**:
-  when the `HX-Request` header is absent, return the full page. The POC's
-  `/ui/status` handler does exactly this and stays as the working reference
-  for the pattern; the dashboard no longer surfaces a control for it, so the
-  first real read paths (metric cards, chart) will wire their own swap
-  targets the same way — always with a real `<a href>`/`<form>` underneath
-  so the control works with JavaScript disabled.
+- Handlers that back an htmx swap must also work as a **hard navigation**: when
+  the `HX-Request` header is absent, return the full page. `/ui/status` is the
+  minimal reference implementation of the pattern. Every control needs a real
+  `<a href>` / `<form>` underneath so it works with JavaScript disabled — the
+  dashboard's window and series selectors are plain links for exactly this
+  reason.
+- `AutoVaryLayer` emits `Vary: HX-Request` on handlers that read the header, so
+  a cache never serves a fragment for a hard navigation. Being on this router
+  gets you this for free; don't hand-roll the header.
 
 Relevant htmx request/response headers we rely on: `HX-Request` (present on
 htmx-issued requests). See the
@@ -157,44 +340,115 @@ inline-validation, and infinite-scroll fragment recipes we'll standardize on.
 
 ---
 
-## POC in this crate
+## Pages & routes
 
 Mounted under `/ui` when running `hfs` (the `ui` feature is on by default; the
-`headless` feature disables it):
-
-- `GET /ui` — full landing page (`pages/index.html` → `layouts/base.html`).
-- `GET /ui/queries` — saved FHIR queries per resource type (#234), hydrated
-  client-side from the per-user settings document.
-- `GET /ui/search-parameters` — read-only SearchParameter viewer (#238):
-  Resource Filter rail, type/source facet rows, paginated table, and a detail
-  panel, over the same snapshot the storage backends seed their registries
-  from (embedded fallback + the spec bundle in `HFS_DATA_DIR`). Every filter
-  is a link, so the whole screen works without JavaScript; the write half
-  lands behind #235.
-- `GET /ui/compartments` — Compartment viewer & route tester (#237): the
-  vendored spec `CompartmentDefinition`s (`data/compartments/`, parity-tested
-  against the codegen'd `get_compartment_params()` table), a Members tab, and
-  a tester that answers "is this type in this compartment, via which
-  parameters, and what search does the server run?" — resolved through the
-  same table the REST compartment handler consults.
-- `GET /ui/status` — a system-status read path. Returns the
-  `partials/status.html` **fragment** on `HX-Request`, and the **full page** on
-  a hard navigation — demonstrating the same URL working with and without JS.
-- `GET /ui/assets/*` — embedded, pinned htmx and CSS.
+`headless` feature disables it — the mount is
+`cfg(all(feature = "ui", not(feature = "headless")))`, so enabling both yields
+no UI).
 
 ```bash
-cargo run -p helios-hfs --features ui   # then open http://127.0.0.1:8080/ui
+cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 ```
 
-`cargo build`, `cargo clippy`, and `cargo test -p helios-ui` are clean.
+| Route | Method | Page |
+|---|---|---|
+| `/ui` | GET | Dashboard — stat cards and the "FHIR resources over time" chart |
+| `/ui/resources` | GET | Resources workspace: type rail with live counts, search, edit modal |
+| `/ui/editor` | GET | Standalone schema-driven resource editor |
+| `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request |
+| `/ui/json-view/render` | POST | Renders raw `application/json` as a highlighted, foldable HTML fragment; applies no FHIR semantics and retains no payload |
+| `/ui/editor/expand` | GET | ValueSet expansion, proxied to `HFS_TERMINOLOGY_SERVER` |
+| `/ui/queries` | GET | Saved FHIR queries per resource type (#234) and the visual search builder |
+| `/ui/queries/params` | GET | Per-type search-parameter catalog backing the builder's datalist |
+| `/ui/search` | GET | Natural-language search — **registered only when NL search is enabled** |
+| `/ui/search-parameters` | GET | SearchParameter viewer (#238): rail, facets, paginated table, detail panel, plus the write half |
+| `/ui/compartments` | GET | Compartment viewer & route tester (#237): "is this type in this compartment, via which parameters, and what search does the server run?" |
+| `/ui/history` | GET | Version rail with from/to selection |
+| `/ui/history/diff` | POST | Server-side field-level and word-level diff (`docs/history-diff-rendering.md`) |
+| `/ui/batch` | GET | Batch/Transaction workspace (#476) |
+| `/ui/tenants` | GET/POST | Tenant maintenance; `/ui/tenants/rows` (GET), `/ui/tenants/{id}` (DELETE) |
+| `/ui/status` | GET | System-status read path; the fragment-vs-full-page reference |
+| `/ui/version` | POST | Persists the sidebar FHIR-version choice (#343) and redirects back |
+| `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector (#344), options loaded lazily |
+| `/ui/assets/*` | GET | Embedded htmx, CSS, JS, fonts, logo |
 
-### Left for follow-up work
+The router's `fallback_service` is the FHIR app, so anything not under `/ui`
+falls through to the normal REST surface.
 
-- Swap the self-contained status snapshot for richer real read paths
-  (CodeSystem/ValueSet lookup, resource counts) by calling into
-  `helios-persistence` / `helios-hts` from the handlers.
-- Resolve the asset base-path generically if the mount point ever moves off the
-  hardcoded `/ui` prefix.
+### Where the data comes from
+
+- **Conformance resources are not vendored into this crate.** SearchParameter and
+  CompartmentDefinition are fetched from the server's *own* FHIR API over HTTP on
+  the loopback address — storage is the source of truth, seeded per provisioned
+  tenant. `ConformanceSource` is the seam; `StaticConformanceSource` stands in
+  for it in tests.
+- **Dashboard counts and the chart** come from the storage backend through
+  `helios_observability::dashboard`, a provider the server registers at startup.
+  That keeps this crate free of any persistence dependency for the read path;
+  with no provider registered, the dashboard renders placeholder figures through
+  the same rendering path. Counts reflect the **default tenant** only — an
+  operator view, never exported to the public Prometheus `/metrics` endpoint.
+- **Per-user preferences** (theme, nav state, FHIR version, tenant, saved and
+  recent queries) roam in the `/_user/settings` document: weak `ETag`, JSON merge
+  patch, `If-Match` on write. Tenant-derived keys live under a reserved
+  `byTenant` map so a tenant purge can reach them.
+
+### Internationalization
+
+All user-visible text resolves from Fluent catalogs at `locales/<locale>/main.ftl`
+(workspace root, embedded at compile time). Negotiation order: `?lang=` → the
+`hfs_lang` cookie → `Accept-Language` (RFC 4647 Lookup) → `en`. Supported today:
+`en`, `es`, `de`. A key missing from a translation falls back to its English
+string, and `catalogs_share_the_same_key_set` fails the build-time test suite if
+the catalogs drift apart. See `docs/multi-language.md`.
+
+---
+
+## Tests
+
+Two rings, both required.
+
+**Inner ring — Rust, fast.** `tower::oneshot` against the mounted router,
+locale middleware included:
+
+```bash
+cargo test -p helios-ui
+```
+
+`tests/router_http.rs`, `tests/i18n_http.rs`, `tests/tenants_http.rs` (a real
+SQLite store, via the test-only `sqlite` feature), plus `mod tests` in most
+`src/` modules.
+
+**Outer ring — Playwright + axe-core.** Behavior only a real browser can
+observe. Everything Node lives in `e2e/`; the cargo workspace is untouched. See
+[`e2e/README.md`](e2e/README.md) for the spec inventory.
+
+```bash
+cargo build -p helios-hfs --features ui
+cd e2e && npm ci && npx playwright install chromium
+npx playwright test
+```
+
+The axe gate is strict: every WCAG 2.2 AA rule, `color-contrast` included, in
+both themes, is a hard failure. CI runs `ui-tests.yml` per PR on SQLite, and
+`ui-tests-matrix.yml` across every storage backend nightly and on demand.
+
+---
+
+## Known follow-ups
+
+- **Outbound service token.** When auth is enabled, the conformance self-call
+  relies on an operator provisioning a non-expiring bearer via
+  `HFS_OUTBOUND_BEARER_TOKEN`; without one the fetch is rejected and the pages
+  degrade to a warning (`pages/compartments-degraded.html`). The fix is a
+  short-lived, auto-refreshed token minted through the planned
+  `JwtAssertionOutboundAuthProvider` (SMART Backend Services
+  `client_credentials` + `private_key_jwt`, `crates/auth/src/outbound.rs`).
+- **Asset base path.** `/ui/assets/*` is hardcoded in `layouts/base.html`; it
+  would need resolving generically if the mount point ever moves off `/ui`.
+- **Richer status read paths** — CodeSystem/ValueSet lookup alongside the
+  existing resource counts.
 
 ---
 
@@ -208,6 +462,7 @@ cargo run -p helios-hfs --features ui   # then open http://127.0.0.1:8080/ui
 - Axum — <https://docs.rs/axum> · tower-http — <https://docs.rs/tower-http>
 - Askama — <https://docs.rs/askama> · Maud — <https://maud.lambda.xyz/> ·
   Minijinja — <https://docs.rs/minijinja>
-- rust-embed — <https://docs.rs/rust-embed>
+- rust-embed — <https://docs.rs/rust-embed> · axum-htmx — <https://docs.rs/axum-htmx>
+- Fluent — <https://projectfluent.org/> · axe-core — <https://github.com/dequelabs/axe-core>
 - OWASP XSS Prevention Cheat Sheet —
   <https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html>

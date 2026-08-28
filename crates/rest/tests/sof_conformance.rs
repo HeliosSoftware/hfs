@@ -1,6 +1,6 @@
 //! SQL-on-FHIR v2 official conformance test suite (in-DB runner).
 //!
-//! Runs every test case in `crates/sof/tests/sql-on-fhir-v2/tests/*.json`
+//! Runs every test case in `crates/sof/tests/sql-on-fhir/tests/*.json`
 //! against the SQLite in-DB SOF runner via the public HTTP endpoint, and
 //! reports all failures at the end. A test case is considered passing if:
 //!
@@ -71,8 +71,8 @@ mod sof_conformance_tests {
     }
 
     fn load_fixtures() -> Vec<Fixture> {
-        // Single canonical fixture set — `crates/sof/tests/sql-on-fhir-v2/tests/`.
-        let dir = std::path::Path::new("../sof/tests/sql-on-fhir-v2/tests");
+        // Single canonical fixture set — `crates/sof/tests/sql-on-fhir/tests/`.
+        let dir = std::path::Path::new("../sof/tests/sql-on-fhir/tests");
         assert!(
             dir.exists(),
             "conformance fixture directory not found: {}",
@@ -333,7 +333,7 @@ mod sof_conformance_tests {
                 let view_body = normalise_view(&test.view);
 
                 let resp = server
-                    .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+                    .post("/$sql-run?_format=ndjson")
                     .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
                     .add_header(
                         axum::http::HeaderName::from_static("content-type"),

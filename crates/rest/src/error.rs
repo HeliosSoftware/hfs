@@ -246,6 +246,19 @@ pub enum RestError {
         /// Error message.
         message: String,
     },
+
+    /// Multiple independent structural problems were found together — e.g.
+    /// the SQL-on-FHIR dependency-graph resolver (`handlers::sof::graph`)
+    /// found both a cycle and an unresolved reference in the same request.
+    /// Carries a fully-formed OperationOutcome with one `issue` per problem,
+    /// mirroring [`RestError::ValidationFailed`]'s multi-issue shape. Always
+    /// HTTP `400 Bad Request`: the request as a whole cannot proceed until
+    /// every problem named here is fixed. A single problem keeps its own
+    /// precise status code instead of using this variant.
+    MultiIssue {
+        /// The OperationOutcome to return as the response body.
+        outcome: serde_json::Value,
+    },
 }
 
 impl fmt::Display for RestError {
@@ -335,6 +348,9 @@ impl fmt::Display for RestError {
             RestError::InvalidParameter { param, message } => {
                 write!(f, "Invalid parameter '{}': {}", param, message)
             }
+            RestError::MultiIssue { .. } => {
+                write!(f, "Multiple structural problems detected")
+            }
         }
     }
 }
@@ -352,12 +368,19 @@ impl RestError {
     /// backend/driver/SQL detail — table and column names, connection strings,
     /// query fragments — never leaks; safe classes (not-found, conflict,
     /// validation, gone, …) keep their specific, actionable message.
+    ///
+    /// Wording duality: the messages returned here become the `diagnostics`
+    /// of the response's `OperationOutcome` and are shown to end users
+    /// verbatim (see `crates/ui/README.md` §"Error wording"), so — where a
+    /// variant has one — they intentionally differ in grammar from
+    /// [`fmt::Display`]'s `Label: value` form, which stays a terse,
+    /// technical string meant for logs and traces, not the UI.
     pub(crate) fn client_response(&self) -> (StatusCode, &'static str, String) {
         match self {
             RestError::NotFound { resource_type, id } => (
                 StatusCode::NOT_FOUND,
                 "not-found",
-                format!("Resource {}/{} not found", resource_type, id),
+                format!("Could not find the resource '{}/{}'.", resource_type, id),
             ),
             RestError::Gone { resource_type, id } => (
                 StatusCode::GONE,
@@ -372,7 +395,7 @@ impl RestError {
                 StatusCode::NOT_FOUND,
                 "not-found",
                 format!(
-                    "Version {} of {}/{} not found",
+                    "Could not find version '{}' of the resource '{}/{}'.",
                     version_id, resource_type, id
                 ),
             ),
@@ -386,7 +409,7 @@ impl RestError {
                 StatusCode::PRECONDITION_FAILED,
                 "multiple-matches",
                 format!(
-                    "Conditional {} matched {} resources, expected at most 1",
+                    "The conditional '{}' matched {} resources — expected at most one.",
                     operation, count
                 ),
             ),
@@ -396,7 +419,7 @@ impl RestError {
             RestError::UnsupportedMediaType { content_type } => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "not-supported",
-                format!("Content type '{}' is not supported", content_type),
+                format!("Content type '{}' is not supported.", content_type),
             ),
             RestError::PayloadTooLarge { message } => {
                 (StatusCode::PAYLOAD_TOO_LARGE, "too-long", message.clone())
@@ -461,7 +484,7 @@ impl RestError {
             RestError::NotImplemented { feature } => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",
-                format!("Feature '{}' is not implemented", feature),
+                format!("Feature '{}' is not implemented.", feature),
             ),
             RestError::NotSupported { feature } => {
                 (StatusCode::BAD_REQUEST, "not-supported", feature.clone())
@@ -483,7 +506,13 @@ impl RestError {
             RestError::InvalidParameter { param, message } => (
                 StatusCode::BAD_REQUEST,
                 "invalid",
-                format!("Invalid parameter '{}': {}", param, message),
+                format!("The parameter '{}' is invalid: {}.", param, message),
+            ),
+            RestError::MultiIssue { .. } => (
+                StatusCode::BAD_REQUEST,
+                "invalid",
+                "Multiple structural problems detected; see the OperationOutcome issues"
+                    .to_string(),
             ),
         }
     }
@@ -496,6 +525,9 @@ impl IntoResponse for RestError {
         // rather than collapsing it to the generic single-issue shape.
         if let RestError::ValidationFailed { outcome } = &self {
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(outcome.clone())).into_response();
+        }
+        if let RestError::MultiIssue { outcome } = &self {
+            return (StatusCode::BAD_REQUEST, Json(outcome.clone())).into_response();
         }
         let (status, code, details) = self.client_response();
         let operation_outcome = create_operation_outcome("error", code, &details);
@@ -762,7 +794,10 @@ impl From<ValidationError> for RestError {
             ValidationError::InvalidResource { message, .. } => RestError::BadRequest { message },
             ValidationError::InvalidSearchParameter { parameter, message } => {
                 RestError::BadRequest {
-                    message: format!("Invalid search parameter '{}': {}", parameter, message),
+                    message: format!(
+                        "The search parameter '{}' is invalid: {}.",
+                        parameter, message
+                    ),
                 }
             }
             ValidationError::UnsupportedResourceType { resource_type } => RestError::BadRequest {
@@ -772,7 +807,7 @@ impl From<ValidationError> for RestError {
                 message: format!("Missing required field: {}", field),
             },
             ValidationError::InvalidReference { reference, message } => RestError::BadRequest {
-                message: format!("Invalid reference '{}': {}", reference, message),
+                message: format!("The reference '{}' is invalid: {}.", reference, message),
             },
         }
     }
@@ -817,6 +852,13 @@ impl From<TransactionError> for RestError {
             // for `BackendError::Timeout`.
             TransactionError::Timeout { .. } => RestError::GatewayTimeout {
                 message: err.to_string(),
+            },
+            // A capability gap, not a fault: the backend is healthy and
+            // declined work it cannot perform correctly. Kept in step with
+            // `transaction_error_response_parts` in `handlers/batch.rs`, so the
+            // refusal reports the same status whichever path surfaces it.
+            TransactionError::AtomicityUnsupported { .. } => RestError::NotImplemented {
+                feature: err.to_string(),
             },
             TransactionError::RolledBack { .. }
             | TransactionError::InvalidTransaction
@@ -1473,6 +1515,30 @@ mod tests {
         let (status, code, _) = RestError::from(err).client_response();
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(code, "timeout");
+    }
+
+    /// A backend that cannot honour transaction atomicity is a capability gap,
+    /// not a fault: it is healthy and declined work it cannot perform
+    /// correctly, so 501 + `not-supported` is the answer, never a 500 (#489).
+    ///
+    /// This is the second path to that refusal. `transaction_error_response_parts`
+    /// in `handlers/batch.rs` carries the bundle-shaped message, and this `From`
+    /// impl catches the error anywhere else it surfaces; the two must not drift
+    /// apart, or the same condition reports two different statuses depending on
+    /// which layer saw it.
+    #[test]
+    fn test_transaction_atomicity_unsupported_maps_to_501() {
+        let err = TransactionError::AtomicityUnsupported {
+            backend_name: "s3".to_string(),
+        };
+        let (status, code, message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(code, "not-supported");
+        assert!(message.contains("s3"), "should name the backend: {message}");
+        assert!(
+            message.contains("batch"),
+            "should point at the workable alternative: {message}"
+        );
     }
 
     /// The 504 deliberately carries no `Retry-After`: a cancelled query is

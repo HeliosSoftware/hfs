@@ -872,6 +872,21 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_REQUEST_TIMEOUT", default_value = "30")]
     pub request_timeout: u64,
 
+    /// Ceiling on how many entries of one `batch` Bundle execute concurrently.
+    ///
+    /// The effective bound is the storage backend's own
+    /// [`bulk_write_concurrency`] capped by this value: it can lower what a
+    /// backend declared it tolerates, never raise it. Raising a backend's
+    /// tolerance is a backend setting (connection pool size, for instance).
+    ///
+    /// This exists to keep a large batch inside `request_timeout`: entries run
+    /// sequentially at a bound of 1, so wall clock is the sum of every entry's
+    /// storage round trips.
+    ///
+    /// [`bulk_write_concurrency`]: helios_persistence::core::ResourceStorage::bulk_write_concurrency
+    #[arg(long, env = "HFS_BATCH_MAX_CONCURRENCY", default_value = "16")]
+    pub batch_max_concurrency: usize,
+
     /// Enable CORS.
     #[arg(long, env = "HFS_ENABLE_CORS", default_value = "true")]
     pub enable_cors: bool,
@@ -901,7 +916,12 @@ pub struct ServerConfig {
     pub default_tenant: String,
 
     /// Base URL for the server (used in Location headers and Bundle links).
-    #[arg(long, env = "HFS_BASE_URL", default_value = "http://localhost:8080")]
+    #[arg(
+        long,
+        env = "HFS_BASE_URL",
+        default_value = "http://localhost:8080",
+        value_parser = parse_public_base_url_arg
+    )]
     pub base_url: String,
 
     /// Database connection string.
@@ -986,7 +1006,7 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
     pub elasticsearch_password: Option<String>,
 
-    /// Enable SQL-on-FHIR operations ($viewdefinition-run, $viewdefinition-export).
+    /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
@@ -1067,7 +1087,7 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_MAX_CONCURRENCY", default_value = "4")]
     pub export_max_concurrency: usize,
 
-    /// Target rows per output shard for `$viewdefinition-export`.
+    /// Target rows per output shard for `$sql-export`.
     /// Large result sets are split into multiple files of this size.
     #[arg(long, env = "HFS_EXPORT_SHARD_ROWS", default_value = "500000")]
     pub export_shard_rows: usize,
@@ -1089,11 +1109,11 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_CLEANUP_INTERVAL", default_value = "300")]
     pub export_cleanup_interval_secs: u64,
 
-    /// Maximum rows returned by `$sqlquery-run`.
+    /// Maximum rows returned by `$sql-run`.
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_ROWS", default_value = "100000")]
     pub sof_sqlquery_max_rows: usize,
 
-    /// Maximum rows materialized per depends-on ViewDefinition by `$sqlquery-run`.
+    /// Maximum rows materialized per depends-on ViewDefinition by `$sql-run`.
     #[arg(
         long,
         env = "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
@@ -1101,11 +1121,15 @@ pub struct ServerConfig {
     )]
     pub sof_sqlquery_max_source_rows_per_vd: usize,
 
-    /// Maximum number of depends-on ViewDefinitions a single SQLQuery Library may declare.
+    /// Maximum number of nodes in a `$sql-run`/`$sql-export` subject's
+    /// resolved dependency graph — every ViewDefinition and SQLView Library
+    /// the two-phase resolver reaches, not just the subject's direct
+    /// `depends-on` entries (SQLView nesting can pull in a graph several
+    /// levels deep; see `handlers::sof::graph`).
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_VDS", default_value = "16")]
     pub sof_sqlquery_max_vds: usize,
 
-    /// Hard timeout (seconds) for `$sqlquery-run` queries.
+    /// Hard timeout (seconds) for `$sql-run` queries.
     #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
     pub sof_sqlquery_timeout_secs: u64,
 
@@ -1139,7 +1163,31 @@ pub struct ServerConfig {
     pub validation: ValidationConfig,
 }
 
+fn parse_public_base_url_arg(value: &str) -> Result<String, String> {
+    crate::public_url::PublicUrl::parse(value).map(|url| url.as_str().to_string())
+}
+
 impl ServerConfig {
+    /// Loads configuration for the HFS binary and reports command-line,
+    /// environment, and validation errors to the caller.
+    pub fn try_from_env() -> Result<Self, clap::Error> {
+        Self::finish_parsed(Self::try_parse()?)
+    }
+
+    fn finish_parsed(mut config: Self) -> Result<Self, clap::Error> {
+        config.multitenancy = MultitenancyConfig::from_env();
+        config.bulk_export = BulkExportConfig::from_env();
+        config.bulk_submit = BulkSubmitConfig::from_env();
+        config.validation = ValidationConfig::from_env();
+        config.normalize_public_base_url().map_err(|message| {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
+        })?;
+        config.validate().map_err(|errors| {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, errors.join("\n"))
+        })?;
+        Ok(config)
+    }
+
     /// Parses the storage backend mode from the string field.
     pub fn storage_backend_mode(&self) -> Result<StorageBackendMode, String> {
         self.storage_backend.parse()
@@ -1154,6 +1202,7 @@ impl Default for ServerConfig {
             log_level: "info".to_string(),
             max_body_size: 10 * 1024 * 1024, // 10MB
             request_timeout: 30,
+            batch_max_concurrency: 16,
             enable_cors: true,
             cors_origins: "*".to_string(),
             cors_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS".to_string(),
@@ -1227,9 +1276,61 @@ impl ServerConfig {
         config
     }
 
+    /// Validates and removes trailing slashes from the configured public base.
+    pub fn normalize_public_base_url(&mut self) -> Result<(), String> {
+        self.base_url = crate::public_url::PublicUrl::parse(&self.base_url)?
+            .as_str()
+            .to_string();
+        Ok(())
+    }
+
+    /// Returns why a loopback public base is unsafe for the configured listener.
+    ///
+    /// A loopback URL is safe only when the listener is also loopback and the
+    /// effective advertised port matches the listener port.
+    pub fn loopback_public_base_warning(&self) -> Option<String> {
+        let public_url = crate::public_url::PublicUrl::parse(&self.base_url).ok()?;
+        if !public_url.is_loopback() {
+            return None;
+        }
+
+        let listener_host = self
+            .host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(&self.host);
+        let listener_is_loopback = match listener_host.parse::<std::net::IpAddr>() {
+            Ok(address) => address.is_loopback(),
+            Err(_) => listener_host.eq_ignore_ascii_case("localhost"),
+        };
+        let port_matches = public_url.port_or_known_default() == Some(self.port);
+
+        match (listener_is_loopback, port_matches) {
+            (true, true) => None,
+            (false, true) => Some(format!(
+                "HFS_BASE_URL '{}' advertises a loopback host while HFS listens on {}",
+                public_url.as_str(),
+                self.socket_addr()
+            )),
+            (true, false) => Some(format!(
+                "HFS_BASE_URL '{}' advertises a different port from listener {}",
+                public_url.as_str(),
+                self.socket_addr()
+            )),
+            (false, false) => Some(format!(
+                "HFS_BASE_URL '{}' advertises a loopback host and a different port from listener {}",
+                public_url.as_str(),
+                self.socket_addr()
+            )),
+        }
+    }
+
     /// Returns the socket address to bind to.
     pub fn socket_addr(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        match self.host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(address)) => format!("[{address}]:{}", self.port),
+            _ => format!("{}:{}", self.host, self.port),
+        }
     }
 
     /// Returns the full base URL for the server.
@@ -1253,12 +1354,20 @@ impl ServerConfig {
             errors.push("Request timeout cannot be 0".to_string());
         }
 
+        if self.batch_max_concurrency == 0 {
+            errors.push("Batch max concurrency cannot be 0".to_string());
+        }
+
         if self.default_page_size == 0 {
             errors.push("Default page size cannot be 0".to_string());
         }
 
         if self.default_page_size > self.max_page_size {
             errors.push("Default page size cannot exceed max page size".to_string());
+        }
+
+        if let Err(error) = crate::public_url::PublicUrl::parse(&self.base_url) {
+            errors.push(error);
         }
 
         // A reserved default tenant is the isolation hole of issue #317 in
@@ -1313,6 +1422,7 @@ impl ServerConfig {
             log_level: "debug".to_string(),
             max_body_size: 10 * 1024 * 1024,
             request_timeout: 5, // Shorter timeout for tests
+            batch_max_concurrency: 16,
             enable_cors: false,
             cors_origins: "*".to_string(),
             cors_methods: "*".to_string(),
@@ -1392,6 +1502,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.socket_addr(), "0.0.0.0:3000");
+
+        let ipv6 = ServerConfig {
+            port: 3000,
+            host: "::1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(ipv6.socket_addr(), "[::1]:3000");
     }
 
     #[test]
@@ -1723,6 +1840,24 @@ mod tests {
         assert!(errors.iter().any(|e| e.contains("timeout")));
     }
 
+    // ── validate() – batch_max_concurrency == 0 ──────────────────
+
+    /// A zero bound would make `buffered(0)` poll nothing, hanging every batch
+    /// request until the timeout — the exact symptom the bound exists to
+    /// remove. The batch handler clamps defensively as well, but the operator
+    /// should be told at startup rather than by a stalled request.
+    #[test]
+    fn test_validate_batch_concurrency_zero() {
+        let config = ServerConfig {
+            batch_max_concurrency: 0,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("Batch max concurrency")));
+    }
+
     // ── validate() – default_page_size == 0 ──────────────────────
 
     #[test]
@@ -1770,6 +1905,119 @@ mod tests {
     fn test_full_base_url_default() {
         let config = ServerConfig::default();
         assert_eq!(config.full_base_url(), "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_public_base_url_normalization() {
+        for (input, expected) in [
+            ("http://example.test/", "http://example.test"),
+            ("https://example.test/fhir///", "https://example.test/fhir"),
+            ("http://127.0.0.1:9000/", "http://127.0.0.1:9000"),
+            ("http://[::1]:9000/fhir/", "http://[::1]:9000/fhir"),
+        ] {
+            let mut config = ServerConfig {
+                base_url: input.to_string(),
+                ..Default::default()
+            };
+            config.normalize_public_base_url().unwrap();
+            assert_eq!(config.base_url, expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn test_cli_public_base_url_parser_is_fallible_and_normalizes() {
+        let config = ServerConfig::try_parse_from([
+            "rest-server",
+            "--base-url",
+            "https://fhir.example.test/fhir/",
+        ])
+        .unwrap();
+        assert_eq!(config.base_url, "https://fhir.example.test/fhir");
+
+        assert!(
+            ServerConfig::try_parse_from(["rest-server", "--base-url", "ftp://fhir.example.test"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_public_base_url_validation_rejects_unsafe_shapes() {
+        for value in [
+            "fhir.example.test",
+            "ftp://fhir.example.test",
+            "http:///fhir",
+            "http://@fhir.example.test",
+            "http://user@fhir.example.test",
+            "http://user:pass@fhir.example.test",
+            "http://fhir.example.test?tenant=acme",
+            "http://fhir.example.test#metadata",
+        ] {
+            let config = ServerConfig {
+                base_url: value.to_string(),
+                ..Default::default()
+            };
+            assert!(config.validate().is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn test_finish_parsed_normalizes_and_validates() {
+        let config = ServerConfig {
+            base_url: "https://fhir.example.test/root/".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ServerConfig::finish_parsed(config).unwrap().base_url,
+            "https://fhir.example.test/root"
+        );
+
+        let invalid_url = ServerConfig {
+            base_url: "not-a-url".to_string(),
+            ..Default::default()
+        };
+        assert!(ServerConfig::finish_parsed(invalid_url).is_err());
+
+        let invalid_config = ServerConfig {
+            port: 0,
+            ..Default::default()
+        };
+        assert!(ServerConfig::finish_parsed(invalid_config).is_err());
+    }
+
+    #[test]
+    fn test_loopback_public_base_warning() {
+        let cases = [
+            ("127.0.0.1", 8080, "http://localhost:8080", false),
+            ("localhost", 8080, "http://localhost:8080", false),
+            ("::1", 8080, "http://[::1]:8080", false),
+            ("[::1]", 8080, "http://[::1]:8080", false),
+            ("0.0.0.0", 8080, "http://localhost:8080", true),
+            ("::", 8080, "http://127.0.0.1:8080", true),
+            ("192.0.2.10", 8080, "http://[::1]:8080", true),
+            ("127.0.0.1", 18080, "http://localhost:8080", true),
+            ("0.0.0.0", 18080, "http://localhost:8080", true),
+        ];
+
+        for (host, port, base_url, warns) in cases {
+            let config = ServerConfig {
+                host: host.to_string(),
+                port,
+                base_url: base_url.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                config.loopback_public_base_warning().is_some(),
+                warns,
+                "host={host} port={port} base={base_url}"
+            );
+        }
+
+        let public = ServerConfig {
+            host: "0.0.0.0".to_string(),
+            base_url: "https://fhir.example.test".to_string(),
+            ..Default::default()
+        };
+        assert!(public.loopback_public_base_warning().is_none());
     }
 
     // ── multitenancy() accessor ───────────────────────────────────

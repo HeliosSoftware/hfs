@@ -85,7 +85,7 @@ pub use loader::SearchParameterLoader;
 pub use range::{implicit_precision, implicit_range};
 pub use registry::{
     RegistryUpdate, SearchParameterDefinition, SearchParameterRegistry, SearchParameterSource,
-    SearchParameterStatus, resolve_param_targets, resolve_param_type,
+    SearchParameterStatus, fallback_param_type, resolve_param_targets, resolve_param_type,
 };
 pub use reindex::{
     ReindexOperation, ReindexProgress, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
@@ -95,8 +95,6 @@ pub use seeder::{
     SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,
     seed_tenant_conformance,
 };
-pub use tenant_registries::{
-    StoredParamLoader, TenantSearchRegistries, search_parameter_create_affects_overlay,
-};
+pub use tenant_registries::{StoredParamLoader, TenantSearchRegistries};
 pub use text_fold::fold_text;
 pub use writer::SearchIndexWriter;

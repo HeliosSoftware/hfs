@@ -25,8 +25,8 @@ pub use pagination::Pagination;
 pub use peer::PeerIp;
 pub use search_params::SearchParams;
 pub use search_query_builder::{
-    build_search_query, build_search_query_from_map, build_search_query_from_pairs,
-    unknown_search_params,
+    GLOBAL_SEARCH_PARAMS, build_search_query, build_search_query_from_map,
+    build_search_query_from_pairs, unknown_search_params,
 };
 pub use tenant::TenantExtractor;
 pub use user::UserKey;

@@ -28,17 +28,35 @@ use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
 use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::{info, warn};
 
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+// Bulk *export* is only wired on backends that can host (or sidecar) job state,
+// so its imports stay narrow. Bulk *submit* is wired on every backend that
+// implements the job store — SQLite, PostgreSQL, MongoDB, and S3 — so the types
+// it needs are gated on the wider set.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::core::SettingsStore;
-// Bulk export/submit is only wired on backends that can host (or sidecar) job
-// state; the imports are unused in standalone MongoDB/S3-only builds.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
+use helios_persistence::core::{BulkExportJobStore, DefaultExportWorker};
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 use helios_persistence::core::{
-    BulkExportJobStore, BulkSubmitJobStore, DefaultExportWorker, DefaultSubmitWorker,
-    ExportOutputStore, SubmitInputFetcher, WorkerId,
+    BulkSubmitJobStore, DefaultSubmitWorker, ExportOutputStore, SubmitInputFetcher, WorkerId,
 };
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 use helios_rest::bulk_export_auth::BearerScopeAuth;
 // Every startup path goes through one builder. The bundles it takes are all
 // optional, so a backend that lacks a capability passes `None` rather than
@@ -583,6 +601,10 @@ async fn start_mongodb(
             None
         }
     };
+    // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
+    // lease, and artifact state itself, in the same store the ingestion engine
+    // writes resources to.
+    let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
 
     let ops = standalone_ops(
         backend.clone(),
@@ -596,7 +618,7 @@ async fn start_mongodb(
         auth_state,
         audit_state,
         export_bundle,
-        None,
+        submit_bundle,
         settings_store,
         ops,
     );
@@ -644,7 +666,7 @@ async fn serve(
         // configured from HFS_UI_* client credentials.
         let self_base_url = format!("http://127.0.0.1:{}", config.port);
         let outbound_auth = AuthConfig::from_env().outbound_provider();
-        helios_ui::mount(
+        helios_ui::mount_with_body_limit_and_tenant_routing(
             app,
             env!("CARGO_PKG_VERSION"),
             config.data_dir.clone(),
@@ -660,6 +682,9 @@ async fn serve(
             outbound_auth,
             config.default_fhir_version,
             config.terminology_server.clone(),
+            config.base_url.clone(),
+            config.max_body_size,
+            config.multitenancy.routing_mode.supports_url_path(),
         )
     };
     #[cfg(not(all(feature = "ui", not(feature = "headless"))))]
@@ -849,10 +874,10 @@ async fn init_audit(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Use `from_env()` (not `parse()`) so `multitenancy` and `bulk_export`
-    // sub-structs — both `#[arg(skip)]` for clap — are populated from
-    // their `HFS_*` environment variables.
-    let config = ServerConfig::from_env();
+    // Keep the skipped sub-configs populated while surfacing invalid CLI and
+    // environment values instead of silently replacing the whole config with
+    // defaults.
+    let config = ServerConfig::try_from_env().unwrap_or_else(|error| error.exit());
     helios_observability::uptime::init();
     helios_observability::telemetry::init("hfs", &config.log_level);
     helios_observability::metrics::init("hfs");
@@ -860,6 +885,14 @@ async fn main() -> anyhow::Result<()> {
     // backed by the reqlog ring buffer, so it opts into recording. Servers that
     // don't (hts, sof-server, fhirpath-server) leave it off and skip the cost.
     helios_observability::reqlog::enable();
+
+    if let Some(message) = config.loopback_public_base_warning() {
+        warn!(
+            public_base_url = %config.base_url,
+            bind_address = %config.socket_addr(),
+            "{message}. Set HFS_BASE_URL to the public HTTP(S) origin clients can reach"
+        );
+    }
 
     if let Err(errors) = config.validate() {
         for error in &errors {
@@ -902,6 +935,8 @@ async fn main() -> anyhow::Result<()> {
     info!(
         port = config.port,
         host = %config.host,
+        bind_address = %config.socket_addr(),
+        public_base_url = %config.base_url,
         fhir_version = ?config.default_fhir_version,
         storage_backend = %backend_mode,
         terminology_server = ?config.terminology_server,
@@ -1462,7 +1497,16 @@ fn spawn_export_workers<Dp>(
 /// worker pool) from a caller-supplied job store. Returns `None` when bulk submit
 /// is disabled. The job store is the same backend instance that holds the FHIR
 /// resources (so ingestion writes go to the primary store).
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+///
+/// Unlike bulk *export*, every backend that can run `$bulk-submit` hosts its own
+/// job state — MongoDB in its own collections, S3 in the same objects its
+/// ingestion engine already writes — so there is no sidecar variant here.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 async fn build_bulk_submit(
     config: &ServerConfig,
     jobs: Arc<dyn BulkSubmitJobStore>,
@@ -1581,7 +1625,12 @@ async fn build_bulk_submit(
 }
 
 /// Spawns the in-process submit worker pool and the periodic cleanup task.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 fn spawn_submit_workers(
     jobs: Arc<dyn BulkSubmitJobStore>,
     fetcher: Arc<dyn SubmitInputFetcher>,
@@ -2226,6 +2275,10 @@ async fn start_mongodb_elasticsearch(
             None
         }
     };
+    // Bulk submit runs against the MongoDB primary, which hosts its own job
+    // state. Ingestion deliberately goes to `mongo` rather than the composite:
+    // the composite's search half is fed by the primary's own indexing hooks.
+    let submit_bundle = build_bulk_submit(&config, mongo.clone()).await?;
 
     let ops = composite_ops(
         composite.clone(),
@@ -2241,7 +2294,7 @@ async fn start_mongodb_elasticsearch(
         auth_state,
         audit_state,
         export_bundle,
-        None,
+        submit_bundle,
         settings_store,
         ops,
     );
@@ -2333,8 +2386,8 @@ async fn start_s3(
         Some(backend.clone() as Arc<dyn ResourceStorage>);
 
     // The S3 backend also hosts the per-user settings store (a compare-and-swap
-    // over conditional PutObject). Bulk export/submit are not wired on a
-    // standalone S3 primary, which has no job store.
+    // over conditional PutObject). Bulk *export* is still not wired on a
+    // standalone S3 primary, which has no export job store.
     //
     // A bucket-per-tenant configuration with no `default_system_bucket` has
     // nowhere tenant-independent to keep a user-global document, so the store is
@@ -2361,6 +2414,23 @@ async fn start_s3(
         reindex: None,
     };
 
+    // Bulk submit *is* wired: S3 keeps the submission, manifest, lease, and
+    // artifact state in the same objects its ingestion engine already writes,
+    // compare-and-swapped over conditional PutObject. The one configuration
+    // that cannot is bucket-per-tenant with no `default_system_bucket`, which
+    // has nowhere to keep the cross-tenant claim queue and poll-token index —
+    // there the backend does not declare `BulkSubmitRestWorker` and the worker
+    // simply never claims anything.
+    let submit_bundle = if backend.supports_bulk_submit_worker() {
+        build_bulk_submit(&config, backend.clone()).await?
+    } else {
+        tracing::warn!(
+            "S3 is configured bucket-per-tenant with no default system bucket; \
+             $bulk-submit will report 501 Not Implemented"
+        );
+        None
+    };
+
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend,
         config.clone(),
@@ -2368,7 +2438,7 @@ async fn start_s3(
         auth_state,
         audit_state,
         None,
-        None,
+        submit_bundle,
         settings_store,
         ops,
     );
@@ -2611,6 +2681,18 @@ async fn start_s3_elasticsearch(
             None
         }
     };
+    // Bulk submit needs no sidecar here either: the S3 primary hosts its own
+    // job state. Ingestion goes to `s3` rather than the composite because the
+    // composite's Elasticsearch half is fed by the primary's indexing hooks.
+    let bulk_submit = if s3.supports_bulk_submit_worker() {
+        build_bulk_submit(&config, s3.clone()).await?
+    } else {
+        tracing::warn!(
+            "S3 is configured bucket-per-tenant with no default system bucket; \
+             $bulk-submit will report 501 Not Implemented"
+        );
+        None
+    };
 
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
@@ -2619,7 +2701,7 @@ async fn start_s3_elasticsearch(
         auth_state,
         audit_state,
         bulk_export,
-        None,
+        bulk_submit,
         settings_store,
         ops,
     );
@@ -2811,6 +2893,20 @@ mod tests {
             config.validate().is_ok(),
             "default ServerConfig should be valid"
         );
+    }
+
+    #[test]
+    fn test_server_config_validation() {
+        let mut config = ServerConfig {
+            base_url: "https://fhir.example.test/fhir/".to_string(),
+            ..Default::default()
+        };
+        config.normalize_public_base_url().unwrap();
+        assert_eq!(config.base_url, "https://fhir.example.test/fhir");
+        assert!(config.validate().is_ok());
+
+        config.base_url = "javascript:alert(1)".to_string();
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Integration tests for `POST /$sqlquery-run` (SoF v2).
+//! Integration tests for `POST /$sql-run` (SoF v2).
 
 mod sof_sqlquery_tests {
     use axum::http::{HeaderName, HeaderValue, StatusCode};
@@ -126,7 +126,7 @@ mod sof_sqlquery_tests {
     fn run_body_inline(library: Value, format: &str, inner_params: Option<Value>) -> Value {
         let mut entries = vec![
             json!({"name": "_format", "valueCode": format}),
-            json!({"name": "queryResource", "resource": library}),
+            json!({"name": "subjectResource", "resource": library}),
         ];
         if let Some(p) = inner_params {
             entries.push(json!({"name": "parameters", "resource": p}));
@@ -137,7 +137,7 @@ mod sof_sqlquery_tests {
     fn run_body_reference(reference: &str, format: &str, inner_params: Option<Value>) -> Value {
         let mut entries = vec![
             json!({"name": "_format", "valueCode": format}),
-            json!({"name": "queryReference", "valueReference": {"reference": reference}}),
+            json!({"name": "subjectReference", "valueReference": {"reference": reference}}),
         ];
         if let Some(p) = inner_params {
             entries.push(json!({"name": "parameters", "resource": p}));
@@ -165,7 +165,7 @@ mod sof_sqlquery_tests {
         let body = run_body_inline(lib, "csv", None);
 
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -198,7 +198,7 @@ mod sof_sqlquery_tests {
         let body = run_body_inline(lib, "json", None);
 
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -229,7 +229,7 @@ mod sof_sqlquery_tests {
 
         let body = run_body_reference("Library/demo", "json", None);
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -268,7 +268,7 @@ mod sof_sqlquery_tests {
         let body = run_body_inline(lib, "ndjson", Some(inner));
 
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -285,7 +285,7 @@ mod sof_sqlquery_tests {
         let lib2 = library_with_canonical_vd("SELECT COUNT(*) AS n FROM t", &vd_url, "t", vec![]);
         let body2 = run_body_inline(lib2, "json", None);
         let r2 = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -317,7 +317,7 @@ mod sof_sqlquery_tests {
         let body = run_body_inline(lib, "fhir", None);
 
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -339,11 +339,13 @@ mod sof_sqlquery_tests {
     }
 
     // =========================================================================
-    // Instance route
+    // Naming a stored Library as the subject
     // =========================================================================
 
+    /// `$sql-run` is `instance=false`, so a stored Library is named by
+    /// `subjectReference` rather than by an instance-level URL.
     #[tokio::test]
-    async fn instance_route_binds_library_by_id() {
+    async fn subject_reference_binds_stored_library() {
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "p1", "Smith", true).await;
         let vd_url = seed_patient_view(&backend).await;
@@ -355,10 +357,13 @@ mod sof_sqlquery_tests {
 
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [{"name": "_format", "valueCode": "json"}]
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "subjectReference", "valueReference": {"reference": "Library/demo"}}
+            ]
         });
         let response = server
-            .post("/Library/demo/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -371,26 +376,36 @@ mod sof_sqlquery_tests {
         assert_eq!(v[0]["patient_id"], json!("p1"));
     }
 
+    /// The pre-ballot type- and instance-level Library endpoints were
+    /// consolidated into the system-level `$sql-run`.
     #[tokio::test]
-    async fn instance_route_rejects_body_query_reference() {
+    async fn pre_ballot_library_urls_are_not_routed() {
         let (server, _) = create_test_server().await;
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [
-                {"name": "_format", "valueCode": "json"},
-                {"name": "queryReference", "valueReference": {"reference": "Library/other"}}
-            ]
+            "parameter": [{"name": "_format", "valueCode": "json"}]
         });
-        let response = server
-            .post("/Library/demo/$sqlquery-run")
-            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-            .add_header(
-                CONTENT_TYPE,
-                HeaderValue::from_static("application/fhir+json"),
-            )
-            .json(&body)
-            .await;
-        response.assert_status(StatusCode::BAD_REQUEST);
+        for url in [
+            "/Library/$sqlquery-run",
+            "/Library/demo/$sqlquery-run",
+            "/$sqlquery-run",
+        ] {
+            let response = server
+                .post(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&body)
+                .expect_failure()
+                .await;
+            assert_ne!(
+                response.status_code(),
+                StatusCode::OK,
+                "{url} was consolidated into $sql-run"
+            );
+        }
     }
 
     // =========================================================================
@@ -408,10 +423,10 @@ mod sof_sqlquery_tests {
         let lib = library_with_canonical_vd("SELECT patient_id FROM t", &vd_url, "t", vec![]);
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [{"name": "queryResource", "resource": lib}]
+            "parameter": [{"name": "subjectResource", "resource": lib}]
         });
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -450,12 +465,12 @@ mod sof_sqlquery_tests {
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "_format", "valueCode": "json"},
-                {"name": "queryResource", "resource": lib},
+                {"name": "subjectResource", "resource": lib},
                 {"name": "_limit", "valueInteger": 2}
             ]
         });
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -488,7 +503,7 @@ mod sof_sqlquery_tests {
         );
         let body = run_body_inline(lib, "json", None);
         let response = server
-            .post("/$sqlquery-run?_limit=1")
+            .post("/$sql-run?_limit=1")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -516,12 +531,12 @@ mod sof_sqlquery_tests {
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "_format", "valueCode": "json"},
-                {"name": "queryResource", "resource": lib},
+                {"name": "subjectResource", "resource": lib},
                 {"name": "_limit", "valueInteger": 100}
             ]
         });
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -541,7 +556,7 @@ mod sof_sqlquery_tests {
         let lib = library_with_canonical_vd("DELETE FROM t", &vd_url, "t", vec![]);
         let body = run_body_inline(lib, "json", None);
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -566,12 +581,12 @@ mod sof_sqlquery_tests {
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "_format", "valueCode": "json"},
-                {"name": "queryResource", "resource": lib},
+                {"name": "subjectResource", "resource": lib},
                 {"name": "source", "valueString": "http://example.org/data.ndjson"}
             ]
         });
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -592,10 +607,10 @@ mod sof_sqlquery_tests {
         // No `_format` in the body; only in the URL query.
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [{"name": "queryResource", "resource": lib}]
+            "parameter": [{"name": "subjectResource", "resource": lib}]
         });
         let response = server
-            .post("/$sqlquery-run?_format=csv")
+            .post("/$sql-run?_format=csv")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -622,10 +637,10 @@ mod sof_sqlquery_tests {
         // No _format in body or URL; rely on Accept.
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [{"name": "queryResource", "resource": lib}]
+            "parameter": [{"name": "subjectResource", "resource": lib}]
         });
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -655,7 +670,7 @@ mod sof_sqlquery_tests {
         let body = run_body_inline(lib, "json", None);
         // URL says csv, body says json — body wins.
         let response = server
-            .post("/$sqlquery-run?_format=csv")
+            .post("/$sql-run?_format=csv")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -681,7 +696,7 @@ mod sof_sqlquery_tests {
             library_with_canonical_vd("SELECT patient_id, family FROM t", &vd_url, "t", vec![]);
         let body = run_body_inline(lib, "csv", None);
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -723,12 +738,12 @@ mod sof_sqlquery_tests {
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "_format", "valueCode": "json"},
-                {"name": "queryResource", "resource": lib},
-                {"name": "queryReference", "valueReference": {"reference": "Library/other"}}
+                {"name": "subjectResource", "resource": lib},
+                {"name": "subjectReference", "valueReference": {"reference": "Library/other"}}
             ]
         });
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -739,21 +754,20 @@ mod sof_sqlquery_tests {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
+    /// A `subjectReference` naming a Library that does not exist is a 404: the
+    /// subject is what the operation is about, so it cannot proceed without it.
     #[tokio::test]
-    async fn query_reference_value_string_is_ignored() {
-        // Spec types queryReference as Reference; only valueReference.reference
-        // is honored. A valueString must not be silently accepted — the request
-        // should fail because no Library source was supplied.
+    async fn subject_reference_to_absent_library_returns_404() {
         let (server, _) = create_test_server().await;
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "_format", "valueCode": "json"},
-                {"name": "queryReference", "valueString": "Library/demo"}
+                {"name": "subjectReference", "valueString": "Library/does-not-exist"}
             ]
         });
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -761,7 +775,7 @@ mod sof_sqlquery_tests {
             )
             .json(&body)
             .await;
-        response.assert_status(StatusCode::BAD_REQUEST);
+        response.assert_status(StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -776,7 +790,7 @@ mod sof_sqlquery_tests {
         });
         let body = run_body_inline(lib, "json", Some(inner));
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -800,7 +814,7 @@ mod sof_sqlquery_tests {
         );
         let body = run_body_inline(lib, "json", None);
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -816,10 +830,13 @@ mod sof_sqlquery_tests {
         let (server, _) = create_test_server().await;
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [{"name": "_format", "valueCode": "json"}]
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "subjectReference", "valueReference": {"reference": "Library/does-not-exist"}}
+            ]
         });
         let response = server
-            .post("/Library/does-not-exist/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -844,7 +861,7 @@ mod sof_sqlquery_tests {
         );
         let body = run_body_inline(lib, "json", None);
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -868,7 +885,7 @@ mod sof_sqlquery_tests {
         );
         let body = run_body_inline(lib, "json", None);
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -888,7 +905,7 @@ mod sof_sqlquery_tests {
         lib.as_object_mut().unwrap().remove("type");
         let body = run_body_inline(lib, "json", None);
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -917,7 +934,7 @@ mod sof_sqlquery_tests {
         });
         let body = run_body_inline(lib, "json", None);
         let response = server
-            .post("/$sqlquery-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -932,25 +949,122 @@ mod sof_sqlquery_tests {
     // Capability statement
     // =========================================================================
 
+    /// A Library subject runs through the same `$sql-run` the CapabilityStatement
+    /// advertises; there is no separate `$sqlquery-run` to declare.
     #[tokio::test]
-    async fn capabilities_advertise_sqlquery_and_canonical() {
+    async fn capabilities_declare_one_run_operation() {
         let (server, _) = create_test_server().await;
         let response = server
-            .get("/$sql-on-fhir-capabilities")
+            .get("/metadata")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
         response.assert_status(StatusCode::OK);
         let v: Value = response.json();
-        let params = v["parameter"].as_array().unwrap();
-        let sqlquery = params
+        let names: Vec<&str> = v["rest"][0]["operation"]
+            .as_array()
+            .expect("rest[0].operation")
             .iter()
-            .find(|p| p["name"] == "supportsSqlQueryRun")
-            .expect("supportsSqlQueryRun present");
-        assert_eq!(sqlquery["valueBoolean"], json!(true));
-        let canonical = params
+            .filter_map(|op| op["name"].as_str())
+            .collect();
+        assert!(names.contains(&"sql-run"), "{names:?}");
+        assert!(
+            !names.contains(&"sqlquery-run"),
+            "$sqlquery-run was consolidated into $sql-run: {names:?}"
+        );
+    }
+
+    // =========================================================================
+    // Inline `context` artifacts on `$sql-run`
+    // =========================================================================
+
+    /// A `$sql-run` with an inline `queryResource` whose `depends-on`
+    /// ViewDefinition is supplied via `context` in the same body succeeds
+    /// without the ViewDefinition being stored on the server.
+    #[tokio::test]
+    async fn inline_view_resource_satisfies_depends_on_without_storage() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        seed_patient(&backend, "p2", "Jones", false).await;
+
+        let vd_url = "http://example.org/sof/ViewDefinition/patient-flat-inline";
+        let vd = json!({
+            "resourceType": "ViewDefinition",
+            "url": vd_url,
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "patient_id", "type": "string"},
+                {"path": "name.family", "name": "family", "type": "string"}
+            ]}]
+        });
+
+        let lib = library_with_canonical_vd(
+            "SELECT patient_id, family FROM t ORDER BY patient_id",
+            vd_url,
+            "t",
+            vec![],
+        );
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "subjectResource", "resource": lib},
+                {"name": "context", "resource": vd}
+            ]
+        });
+
+        let response = server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows.as_array().map(|a| a.len()), Some(2));
+        let ids: Vec<&str> = rows
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|p| p["name"] == "supportsCanonicalReference")
-            .expect("supportsCanonicalReference present");
-        assert_eq!(canonical["valueBoolean"], json!(true));
+            .filter_map(|r| r["patient_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"p1") && ids.contains(&"p2"));
+    }
+
+    /// When a `context` entry's URL matches a `depends-on` canonical, the
+    /// inline VD is used and storage is never consulted for that dependency.
+    /// A dependency whose URL does NOT appear in any supplied `context` entry
+    /// still falls back to storage and returns 404 when absent.
+    #[tokio::test]
+    async fn depends_on_not_in_inline_views_falls_back_to_storage_404() {
+        let (server, _) = create_test_server().await;
+
+        let vd_url = "http://example.org/sof/ViewDefinition/not-stored";
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", vd_url, "t", vec![]);
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "subjectResource", "resource": lib}
+            ]
+        });
+
+        let response = server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+
+        response.assert_status(StatusCode::NOT_FOUND);
     }
 }

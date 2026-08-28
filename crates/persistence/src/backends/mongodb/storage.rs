@@ -684,12 +684,13 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, &id, &resource, &mut session)
             .await?;
 
-        // An active SearchParameter write changes a tenant's overlay: refresh
-        // the stored-param cache (which the per-tenant loader reads) and drop
-        // the cached registries. Draft copies (the seeded spec set) never
-        // overlay, so skip them — avoids an O(n²) reload storm during seeding.
+        // An overlay-affecting SearchParameter write: refresh the stored-param
+        // cache (which the per-tenant loader reads) and drop the cached
+        // registries. Seeded spec copies never affect the overlay (see
+        // `create_affects_overlay`), which keeps bulk seeding from triggering
+        // an O(n²) reload storm.
         if resource_type == "SearchParameter"
-            && crate::search::search_parameter_create_affects_overlay(&resource)
+            && self.tenant_registries().create_affects_overlay(&resource)
         {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
@@ -2521,6 +2522,18 @@ impl SystemHistoryProvider for MongoBackend {
 
 #[async_trait]
 impl BundleProvider for MongoBackend {
+    /// MongoDB bundles run inside a server-side session transaction
+    /// (`begin_required_bundle_transaction_session` … `commit_transaction`),
+    /// so the server unwinds on abort or on a dropped session — including the
+    /// cancellation case that defeats an in-process compensation log.
+    ///
+    /// Requires a replica set; `begin_required_bundle_transaction_session`
+    /// fails the bundle when transactions are unavailable rather than silently
+    /// degrading to non-atomic writes.
+    fn supports_atomic_transactions(&self) -> bool {
+        true
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
@@ -2615,18 +2628,6 @@ impl BundleProvider for MongoBackend {
             bundle_type: BundleType::Transaction,
             entries: results,
         })
-    }
-
-    async fn process_batch(
-        &self,
-        _tenant: &TenantContext,
-        _entries: Vec<BundleEntry>,
-        _fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleResult> {
-        Err(StorageError::Backend(BackendError::UnsupportedCapability {
-            backend_name: "mongodb".to_string(),
-            capability: "BundleProvider".to_string(),
-        }))
     }
 }
 

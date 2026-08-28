@@ -159,12 +159,44 @@ async fn execute_search<S>(
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    let bundle_json = execute_search_bundle(state, &tenant, resource_type, pairs, strict).await?;
+    format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format).map_err(|_| {
+        RestError::InternalError {
+            message: "Failed to serialize response".to_string(),
+        }
+    })
+}
+
+/// Executes a type-level search and returns the searchset Bundle as JSON.
+///
+/// The HTTP search handlers wrap this in content negotiation; bundle
+/// processing (`GET [type]?params` entries in batch/transaction Bundles,
+/// #478) embeds the returned Bundle as an entry resource.
+pub(crate) async fn execute_search_bundle<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    resource_type: &str,
+    pairs: Vec<(String, String)>,
+    strict: bool,
+) -> RestResult<serde_json::Value>
+where
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
+{
     // Reject known-but-unimplemented control parameters instead of silently
     // ignoring them (which returns an unfiltered, misleading `200`). `_query`
     // (named queries) is not implemented by any backend. (`_list` is implemented
     // via list resolution; `_score` as an output/`_sort` concept; `_contained` /
     // `_containedType` are parsed below and gated per backend capability.)
-    const UNSUPPORTED_PARAMS: [&str; 1] = ["_query"];
+    //
+    // `_in` (R5/R6) asks whether a resource is a member of a referenced List or
+    // Group; resolving that is not implemented (#638). It cannot be left to fall
+    // through, because it *is* a registered parameter of type `reference` on
+    // those versions — so `Prefer: handling=lenient` would not drop it, and the
+    // backends would answer it with whatever their reference path makes of the
+    // spec's placeholder `Resource.id` expression: an identity test on
+    // PostgreSQL, an unfiltered result set on SQLite. Use `_list` for List
+    // membership.
+    const UNSUPPORTED_PARAMS: [&str; 2] = ["_query", "_in"];
     if let Some((key, _)) = pairs
         .iter()
         .find(|(k, _)| UNSUPPORTED_PARAMS.contains(&k.as_str()))
@@ -227,7 +259,47 @@ where
         pairs
     };
 
-    let search_params = SearchParams::from_pairs(pairs);
+    let mut search_params = SearchParams::from_pairs(pairs);
+
+    // Unknown search parameters. Per FHIR search error handling these may be
+    // ignored only under lenient handling and only if that is reported; under
+    // `Prefer: handling=strict` they are an error.
+    //
+    // Scope the registry read guard tightly so it doesn't span any await —
+    // parking_lot guards aren't Send by default, which would make this async fn
+    // !Send.
+    let ignored_params = {
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
+        unknown_search_params(resource_type, &search_params, &registry)
+    };
+    if !ignored_params.is_empty() {
+        if strict {
+            return Err(RestError::InvalidParameter {
+                param: ignored_params.join(", "),
+                message: format!(
+                    "unknown search parameter(s) rejected under Prefer: handling=strict: {}",
+                    ignored_params.join(", ")
+                ),
+            });
+        }
+        // Lenient: ignore them for real. Dropping them here keeps the filter out
+        // of the executed query (an unrecognized name would otherwise be matched
+        // against the search index and quietly return nothing), keeps them out of
+        // the self link built below, and they are reported as an OperationOutcome
+        // entry on the bundle.
+        debug!(
+            resource_type = %resource_type,
+            params = %ignored_params.join(", "),
+            "Ignoring unknown search parameter(s) under lenient handling"
+        );
+        let retained: Vec<(String, String)> = search_params
+            .iter()
+            .filter(|(k, _)| !ignored_params.contains(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        search_params = SearchParams::from_pairs(retained);
+    }
 
     // Convert REST params to persistence SearchQuery. Scope the registry read
     // guard tightly so it doesn't span any await — parking_lot guards aren't
@@ -235,20 +307,6 @@ where
     let mut query = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        // Under `Prefer: handling=strict`, reject unknown search parameters
-        // (the lenient default ignores them).
-        if strict {
-            let unknown = unknown_search_params(resource_type, &search_params, &registry);
-            if !unknown.is_empty() {
-                return Err(RestError::InvalidParameter {
-                    param: unknown.join(", "),
-                    message: format!(
-                        "unknown search parameter(s) rejected under Prefer: handling=strict: {}",
-                        unknown.join(", ")
-                    ),
-                });
-            }
-        }
         let built = build_search_query(resource_type, &search_params, &registry)?;
         // Under strict handling, reject a `_sort` on a field the server cannot
         // actually sort by (it would otherwise silently fall back to `id`). Only
@@ -365,10 +423,14 @@ where
     }
 
     // Build the self link URL
-    let self_link = build_search_url(state.base_url(), resource_type, &search_params);
+    let public_base = state.public_base_url_for_request(tenant);
+    let self_link = build_search_url(&public_base, resource_type, &search_params);
 
     // Convert result to FHIR Bundle
-    let bundle = result.to_bundle(state.base_url(), &self_link);
+    let mut bundle = result.to_bundle(&public_base, &self_link);
+    crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+        state.public_url_for_request(tenant, [resource_type, id])
+    });
 
     // Parse subsetting parameters
     let summary_mode = search_params
@@ -390,14 +452,43 @@ where
     // Get FHIR version from config for subsetting
     let fhir_version = state.config().default_fhir_version;
 
-    let bundle_json =
+    let mut bundle_json =
         bundle_to_json_with_subsetting(bundle, summary_mode, elements.as_deref(), fhir_version);
 
-    format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format).map_err(|_| {
-        RestError::InternalError {
-            message: "Failed to serialize response".to_string(),
-        }
-    })
+    // Report the parameters that were ignored under lenient handling. Added
+    // after subsetting so `_elements`/`_summary` don't strip the outcome.
+    // `_summary=count` returns only `Bundle.total`, so there is no entry list to
+    // attach it to.
+    if !ignored_params.is_empty() && summary_mode != Some(SummaryMode::Count) {
+        append_ignored_params_outcome(&mut bundle_json, &ignored_params);
+    }
+
+    Ok(bundle_json)
+}
+
+/// Appends a `search.mode = outcome` entry to a searchset bundle reporting the
+/// search parameters the server ignored under lenient handling.
+///
+/// FHIR allows an unsupported parameter to be ignored only if the server says
+/// so; the self link already omits it, and this outcome names it explicitly.
+fn append_ignored_params_outcome(bundle_json: &mut serde_json::Value, ignored: &[String]) {
+    let outcome = crate::responses::OperationOutcomeBuilder::new()
+        .warning(
+            crate::responses::operation_outcome::IssueType::NotSupported,
+            format!(
+                "search parameter(s) not supported by this server and ignored: {}",
+                ignored.join(", ")
+            ),
+        )
+        .build();
+    let entry = serde_json::json!({
+        "search": { "mode": "outcome" },
+        "resource": outcome,
+    });
+    match bundle_json.get_mut("entry").and_then(|e| e.as_array_mut()) {
+        Some(entries) => entries.push(entry),
+        None => bundle_json["entry"] = serde_json::json!([entry]),
+    }
 }
 
 /// Executes a system-level search across all resource types.
@@ -450,10 +541,14 @@ where
         })?;
 
     // Build the self link URL
-    let self_link = build_system_search_url(state.base_url(), &search_params);
+    let public_base = state.public_base_url_for_request(&tenant);
+    let self_link = build_system_search_url(&public_base, &search_params);
 
     // Convert result to FHIR Bundle
-    let bundle = result.to_bundle(state.base_url(), &self_link);
+    let mut bundle = result.to_bundle(&public_base, &self_link);
+    crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+        state.public_url_for_request(&tenant, [resource_type, id])
+    });
 
     // Parse subsetting parameters
     let summary_mode = search_params
@@ -486,21 +581,17 @@ where
 /// Builds a type-level search URL from base URL and parameters.
 fn build_search_url(base_url: &str, resource_type: &str, params: &SearchParams) -> String {
     let query = encode_query(params);
-    if query.is_empty() {
-        format!("{}/{}", base_url, resource_type)
-    } else {
-        format!("{}/{}?{}", base_url, resource_type, query)
-    }
+    crate::public_url::PublicUrl::parse(base_url)
+        .expect("request public base was built from validated configuration")
+        .with_segments_and_query([resource_type], &query)
 }
 
 /// Builds a system-level search URL from base URL and parameters.
 fn build_system_search_url(base_url: &str, params: &SearchParams) -> String {
     let query = encode_query(params);
-    if query.is_empty() {
-        base_url.to_string()
-    } else {
-        format!("{}?{}", base_url, query)
-    }
+    crate::public_url::PublicUrl::parse(base_url)
+        .expect("request public base was built from validated configuration")
+        .with_segments_and_query(std::iter::empty::<&str>(), &query)
 }
 
 /// Encodes search params back into a query string, preserving repeated keys.
@@ -774,6 +865,13 @@ async fn expand_subsumption_into(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+
+    use crate::config::ServerConfig;
+    use crate::tenant::TenantSource;
 
     /// Collapses result pairs into a last-wins map for assertions.
     fn as_map(pairs: &[(String, String)]) -> HashMap<String, String> {
@@ -787,6 +885,51 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         )
+    }
+
+    #[tokio::test]
+    async fn system_search_uses_the_tenant_aware_public_base() {
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| path.join("data"));
+        let backend = Arc::new(
+            SqliteBackend::with_config(
+                ":memory:",
+                SqliteBackendConfig {
+                    data_dir,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        backend.init_schema().unwrap();
+        let state = AppState::new(
+            backend,
+            ServerConfig {
+                base_url: "https://public.example/fhir".to_string(),
+                ..ServerConfig::for_testing()
+            },
+        );
+        let tenant = TenantExtractor::new("acme", TenantSource::UrlPath);
+
+        let response = execute_system_search(
+            &state,
+            tenant,
+            vec![("_type".to_string(), "Patient".to_string())],
+            FhirFormat::Json,
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            bundle["link"][0]["url"],
+            "https://public.example/fhir/acme?_type=Patient"
+        );
     }
 
     #[test]

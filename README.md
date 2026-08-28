@@ -60,7 +60,7 @@ echo '{"resourceType": "Patient", "id": "123"}' | ./fhirpath-cli 'Patient.id'
 # Transform NDJSON file to CSV using SQL-on-FHIR
 ./sof-cli --view examples/patient-view.json --bundle examples/patients.ndjson
 
-# SQL-on-FHIR HTTP server (POST to http://localhost:8080/ViewDefinition/$viewdefinition-run)
+# SQL-on-FHIR HTTP server (POST to http://localhost:8080/$sql-run)
 ./sof-server
 
 # FHIRPath HTTP server (POST expressions to http://localhost:3000/fhirpath)
@@ -233,12 +233,18 @@ AWS_REGION=us-east-1 \
 | `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch` |
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
-| `HFS_BASE_URL` | `http://localhost:8080` | Base URL used in `Location` headers and Bundle links |
+| `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base used in `Location` headers and Bundle links |
 | `HFS_DATABASE_URL` | `fhir.db` | Database URL (SQLite path or PostgreSQL connection string) |
 | `HFS_DATA_DIR` | `./data` | Directory containing FHIR data files (search parameters) |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_DEFAULT_FHIR_VERSION` | `R4` | FHIR version (R4, R4B, R5, R6) |
 | `HFS_LOG_LEVEL` | `info` | Log level (error, warn, info, debug, trace) |
+
+Set `HFS_BASE_URL` to the URL clients use, including any reverse-proxy path
+prefix, for example `https://fhir.example.com/fhir`. HFS accepts only absolute
+`http` or `https` URLs without credentials, query strings, or fragments. It
+removes trailing slashes at startup. HFS does not derive this value from
+`Host`, `Forwarded`, or `X-Forwarded-*` request headers.
 
 **Limits & behavior**
 
@@ -328,13 +334,13 @@ compressed when the client sends `Accept-Encoding`.
 
 **SQL-on-FHIR async export**
 
-The `$viewdefinition-export` / `$sqlquery-export` operations write tabular output
+The `$sql-export` operation writes tabular output
 asynchronously to an export sink. See the [rest crate README](crates/rest/README.md#sql-on-fhir-async-export)
 for the full `HFS_EXPORT_*` table.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$viewdefinition-run`/`-export`, `$sqlquery-*`); requires a `sqlite`/`postgres` backend |
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`); requires a `sqlite`/`postgres` backend |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` export sink |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output and bookkeeping; the cleanup reaper deletes shards and drops the job afterward |
@@ -413,10 +419,10 @@ Complete implementation of the [FHIRPath 3.0.0-ballot specification](https://hl7
 - Auto-detects FHIR version from input data
 
 ### 6. [`helios-sof`](crates/sof) - SQL-on-FHIR Implementation
-Transform FHIR resources into tabular data using [ViewDefinitions](https://sql-on-fhir.org/ig/latest/index.html).
+Transform FHIR resources into tabular data using [ViewDefinitions](http://hl7.org/fhir/uv/sql-on-fhir/index.html).
 - **Executables:**
   - `sof-cli` - Command-line tool for batch transformations
-  - `sof-server` - HTTP server with `ViewDefinition/$viewdefinition-run` operation
+  - `sof-server` - HTTP server with `$sql-run` operation
 - Supports multiple input formats: JSON, NDJSON, and FHIR Bundles from local/cloud storage
 - Supports multiple output formats: CSV, JSON, NDJSON, and Parquet
 
@@ -497,7 +503,7 @@ Storage backend abstraction supporting multiple database technologies optimized 
 - Multiple input formats: JSON, NDJSON (newline-delimited), and FHIR Bundles
 - Multiple output formats: CSV, JSON, NDJSON, Parquet
 - Streaming support for large datasets
-- HTTP API with `$viewdefinition-run` operation
+- HTTP API with `$sql-run` operation
 - Cloud storage support: S3, GCS, Azure Blob Storage
 
 ## FHIR REST API

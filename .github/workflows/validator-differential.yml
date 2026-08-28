@@ -1,0 +1,141 @@
+name: Validator Differential Spike
+
+# Phase-1 spike for issue #427: differential-test the FHIR example corpus
+# against the HL7 reference validator to adjudicate the #423 baselines.
+#
+# Posture (deliberate, per the issue):
+#   * NOT a merge gate, NOT per-PR. The issue's non-goals say "same posture as
+#     the sweep it builds on: a tracking signal" and "belongs on a schedule".
+#   * This is `workflow_dispatch` ONLY — the spike is run on demand to PRODUCE
+#     THE NUMBERS (throughput + output shape) the issue asks to post before a
+#     full harness is designed. A nightly `schedule:` trigger is added in
+#     phase 2, once those numbers justify the runner time.
+#
+# It answers the issue's three "known unknowns":
+#   1. Validator reusability — resolved: `validator_cli.jar` (same provisioning
+#      as hts-ig-conformance.yml), no Inferno compose stack needed.
+#   2. Throughput — measured here: wall-clock per resource, reported to the job
+#      summary and the uploaded artifact.
+#   3. Output comparability — exercised by the unit-tested normalization layer
+#      in tests/differential/normalize.rs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample_size:
+        description: "Resources per version to push through the reference validator"
+        required: false
+        default: "50"
+      versions:
+        description: "Space-separated FHIR versions to run (subset of: R4 R4B R5)"
+        required: false
+        default: "R4 R4B R5"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  DIFFERENTIAL_SAMPLE_SIZE: ${{ github.event.inputs.sample_size || '50' }}
+
+jobs:
+  differential-spike:
+    name: Differential spike (our engine vs HL7 reference validator)
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Java 21 (for validator_cli.jar)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Configure LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      # Corpus is vendored; a missing directory is a checkout problem, not a
+      # reason to run an empty spike. Mirrors validator-conformance.yml.
+      - name: Verify the example corpus is present
+        run: |
+          set -euo pipefail
+          for v in R4 R4B R5; do
+            dir="crates/fhir/tests/data/json/$v"
+            [ -d "$dir" ] || { echo "::error::[CORPUS-MISSING] $dir does not exist."; exit 1; }
+          done
+
+      # The comparability layer must be green before any JVM work — this is the
+      # Java-free unit-test half of the harness.
+      - name: Normalization + harness unit tests (no Java)
+        run: |
+          cargo test -p helios-fhir-validator --all-features --test differential -- --nocapture
+
+      - name: Run reference validator over the deterministic sample
+        run: |
+          set -euo pipefail
+          for v in ${{ github.event.inputs.versions || 'R4 R4B R5' }}; do
+            echo "::group::reference validator $v"
+            crates/fhir-validator/tests/scripts/run_reference_validator.sh "$v" "$DIFFERENTIAL_SAMPLE_SIZE"
+            echo "::endgroup::"
+          done
+
+      - name: Diff (our engine vs reference) and produce the buckets
+        run: |
+          set -euo pipefail
+          filters=""
+          for v in ${{ github.event.inputs.versions || 'R4 R4B R5' }}; do
+            case "$v" in
+              R4)  filters="$filters r4_differential" ;;
+              R4B) filters="$filters r4b_differential" ;;
+              R5)  filters="$filters r5_differential" ;;
+            esac
+          done
+          # cargo test exits 0 when a filter matches nothing; run each explicitly.
+          for t in $filters; do
+            cargo test -p helios-fhir-validator --all-features --test differential \
+              "$t" -- --ignored --nocapture
+          done
+
+      - name: Upload differential artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential-spike
+          path: |
+            target/differential/*.reference.json
+            target/differential/*.diff.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Summary (the numbers to post on #427)
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Validator differential spike (#427)"
+            echo
+            echo "Sample size per version: \`$DIFFERENTIAL_SAMPLE_SIZE\`"
+            echo
+            if ls target/differential/*.diff.json >/dev/null 2>&1; then
+              echo "| Version | Sampled | ms/resource | Agree | False positives | **False negatives** | Out-of-scope |"
+              echo "|---|---:|---:|---:|---:|---:|---:|"
+              for f in target/differential/*.diff.json; do
+                jq -r '"| \(.version) | \(.sampled) | \(.reference_mean_ms_per_resource) | \(.files_agreeing) | \(.total_false_positive_findings) | **\(.total_false_negative_findings)** | \(.total_out_of_scope_findings) |"' "$f"
+              done
+              echo
+              echo "**False negatives** are structural issues the HL7 reference validator raised and our engine did not — the highest-value discovery of this spike. Terminology/invariant findings are counted under *Out-of-scope* (our structural sweep does not compute them) and are excluded from the false-negative bucket. Full per-file buckets are in the **differential-spike** artifact."
+            else
+              echo "No diff artifacts were produced — the reference run did not complete."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -62,7 +62,7 @@ jobs:
         run: cargo test -p helios-ui
 
       - name: Build hfs (ui feature)
-        run: cargo build -p helios-hfs --features ui
+        run: cargo build -p helios-hfs --features ui,subscriptions
 
       # The browser ring, inside the Playwright container on the remote daemon.
       # boot.mjs starts the copied-in hfs and Playwright drives it — both live in
@@ -73,13 +73,24 @@ jobs:
           docker rm -fv "$RUN_CONTAINER" 2>/dev/null || true
           # 2g shm: Chromium and the tmpfs-backed SQLite DB share /dev/shm, and
           # per-tenant conformance seeding overflows docker's 64m default.
-          docker run -d --name "$RUN_CONTAINER" --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
-          docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui
+          # Labels are what make this container reapable by something other
+          # than the step below. `hfs-ci=true` is the marker the docker-host-gc
+          # orphan sweep looks for; `github.run_id` matches the filter ci.yml
+          # already uses. Without them a container that outlives its job is
+          # invisible to every sweep on the host, because the name is
+          # run-id-scoped and so can never be matched by a later run.
+          docker run -d --name "$RUN_CONTAINER" \
+            --label hfs-ci=true \
+            --label github.run_id=${{ github.run_id }} \
+            --label github.workflow=ui-tests \
+            --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+          docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui/assets
           docker cp target/debug/hfs "$RUN_CONTAINER":/work/target/debug/hfs
           docker cp data "$RUN_CONTAINER":/work/data
+          docker cp crates/ui/assets/. "$RUN_CONTAINER":/work/crates/ui/assets
           docker cp crates/ui/e2e "$RUN_CONTAINER":/work/crates/ui/e2e
           docker exec -e CI=1 -w /work/crates/ui/e2e "$RUN_CONTAINER" \
-            bash -c "npm ci && npx playwright test"
+            bash -c "npm ci && npm run test:unit && npx playwright test"
 
       - name: Copy Playwright report out
         if: always()
@@ -97,4 +108,190 @@ jobs:
 
       - name: Remove Playwright container
         if: always()
-        run: docker rm -fv "$RUN_CONTAINER" 2>/dev/null || true
+        run: |
+          # Deliberately not `2>/dev/null || true`. On 2026-07-30 the host was
+          # over its disk quota, containerd could not write meta.db, and this
+          # removal failed with "disk quota exceeded" — but the error went to
+          # /dev/null and `|| true` made the step green, so a running
+          # Playwright container leaked unnoticed for two weeks. Cleanup that
+          # cannot clean up has to say so.
+          #
+          # Still non-fatal: a leak should not turn a passing suite red. The
+          # annotation is the signal, and docker-host-gc is the backstop.
+          reap() {
+            local name="${1:-}"
+            [ -n "$name" ] || return 0
+            if ! docker inspect "$name" >/dev/null 2>&1; then
+              echo "$name already gone"
+              return 0
+            fi
+            # Verify by inspect rather than trusting the exit code: `docker rm
+            # -f` exits 0 for a container that does not exist, and a wedged
+            # daemon can report success without the container actually going
+            # away. "Did it disappear?" is the only claim worth making.
+            if err=$(docker rm -fv "$name" 2>&1) && ! docker inspect "$name" >/dev/null 2>&1; then
+              echo "Removed $name"
+            else
+              if [ -n "$err" ]; then echo "$err"; fi
+              echo "::warning::Could not remove $name; it is leaking on the Docker host."
+            fi
+          }
+
+          reap "$RUN_CONTAINER"
+
+  # Build once with every FHIR version, then boot that binary once per default
+  # version for the escaped-value and Resources create-target contracts. These
+  # jobs are the version axis of an orthogonal matrix: ui-tests-matrix.yml
+  # covers all seven
+  # search-capable storage modes on R4, because the codec and REST alternative
+  # boundary run before backend dispatch. The R6 leg also retains #600's
+  # dedicated selector coverage. Split into build + test jobs,
+  # artifact-handed-off, like ui-tests-matrix.yml's backend matrix.
+  ui-multiversion-build:
+    name: Build HFS (multi-version + ui)
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
+
+      - name: Build HFS (R4 + R4B + R5 + R6)
+        run: |
+          cargo build -p helios-hfs --no-default-features \
+            --features R4,R4B,R5,R6,ui,sqlite
+
+      - name: Upload HFS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-ui-multiversion-binary
+          path: target/debug/hfs
+          retention-days: 1
+
+  ui-multiversion-tests:
+    name: search + Resources (${{ matrix.fhir_version }})
+    needs: ui-multiversion-build
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        fhir_version: [R4, R4B, R5, R6]
+    env:
+      # Job-scoped override of the workflow-level RUN_CONTAINER: this job runs
+      # concurrently with `ui-tests` above and must not fight it for the same
+      # container name on the shared remote Docker host.
+      RUN_CONTAINER: ui-e2e-${{ matrix.fhir_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-ui-multiversion-binary
+          path: target/debug
+
+      - name: Make HFS binary executable
+        run: chmod +x target/debug/hfs
+
+      - name: Run search and Resources checks for the selected FHIR version
+        run: |
+          set -euo pipefail
+          docker rm -fv "$RUN_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$RUN_CONTAINER" \
+            --label hfs-ci=true \
+            --label github.run_id=${{ github.run_id }} \
+            --label github.workflow=ui-tests \
+            --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+          docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui/assets
+          docker cp target/debug/hfs "$RUN_CONTAINER":/work/target/debug/hfs
+          docker cp data "$RUN_CONTAINER":/work/data
+          docker cp crates/ui/assets/. "$RUN_CONTAINER":/work/crates/ui/assets
+          docker cp crates/ui/e2e "$RUN_CONTAINER":/work/crates/ui/e2e
+          # Search uses the server default rather than the sidebar selection,
+          # so each matrix leg must boot HFS with the version under test.
+          # Keep the pre-existing selector regression on the R6 leg too.
+          docker exec -e CI=1 \
+            -e HFS_DEFAULT_FHIR_VERSION=${{ matrix.fhir_version }} \
+            -w /work/crates/ui/e2e "$RUN_CONTAINER" bash -c '
+              set -euo pipefail
+              npm ci
+              npm run test:unit
+              HFS_E2E_PORT=8080 node boot.mjs >/tmp/hfs-escaped-comma.log 2>&1 &
+              server_pid=$!
+              cleanup() { kill -TERM "$server_pid" 2>/dev/null || true; }
+              trap cleanup EXIT
+              ready=0
+              for _ in $(seq 1 180); do
+                if ! kill -0 "$server_pid" 2>/dev/null; then break; fi
+                if node -e "fetch(\"http://127.0.0.1:8080/ui\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+                  ready=1
+                  break
+                fi
+                sleep 1
+              done
+              if [ "$ready" -ne 1 ]; then
+                cat /tmp/hfs-escaped-comma.log
+                exit 1
+              fi
+              HFS_E2E_BASE_URL=http://127.0.0.1:8080 \
+                npx playwright test tests/queries.spec.ts tests/resources.spec.ts \
+                  --grep "escaped commas|literal commas|malformed FHIR|empty alternatives|drilling preserves|create eligibility follows"
+              if [ "$HFS_DEFAULT_FHIR_VERSION" = R6 ]; then
+                HFS_E2E_BASE_URL=http://127.0.0.1:8080 \
+                  npx playwright test tests/dashboard-multiversion.spec.ts
+              fi
+            '
+
+      - name: Copy Playwright report out
+        if: always()
+        run: |
+          mkdir -p "./crates/ui/e2e/multiversion-results-${{ matrix.fhir_version }}"
+          docker cp "$RUN_CONTAINER":/work/crates/ui/e2e/playwright-report \
+            "./crates/ui/e2e/multiversion-results-${{ matrix.fhir_version }}/playwright-report" \
+            2>/dev/null || true
+          docker cp "$RUN_CONTAINER":/tmp/hfs-escaped-comma.log \
+            "./crates/ui/e2e/multiversion-results-${{ matrix.fhir_version }}/hfs.log" \
+            2>/dev/null || true
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.fhir_version }}
+          path: crates/ui/e2e/multiversion-results-${{ matrix.fhir_version }}/
+          retention-days: 7
+
+      - name: Remove Playwright container
+        if: always()
+        run: |
+          # See the `ui-tests` job's identical step for why this is not
+          # `2>/dev/null || true`.
+          reap() {
+            local name="${1:-}"
+            [ -n "$name" ] || return 0
+            if ! docker inspect "$name" >/dev/null 2>&1; then
+              echo "$name already gone"
+              return 0
+            fi
+            if err=$(docker rm -fv "$name" 2>&1) && ! docker inspect "$name" >/dev/null 2>&1; then
+              echo "Removed $name"
+            else
+              if [ -n "$err" ]; then echo "$err"; fi
+              echo "::warning::Could not remove $name; it is leaking on the Docker host."
+            fi
+          }
+
+          reap "$RUN_CONTAINER"

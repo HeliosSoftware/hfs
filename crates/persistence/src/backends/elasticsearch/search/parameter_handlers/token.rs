@@ -10,15 +10,10 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
 
     // Handle modifiers first
     match param.modifier {
-        Some(SearchModifier::Not) => {
-            // Negate the inner clause
-            let inner = build_token_condition(name, value, None)?;
-            return Some(json!({
-                "bool": {
-                    "must_not": [inner]
-                }
-            }));
-        }
+        // `:not` builds the POSITIVE clause here; the query builder negates once,
+        // around the OR of all values (#473). Negating per value made
+        // `:not=a,b` mean "NOT a OR NOT b", so any resource carrying both values
+        // satisfied one half of the OR and leaked back into the result set.
         Some(SearchModifier::Text) => {
             return build_text_clause(name, value);
         }
@@ -217,11 +212,15 @@ mod tests {
     }
 
     #[test]
-    fn test_not_modifier() {
+    fn test_not_modifier_builds_positive_clause() {
+        // The query builder applies the negation once, around all values (#473);
+        // the per-value clause must stay positive.
         let param = make_param("gender", Some(SearchModifier::Not));
         let clause = build_clause(&param, "male").unwrap();
         let s = serde_json::to_string(&clause).unwrap();
-        assert!(s.contains("must_not"));
+        assert!(!s.contains("must_not"));
+        assert!(s.contains("search_params.token.code"));
+        assert!(s.contains("male"));
     }
 
     #[test]

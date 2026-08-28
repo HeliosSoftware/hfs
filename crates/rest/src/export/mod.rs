@@ -1,5 +1,4 @@
-//! Export job infrastructure for `$viewdefinition-export` and
-//! `$sqlquery-export`.
+//! Export job infrastructure for `$sql-export`.
 //!
 //! This module defines:
 //! - [`ExportJobController`] — trait for managing async export jobs
@@ -23,7 +22,7 @@ pub mod sink;
 
 pub use controller::{
     CompletedFile, ExportError, ExportJobController, ExportTask, ExportWork, JobStatus,
-    NamedSqlQuery, SqlExportLimits, SqlTableSource,
+    NamedSqlQuery, SqlExportLimits,
 };
 pub use in_memory::{CleanupConfig, InMemoryController};
 pub use planner::DEFAULT_SHARD_ROWS;

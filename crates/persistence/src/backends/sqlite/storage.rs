@@ -204,12 +204,13 @@ impl ResourceStorage for SqliteBackend {
         // Index the resource for search
         self.index_resource(&conn, tenant_id, resource_type, &id, &resource)?;
 
-        // An *active* SearchParameter write changes this tenant's overlay — drop
-        // its cached registry so the next access rebuilds from storage. Draft
-        // copies (e.g. the seeded spec set) never overlay, so skip them and
-        // avoid an O(n²) rebuild storm during bulk seeding.
+        // An overlay-affecting SearchParameter write changes this tenant's
+        // registry — drop the cached copy so the next access rebuilds from
+        // storage. Seeded spec copies never affect the overlay (see
+        // `create_affects_overlay`), which keeps bulk seeding from triggering
+        // an O(n²) rebuild storm.
         if resource_type == "SearchParameter"
-            && crate::search::search_parameter_create_affects_overlay(&resource)
+            && self.tenant_registries().create_affects_overlay(&resource)
         {
             self.tenant_registries().invalidate(tenant_id);
         }
@@ -1112,9 +1113,10 @@ impl SqliteBackend {
         self.delete_search_index(&conn, tenant_id, resource_type, id)?;
         self.index_resource(&conn, tenant_id, resource_type, id, &resource)?;
 
-        // A restored *active* SearchParameter re-enters this tenant's overlay.
+        // A restored overlay-affecting SearchParameter re-enters this tenant's
+        // overlay.
         if resource_type == "SearchParameter"
-            && crate::search::search_parameter_create_affects_overlay(&resource)
+            && self.tenant_registries().create_affects_overlay(&resource)
         {
             self.tenant_registries().invalidate(tenant_id);
         }
@@ -2919,23 +2921,11 @@ impl SqliteBackend {
         let mut search_params = Vec::with_capacity(params.len());
 
         for (name, value) in params {
-            // Look up the parameter definition to get its type
+            // Look up the parameter definition to get its type, falling back to
+            // the shared registry-miss guess when it is not registered.
             let param_type = self
                 .lookup_param_type(&registry, resource_type, name)
-                .unwrap_or({
-                    // Fallback for common parameters when not in registry
-                    match name.as_str() {
-                        "_id" => SearchParamType::Token,
-                        "_lastUpdated" => SearchParamType::Date,
-                        "_tag" | "_profile" | "_security" => SearchParamType::Token,
-                        "identifier" => SearchParamType::Token,
-                        // Common reference parameters across many resource types
-                        "patient" | "subject" | "encounter" | "performer" | "author"
-                        | "requester" | "recorder" | "asserter" | "practitioner"
-                        | "organization" | "location" | "device" => SearchParamType::Reference,
-                        _ => SearchParamType::String, // Default fallback
-                    }
-                });
+                .unwrap_or_else(|| crate::search::fallback_param_type(name));
 
             search_params.push(SearchParameter {
                 name: name.clone(),
@@ -3168,6 +3158,13 @@ impl SqliteBackend {
 
 #[async_trait]
 impl BundleProvider for SqliteBackend {
+    /// SQLite provides real ACID transactions; `SqliteBackend` also implements
+    /// [`TransactionProvider`](crate::core::TransactionProvider), and
+    /// `process_transaction` runs inside one, so a failure unwinds completely.
+    fn supports_atomic_transactions(&self) -> bool {
+        true
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
@@ -3256,26 +3253,6 @@ impl BundleProvider for SqliteBackend {
 
         Ok(BundleResult {
             bundle_type: BundleType::Transaction,
-            entries: results,
-        })
-    }
-
-    async fn process_batch(
-        &self,
-        tenant: &TenantContext,
-        entries: Vec<BundleEntry>,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleResult> {
-        let mut results = Vec::with_capacity(entries.len());
-
-        // Process each entry independently
-        for entry in &entries {
-            let result = self.process_batch_entry(tenant, entry, fhir_version).await;
-            results.push(result);
-        }
-
-        Ok(BundleResult {
-            bundle_type: BundleType::Batch,
             entries: results,
         })
     }
@@ -3398,147 +3375,6 @@ impl SqliteBackend {
                     }),
                 ))
             }
-        }
-    }
-
-    /// Process a single batch entry (independent, no transaction).
-    async fn process_batch_entry(
-        &self,
-        tenant: &TenantContext,
-        entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> BundleEntryResult {
-        match self
-            .process_batch_entry_inner(tenant, entry, fhir_version)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => BundleEntryResult::error(
-                500,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "error", "code": "exception", "diagnostics": e.to_string()}]
-                }),
-            ),
-        }
-    }
-
-    async fn process_batch_entry_inner(
-        &self,
-        tenant: &TenantContext,
-        entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleEntryResult> {
-        match entry.method {
-            BundleMethod::Get => {
-                let (resource_type, id) = self.parse_url(&entry.url)?;
-                match self.read(tenant, &resource_type, &id).await? {
-                    Some(resource) => Ok(BundleEntryResult::ok(resource)),
-                    None => Ok(BundleEntryResult::error(
-                        404,
-                        serde_json::json!({
-                            "resourceType": "OperationOutcome",
-                            "issue": [{"severity": "error", "code": "not-found"}]
-                        }),
-                    )),
-                }
-            }
-            BundleMethod::Post => {
-                let resource = entry.resource.clone().ok_or_else(|| {
-                    StorageError::Validation(crate::error::ValidationError::MissingRequiredField {
-                        field: "resource".to_string(),
-                    })
-                })?;
-
-                let resource_type = resource
-                    .get("resourceType")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| {
-                        StorageError::Validation(
-                            crate::error::ValidationError::MissingRequiredField {
-                                field: "resourceType".to_string(),
-                            },
-                        )
-                    })?;
-
-                let created = self
-                    .create(tenant, &resource_type, resource, fhir_version)
-                    .await?;
-                Ok(BundleEntryResult::created(created))
-            }
-            BundleMethod::Put => {
-                let resource = entry.resource.clone().ok_or_else(|| {
-                    StorageError::Validation(crate::error::ValidationError::MissingRequiredField {
-                        field: "resource".to_string(),
-                    })
-                })?;
-
-                let (resource_type, id) = self.parse_url(&entry.url)?;
-
-                // `ifMatch` was previously dropped on the floor in the BATCH
-                // path (the transaction path did check it), so optimistic
-                // locking silently disappeared for anyone who wrapped a PUT in a
-                // `type: batch` Bundle — a lost update reported as 200 OK.
-                // Only pay for the extra read when a precondition was supplied.
-                if entry.if_match.is_some() {
-                    // A deleted resource has no current representation, so
-                    // `Gone` is `None` here; real storage errors must not be
-                    // swallowed into a bogus precondition failure.
-                    let existing = match self.read(tenant, &resource_type, &id).await {
-                        Ok(v) => v,
-                        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-                        Err(e) => return Err(e),
-                    };
-                    if let Some(failure) = bundle_if_match_gate(
-                        entry.if_match.as_deref(),
-                        existing.as_ref().map(|r| r.version_id()),
-                    ) {
-                        return Ok(failure);
-                    }
-                }
-
-                let (stored, _created) = self
-                    .create_or_update(tenant, &resource_type, &id, resource, fhir_version)
-                    .await?;
-                Ok(BundleEntryResult::ok(stored))
-            }
-            BundleMethod::Delete => {
-                let (resource_type, id) = self.parse_url(&entry.url)?;
-
-                // As above: `ifMatch` on DELETE was ignored here entirely.
-                if entry.if_match.is_some() {
-                    // A deleted resource has no current representation, so
-                    // `Gone` is `None` here; real storage errors must not be
-                    // swallowed into a bogus precondition failure.
-                    let existing = match self.read(tenant, &resource_type, &id).await {
-                        Ok(v) => v,
-                        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-                        Err(e) => return Err(e),
-                    };
-                    if let Some(failure) = bundle_if_match_gate(
-                        entry.if_match.as_deref(),
-                        existing.as_ref().map(|r| r.version_id()),
-                    ) {
-                        return Ok(failure);
-                    }
-                }
-
-                match self.delete(tenant, &resource_type, &id).await {
-                    Ok(()) => Ok(BundleEntryResult::deleted()),
-                    Err(StorageError::Resource(ResourceError::NotFound { .. })) => {
-                        Ok(BundleEntryResult::deleted()) // Idempotent delete
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            BundleMethod::Patch => Ok(BundleEntryResult::error(
-                501,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "error", "code": "not-supported", "diagnostics": "PATCH not implemented"}]
-                }),
-            )),
         }
     }
 
@@ -6323,46 +6159,13 @@ mod tests {
     // BundleProvider Tests
     // ========================================================================
 
-    #[tokio::test]
-    async fn test_batch_create_multiple() {
-        use crate::core::transaction::BundleProvider;
-
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-
-        let entries = vec![
-            BundleEntry {
-                method: BundleMethod::Post,
-                url: "Patient".to_string(),
-                resource: Some(json!({"resourceType": "Patient", "id": "batch-p1"})),
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                full_url: None,
-            },
-            BundleEntry {
-                method: BundleMethod::Post,
-                url: "Patient".to_string(),
-                resource: Some(json!({"resourceType": "Patient", "id": "batch-p2"})),
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                full_url: None,
-            },
-        ];
-
-        let result = backend
-            .process_batch(&tenant, entries, helios_fhir::FhirVersion::default())
-            .await
-            .unwrap();
-
-        assert_eq!(result.entries.len(), 2);
-        assert_eq!(result.entries[0].status, 201);
-        assert_eq!(result.entries[1].status, 201);
-    }
-
     /// #350: bundle-created resources must be stamped with the bundle's
     /// negotiated version, not the compile-time default.
+    ///
+    /// This covers the transaction arm only. The batch arm is executed by the
+    /// REST layer, and its half of #350 is pinned by
+    /// `batch_entries_stamp_the_configured_default` in
+    /// `helios-rest/tests/default_version_fallback.rs`.
     #[cfg(feature = "R5")]
     #[tokio::test]
     async fn test_bundle_writes_stamp_the_negotiated_version() {
@@ -6387,131 +6190,16 @@ mod tests {
             .unwrap();
         assert_eq!(tx_result.entries[0].status, 201);
 
-        let batch_result = backend
-            .process_batch(
-                &tenant,
-                vec![entry("batch-r5")],
-                helios_fhir::FhirVersion::R5,
-            )
+        let stored = backend
+            .read(&tenant, "Patient", "tx-r5")
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(batch_result.entries[0].status, 201);
-
-        for id in ["tx-r5", "batch-r5"] {
-            let stored = backend.read(&tenant, "Patient", id).await.unwrap().unwrap();
-            assert_eq!(
-                stored.fhir_version(),
-                helios_fhir::FhirVersion::R5,
-                "{id} should be stamped R5"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_batch_mixed_operations() {
-        use crate::core::transaction::BundleProvider;
-
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-
-        // Create a resource first
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "existing"}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        let entries = vec![
-            // Read existing
-            BundleEntry {
-                method: BundleMethod::Get,
-                url: "Patient/existing".to_string(),
-                resource: None,
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                full_url: None,
-            },
-            // Create new
-            BundleEntry {
-                method: BundleMethod::Post,
-                url: "Patient".to_string(),
-                resource: Some(json!({"resourceType": "Patient", "id": "new"})),
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                full_url: None,
-            },
-            // Read nonexistent
-            BundleEntry {
-                method: BundleMethod::Get,
-                url: "Patient/nonexistent".to_string(),
-                resource: None,
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                full_url: None,
-            },
-        ];
-
-        let result = backend
-            .process_batch(&tenant, entries, helios_fhir::FhirVersion::default())
-            .await
-            .unwrap();
-
-        assert_eq!(result.entries.len(), 3);
-        assert_eq!(result.entries[0].status, 200); // Read existing
-        assert_eq!(result.entries[1].status, 201); // Create new
-        assert_eq!(result.entries[2].status, 404); // Read nonexistent
-    }
-
-    #[tokio::test]
-    async fn test_batch_delete() {
-        use crate::core::transaction::BundleProvider;
-
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-
-        // Create a resource
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "to-delete"}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        let entries = vec![BundleEntry {
-            method: BundleMethod::Delete,
-            url: "Patient/to-delete".to_string(),
-            resource: None,
-            if_match: None,
-            if_none_match: None,
-            if_none_exist: None,
-            full_url: None,
-        }];
-
-        let result = backend
-            .process_batch(&tenant, entries, helios_fhir::FhirVersion::default())
-            .await
-            .unwrap();
-
-        assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.entries[0].status, 204);
-
-        // Verify deletion (read returns Gone error or None)
-        let read_result = backend.read(&tenant, "Patient", "to-delete").await;
-        match read_result {
-            Ok(None) => {}                                                // Resource not found
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {} // Soft deleted
-            other => panic!("Expected None or Gone, got {:?}", other),
-        }
+        assert_eq!(
+            stored.fhir_version(),
+            helios_fhir::FhirVersion::R5,
+            "tx-r5 should be stamped R5"
+        );
     }
 
     #[tokio::test]

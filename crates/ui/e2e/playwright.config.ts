@@ -8,6 +8,14 @@ const PORT = Number(process.env.HFS_E2E_PORT || 8080);
 // external server and skip booting our own (see webServer, below).
 const externalBase = process.env.HFS_E2E_BASE_URL;
 const baseURL = externalBase || `http://127.0.0.1:${PORT}`;
+// Chromium withholds secure-context APIs such as navigator.clipboard from the
+// backend matrix's plain-HTTP Docker-host IP. The suite grants clipboard
+// permissions in the relevant test; this flag makes that grant effective for
+// the one external test origin without weakening HFS or skipping coverage.
+const insecureExternalOrigin =
+  externalBase && new URL(externalBase).protocol === "http:"
+    ? new URL(externalBase).origin
+    : undefined;
 
 export default defineConfig({
   testDir: "./tests",
@@ -22,6 +30,16 @@ export default defineConfig({
   use: {
     baseURL,
     trace: "on-first-retry",
+    ...(insecureExternalOrigin
+      ? {
+          // The legacy headless shell ignores Chromium's secure-origin
+          // allowlist; the full Chromium channel honors it in headless mode.
+          channel: "chromium",
+          launchOptions: {
+            args: [`--unsafely-treat-insecure-origin-as-secure=${insecureExternalOrigin}`],
+          },
+        }
+      : {}),
   },
   projects: [
     {
@@ -36,6 +54,19 @@ export default defineConfig({
       testMatch: "**/nojs/**/*.spec.ts",
       use: { ...devices["Desktop Chrome"], javaScriptEnabled: false },
     },
+    // The Keycloak smoke (#444): an external server whose auth is backed by a
+    // real IdP runs the same conformance assertions as the local auth leg —
+    // the spec is identical, only who minted the token differs. Opted into
+    // explicitly so ordinary external runs (the backend matrix) skip it.
+    ...(externalBase && process.env.HFS_E2E_AUTH_SMOKE === "1"
+      ? [
+          {
+            name: "auth-external",
+            testMatch: "**/auth/conformance.spec.ts",
+            use: { ...devices["Desktop Chrome"] },
+          },
+        ]
+      : []),
     // The auth legs (#320) drive their own servers (see webServer below), so
     // they only exist when this run boots its servers itself.
     ...(externalBase

@@ -406,6 +406,139 @@ mod basic_search {
         ok.assert_status_ok();
     }
 
+    /// Returns the bundle's `self` link URL.
+    fn self_link(body: &Value) -> String {
+        body["link"]
+            .as_array()
+            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+            .and_then(|l| l["url"].as_str())
+            .expect("searchset must carry a self link")
+            .to_string()
+    }
+
+    /// Returns the `search.mode = outcome` entries of a searchset bundle.
+    fn outcome_entries(body: &Value) -> Vec<&Value> {
+        get_bundle_entries(body)
+            .into_iter()
+            .filter(|e| e["search"]["mode"] == "outcome")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_unknown_underscore_param_rejected_under_strict() {
+        // Regression for #524: `_`-prefixed names used to bypass the unknown
+        // parameter check entirely, so strict handling could never reject one.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for param in ["_typo=foo", "_whatever=foo", "_language=en"] {
+            let strict = server
+                .get(&format!("/Patient?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            assert_eq!(
+                strict.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{param} must be rejected under Prefer: handling=strict"
+            );
+        }
+
+        // Global parameters the server does honour are still accepted.
+        for param in ["_id=patient-1", "_lastUpdated=gt2000-01-01", "_tag=foo"] {
+            let ok = server
+                .get(&format!("/Patient?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            ok.assert_status_ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ignored_param_dropped_from_self_link_and_reported() {
+        // Under lenient handling an unsupported parameter may be ignored only if
+        // the server says so: it must not appear in the self link (which states
+        // what was applied) and is reported as an OperationOutcome entry.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let all: Value = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let total = get_bundle_entries(&all).len();
+        assert!(total > 0, "fixture should seed patients");
+
+        for query in ["_typo=foo", "nonsense-param=foo"] {
+            let response = server
+                .get(&format!("/Patient?{query}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+
+            let link = self_link(&body);
+            assert!(
+                !link.contains("typo") && !link.contains("nonsense-param"),
+                "self link must not echo the ignored parameter ({query}): {link}"
+            );
+
+            let outcomes = outcome_entries(&body);
+            assert_eq!(
+                outcomes.len(),
+                1,
+                "ignored parameter must be reported ({query})"
+            );
+            let issue = &outcomes[0]["resource"]["issue"][0];
+            assert_eq!(issue["severity"], "warning");
+            assert_eq!(issue["code"], "not-supported");
+            let text = issue["details"]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(query.split('=').next().unwrap()),
+                "outcome must name the ignored parameter: {text}"
+            );
+
+            // "Ignored" is literal: the filter is not applied, so the result set
+            // is the same as the unfiltered search (previously the parameter
+            // reached the backend and silently matched nothing).
+            let matches = get_bundle_entries(&body)
+                .into_iter()
+                .filter(|e| e["search"]["mode"] == "match")
+                .count();
+            assert_eq!(
+                matches, total,
+                "ignored parameter must not filter ({query})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_known_params_survive_lenient_handling() {
+        // The self link still carries every parameter that was applied, and no
+        // outcome entry is added when nothing was ignored.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let body: Value = server
+            .get("/Patient?name=Smith&_count=5")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+
+        let link = self_link(&body);
+        assert!(link.contains("name=Smith"), "self link: {link}");
+        assert!(link.contains("_count=5"), "self link: {link}");
+        assert!(outcome_entries(&body).is_empty());
+    }
+
     #[tokio::test]
     async fn test_date_prefix_uses_precision_boundaries() {
         let (server, backend) = create_test_server().await;
@@ -718,6 +851,29 @@ mod string_search {
     }
 
     #[tokio::test]
+    async fn test_membership_parameter_in_is_rejected() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `_in` asks whether the resource belongs to a referenced List or
+        // Group. That is unimplemented, and it must not fall through: on R5/R6
+        // it is a registered `reference` parameter, so lenient handling would
+        // not drop it and the spec's placeholder `Resource.id` expression makes
+        // the backends answer a membership question with an identity test
+        // (PostgreSQL) or with the entire resource type (SQLite). Rejecting is
+        // the only answer that is not silently wrong (#535).
+        let response = server
+            .get("/Patient?_in=42")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["code"], "invalid");
+    }
+
+    #[tokio::test]
     async fn test_modifier_invalid_for_param_type_returns_400() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
@@ -741,6 +897,107 @@ mod string_search {
                 .unwrap()
                 .contains("above")
         );
+    }
+}
+
+// =============================================================================
+// :missing Modifier Tests
+// =============================================================================
+
+mod missing_modifier {
+    use super::*;
+
+    fn entry_ids(body: &Value) -> Vec<String> {
+        let mut ids: Vec<String> = get_bundle_entries(body)
+            .iter()
+            .map(|entry| {
+                entry["resource"]["id"]
+                    .as_str()
+                    .expect("search result must carry a logical id")
+                    .to_string()
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn test_missing_boolean_polarity_returns_exact_membership() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        backend
+            .create(
+                &test_tenant(),
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "patient-without-birthdate",
+                    "active": true
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed Patient without birthDate");
+
+        let missing = server
+            .get("/Patient?birthdate:missing=true&_total=accurate&_count=100")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        missing.assert_status_ok();
+        let missing_body: Value = missing.json();
+        assert_eq!(missing_body["total"], 1);
+        assert_eq!(entry_ids(&missing_body), vec!["patient-without-birthdate"]);
+
+        let present = server
+            .get("/Patient?birthdate:missing=false&_total=accurate&_count=100")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        present.assert_status_ok();
+        let present_body: Value = present.json();
+        assert_eq!(present_body["total"], 4);
+        assert_eq!(
+            entry_ids(&present_body),
+            vec!["patient-1", "patient-2", "patient-3", "patient-4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_requires_an_exact_boolean_literal() {
+        let (server, _) = create_test_server().await;
+
+        for value in ["invalid", "", "TRUE", "true,false"] {
+            let response = server
+                .get(&format!("/Patient?birthdate:missing={value}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+
+            response.assert_status(StatusCode::BAD_REQUEST);
+            let body: Value = response.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "value={value:?}");
+            assert_eq!(body["issue"][0]["code"], "invalid", "value={value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_missing_rejects_non_indexed_and_contained_searches() {
+        let (server, _) = create_test_server().await;
+
+        for query in [
+            "/Patient?_text:missing=true",
+            "/Patient?_content:missing=true",
+            "/Patient?_contained=true&birthdate:missing=true",
+            "/Patient?_contained=both&birthdate:missing=true",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+
+            response.assert_status(StatusCode::BAD_REQUEST);
+            let body: Value = response.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "query={query}");
+            assert_eq!(body["issue"][0]["code"], "invalid", "query={query}");
+        }
     }
 }
 
@@ -2575,6 +2832,76 @@ mod summary_count {
         response.assert_status_ok();
         let body: Value = response.json();
         assert!(body["total"].is_null(), "explicit _total=none wins: {body}");
+    }
+}
+
+// ============================================================================
+// Meta Parameter Tests (_tag / _profile / _security, #474)
+// ============================================================================
+
+mod meta_params {
+    use super::*;
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+
+    async fn seed_tagged_patient(backend: &SqliteBackend) {
+        let tenant = TenantContext::new(
+            TenantId::new("test-tenant"),
+            TenantPermissions::full_access(),
+        );
+        let tagged = json!({
+            "resourceType": "Patient",
+            "meta": {
+                "tag": [{"system": "http://example.org/tags", "code": "test-data"}],
+                "profile": ["http://example.org/StructureDefinition/custom-patient"]
+            },
+            "name": [{"family": "Tagged"}]
+        });
+        backend
+            .create(&tenant, "Patient", tagged, FhirVersion::R4)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tag_filters_over_http() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        seed_tagged_patient(&backend).await;
+
+        let response = server
+            .get("/Patient?_tag=http%3A%2F%2Fexample.org%2Ftags%7Ctest-data")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(
+            entries.len(),
+            1,
+            "_tag must filter instead of returning every patient"
+        );
+        assert_eq!(entries[0]["resource"]["name"][0]["family"], "Tagged");
+    }
+
+    #[tokio::test]
+    async fn test_profile_filters_over_http() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        seed_tagged_patient(&backend).await;
+
+        let response = server
+            .get(
+                "/Patient?_profile=http%3A%2F%2Fexample.org%2FStructureDefinition%2Fcustom-patient",
+            )
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resource"]["name"][0]["family"], "Tagged");
     }
 }
 

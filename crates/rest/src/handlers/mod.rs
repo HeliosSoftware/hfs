@@ -20,6 +20,7 @@ pub mod batch;
 pub mod bulk_common;
 pub mod bulk_export;
 pub mod bulk_submit;
+pub mod bulk_submit_jwks;
 pub mod capabilities;
 pub mod compartment;
 pub mod console_metrics;
@@ -71,6 +72,7 @@ pub use bulk_submit::{
     bulk_submit_cancel_handler, bulk_submit_file_handler, bulk_submit_kickoff_handler,
     bulk_submit_poll_handler, bulk_submit_status_kickoff_handler,
 };
+pub use bulk_submit_jwks::bulk_submit_jwks_handler;
 pub use capabilities::capabilities_handler;
 pub use compartment::compartment_search_handler;
 pub use create::create_handler;

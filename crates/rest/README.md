@@ -134,6 +134,22 @@ the background and is polled via `/$reindex-status/[job_id]`.
   deployment, poll the node you kicked off against.
 - The `s3` backend standalone has no search index of any kind, so `$reindex`
   there returns `501`. Every other backend and composite supports it.
+- The same applies after a **server upgrade that adds a parameter to the
+  built-in set**, not just after an operator edits one. Resources written
+  before the upgrade were extracted under the old definitions and have no index
+  rows for the new parameter, so it matches nothing on that older data until a
+  `$reindex` runs. Three current cases: `_source` (`meta.source`), which no
+  version of the server indexed before [#523]; `_language`
+  (`Resource.language`) on R5/R6; and the `ViewDefinition` SearchParameters
+  from the SQL-on-FHIR IG (`url`, `name`, `status`, `date`, `context`, …)
+  added in [#570] — `ViewDefinition` resources created before that upgrade are
+  not searchable by those parameters until `POST /ViewDefinition/$reindex` (or
+  a system-wide `$reindex`) runs. None of these return an error on stale
+  data — they simply under-match, which is the failure mode a reindex exists
+  to clear.
+
+[#523]: https://github.com/HeliosSoftware/hfs/issues/523
+[#570]: https://github.com/HeliosSoftware/hfs/issues/570
 
 Both operations emit BALP `AuditEvent`s — purge on completion or failure,
 reindex at start and at its terminal state (complete / cancel / fail, outcome
@@ -150,12 +166,47 @@ The server is configured via environment variables:
 | `HFS_LOG_LEVEL` | info | Log level |
 | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
+| `HFS_BATCH_MAX_CONCURRENCY` | 16 | Ceiling on concurrent entries within one `batch` Bundle (see below) |
 | `HFS_ENABLE_CORS` | true | Enable CORS |
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
 | `HFS_DATABASE_URL` | - | Database connection string |
 | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode |
 | `HFS_TENANT_STRICT_VALIDATION` | false | Error on tenant mismatch |
 | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name (future) |
+
+### Batch entry concurrency
+
+Entries of a `batch` Bundle execute concurrently, bounded by whatever the
+storage backend declares it tolerates (`ResourceStorage::bulk_write_concurrency`)
+capped by `HFS_BATCH_MAX_CONCURRENCY`. The setting is a **ceiling**: it can
+lower a backend's declared tolerance but never raise it, because only the
+backend knows what its connection pool absorbs. Raise throughput by raising the
+backend's own limit — pool size, for instance — not this one.
+
+The bound exists so a large bundle finishes inside `HFS_REQUEST_TIMEOUT`. At a
+bound of 1 the wall clock is the *sum* of every entry's storage round trips, so
+against a latency-bound backend a few hundred entries will exceed the timeout
+and the client receives a 408 with no body — while the entries that already
+committed stay committed.
+
+Points worth knowing before raising it:
+
+- **It multiplies per concurrent request.** Twenty simultaneous batches at a
+  bound of 16 put 320 storage operations in flight. This is a per-request bound,
+  not a server-wide budget.
+- **Entries are not ordered relative to one another.** FHIR states that a server
+  may process batch entries in any order, and at a bound above 1 it does. Two
+  entries writing the same id, or an entry reading what another entry in the
+  same bundle writes, resolve by timing. Put ordered work in a `transaction`, or
+  in separate requests.
+- **Response entries stay positional** regardless: response entry *i* always
+  answers request entry *i*.
+- **A bundle that writes a `StructureDefinition` drops to sequential**
+  automatically, because later entries validate against profiles earlier entries
+  register.
+- **Auditing amplifies with it.** Per-entry audit events are emitted as the
+  entries complete, so a database or S3 audit sink sees the same event count
+  compressed into a much shorter window.
 
 ### HTTP Compression
 
@@ -306,16 +357,16 @@ rather than PHI and providers commonly leave them unencrypted.
 
 ### SQL-on-FHIR Async Export
 
-Separate from Bulk Data Export, the SQL-on-FHIR `$viewdefinition-export` and
-`$sqlquery-export` operations run asynchronously and write their tabular output
+Separate from Bulk Data Export, the SQL-on-FHIR `$sql-export` and
+`$sql-export` operations run asynchronously and write their tabular output
 to a dedicated *export sink*, configured via `HFS_EXPORT_*`. The whole subsystem
-is gated by `HFS_SOF_ENABLED` (which also enables `$viewdefinition-run`); when
+is gated by `HFS_SOF_ENABLED` (which also enables `$sql-run`); when
 enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 `postgres`).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$viewdefinition-run`/`-export`, `$sqlquery-*`). |
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`). |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. |
 | `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |
@@ -326,6 +377,15 @@ enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`. Aligns with the manifest's advertised 24h `Expires`. |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
+
+`$sql-run` and `$sql-export` both accept a repeating `context` parameter
+carrying ViewDefinitions or SQLView Libraries inline, matched to the
+subject's dependency graph by canonical URL at any depth. Resolution is
+**server-first**: for each dependency, storage is checked before `context`,
+so `context` only applies to URLs the server cannot resolve on its own — a
+`context` entry that duplicates an artifact the server already has is
+silently ignored (there is no channel to attach a warning to a streamed
+`$sql-run`/`$sql-export` response).
 
 Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
 job's already-written partial shards immediately; the reaper above reclaims
@@ -369,6 +429,11 @@ curl http://localhost:8080/acme/Patient/123
 curl http://localhost:8080/acme/metadata
 # Returns implementation.url: "http://localhost:8080/acme"
 ```
+
+All advertised URLs use `HFS_BASE_URL`. Set it to the public origin and any
+reverse-proxy prefix, such as `https://fhir.example.com/fhir`. URL-routed
+requests append the selected tenant after that prefix. Header-routed requests
+keep the configured base unchanged. Forwarding headers never override it.
 
 ### URL-Based Routing Setup
 
@@ -464,20 +529,46 @@ curl -X POST http://localhost:8080/ \
   }'
 ```
 
+### Entry Methods
+
+`Bundle.entry.request.method` is matched **case-sensitively** in both bundle types.
+It is a `code` with a required binding to `http://hl7.org/fhir/ValueSet/http-verb`,
+whose concepts are `caseSensitive: true` and uppercase in every supported FHIR
+version — so a lowercase `"post"` is invalid instance data and is refused with
+`400`, not silently accepted. `GET`, `POST`, `PUT` and `DELETE` dispatch; `PATCH`
+and `HEAD` are refused as described under Current Limitations.
+
 ### Conditional Operations in Bundles
 
-Bundle entries support conditional headers:
-- `ifMatch` - ETag for optimistic locking on `PUT` **and `DELETE`** entries, in
-  both `batch` and `transaction` bundles. Parsed as the comma-separated list
-  RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
-- `ifNoneMatch` - Prevent overwrites (`*` for conditional create)
-- `ifNoneExist` - Search query for conditional create
+- `ifMatch` — **supported.** ETag for optimistic locking on `PUT` **and `DELETE`**
+  entries, in both `batch` and `transaction` bundles. Parsed as the comma-separated
+  list RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
+- `ifNoneMatch` — **parsed and ignored.** `parse_bundle_entry` populates
+  `BundleEntry.if_none_match`; no handler or backend reads it.
+- `ifNoneExist` — **MongoDB transactions only.** MongoDB resolves it inside the
+  bundle's session. The batch path never reads it, and SQLite/PostgreSQL ignore it
+  in a transaction and create a duplicate. Tracked by #511.
+
+Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
+`DELETE [type]?[criteria]`) are **not resolved**:
+
+- In a `batch`, such an entry is refused per-entry with `400`; nothing is written.
+- In a `transaction`, any non-`GET` entry whose URL carries a query string
+  declines the whole bundle with `400 not-supported` before anything executes,
+  because the backends parse entry URLs query-blind and would otherwise commit
+  the criteria as part of the resource type or the id.
+
+Note that `/metadata` advertises `conditionalCreate`, `conditionalUpdate` and
+`conditionalDelete` for every resource type. That is accurate for the resource
+endpoints and **not** for bundle entries; reconciling the two is #511.
 
 ### Current Limitations
 
 The following FHIR transaction features are not yet implemented:
+- **Conditional interactions in bundle entries** - `[type]?[criteria]` URLs are refused rather than resolved (#511)
 - **Conditional reference resolution** - References like `Patient?identifier=12345` are not resolved
-- **PATCH method** - PATCH operations in bundles return 501 Not Implemented
+- **PATCH method** - PATCH operations in bundles return 501 Not Implemented, in both `batch` (per entry) and `transaction` (whole bundle). Send the patch to the instance endpoint instead
+- **HEAD entries** - refused with 405. `HEAD` is a legal `http-verb` code and is served on the instance-read route, but not inside a Bundle
 - **Prefer header** - `return=minimal` and `return=OperationOutcome` not honored
 - **Duplicate detection** - Same resource appearing twice in a transaction is not detected
 

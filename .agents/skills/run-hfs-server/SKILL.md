@@ -33,8 +33,14 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `HFS_LOG_LEVEL` | `info` | Log level: error, warn, info, debug, trace |
-| `HFS_BASE_URL` | `http://localhost:8080` | Base URL for Location headers and Bundle links |
+| `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base for Location headers and Bundle links |
 | `HFS_DATA_DIR` | `./data` | FHIR data directory, including search parameters |
+
+Set `HFS_BASE_URL` explicitly for containers and reverse proxies. Include any
+published path prefix. HFS rejects non-HTTP(S) values, credentials, query
+strings, and fragments, and it never derives the public base from request
+forwarding headers. A loopback base that conflicts with the listener produces
+a startup warning.
 
 ## Limits
 

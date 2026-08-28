@@ -1,6 +1,6 @@
-//! Handler-level tests for `$viewdefinition-run`.
+//! Handler-level tests for `$sql-run`.
 //!
-//! Tests the POST `/ViewDefinition/$viewdefinition-run` endpoint using an
+//! Tests the POST `/$sql-run` endpoint using an
 //! in-memory SQLite backend and the in-process FHIRPath runner.
 
 mod sof_run_tests {
@@ -118,7 +118,7 @@ mod sof_run_tests {
     // Happy path
     // =========================================================================
 
-    /// `POST /ViewDefinition/$viewdefinition-run?_format=ndjson` with seeded
+    /// `POST /$sql-run?_format=ndjson` with seeded
     /// data returns 200 and NDJSON rows containing the expected columns.
     #[tokio::test]
     async fn test_run_view_definition_ndjson_happy_path() {
@@ -127,7 +127,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-002", "Jones").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -188,7 +188,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-default", "Default").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -216,7 +216,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-json-1", "Brown").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=json")
+            .post("/$sql-run?_format=json")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -252,7 +252,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-csv-1", "White").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=csv&header=true")
+            .post("/$sql-run?_format=csv&header=true")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -296,26 +296,31 @@ mod sof_run_tests {
         );
     }
 
-    /// `POST /ViewDefinition/{id}/$viewdefinition-run` (instance variant) runs
-    /// the *stored* ViewDefinition. Spec: at instance level the server infers
-    /// `viewReference` from the URL path. A body whose `id` matches the path
-    /// is allowed (no-op override).
+    /// A stored ViewDefinition is named by `subjectReference`, not by an
+    /// instance-level URL. `$sql-run` is `instance=false`, so the path no
+    /// longer carries the subject.
     #[tokio::test]
-    async fn test_run_stored_view_definition_with_body() {
+    async fn test_run_stored_view_definition_by_subject_reference() {
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "pt-stored-1", "Green").await;
         seed_view_definition(&backend, "some-view-id", None, None).await;
 
-        // Body's bare ViewDefinition has no `id` field — guard treats this as
-        // a no-op override; stored view runs.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "subjectReference",
+                "valueReference": {"reference": "ViewDefinition/some-view-id"}
+            }]
+        });
+
         let response = server
-            .post("/ViewDefinition/some-view-id/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
                 HeaderValue::from_static("application/fhir+json"),
             )
-            .json(&patient_view_definition())
+            .json(&body)
             .await;
 
         response.assert_status(StatusCode::OK);
@@ -331,37 +336,79 @@ mod sof_run_tests {
         assert_eq!(rows[0]["family"], "Green");
     }
 
-    /// Spec G5: an instance-level URL is bound to its path id. A body that
-    /// supplies a `viewResource` with a *different* id (or a
-    /// `viewReference` pointing elsewhere) must be rejected with 400.
+    /// Supplying two subject parameters is rejected: the spec is explicit that
+    /// exactly one of the three is supplied, and the error names both so the
+    /// client can see what it sent.
     #[tokio::test]
-    async fn test_run_stored_view_definition_rejects_mismatched_body() {
+    async fn test_run_rejects_two_subject_parameters() {
         let (server, backend) = create_test_server().await;
-        seed_patient(&backend, "pt-x", "Green").await;
         seed_view_definition(&backend, "view-a", None, None).await;
 
-        // Body's ViewDefinition has id `view-b`, conflicting with path
-        // `view-a`.
-        let mut conflicting = patient_view_definition();
-        conflicting["id"] = Value::String("view-b".into());
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {
+                    "name": "subjectReference",
+                    "valueReference": {"reference": "ViewDefinition/view-a"}
+                },
+                {
+                    "name": "subjectResource",
+                    "resource": patient_view_definition()
+                }
+            ]
+        });
 
         let response = server
-            .post("/ViewDefinition/view-a/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
                 HeaderValue::from_static("application/fhir+json"),
             )
-            .json(&conflicting)
+            .json(&body)
             .await;
 
         response.assert_status(StatusCode::BAD_REQUEST);
         let outcome: Value = serde_json::from_str(&response.text()).unwrap();
         assert_eq!(outcome["resourceType"], "OperationOutcome");
-        assert_eq!(outcome["issue"][0]["code"], "invalid");
+        let text = outcome["issue"][0]["details"]["text"].as_str().unwrap();
+        assert!(text.contains("subjectReference"), "{text}");
+        assert!(text.contains("subjectResource"), "{text}");
     }
 
-    /// A `Parameters` body wrapping a ViewDefinition via `viewResource` is accepted.
+    /// The pre-ballot type- and instance-level operation URLs were
+    /// consolidated away. `$sql-run` is `system=true, type=false,
+    /// instance=false`, so those paths are not routed.
+    #[tokio::test]
+    async fn test_pre_ballot_run_urls_are_not_routed() {
+        let (server, backend) = create_test_server().await;
+        seed_view_definition(&backend, "view-a", None, None).await;
+
+        for url in [
+            "/ViewDefinition/$viewdefinition-run",
+            "/ViewDefinition/view-a/$viewdefinition-run",
+            "/$viewdefinition-run",
+            "/Library/$sqlquery-run",
+        ] {
+            let response = server
+                .post(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&patient_view_definition())
+                .expect_failure()
+                .await;
+            assert_ne!(
+                response.status_code(),
+                StatusCode::OK,
+                "{url} was consolidated into $sql-run and must not run a view"
+            );
+        }
+    }
+
+    /// A `Parameters` body naming a ViewDefinition via `subjectResource` is accepted.
     #[tokio::test]
     async fn test_run_view_definition_parameters_body() {
         let (server, backend) = create_test_server().await;
@@ -371,14 +418,14 @@ mod sof_run_tests {
             "resourceType": "Parameters",
             "parameter": [
                 {
-                    "name": "viewResource",
+                    "name": "subjectResource",
                     "resource": patient_view_definition()
                 }
             ]
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -444,7 +491,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&patient=Patient/alice")
+            .post("/$sql-run?_format=ndjson&patient=Patient/alice")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -492,14 +539,14 @@ mod sof_run_tests {
         let parameters_body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "viewResource", "resource": view},
+                {"name": "subjectResource", "resource": view},
                 {"name": "resource", "resource": pt_bob},
                 {"name": "patient", "valueReference": {"reference": "Patient/alice"}}
             ]
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -554,7 +601,7 @@ mod sof_run_tests {
         let parameters_body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "viewResource", "resource": view},
+                {"name": "subjectResource", "resource": view},
                 {"name": "resource", "resource": group},
                 {"name": "resource", "resource": pt_in},
                 {"name": "resource", "resource": pt_out},
@@ -563,7 +610,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -632,7 +679,7 @@ mod sof_run_tests {
         let parameters_body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "viewResource", "resource": view},
+                {"name": "subjectResource", "resource": view},
                 {"name": "resource", "resource": pt_abc},
                 {"name": "resource", "resource": ai_match},
                 {"name": "resource", "resource": ai_other},
@@ -641,7 +688,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -704,7 +751,7 @@ mod sof_run_tests {
         let parameters_body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "viewResource", "resource": view},
+                {"name": "subjectResource", "resource": view},
                 {"name": "resource", "resource": pt_a},
                 {"name": "resource", "resource": pt_b},
                 {"name": "resource", "resource": pt_c},
@@ -714,7 +761,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -756,7 +803,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-lim-3", "Gamma").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&_limit=1")
+            .post("/$sql-run?_format=ndjson&_limit=1")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -800,7 +847,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -833,7 +880,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -867,7 +914,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -879,7 +926,7 @@ mod sof_run_tests {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
-    /// A `Parameters` body without a `viewResource` parameter returns 400.
+    /// A `Parameters` body without a subject-naming parameter returns 400.
     #[tokio::test]
     async fn test_run_view_definition_parameters_missing_view_resource_returns_400() {
         let (server, _backend) = create_test_server().await;
@@ -892,7 +939,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -974,9 +1021,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post(&format!(
-                "/ViewDefinition/$viewdefinition-run?_format=ndjson&_since={since_str}"
-            ))
+            .post(&format!("/$sql-run?_format=ndjson&_since={since_str}"))
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -1035,7 +1080,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&patient=Patient/p1")
+            .post("/$sql-run?_format=ndjson&patient=Patient/p1")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -1102,7 +1147,7 @@ mod sof_run_tests {
         }
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&group=Group/g1")
+            .post("/$sql-run?_format=ndjson&group=Group/g1")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -1160,7 +1205,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -1190,17 +1235,17 @@ mod sof_run_tests {
             .await
             .expect("failed to seed VD");
 
-        // Run via viewReference instead of inline viewResource.
+        // Run via subjectReference instead of an inline subjectResource.
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [{
-                "name": "viewReference",
+                "name": "subjectReference",
                 "valueReference": {"reference": "ViewDefinition/stored-vd-1"}
             }]
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .json(&body)
             .await;
@@ -1228,13 +1273,13 @@ mod sof_run_tests {
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "_format", "valueCode": "ndjson"},
-                {"name": "viewReference",
+                {"name": "subjectReference",
                  "valueReference": {"reference": "http://example.org/ViewDefinition/missing|1.0"}}
             ]
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -1257,7 +1302,7 @@ mod sof_run_tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "viewResource", "resource": patient_view_definition()},
+                {"name": "subjectResource", "resource": patient_view_definition()},
                 {"name": "resource", "resource": {
                     "resourceType": "Patient", "id": "inline-a",
                     "name": [{"family": "InlineA"}]
@@ -1270,7 +1315,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .json(&body)
             .await;
@@ -1347,9 +1392,7 @@ mod sof_run_tests {
 
         // Filter by two distinct patient references.
         let response = server
-            .post(
-                "/ViewDefinition/$viewdefinition-run?_format=ndjson&patient=Patient/p1,Patient/p2",
-            )
+            .post("/$sql-run?_format=ndjson&patient=Patient/p1,Patient/p2")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .json(&obs_view)
             .await;
@@ -1376,7 +1419,7 @@ mod sof_run_tests {
     // Spec alignment (round 2)
     // =========================================================================
 
-    /// G7: system-level URL `/$viewdefinition-run` is routed and works like
+    /// G7: system-level URL `/$sql-run` is routed and works like
     /// the type-level form.
     #[tokio::test]
     async fn test_run_view_definition_system_level_route() {
@@ -1384,7 +1427,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-sys-1", "System").await;
 
         let response = server
-            .post("/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -1404,10 +1447,11 @@ mod sof_run_tests {
         assert_eq!(rows[0]["family"], "System");
     }
 
-    /// G1: `viewReference` accepts a canonical URL; the server resolves it
-    /// via `SearchProvider` against `ViewDefinition.url`.
+    /// `subjectCanonical` names the subject by canonical URL; the server
+    /// resolves it via `SearchProvider` against `ViewDefinition.url`. Because
+    /// every supplied parameter here is primitive, GET is available.
     #[tokio::test]
-    async fn test_run_view_definition_canonical_view_reference() {
+    async fn test_run_view_definition_subject_canonical() {
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "pt-can-1", "Canonical").await;
         seed_view_definition(
@@ -1418,9 +1462,9 @@ mod sof_run_tests {
         )
         .await;
 
-        let url = "/ViewDefinition/$viewdefinition-run\
+        let url = "/$sql-run\
                    ?_format=ndjson\
-                   &viewReference=http://example.org/fhir/ViewDefinition/patient-family";
+                   &subjectCanonical=http://example.org/fhir/ViewDefinition/patient-family";
         let response = server
             .get(url)
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
@@ -1437,17 +1481,16 @@ mod sof_run_tests {
         assert_eq!(rows[0]["family"], "Canonical");
     }
 
-    /// G1: canonical URL with `|version` selects the matching version.
+    /// A canonical URL with a `|version` suffix pins that version.
     #[tokio::test]
-    async fn test_run_view_definition_canonical_view_reference_with_version() {
+    async fn test_run_view_definition_subject_canonical_with_version() {
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "pt-ver-1", "Versioned").await;
         let url = "http://example.org/fhir/ViewDefinition/family";
         seed_view_definition(&backend, "vd-v1", Some(url), Some("1.0.0")).await;
         seed_view_definition(&backend, "vd-v2", Some(url), Some("2.0.0")).await;
 
-        let route =
-            format!("/ViewDefinition/$viewdefinition-run?_format=ndjson&viewReference={url}|2.0.0");
+        let route = format!("/$sql-run?_format=ndjson&subjectCanonical={url}|2.0.0");
         let response = server
             .get(&route)
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
@@ -1475,14 +1518,14 @@ mod sof_run_tests {
         let parameters_body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                { "name": "viewResource", "resource": patient_view_definition() },
+                { "name": "subjectResource", "resource": patient_view_definition() },
                 { "name": "_format", "valueCode": "ndjson" },
                 { "name": "source", "valueString": "s3://example/bucket" }
             ]
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -1504,7 +1547,7 @@ mod sof_run_tests {
         let (server, _backend) = create_test_server().await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&_limit=0")
+            .post("/$sql-run?_format=ndjson&_limit=0")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -1529,7 +1572,7 @@ mod sof_run_tests {
         let (server, _backend) = create_test_server().await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&_limit=10001")
+            .post("/$sql-run?_format=ndjson&_limit=10001")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -1560,7 +1603,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-002", "Jones").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=fhir")
+            .post("/$sql-run?_format=fhir")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .json(&patient_view_definition())
             .await;
@@ -1599,7 +1642,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-001", "Smith").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/$sql-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 HeaderName::from_static("accept"),
@@ -1626,7 +1669,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-001", "Smith").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=csv")
+            .post("/$sql-run?_format=csv")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 HeaderName::from_static("accept"),
@@ -1670,7 +1713,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-001", "Smith").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 HeaderName::from_static("accept"),
@@ -1698,7 +1741,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-001", "Smith").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=csv")
+            .post("/$sql-run?_format=csv")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 HeaderName::from_static("accept"),
@@ -1721,7 +1764,7 @@ mod sof_run_tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "viewResource", "resource": patient_view_definition()},
+                {"name": "subjectResource", "resource": patient_view_definition()},
                 {"name": "resource", "resource": {
                     "resourceType": "Patient", "id": "inline-a",
                     "name": [{"family": "InlineA"}]
@@ -1733,7 +1776,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=fhir")
+            .post("/$sql-run?_format=fhir")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .json(&body)
             .await;
@@ -1764,7 +1807,7 @@ mod sof_run_tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "viewResource", "resource": patient_view_definition()},
+                {"name": "subjectResource", "resource": patient_view_definition()},
                 {"name": "resource", "resource": {
                     "resourceType": "Bundle",
                     "type": "collection",
@@ -1779,7 +1822,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .json(&body)
             .await;
@@ -1798,5 +1841,89 @@ mod sof_run_tests {
         );
         let families: Vec<&str> = rows.iter().filter_map(|r| r["family"].as_str()).collect();
         assert!(families.contains(&"Cole") && families.contains(&"Doe"));
+    }
+
+    // =========================================================================
+    // The renamed `view` parameter (#575): `$sql-run` extractors are
+    // deliberately permissive and silently ignore unrecognised parameter
+    // names, but `view` — the pre-ballot spelling of `context` — is a special
+    // case that gets the same didactic 400 `$sql-export` gives, instead of
+    // falling through to a generic "requires a subject" error. Any other
+    // unknown name keeps today's silently-ignored behavior.
+    // =========================================================================
+
+    /// A `$sql-run` body naming the pre-ballot `view` parameter gets a
+    /// didactic 400 pointing at the rename, not the generic "requires a
+    /// subject" 400 an unrecognised/absent subject parameter would produce.
+    #[tokio::test]
+    async fn test_run_renamed_view_param_gets_didactic_message() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "view", "part": [
+                    {"name": "viewResource", "resource": patient_view_definition()}
+                ]}
+            ]
+        });
+
+        let response = server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let outcome: Value = response.json();
+        // `RestError::BadRequest` renders through `create_operation_outcome`,
+        // which puts the message in `issue[0].details.text` rather than a
+        // top-level `diagnostics` field (that shape is specific to the raw
+        // `OperationOutcome` responses `$sql-export` builds by hand).
+        let details = outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            details.contains("renamed to `context`"),
+            "expected the didactic rename message, got: {outcome}"
+        );
+    }
+
+    /// Any other unrecognised parameter name on `$sql-run` keeps today's
+    /// behavior: the extractor silently ignores it rather than rejecting the
+    /// request, so a valid `subjectResource` alongside it still runs.
+    #[tokio::test]
+    async fn test_run_unrelated_unknown_param_is_silently_ignored() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": patient_view_definition()},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "inline-a",
+                    "name": [{"family": "InlineA"}]
+                }},
+                {"name": "banana", "valueString": "not a real parameter"}
+            ]
+        });
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "an unrelated unknown parameter must not block the run: {rows:?}"
+        );
     }
 }

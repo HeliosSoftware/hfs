@@ -20,12 +20,10 @@ use axum::{
     response::Response,
 };
 use helios_fhir::FhirVersion;
-use helios_persistence::core::{ResourceStorage, SearchProvider};
+use helios_persistence::core::{BundleProvider, ResourceStorage, SearchProvider};
 use helios_persistence::search::SearchParameterRegistry;
 use helios_persistence::types::SearchParamType;
 use tracing::debug;
-
-use super::sof::capability::build_sof_capabilities;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
@@ -77,7 +75,7 @@ pub async fn capabilities_handler<S>(
     req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+    S: ResourceStorage + SearchProvider + BundleProvider + Send + Sync + 'static,
 {
     // Determine which version to describe (from Accept header or default)
     let fhir_version = version.accept_version_or(state.config().default_fhir_version);
@@ -89,16 +87,7 @@ where
         "Processing capabilities request"
     );
 
-    // Build tenant-aware base URL
-    let base_url = if tenant.is_url_based() {
-        format!(
-            "{}/{}",
-            state.base_url().trim_end_matches('/'),
-            tenant.tenant_id()
-        )
-    } else {
-        state.base_url().to_string()
-    };
+    let base_url = state.public_base_url_for_request(&tenant);
 
     let capability_statement =
         build_capability_statement(&state, tenant.context(), fhir_version, &base_url);
@@ -133,7 +122,7 @@ fn build_capability_statement<S>(
     base_url: &str,
 ) -> serde_json::Value
 where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+    S: ResourceStorage + SearchProvider + BundleProvider + Send + Sync + 'static,
 {
     // Get resource types for the requested FHIR version
     let resource_types = get_resource_type_names_for_version(version);
@@ -191,13 +180,29 @@ where
         formats.push("application/fhir+xml");
     }
 
-    // Standard operations, extended with SOF operations
+    // Advertise `transaction` only when the storage backend can actually
+    // honour all-or-nothing semantics. This was an unconditional literal, so an
+    // s3-elasticsearch deployment published transaction support it had no way
+    // to provide — a bundle that timed out left 466 of 473 entries committed
+    // (#489). `batch` is unconditional: every bundle provider can process
+    // entries independently, which is exactly what design discussion #28
+    // prescribes for a backend without transaction support.
+    let mut system_interactions = Vec::new();
+    if state.storage().supports_atomic_transactions() {
+        system_interactions.push(serde_json::json!({ "code": "transaction" }));
+    }
+    system_interactions.push(serde_json::json!({ "code": "batch" }));
+    system_interactions.push(serde_json::json!({ "code": "history-system" }));
+    system_interactions.push(serde_json::json!({ "code": "search-system" }));
+
+    // Standard operations, extended with the system-level SQL on FHIR
+    // operations. Partial parameter support is advertised through the
+    // OperationDefinitions those entries cite, not through an extension block —
+    // the pre-ballot `sof-capabilities` extension has no counterpart in
+    // 3.0.0-ballot.
     let mut operations = build_rest_operations(state);
 
-    // Optional SOF extension block on the rest[0] element
-    let sof_extension = build_sof_rest_extension(state);
-
-    let mut rest_entry = serde_json::json!({
+    let rest_entry = serde_json::json!({
         "mode": "server",
         "documentation": "Helios FHIR RESTful API",
         "security": {
@@ -205,18 +210,8 @@ where
             "description": "This server supports CORS for cross-origin requests"
         },
         "resource": resources,
-        "interaction": [
-            { "code": "transaction" },
-            { "code": "batch" },
-            { "code": "history-system" },
-            { "code": "search-system" }
-        ]
+        "interaction": system_interactions
     });
-
-    // Inject the SOF extension array when present
-    if let Some(ext) = sof_extension {
-        rest_entry["extension"] = ext;
-    }
 
     let mut statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
@@ -266,14 +261,23 @@ where
     statement
 }
 
-/// Builds the `rest[0].operation` list, including SOF operations.
+/// Builds the `rest[0].operation` list, including the SQL on FHIR operations.
 ///
-/// `viewdefinition-run` and `sqlquery-run` are always declared when SOF is enabled.
-/// `viewdefinition-export` and `sqlquery-export` are declared only when an
-/// export controller is wired.
+/// Both data operations are invoked at the system level, so they are declared
+/// here rather than under a resource type. `$sql-run` is always declared when
+/// SOF is enabled; `$sql-export` only when an export controller is wired.
+///
+/// `definition` points at *this server's* OperationDefinition rather than the
+/// guide's. Citing the guide's would assert support for every parameter it
+/// declares, and HFS supports a subset (no `context`, no `source`); per
+/// operations-capability.html#partial-operation-support a server in that
+/// position publishes its own definition with `base` naming the guide's. See
+/// [`crate::handlers::sof::capability`].
 fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
     state: &AppState<S>,
 ) -> Vec<serde_json::Value> {
+    use crate::handlers::sof::capability::{SQL_EXPORT_DEFINITION_ID, SQL_RUN_DEFINITION_ID};
+
     let mut ops = vec![
         serde_json::json!({
             "name": "validate",
@@ -284,52 +288,19 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
             "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
         }),
         serde_json::json!({
-            "name": "viewdefinition-run",
-            "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run"
-        }),
-        serde_json::json!({
-            "name": "sqlquery-run",
-            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-run"
+            "name": "sql-run",
+            "definition": format!("/OperationDefinition/{SQL_RUN_DEFINITION_ID}")
         }),
     ];
 
     if state.export_controller().is_some() {
         ops.push(serde_json::json!({
-            "name": "viewdefinition-export",
-            "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-export"
-        }));
-        ops.push(serde_json::json!({
-            "name": "sqlquery-export",
-            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-export"
+            "name": "sql-export",
+            "definition": format!("/OperationDefinition/{SQL_EXPORT_DEFINITION_ID}")
         }));
     }
 
     ops
-}
-
-/// Builds the `extension` array on `rest[0]` advertising SOF-specific flags.
-fn build_sof_rest_extension<S: ResourceStorage + Send + Sync + 'static>(
-    state: &AppState<S>,
-) -> Option<serde_json::Value> {
-    let caps = build_sof_capabilities(state);
-    // Inline the SOF Parameters as a contained extension value so consumers
-    // that understand the SOF spec can discover the flags without an extra request.
-    Some(serde_json::json!([
-        {
-            "url": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/StructureDefinition-sof-capabilities.html",
-            "valueReference": {
-                "reference": "/$sql-on-fhir-capabilities",
-                "display": "SQL-on-FHIR Capabilities"
-            }
-        },
-        {
-            "url": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/StructureDefinition-sof-capabilities-inline.html",
-            "valueAttachment": {
-                "contentType": "application/json",
-                "data": serde_json::to_string(&caps).unwrap_or_default()
-            }
-        }
-    ]))
 }
 
 /// Builds the capability entry for a resource type.
@@ -340,10 +311,16 @@ fn build_resource_capability(
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
     revinclude_by_target: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
 ) -> serde_json::Value {
-    let mut entry = serde_json::json!({
-        "type": resource_type,
-        "profile": format!("http://hl7.org/fhir/StructureDefinition/{}", resource_type),
-        "interaction": [
+    let interactions = if resource_type == "AuditEvent" {
+        serde_json::json!([
+            { "code": "read" },
+            { "code": "vread" },
+            { "code": "history-instance" },
+            { "code": "history-type" },
+            { "code": "search-type" }
+        ])
+    } else {
+        serde_json::json!([
             { "code": "read" },
             { "code": "vread" },
             { "code": "update" },
@@ -353,16 +330,25 @@ fn build_resource_capability(
             { "code": "history-type" },
             { "code": "create" },
             { "code": "search-type" }
-        ],
+        ])
+    };
+
+    let mut entry = serde_json::json!({
+        "type": resource_type,
+        "profile": format!("http://hl7.org/fhir/StructureDefinition/{}", resource_type),
+        "interaction": interactions,
         "versioning": "versioned",
         "readHistory": true,
-        "updateCreate": true,
-        "conditionalCreate": true,
         "conditionalRead": "full-support",
-        "conditionalUpdate": true,
-        "conditionalDelete": "single",
         "searchParam": build_search_params(resource_type, registry, supports_contained, modifier_map)
     });
+
+    if resource_type != "AuditEvent" {
+        entry["updateCreate"] = serde_json::Value::Bool(true);
+        entry["conditionalCreate"] = serde_json::Value::Bool(true);
+        entry["conditionalUpdate"] = serde_json::Value::Bool(true);
+        entry["conditionalDelete"] = serde_json::Value::String("single".to_string());
+    }
 
     // Advertise real `_include` targets: one "Type:code" per reference param on
     // this type. Omitted entirely when the type has no reference params.
