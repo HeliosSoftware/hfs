@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 29;
+pub const SCHEMA_VERSION: i32 = 30;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -349,6 +349,7 @@ async fn migrate_schema(
             26 => migrate_v26_to_v27(client).await?,
             27 => migrate_v27_to_v28(client).await?,
             28 => migrate_v28_to_v29(client).await?,
+            29 => migrate_v29_to_v30(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1963,6 +1964,200 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
             .execute(sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v28->v29 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v29 -> v30: make FHIR `string` search seek instead of scan.
+///
+/// String search was the single most expensive statement of run 33128380492:
+/// **268.2 s of ~885 s** of k6-window Postgres execution — 30% of all search
+/// work — over 45,150 calls at 5.94 ms mean, to return 125,551 rows. 2.8 rows
+/// per call. `string Patient` is the worst published category we have: p99
+/// **47 ms** against aidbox 23, microsoft 15, medplum 68, hapi 89.
+///
+/// `index-usage.txt` for the same run says where it went:
+///
+/// ```text
+/// idx_search_string_folded_pattern    |      0 scans |           0 tuples | 495 MB
+/// idx_search_string                   |  44931 scans | 140,153,204 tuples |  50 MB
+/// ```
+///
+/// 3,120 tuples read per scan through a generic index, and the 495 MB index
+/// `migrate_v23_to_v24` built *for this query* had zero scans for the third run
+/// running. v28 dropped its competitor `idx_search_string_folded` on the theory
+/// that the planner was merely preferring the smaller sibling; that did not
+/// move it either. It has been pure write cost since v24.
+///
+/// ## Two independent reasons, both reproduced
+///
+/// Measured on a local 22.6M-row `search_index` built to the run's proportions
+/// (110k rows with a string value, `(Patient, address)` slice 5,000 rows,
+/// `(Patient, name)` 3,542 — the artifact's own numbers), with the v29 index set
+/// and the v15/v16 extended statistics.
+///
+/// ### 1. The `IS NOT NULL` conjunct destroys the row estimate
+///
+/// v24 added `value_string IS NOT NULL` to `build_string_condition` so the
+/// pattern index — partial on exactly that — could be *proved* usable, since
+/// `COALESCE(a, b) LIKE …` does not imply it (COALESCE is not strict). That
+/// reasoning was right, and the conjunct did make the index legal. But it is
+/// also a selectivity factor, and the planner multiplies it in as if it were
+/// independent of `param_name` when it is entirely determined by it:
+///
+/// ```text
+/// EXPLAIN … WHERE resource_type='Patient' AND param_name='address'
+///   ->  rows=5171          (truth 5000 — stx_search_type_param already fixes this pair)
+/// EXPLAIN … same, AND value_string IS NOT NULL
+///   ->  rows=23            (truth 5000 — x 0.0049, the table-wide non-null fraction)
+/// ```
+///
+/// On a 25-row estimate every candidate looks free, the `LIMIT` looks instantly
+/// satisfied, and the planner takes the physically smallest index that can
+/// supply the `(tenant, type, param)` prefix — `idx_search_string`, 50 MB — and
+/// filters. That is exactly the production plan (`search-plans.txt` section AI):
+/// `cost=0.42..2.65 rows=1`, `Rows Removed by Filter: 4978`,
+/// `Buffers: shared hit=4997 read=28`. ~40 MB of buffers touched to return 22
+/// rows, 45,150 times in a five-minute window, on an 11 GB host — which is also
+/// why this shape hurts every other category: it evicts their pages.
+///
+/// No extended statistics object fixes this. `(mcv, dependencies)` on
+/// `resource_type, param_name, (value_string IS NOT NULL)` was built and
+/// ANALYZEd at statistics targets 100 and 10000: the estimate went 23 -> 27.
+/// Dependencies are equality-only, and an MCV list cannot help a range or
+/// `LIKE` predicate over a high-cardinality value column.
+///
+/// So the conjunct is removed from the emitted SQL instead, and the index is
+/// rebuilt with a predicate the *operator* implies: `~>=~` is strict, so
+/// `COALESCE(…) ~>=~ $n` proves `COALESCE(…) IS NOT NULL` by itself. The
+/// population is unchanged — `writer.rs` sets `value_string_folded` only
+/// together with `value_string`, so `COALESCE(value_string_folded,
+/// lower(value_string)) IS NOT NULL` and `value_string IS NOT NULL` select the
+/// same rows. What changes is that the query no longer *mentions* the factor
+/// the planner was mis-multiplying.
+///
+/// It also removes `idx_search_string` from the competition for this shape:
+/// nothing in the new predicate implies *its* `value_string IS NOT NULL`
+/// predicate, because COALESCE is not strict in `value_string`. `:exact`
+/// (`value_string = $n`, strict) still reaches it, unchanged.
+///
+/// ### 2. A parameterized `LIKE` can never seek, at any estimate
+///
+/// `match_pattern_prefix` (`indxpath.c`) turns `LIKE` into an index range only
+/// when it can see the pattern as a `Const`. The live statement binds it:
+/// `… LIKE $3 ESCAPE $5`. Under a generic plan the whole predicate survives
+/// rewriting as `~~ like_escape($1, '\')` — a function call on a parameter —
+/// and no prefix exists to extract. Forced generic, same table, same index:
+///
+/// ```text
+/// Index Cond: (tenant_id = … AND resource_type = … AND param_name = …)
+/// Filter: (COALESCE(value_string_folded, lower(value_string)) ~~ like_escape($1, '\'))
+/// Rows Removed by Filter: 4978          Buffers: shared hit=1667 read=53
+/// ```
+///
+/// This is a latent hazard rather than today's plan: `search_impl.rs` calls
+/// `client.query(&sql, …)` with a `&str`, and `ToStatementType::Query` routes
+/// that to `prepare::prepare` — a fresh statement per call, closed on drop — so
+/// the plan cache's custom-plan counter never reaches the five executions that
+/// would switch it to generic. Reason 1 above is what is biting now. But that
+/// is a property of one driver call site, not of the query, and `deadpool`'s
+/// `prepare_cached` — used elsewhere in this backend, and the obvious thing to
+/// reach for when trimming planning time — is one line away from turning the
+/// latent case into the live one. `build_string_condition` therefore computes the bound in
+/// Rust and emits the range itself: `FOLDED_STRING_EXPR ~>=~ $lo AND … ~<~ $hi`.
+/// `~>=~`/`~<~` are the `text_pattern_ops` operators — bytewise, collation-free,
+/// the same ones the planner generates — and UTF-8 byte order is code-point
+/// order, so the range holds exactly the values with that prefix. Default FHIR
+/// `string` semantics are starts-with, so this is the whole modifier.
+///
+/// ## Measured, paired, same database, after VACUUM ANALYZE
+///
+/// ```text
+/// shape                              v29 SQL + v29 index   v30 SQL + v30 index
+/// Patient?address=Springfield (22)   1,709 buffers 1.07ms      25 buffers 0.09ms
+/// Patient?name=Zzz       (0 matches) 1,183 buffers 1.15ms       4 buffers 0.10ms
+/// Patient?family=Smith (whole slice)   725 buffers 1.79ms     733 buffers 1.65ms
+/// Patient?address:contains=…         1,709 buffers 1.07ms   1,709 buffers (unchanged)
+/// Patient?name:exact=…                   4 buffers          unchanged
+/// ```
+///
+/// 68x and 296x fewer buffers on the two selective shapes, and the plan holds
+/// under `plan_cache_mode = force_generic_plan`, which no `LIKE` form does.
+///
+/// The third row is the shape that gains nothing: a prefix matching the whole
+/// parameter slice reads the same rows either way, just through a wider index.
+/// It lands at parity *provided the index is compact* — repeated against a
+/// deliberately bloated copy (fillfactor 10, 86 MB for the same 110k entries)
+/// it is 1,012 buffers / 4.66 ms, a real regression. That is an argument for
+/// the rebuild below, not against the seek.
+///
+/// Execution cost alone, 500 iterations inside a plpgsql loop so the plan is
+/// cached and no client round trip or planning is counted: **513 ms -> 54 ms**,
+/// 1.03 ms -> 0.11 ms per call. End to end through the wire with planning
+/// included (pgbench, simple protocol, 4 clients, prefixes mixed 22-row /
+/// 500-row / 0-row): 1,537 -> 2,186 tps. The gap between 9.5x and 1.4x is
+/// planning and round trip on a box where the whole index is in RAM; the
+/// benchmark host has 11 GB against a 15.7 GB working set, where the buffers
+/// this stops touching are the point.
+///
+/// `:contains`/`:text` deliberately keep the old form. A leading `%` cannot
+/// seek, so all the conjunct's removal would do is move an unavoidable
+/// full-slice scan from the 50 MB index onto the wide covering one: measured
+/// 1,709 -> 2,169 buffers, a 27% regression. It stays where it is. A trigram
+/// GIN would be the real answer and is not affordable here — the benchmark host
+/// has 11 GB of RAM against a 15.7 GB working set.
+///
+/// ## What this costs a real database
+///
+/// One `DROP INDEX` and one `CREATE INDEX` over the rows that have a string
+/// value — 205,918 of 22,644,934 in the reference database (0.9%), the count
+/// `search-plans.txt` section AL reports. Same key columns, same payload, same
+/// population; only the predicate is reworded. The rebuild takes a `SHARE` lock
+/// and runs at startup under `initialize_schema`'s advisory lock, before this
+/// instance serves traffic, as v15/v17/v18/v24/v26 all do.
+///
+/// It also reclaims the index. 205,918 entries of ~130 bytes is ~27 MB; the run
+/// measured **495 MB**, ~18x, which is churn bloat on an index that has never
+/// been read and so has never had a scan clean anything up. The rebuild returns
+/// that to the filesystem.
+///
+/// Rolling deploys are safe in both directions. An old binary's SQL —
+/// `value_string IS NOT NULL AND COALESCE(…) LIKE $n` — still proves the new
+/// predicate, via the strict `~~`, so it keeps working against the new index
+/// exactly as it does today (verified: same plan, same 1,709 buffers). A new
+/// binary against an un-migrated database is not reachable: migrations complete
+/// under the advisory lock before the instance serves.
+async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        // Same key columns, same `INCLUDE`, same population as v24 built. The
+        // predicate is reworded onto the expression the query actually compares,
+        // so a strict operator on it — `~>=~`, `~<~`, `~~` — proves the index
+        // usable with no help from a separate conjunct.
+        "DROP INDEX IF EXISTS idx_search_string_folded_pattern",
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded_pattern
+         ON search_index (tenant_id, resource_type, param_name,
+                          (COALESCE(value_string_folded, lower(value_string))) text_pattern_ops)
+         INCLUDE (resource_id, last_updated)
+         WHERE COALESCE(value_string_folded, lower(value_string)) IS NOT NULL",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v29->v30 failed: {}", e)))?;
+    }
+
+    // The rebuilt index carries the statistics for its expression, and the
+    // planner needs them for the new range predicate. Best-effort: a failure
+    // here costs plan quality, not correctness.
+    if let Err(e) = client.execute("ANALYZE search_index", &[]).await {
+        tracing::warn!(
+            "Migration v29->v30: optional ANALYZE failed (plans may be suboptimal \
+             until autovacuum catches up, search remains correct): {}",
+            e
+        );
     }
 
     Ok(())
