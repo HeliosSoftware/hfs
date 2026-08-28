@@ -137,5 +137,5 @@ test("Bulk Import create, add, and remove forms work without JavaScript", async 
   const menu = page.locator("details.bulk-import-manifest-menu");
   await menu.locator("summary").click();
   await menu.getByRole("button", { name: "Remove" }).click();
-  await expect(page.locator("[data-empty=manifests]")).toBeVisible();
+  await expect(page.locator("[data-bulk-import-manifest-empty]")).toBeVisible();
 });

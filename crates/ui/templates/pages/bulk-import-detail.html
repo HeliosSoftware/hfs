@@ -1,4 +1,6 @@
 {% extends "layouts/base.html" %}
+{% import "partials/dialog.html" as dialog %}
+
 {% block title %}{{ name }} — {{ i18n.t("bulk-import-title") }}{% endblock %}
 {% block breadcrumb %}{% endblock %}
 {% block content %}
@@ -7,34 +9,17 @@
     <a class="back-link" href="/ui/bulk-import">‹ {{ i18n.t("bulk-import-all") }}</a>
     <h1 class="page-head__title">{{ name }}</h1>
   </div>
+
   {% if terminal %}
   <button type="button" class="btn btn--primary" data-bulk-import-add-manifest disabled>
     {% include "icons/plus.svg" %}{{ i18n.t("bulk-import-add-manifest") }}
   </button>
   {% else %}
-  <details class="addbox addbox--modal" data-bulk-import-add-manifest>
-    <summary class="btn btn--primary">{% include "icons/plus.svg" %}{{ i18n.t("bulk-import-add-manifest") }}</summary>
-    <div class="addbox__panel" role="dialog" aria-labelledby="bulk-import-add-manifest-title">
-      <div class="addbox__head">
-        <div class="addbox__title" id="bulk-import-add-manifest-title">{{ i18n.t("bulk-import-add-manifest-title") }}</div>
-        <button type="button" class="addbox__x" data-addbox-close aria-label="{{ i18n.t("ui-close") }}">×</button>
-      </div>
+  {% call dialog::modal(i18n.t("bulk-import-add-manifest"), "bulk-import-add-manifest-dialog-title", i18n.t("bulk-import-add-manifest-title"), marker="data-bulk-import-add-manifest") %}
       <form method="post" action="/ui/bulk-import/{{ id }}/manifests">
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-manifest-url") }}</span>
-          <input class="field__input" type="url" name="manifest_url" required autocomplete="off" data-addbox-initial-focus>
-          <span class="field__hint">{{ i18n.t("bulk-import-field-manifest-url-hint") }}</span>
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-fhir-base") }}</span>
-          <input class="field__input" type="url" name="fhir_base_url" autocomplete="off">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-fhir-base-hint") }}</span>
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-output-format") }}</span>
-          <input class="field__input" type="text" name="output_format" autocomplete="off" placeholder="application/fhir+ndjson">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-output-format-hint") }}</span>
-        </label>
+        {% call dialog::field(i18n.t("bulk-import-field-manifest-url"), "manifest_url", "url", required=true, hint=i18n.t("bulk-import-field-manifest-url-hint"), initial_focus=true) %}{% endcall %}
+        {% call dialog::field(i18n.t("bulk-import-field-fhir-base"), "fhir_base_url", "url", hint=i18n.t("bulk-import-field-fhir-base-hint")) %}{% endcall %}
+        {% call dialog::field(i18n.t("bulk-import-field-output-format"), "output_format", "text", placeholder="application/fhir+ndjson", hint=i18n.t("bulk-import-field-output-format-hint")) %}{% endcall %}
         <label class="field">
           <span class="field__label">{{ i18n.t("bulk-import-field-headers") }}</span>
           <textarea class="field__input" name="file_request_headers" rows="2" placeholder="Authorization: Bearer …"></textarea>
@@ -45,8 +30,7 @@
           <button type="submit" class="btn btn--primary">{{ i18n.t("bulk-import-add-manifest-submit") }}</button>
         </div>
       </form>
-    </div>
-  </details>
+  {% endcall %}
   {% endif %}
 </header>
 
@@ -126,7 +110,7 @@
     {% endif %}
   </div>
   {% if manifests.is_empty() %}
-  <div class="empty-state" data-empty="manifests">{{ i18n.t("bulk-import-no-manifests") }}</div>
+  <div class="empty-state" data-bulk-import-manifest-empty>{{ i18n.t("bulk-import-no-manifests") }}</div>
   {% else %}
   <ul class="bulk-import-manifest-list">
     {% for m in manifests %}

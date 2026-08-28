@@ -142,6 +142,40 @@ Spanish and German keep their own capitalization norms (both languages use
 sentence case where English uses Title Case); the convention above is for
 `en` only.
 
+## Required-field marker (#680)
+
+Required fields get an accent-colored asterisk, matching the marker already
+used by the resource editor's add-picker (`.editor-add__name em`). This is
+implemented as a single CSS `:has()` rule next to `.field__label` in
+`assets/app.css`, not per-field markup: the `required` attribute on the input
+is the source of truth, and the rule appends `*` after the field's visible
+label whenever it wraps a required input. The one field without a visible
+label — the search builder's query URL — is marked on its `query-builder__tag`
+chip instead. No template renders `*` for this; the only literal `<em>*</em>`
+in the codebase is the editor's own (unrelated) marker. Changing the
+convention later (e.g. an `(optional)` suffix instead) means editing only
+that one CSS rule.
+
+## Error wording (#677)
+
+Errors follow one convention across the Fluent catalogs
+(`locales/{en,es,de}/main.ftl`) and the OperationOutcome diagnostics that
+`crates/rest/src/error.rs` renders into them:
+
+- Full-sentence errors end with a terminal period; fragments, labels, and
+  status values (`Failed`, `failed`, `unavailable`) take none.
+- Operation failures use one shape: a full sentence naming the object, with
+  the cause after an em dash — `Could not add the tenant — that ID is
+  already in use.`
+- Interpolated values are single-quoted: `Content type 'text/csv' is not
+  supported.`
+- Duality: this convention governs what the user sees — the message catalogs
+  and the `diagnostics` field of returned `OperationOutcome`s, which reach
+  the browser verbatim. It does not apply to `RestError`'s `Display` impl in
+  `crates/rest/src/error.rs`, which stays in its own `Label: value` shape —
+  that form is for logs and traces, not the UI, and is intentionally
+  distinct.
+
 ## Rules of the road — where things go
 
 - `crates/ui/src/` — Axum handlers/routers returning `impl IntoResponse`

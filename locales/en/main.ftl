@@ -64,7 +64,7 @@ terminology-lede = Connect HFS to a FHIR terminology server.
 terminology-configured-heading = Terminology Server Configured
 terminology-configured-body = HFS_TERMINOLOGY_SERVER points to a valid server URL.
 terminology-configured-open = Open Terminology Server
-terminology-invalid-heading = HFS_TERMINOLOGY_SERVER is invalid
+terminology-invalid-heading = HFS_TERMINOLOGY_SERVER is invalid.
 terminology-invalid-body = Use an absolute HTTP or HTTPS URL with a host. Paths and a trailing slash are allowed. Do not include credentials, a query string, or a fragment.
 terminology-invalid-note = Update the environment variable, then restart HFS.
 terminology-setup-heading = Connect a Terminology Server
@@ -86,7 +86,7 @@ action-retry = Retry
 
 error-not-found = The requested resource was not found.
 error-unauthorized = You are not authorized to perform this action.
-error-generic = Something went wrong. Please try again.
+error-generic = Something went wrong. Try again.
 
 ## Dashboard shell (Figma "Dashboard V1.1")
 
@@ -142,7 +142,7 @@ tenants-unregistered = unregistered
 tenants-delete = Delete Tenant
 tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept unless purged via the API.
 tenants-row-provisioning = Provisioning… this may take a moment.
-tenants-row-failed = Provisioning failed
+tenants-row-failed = Could not provision the tenant.
 tenants-dismiss = Dismiss
 
 tenant-heading = Tenants
@@ -294,7 +294,7 @@ cmp-new = New Compartment Definition
 cmp-edit = Edit
 cmp-delete = Delete
 cmp-delete-confirm = Delete this compartment definition? Its compartment routes stop resolving.
-crud-delete-failed = Delete failed
+crud-delete-failed = Could not delete this item.
 
 ## Compartment viewer & tester (#237)
 
@@ -542,9 +542,9 @@ batch-lede = Upload a FHIR Bundle, review the actions it will run, execute it ag
 batch-upload = Upload
 batch-drop-hint = Drop a bundle JSON file here
 batch-drop-browse = or click to browse
-batch-invalid-json = That file is not valid JSON
-batch-not-a-bundle = That JSON is not a FHIR Bundle
-batch-bad-type = Only Bundles of type batch or transaction can be executed here
+batch-invalid-json = That file is not valid JSON.
+batch-not-a-bundle = That JSON is not a FHIR Bundle.
+batch-bad-type = Only Bundles of type batch or transaction can be executed here.
 batch-request = Request
 batch-entries = entries
 batch-semantics-batch = Batch: entries run independently — a failed entry does not stop or undo the others.
@@ -561,10 +561,10 @@ batch-sum-created = created
 batch-sum-updated = updated
 batch-sum-other = read/other
 batch-sum-failed = failed
-batch-request-failed = The request failed
+batch-request-failed = The request failed.
 batch-reading = Reading bundle…
 batch-executing = Executing…
-batch-read-failed = The file could not be read
+batch-read-failed = The file could not be read.
 
 ## Bulk Import workspace (#527)
 
@@ -793,12 +793,12 @@ vd-empty-lede = Create your first ViewDefinition with Create New.
 vd-degraded = The view definition list could not be loaded.
 vd-saved = Saved.
 vd-run = Run
-vd-run-failed = Running the view failed.
+vd-run-failed = Could not run the view.
 vd-save = Save
 vd-duplicate = Duplicate
 vd-delete = Delete
 vd-delete-confirm = Delete view definition "{ $name }"? This cannot be undone.
-vd-delete-failed = Deleting the view definition failed.
+vd-delete-failed = Could not delete the view definition.
 vd-json-heading = Definition (JSON)
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
@@ -813,11 +813,11 @@ lib-empty-lede = Create your first library with Create New.
 lib-degraded = The library list could not be loaded.
 lib-sql-heading = SQL
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
-lib-delete-failed = Deleting the library failed.
+lib-delete-failed = Could not delete the library.
 
 ## SQL Export and Files pages (#649)
 
-export-start-failed = Starting the export failed.
+export-start-failed = Could not start the export.
 export-started = Export started.
 export-cancelled = Cancellation requested.
 export-job-heading = Export Job
@@ -835,7 +835,7 @@ export-format = Output format
 export-start = Start Export
 files-job-heading = Export Job
 files-load = Load Manifest
-files-error = Loading the manifest failed.
+files-error = Could not load the manifest.
 files-outputs-heading = Outputs
 files-col-output = Output
 files-col-downloads = Downloads
