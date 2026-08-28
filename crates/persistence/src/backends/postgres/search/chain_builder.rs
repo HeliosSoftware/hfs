@@ -294,7 +294,7 @@ impl ChainQueryBuilder {
         }
 
         let param_num = self.param_offset + 1;
-        let (terminal_sql, terminal_param) =
+        let (terminal_sql, terminal_params) =
             self.build_terminal_condition(chain, value, param_num)?;
         let terminal_type = &chain.links[chain.links.len() - 1].target_type;
 
@@ -363,7 +363,7 @@ impl ChainQueryBuilder {
 
         Ok(SqlFragment::with_params(
             format!("r.id IN ({})", current_sql),
-            vec![terminal_param],
+            terminal_params,
         ))
     }
 
@@ -372,21 +372,21 @@ impl ChainQueryBuilder {
         chain: &ParsedChain,
         value: &SearchValue,
         param_num: usize,
-    ) -> StorageResult<(String, SqlParam)> {
+    ) -> StorageResult<(String, Vec<SqlParam>)> {
         let alias = format!("si{}", chain.links.len());
 
-        if let Some(resolved) =
+        if let Some((sql, bind)) =
             resources_backed_condition(&chain.terminal_param, &alias, value, param_num)
         {
-            return Ok(resolved);
+            return Ok((sql, vec![bind]));
         }
 
-        let (condition, param) = match chain.terminal_type {
+        let (condition, params) = match chain.terminal_type {
             SearchParamType::String => {
                 let escaped = value.value.replace('%', "\\%").replace('_', "\\_");
                 (
                     format!("{}.value_string ILIKE ${} ESCAPE '\\'", alias, param_num),
-                    SqlParam::Text(format!("%{}%", escaped)),
+                    vec![SqlParam::Text(format!("%{}%", escaped))],
                 )
             }
             SearchParamType::Token => {
@@ -399,53 +399,64 @@ impl ChainQueryBuilder {
                                 alias = alias,
                                 pn = param_num,
                             ),
-                            SqlParam::Text(code.to_string()),
+                            vec![SqlParam::Text(code.to_string())],
                         )
                     } else {
+                        // Both halves are bound. The system used to be
+                        // interpolated into the SQL text with its quotes doubled:
+                        // user-supplied text in a literal, correct only for as
+                        // long as `standard_conforming_strings` stays on, and a
+                        // distinct statement text per system either way.
                         (
                             format!(
-                                "{alias}.value_token_system = '{sys}' AND {alias}.value_token_code = ${pn}",
+                                "{alias}.value_token_system = ${pn} AND {alias}.value_token_code = ${pn2}",
                                 alias = alias,
-                                sys = system.replace('\'', "''"),
                                 pn = param_num,
+                                pn2 = param_num + 1,
                             ),
-                            SqlParam::Text(code.to_string()),
+                            vec![
+                                SqlParam::Text(system.to_string()),
+                                SqlParam::Text(code.to_string()),
+                            ],
                         )
                     }
                 } else {
                     (
                         format!("{}.value_token_code = ${}", alias, param_num),
-                        SqlParam::Text(value.value.clone()),
+                        vec![SqlParam::Text(value.value.clone())],
                     )
                 }
             }
             SearchParamType::Reference => (
                 format!("{}.value_reference ILIKE ${}", alias, param_num),
-                SqlParam::Text(format!("%{}%", value.value)),
+                vec![SqlParam::Text(format!("%{}%", value.value))],
             ),
             SearchParamType::Date => {
                 let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                let (sql, bind) = build_date_condition(&date_col, value, param_num);
+                (sql, vec![bind])
             }
             SearchParamType::Number => {
                 let num_col = format!("{}.value_number", alias);
-                build_number_condition(&num_col, value, param_num)
+                let (sql, bind) = build_number_condition(&num_col, value, param_num);
+                (sql, vec![bind])
             }
             SearchParamType::Quantity => {
                 let qty_col = format!("{}.value_quantity_value", alias);
-                build_number_condition(&qty_col, value, param_num)
+                let (sql, bind) = build_number_condition(&qty_col, value, param_num);
+                (sql, vec![bind])
             }
             SearchParamType::Uri => (
                 format!("{}.value_uri = ${}", alias, param_num),
-                SqlParam::Text(value.value.clone()),
+                vec![SqlParam::Text(value.value.clone())],
             ),
             _ => (
                 format!("{}.value_string ILIKE ${}", alias, param_num),
-                SqlParam::Text(format!("%{}%", value.value)),
+                vec![SqlParam::Text(format!("%{}%", value.value))],
             ),
         };
 
-        Ok((condition, param))
+        Ok((condition, params))
     }
 
     /// Builds SQL for a reverse chain (`_has`) query.
@@ -508,7 +519,7 @@ impl ChainQueryBuilder {
                 source: None,
             })?;
 
-            let (search_condition, search_param) = self.build_reverse_terminal_condition(
+            let (search_condition, search_params) = self.build_reverse_terminal_condition(
                 &rc.source_type,
                 &rc.search_param,
                 value,
@@ -554,7 +565,7 @@ impl ChainQueryBuilder {
                 },
             );
 
-            Ok((sql, vec![search_param]))
+            Ok((sql, search_params))
         } else {
             let inner = rc.nested.as_ref().ok_or_else(|| BackendError::Internal {
                 backend_name: "postgres".to_string(),
@@ -597,7 +608,7 @@ impl ChainQueryBuilder {
         value: &SearchValue,
         depth: usize,
         param_num: usize,
-    ) -> StorageResult<(String, SqlParam)> {
+    ) -> StorageResult<(String, Vec<SqlParam>)> {
         let param_type = {
             let registry = self.registry.read();
             crate::search::resolve_param_type(
@@ -610,16 +621,17 @@ impl ChainQueryBuilder {
 
         let alias = format!("si{}", depth);
 
-        if let Some(resolved) = resources_backed_condition(param_name, &alias, value, param_num) {
-            return Ok(resolved);
+        if let Some((sql, bind)) = resources_backed_condition(param_name, &alias, value, param_num)
+        {
+            return Ok((sql, vec![bind]));
         }
 
-        let (condition, param) = match param_type {
+        let (condition, params) = match param_type {
             SearchParamType::String => {
                 let escaped = value.value.replace('%', "\\%").replace('_', "\\_");
                 (
                     format!("{}.value_string ILIKE ${} ESCAPE '\\'", alias, param_num),
-                    SqlParam::Text(format!("%{}%", escaped)),
+                    vec![SqlParam::Text(format!("%{}%", escaped))],
                 )
             }
             SearchParamType::Token => {
@@ -632,53 +644,64 @@ impl ChainQueryBuilder {
                                 alias = alias,
                                 pn = param_num,
                             ),
-                            SqlParam::Text(code.to_string()),
+                            vec![SqlParam::Text(code.to_string())],
                         )
                     } else {
+                        // Both halves are bound. The system used to be
+                        // interpolated into the SQL text with its quotes doubled:
+                        // user-supplied text in a literal, correct only for as
+                        // long as `standard_conforming_strings` stays on, and a
+                        // distinct statement text per system either way.
                         (
                             format!(
-                                "{alias}.value_token_system = '{sys}' AND {alias}.value_token_code = ${pn}",
+                                "{alias}.value_token_system = ${pn} AND {alias}.value_token_code = ${pn2}",
                                 alias = alias,
-                                sys = system.replace('\'', "''"),
                                 pn = param_num,
+                                pn2 = param_num + 1,
                             ),
-                            SqlParam::Text(code.to_string()),
+                            vec![
+                                SqlParam::Text(system.to_string()),
+                                SqlParam::Text(code.to_string()),
+                            ],
                         )
                     }
                 } else {
                     (
                         format!("{}.value_token_code = ${}", alias, param_num),
-                        SqlParam::Text(value.value.clone()),
+                        vec![SqlParam::Text(value.value.clone())],
                     )
                 }
             }
             SearchParamType::Reference => (
                 format!("{}.value_reference ILIKE ${}", alias, param_num),
-                SqlParam::Text(format!("%{}%", value.value)),
+                vec![SqlParam::Text(format!("%{}%", value.value))],
             ),
             SearchParamType::Date => {
                 let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                let (sql, bind) = build_date_condition(&date_col, value, param_num);
+                (sql, vec![bind])
             }
             SearchParamType::Number => {
                 let num_col = format!("{}.value_number", alias);
-                build_number_condition(&num_col, value, param_num)
+                let (sql, bind) = build_number_condition(&num_col, value, param_num);
+                (sql, vec![bind])
             }
             SearchParamType::Quantity => {
                 let qty_col = format!("{}.value_quantity_value", alias);
-                build_number_condition(&qty_col, value, param_num)
+                let (sql, bind) = build_number_condition(&qty_col, value, param_num);
+                (sql, vec![bind])
             }
             SearchParamType::Uri => (
                 format!("{}.value_uri = ${}", alias, param_num),
-                SqlParam::Text(value.value.clone()),
+                vec![SqlParam::Text(value.value.clone())],
             ),
             _ => (
                 format!("{}.value_string ILIKE ${}", alias, param_num),
-                SqlParam::Text(format!("%{}%", value.value)),
+                vec![SqlParam::Text(format!("%{}%", value.value))],
             ),
         };
 
-        Ok((condition, param))
+        Ok((condition, params))
     }
 }
 
@@ -836,6 +859,36 @@ mod tests {
         ])
     }
 
+    /// `subject.identifier` on Observation (forward) and `code` on Observation
+    /// (the reverse-chain terminal) — two token terminals, which is what the
+    /// `system|code` binding tests need.
+    fn obs_subject_patient_org_code() -> Arc<RwLock<SearchParameterRegistry>> {
+        registry_with(vec![
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Observation-subject",
+                "subject",
+                SearchParamType::Reference,
+                "Observation.subject",
+            )
+            .with_base(vec!["Observation"])
+            .with_targets(vec!["Patient"]),
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Patient-identifier",
+                "identifier",
+                SearchParamType::Token,
+                "Patient.identifier",
+            )
+            .with_base(vec!["Patient"]),
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Observation-code",
+                "code",
+                SearchParamType::Token,
+                "Observation.code",
+            )
+            .with_base(vec!["Observation"]),
+        ])
+    }
+
     #[test]
     fn parses_three_link_chain() {
         let registry = obs_subject_patient_org_name();
@@ -952,6 +1005,70 @@ mod tests {
             .unwrap();
         assert!(!frag.sql.contains("FROM resources"), "{}", frag.sql);
         assert_eq!(frag.sql.matches("FROM search_index").count(), 3);
+    }
+
+    /// The `system|code` token form used to interpolate the SYSTEM into the SQL
+    /// text as a literal with its quotes doubled, and bind only the code. Both
+    /// halves are request-derived, so that was user text in a string literal:
+    /// correct only while `standard_conforming_strings` is on, and a distinct
+    /// statement text per system regardless — which is a fresh parse and plan on
+    /// every call, and unbounded growth in any prepared-statement cache placed
+    /// in front of it.
+    ///
+    /// A single quote in the system is the thing to test: it must reach the
+    /// server as a *value*, never as SQL.
+    #[test]
+    fn a_chained_token_system_is_bound_not_interpolated() {
+        let registry = obs_subject_patient_org_code();
+        let builder = ChainQueryBuilder::new("t", "Observation", registry);
+        let parsed = builder.parse_chain("subject.identifier").unwrap();
+        let frag = builder
+            .build_forward_chain_sql(&parsed, &SearchValue::eq("http://ex.org/o'brien|A1"))
+            .unwrap();
+
+        assert!(
+            frag.sql.contains("value_token_system = $2")
+                && frag.sql.contains("value_token_code = $3"),
+            "both halves bound: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("o'brien") && !frag.sql.contains("o''brien"),
+            "the system must not appear in the SQL text at all: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 2);
+        assert!(matches!(&frag.params[0], SqlParam::Text(v) if v == "http://ex.org/o'brien"));
+        assert!(matches!(&frag.params[1], SqlParam::Text(v) if v == "A1"));
+    }
+
+    /// Same, on the reverse-chain terminal, which is a separate copy of the
+    /// same match.
+    #[test]
+    fn a_reverse_chained_token_system_is_bound_not_interpolated() {
+        let registry = obs_subject_patient_org_code();
+        let builder = ChainQueryBuilder::new("t", "Patient", registry);
+        let rc = ReverseChainedParameter {
+            source_type: "Observation".to_string(),
+            reference_param: "subject".to_string(),
+            search_param: "code".to_string(),
+            value: Some(SearchValue::eq("http://ex.org/o'brien|A1")),
+            nested: None,
+        };
+        let frag = builder.build_reverse_chain_sql(&rc).unwrap();
+
+        assert!(
+            frag.sql.contains("value_token_system = $2")
+                && frag.sql.contains("value_token_code = $3"),
+            "both halves bound: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("o'brien") && !frag.sql.contains("o''brien"),
+            "the system must not appear in the SQL text at all: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 2);
     }
 
     #[test]

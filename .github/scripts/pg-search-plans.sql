@@ -1396,3 +1396,232 @@ SELECT count(*) AS value_quantity_rows,
        (SELECT count(*) FROM search_index WHERE tenant_id = 'default') AS table_rows
 FROM search_index
 WHERE tenant_id = 'default' AND resource_type = 'Observation' AND param_name = 'value-quantity';
+
+\echo ''
+\echo '################ v31 — THE REFERENCE PREDICATE ################'
+-- v31 stores `value_reference` in its version-agnostic base form (the writer
+-- strips `/_history/<vid>`, and `migrate_v30_to_v31` strips it from existing
+-- rows), so `build_reference_condition` emits ONE equality where it used to
+-- emit `= OR LIKE '<base>/\_history/%'`.
+--
+-- Reference was the second-largest statement of the search suite on run
+-- 33128380492: 159.2 s of ~885 s of real k6-window execution over 109,981 calls
+-- at 1.447 ms, plus a three-value variant at 16.9 s / 5,304 calls / 3.190 ms.
+--
+-- WARNING when reading that run's index-usage.txt: it contains a leaked
+-- `idx_search_reference_v26` that section AU created outside a transaction (see
+-- the note on the backstop there). The `=` arm went to the leak and the `LIKE`
+-- arm to `idx_search_reference_pattern`, which is why the latter shows 135,454
+-- scans for 1 tuple. On the shipped schema both arms land on the one index.
+
+-- A real stored reference, and a real target id for the :identifier sections.
+SELECT COALESCE((SELECT value_reference FROM search_index
+                 WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                   AND param_name = 'subject' AND value_reference IS NOT NULL
+                 LIMIT 1), 'Patient/no-such-id') AS vref \gset
+
+\echo ''
+\echo '######## BN. v31 REFERENCE Observation?subject=<ref> — one equality ########'
+-- EXPECT: `Index Scan using idx_search_reference_pattern`, a four-column
+-- `Index Cond` ending in `value_reference = '…'`, NO `BitmapOr`, NO `Recheck
+-- Cond` and NO `Filter` on `value_reference`, and roughly one buffer per
+-- matching row plus the descent.
+--
+-- FALSIFIED IF: a `BitmapOr` survives (something still emits a disjunction), or
+-- the value predicate appears under `Filter:`.
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated
+       FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'subject'
+         AND value_reference = :'vref'
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## BO. BN COUNTERFACTUAL — the v30 predicate, same pass, same cache ########'
+-- No DDL: the two shapes differ only in the SQL, so this is a paired before/after
+-- against identical data and an identical index set. Nothing to roll back and
+-- nothing that can leak.
+--
+-- EXPECT: `BitmapOr` over two `Bitmap Index Scan`s on
+-- `idx_search_reference_pattern`, the second returning ~0 rows, plus a `Bitmap
+-- Heap Scan` whose `Filter` re-evaluates the whole disjunction per row. Measured
+-- on a 3.4M-row replica over 300 warm searches: 1.50 ms/call here against
+-- 0.47 ms/call for BN.
+--
+-- FALSIFIED IF: BO is not slower than BN. Then the disjunction cost nothing and
+-- v31's read-side claim is wrong (its correctness claim is independent).
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated
+       FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'subject'
+         AND (value_reference = :'vref'
+              OR value_reference LIKE :'vref' || '/\_history/%' ESCAPE '\')
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) c
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = c.resource_id
+WHERE r.is_deleted = FALSE
+ORDER BY c.last_updated DESC, c.resource_id ASC;
+
+\echo ''
+\echo '######## BP. THE GENERIC-PLAN TRAP — why the disjunction was also a landmine ########'
+-- A prefix LIKE against a BIND PARAMETER derives index bounds only under a
+-- CUSTOM plan; under a generic plan Postgres reads no bounds off `$n`, and
+-- because an OR is index-usable only when every arm is, it loses the EQUALITY
+-- arm with it. The search query builder emits format!-built SQL through a
+-- prepare-and-drop, so today every execution is a custom plan — but
+-- `postgres/cached.rs` exists to move fixed SQL onto `prepare_cached`, and its
+-- own rule is "only where a generic plan is the plan anyway".
+--
+-- EXPECT: the v31 single equality keeps its full four-column `Index Cond` under
+-- `force_generic_plan`. Measured on the replica, the v30 disjunction did not:
+-- 2.89 ms custom -> 193.58 ms generic, 149 buffers -> 29,862, with the value
+-- predicate demoted to `Filter` and 446,688 rows removed per worker.
+--
+-- FALSIFIED IF: the generic plan below shows `value_reference` under `Filter:`
+-- rather than in the `Index Cond`.
+SET plan_cache_mode = force_generic_plan;
+PREPARE v31_ref(text, text) AS
+SELECT DISTINCT resource_id, last_updated FROM search_index
+ WHERE tenant_id = 'default' AND resource_type = 'Observation' AND param_name = $1
+   AND value_reference = $2
+ ORDER BY last_updated DESC, resource_id ASC LIMIT 22;
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF) EXECUTE v31_ref('subject', :'vref');
+DEALLOCATE v31_ref;
+RESET plan_cache_mode;
+
+\echo ''
+\echo '######## BQ. THE MIGRATION POSTCONDITION — no stored version survives ########'
+-- `migrate_v30_to_v31` strips `/_history/<vid>` from existing rows and the
+-- writer never writes one again. If this is not 0, the v31 predicate is
+-- under-matching and the migration did not run (or a v30 writer has written
+-- since).
+SELECT count(*) AS rows_still_carrying_a_version
+FROM search_index
+WHERE value_reference IS NOT NULL AND strpos(value_reference, '/_history/') > 0;
+
+\echo ''
+\echo '######## BR. THE BARE-ID FORM — known non-sargable, measured so it is not guessed ########'
+-- `Observation?patient=<id>` (a bare logical id) is the PRIMARY form in the FHIR
+-- spec and emits `value_reference = $n OR value_reference LIKE '%/<id>'`. A
+-- leading-wildcard LIKE has no index bounds in any operator class, so the
+-- planner has nothing for the value at all. The benchmark only ever sends
+-- `Type/id`, so this never appears in a run — this section exists so the next
+-- round has the number rather than an argument.
+--
+-- Measured on the replica against a 1.34M-row slice: parallel Seq Scan of the
+-- whole `search_index`, 259 ms, 71,943 buffers, against 0.47 ms for BN.
+--
+-- Fixing it needs a stored bare target id — a column and an index, i.e. one more
+-- btree insert per reference row, which is the write-path cost v27 spent a
+-- migration reducing. Not attempted; costed here.
+SELECT COALESCE((SELECT substring(value_reference from '[^/]+$') FROM search_index
+                 WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                   AND param_name = 'subject' AND value_reference IS NOT NULL
+                 LIMIT 1), 'no-such-id') AS bareid \gset
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT DISTINCT resource_id, last_updated FROM search_index
+ WHERE tenant_id = 'default' AND resource_type = 'Observation'
+   AND param_name = 'subject'
+   AND (value_reference = :'bareid'
+        OR value_reference LIKE '%/' || :'bareid' ESCAPE '\')
+ ORDER BY last_updated DESC, resource_id ASC LIMIT 22;
+
+\echo ''
+\echo '######## BS. :identifier — the identifier lookup must DRIVE ########'
+-- `build_reference_identifier_condition` used to correlate an `EXISTS` into the
+-- identifier rows, pulling the target id out of each reference row with
+-- `SUBSTRING(value_reference FROM POSITION('/' …) + 1)`. Nothing about `ref` is
+-- seekable in that form, so the whole parameter slice is materialized first; and
+-- the inner lookup bound only `tenant_id` and `param_name`, never
+-- `resource_type`, so it could not seek past the first key column either.
+--
+-- Inverted, the sub-select yields the target's `Type/id` and the reference index
+-- is seeked with it. Measured on the replica (1.34M-row slice, 490,000
+-- identifier rows): 285.6 ms / 80,393 buffers -> 1.4 ms / 845 buffers, 209x.
+-- Binding `resource_type` into the old correlated EXISTS instead measured
+-- 338.2 ms — SLOWER — because the inner lookup was never the cost.
+--
+-- EXPECT: an `Index Scan using idx_search_reference_pattern` fed by an index
+-- scan over the identifier rows. FALSIFIED IF: a Seq Scan on `search_index`
+-- appears anywhere in this plan.
+SELECT COALESCE((SELECT value_token_system FROM search_index
+                 WHERE tenant_id = 'default' AND param_name = 'identifier'
+                   AND value_token_system IS NOT NULL LIMIT 1), 'no-such-system') AS isys \gset
+SELECT COALESCE((SELECT value_token_code FROM search_index
+                 WHERE tenant_id = 'default' AND param_name = 'identifier'
+                   AND value_token_code IS NOT NULL LIMIT 1), 'no-such-code') AS icode \gset
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT DISTINCT resource_id, last_updated FROM search_index
+ WHERE tenant_id = 'default' AND resource_type = 'Observation'
+   AND param_name = 'subject'
+   AND resource_id IN (
+     SELECT ref.resource_id FROM search_index ref
+      WHERE ref.tenant_id = 'default' AND ref.resource_type = 'Observation'
+        AND ref.param_name = 'subject'
+        AND ref.value_reference IN (SELECT idx.resource_type || '/' || idx.resource_id
+                                      FROM search_index idx
+                                     WHERE idx.tenant_id = 'default'
+                                       AND idx.param_name = 'identifier'
+                                       AND idx.value_token_system = :'isys'
+                                       AND idx.value_token_code = :'icode'))
+ ORDER BY last_updated DESC, resource_id ASC LIMIT 22;
+
+\echo ''
+\echo '######## BT. BS COUNTERFACTUAL — the correlated EXISTS it replaces ########'
+-- Same pass, same cache, no DDL. `statement_timeout` bounds it: on a 22M-row
+-- table this shape can take minutes, and a missing measurement is preferable to
+-- a stalled capture.
+SET statement_timeout = '120s';
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT DISTINCT resource_id, last_updated FROM search_index
+ WHERE tenant_id = 'default' AND resource_type = 'Observation'
+   AND param_name = 'subject'
+   AND resource_id IN (
+     SELECT ref.resource_id FROM search_index ref
+      WHERE ref.tenant_id = 'default' AND ref.resource_type = 'Observation'
+        AND ref.param_name = 'subject'
+        AND EXISTS (SELECT 1 FROM search_index idx
+                     WHERE idx.tenant_id = 'default' AND idx.param_name = 'identifier'
+                       AND idx.resource_id = SUBSTRING(ref.value_reference
+                                                       FROM POSITION('/' IN ref.value_reference) + 1)
+                       AND idx.value_token_system = :'isys'
+                       AND idx.value_token_code = :'icode'))
+ ORDER BY last_updated DESC, resource_id ASC LIMIT 22;
+RESET statement_timeout;
+
+\echo ''
+\echo '######## BU. REFERENCE INDEX GEOMETRY — why the sort key is NOT added ########'
+-- With the OR gone, the obvious follow-through is to give
+-- `idx_search_reference_pattern` the fast path`s sort key, as v24 did for the
+-- token indexes: 22 index tuples and zero heap fetches instead of 134 index
+-- tuples and 134 heap blocks. It is not done, and this is the reason.
+--
+-- The index is small precisely because it has no per-row column: each
+-- (tenant, type, param, value_reference) group is one key plus a posting list of
+-- TIDs. Adding `last_updated`/`resource_id` — as KEY columns or as INCLUDE, it
+-- makes no difference — turns deduplication off. Measured per slice on the
+-- replica: 7.9 B/row -> 160.4 B/row where references repeat (134:1), 105.4 ->
+-- 160.2 where they do not. On the live 550 MB index the two extremes bound the
+-- reference row count at 5.5M-18.2M, so the sort-key shape is 880-2,912 MB:
+-- between +330 MB and +2.4 GB on an 11 GB host, against the 2.2 GB v30 just
+-- recovered. The census below is what narrows that bound; read it before
+-- re-litigating.
+SELECT count(*) FILTER (WHERE value_reference IS NOT NULL) AS reference_rows,
+       count(DISTINCT value_reference)                     AS distinct_values,
+       round(count(*) FILTER (WHERE value_reference IS NOT NULL)::numeric
+             / NULLIF(count(DISTINCT value_reference), 0), 2) AS rows_per_value,
+       pg_size_pretty(pg_relation_size('idx_search_reference_pattern')) AS index_size,
+       round(pg_relation_size('idx_search_reference_pattern')::numeric
+             / NULLIF(count(*) FILTER (WHERE value_reference IS NOT NULL), 0), 1)
+         AS bytes_per_row
+FROM search_index WHERE tenant_id = 'default';

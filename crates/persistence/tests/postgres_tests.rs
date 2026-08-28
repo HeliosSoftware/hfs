@@ -380,10 +380,18 @@ mod query_builder_tests {
         });
 
         let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
-        // Correlated subquery against the target's 'identifier' index rows.
+        // The identifier lookup drives and yields the target's `Type/id`; the
+        // reference index is seeked with it. The correlated-EXISTS form this
+        // replaced measured 285.6 ms against 1.4 ms on the same replica — see
+        // `build_reference_identifier_condition`.
         assert!(fragment.sql.contains("param_name = 'identifier'"));
         assert!(fragment.sql.contains("idx.value_token_system"));
         assert!(fragment.sql.contains("idx.value_token_code"));
+        assert!(
+            !fragment.sql.contains("EXISTS") && !fragment.sql.contains("SUBSTRING"),
+            "{}",
+            fragment.sql
+        );
     }
 
     #[test]

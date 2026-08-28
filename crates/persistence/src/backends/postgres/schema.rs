@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 31;
+pub const SCHEMA_VERSION: i32 = 32;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -351,6 +351,7 @@ async fn migrate_schema(
             28 => migrate_v28_to_v29(client).await?,
             29 => migrate_v29_to_v30(client).await?,
             30 => migrate_v30_to_v31(client).await?,
+            31 => migrate_v31_to_v32(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -2478,6 +2479,210 @@ async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult
 
     Ok(())
 }
+
+/// v31 -> v32: store `value_reference` in its version-agnostic base form, and
+/// delete the `LIKE` that existed only because it was not.
+///
+/// `build_reference_condition` emitted, for the `Type/id` form that is every
+/// reference search the benchmark sends:
+///
+/// ```text
+/// value_reference = $3 OR value_reference LIKE $4 ESCAPE '\'      -- $4 = 'Patient/<id>/\_history/%'
+/// ```
+///
+/// On run 33128380492 that statement is the second-largest of the search suite —
+/// **159.2 s of the ~885 s of real k6-window Postgres execution, 18%**, over
+/// 109,981 calls at 1.447 ms, plus a three-value variant at 16.9 s / 5,304 calls
+/// / 3.190 ms. The `LIKE` arm returned **one tuple in the entire run**.
+///
+/// ## Why the arm existed
+///
+/// `search/writer.rs` stored `Reference.reference` verbatim, so a resource
+/// carrying `{"reference": "Patient/123/_history/4"}` put that whole string in
+/// the column. FHIR reference search is version-agnostic, so a search for
+/// `Patient/123` has to find it — and equality cannot, hence the pattern.
+///
+/// The search *value* was already normalized (`strip_reference_version`), and
+/// has been since the parameter was written. This makes the other end match: the
+/// writer stores the base, and the read becomes one equality. There is no third
+/// form to cover, because the version suffix is the only thing the two ends
+/// disagreed about.
+///
+/// ## What the arm cost, measured
+///
+/// A 3.4M-row local replica calibrated to the real slice geometry — 1,340,000
+/// `Observation.subject` rows over 10,000 patients, i.e. the run's own 134
+/// tuples per scan — on PostgreSQL 18.6, 300 searches over random patients,
+/// warm cache, three repeats:
+///
+/// ```text
+/// = OR LIKE (today)   1.496  1.525  1.510 ms/call
+/// = only  (v32)       0.479  0.494  0.418 ms/call        -3.1x
+/// ```
+///
+/// The saving is not the extra index descent, which is ~4 buffers of ~149. It
+/// is the plan shape. An `OR` is index-usable only as a `BitmapOr`, so the whole
+/// statement became `BitmapOr -> Bitmap Heap Scan`, which builds a bitmap and
+/// then **re-checks the full disjunction on every heap tuple it visits** — a
+/// `LIKE` match per row, 134 rows, to return 22:
+///
+/// ```text
+/// Bitmap Heap Scan  Recheck Cond: ((… value_reference = '…') OR (… ~~ '…/\_history/%'))
+///                   Filter: ((value_reference = '…') OR (value_reference ~~ '…'))
+///                   Heap Blocks: exact=135
+///   BitmapOr
+///     Bitmap Index Scan on idx_search_reference_pattern   rows=134
+///     Bitmap Index Scan on idx_search_reference_pattern   rows=1
+/// ```
+///
+/// With one equality it is a plain `Index Scan`, no bitmap, no re-check. The
+/// replica reproduces the run's per-call cost for this shape to within 4%
+/// (1.50 ms vs 1.447 ms); it does **not** reproduce the three-value variant
+/// (0.40 ms vs 3.190 ms), so the transferable quantity is the ratio between the
+/// two arms on identical data, not the absolute number. The ratio is CPU-side,
+/// and the benchmark host is 4 CPUs at ~43x concurrency.
+///
+/// Applying the ratio to the measured statement: 159.2 s -> ~51 s, about
+/// **12% of the search suite's Postgres time**. That is a prediction, not a
+/// result.
+///
+/// ## The generic-plan trap, which is real and is *not* what this run hit
+///
+/// A prefix `LIKE` against a bind parameter seeks a `text_pattern_ops` index
+/// only under a **custom** plan. Under a generic plan Postgres derives no bounds
+/// from `$n`, and because an `OR` needs every arm indexable, it loses the
+/// *equality* arm too. Measured, same replica, same statement:
+///
+/// ```text
+/// force_custom_plan    BitmapOr, 149 buffers                         2.89 ms
+/// force_generic_plan   Bitmap Index Scan on (tenant, type, param)
+///                      only, Filter removes 446,688 rows/worker,
+///                      29,862 buffers                              193.58 ms   67x
+/// ```
+///
+/// This backend does not hit that today: the search query builder emits
+/// `format!`-built SQL through `client.query(&str, …)`, which re-prepares and
+/// drops the statement every call, so every execution is a custom plan. The run
+/// confirms it — 135,454 scans reading 1 tuple *total* is a working seek that
+/// finds nothing, whereas a generic-plan fall-off would have read billions.
+///
+/// It is a landmine rather than a live defect, and the direction of travel walks
+/// into it: `postgres/cached.rs` exists to route fixed SQL through
+/// `prepare_cached`, and documents its own second rule as "only where a generic
+/// plan is the plan anyway". A single equality satisfies that rule — measured,
+/// the generic plan keeps the full four-column `Index Cond` — and the
+/// disjunction never could.
+///
+/// ## Three readers that a stored version silently broke
+///
+/// This is not only a performance change. Every other consumer of
+/// `value_reference` already assumed the base form and got the wrong answer for
+/// a versioned one:
+///
+/// - `_revinclude` (`search_impl.rs`) builds `si.value_reference IN ($3, $4, …)`
+///   from `format!("{}/{}", type, id)`. A stored `Patient/123/_history/4` never
+///   matched, so a versioned reference was invisible to `_revinclude`.
+/// - `ChainQueryBuilder` links on `si.value_reference IN (SELECT '{type}/' ||
+///   resource_id …)` and extracts the target with `SUBSTRING(value_reference
+///   FROM POSITION('/' IN value_reference) + 1)`, which yields
+///   `123/_history/4` — matching no resource id.
+/// - `build_reference_identifier_condition` uses the same `SUBSTRING`, with the
+///   same result.
+///
+/// The SQLite backend reaches the same place from the other side: its
+/// `build_identifier_condition` carries a `CASE WHEN INSTR(value_reference,
+/// '/_history/') …` to strip the suffix at *read* time, and there is a test
+/// pinning that `:identifier` must match a stored
+/// `Patient/pat-shared/_history/1`. Postgres had no such device anywhere.
+///
+/// ## The data migration, and what happens to a database that skips it
+///
+/// One `UPDATE` over the rows that carry a suffix. It is a sequential scan of
+/// `search_index` — `strpos(value_reference, '/_history/') > 0` has no usable
+/// index bounds and never could, since the pattern is not anchored — so it is
+/// one full read of the heap plus a row rewrite for each match. Measured on the
+/// replica: **1.06 s over 3.4M rows / 561 MB**, ~530 MB/s, which puts the
+/// benchmark's 3,682 MB heap at roughly 7 s. That is a one-off cost inside
+/// `initialize_schema`'s advisory lock, an order of magnitude below the
+/// `CREATE INDEX`es v15/v18/v24/v26 already take there, and on the benchmark it
+/// is free: migrations run against an empty database before the import.
+///
+/// It is deliberately *not* limited to the denormalized layout — this is a
+/// column value, not a row shape, and `build_composite_condition_legacy` reads
+/// the same column.
+///
+/// The unmigrated combinations are all safe, in both directions:
+///
+/// - **v31 data, v32 code** cannot happen. `initialize_schema` runs the chain
+///   under an advisory lock before the instance serves traffic, and a failure
+///   aborts startup rather than continuing.
+/// - **v32 data, v31 code** (a binary rollback) is safe because the pre-v32
+///   predicate is a strict superset of the post-v32 one:
+///   `= OR LIKE '<base>/\_history/%'` still matches a row holding `<base>`.
+/// - A v32 database written by a *later* rollback to a pre-v32 writer would
+///   store suffixes again, and a v32 reader would stop matching those rows.
+///   That is the one lossy direction and it requires downgrading the binary,
+///   writing, then upgrading; `set_schema_version` leaves the recorded version
+///   at 32, so the `UPDATE` does not run again. It is called out here rather
+///   than guarded against, because guarding it means keeping the `LIKE` arm,
+///   which is the thing being removed.
+///
+/// ## The index is deliberately left alone
+///
+/// The obvious follow-through is to give `idx_search_reference_pattern` the fast
+/// path's sort key, as v24 did for the token indexes: with the `OR` gone the
+/// value predicate is a clean equality, so `(…, value_reference, last_updated
+/// DESC, resource_id ASC)` would make `DISTINCT` a streaming `Unique`, stop the
+/// scan at the `LIMIT`, and read 22 index tuples with **zero** heap fetches
+/// instead of 134 index tuples plus 134 heap blocks.
+///
+/// It was measured and rejected. The reference index is small precisely because
+/// it has no per-row column: `(tenant_id, resource_type, param_name,
+/// value_reference)` repeats a value once per resource that references it, and
+/// btree deduplication collapses each group to one key plus a posting list.
+/// Adding `last_updated`/`resource_id` makes every key unique and turns
+/// deduplication off. Measured on the replica, per-slice, same rows:
+///
+/// ```text
+/// slice                      rows       dup    seek-only   with sort key
+/// Observation.subject   1,340,000   134:1     7.9 B/row      160.4 B/row    20.3x
+/// Observation.performer   500,000  1000:1     8.4 B/row      160.4 B/row    19.2x
+/// Provenance.target       600,000     1:1   105.4 B/row      160.2 B/row     1.5x
+/// whole reference set   2,440,200               76 MB           382 MB       5.0x
+/// ```
+///
+/// The live index is 550 MB. The bound that follows from the two extreme
+/// bytes-per-row figures is 5.5M-18.2M reference rows, so the sort-key shape
+/// would be **880 MB to 2,912 MB** — between +330 MB and +2.4 GB on an 11 GB
+/// host whose whole index set is 12 GB and where v30 has just spent a migration
+/// recovering 2.2 GB. The upper half of that range gives back more than v30
+/// gained, and nothing available here narrows it: the row census the run
+/// captures would, and this seat did not have one.
+///
+/// `INCLUDE (resource_id, last_updated)` is the same trade, not a cheaper one —
+/// 366 MB vs 382 MB on the replica, because included columns disable
+/// deduplication as surely as key columns do, and it gives up the ordering as
+/// well. Neither is done here.
+async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    // `left(v, strpos(v, '/_history/') - 1)` rather than a `LIKE`/`substring`
+    // pair: no escape character to get wrong (LIKE's default escape is the
+    // backslash, so the pattern would have to be `'%/\_history/%'` for the
+    // underscore to stay literal), and the predicate and the assignment then
+    // share one function call.
+    client
+        .execute(
+            "UPDATE search_index \
+                SET value_reference = left(value_reference, strpos(value_reference, '/_history/') - 1) \
+              WHERE value_reference IS NOT NULL \
+                AND strpos(value_reference, '/_history/') > 0",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v31->v32 failed: {}", e)))?;
+
+    Ok(())
+}
+
 
 /// v22 -> v23: drop `fk_search_resource`.
 ///
