@@ -614,6 +614,36 @@ impl PostgresSearchIndexWriter {
     }
 
     /// Flattens the values extracted from one `contained[]` entry into rows.
+    ///
+    /// [`Self::drop_resources_backed`] applies here too, and did not before.
+    /// `build_contained` (`search/query_builder.rs`) skips every parameter whose
+    /// name `starts_with('_')` outright, so a contained `_id` or `_lastUpdated`
+    /// row has no reader at all — not "answered from `resources`" as on the
+    /// plain path, but genuinely unreachable.
+    ///
+    /// The `_id` row is worse than merely unread: it is a byte-for-byte
+    /// restatement of a column the same row already carries. On the benchmark's
+    /// `ExplanationOfBenefit` seed, whose two `contained[]` entries are a
+    /// `ServiceRequest` with `id: "referral"` and a `Coverage` with
+    /// `id: "coverage"`:
+    ///
+    /// ```text
+    /// param_name | value_token_code | contained_type  | contained_local_id
+    /// _id        | referral         | ServiceRequest  | referral
+    /// _id        | coverage         | Coverage        | coverage
+    /// ```
+    ///
+    /// Each costs a heap tuple plus three index entries — `idx_search_resource`,
+    /// and both token indexes, whose predicate is `value_token_code IS NOT NULL`
+    /// and so admits them despite their NULL `last_updated`. Two of the 132 rows
+    /// the nine crud seed resources produce, i.e. **1.5% of the crud suite's
+    /// `search_index` write**, and they are the only `_`-prefixed rows the
+    /// corpus produces.
+    ///
+    /// Write-side only and one-directional, exactly as
+    /// [`PARAMS_ANSWERED_FROM_RESOURCES`] is: a database written by an older
+    /// build still holds the rows, nothing reads them, and both shapes answer
+    /// identically. No schema version, no migration.
     pub(crate) fn build_contained_rows(
         container: (&str, &str),
         contained: (&str, &str),
@@ -621,6 +651,7 @@ impl PostgresSearchIndexWriter {
     ) -> Vec<IndexRow> {
         values
             .iter()
+            .filter(|value| !answered_from_resources(&value.param_name))
             .filter_map(|value| IndexRow::from_contained(value, container, contained))
             .collect()
     }
@@ -1277,6 +1308,35 @@ mod tests {
         assert_eq!(plain.value_string, contained.value_string);
         assert_eq!(plain.value_string_folded, contained.value_string_folded);
         assert_eq!(plain.param_name, contained.param_name);
+    }
+
+    /// `build_contained` (`query_builder.rs`) skips every `_`-prefixed
+    /// parameter, so a contained `_id` row is not "answered elsewhere" — it is
+    /// unreachable. The plain path has dropped these since
+    /// `PARAMS_ANSWERED_FROM_RESOURCES`; the contained path did not, and wrote
+    /// two per `ExplanationOfBenefit` whose value duplicated
+    /// `contained_local_id` exactly.
+    #[test]
+    fn contained_rows_drop_the_parameters_answered_from_resources() {
+        let mut id_value = extracted(IndexValue::Token {
+            system: None,
+            code: "referral".to_string(),
+            display: None,
+            identifier_type_system: None,
+            identifier_type_code: None,
+        });
+        id_value.param_name = "_id".to_string();
+        let mut kept = extracted(IndexValue::String("Smith".to_string()));
+        kept.param_name = "family".to_string();
+
+        let rows = PostgresSearchIndexWriter::build_contained_rows(
+            ("ExplanationOfBenefit", "eob1"),
+            ("ServiceRequest", "referral"),
+            &[id_value, kept],
+        );
+
+        let names: Vec<&str> = rows.iter().map(|r| r.param_name.as_str()).collect();
+        assert_eq!(names, vec!["family"], "contained rows: {names:?}");
     }
 
     /// The re-index `DELETE` is folded into the insert, so the two texts have to
