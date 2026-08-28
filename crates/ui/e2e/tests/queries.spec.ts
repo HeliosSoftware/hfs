@@ -1,5 +1,9 @@
 import { test, expect } from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
+import {
+  CANONICAL_BUTTON_GEOMETRY,
+  readButtonGeometries,
+} from "../pages/button-geometry";
 
 function catalogHtml(
   params: Array<{ code: string; type: string; targets?: string[] }>,
@@ -2242,6 +2246,11 @@ test.describe("query builder", () => {
     await queries.builder.nameInput.fill(name);
     await queries.builder.saveButton.click();
     await expect(queries.savedList).toContainText(name);
+    const savedActionMetrics = await readButtonGeometries(queries.savedList.locator(".btn"));
+    expect(savedActionMetrics.length).toBeGreaterThan(0);
+    for (const geometry of savedActionMetrics) {
+      expect(geometry).toEqual(CANONICAL_BUTTON_GEOMETRY);
+    }
 
     await page.reload({ waitUntil: "networkidle" });
     await queries.builder.recentToggle.click();

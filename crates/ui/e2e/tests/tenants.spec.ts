@@ -1,4 +1,8 @@
 import { test, expect } from "../pages/fixtures";
+import {
+  CANONICAL_BUTTON_GEOMETRY,
+  readButtonGeometries,
+} from "../pages/button-geometry";
 
 // Tenant maintenance (/ui/tenants): the htmx add-tenant slide-over, the live
 // search filter, and per-row delete (hx-confirm). Skips itself if this backend
@@ -71,6 +75,11 @@ test.describe("tenants", () => {
 
   test("typing a display name mirrors a slug into the tenant id", async ({ tenants }) => {
     await tenants.addToggle.click();
+    const actionMetrics = await readButtonGeometries(
+      tenants.addForm.locator(".addbox__actions .btn"),
+    );
+    expect(actionMetrics).toHaveLength(2);
+    for (const geometry of actionMetrics) expect(geometry).toEqual(CANONICAL_BUTTON_GEOMETRY);
     await tenants.addForm.locator("input[name=display_name]").fill("Acme Health");
     await expect(tenants.addForm.locator("input[name=id]")).toHaveValue("acme-health");
     await tenants.addForm.locator("input[name=display_name]").fill("  Ünïcode & Co.  ");

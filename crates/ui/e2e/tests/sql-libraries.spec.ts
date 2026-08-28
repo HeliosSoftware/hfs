@@ -40,6 +40,12 @@ test("a stored SQLQuery lists, decodes its SQL, and previews rows", async ({ pag
   // The SQL pane holds the decoded query, not base64.
   await expect(page.locator("textarea[name='sql']")).toContainText("SELECT COUNT(*)");
 
+  const createNew = page.locator("a[href$='?lib=new']");
+  await expect(createNew).toHaveClass(/\bbtn--primary\b/);
+  await expect(createNew).not.toHaveClass(/\bbtn--accent\b/);
+  await expect(createNew).toHaveCSS("height", "30px");
+  await expect(createNew).toHaveCSS("padding-left", "12px");
+
   await page.locator("a[href*='run=1']").click();
   await expect(page.locator(".data-table")).toBeVisible();
   await expect(page.locator(".data-table th", { hasText: "n" }).first()).toBeVisible();

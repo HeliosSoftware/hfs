@@ -1,4 +1,8 @@
 import { test, expect } from "../../pages/fixtures";
+import {
+  CANONICAL_BUTTON_GEOMETRY,
+  readButtonGeometries,
+} from "../../pages/button-geometry";
 
 // This whole file runs in the `nojs` project (javaScriptEnabled: false), which
 // exercises the README's core promise: the UI works with JavaScript off. htmx,
@@ -91,4 +95,25 @@ test("a hard navigation returns the full page, not an htmx fragment", async ({ p
   await page.goto("/ui/status");
   await expect(chrome.sidebar).toBeVisible();
   await expect(page.locator("html")).toHaveAttribute("lang", /.+/);
+});
+
+test("native Addbox dialogs keep canonical actions and the open-summary backdrop", async ({ page }) => {
+  await page.goto("/ui/bulk-import");
+  const details = page.locator("details.addbox--modal");
+  const summary = details.locator("summary.btn");
+  await expect(summary).toHaveCSS("height", "30px");
+  await expect(summary).toHaveCSS("padding-left", "12px");
+  await expect(summary).toHaveCSS("border-radius", "9px");
+
+  await summary.click();
+  await expect(details).toHaveAttribute("open", "");
+  const backdrop = await summary.boundingBox();
+  const viewport = page.viewportSize()!;
+  expect(backdrop!.height).toBeGreaterThan(viewport.height * 0.9);
+  await expect(summary).toHaveCSS("padding-left", "0px");
+  await expect(summary).toHaveCSS("border-radius", "0px");
+
+  const actionMetrics = await readButtonGeometries(details.locator(".addbox__actions .btn"));
+  expect(actionMetrics).toHaveLength(2);
+  for (const geometry of actionMetrics) expect(geometry).toEqual(CANONICAL_BUTTON_GEOMETRY);
 });
