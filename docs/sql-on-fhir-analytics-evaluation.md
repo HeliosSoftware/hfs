@@ -167,6 +167,29 @@ v1 direction) or an **external platform**, reached by handing over result data (
 later stage is independently valuable and independently shippable; and the surface never forks — the notebook a
 user learns in Stage 1 is the same surface they build a dashboard on in Stage 3.
 
+**Proof of concept — built and running [demonstrated].** Each in-repo option in this recommendation was built as
+a runnable POC (draft PRs off `main`), so its *feasibility* is shown, not asserted:
+
+- **Native query notebook** ([#768](https://github.com/HeliosSoftware/hfs/pull/768), `poc/650-native-notebook`)
+  — the Stage-1 + Stage-2-slice page at `/ui/sql/notebook`: run a ViewDefinition, get a table + an inline-SVG
+  group-by chart. `cargo check -p helios-ui` clean; no new deps, no CDN. **[demonstrated]**
+- **DuckDB-WASM over Arrow** ([#769](https://github.com/HeliosSoftware/hfs/pull/769), `poc/650-duckdb-wasm`) —
+  the Stage-2 client-side engine ingesting a real `sof-cli --format arrow` stream and grouping in the browser;
+  **browser-verified** (0 console errors, 0 off-origin). Building it surfaced the real no-CDN vendoring costs (an
+  import map for the bare `apache-arrow`/`tslib`/`flatbuffers` specifiers, `.mjs` MIME, a worker-URL fix). **[demonstrated]**
+- **pysof + example notebook** ([#770](https://github.com/HeliosSoftware/hfs/pull/770), `poc/650-pysof-notebook`)
+  — the do-nothing baseline; the offline path runs against the real pysof 0.2.1 build. **[demonstrated]**
+- **JupyterLite** ([#771](https://github.com/HeliosSoftware/hfs/pull/771), `poc/650-jupyterlite`) — the opt-in
+  escape hatch; builds with the sample notebook baked in; the 463 MB vendored-offline vs 70 MB CDN split
+  confirmed. **[demonstrated]**
+
+What the POCs do **not** settle stays **[proposal]**: the product decision itself; Stage 2 done properly
+(server-side aggregation — the DuckDB POC deliberately does the naive browser-side pivot, which is only correct
+under the row cap, §2/§5); all of Stage 3 (dashboards + semantic layer + row-level access); the open questions
+(what a "cell" is vs the ViewDefinition/SQLQuery/SQLView model, notebook/dashboard persistence, per-user
+identity, audit); and Stage 4. The POCs prove each path *works* — the direction, and everything from a correct
+Stage 2 through Stage 3, remains to be built.
+
 ## 6. Why not *buy* a notebook — measured
 
 The "buy a Python notebook and embed it" path is the one #650 names first, so it was tested hardest. Two leading
