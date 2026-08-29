@@ -544,6 +544,7 @@ async fn capability_statement_raw_json_falls_back_with_http_200_over_budget() {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     );
 
     let response = app
