@@ -430,6 +430,33 @@ impl OutcomeView {
     }
 }
 
+/// Build the FHIR query used by the three terminology browsers.
+///
+/// The UI's public query language stays stable (`name` and `title`), but its
+/// loopback FHIR request uses `:contains` so the filter rail keeps the
+/// substring behavior operators already expect.
+fn build_upstream_browser_query<const N: usize>(
+    filters: [(&str, &Option<String>); N],
+    count: u32,
+    offset: u32,
+) -> Vec<(String, String)> {
+    let mut query = Vec::new();
+    for (field, value) in filters {
+        let Some(value) = value.as_ref().filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let upstream_field = match field {
+            "name" => "name:contains",
+            "title" => "title:contains",
+            _ => field,
+        };
+        query.push((upstream_field.to_owned(), value.clone()));
+    }
+    query.push(("_count".to_owned(), count.to_string()));
+    query.push(("_offset".to_owned(), offset.to_string()));
+    query
+}
+
 /// Filters accepted by the CS browser page and its rows fragment.
 ///
 /// `_count` and `_offset` are parsed from strings so a malformed query
@@ -468,6 +495,23 @@ impl CsBrowserFilters {
     /// rejects the request when this is true (design doc §7.2 states matrix).
     pub fn count_exceeds_cap(&self) -> bool {
         self.count > Self::MAX_COUNT
+    }
+
+    /// Query sent from the UI process to HTS. The public browser URL keeps
+    /// the bare `name` / `title` keys, while the FHIR request asks HTS for
+    /// substring matching explicitly.
+    fn upstream_query(&self) -> Vec<(String, String)> {
+        build_upstream_browser_query(
+            [
+                ("url", &self.url),
+                ("version", &self.version),
+                ("name", &self.name),
+                ("title", &self.title),
+                ("status", &self.status),
+            ],
+            self.effective_count(),
+            self.offset,
+        )
     }
 
     /// URL for the Load-more button that preserves every active filter
@@ -843,22 +887,7 @@ impl UpstreamClient {
         &self,
         filters: &CsBrowserFilters,
     ) -> Result<CsBrowserPage, UpstreamError> {
-        let mut query: Vec<(String, String)> = Vec::new();
-        for (field, value) in [
-            ("url", &filters.url),
-            ("version", &filters.version),
-            ("name", &filters.name),
-            ("title", &filters.title),
-            ("status", &filters.status),
-        ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    query.push((field.to_owned(), v.clone()));
-                }
-            }
-        }
-        query.push(("_count".to_owned(), filters.effective_count().to_string()));
-        query.push(("_offset".to_owned(), filters.offset.to_string()));
+        let query = filters.upstream_query();
 
         let url = format!("{}/CodeSystem", self.base_url);
         let response = self
@@ -1579,6 +1608,22 @@ impl VsBrowserFilters {
         self.count > Self::MAX_COUNT
     }
 
+    /// Query sent from the UI process to HTS. See
+    /// [`CsBrowserFilters::upstream_query`].
+    fn upstream_query(&self) -> Vec<(String, String)> {
+        build_upstream_browser_query(
+            [
+                ("url", &self.url),
+                ("version", &self.version),
+                ("name", &self.name),
+                ("title", &self.title),
+                ("status", &self.status),
+            ],
+            self.effective_count(),
+            self.offset,
+        )
+    }
+
     /// See [`CsBrowserFilters::load_more_url`].
     pub fn load_more_url(&self, next_offset: &u32) -> String {
         let mut ser = form_urlencoded::Serializer::new(String::new());
@@ -1936,22 +1981,7 @@ impl UpstreamClient {
         &self,
         filters: &VsBrowserFilters,
     ) -> Result<VsBrowserPage, UpstreamError> {
-        let mut query: Vec<(String, String)> = Vec::new();
-        for (field, value) in [
-            ("url", &filters.url),
-            ("version", &filters.version),
-            ("name", &filters.name),
-            ("title", &filters.title),
-            ("status", &filters.status),
-        ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    query.push((field.to_owned(), v.clone()));
-                }
-            }
-        }
-        query.push(("_count".to_owned(), filters.effective_count().to_string()));
-        query.push(("_offset".to_owned(), filters.offset.to_string()));
+        let query = filters.upstream_query();
 
         let url = format!("{}/ValueSet", self.base_url);
         let response = self
@@ -2518,6 +2548,23 @@ impl CmBrowserFilters {
         self.count > Self::MAX_COUNT
     }
 
+    /// Query sent from the UI process to HTS. See
+    /// [`CsBrowserFilters::upstream_query`].
+    fn upstream_query(&self) -> Vec<(String, String)> {
+        build_upstream_browser_query(
+            [
+                ("url", &self.url),
+                ("name", &self.name),
+                ("title", &self.title),
+                ("source-uri", &self.source),
+                ("target-uri", &self.target),
+                ("status", &self.status),
+            ],
+            self.effective_count(),
+            self.offset,
+        )
+    }
+
     /// See [`CsBrowserFilters::load_more_url`]. CM omits `version` from
     /// the filter strip (design doc §7.5: HTS ignores CM version on
     /// `$translate`) and adds `source-uri` / `target-uri`.
@@ -2856,23 +2903,7 @@ impl UpstreamClient {
         &self,
         filters: &CmBrowserFilters,
     ) -> Result<CmBrowserPage, UpstreamError> {
-        let mut query: Vec<(String, String)> = Vec::new();
-        for (field, value) in [
-            ("url", &filters.url),
-            ("name", &filters.name),
-            ("title", &filters.title),
-            ("source-uri", &filters.source),
-            ("target-uri", &filters.target),
-            ("status", &filters.status),
-        ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    query.push((field.to_owned(), v.clone()));
-                }
-            }
-        }
-        query.push(("_count".to_owned(), filters.effective_count().to_string()));
-        query.push(("_offset".to_owned(), filters.offset.to_string()));
+        let query = filters.upstream_query();
 
         let url = format!("{}/ConceptMap", self.base_url);
         let response = self
@@ -4467,6 +4498,82 @@ mod tests {
         };
         assert!(!f.count_exceeds_cap());
         assert_eq!(f.effective_count(), CsBrowserFilters::DEFAULT_COUNT);
+    }
+
+    #[test]
+    fn browser_queries_add_fhir_contains_only_on_the_upstream_hop() {
+        let cs = CsBrowserFilters {
+            url: Some("http://example.org/cs".into()),
+            version: Some("1.0.0".into()),
+            name: Some("ExampleCodeSystem".into()),
+            title: Some("Anatomy Code".into()),
+            status: Some("active".into()),
+            count: 50,
+            offset: 25,
+        };
+        assert_eq!(
+            cs.upstream_query(),
+            vec![
+                ("url".into(), "http://example.org/cs".into()),
+                ("version".into(), "1.0.0".into()),
+                ("name:contains".into(), "ExampleCodeSystem".into()),
+                ("title:contains".into(), "Anatomy Code".into()),
+                ("status".into(), "active".into()),
+                ("_count".into(), "50".into()),
+                ("_offset".into(), "25".into()),
+            ]
+        );
+        let cs_load_more = cs.load_more_url(&75);
+        assert!(cs_load_more.contains("name=ExampleCodeSystem"));
+        assert!(cs_load_more.contains("title=Anatomy+Code"));
+        assert!(!cs_load_more.contains("%3Acontains"));
+
+        let vs = VsBrowserFilters {
+            name: Some("ExampleLimbsVS".into()),
+            title: Some("Limbs Value".into()),
+            ..VsBrowserFilters::default()
+        };
+        assert_eq!(
+            vs.upstream_query(),
+            vec![
+                ("name:contains".into(), "ExampleLimbsVS".into()),
+                ("title:contains".into(), "Limbs Value".into()),
+                ("_count".into(), "25".into()),
+                ("_offset".into(), "0".into()),
+            ]
+        );
+        let vs_load_more = vs.load_more_url(&25);
+        assert!(vs_load_more.contains("name=ExampleLimbsVS"));
+        assert!(vs_load_more.contains("title=Limbs+Value"));
+        assert!(!vs_load_more.contains("%3Acontains"));
+
+        let cm = CmBrowserFilters {
+            url: Some("http://example.org/cm/example".into()),
+            name: Some("ExampleCM".into()),
+            title: Some("Source-to-Target".into()),
+            source: Some("http://example.org/cs/source".into()),
+            target: Some("http://example.org/cs/target".into()),
+            status: Some("active".into()),
+            count: 100,
+            offset: 50,
+        };
+        assert_eq!(
+            cm.upstream_query(),
+            vec![
+                ("url".into(), "http://example.org/cm/example".into()),
+                ("name:contains".into(), "ExampleCM".into()),
+                ("title:contains".into(), "Source-to-Target".into()),
+                ("source-uri".into(), "http://example.org/cs/source".into()),
+                ("target-uri".into(), "http://example.org/cs/target".into()),
+                ("status".into(), "active".into()),
+                ("_count".into(), "100".into()),
+                ("_offset".into(), "50".into()),
+            ]
+        );
+        let cm_load_more = cm.load_more_url(&75);
+        assert!(cm_load_more.contains("name=ExampleCM"));
+        assert!(cm_load_more.contains("title=Source-to-Target"));
+        assert!(!cm_load_more.contains("%3Acontains"));
     }
 
     #[test]

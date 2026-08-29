@@ -43,6 +43,32 @@ test.describe("HTS CodeSystem browser (§7.2)", () => {
     ).toBeVisible();
   });
 
+  test("Title substring keeps the browser URL bare and selects ExampleCodeSystem", async ({
+    page,
+  }) => {
+    await page.goto("/ui/hts/code-systems?title=Anatomy%20Code");
+
+    const browserUrl = new URL(page.url());
+    expect(browserUrl.searchParams.get("title")).toBe("Anatomy Code");
+    expect(browserUrl.searchParams.has("title:contains")).toBe(false);
+    await expect(page.locator("#filter-title")).toHaveValue("Anatomy Code");
+    await expect(
+      page.getByText("No CodeSystems match these filters."),
+    ).toHaveCount(0);
+
+    const rows = page.locator("table tbody tr");
+    await expect(rows).toHaveCount(1);
+    await expect(
+      rows.getByRole("link", { name: "ExampleCodeSystem", exact: true }),
+    ).toBeVisible();
+    await expect(
+      rows.getByRole("cell", {
+        name: "Example Anatomy Code System",
+        exact: true,
+      }),
+    ).toBeVisible();
+  });
+
   test("load-more appends the next page beforeend without replacing rows", async ({ page }) => {
     // The seed loader injects 34 CodeSystems total (ex-cs-1 + ex-cs-2..
     // ex-cs-31 + ex-cs-source + ex-cs-target + ex-cs-limbs). The default
