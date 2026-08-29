@@ -53,13 +53,13 @@ for (const theme of THEMES) {
     await page.goto("/ui/bulk-import", { waitUntil: "networkidle" });
     await page.locator("summary.btn", { hasText: "New Submission" }).click();
     expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+    await page.locator(".disclosure__summary", { hasText: "Advanced options" }).click();
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+    await page.keyboard.press("Escape");
 
     const detail = await seedBulkImportDetail(request);
     await page.goto(detail, { waitUntil: "networkidle" });
     await page.locator("summary.btn", { hasText: "Edit" }).click();
-    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
-    await page.keyboard.press("Escape");
-    await page.locator("summary.btn", { hasText: "Add Manifest" }).click();
     expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
   });
 

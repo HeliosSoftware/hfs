@@ -1143,14 +1143,6 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
             get(bulk_import::empty_manifest),
         )
         .route("/ui/bulk-import/keys", get(bulk_import::keys))
-        .route(
-            "/ui/bulk-import/{id}/manifests/{mid}/replace",
-            axum::routing::post(bulk_import::replace_manifest),
-        )
-        .route(
-            "/ui/bulk-import/{id}/manifests/{mid}/abort",
-            axum::routing::post(bulk_import::abort_manifest),
-        )
         .route("/ui/bulk-import/{id}", get(bulk_import::detail))
         .route(
             "/ui/bulk-import/{id}/status",
@@ -1167,26 +1159,6 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         .route(
             "/ui/bulk-import/{id}/abort",
             axum::routing::post(bulk_import::abort),
-        )
-        .route(
-            "/ui/bulk-import/{id}/complete",
-            axum::routing::post(bulk_import::complete),
-        )
-        .route(
-            "/ui/bulk-import/{id}/submit-all",
-            axum::routing::post(bulk_import::submit_all),
-        )
-        .route(
-            "/ui/bulk-import/{id}/manifests",
-            axum::routing::post(bulk_import::add_manifest),
-        )
-        .route(
-            "/ui/bulk-import/{id}/manifests/{mid}/delete",
-            axum::routing::post(bulk_import::delete_manifest),
-        )
-        .route(
-            "/ui/bulk-import/{id}/manifests/{mid}/submit",
-            axum::routing::post(bulk_import::submit_manifest),
         )
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
