@@ -1,18 +1,18 @@
 //! Subscriptions operator page (#580) — read-only, per Brett's design.
 //!
-//! One screen over the engine's live inventory: four status cards (failing /
-//! idle / active / notifications since start) and a table of every
-//! subscription with its channel, status chip, event counter, and consecutive
-//! failure streak. The data arrives through the process-global
+//! One screen over the engine's live inventory: four status cards (active /
+//! failing / idle / delivered in 24 h) and a table of every subscription with
+//! its channel, status, 24-hour delivery count, event counter, and
+//! consecutive failure streak. The data arrives through the process-global
 //! [`helios_observability::subscriptions`] provider the server registers when
 //! the engine is enabled — the page renders an explained unavailable state
-//! when it is not, and the sidebar hides the entry entirely (the feature is
-//! only *advertised* when the engine runs).
+//! (naming `HFS_SUBSCRIPTIONS_ENABLED` and the `subscriptions` build feature)
+//! when it is not; the sidebar entry is always present (#767).
 //!
-//! Deliberately absent: per-window delivery counts and success rates. The
-//! engine does not persist delivery history yet, and this page shows real
-//! figures or none (#555's rule) — the 24-hour column of the design lands
-//! with the engine instrumentation, not before.
+//! The design's 24-hour sparkline needs a per-window time series the
+//! [`SubscriptionsSnapshot`](helios_observability::subscriptions::SubscriptionsSnapshot)
+//! does not carry; the column shows the real count until the engine grows
+//! that series (#555's rule: real figures or none).
 
 use askama::Template;
 use axum::{extract::RawQuery, extract::State, response::Response};

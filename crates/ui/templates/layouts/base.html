@@ -153,13 +153,12 @@
         <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
       </a>
       {% endif %}
-      <!-- Visible only when the subscriptions engine is advertised (#580). -->
-      {% if status.subscriptions_enabled() %}
+      <!-- Always present, like the other feature pages: with the engine off
+           the page explains how to enable it (#767). -->
       <a class="nav-item" href="/ui/subscriptions"{% if active_page == "subscriptions" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-subscriptions") }}">
         <span class="icon">{% include "icons/sync.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-subscriptions") }}</span>
       </a>
-      {% endif %}
     </nav>
 
     <!--
