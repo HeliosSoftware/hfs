@@ -1,0 +1,159 @@
+{#-
+  Home cards fragment (design doc §7.1).
+  Rendered once on hard navigation as part of `pages/home.html`, and
+  again on every 15 s htmx refresh via `GET /ui/hts/home/cards`. Same
+  markup either way — the outer `#hts-home-cards` region is swapped
+  wholesale, so a partial failure never blanks the healthy tiles.
+
+  Style: reuse the HFS `.stat-grid` / `.card.stat` primitives from
+  `crates/ui/assets/app.css` so the terminology home page reads with the
+  same visual grammar as the FHIR-server home. The fragment is selected in
+  tests by its `#hts-home-cards` id, not by a class — every class here has a
+  real rule in app.css. (The quick-links strip was removed on 2026-08-27;
+  `.hts-quick-strip` / `.hts-quick-links` went with it, and the degraded
+  banner moved to the shared `.notice.notice--warn` primitive.)
+
+  The Requests tile and its latency sub-line are fed by
+  `HomeCards::fetch()` scraping `/metrics` (Prometheus text). Both
+  fields are `Option`, so a fetch or parse failure falls back to an
+  em-dash without breaking the surrounding cards — the design's
+  fail-open invariant (§7 degraded contract).
+
+  The 15 s poll lives on THIS element, not on a wrapper around it, and
+  carries no `hx-target`: htmx defaults the target to the element
+  itself, and `hx-swap="outerHTML"` therefore replaces the element
+  *including this refreshed `hx-get`*. Because `refresh_href()` embeds
+  the current `?window=&series=`, the chart selection is
+  self-perpetuating. The previous shape — an outer, never-swapped
+  wrapper carrying `hx-target="#hts-home-cards"` — froze its URL at
+  first paint, so any selection would have been reverted by the next
+  tick. Same pattern as `#hts-batch-progress`.
+-#}
+<div id="hts-home-cards"
+          hx-get="{{ cards.refresh_href() }}"
+     hx-trigger="every 15s"
+     hx-swap="outerHTML"
+     aria-live="polite"
+     aria-busy="false">
+
+  {% if let Some(reason) = cards.degraded_reason() %}
+  <aside class="notice notice--warn" role="alert" aria-live="assertive">
+    <p class="field__label">{{ chrome.i18n.t("hts-degraded-title") }}</p>
+    <p>
+      {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    </p>
+    <p>{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  </aside>
+  {% endif %}
+
+  {#--
+    One row of four tiles, per the approved "Ops console" layout: Status,
+    Uptime, Loaded code systems and Requests, each with a `.stat__sub`.
+
+    Until 2026-08-28 this was **eight** tiles across three rows: Backend and
+    FHIR version stood alone beside Status, Bundled data beside Loaded
+    systems, and Avg latency beside Requests. The mockup folds each of those
+    four into the sub-line of the tile it qualifies, which is what
+    `.stat__sub` is for. **No datum was dropped** — every value still renders,
+    one line lower.
+
+    `.stat-grid` is already `repeat(4, 1fr)` (app.css:666), so four tiles need
+    no modifier; the old `.stat-grid--2` rows are gone with the split. HFS's
+    own home uses the same `.stat__label` / `.stat__value` / `.stat__sub`
+    primitives, so tile *count* is not an HFS pattern — tile *structure* is,
+    and it is preserved.
+
+    Every sub-line degrades independently: a failed `/health` or `/metrics`
+    leaves its tile's value as an em-dash and omits the sub-line rather than
+    printing half a sentence (§7 fail-open contract).
+  --#}
+  <section class="stat-grid" aria-labelledby="hts-home-row-status">
+    <h2 id="hts-home-row-status" class="visually-hidden">{{ chrome.i18n.t("hts-home-row-status") }}</h2>
+
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-home-tile-status") }}</span>
+      {% match cards.health %}
+        {% when Ok(h) %}
+          <span class="stat__value stat__value--ok">
+            {{ chrome.i18n.t(format!("hts-home-status-{}", h.status).as_str()) }}
+          </span>
+          {#- Backend and FHIR version, folded in from their own tiles. -#}
+          <span class="stat__sub">{{ chrome.i18n.t_arg2("hts-home-tile-status-sub", "backend", h.backend.to_string(), "version", cards.fhir_version_label(chrome.fhir_version)) }}</span>
+        {% when Err(_) %}
+          <span class="stat__value">&mdash;</span>
+      {% endmatch %}
+    </article>
+
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-home-tile-uptime") }}</span>
+      {% match cards.health %}
+        {% when Ok(h) %}
+          <span class="stat__value">{{ h.uptime_pretty() }}</span>
+          {#- `started_at_utc_hhmm` is `now − uptime`, so it is by construction
+              the start of the current run: a restart moves it. `None` only on
+              a clock anomaly, and then the version renders alone rather than
+              a wrong time. -#}
+          {%- match h.started_at_utc_hhmm() -%}
+            {%- when Some(t) -%}
+              <span class="stat__sub">{{ chrome.i18n.t_arg2("hts-home-tile-uptime-sub", "version", chrome.version.to_string(), "since", t.to_string()) }}</span>
+            {%- when None -%}
+              <span class="stat__sub">{{ chrome.i18n.t_arg("hts-home-tile-uptime-sub-noclock", "version", chrome.version.to_string()) }}</span>
+          {%- endmatch -%}
+        {% when Err(_) %}
+          <span class="stat__value">&mdash;</span>
+      {% endmatch %}
+    </article>
+
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-home-tile-loaded-systems") }}</span>
+      <span class="stat__value">
+        {%- match cards.loaded_system_count() -%}
+          {%- when Some(n) -%}{{ n }}
+          {%- when None -%}&mdash;
+        {%- endmatch -%}
+      </span>
+      {#- Bundled-data footprint, folded in from its own tile. `None` when no
+          HTS_BOOTSTRAP_DIR was configured — then the provenance hint stands
+          alone rather than claiming a misleading zero. -#}
+      {%- match cards.bundled_data_mib() -%}
+        {%- when Some(mib) -%}
+          <span class="stat__sub">{{ chrome.i18n.t_arg("hts-home-tile-loaded-systems-sub", "mib", mib.to_string()) }}</span>
+        {%- when None -%}
+          <span class="stat__sub">{{ chrome.i18n.t("hts-home-tile-loaded-systems-hint") }}</span>
+      {%- endmatch -%}
+    </article>
+
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-home-tile-requests") }}</span>
+      <span class="stat__value">
+        {%- match cards.requests_total -%}
+          {%- when Some(n) -%}{{ n }}
+          {%- when None -%}&mdash;
+        {%- endmatch -%}
+      </span>
+      {#- Average latency, folded in from its own tile. -#}
+      {%- match cards.avg_latency_ms -%}
+        {%- when Some(ms) -%}
+          <span class="stat__sub">{{ chrome.i18n.t_arg("hts-home-tile-requests-sub", "ms", format!("{:.1}", ms)) }}</span>
+        {%- when None -%}
+          <span class="stat__sub">{{ chrome.i18n.t("hts-home-tile-metrics-hint") }}</span>
+      {%- endmatch -%}
+    </article>
+  </section>
+
+  {#--
+    Row 4: the request-rate chart (V3 "Ops console" layout).
+
+    The V3 mockup also placed "Loaded content" and "Recent imports" tables
+    below this chart. Both are DEFERRED, not pending — they need a
+    team-approved design and explicit sign-off before any `crates/hts` work.
+    "Loaded content" is cheap (a GROUP BY over `concepts`, ~29 ms, no schema
+    change); "Recent imports" is blocked, because three of its five columns do
+    not exist (which code system a file produced, its concept count, and
+    whether it succeeded), and creating them needs a schema migration that
+    forces a re-import on every existing deployment while still leaving the
+    multi-GB SNOMED/LOINC/RxNorm rows empty.
+  --#}
+  {% include "partials/hts-home-chart.html" %}
+
+</div>

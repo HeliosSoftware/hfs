@@ -1,0 +1,215 @@
+{#-
+  Shared workbench result panel for CodeSystem $lookup / $validate-code /
+  $subsumes (design doc §6.1 unified workbench, §7.3 wireframe).
+
+  Branches on `view.lookup` / `view.validate` / `view.subsumes` as `Option<_>`
+  (mirrors the Slice A dashboard's Result-matching style). Any upstream
+  failure surfaces here — connection-level via the degraded notice,
+  OperationOutcome via the shared partial — so the caller does not need to
+  render either separately.
+
+  V3 layout: every result is a `.card` with a `.card-head` (`<h3>`, not the
+  old `<h5>`-shaped hook that rendered below body size) and one or more
+  `.panel` bands of `.kv-grid` / `.detail__field` pairs. The raw echo is a
+  bare `<details>` inside its own `.card`, exactly as
+  `crates/ui/templates/pages/capability-statement.html` renders its raw
+  payload — deliberately NOT `.addbox`, which is the Add-tenant dropdown
+  and would float this over the page.
+
+  Fluent keys: op-specific under `hts-cs-lookup-*` / `hts-cs-validate-*` /
+  `hts-cs-subsumes-*`; shared under `hts-workbench-*` (reused by Slice C/D/E).
+-#}
+<div id="hts-workbench-result" aria-live="polite">
+  {% if let Some(reason) = view.degraded_reason %}
+  <aside class="notice notice--warn" role="alert" aria-live="assertive">
+    <strong>{{ chrome.i18n.t("hts-degraded-title") }}</strong>
+    {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    {{ chrome.i18n.t("hts-degraded-body") }}
+  </aside>
+  {% endif %}
+
+  {% if let Some(outcome) = view.outcome.as_ref() %}
+    {% let outcome = outcome.clone() %}
+    {% include "partials/hts-outcome.html" %}
+  {% endif %}
+
+  {% if let Some(result) = view.lookup.as_ref() %}
+    <article class="card" style="margin-bottom:16px">
+      <div class="card-head">
+        <h3>
+          {% if !result.display.is_empty() %}{{ result.display }}
+          {%- else if !result.name.is_empty() %}{{ result.name }}
+          {%- else %}{{ chrome.i18n.t("hts-cs-lookup-no-match") }}
+          {%- endif %}
+        </h3>
+        <div class="card-head__tools">
+          {% if !result.code.is_empty() %}<span class="tag tag--param">{{ result.code }}</span>{% endif %}
+          {#- Entry point into the concept information plane (Direction B). The
+              permalink is query-shaped (`?system=…&code=…`) because a canonical
+              system URI cannot survive a path segment. `concept_permalink()`
+              returns None when `$lookup` did not echo both halves of the
+              address, so a broken link is never rendered. -#}
+          {% if let Some(permalink) = result.concept_permalink() %}
+          <a class="chip" href="{{ permalink }}">{{ chrome.i18n.t("hts-concept-open") }}</a>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="kv-grid" style="margin-bottom:0">
+          {% if !result.system.is_empty() %}
+          <div class="detail__field detail__field--wide">
+            <span>{{ chrome.i18n.t("hts-cs-validate-coding-system") }}</span>
+            <code>{{ result.system }}</code>
+          </div>
+          {% endif %}
+          {% if !result.name.is_empty() %}
+          <div class="detail__field">
+            <span>{{ chrome.i18n.t("hts-cs-browser-column-name") }}</span>
+            <code>{{ result.name }}</code>
+          </div>
+          {% endif %}
+          {% if !result.version.is_empty() %}
+          <div class="detail__field">
+            <span>{{ chrome.i18n.t("hts-cs-lookup-version") }}</span>
+            <div>{{ result.version }}</div>
+          </div>
+          {% endif %}
+          {% if !result.definition.is_empty() %}
+          <div class="detail__field detail__field--wide">
+            <span>{{ chrome.i18n.t("hts-cs-lookup-definition") }}</span>
+            <div>{{ result.definition }}</div>
+          </div>
+          {% endif %}
+        </div>
+      </div>
+
+      {% if !result.designations.is_empty() %}
+      <div class="card-head">
+        <h3>{{ chrome.i18n.t("hts-cs-lookup-designations") }}</h3>
+      </div>
+      <div class="panel">
+        <div class="kv-grid" style="margin-bottom:0">
+          {% for d in result.designations %}
+          <div class="detail__field detail__field--wide">
+            {#- The label is data, not UI copy: the language tag and the
+                designation-use code exactly as HTS returned them. -#}
+            <span>{% if d.language.is_empty() %}&mdash;{% else %}{{ d.language }}{% endif %}{% if !d.use_code.is_empty() %} · {{ d.use_code }}{% endif %}</span>
+            <div>{{ d.value }}</div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+      {% if !result.properties.is_empty() %}
+      <div class="card-head">
+        <h3>{{ chrome.i18n.t("hts-cs-lookup-properties") }}</h3>
+      </div>
+      <div class="panel">
+        <div class="kv-grid" style="margin-bottom:0">
+          {% for p in result.properties %}
+          <div class="detail__field">
+            <span>{{ p.code }}</span>
+            <code>{{ p.value }}</code>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+    </article>
+  {% endif %}
+
+  {% if let Some(result) = view.validate.as_ref() %}
+    <article class="card" style="margin-bottom:16px">
+      <div class="card-head">
+        <h3>
+          {% if !result.display.is_empty() %}{{ result.display }}{% else %}{{ chrome.i18n.t("hts-cs-validate-result-heading") }}{% endif %}
+        </h3>
+        <div class="card-head__tools">
+          {% if result.result %}
+            <span class="tag tag--matched">{{ chrome.i18n.t("hts-cs-validate-badge-true") }}</span>
+          {% else %}
+            <span class="tag tag--excluded">{{ chrome.i18n.t("hts-cs-validate-badge-false") }}</span>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="kv-grid" style="margin-bottom:0">
+          {% if !result.code.is_empty() %}
+          <div class="detail__field">
+            <span>{{ chrome.i18n.t("hts-cs-validate-code") }}</span>
+            <code>{{ result.code }}</code>
+          </div>
+          {% endif %}
+          {% if !result.version.is_empty() %}
+          <div class="detail__field">
+            <span>{{ chrome.i18n.t("hts-cs-lookup-version") }}</span>
+            <div>{{ result.version }}</div>
+          </div>
+          {% endif %}
+          {% if !result.system.is_empty() %}
+          <div class="detail__field detail__field--wide">
+            <span>{{ chrome.i18n.t("hts-cs-validate-coding-system") }}</span>
+            <code>{{ result.system }}</code>
+          </div>
+          {% endif %}
+          {% if !result.message.is_empty() %}
+          <div class="detail__field detail__field--wide">
+            <span>{{ chrome.i18n.t("hts-cs-validate-message") }}</span>
+            <div>{{ result.message }}</div>
+          </div>
+          {% endif %}
+        </div>
+
+        {% if let Some(issues) = result.issues.as_ref() %}
+          {% let outcome = issues.clone() %}
+          {% include "partials/hts-outcome.html" %}
+        {% endif %}
+      </div>
+    </article>
+  {% endif %}
+
+  {% if let Some(result) = view.subsumes.as_ref() %}
+    <article class="card" style="margin-bottom:16px">
+      <div class="card-head">
+        <h3>{{ chrome.i18n.t("hts-cs-subsumes-result-heading") }}</h3>
+        <div class="card-head__tools">
+          {#- The four `$subsumes` outcomes carry no severity, so they all
+              render on the neutral `.tag--param` token — the sentence in
+              the panel below is the operator-visible answer. -#}
+          <span class="tag tag--param">{{ result.outcome }}</span>
+        </div>
+      </div>
+      <div class="panel">
+        <p class="query-empty" style="margin:0">
+          {{ chrome.i18n.t(format!("hts-cs-subsumes-outcome-{}", result.outcome).as_str()) }}
+        </p>
+      </div>
+    </article>
+  {% endif %}
+
+  {#- Raw request + response echo (§7.3 wireframe). Kept last so the
+      readable summary above stays visually primary. A bare
+      <details>/<summary> keeps the native disclosure marker; `.detail__code`
+      is the shared preformatted-payload token. -#}
+  {% if !view.raw_body.is_empty() || !view.request_url.is_empty() %}
+  <section class="card panel">
+    <details>
+      <summary class="field__label">{{ chrome.i18n.t("hts-workbench-raw-response") }}</summary>
+      {% if !view.request_url.is_empty() %}
+      <div class="kv-grid" style="margin:14px 0">
+        <div class="detail__field detail__field--wide">
+          <span>{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
+          <code>{{ view.request_url }}</code>
+        </div>
+      </div>
+      {% endif %}
+      {% if !view.raw_body.is_empty() %}
+      <pre class="detail__code" tabindex="0">{{ view.raw_body }}</pre>
+      {% endif %}
+    </details>
+  </section>
+  {% endif %}
+</div>
