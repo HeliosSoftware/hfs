@@ -13,7 +13,7 @@ use helios_fhir::FhirVersion;
 use helios_persistence::{
     StorageResult,
     backends::sqlite::SqliteBackend,
-    core::{BulkProviderStore, SettingsStore, StoredUserSettings},
+    core::{BulkProviderStore, SettingsStore},
     error::BackendError,
 };
 use http_body_util::BodyExt;
@@ -26,10 +26,6 @@ fn backing_stores() -> (Arc<dyn SettingsStore>, Arc<dyn BulkProviderStore>) {
         backend
     });
     (backend.clone(), backend)
-}
-
-fn settings_store() -> Arc<dyn SettingsStore> {
-    backing_stores().0
 }
 
 /// One test's world: the settings store and the recipient base the router is
