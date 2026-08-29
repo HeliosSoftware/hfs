@@ -245,11 +245,14 @@ pub(crate) fn build_view(statement: &Value, version: FhirVersion) -> CapabilityV
             let resource_type = str_at(r, &["type"]).to_string();
             let advertised_profile = str_at(r, &["profile"]);
             let resource_href = safe_canonical_href(advertised_profile).unwrap_or_else(|| {
-                registry
+                if registry
                     .resolve(&resource_type)
                     .is_some_and(|schema| editor::is_resource(&schema))
-                    .then(|| resource_definition_href(version, &resource_type))
-                    .unwrap_or_default()
+                {
+                    resource_definition_href(version, &resource_type)
+                } else {
+                    String::new()
+                }
             });
             ResourceRow {
                 resource_type,
