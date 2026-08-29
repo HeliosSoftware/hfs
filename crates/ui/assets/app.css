@@ -42,6 +42,41 @@
 }
 }
 
+@layer pages {
+/* CapabilityStatement-only presentation: keep the backend note subordinate to
+   its interaction tags, and let the resource filter fit a phone-width card. */
+.cap-transaction-note {
+  margin: 8px 0 0 16px;
+  padding-left: 10px;
+  border-left: 2px solid var(--surface-border);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.cap-resource-filter {
+  flex: 0 1 280px;
+  min-width: 0;
+}
+
+.cap-resource-filter input {
+  width: 100%;
+  min-width: 0;
+}
+
+@media (max-width: 520px) {
+  .cap-resource-card > .card-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .cap-resource-filter {
+    flex-basis: auto;
+    width: 100%;
+  }
+}
+}
+
 @layer tokens {
 :root {
   color-scheme: light;
