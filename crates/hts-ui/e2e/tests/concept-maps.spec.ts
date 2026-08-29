@@ -85,6 +85,32 @@ test.describe("HTS ConceptMap browser (§7.5)", () => {
     await expect(page.locator("#hts-cm-rows tbody > tr").first()).toBeVisible();
   });
 
+  test("Title substring keeps the browser URL bare and selects ExampleCM", async ({
+    page,
+  }) => {
+    await page.goto("/ui/hts/concept-maps?title=Source-to-Target");
+
+    const browserUrl = new URL(page.url());
+    expect(browserUrl.searchParams.get("title")).toBe("Source-to-Target");
+    expect(browserUrl.searchParams.has("title:contains")).toBe(false);
+    await expect(page.locator("#filter-title")).toHaveValue("Source-to-Target");
+    await expect(
+      page.getByText("No ConceptMaps match these filters."),
+    ).toHaveCount(0);
+
+    const rows = page.locator("table tbody tr");
+    await expect(rows).toHaveCount(1);
+    await expect(
+      rows.getByRole("link", { name: "ExampleCM", exact: true }),
+    ).toBeVisible();
+    await expect(
+      rows.getByRole("cell", {
+        name: "Example Source-to-Target Mapping",
+        exact: true,
+      }),
+    ).toBeVisible();
+  });
+
   test("Source system filter routes to the `source` FHIR param without narrowing the table", async ({
     page,
   }) => {

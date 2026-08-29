@@ -213,16 +213,37 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
         })
     }
 
+    /// Search ConceptMap resources by query parameters.
+    ///
+    /// `url`, `version`, and `status` use exact matching. `name` and `title`
+    /// use normalized FHIR prefix matching by default and support `:contains`
+    /// and `:exact`. Multiple populated fields are ANDed.
     async fn search(
         &self,
         _ctx: &TenantContext,
-        query: ResourceSearchQuery,
+        mut query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError> {
-        let client = self
+        let string_search = crate::string_search::ResourceStringSearch::new(&query);
+        if string_search.is_empty() {
+            query.name = None;
+            query.title = None;
+        }
+        let mut client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+        if !string_search.is_empty() {
+            return super::search_resources(
+                &mut client,
+                "concept_maps",
+                "ConceptMap",
+                query,
+                string_search,
+            )
+            .await;
+        }
 
         let limit = i64::from(query.count.unwrap_or(20));
         let offset = i64::from(query.offset.unwrap_or(0));

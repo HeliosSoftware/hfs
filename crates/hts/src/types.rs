@@ -500,10 +500,18 @@ pub struct ResourceSearchQuery {
     pub url: Option<String>,
     /// Filter by version string (exact match).
     pub version: Option<String>,
-    /// Filter by computer-friendly name (exact match).
+    /// Filter by computer-friendly name using FHIR `string` search semantics.
     pub name: Option<String>,
-    /// Filter by human-friendly title (exact match).
+    /// Matching mode for [`Self::name`].
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub name_mode: crate::string_search::FhirStringSearchMode,
+    /// Filter by human-friendly title using FHIR `string` search semantics.
     pub title: Option<String>,
+    /// Matching mode for [`Self::title`].
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub title_mode: crate::string_search::FhirStringSearchMode,
     /// Filter by status: `draft`, `active`, `retired`, or `unknown`.
     pub status: Option<String>,
     /// Maximum number of results to return (default: 20).

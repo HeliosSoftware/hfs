@@ -63,17 +63,37 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
     }
 
     /// Search ConceptMap resources by query parameters.
+    ///
+    /// `url`, `version`, and `status` use exact matching. `name` and `title`
+    /// use normalized FHIR prefix matching by default and support `:contains`
+    /// and `:exact`. Multiple populated fields are ANDed.
     async fn search(
         &self,
         _ctx: &TenantContext,
-        query: ResourceSearchQuery,
+        mut query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError> {
+        let string_search = crate::string_search::ResourceStringSearch::new(&query);
+        if string_search.is_empty() {
+            query.name = None;
+            query.title = None;
+        }
         let pool = self.pool().clone();
 
         tokio::task::spawn_blocking(move || {
-            let conn = pool
+            let mut conn = pool
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+            if !string_search.is_empty() {
+                return super::search_resources(
+                    &mut conn,
+                    "concept_maps",
+                    "ConceptMap",
+                    query,
+                    string_search,
+                    false,
+                );
+            }
 
             let limit = i64::from(query.count.unwrap_or(20));
             let offset = i64::from(query.offset.unwrap_or(0));

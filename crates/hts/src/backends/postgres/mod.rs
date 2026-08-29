@@ -19,8 +19,11 @@ use tracing::info;
 use crate::error::HtsError;
 use crate::import::bundle_parser::{self, ParsedCodeSystem, ParsedConceptMap, ParsedValueSet};
 use crate::import::{BundleImportBackend, ImportStats};
+use crate::string_search::{ResourceSearchRow, ResourceStringSearch, filter_rows};
 use crate::traits::{TerminologyCaches, TerminologyMetadata};
-use crate::types::{ExpansionContains, LookupResponse, SubsumesResponse, TranslateResponse};
+use crate::types::{
+    ExpansionContains, LookupResponse, ResourceSearchQuery, SubsumesResponse, TranslateResponse,
+};
 use helios_persistence::tenant::TenantContext;
 
 /// Per-compose in-memory expansion index. Mirrors SQLite's
@@ -82,6 +85,126 @@ pub const PG_SUBSUMES_RESPONSE_CACHE_MAX: usize = 16384;
 
 /// Soft cap on `translate_response_cache` entries.
 pub const PG_TRANSLATE_RESPONSE_CACHE_MAX: usize = 16384;
+
+/// Search metadata using backend-neutral FHIR string matching, then hydrate
+/// only the selected page. PostgreSQL search historically returns full
+/// resources even for `_summary=true`, which this path preserves.
+async fn search_resources(
+    client: &mut deadpool_postgres::Object,
+    table: &str,
+    resource_type: &str,
+    query: ResourceSearchQuery,
+    search: ResourceStringSearch,
+) -> Result<Vec<serde_json::Value>, HtsError> {
+    // PostgreSQL's default READ COMMITTED level takes a fresh snapshot per
+    // statement, so use REPEATABLE READ to keep metadata selection and JSON
+    // hydration on one read snapshot without taking write locks.
+    let transaction = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .start()
+        .await
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    let result =
+        search_resources_in_transaction(&transaction, table, resource_type, query, search).await;
+    match result {
+        Ok(resources) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+            Ok(resources)
+        }
+        Err(search_error) => match transaction.rollback().await {
+            Ok(()) => Err(search_error),
+            Err(rollback_error) => Err(HtsError::StorageError(format!(
+                "{search_error}; failed to roll back search snapshot: {rollback_error}"
+            ))),
+        },
+    }
+}
+
+async fn search_resources_in_transaction<C>(
+    client: &C,
+    table: &str,
+    resource_type: &str,
+    query: ResourceSearchQuery,
+    search: ResourceStringSearch,
+) -> Result<Vec<serde_json::Value>, HtsError>
+where
+    C: GenericClient + Sync,
+{
+    let metadata_sql = format!(
+        "SELECT id, url, version, name, title, status
+         FROM {table}
+         WHERE ($1::text IS NULL OR url = $1)
+           AND ($2::text IS NULL OR version = $2)
+           AND ($3::text IS NULL OR status = $3)
+         ORDER BY created_at"
+    );
+    let rows = client
+        .query(&metadata_sql, &[&query.url, &query.version, &query.status])
+        .await
+        .map_err(|error| HtsError::StorageError(error.to_string()))?
+        .into_iter()
+        .map(|row| ResourceSearchRow {
+            id: row.get(0),
+            url: row.get(1),
+            version: row.get(2),
+            name: row.get(3),
+            title: row.get(4),
+            status: row.get(5),
+        })
+        .collect::<Vec<_>>();
+    let selected = filter_rows(rows, &query, &search);
+
+    let stored_resources = if selected.is_empty() {
+        HashMap::new()
+    } else {
+        let ids = selected
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        let resource_sql = format!("SELECT id, resource_json FROM {table} WHERE id = ANY($1)");
+        client
+            .query(&resource_sql, &[&ids])
+            .await
+            .map_err(|error| HtsError::StorageError(error.to_string()))?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, Option<serde_json::Value>>(1),
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    };
+
+    let mut results = Vec::with_capacity(selected.len());
+    for row in selected {
+        let mut resource = stored_resources
+            .get(&row.id)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| {
+                code_system::build_synthetic_resource(
+                    resource_type,
+                    &row.id,
+                    &row.url,
+                    row.version.as_deref(),
+                    row.name.as_deref(),
+                    row.title.as_deref(),
+                    &row.status,
+                )
+            });
+        // The table id is authoritative after URL-conflict upserts.
+        if let Some(object) = resource.as_object_mut() {
+            object.insert("id".to_owned(), serde_json::Value::String(row.id));
+        }
+        results.push(resource);
+    }
+    Ok(results)
+}
 
 /// PostgreSQL-backed terminology service backend.
 ///

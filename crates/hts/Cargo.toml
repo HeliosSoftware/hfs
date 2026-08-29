@@ -71,6 +71,7 @@ uuid = { version = "1", features = ["v4"] }
 regex = "1"
 sha2 = "0.10"
 octofhir-ucum = "0.5"
+unicode-normalization = "0.1"
 
 # SQLite (default)
 rusqlite = { version = "0.33", features = ["bundled"], optional = true }

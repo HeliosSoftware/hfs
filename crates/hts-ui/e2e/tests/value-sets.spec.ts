@@ -57,6 +57,32 @@ test.describe("HTS ValueSet browser (Â§7.4)", () => {
       page.getByRole("cell", { name: "http://example.org/vs/limbs" }),
     ).toBeVisible();
   });
+
+  test("Title substring keeps the browser URL bare and selects ExampleLimbsVS", async ({
+    page,
+  }) => {
+    await page.goto("/ui/hts/value-sets?title=Limbs%20Value");
+
+    const browserUrl = new URL(page.url());
+    expect(browserUrl.searchParams.get("title")).toBe("Limbs Value");
+    expect(browserUrl.searchParams.has("title:contains")).toBe(false);
+    await expect(page.locator("#filter-title")).toHaveValue("Limbs Value");
+    await expect(
+      page.getByText("No ValueSets match these filters."),
+    ).toHaveCount(0);
+
+    const rows = page.locator("table tbody tr");
+    await expect(rows).toHaveCount(1);
+    await expect(
+      rows.getByRole("link", { name: "ExampleLimbsVS", exact: true }),
+    ).toBeVisible();
+    await expect(
+      rows.getByRole("cell", {
+        name: "Example Limbs Value Set",
+        exact: true,
+      }),
+    ).toBeVisible();
+  });
 });
 
 test.describe("HTS ValueSet detail + $expand workbench (Â§7.4)", () => {
