@@ -1008,6 +1008,29 @@ mod tests {
     }
 
     #[test]
+    fn string_search_rolls_back_after_query_error() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        let query = ResourceSearchQuery::default();
+        let search = ResourceStringSearch::new(&query);
+
+        let error = search_resources(
+            &mut conn,
+            "missing_search_table",
+            "CodeSystem",
+            query,
+            search,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, HtsError::StorageError(_)));
+        assert!(
+            conn.is_autocommit(),
+            "failed search must close its transaction"
+        );
+    }
+
+    #[test]
     fn supported_systems_empty_initially() {
         let b = backend();
         assert!(

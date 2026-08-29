@@ -52,15 +52,10 @@ impl FhirStringSearch {
 
     /// Whether a present candidate satisfies this search value.
     pub(crate) fn matches(&self, candidate: &str) -> bool {
-        if self.mode == FhirStringSearchMode::Exact {
-            return candidate == self.value;
-        }
-
-        let candidate = normalize(candidate);
         match self.mode {
-            FhirStringSearchMode::Prefix => candidate.starts_with(&self.normalized),
-            FhirStringSearchMode::Contains => candidate.contains(&self.normalized),
-            FhirStringSearchMode::Exact => unreachable!("handled above"),
+            FhirStringSearchMode::Prefix => normalize(candidate).starts_with(&self.normalized),
+            FhirStringSearchMode::Contains => normalize(candidate).contains(&self.normalized),
+            FhirStringSearchMode::Exact => candidate == self.value,
         }
     }
 }

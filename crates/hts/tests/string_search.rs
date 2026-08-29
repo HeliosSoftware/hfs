@@ -131,7 +131,7 @@ async fn sqlite_applies_and_semantics_literal_matching_and_filter_before_paginat
 
     let (status, combined) = app
         .get_fhir(
-            "/CodeSystem?name=cafe&title:contains=terminology&url=http%3A%2F%2Fhts.test%2F719%2Fcs%2Fcafe&status=active",
+            "/CodeSystem?name=cafe&title:contains=terminology&url=http%3A%2F%2Fhts.test%2F719%2Fcs%2Fcafe&version=1.0&status=active",
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{combined}");
@@ -199,17 +199,24 @@ async fn empty_and_normalization_empty_parameters_are_ignored_first() {
 async fn unsupported_modifiers_on_announced_parameters_return_operation_outcome() {
     let app = TestApp::new();
 
-    for parameter in ["url", "version", "name", "title", "status"] {
-        let path = format!("/CodeSystem?{parameter}:not=value");
-        let (status, body) = app.get_fhir(&path).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
-        assert_eq!(body["resourceType"], "OperationOutcome", "{path}: {body}");
-        assert_eq!(body["issue"][0]["code"], "invalid", "{path}: {body}");
+    for resource_type in ["CodeSystem", "ValueSet", "ConceptMap"] {
+        for parameter in ["url", "version", "name", "title", "status"] {
+            let path = format!("/{resource_type}?{parameter}:not=value");
+            let (status, body) = app.get_fhir(&path).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+            assert_eq!(body["resourceType"], "OperationOutcome", "{path}: {body}");
+            assert_eq!(body["issue"][0]["code"], "invalid", "{path}: {body}");
+        }
     }
 
     let (status, body) = app.get_fhir("/CodeSystem?_count=not-a-number").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["resourceType"], "OperationOutcome", "{body}");
+
+    let (status, body) = app.get_fhir("/CodeSystem?title=first&title=second").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["resourceType"], "OperationOutcome", "{body}");
+    assert_eq!(body["issue"][0]["code"], "invalid", "{body}");
 }
 
 #[cfg(feature = "sqlite")]
@@ -247,6 +254,30 @@ async fn postgres_matches_string_and_full_hydration_contract() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(SEARCH_BUNDLE).await;
 
+    let (client, connection) =
+        tokio_postgres::connect(common::pg_http_url().await, tokio_postgres::NoTls)
+            .await
+            .expect("connect to PostgreSQL test database");
+    tokio::spawn(async move {
+        connection.await.expect("PostgreSQL test connection");
+    });
+    client
+        .execute(
+            "INSERT INTO code_systems
+             (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, 'active', 'complete', NULL, $6, $6)",
+            &[
+                &"synthetic-search-cs",
+                &"http://hts.test/719/cs/synthetic",
+                &"1.0",
+                &"SyntheticSearchCodeSystem",
+                &"Synthetic search fallback",
+                &"2026-08-29T00:00:00Z",
+            ],
+        )
+        .await
+        .expect("insert legacy CodeSystem metadata without resource_json");
+
     for (path, full_field, expected_id) in [
         ("/CodeSystem?title=cafe&_summary=true", "concept", "cafe-cs"),
         (
@@ -272,6 +303,17 @@ async fn postgres_matches_string_and_full_hydration_contract() {
         .get_fhir("/ConceptMap?title:exact=caf%C3%A9%20concept%20map")
         .await;
     assert!(entries(&exact_miss).is_empty(), "{exact_miss}");
+
+    let (status, synthetic) = app.get_fhir("/CodeSystem?name=syntheticsearch").await;
+    assert_eq!(status, StatusCode::OK, "{synthetic}");
+    assert_eq!(entries(&synthetic).len(), 1, "{synthetic}");
+    let synthetic_resource = &entries(&synthetic)[0]["resource"];
+    assert_eq!(synthetic_resource["resourceType"], "CodeSystem");
+    assert_eq!(synthetic_resource["id"], "synthetic-search-cs");
+    assert_eq!(
+        synthetic_resource["url"],
+        "http://hts.test/719/cs/synthetic"
+    );
 
     let (status, outcome) = app.get_fhir("/ConceptMap?status:not=active").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{outcome}");
