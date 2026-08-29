@@ -660,11 +660,12 @@ editor-hint-instant = FHIR instant: vollständiger Zeitstempel mit Zeitzone, z. 
 subs-title = Abonnements
 subs-lede = Schreibgeschützte Sicht auf die Abonnement-Engine: jedes registrierte Abonnement, sein Kanal, Live-Status und Zustellzähler.
 subs-unavailable = Die Abonnement-Engine ist auf diesem Server nicht aktiviert.
+subs-unavailable-how = Zum Aktivieren HFS starten mit:
 subs-empty = Für diesen Mandanten sind keine Abonnements registriert.
 subs-card-failing = Fehlgeschlagen
-subs-card-failing-sub = braucht Aufmerksamkeit
+subs-card-failing-sub = Braucht Aufmerksamkeit
 subs-card-idle = Inaktiv
-subs-card-idle-sub = keine Clients
+subs-card-idle-sub = Keine Clients
 subs-card-active = Aktiv
 subs-card-active-sub = wird zugestellt
 subs-card-delivered = Zugestellt in 24 h
@@ -681,11 +682,11 @@ subs-col-status = Status
 subs-col-last24 = Letzte 24 h
 subs-col-sent = Gesendet
 subs-col-fails = Fehlerserie
-subs-state-active = aktiv
+subs-state-active = Aktiv
 subs-state-error = Fehler
 subs-state-idle = 0 Clients
-subs-state-requested = angefragt
-subs-state-off = aus
+subs-state-requested = Angefragt
+subs-state-off = Aus
 
 ## Bulk Export workspace (#537)
 

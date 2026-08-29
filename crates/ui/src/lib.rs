@@ -320,9 +320,6 @@ pub(crate) struct Status {
     tenant_display: Option<String>,
     /// Whether the sidebar renders the tenant picker (#544).
     show_tenant_picker: bool,
-    /// Whether the subscriptions engine is advertised â€” the sidebar entry and
-    /// the operator page only appear when it is (#580).
-    subscriptions_enabled: bool,
     /// The safe navigation state derived from `HFS_TERMINOLOGY_SERVER` (#611).
     /// The raw value is never exposed to templates unless it is a valid HTTP(S)
     /// base URL.
@@ -385,11 +382,6 @@ impl Status {
     /// Whether the sidebar renders the tenant picker (#544).
     pub(crate) fn show_tenant_picker(&self) -> bool {
         self.show_tenant_picker
-    }
-
-    /// Whether the subscriptions engine is advertised (#580).
-    pub(crate) fn subscriptions_enabled(&self) -> bool {
-        self.subscriptions_enabled
     }
 
     /// The topbar avatar menu's identity (#725). `/ui` sits outside the auth
@@ -3484,7 +3476,6 @@ pub(crate) fn current_status(
         tenant_id: tenant.id.clone(),
         tenant_display: tenant.display.clone(),
         show_tenant_picker: tenant.multi,
-        subscriptions_enabled: helios_observability::subscriptions::enabled(),
         terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
     }
 }
@@ -3531,7 +3522,6 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
-                subscriptions_enabled: false,
                 terminology: TerminologyNavigation::Unconfigured,
             },
             metrics: dash.metrics,
@@ -3703,7 +3693,6 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
-                subscriptions_enabled: false,
                 terminology: TerminologyNavigation::Unconfigured,
             },
             i18n: i18n("en"),
@@ -3763,7 +3752,6 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
-                subscriptions_enabled: false,
                 terminology: TerminologyNavigation::Unconfigured,
             },
             i18n: i18n("en"),
@@ -3825,7 +3813,6 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
-                subscriptions_enabled: false,
                 terminology: TerminologyNavigation::Unconfigured,
             },
             i18n: i18n("es"),
