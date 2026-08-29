@@ -750,6 +750,7 @@ cap-summary-date = Fecha
 cap-summary-formats = Formatos
 cap-interactions-heading = Interacciones de sistema
 cap-transaction-note = transaction se anuncia porque el backend activo soporta transacciones atómicas; batch está siempre disponible.
+cap-role-matrix = Ver la matriz de roles de backend.
 cap-operations-heading = Operaciones
 cap-col-operation = Operación
 cap-col-definition = Definición
