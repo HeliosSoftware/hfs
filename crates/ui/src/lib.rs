@@ -320,9 +320,6 @@ pub(crate) struct Status {
     tenant_display: Option<String>,
     /// Whether the sidebar renders the tenant picker (#544).
     show_tenant_picker: bool,
-    /// Whether the subscriptions engine is advertised â€” the sidebar entry and
-    /// the operator page only appear when it is (#580).
-    subscriptions_enabled: bool,
     /// The safe navigation state derived from `HFS_TERMINOLOGY_SERVER` (#611).
     /// The raw value is never exposed to templates unless it is a valid HTTP(S)
     /// base URL.
@@ -385,11 +382,6 @@ impl Status {
     /// Whether the sidebar renders the tenant picker (#544).
     pub(crate) fn show_tenant_picker(&self) -> bool {
         self.show_tenant_picker
-    }
-
-    /// Whether the subscriptions engine is advertised (#580).
-    pub(crate) fn subscriptions_enabled(&self) -> bool {
-        self.subscriptions_enabled
     }
 
     /// The topbar avatar menu's identity (#725). `/ui` sits outside the auth
@@ -2695,8 +2687,14 @@ struct CapabilityPage {
     active_page: &'static str,
     /// `None` when the self-fetch failed — the page degrades to a warning.
     view: Option<capability::CapabilityView>,
-    /// Pretty-printed raw statement for the foldable block.
+    /// Highlighted, foldable JSON when the statement fits the render budget.
+    json_lines: Vec<json_view::JsonLine>,
+    json_view_id: String,
+    json_view_paths: bool,
+    /// Pretty-printed raw statement when highlighted rendering exceeds its
+    /// budget. Askama escapes it inside the fallback `<pre>`.
     raw: String,
+    raw_fallback: bool,
     /// The server-side resource-type filter, echoed back into the form.
     filter: String,
 }
@@ -2715,20 +2713,38 @@ async fn capability_page(
 ) -> Response {
     let filter = query.filter.unwrap_or_default();
     let fetched = state.conformance.metadata(rv.0, &rt.id).await;
-    let (view, raw) = match fetched {
+    let (view, json_lines, raw, raw_fallback) = match fetched {
         Ok(statement) => {
-            let mut view = capability::build_view(&statement);
+            let mut view = capability::build_view(&statement, rv.0);
             if !filter.is_empty() {
                 let needle = filter.to_lowercase();
                 view.resources
                     .retain(|r| r.resource_type.to_lowercase().contains(&needle));
             }
-            let raw = serde_json::to_string_pretty(&statement).unwrap_or_default();
-            (Some(view), raw)
+            const MAX_LINES: usize = 4_000;
+            const MAX_ESTIMATED_HTML_BYTES: usize = 2 * 1024 * 1024;
+            match json_view::try_lines(
+                &statement,
+                json_view::RenderOptions {
+                    include_paths: false,
+                    budget: Some(json_view::RenderBudget {
+                        max_lines: MAX_LINES,
+                        max_estimated_html_bytes: MAX_ESTIMATED_HTML_BYTES,
+                    }),
+                },
+            ) {
+                Ok(lines) => (Some(view), lines, String::new(), false),
+                Err(_) => (
+                    Some(view),
+                    Vec::new(),
+                    serde_json::to_string_pretty(&statement).unwrap_or_default(),
+                    true,
+                ),
+            }
         }
         Err(error) => {
             tracing::warn!("CapabilityStatement self-fetch failed: {error}");
-            (None, String::new())
+            (None, Vec::new(), String::new(), false)
         }
     };
     render(CapabilityPage {
@@ -2736,7 +2752,11 @@ async fn capability_page(
         i18n: I18n::new(locale),
         active_page: "capability-statement",
         view,
+        json_lines,
+        json_view_id: "capability-json".to_string(),
+        json_view_paths: false,
         raw,
+        raw_fallback,
         filter,
     })
 }
@@ -3456,7 +3476,6 @@ pub(crate) fn current_status(
         tenant_id: tenant.id.clone(),
         tenant_display: tenant.display.clone(),
         show_tenant_picker: tenant.multi,
-        subscriptions_enabled: helios_observability::subscriptions::enabled(),
         terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
     }
 }
@@ -3503,7 +3522,6 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
-                subscriptions_enabled: false,
                 terminology: TerminologyNavigation::Unconfigured,
             },
             metrics: dash.metrics,
@@ -3675,7 +3693,6 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
-                subscriptions_enabled: false,
                 terminology: TerminologyNavigation::Unconfigured,
             },
             i18n: i18n("en"),
@@ -3735,7 +3752,6 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
-                subscriptions_enabled: false,
                 terminology: TerminologyNavigation::Unconfigured,
             },
             i18n: i18n("en"),
@@ -3797,7 +3813,6 @@ mod tests {
                 tenant_id: "default".to_string(),
                 tenant_display: None,
                 show_tenant_picker: true,
-                subscriptions_enabled: false,
                 terminology: TerminologyNavigation::Unconfigured,
             },
             i18n: i18n("es"),

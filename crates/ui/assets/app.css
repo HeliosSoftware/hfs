@@ -24,7 +24,7 @@
   font-style: normal;
   font-weight: 300 900;
   font-display: swap;
-  src: url("/ui/assets/fonts/figtree-latin.woff2") format("woff2");
+  src: url("fonts/figtree-latin.woff2") format("woff2");
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
     U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
     U+2212, U+2215, U+FEFF, U+FFFD;
@@ -35,10 +35,45 @@
   font-style: normal;
   font-weight: 300 900;
   font-display: swap;
-  src: url("/ui/assets/fonts/figtree-latin-ext.woff2") format("woff2");
+  src: url("fonts/figtree-latin-ext.woff2") format("woff2");
   unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
     U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
     U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+}
+
+@layer pages {
+/* CapabilityStatement-only presentation: keep the backend note subordinate to
+   its interaction tags, and let the resource filter fit a phone-width card. */
+.cap-transaction-note {
+  margin: 8px 0 0 16px;
+  padding-left: 10px;
+  border-left: 2px solid var(--surface-border);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.cap-resource-filter {
+  flex: 0 1 280px;
+  min-width: 0;
+}
+
+.cap-resource-filter input {
+  width: 100%;
+  min-width: 0;
+}
+
+@media (max-width: 520px) {
+  .cap-resource-card > .card-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .cap-resource-filter {
+    flex-basis: auto;
+    width: 100%;
+  }
 }
 }
 
@@ -102,6 +137,14 @@
   /* Destructive text clears 7:1 on the light card surface; the soft hover
      fill keeps 5.8:1 contrast with the same foreground. */
   --danger: #a61b12;
+  /* Positive / caution pairs, mirroring the danger pair: referenced by the
+     stored/member and warn tag variants and the progress track since the
+     SearchParameter viewer landed, but never defined - they rendered
+     transparent. */
+  --ok: #1e7d46;
+  --ok-soft: #e4f6ec;
+  --warn: #8a5a00;
+  --warn-soft: #fdf2dd;
   --danger-soft: #f0dfde;
   /* Menu panel input */
   --input-bg: #f5f5f5;
@@ -109,6 +152,12 @@
   --scroll-track: #ececec;
   --scroll-thumb: #bdbdbd;
   --scroll-thumb-hover: #a0a0a0;
+  /* The semantic status pairs `.tag--*`, `.lint__item--*`, `.notice--warn` and
+     `.batch-badge--*` reference are declared once, above. This branch used to
+     redeclare all six here; every one of them now has a canonical definition
+     earlier in the same rule, so a second declaration only shadowed it — which
+     is what `design-system.spec.ts` and the contrast guard in
+     `bulk-import.spec.ts` exist to catch. */
 
   font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
@@ -134,6 +183,10 @@
   --json-literal: #d2a8ff;
   /* Theme-specific destructive pair: 7.6:1 on the card and 5.6:1 on soft. */
   --danger: #ff9a90;
+  --ok: #7fd8a5;
+  --ok-soft: #14301f;
+  --warn: #e8c07a;
+  --warn-soft: #2f2410;
   --danger-soft: #453534;
   /* Same value as light for now (#681) — the point to adjust from if flat
      black at 45% is later found to read too heavy/light over the dark bg. */
@@ -146,6 +199,7 @@
   --scroll-track: rgb(255 255 255 / 7%);
   --scroll-thumb: rgb(255 255 255 / 25%);
   --scroll-thumb-hover: rgb(255 255 255 / 38%);
+  /* Dark-theme status pairs are declared once, above — see the light block. */
 }
 }
 
@@ -800,6 +854,19 @@ button.menu__option {
   color: var(--text);
 }
 
+/* The single accent moment on a stat tile — used sparingly (currently only
+   the "up" state of the HTS dashboard Status tile). Reuses the accent token
+   already tuned for AA contrast per theme, so no new palette values enter. */
+.stat__value--ok {
+  color: var(--accent-text);
+}
+
+.stat__unit {
+  font-size: 17px;
+  letter-spacing: -0.3px;
+  vertical-align: 12px;
+}
+
 .stat__sub {
   display: block;
   margin-top: 6px;
@@ -1186,6 +1253,24 @@ button.pill {
   max-width: 620px;
 }
 
+/* Accessible sr-only helper — hides the element visually while keeping it
+   in the accessibility tree. Referenced by row headings in the HTS
+   dashboard partial and by outcome/import announcements. Without this rule
+   those `<h2>`s would render at browser default size and break the
+   visual hierarchy. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+
 .stat-grid--5 {
   grid-template-columns: repeat(5, 1fr);
 }
@@ -1502,11 +1587,10 @@ select.field__input {
 }
 
 .col-num {
-  text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-.col-actions {
+.data-table .col-actions {
   text-align: right;
   width: 64px;
 }
@@ -1637,6 +1721,7 @@ select.field__input {
    defined twice and render their cascade-merge, which this preserves. */
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   margin-bottom: 16px;
   border-bottom: 1px solid var(--surface-border);
@@ -1778,6 +1863,32 @@ select.field__input {
   margin-bottom: 20px;
 }
 
+.page-head--back-link {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "back-link ."
+    "copy action";
+  column-gap: 16px;
+  align-items: start;
+}
+
+.page-head--back-link > .back-link {
+  grid-area: back-link;
+  justify-self: start;
+}
+
+.page-head--back-link > .page-head__copy {
+  grid-area: copy;
+  min-width: 0;
+}
+
+.page-head--back-link > .page-head__action {
+  grid-area: action;
+  min-width: 0;
+  align-self: start;
+}
+
 .page-head__title {
   margin: 0 0 4px;
   font-size: 24px;
@@ -1793,6 +1904,11 @@ select.field__input {
 
 .back-link,
 .back-link:visited {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 24px;
+  font-size: 13px;
   color: var(--accent-text);
   text-decoration: none;
 }
@@ -2555,6 +2671,29 @@ details.json-fold[open] > summary .icon {
   min-width: 0;
 }
 
+/* HTS Phase-5 filter-rail field group: label above a row of
+   mode-select + text-input. Input skin comes from
+   `.builder-row__value` / `.builder-row__modifier`; rules below
+   only handle the stacked layout and the sticky action row. */
+.filter-rail__field { display: flex; flex-direction: column; gap: 4px; padding: 0 4px; }
+.filter-rail__field-label { margin: 0 2px; font-size: 11px; font-weight: 600; color: var(--muted); }
+.filter-rail__field-row { display: flex; gap: 6px; align-items: center; }
+.filter-rail__field-row .builder-row__value { flex: 1; min-width: 0; }
+.filter-rail__actions {
+  display: flex; gap: 8px; padding: 10px 4px 0; margin-top: 4px;
+  border-top: 1px solid var(--surface-border);
+}
+/* HTS browsers: bound Name column so long computer-friendly names
+   (`hl7.terminology.r4.CodeSystem-*`) don't crowd Title. */
+.data-table .col-name { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* HTS ConceptMap stacked source/target cell (Phase-5 §7.5 Gate 1):
+   two vertically-stacked lines with a monospace `S:` / `T:` prefix
+   so the mapping direction stays scannable in-row. */
+.cm-mapping { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cm-mapping__line { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.cm-mapping__prefix { font-size: 11px; font-weight: 600; color: var(--muted); flex: none; }
+.cm-mapping__line .url { min-width: 0; }
+
 /* Facet chip rows */
 
 .facets {
@@ -2635,6 +2774,7 @@ details.json-fold[open] > summary .icon {
   padding: 9px 14px;
   border-bottom: 1px solid var(--surface-border);
   color: var(--text);
+  text-align: left;
   vertical-align: top;
 }
 
@@ -2642,7 +2782,7 @@ details.json-fold[open] > summary .icon {
   border-bottom: 0;
 }
 
-.data-table__empty td,
+.data-table .data-table__empty td,
 .empty-state {
   margin: 0;
   color: var(--muted);
@@ -2651,8 +2791,16 @@ details.json-fold[open] > summary .icon {
 }
 
 
+/* Merge of two independent intents, 2026-08-28:
+   - main excluded the empty-state row from hover highlighting, so "no
+     results" no longer lights up under the cursor;
+   - this branch added `aria-current`, the convention every other selected
+     element in this file already uses (.chip, .tab, .nav-item,
+     .filter-rail__item), so a selected row paints like everything else.
+   They touch different selectors in the same list; both are kept. */
 .data-table tbody tr:not(.data-table__empty):hover td,
-.data-table tbody tr[aria-selected="true"] td {
+.data-table tbody tr[aria-selected="true"] td,
+.data-table tbody tr[aria-current="true"] td {
   background: var(--accent-soft);
 }
 
@@ -2737,7 +2885,8 @@ details.json-fold[open] > summary .icon {
 }
 
 .tag--stored,
-.tag--member {
+.tag--member,
+.tag--matched {
   background: var(--ok-soft);
   color: var(--ok);
 }
@@ -2755,22 +2904,62 @@ details.json-fold[open] > summary .icon {
   color: var(--danger);
 }
 
-/* Subscription states (#580): the cards and the STATUS column share this
-   vocabulary — active delivers, idle has no listeners, error needs attention. */
+/* FHIR publication-status tags (HTS browsers + resource detail headers).
+   Distinct from the .tag--stored/config/conflict family: those describe
+   configuration/lint outcomes, these describe a resource's own status. */
 .tag--active {
   background: var(--ok-soft);
   color: var(--ok);
 }
 
-.tag--idle,
-.tag--requested {
+.tag--draft {
   background: var(--warn-soft);
   color: var(--warn);
 }
 
-.tag--error {
-  background: var(--danger-soft);
-  color: var(--danger);
+.tag--retired {
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  color: var(--muted);
+}
+
+.tag--unknown {
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  color: var(--muted);
+}
+
+/* Subscription states (#580, reshaped to the frame in #767): the cards and
+   the STATUS column share a dot vocabulary — green delivers, amber has no
+   listeners, red needs attention. */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  border-radius: 50%;
+  vertical-align: baseline;
+}
+
+.status-dot--ok {
+  background: var(--ok);
+}
+
+.status-dot--danger {
+  background: var(--danger);
+}
+
+.status-dot--warn {
+  background: var(--warn);
+}
+
+.status-dot--muted {
+  background: var(--muted);
+}
+
+/* A failing row carries the frame's red left edge. */
+.data-table tr.row--alert > td:first-child {
+  box-shadow: inset 3px 0 0 var(--danger);
 }
 
 /* Bulk Export job states (#537) — the same status-pill vocabulary. */
@@ -2800,6 +2989,21 @@ details.json-fold[open] > summary .icon {
 
 .subs-sort summary.btn::-webkit-details-marker {
   display: none;
+}
+
+.subs-sort__label {
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.subs-sort__chevron {
+  transition: transform 120ms ease;
+}
+
+.subs-sort[open] .subs-sort__chevron {
+  transform: rotate(180deg);
 }
 }
 
@@ -3269,7 +3473,8 @@ details.json-fold[open] > summary .icon {
 /* Compartment viewer: tabs, members, tester. The .tabs / .tab primitives are
    defined once, with the history feed switcher. */
 
-.tab[aria-current="true"] {
+.tab[aria-current="true"],
+.tab[aria-current="page"] {
   background: var(--accent-soft);
   color: var(--text-strong);
 }

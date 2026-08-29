@@ -28,6 +28,7 @@ use crate::operations::batch_validate::vs_batch_validate_handler;
 use axum::extract::DefaultBodyLimit;
 use axum::{
     Router,
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use std::time::Duration;
@@ -65,6 +66,18 @@ use crate::operations::validate_code::{
 use crate::state::AppState;
 use crate::traits::TerminologyBackend;
 
+/// Redirects the bare root URL to the HTS UI home (`/ui/hts`).
+///
+/// Mounted by [`create_app`] only when `config.ui_enabled` is true, so a UI-off
+/// deployment keeps axum's default 405 on `GET /` instead of pointing operators
+/// at a 404. Returns a 308 (permanent) mirroring the trailing-slash
+/// canonicalization pattern in `helios-hts-ui`'s `home.rs`; the sibling
+/// `POST /` FHIR batch route on the same path is unaffected because axum merges
+/// compatible method routers per path.
+async fn root_redirect() -> Response {
+    Redirect::permanent("/ui/hts").into_response()
+}
+
 /// Build the Axum application router with all middleware and routes.
 ///
 /// Accepts the runtime [`HtsConfig`] (for CORS and other settings) and the
@@ -81,7 +94,69 @@ where
 {
     let cors = build_cors(config);
 
-    Router::new()
+    // Optional HTS administrative UI (crates/hts-ui) mounted at `/ui` so
+    // routes resolve as `/ui/hts`, `/ui/hts/assets/*`, etc. The crate owns
+    // the `/hts` prefix internally so this mount point stays `/ui`, the same
+    // place HFS mounts its own UI. Off by default; opt in with
+    // `HTS_UI_ENABLED=1`.
+    //
+    // Upstream URL policy (design doc §7 degraded state contract):
+    //   1. `HTS_UI_UPSTREAM_URL` when set — lets a developer point the UI at
+    //      a remote HTS without a rebuild;
+    //   2. otherwise loopback to *this* binary's `127.0.0.1:{port}`. Not
+    //      `config.host` because that may be `0.0.0.0` for external binds;
+    //      the loopback client always uses the loopback interface.
+    //
+    // Bundled data footprint powers the dashboard's "Bundled data: X MB"
+    // tile. `None` when no `HTS_BOOTSTRAP_DIR` was configured — the tile
+    // then shows an em-dash rather than a misleading zero.
+    let hts_ui = if config.ui_enabled {
+        let upstream_url = std::env::var("HTS_UI_UPSTREAM_URL")
+            .unwrap_or_else(|_| format!("http://127.0.0.1:{}", config.port));
+        let upstream = helios_hts_ui::UpstreamClient::new(upstream_url).unwrap_or_else(|err| {
+            // reqwest's builder fails only under very degenerate conditions
+            // (e.g. no TLS backend, which cannot happen here — we use
+            // default_features = false with no TLS feature). Log loudly if
+            // it ever does and fall back to a client aimed at a closed loopback
+            // port so the dashboard degrades cleanly instead of the whole
+            // binary crashing.
+            tracing::error!(
+                ?err,
+                "hts-ui: upstream client build failed; UI will render only the degraded banner"
+            );
+            helios_hts_ui::UpstreamClient::new("http://127.0.0.1:1")
+                .expect("closed loopback URL should always parse")
+        });
+        let bundled_data_bytes = if config.bootstrap_dir.is_empty() {
+            None
+        } else {
+            match dir_size_bytes(std::path::Path::new(&config.bootstrap_dir)) {
+                Ok(bytes) => Some(bytes),
+                Err(err) => {
+                    tracing::warn!(
+                        dir = %config.bootstrap_dir,
+                        error = %err,
+                        "hts-ui: could not compute bootstrap dir size; the tile will read `—`"
+                    );
+                    None
+                }
+            }
+        };
+        let ui_state = std::sync::Arc::new(helios_hts_ui::HtsUiState {
+            fhir_version: FHIR_VERSION_LABEL,
+            version: env!("CARGO_PKG_VERSION"),
+            upstream,
+            bundled_data_bytes,
+            // Rolling `/metrics` samples for the Home request-rate chart.
+            // Starts empty; the Home page's own 15 s poll fills it.
+            metrics_ring: Default::default(),
+        });
+        Some(helios_hts_ui::router(ui_state))
+    } else {
+        None
+    };
+
+    let router = Router::new()
         // ── Batch / transaction ───────────────────────────────────────────────
         .route("/", post(batch_handler::<B>))
         // ── Utility ──────────────────────────────────────────────────────────
@@ -176,7 +251,29 @@ where
                 .put(update_concept_map::<B>)
                 .delete(delete_concept_map::<B>),
         )
-        .with_state(state)
+        .with_state(state);
+
+    // Merge the optional UI router before wrapping the whole app in the
+    // observability / cors / timeout / trace layers so the UI benefits from
+    // the same shared middleware stack (metrics + trace spans).
+    //
+    // `GET /` -> 308 `/ui/hts`: reviewer-requested landing so browsers hitting
+    // the bare root URL end up on the HTS UI home instead of seeing axum's
+    // "405 Method Not Allowed" for the POST-only FHIR batch endpoint.
+    // Registered inside the `ui_enabled` branch so a UI-off deployment keeps
+    // the current 405 behavior (redirecting to `/ui/hts` when that route is
+    // not mounted would send operators to a 404). `Redirect::permanent`
+    // (308) is the idiomatic choice mirrored from `hts-ui/src/home.rs`
+    // trailing-slash canonicalization; the existing `POST /` batch handler
+    // is unaffected because axum's `Router::route` merges compatible method
+    // routers on the same path.
+    let router = if let Some(ui) = hts_ui {
+        router.route("/", get(root_redirect)).nest("/ui", ui)
+    } else {
+        router
+    };
+
+    router
         // Raise the body-size limit from axum's 2 MiB default to the
         // configured ceiling. The decompression layer below replaces the
         // request body before extractors read it, so this limit applies to
@@ -200,6 +297,51 @@ where
         ))
         .layer(TraceLayer::new_for_http())
 }
+
+/// Recursively size a directory in bytes. Small utility used at HTS-UI
+/// mount time to compute the "Bundled data: X MiB" dashboard tile.
+///
+/// Returns `Err` on the first I/O failure so operator-facing errors don't
+/// mix "partial walk succeeded" with "walk failed" — callers log and fall
+/// back to `None` for the tile.
+fn dir_size_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
+    let mut total: u64 = 0;
+    let mut stack: Vec<std::path::PathBuf> = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                stack.push(entry?.path());
+            }
+        } else if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        }
+        // Symlinks and other non-file entries: skip silently — the bootstrap
+        // directory contract is "regular files under a directory tree".
+    }
+    Ok(total)
+}
+
+/// Compile-time FHIR version label rendered in the HTS UI topbar.
+///
+/// The `hts` binary is built for exactly one FHIR version (features are
+/// mutually exclusive in this crate's build matrix). R4 is the workspace
+/// default; the CI matrix and Docker images set exactly one of the four.
+#[cfg(feature = "R4")]
+const FHIR_VERSION_LABEL: &str = "R4";
+#[cfg(all(feature = "R4B", not(feature = "R4")))]
+const FHIR_VERSION_LABEL: &str = "R4B";
+#[cfg(all(feature = "R5", not(feature = "R4"), not(feature = "R4B")))]
+const FHIR_VERSION_LABEL: &str = "R5";
+#[cfg(all(
+    feature = "R6",
+    not(feature = "R4"),
+    not(feature = "R4B"),
+    not(feature = "R5")
+))]
+const FHIR_VERSION_LABEL: &str = "R6";
+#[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6")))]
+const FHIR_VERSION_LABEL: &str = "R4";
 
 fn build_cors(config: &HtsConfig) -> CorsLayer {
     if !config.enable_cors {

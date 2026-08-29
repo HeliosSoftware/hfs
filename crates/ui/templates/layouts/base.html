@@ -153,13 +153,12 @@
         <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
       </a>
       {% endif %}
-      <!-- Visible only when the subscriptions engine is advertised (#580). -->
-      {% if status.subscriptions_enabled() %}
+      <!-- Always present, like the other feature pages: with the engine off
+           the page explains how to enable it (#767). -->
       <a class="nav-item" href="/ui/subscriptions"{% if active_page == "subscriptions" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-subscriptions") }}">
         <span class="icon">{% include "icons/sync.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-subscriptions") }}</span>
       </a>
-      {% endif %}
     </nav>
 
     <!--
@@ -250,7 +249,7 @@
                 {% if let Some(initials) = status.user_initials() %}{{ initials }}{% else %}<span class="icon">{% include "icons/user.svg" %}</span>{% endif %}
                 {% endif %}
               </span>
-              <div class="user-menu__name">{% if let Some(name) = status.user_display() %}{{ name }}{% else %}{{ i18n.t("user-local") }}{% endif %}</div>
+              <div class="user-menu__name">{% if let Some(name) = status.user_display() %}{{ name }}{% else %}{{ i18n.t("user-anonymous") }}{% endif %}</div>
               <div class="user-menu__hint">{% if let Some(secondary) = status.user_secondary() %}{{ secondary }}{% else %}{{ i18n.t("user-local-hint") }}{% endif %}</div>
             </div>
             <div class="menu__heading">{{ i18n.t("language-label") }}</div>

@@ -30,8 +30,9 @@ use tracing::info;
 
 use crate::error::HtsError;
 use crate::import::{BundleImportBackend, ImportStats};
+use crate::string_search::{ResourceSearchRow, ResourceStringSearch, filter_rows};
 use crate::traits::{TerminologyCaches, TerminologyMetadata};
-use crate::types::{LookupResponse, ValidateCodeResponse};
+use crate::types::{LookupResponse, ResourceSearchQuery, ValidateCodeResponse};
 use helios_persistence::tenant::TenantContext;
 
 // ─── Per-instance cache type aliases (see field docs on SqliteTerminologyBackend) ──
@@ -43,6 +44,138 @@ pub(crate) type StringOptionMap = HashMap<String, Option<String>>;
 pub(crate) type BoolMap = HashMap<String, bool>;
 pub(crate) type LookupResponseMap = HashMap<String, Arc<LookupResponse>>;
 pub(crate) type ValidateCodeResponseMap = HashMap<String, Arc<ValidateCodeResponse>>;
+
+/// Search metadata using backend-neutral FHIR string matching, then hydrate
+/// only the selected page. Exact URL/version/status predicates stay in SQL.
+fn search_resources(
+    conn: &mut rusqlite::Connection,
+    table: &str,
+    resource_type: &str,
+    query: ResourceSearchQuery,
+    search: ResourceStringSearch,
+    synthetic_summary: bool,
+) -> Result<Vec<serde_json::Value>, HtsError> {
+    // A deferred transaction acquires no write lock. It pins the read snapshot
+    // so metadata selection and subsequent JSON hydration cannot observe
+    // different resource revisions.
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    let result = search_resources_in_transaction(
+        &transaction,
+        table,
+        resource_type,
+        query,
+        search,
+        synthetic_summary,
+    );
+    match result {
+        Ok(resources) => {
+            transaction
+                .commit()
+                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+            Ok(resources)
+        }
+        Err(search_error) => match transaction.rollback() {
+            Ok(()) => Err(search_error),
+            Err(rollback_error) => Err(HtsError::StorageError(format!(
+                "{search_error}; failed to roll back search snapshot: {rollback_error}"
+            ))),
+        },
+    }
+}
+
+fn search_resources_in_transaction(
+    conn: &rusqlite::Connection,
+    table: &str,
+    resource_type: &str,
+    query: ResourceSearchQuery,
+    search: ResourceStringSearch,
+    synthetic_summary: bool,
+) -> Result<Vec<serde_json::Value>, HtsError> {
+    let metadata_sql = format!(
+        "SELECT id, url, version, name, title, status
+         FROM {table}
+         WHERE (?1 IS NULL OR url = ?1)
+           AND (?2 IS NULL OR version = ?2)
+           AND (?3 IS NULL OR status = ?3)
+         ORDER BY created_at"
+    );
+    let mut statement = conn
+        .prepare(&metadata_sql)
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![
+                query.url.as_deref(),
+                query.version.as_deref(),
+                query.status.as_deref()
+            ],
+            |row| {
+                Ok(ResourceSearchRow {
+                    id: row.get(0)?,
+                    url: row.get(1)?,
+                    version: row.get(2)?,
+                    name: row.get(3)?,
+                    title: row.get(4)?,
+                    status: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|error| HtsError::StorageError(error.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    let selected = filter_rows(rows, &query, &search);
+
+    let use_synthetic = synthetic_summary && query.summary.as_deref() == Some("true");
+    let mut stored_resources = HashMap::<String, Option<String>>::new();
+    if !use_synthetic {
+        // Stay below SQLite's common 999-variable ceiling regardless of an
+        // arbitrary u32 `_count`. Chunking also avoids loading unselected JSON.
+        for chunk in selected.chunks(900) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let resource_sql =
+                format!("SELECT id, resource_json FROM {table} WHERE id IN ({placeholders})");
+            let mut resource_statement = conn
+                .prepare(&resource_sql)
+                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+            let resource_rows = resource_statement
+                .query_map(
+                    rusqlite::params_from_iter(chunk.iter().map(|row| row.id.as_str())),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+            for resource in resource_rows {
+                let (id, json) =
+                    resource.map_err(|error| HtsError::StorageError(error.to_string()))?;
+                stored_resources.insert(id, json);
+            }
+        }
+    }
+
+    let mut results = Vec::with_capacity(selected.len());
+    for row in selected {
+        let resource = stored_resources
+            .remove(&row.id)
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_else(|| {
+                code_system::build_synthetic_resource(
+                    resource_type,
+                    &row.id,
+                    &row.url,
+                    row.version.as_deref(),
+                    row.name.as_deref(),
+                    row.title.as_deref(),
+                    &row.status,
+                )
+            });
+        results.push(resource);
+    }
+    Ok(results)
+}
 
 /// Insert `(key, value)` into a bounded cache, evicting one existing entry when
 /// the map is already at `max` capacity.
@@ -872,6 +1005,29 @@ mod tests {
     #[test]
     fn backend_name_is_sqlite() {
         assert_eq!(backend().backend_name(), "sqlite");
+    }
+
+    #[test]
+    fn string_search_rolls_back_after_query_error() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        let query = ResourceSearchQuery::default();
+        let search = ResourceStringSearch::new(&query);
+
+        let error = search_resources(
+            &mut conn,
+            "missing_search_table",
+            "CodeSystem",
+            query,
+            search,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, HtsError::StorageError(_)));
+        assert!(
+            conn.is_autocommit(),
+            "failed search must close its transaction"
+        );
     }
 
     #[test]

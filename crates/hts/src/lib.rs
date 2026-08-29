@@ -46,6 +46,7 @@ pub(crate) mod language;
 pub mod operations;
 pub mod server;
 pub mod state;
+pub mod string_search;
 pub mod traits;
 pub mod types;
 pub(crate) mod ucum_validate;

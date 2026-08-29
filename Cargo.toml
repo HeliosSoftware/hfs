@@ -21,6 +21,7 @@ default-members = [
 	"crates/sof",
 	"crates/cds-hooks",
 	"crates/hts",
+	"crates/hts-ui",
 	"crates/auth",
 	"crates/audit",
 	"crates/subscriptions",

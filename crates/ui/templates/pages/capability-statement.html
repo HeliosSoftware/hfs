@@ -33,12 +33,20 @@
   <div class="card__body">
     <p>
       {% for i in view.interactions %}
-      <span class="tag">{{ i.code }}</span>
+      {% if !i.href.is_empty() %}
+      <a class="tag {{ i.tag_class }}" href="{{ i.href }}" target="_blank" rel="noopener">{{ i.code }}</a>
+      {% else %}
+      <span class="tag {{ i.tag_class }}">{{ i.code }}</span>
+      {% endif %}
       {% endfor %}
     </p>
-    {% for i in view.interactions %}{% if i.conditional %}
-    <p class="page-head__lede">{{ i18n.t("cap-transaction-note") }}</p>
-    {% endif %}{% endfor %}
+    {% if view.has_conditional_transaction %}
+    <p class="cap-transaction-note">
+      {{ i18n.t("cap-transaction-note") }}
+      <a href="https://github.com/HeliosSoftware/hfs/blob/main/crates/persistence/README.md#primarysecondary-role-matrix"
+         target="_blank" rel="noopener">{{ i18n.t("cap-role-matrix") }}</a>
+    </p>
+    {% endif %}
   </div>
 </section>
 
@@ -56,8 +64,8 @@
         <tr>
           <td>${{ op.name }}</td>
           <td>
-            {% if !op.definition_path.is_empty() %}
-            <a class="url" href="{{ op.definition_path }}">{{ op.definition }}</a>
+            {% if !op.definition_href.is_empty() %}
+            <a class="url" href="{{ op.definition_href }}" target="_blank" rel="noopener">{{ op.definition }}</a>
             {% else %}
             <span class="url">{{ op.definition }}</span>
             {% endif %}
@@ -69,17 +77,21 @@
   </div>
 </section>
 
-<section class="card table-card">
+<section class="card table-card cap-resource-card">
   <div class="card-head">
     <h3>{{ i18n.t("cap-resources-heading") }}</h3>
     <!-- Server-side narrowing: a plain GET form, so it works without JS. -->
-    <form class="filter-rail__search" method="get" action="/ui/capability-statement" role="search">
+    <form class="filter-rail__search cap-resource-filter" method="get" action="/ui/capability-statement" role="search">
       <input type="search" name="filter" value="{{ filter }}"
              placeholder="{{ i18n.t("cap-filter-placeholder") }}"
-             aria-label="{{ i18n.t("cap-filter-placeholder") }}">
+             aria-label="{{ i18n.t("cap-filter-placeholder") }}"
+             hx-get="/ui/capability-statement" hx-include="closest form"
+             hx-trigger="input changed delay:300ms, search"
+             hx-target="#cap-resource-table" hx-select="#cap-resource-table"
+             hx-swap="outerHTML">
     </form>
   </div>
-  <div class="table-wrap">
+  <div class="table-wrap" id="cap-resource-table">
     <table class="data-table">
       <thead>
         <tr>
@@ -93,8 +105,14 @@
       <tbody>
         {% for r in view.resources %}
         <tr>
-          <td>{{ r.resource_type }}</td>
-          <td>{% for i in r.interactions %}<span class="tag">{{ i }}</span> {% endfor %}</td>
+          <td>
+            {% if !r.resource_href.is_empty() %}
+            <a href="{{ r.resource_href }}" target="_blank" rel="noopener">{{ r.resource_type }}</a>
+            {% else %}
+            <span>{{ r.resource_type }}</span>
+            {% endif %}
+          </td>
+          <td>{% for i in r.interactions %}<span class="tag {{ i.tag_class }}">{{ i.code }}</span> {% endfor %}</td>
           <td class="col-num">{{ r.search_param_count }}</td>
           <td class="col-num">{{ r.include_count }}</td>
           <td class="col-num">{{ r.revinclude_count }}</td>
@@ -114,7 +132,11 @@
     <span class="icon">{% include "icons/chevron-down.svg" %}</span>
   </summary>
   <div class="card__body">
+    {% if raw_fallback %}
     <pre class="detail__code">{{ raw }}</pre>
+    {% else %}
+    {% include "partials/json-view.html" %}
+    {% endif %}
   </div>
 </details>
 {% else %}
