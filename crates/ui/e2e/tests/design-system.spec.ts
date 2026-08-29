@@ -101,6 +101,66 @@ test("every page <h1> uses the canonical .page-head__title", async ({ page, requ
   expect(offenders, `page titles off the canonical class:\n${offenders.join("\n")}`).toEqual([]);
 });
 
+test("every rendered table uses the canonical .data-table", async ({ page, request }) => {
+  const offenders: string[] = [];
+  for (const route of [...ROUTES, await seedBulkImportDetail(request)]) {
+    await page.goto(route, { waitUntil: "networkidle" });
+    const tables = await page.$$eval("table:not(.data-table)", (nodes) =>
+      nodes.map((node) => {
+        const id = node.id ? `#${node.id}` : "";
+        const classes = Array.from(node.classList)
+          .map((name) => `.${name}`)
+          .join("");
+        return `${node.tagName.toLowerCase()}${id}${classes}`;
+      }),
+    );
+    for (const table of tables) offenders.push(`${route}: ${table}`);
+  }
+  expect(offenders, `tables off the canonical class:\n${offenders.join("\n")}`).toEqual([]);
+});
+
+test("data tables share one alignment contract", async ({ page }) => {
+  await page.goto("/ui");
+  await page.evaluate(() => {
+    const probe = document.createElement("table");
+    probe.id = "data-table-contract";
+    probe.className = "data-table";
+    probe.innerHTML = `
+      <thead>
+        <tr>
+          <th data-probe="ordinary-header">Name</th>
+          <th class="col-num" data-probe="numeric-header">Count</th>
+          <th class="col-actions" data-probe="actions-header">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td data-probe="ordinary-cell">Example</td>
+          <td class="col-num" data-probe="numeric-cell">123</td>
+          <td class="col-actions" data-probe="actions-cell"></td>
+        </tr>
+        <tr class="data-table__empty">
+          <td class="col-actions" colspan="3" data-probe="empty-cell">No results</td>
+        </tr>
+      </tbody>
+    `;
+    document.body.append(probe);
+  });
+
+  const probe = page.locator("#data-table-contract");
+  for (const name of ["ordinary-header", "ordinary-cell", "numeric-header", "numeric-cell"]) {
+    await expect(probe.locator(`[data-probe='${name}']`)).toHaveCSS("text-align", "left");
+  }
+  for (const name of ["numeric-header", "numeric-cell"]) {
+    await expect(probe.locator(`[data-probe='${name}']`)).toHaveCSS("font-variant-numeric", "tabular-nums");
+  }
+  for (const name of ["actions-header", "actions-cell"]) {
+    const action = probe.locator(`[data-probe='${name}']`);
+    await expect(action).toHaveCSS("text-align", "right");
+  }
+  await expect(probe.locator("[data-probe='empty-cell']")).toHaveCSS("text-align", "center");
+});
+
 test("ordinary actions resolve to the canonical button scale on every page", async ({ page, request }) => {
   const offenders: string[] = [];
   const primaryColors = new Map<string, string[]>();
@@ -215,6 +275,135 @@ test("shared query-builder actions stay 30px while their inputs keep the field s
       await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
       for (const control of ["#query-copy", ".query-recent__toggle", "[data-intent='run']", "[data-intent='save']"]) {
         await expect(page.locator(`#saved-query-form ${control}`)).toHaveCSS("height", "30px");
+      }
+    }
+  }
+});
+
+test("shared back links match the Figma geometry on both consumers", async ({
+  page,
+  request,
+}) => {
+  const css = postcss.parse(await stylesheet(request));
+  let sourceRule:
+    | { selectors: string[]; declarations: Record<string, string> }
+    | undefined;
+  css.walkRules((rule) => {
+    if (!rule.selectors.includes(".back-link") || !rule.selectors.includes(".back-link:visited")) {
+      return;
+    }
+    const declarations: Record<string, string> = {};
+    rule.walkDecls((declaration) => {
+      declarations[declaration.prop] = declaration.value;
+    });
+    sourceRule = { selectors: rule.selectors, declarations };
+  });
+  expect(sourceRule?.selectors).toEqual(
+    expect.arrayContaining([".back-link", ".back-link:visited"]),
+  );
+  expect(sourceRule?.declarations).toMatchObject({
+    display: "inline-flex",
+    "align-items": "center",
+    gap: "7px",
+    "margin-bottom": "24px",
+    "font-size": "13px",
+    color: "var(--accent-text)",
+    "text-decoration": "none",
+  });
+  let headerRule: Record<string, string> | undefined;
+  css.walkRules((rule) => {
+    if (!rule.selectors.includes(".page-head--back-link")) return;
+    const declarations: Record<string, string> = {};
+    rule.walkDecls((declaration) => {
+      declarations[declaration.prop] = declaration.value;
+    });
+    headerRule = declarations;
+  });
+  expect(headerRule).toMatchObject({
+    display: "grid",
+    "grid-template-columns": "minmax(0, 1fr) auto",
+    "column-gap": "16px",
+    "align-items": "start",
+  });
+  expect(headerRule?.["grid-template-areas"]).toContain('"back-link ."');
+  expect(headerRule?.["grid-template-areas"]).toContain('"copy action"');
+
+  const consumers = [
+    { name: "bulk import detail", route: await seedBulkImportDetail(request) },
+    { name: "active bulk exports", route: "/ui/bulk-export/active" },
+  ];
+  for (const theme of ["light", "dark"] as const) {
+    await page.goto("/ui");
+    await page.evaluate((selected) => localStorage.setItem("hfs-theme", selected), theme);
+    for (const viewport of [
+      { name: "wide", width: 1440, height: 900 },
+      { name: "narrow", width: 390, height: 844 },
+    ] as const) {
+      await page.setViewportSize(viewport);
+      for (const consumer of consumers) {
+        await page.goto(consumer.route, { waitUntil: "networkidle" });
+        await expect(page.locator("html"), `${consumer.name} should use ${theme} theme`).toHaveAttribute(
+          "data-theme",
+          theme,
+        );
+
+        const link = page.locator("a.back-link");
+        const icon = link.locator("svg");
+        const label = link.locator(":scope > span").last();
+        const title = page.locator(".page-head__title");
+        const action = page.locator(".page-head--back-link > .page-head__action");
+        const actionControl = action.locator(
+          ":scope > a.btn, :scope > details > summary.btn",
+        );
+        await expect(action).toHaveCount(1);
+        await expect(actionControl).toHaveCount(1);
+        await expect(actionControl).toBeVisible();
+        // Grid items are blockified, so the authored inline-flex computes to
+        // flex here. The source-rule assertion above guards the shared value.
+        await expect(link).toHaveCSS("display", "flex");
+        await expect(link).toHaveCSS("font-size", "13px");
+        await expect(link).toHaveCSS("gap", "7px");
+        await expect(link).toHaveCSS("margin-bottom", "24px");
+        await expect(icon).toHaveAttribute("width", "5");
+        await expect(icon).toHaveAttribute("height", "8");
+
+        const [linkBox, iconBox, labelBox, titleBox, actionBox] = await Promise.all([
+          link.boundingBox(),
+          icon.boundingBox(),
+          label.boundingBox(),
+          title.boundingBox(),
+          action.boundingBox(),
+        ]);
+        expect(linkBox).not.toBeNull();
+        expect(iconBox).not.toBeNull();
+        expect(labelBox).not.toBeNull();
+        expect(titleBox).not.toBeNull();
+        expect(actionBox).not.toBeNull();
+        expect(Math.abs(labelBox!.x - (iconBox!.x + iconBox!.width) - 7)).toBeLessThanOrEqual(1);
+        expect(Math.abs(titleBox!.y - (linkBox!.y + linkBox!.height) - 24)).toBeLessThanOrEqual(1);
+        expect(actionBox!.y).toBeGreaterThan(linkBox!.y + linkBox!.height);
+        expect(Math.abs(actionBox!.y - titleBox!.y)).toBeLessThanOrEqual(1);
+
+        const normal = await link.evaluate((element) => {
+          const style = getComputedStyle(element);
+          return { color: style.color, decoration: style.textDecorationLine };
+        });
+        expect(normal.decoration).toBe("none");
+        await link.hover();
+        await expect(link).toHaveCSS("color", normal.color);
+        await expect(link).toHaveCSS("text-decoration-line", /underline/);
+        await link.focus();
+        await expect(link).toHaveCSS("outline-style", "solid");
+        await expect(link).toHaveCSS("outline-width", "2px");
+        await expect(link).toHaveCSS("outline-color", normal.color);
+
+        if (viewport.name === "narrow") {
+          expect(
+            await page.evaluate(
+              () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+            ),
+          ).toBe(true);
+        }
       }
     }
   }

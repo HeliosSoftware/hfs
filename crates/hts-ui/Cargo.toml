@@ -1,0 +1,79 @@
+[package]
+name = "helios-hts-ui"
+version.workspace = true
+edition.workspace = true
+description = "Optional server-rendered HTMX administrative UI for the Helios Terminology Server (HTS)"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/hts-ui"
+keywords = ["helios-software", "fhir", "terminology", "ui", "htmx"]
+
+[features]
+# FHIR version features forward to helios-fhir so the UI's read paths cover
+# exactly the version the hts binary is built with. R4 is the workspace default.
+default = ["R4"]
+R4 = ["helios-fhir/R4"]
+R4B = ["helios-fhir/R4B"]
+R5 = ["helios-fhir/R5"]
+R6 = ["helios-fhir/R6"]
+
+[dependencies]
+# FHIR types for typed request/response shaping in later Phase 2 slices.
+helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+# Typed upstream fetch errors surfaced as translated degraded/outcome partials.
+thiserror = "2"
+# `tokio::join!` for the two-legged dashboard fetch. `rt` is enough — we are
+# hosted in the hts binary's runtime, we do not create our own. `sync`
+# supplies the `RwLock`/`Semaphore` primitives Slice E's batch-validate
+# workbench uses to bound per-row fan-out (design doc §7.6 F1=D). `time`
+# supplies the per-row upstream timeout wrapper.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+
+# HTTP proxy client for future Phase 2 slices that call HTS routes over
+# loopback when `HTS_UI_UPSTREAM_URL` is set (see design doc §7 degraded
+# state contract). Not used by the Phase 1 dashboard stub, but declared here
+# so Wave 2 slices land without touching the manifest.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+async-trait = "0.1"
+
+# Multi-map body parsing for workbench POSTs — `serde_urlencoded` (axum's
+# default form parser) collapses repeated keys, but the CodeSystem
+# `$lookup` form sends repeatable `property` checkboxes (design doc §7.3).
+form_urlencoded = "1"
+
+# Web framework — same major/minor as helios-hts / helios-ui.
+axum = "0.8"
+chrono.workspace = true
+
+# Compile-time, type-checked, auto-escaping templates. Markup lives in
+# `templates/`, never in Rust source.
+askama = "0.16"
+
+# Typed htmx header handling: `HxRequest` extractor for the fragment-vs-page
+# branch, and `AutoVaryLayer` for correct HTTP caching (`Vary: HX-Request`).
+axum-htmx = { version = "0.8", features = ["auto-vary"] }
+
+# Static assets (htmx, CSS) embedded into the binary at compile time so the
+# server has no runtime CDN dependency (see design doc §8, #551 D6). During
+# Phase 1 the `Assets` embed points at `../ui/assets` so we do not duplicate
+# CSS/JS bytes; Phase 8 (post-#543) unifies these under `helios-ui-chrome`.
+rust-embed = { version = "8", features = ["debug-embed"] }
+axum-embed = "0.1"
+
+# Fluent message catalogs (locales/<locale>/main.ftl at the workspace root).
+# All user-visible strings live there (#551 D5); templates hold keys only.
+fluent-templates = "0.13"
+unic-langid = { version = "0.9", features = ["macros"] }
+
+[dev-dependencies]
+# Parses the .ftl sources so tests can enforce key-set parity across locales.
+fluent-syntax = "0.11"
+# Drive the mounted router end-to-end (locale middleware included).
+tokio = { version = "1", features = ["macros", "rt", "net"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
