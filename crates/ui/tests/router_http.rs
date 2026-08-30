@@ -450,6 +450,13 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         .unwrap();
     let html = body_text(response).await;
     assert!(html.contains("4.0.1"));
+    assert!(html.contains(r#"<div class="kv-grid kv-grid--flush">"#));
+    assert!(
+        html.contains(r#"<div class="detail__field detail__field--wide"><span>Description</span>"#)
+    );
+    assert!(
+        html.contains(r#"<div class="detail__field detail__field--wide"><span>Base URL</span>"#)
+    );
     assert!(html.contains(
         r#"href="https://hl7.org/fhir/R4/http.html#batch" target="_blank" rel="noopener">batch</a>"#
     ));
@@ -1894,6 +1901,9 @@ async fn sql_export_and_files_follow_a_job_through_the_manifest() {
     let html = body_text(response).await;
     assert!(html.contains(r#"value="ViewDefinition/vd1""#));
     assert!(html.contains(r#"value="Library/q1""#));
+    assert!(html.contains(
+        r#"<form method="post" action="/ui/sql/export" class="card__body detail-stack">"#
+    ));
 
     // Starting redirects to the job the gateway handed back.
     let response = app
@@ -1937,6 +1947,13 @@ async fn sql_export_and_files_follow_a_job_through_the_manifest() {
         .unwrap();
     let html = body_text(response).await;
     assert!(html.contains("2/3"));
+    assert!(html.contains(r#"<div class="card__body">"#));
+    assert!(html.contains(r#"<div class="kv-grid kv-grid--flush">"#));
+    assert_eq!(
+        html.matches(r#"class="detail__field detail__field--wide""#)
+            .count(),
+        2
+    );
     assert!(html.contains("/ui/sql/export/cancel"));
 
     // Files tables the manifest with its download links.
@@ -1950,6 +1967,11 @@ async fn sql_export_and_files_follow_a_job_through_the_manifest() {
         .await
         .unwrap();
     let html = body_text(response).await;
+    assert!(
+        html.contains(
+            r#"<form method="get" action="/ui/sql/files" class="card__body detail-stack">"#
+        )
+    );
     assert!(html.contains("patients"));
     assert!(html.contains(r#"href="http://s/export/job-9/patients-0.csv""#));
     assert!(html.contains(">csv<"));
