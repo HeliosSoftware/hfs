@@ -607,12 +607,40 @@ impl ResourceStorage for PostgresBackend {
         // did rather than differently.
         //
         // `RETURNING` feeds the history row from the tuple just written, so the
-        // deletion entry carries the resource's own `data` and `fhir_version`
-        // without either making a round trip through the client. As in `create`
-        // and `update`, no matching row means the CTE yields nothing, the insert
-        // selects nothing, and the statement reports zero rows affected — one
-        // signal for both writes. One statement is also one implicit
-        // transaction: the tombstone lands with the delete or neither does.
+        // deletion entry carries the resource's own `fhir_version` without
+        // making a round trip through the client. As in `create` and `update`,
+        // no matching row means the CTE yields nothing, the insert selects
+        // nothing, and the statement reports zero rows affected — one signal for
+        // both writes. One statement is also one implicit transaction: the
+        // tombstone lands with the delete or neither does.
+        //
+        // ## The tombstone stores `'null'::jsonb`, not the resource
+        //
+        // A deletion entry is the record that the resource was deleted, not a
+        // version of the resource: FHIR gives it `request.method = DELETE` and
+        // no `resource` in a history Bundle, and `410 Gone` on a vread of that
+        // version. `history_entry_to_json` has always omitted the body, and the
+        // vread handler now answers `410`, so nothing can ask for these bytes.
+        //
+        // Storing them was not free. `data` is a JSONB body of a few kilobytes;
+        // the `UPDATE` above does not touch that column, so `resources` keeps
+        // its existing TOAST datum untouched, but a TOAST pointer cannot be
+        // shared across tables — inserting it into `resource_history` detoasts
+        // the value, re-compresses it, writes it, and puts the whole body in the
+        // WAL a second time. That was 10.6% of the crud suite's Postgres
+        // execution time on run 33213565802 for a row no reader can reach.
+        //
+        // `'null'::jsonb` rather than `NULL` because `resource_history.data` is
+        // `NOT NULL` (schema v1) and both `vread` and the history readers deserialise
+        // the column into a `serde_json::Value` with a non-nullable `FromSql`;
+        // a SQL `NULL` would panic in `row.get`, and widening the column would
+        // put a migration and six read sites in the way of a write-path change.
+        // `Value::Null` reaches the same readers as a well-formed value that
+        // renders as `null`, and they already discard it for a deleted version.
+        //
+        // Rows written by an older build keep their bodies and are read back
+        // exactly as before; nothing needs backfilling, because the only reader
+        // was already dropping the value on the floor.
         let updated = execute_cached(
                 &client,
                 "WITH del AS (
@@ -623,10 +651,10 @@ impl ResourceStorage for PostgresBackend {
                          version_id = ((CASE WHEN version_id ~ '^[0-9]+$' THEN version_id::bigint ELSE 0 END) + 1)::text
                      WHERE tenant_id = $2 AND resource_type = $3 AND id = $4
                        AND is_deleted = FALSE
-                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
+                     RETURNING tenant_id, resource_type, id, version_id, last_updated, is_deleted, fhir_version
                  )
                  INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version FROM del",
+                 SELECT tenant_id, resource_type, id, version_id, 'null'::jsonb, last_updated, is_deleted, fhir_version FROM del",
                 &[&now, &tenant_id, &resource_type, &id],
             )
             .await
