@@ -1128,6 +1128,39 @@ jobs:
               if chk.get('fails', 0) > 0:
                   chk_fmt = f"**{chk_fmt}**"
               print(f"| {suite} | {rps:,.0f} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
+
+          # ── How loaded the shared Docker host was ──────────────────────────
+          #
+          # The Postgres container runs on a Docker host shared with every other
+          # testcontainers job in the repo, and the crud suite is bound by that
+          # container. Across six runs of one unchanged branch on 2026-08-31 the
+          # same statements cost 1.90 to 6.70 ms of Postgres execution per call,
+          # and crud moved 6,391 -> 4,418 RPS with it — a 3.5x environmental
+          # spread that dwarfs every code change measured in this workflow's
+          # history. A run that does not say how loaded the host was cannot be
+          # compared to another one.
+          #
+          # `pg ms/call` is `pg_exec_total_s / calls` over the crud window: every
+          # statement Postgres ran, including ones no change here touches, so it
+          # moves with the host and not with the code. Lower is a quieter host.
+          import re
+          pgstat = f"{results_dir}/crud-pgstat.txt"
+          contention = f"{results_dir}/host-contention.txt"
+          if os.path.exists(pgstat):
+              t = open(pgstat).read()
+              m = re.search(r"^\s*([\d.]+)\s*\|\s*[\d.]+\s*\|\s*(\d+)\s*$", t, re.M)
+              if m:
+                  exec_s, calls = float(m.group(1)), int(m.group(2))
+                  per_call = exec_s * 1000.0 / calls if calls else 0.0
+                  load = ""
+                  if os.path.exists(contention):
+                      c = re.search(r"suite=crud phase=start host_loadavg=(\S+).*host_containers=(\d+)",
+                                    open(contention).read())
+                      if c:
+                          load = f", host loadavg {c.group(1)} over {c.group(2)} containers at crud start"
+                  flag = " ⚠ **contended — do not compare this run's crud to a quiet one**" if per_call > 3.0 else ""
+                  print(f"\n**Environment:** crud Postgres cost **{per_call:.2f} ms/call** "
+                        f"({exec_s:,.0f} s over {calls:,} statements{load}).{flag}")
           PYEOF
           } >> "$GITHUB_STEP_SUMMARY"
 
