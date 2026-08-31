@@ -153,8 +153,12 @@ async fn the_export_page_offers_scopes_types_and_filters() {
     assert!(html.contains("Everything"));
     assert!(html.contains("All Resources"));
     assert!(html.contains(r#"name="types" value="Patient""#));
+    assert!(html.contains(r#"class="typegrid__item" data-full-name="Patient" title="Patient""#));
+    assert!(html.contains(r#"<span class="typegrid__label">Patient</span>"#));
     assert!(html.contains("Narrow it down"));
     assert!(html.contains("Start Export"));
+    assert!(html.contains(r#"<script src="/ui/assets/resource-filter.js" defer></script>"#));
+    assert!(html.contains(r#"<script src="/ui/assets/bulk-export.js" defer></script>"#));
 }
 
 #[tokio::test]
@@ -199,6 +203,21 @@ async fn the_export_page_uses_form_panels_with_name_and_all_resources_up_top() {
     let patient = &html[patient_pos..patient_end];
     assert!(!patient.contains("checked"));
     assert!(!patient.contains("disabled"));
+
+    // Custom instant remains enabled in server-rendered HTML so the no-JS
+    // form can still submit it; bulk-export.js disables it for other presets.
+    let since_custom_pos = html
+        .find(r#"name="since_custom""#)
+        .expect("custom instant input present");
+    let since_custom_start = html[..since_custom_pos]
+        .rfind("<input")
+        .expect("custom instant input starts");
+    let since_custom_end = since_custom_pos
+        + html[since_custom_pos..]
+            .find('>')
+            .expect("custom instant input ends");
+    let since_custom = &html[since_custom_start..=since_custom_end];
+    assert!(!since_custom.contains("disabled"));
 }
 
 #[tokio::test]

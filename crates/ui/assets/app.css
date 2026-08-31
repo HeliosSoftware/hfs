@@ -2631,9 +2631,9 @@ details.json-fold[open] > summary .icon {
   font-variant-numeric: tabular-nums;
 }
 
-/* Appended to <body> and positioned from the focused/hovered rail item so the
-   full label is not clipped by the rail's scrolling overflow. One shared
-   tooltip serves both the main list and cloneNode()-based Recent items. */
+/* Appended to <body> and positioned from the focused/hovered truncated-name
+   item so the full label is not clipped by rail or grid overflow. One shared
+   tooltip serves rails, cloneNode()-based Recent items, and Bulk Export. */
 .filter-rail__tooltip {
   position: fixed;
   z-index: 1000;
@@ -5471,6 +5471,22 @@ details.json-fold[open] > summary .icon {
   display: flex;
   gap: 8px;
   align-items: center;
+  min-width: 0;
+}
+
+.typegrid__item > input {
+  flex: none;
+}
+
+/* Resource names share the rail's clipped-name tooltip. Keep their text
+   inside its grid track instead of allowing a long flex item to overlap the
+   next column (#793). */
+.typegrid__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---- Bulk Export against the Figma frame (#735) ---------------------- */

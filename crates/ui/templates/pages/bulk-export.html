@@ -69,7 +69,10 @@
       <label class="typegrid__item"><input type="checkbox" name="all_types" checked> {{ i18n.t("bulk-export-all-resources") }}</label>
       <div class="typegrid">
         {% for t in resource_types %}
-        <label class="typegrid__item"><input type="checkbox" name="types" value="{{ t }}"> {{ t }}</label>
+        <label class="typegrid__item" data-full-name="{{ t }}" title="{{ t }}">
+          <input type="checkbox" name="types" value="{{ t }}">
+          <span class="typegrid__label">{{ t }}</span>
+        </label>
         {% endfor %}
       </div>
     </div>
@@ -124,5 +127,6 @@
   </div>
 </form>
 {% endif %}
+<script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/bulk-export.js" defer></script>
 {% endblock %}

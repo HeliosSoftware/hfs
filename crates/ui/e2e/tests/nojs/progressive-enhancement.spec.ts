@@ -186,3 +186,30 @@ test("Bulk Export can narrow through a conflicting native form without JavaScrip
   expect(params.get("all_types")).toBe("on");
   expect(params.getAll("types")).toEqual(["Patient"]);
 });
+
+test("Bulk Export submits an exact custom instant without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+
+  const instant = "2026-08-01T00:00:00Z";
+  await bulkExport.sincePreset.selectOption("custom");
+  await expect(bulkExport.sinceCustom).toBeEnabled();
+  await bulkExport.sinceCustom.fill(instant);
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+
+  const request = await submitted;
+  const params = new URLSearchParams(request.postData() ?? "");
+  expect(params.get("since_preset")).toBe("custom");
+  expect(params.get("since_custom")).toBe(instant);
+});
