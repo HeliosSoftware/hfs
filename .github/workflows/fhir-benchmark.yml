@@ -92,17 +92,17 @@ on:
         required: false
         default: "10MB"
       pg_max_wal_size:
-        description: "Postgres max_wal_size (upstream postgres.conf uses 8GB; we cap lower for the shared Docker host's disk)"
+        description: "Postgres max_wal_size (upstream postgres.conf value)"
         required: false
-        default: "4GB"
+        default: "8GB"
       pg_min_wal_size:
-        description: "Postgres min_wal_size (upstream postgres.conf uses 2GB)"
+        description: "Postgres min_wal_size (upstream postgres.conf value)"
         required: false
-        default: "1GB"
+        default: "2GB"
       pg_wal_buffers:
-        description: "Postgres wal_buffers (upstream postgres.conf uses 256MB)"
+        description: "Postgres wal_buffers (upstream postgres.conf value)"
         required: false
-        default: "64MB"
+        default: "256MB"
       pg_checkpoint_timeout:
         description: "Postgres checkpoint_timeout (upstream postgres.conf uses 15min; PG's default is 5min)"
         required: false
@@ -503,13 +503,15 @@ jobs:
           # than aidbox's did and paid a full-page write on the first touch of
           # every page after each one — a self-inflicted handicap on the two
           # write suites, not a property of HFS.
-          # max_wal_size is capped below upstream's 8GB because our Docker host
-          # is shared and has taken the repo's testcontainers jobs down before
-          # by filling (see run 30550776427); 4GB still moves checkpoints from
-          # "every few seconds under crud" to "bounded by checkpoint_timeout".
-          PG_MAX_WAL_SIZE="${{ inputs.pg_max_wal_size || '4GB' }}"
-          PG_MIN_WAL_SIZE="${{ inputs.pg_min_wal_size || '1GB' }}"
-          PG_WAL_BUFFERS="${{ inputs.pg_wal_buffers || '64MB' }}"
+          # These are upstream's exact values. They were capped at 4GB/1GB/64MB
+          # on the first run of this change, out of the concern that the shared
+          # Docker host might fill (run 30550776427). The `df` added beside the
+          # write canary settles it: the host root is **200 G with 170 G free**
+          # (run 33409768172), so 8 GB of WAL segments is not a risk worth
+          # trading fidelity for.
+          PG_MAX_WAL_SIZE="${{ inputs.pg_max_wal_size || '8GB' }}"
+          PG_MIN_WAL_SIZE="${{ inputs.pg_min_wal_size || '2GB' }}"
+          PG_WAL_BUFFERS="${{ inputs.pg_wal_buffers || '256MB' }}"
           PG_CHECKPOINT_TIMEOUT="${{ inputs.pg_checkpoint_timeout || '15min' }}"
 
           if [ "$PG_SHARED_BUFFERS" = "auto" ]; then
