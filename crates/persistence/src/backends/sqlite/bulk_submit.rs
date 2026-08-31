@@ -635,17 +635,31 @@ impl BulkSubmitProvider for SqliteBackend {
 
         let mut results = Vec::new();
         let mut error_count = 0u32;
+        let mut changes: Vec<SubmissionChange> = Vec::new();
+        let mut aborted_on_max_errors = false;
+
+        // One IMMEDIATE transaction per batch (#813): entry rows, history,
+        // and search-index writes for the whole batch land on a single fsync
+        // instead of four-plus autocommits per resource. The connection is
+        // held across sync statement runs only — batch inputs arrived as a
+        // Vec, and the change/receipt inserts run in their own batches after
+        // commit — so #646/#711's held-across-awaits deadlock stays out.
+        let mut txn = <Self as crate::core::TransactionProvider>::begin_transaction(
+            self,
+            tenant,
+            crate::core::TransactionOptions {
+                fhir_version: Some(FhirVersion::default_enabled()),
+                ..Default::default()
+            },
+        )
+        .await?;
 
         for entry in entries {
             // Check if we've hit max errors
             if options.max_errors > 0 && error_count >= options.max_errors {
                 if !options.continue_on_error {
-                    return Err(StorageError::BulkSubmit(
-                        BulkSubmitError::MaxErrorsExceeded {
-                            submission_id: submission_id.submission_id.clone(),
-                            max_errors: options.max_errors,
-                        },
-                    ));
+                    aborted_on_max_errors = true;
+                    break;
                 }
                 // Skip remaining entries
                 let skip_result = BulkEntryResult::skipped(
@@ -657,9 +671,8 @@ impl BulkSubmitProvider for SqliteBackend {
                 continue;
             }
 
-            // Process the entry
             let result = self
-                .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
+                .ingest_entry_in_txn(&mut txn, manifest_id, &entry, options, &mut changes)
                 .await;
 
             let entry_result = match result {
@@ -685,18 +698,29 @@ impl BulkSubmitProvider for SqliteBackend {
                 error_count += 1;
             }
 
-            // Store the result, keyed by the file it came from (#457): line
-            // numbers restart per file, so the file is part of the identity.
-            self.store_entry_result(
-                tenant,
-                submission_id,
-                manifest_id,
-                options.file_url.as_deref().unwrap_or(""),
-                &entry_result,
-            )
-            .await?;
-
             results.push(entry_result);
+        }
+
+        crate::core::Transaction::commit(Box::new(txn)).await?;
+
+        // The rollback log and the per-line receipts (keyed by file, #457)
+        // batch the same way: one transaction each.
+        self.record_changes_batch(tenant, submission_id, &changes)?;
+        self.store_entry_results_batch(
+            tenant,
+            submission_id,
+            manifest_id,
+            options.file_url.as_deref().unwrap_or(""),
+            &results,
+        )?;
+
+        if aborted_on_max_errors {
+            return Err(StorageError::BulkSubmit(
+                BulkSubmitError::MaxErrorsExceeded {
+                    submission_id: submission_id.submission_id.clone(),
+                    max_errors: options.max_errors,
+                },
+            ));
         }
 
         // Update manifest counts, on a fresh connection: the loop above is
@@ -844,25 +868,23 @@ impl BulkSubmitProvider for SqliteBackend {
 }
 
 impl SqliteBackend {
-    /// Process a single NDJSON entry.
-    async fn process_single_entry(
+    /// One NDJSON entry inside the batch transaction (#813): read, then
+    /// update (import-mode aware) or create, collecting the rollback record
+    /// for the post-commit batch insert. Same outcomes as the former
+    /// per-entry autocommit path, minus its per-entry fsyncs.
+    async fn ingest_entry_in_txn(
         &self,
-        tenant: &TenantContext,
-        submission_id: &SubmissionId,
+        txn: &mut super::transaction::SqliteTransaction,
         manifest_id: &str,
         entry: &NdjsonEntry,
         options: &BulkProcessingOptions,
+        changes: &mut Vec<SubmissionChange>,
     ) -> StorageResult<BulkEntryResult> {
-        // Check if resource has an ID
-        let resource_id = entry.resource_id.as_ref();
+        use crate::core::Transaction;
 
-        if let Some(id) = resource_id {
-            // Check if resource exists
-            let existing = self.read(tenant, &entry.resource_type, id).await;
-
-            match existing {
-                Ok(Some(current)) => {
-                    // Resource exists - update if allowed
+        if let Some(id) = entry.resource_id.as_ref() {
+            match txn.read(&entry.resource_type, id).await? {
+                Some(current) => {
                     if !options.allow_updates {
                         return Ok(BulkEntryResult::skipped(
                             entry.line_number,
@@ -871,7 +893,6 @@ impl SqliteBackend {
                         ));
                     }
 
-                    // Record change for rollback
                     let change = SubmissionChange::update(
                         manifest_id,
                         &entry.resource_type,
@@ -880,11 +901,11 @@ impl SqliteBackend {
                         (current.version_id().parse::<i32>().unwrap_or(0) + 1).to_string(),
                         current.content().clone(),
                     );
-                    self.record_change(tenant, submission_id, &change).await?;
 
                     // Update the resource, honoring the submission's import mode.
                     let content = options.content_for_update(current.content(), &entry.resource);
-                    let updated = self.update(tenant, &current, content).await?;
+                    let updated = txn.update(&current, content).await?;
+                    changes.push(change);
 
                     Ok(BulkEntryResult::success(
                         entry.line_number,
@@ -893,27 +914,19 @@ impl SqliteBackend {
                         false,
                     ))
                 }
-                Ok(None)
-                | Err(StorageError::Resource(crate::error::ResourceError::Gone { .. })) => {
-                    // Resource doesn't exist - create it
-                    // Use default FHIR version for bulk operations
-                    let created = self
-                        .create(
-                            tenant,
-                            &entry.resource_type,
-                            entry.resource.clone(),
-                            FhirVersion::default_enabled(),
-                        )
+                // A soft-deleted row reads as None and then fails the create
+                // with AlreadyExists — the same outcome the storage-path
+                // create produced, recorded as this entry's error.
+                None => {
+                    let created = txn
+                        .create(&entry.resource_type, entry.resource.clone())
                         .await?;
-
-                    // Record change for rollback
-                    let change = SubmissionChange::create(
+                    changes.push(SubmissionChange::create(
                         manifest_id,
                         &entry.resource_type,
                         created.id(),
                         created.version_id(),
-                    );
-                    self.record_change(tenant, submission_id, &change).await?;
+                    ));
 
                     Ok(BulkEntryResult::success(
                         entry.line_number,
@@ -922,28 +935,17 @@ impl SqliteBackend {
                         true,
                     ))
                 }
-                Err(e) => Err(e),
             }
         } else {
-            // No ID - create new resource
-            // Use default FHIR version for bulk operations
-            let created = self
-                .create(
-                    tenant,
-                    &entry.resource_type,
-                    entry.resource.clone(),
-                    FhirVersion::default_enabled(),
-                )
+            let created = txn
+                .create(&entry.resource_type, entry.resource.clone())
                 .await?;
-
-            // Record change for rollback
-            let change = SubmissionChange::create(
+            changes.push(SubmissionChange::create(
                 manifest_id,
                 &entry.resource_type,
                 created.id(),
                 created.version_id(),
-            );
-            self.record_change(tenant, submission_id, &change).await?;
+            ));
 
             Ok(BulkEntryResult::success(
                 entry.line_number,
@@ -954,47 +956,107 @@ impl SqliteBackend {
         }
     }
 
-    /// Store an entry result in the database.
-    async fn store_entry_result(
+    /// The batch's rollback records, in one transaction.
+    fn record_changes_batch(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        changes: &[SubmissionChange],
+    ) -> StorageResult<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let txn = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("begin change batch: {e}")))?;
+        {
+            let mut stmt = txn
+                .prepare(
+                    "INSERT INTO bulk_submission_changes
+                     (tenant_id, submitter, submission_id, change_id, manifest_id, change_type, resource_type, resource_id, previous_version, new_version, previous_content, changed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                )
+                .map_err(|e| internal_error(format!("prepare change insert: {e}")))?;
+            for change in changes {
+                let previous_content_bytes = change
+                    .previous_content
+                    .as_ref()
+                    .and_then(|c| serde_json::to_vec(c).ok());
+                stmt.execute(params![
+                    tenant_id,
+                    &submission_id.submitter,
+                    &submission_id.submission_id,
+                    &change.change_id,
+                    &change.manifest_id,
+                    change.change_type.to_string(),
+                    &change.resource_type,
+                    &change.resource_id,
+                    &change.previous_version,
+                    &change.new_version,
+                    previous_content_bytes,
+                    change.changed_at.to_rfc3339()
+                ])
+                .map_err(|e| internal_error(format!("Failed to record change: {}", e)))?;
+            }
+        }
+        txn.commit()
+            .map_err(|e| internal_error(format!("commit change batch: {e}")))
+    }
+
+    /// The batch's per-line receipts, in one transaction, keyed by the file
+    /// they came from (#457): line numbers restart per file, so the file is
+    /// part of the identity. OR REPLACE: the worker re-fetches a whole file
+    /// after a transient failure, and the retry must overwrite its own
+    /// earlier rows instead of colliding with them.
+    fn store_entry_results_batch(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: &str,
-        result: &BulkEntryResult,
+        results: &[BulkEntryResult],
     ) -> StorageResult<()> {
-        let conn = self.get_connection()?;
+        if results.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
-
-        let outcome_bytes = result
-            .operation_outcome
-            .as_ref()
-            .and_then(|o| serde_json::to_vec(o).ok());
-
-        // OR REPLACE: the worker re-fetches a whole file after a transient
-        // failure, and the retry must overwrite its own earlier rows instead
-        // of colliding with them (#457).
-        conn.execute(
-            "INSERT OR REPLACE INTO bulk_entry_results
-             (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                tenant_id,
-                &submission_id.submitter,
-                &submission_id.submission_id,
-                manifest_id,
-                file_url,
-                result.line_number as i64,
-                &result.resource_type,
-                &result.resource_id,
-                if result.created { Some(1) } else { Some(0) },
-                result.outcome.to_string(),
-                outcome_bytes
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to store entry result: {}", e)))?;
-
-        Ok(())
+        let txn = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("begin entry-result batch: {e}")))?;
+        {
+            let mut stmt = txn
+                .prepare(
+                    "INSERT OR REPLACE INTO bulk_entry_results
+                     (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )
+                .map_err(|e| internal_error(format!("prepare entry-result insert: {e}")))?;
+            for result in results {
+                let outcome_bytes = result
+                    .operation_outcome
+                    .as_ref()
+                    .and_then(|o| serde_json::to_vec(o).ok());
+                stmt.execute(params![
+                    tenant_id,
+                    &submission_id.submitter,
+                    &submission_id.submission_id,
+                    manifest_id,
+                    file_url,
+                    result.line_number as i64,
+                    &result.resource_type,
+                    &result.resource_id,
+                    if result.created { Some(1) } else { Some(0) },
+                    result.outcome.to_string(),
+                    outcome_bytes
+                ])
+                .map_err(|e| internal_error(format!("Failed to store entry result: {}", e)))?;
+            }
+        }
+        txn.commit()
+            .map_err(|e| internal_error(format!("commit entry-result batch: {e}")))
     }
 }
 
