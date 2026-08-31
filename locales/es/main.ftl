@@ -642,11 +642,12 @@ editor-hint-instant = FHIR instant: timestamp completo con zona horaria, p. ej. 
 subs-title = Suscripciones
 subs-lede = Vista de solo lectura del motor de suscripciones: cada suscripción registrada, su canal, estado en vivo y contadores de entrega.
 subs-unavailable = El motor de suscripciones no está habilitado en este servidor.
+subs-unavailable-how = Actívalo arrancando HFS con:
 subs-empty = No hay suscripciones registradas para este tenant.
 subs-card-failing = Fallando
-subs-card-failing-sub = requiere atención
+subs-card-failing-sub = Requiere atención
 subs-card-idle = Inactivas
-subs-card-idle-sub = sin clientes
+subs-card-idle-sub = Sin clientes
 subs-card-active = Activas
 subs-card-active-sub = entregando
 subs-card-delivered = Entregadas en 24 h
@@ -663,11 +664,11 @@ subs-col-status = Estado
 subs-col-last24 = Últimas 24 h
 subs-col-sent = Enviadas
 subs-col-fails = Racha de fallos
-subs-state-active = activa
-subs-state-error = error
+subs-state-active = Activa
+subs-state-error = Error
 subs-state-idle = 0 clientes
-subs-state-requested = solicitada
-subs-state-off = apagada
+subs-state-requested = Solicitada
+subs-state-off = Apagada
 
 ## Bulk Export workspace (#537)
 
@@ -786,6 +787,9 @@ vd-delete-failed = No se pudo eliminar la definición de vista.
 vd-json-heading = Definición (JSON)
 vd-results-heading = Resultados
 vd-results-empty = La vista no produjo filas.
+vd-pagination-label = Páginas de definiciones de vistas
+vd-page-prev = Anterior
+vd-page-next = Siguiente
 
 ## Espacios de consultas y vistas SQL (#649)
 

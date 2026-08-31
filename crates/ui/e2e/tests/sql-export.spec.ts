@@ -3,6 +3,7 @@
 // Files page with the manifest's download links.
 import { expect, test } from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
+import { expectDetailFieldSpacing } from "../pages/detail-spacing";
 
 test("an export runs through to downloadable manifest files", async ({ page, request }) => {
   const patientId = await createResource(request, "Patient", { name: [{ family: "ExportE2E" }] });
@@ -19,6 +20,7 @@ test("an export runs through to downloadable manifest files", async ({ page, req
   await waitSearchable(request, "Patient", patientId);
 
   await page.goto("/ui/sql/export");
+  await expectDetailFieldSpacing(page, "SQL Export form");
   await page.locator(`input[value='ViewDefinition/${vdId}']`).check();
   await page.locator("form[action='/ui/sql/export'] button[type='submit']").click();
   await expect(page).toHaveURL(/job=/);
@@ -30,8 +32,14 @@ test("an export runs through to downloadable manifest files", async ({ page, req
       throw new Error("still running");
     }
   }).toPass({ timeout: 20000 });
+  await expectDetailFieldSpacing(page, "SQL Export job");
+  await expect(page.locator(".card__body > .kv-grid--flush").first()).toHaveCSS(
+    "margin-bottom",
+    "0px",
+  );
 
   await page.locator("a[href^='/ui/sql/files?job=']").click();
+  await expectDetailFieldSpacing(page, "SQL Files job form");
   // One output named after the subject's id, with a download link.
   await expect(page.locator(".data-table td", { hasText: vdId }).first()).toBeVisible();
   await expect(page.locator(".data-table a").first()).toBeVisible();

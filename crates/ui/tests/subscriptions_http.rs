@@ -105,21 +105,29 @@ impl SubscriptionsProvider for Fixed {
 
 #[tokio::test]
 async fn the_page_goes_from_unavailable_to_the_live_dashboard() {
-    // Phase 1 — no provider registered: the page explains itself and the
-    // sidebar hides the entry (the feature is not advertised).
+    // Phase 1 — no provider registered: the nav entry is present anyway
+    // (#767) and the page explains what to do, naming the switch and the
+    // build feature rather than a bare "unavailable".
     let (status, html) = get("/ui/subscriptions").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("subs") || !html.is_empty());
     assert!(
         html.contains("not enabled on this server"),
         "unavailable state renders"
     );
     assert!(
-        !html.contains(r#"href="/ui/subscriptions""#),
-        "nav entry hidden while not advertised"
+        html.contains("HFS_SUBSCRIPTIONS_ENABLED"),
+        "the off state names the switch"
+    );
+    assert!(
+        html.contains("--features subscriptions"),
+        "the off state names the build feature"
+    );
+    assert!(
+        html.contains(r#"href="/ui/subscriptions""#),
+        "nav entry present with the engine off"
     );
 
-    // Phase 2 — provider registered: cards, rows, chips, and the nav entry.
+    // Phase 2 — provider registered: cards, rows, dots, and the nav entry.
     set_provider(Arc::new(Fixed));
     let (status, html) = get("/ui/subscriptions").await;
     assert_eq!(status, StatusCode::OK);
@@ -135,13 +143,17 @@ async fn the_page_goes_from_unavailable_to_the_live_dashboard() {
     );
     assert!(html.contains("96.2"), "first-try rate renders");
 
-    // Rows: the failing subscription leads (worst first), the idle websocket
+    // Rows: the failing subscription leads (worst first) and carries the red
+    // edge, statuses render as dots with plain labels, the idle websocket
     // shows the 0-clients state with no streak, and the streak prints.
     let error_at = html.find("obs-critical").expect("error row");
     let active_at = html.find("encounter-start").expect("active row");
     assert!(error_at < active_at, "errors sort first");
-    assert!(html.contains(r#"tag--error"#));
-    assert!(html.contains(r#"tag--idle"#));
+    assert!(html.contains(r#"class="row--alert""#), "failing row edge");
+    assert!(html.contains(r#"status-dot--danger"#));
+    assert!(html.contains(r#"status-dot--ok"#));
+    assert!(html.contains(r#"status-dot--warn"#));
+    assert!(!html.contains(r#"tag--error"#), "pills gave way to dots");
     assert!(html.contains("0 clients"));
     assert!(html.contains(">7<"), "fail streak renders");
     assert!(html.contains("4,182"));

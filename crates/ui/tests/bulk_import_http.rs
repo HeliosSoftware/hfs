@@ -308,7 +308,7 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
         )
     );
     assert_eq!(html.matches("bulk-import-section").count(), 1);
-    assert!(html.contains(r#"<div class="kv-grid">"#));
+    assert!(html.contains(r#"<div class="kv-grid kv-grid--flush">"#));
     assert!(!html.contains(r#"class="card detail""#));
 
     // Machine-readable values stay mono while human-readable labels remain
@@ -1064,7 +1064,7 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert!(html.contains("processing 0% complete"), "{html}");
     assert!(html.contains("every 5s"), "keeps polling: {html}");
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
-    assert!(html.contains(r#"class="kv-grid""#));
+    assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
     assert!(
         html.contains(&format!(r#"action="{detail_path}/abort""#)),
         "abort on the progress card: {html}"
@@ -1077,7 +1077,7 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert!(!html.contains("every 5s"), "polling stopped: {html}");
     assert!(html.contains("Output files"), "{html}");
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
-    assert!(html.contains(r#"class="kv-grid""#));
+    assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
     assert!(html.contains("Processing finished at <code>"), "{html}");
     assert!(!html.contains(&format!(r#"action="{detail_path}/abort""#)));
     assert!(!html.contains(r#"class="card detail""#));

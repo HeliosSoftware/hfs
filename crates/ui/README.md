@@ -239,7 +239,9 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current`, `.btn--icon` | The action button: 30px high, 12px horizontal padding, 12px type, and a 9px radius. Primary, danger, and current change emphasis only; `--icon` makes the control a 30px square with no horizontal padding. |
 | `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
 | `.panel` | Padding for a full-width card that hosts detail fields without rail behavior. |
-| `.kv-grid` | Responsive two-column key/value layout; collapses to one column on compact viewports. |
+| `.detail__field`, `.detail__field--wide` | One labelled value. The field owns the 5px label/value gap; `--wide` spans all columns when the field is inside a key/value grid. |
+| `.detail-stack` | Padding-free vertical composition for detail fields and form actions, with a 12px gap. Direct `.form-actions` children rely on that gap instead of adding their usual top margin. |
+| `.kv-grid`, `.kv-grid--flush` | Responsive two-column key/value layout with 14px row and 18px column gaps; it collapses to one column at 1250px. `--flush` removes the grid's trailing margin when its container already provides the bottom inset. |
 | `.page-head`, `.page-head__title`, `.page-head__lede`, `.page-head--row` | Page heading block; the only `<h1>` treatment; `--row` puts an action on the right. |
 | `.back-link` | In-page return link with theme-safe normal, visited, hover, and focus states. |
 | `.table-wrap` > `.data-table`, `.col-num`, `.col-actions`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper: ordinary headers and data align left; `.col-num` uses tabular figures without changing alignment; `.col-actions` aligns right; empty-state rows stay centered; the footer hosts pagination. |
@@ -260,6 +262,43 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.filter-rail`, `.nav-panel` | Left rails: the filter list inside a page; the type panel flush against the sidebar. |
 | `.icon-button`, `.icon-button--danger` | Bare 30px-square icon action (table rows), with the action-button 9px radius. |
 | `.busy-status` > `.spinner` | Inline working state: the ring plus a short label, `role="status"` in the markup so it announces. |
+
+Labeled values follow one spacing contract: `.detail__field` owns only its 5px
+internal label/value gap, while its direct parent owns the larger external
+rhythm. Use `.detail-stack`, `.kv-grid`, `.detail`, or `.tester` as that parent;
+do not add outer margins to individual fields or place them directly in a
+generic `.card__body`.
+
+```text
+Parent owns external rhythm (> 5px)
+
+  Wide metadata (> 1250px)                 Compact metadata (<= 1250px)
+  ┌──────────────────────────────────┐      ┌─────────────────────────┐
+  │ DESCRIPTION — full width         │      │ DESCRIPTION — full width│
+  │   ↕ 5px  value                   │      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ BASE URL — full width            │      │ BASE URL — full width   │
+  │   ↕ 5px  value                   │      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ FHIR VERSION       ← 18px → STATUS│      │ FHIR VERSION            │
+  │   ↕ 5px value          ↕ 5px value│      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ KIND               ← 18px → DATE │      │ STATUS                  │
+  │   ↕ 5px value          ↕ 5px value│      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ FORMATS             │              │      │ KIND                    │
+  │   ↕ 5px value       │              │      │   ↕ 5px  value          │
+  └──────────────────────────────────┘      │          ↕ 14px         │
+                                            │ DATE                    │
+                                            │   ↕ 5px  value          │
+                                            │          ↕ 14px         │
+                                            │ FORMATS                 │
+                                            │   ↕ 5px  value          │
+                                            └─────────────────────────┘
+
+  `.detail-stack` uses the same contract vertically: 12px between fields,
+  while each field keeps exactly 5px between its label and value.
+```
 
 Starting a new page: copy `templates/pages/_scaffold.html` (or crib
 `tenants.html`, the smallest real page). Both compose only this vocabulary.

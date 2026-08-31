@@ -645,11 +645,12 @@ editor-hint-instant = FHIR instant: full timestamp with timezone, e.g. 2024-05-1
 subs-title = Subscriptions
 subs-lede = Read-only view of the subscriptions engine: every registered subscription, its channel, live status, and delivery counters.
 subs-unavailable = The subscriptions engine is not enabled on this server.
+subs-unavailable-how = Turn it on by starting HFS with:
 subs-empty = No subscriptions are registered for this tenant.
 subs-card-failing = Failing
-subs-card-failing-sub = needs attention
+subs-card-failing-sub = Needs attention
 subs-card-idle = Idle
-subs-card-idle-sub = no clients
+subs-card-idle-sub = No clients
 subs-card-active = Active
 subs-card-active-sub = delivering
 subs-card-delivered = Delivered in 24 h
@@ -666,11 +667,11 @@ subs-col-status = Status
 subs-col-last24 = Last 24 hrs
 subs-col-sent = Sent
 subs-col-fails = Fail streak
-subs-state-active = active
-subs-state-error = error
+subs-state-active = Active
+subs-state-error = Error
 subs-state-idle = 0 clients
-subs-state-requested = requested
-subs-state-off = off
+subs-state-requested = Requested
+subs-state-off = Off
 
 ## Bulk Export workspace (#537)
 
@@ -789,6 +790,9 @@ vd-delete-failed = Could not delete the view definition.
 vd-json-heading = Definition (JSON)
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
+vd-pagination-label = View definition pages
+vd-page-prev = Previous
+vd-page-next = Next
 
 ## SQL Queries / SQL Views workspaces (#649)
 

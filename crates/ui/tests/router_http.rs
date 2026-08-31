@@ -457,6 +457,13 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         .unwrap();
     let html = body_text(response).await;
     assert!(html.contains("4.0.1"));
+    assert!(html.contains(r#"<div class="kv-grid kv-grid--flush">"#));
+    assert!(
+        html.contains(r#"<div class="detail__field detail__field--wide"><span>Description</span>"#)
+    );
+    assert!(
+        html.contains(r#"<div class="detail__field detail__field--wide"><span>Base URL</span>"#)
+    );
     assert!(html.contains(
         r#"href="https://hl7.org/fhir/R4/http.html#batch" target="_blank" rel="noopener">batch</a>"#
     ));
@@ -1905,6 +1912,9 @@ async fn sql_export_and_files_follow_a_job_through_the_manifest() {
     let html = body_text(response).await;
     assert!(html.contains(r#"value="ViewDefinition/vd1""#));
     assert!(html.contains(r#"value="Library/q1""#));
+    assert!(html.contains(
+        r#"<form method="post" action="/ui/sql/export" class="card__body detail-stack">"#
+    ));
 
     // Starting redirects to the job the gateway handed back.
     let response = app
@@ -1948,6 +1958,13 @@ async fn sql_export_and_files_follow_a_job_through_the_manifest() {
         .unwrap();
     let html = body_text(response).await;
     assert!(html.contains("2/3"));
+    assert!(html.contains(r#"<div class="card__body">"#));
+    assert!(html.contains(r#"<div class="kv-grid kv-grid--flush">"#));
+    assert_eq!(
+        html.matches(r#"class="detail__field detail__field--wide""#)
+            .count(),
+        2
+    );
     assert!(html.contains("/ui/sql/export/cancel"));
 
     // Files tables the manifest with its download links.
@@ -1961,6 +1978,11 @@ async fn sql_export_and_files_follow_a_job_through_the_manifest() {
         .await
         .unwrap();
     let html = body_text(response).await;
+    assert!(
+        html.contains(
+            r#"<form method="get" action="/ui/sql/files" class="card__body detail-stack">"#
+        )
+    );
     assert!(html.contains("patients"));
     assert!(html.contains(r#"href="http://s/export/job-9/patients-0.csv""#));
     assert!(html.contains(">csv<"));
@@ -2199,6 +2221,238 @@ async fn view_definitions_save_roundtrips_and_rejects_bad_json() {
     let html = body_text(response).await;
     assert!(html.contains("invalid JSON"));
     assert!(html.contains("{nope"));
+}
+
+fn view_definitions_app(source: helios_ui::StaticConformanceSource) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+/// #741: the rail is one page of a server-side search, not the whole
+/// tenant collection — with more than one page of stored views, page 1 holds
+/// the first 50 (name-sorted) with a "next" link, and page 2 holds the rest
+/// with a "previous" link and no "next". Both links preserve the (empty)
+/// filter.
+#[tokio::test]
+async fn view_definitions_rail_paginates_across_pages_of_fifty() {
+    let vds: Vec<Value> = (1..=52)
+        .map(|n| {
+            serde_json::json!({"resourceType": "ViewDefinition", "id": format!("vd{n:03}"),
+                "name": format!("vd_{n:03}"), "resource": "Patient"})
+        })
+        .collect();
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vds,
+    );
+    let app = view_definitions_app(source);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"data-type="vd001""#),
+        "first page holds vd001"
+    );
+    assert!(
+        html.contains(r#"data-type="vd050""#),
+        "first page holds vd050"
+    );
+    assert!(
+        !html.contains(r#"data-type="vd051""#),
+        "first page stops at 50"
+    );
+    assert!(
+        html.contains(r#"href="/ui/sql/view-definitions?page=2""#),
+        "a next link to page 2"
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?page=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        !html.contains(r#"data-type="vd050""#),
+        "the second page does not repeat the first"
+    );
+    assert!(
+        html.contains(r#"data-type="vd051""#),
+        "second page holds vd051"
+    );
+    assert!(
+        html.contains(r#"data-type="vd052""#),
+        "second page holds vd052"
+    );
+    // Page 1 is the implicit default, so the "previous" link omits `?page=`
+    // entirely rather than spelling out `page=1`.
+    assert!(
+        html.contains(r#"class="pagination""#)
+            && html.contains(r#"href="/ui/sql/view-definitions""#),
+        "a previous link back to the bare route (page 1)"
+    );
+    assert!(!html.contains("page=3"), "no next link past the last page");
+}
+
+/// #741: the search box filters server-side by name only — a substring that
+/// matches none of the stored names (even one that matches a resource type
+/// column, the old in-memory filter's now-removed extra match) narrows the
+/// rail to nothing, case-insensitively.
+#[tokio::test]
+async fn view_definitions_rail_filters_by_name_case_insensitively() {
+    let vds = vec![
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1",
+            "name": "Active_Patients", "resource": "Patient"}),
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd2",
+            "name": "blood_pressure", "resource": "Observation"}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vds,
+    );
+    let app = view_definitions_app(source);
+
+    // A mixed-case substring of the name matches, case-insensitively.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?filter=PATIENT")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-type="vd1""#));
+    assert!(!html.contains(r#"data-type="vd2""#));
+
+    // "Observation" matches vd2's resource type but neither stored name —
+    // the retired in-memory filter used to match this, `name:contains` does
+    // not.
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?filter=Observation")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"class="filter-rail__heading filter-rail__heading--group""#));
+    assert!(!html.contains(r#"data-type="vd1""#));
+    assert!(!html.contains(r#"data-type="vd2""#));
+}
+
+/// #741: a `?vd=` the current filter excludes from the rail still loads
+/// through the direct-by-id read (ticket 01) — selection is independent of
+/// what the rail happens to show.
+#[tokio::test]
+async fn view_definitions_selection_survives_a_filter_that_excludes_it() {
+    let vds = vec![
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "keep",
+            "name": "keep_me", "resource": "Patient"}),
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "other",
+            "name": "exclude_me", "resource": "Patient"}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vds,
+    );
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=keep&filter=exclude")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The rail shows only what the filter matches...
+    assert!(html.contains(r#"data-type="other""#));
+    assert!(!html.contains(r#"data-type="keep""#));
+    // ...but the editor still holds the selected view the filter excluded.
+    assert!(html.contains(r#"name="json""#));
+    assert!(html.contains("keep_me"));
+}
+
+/// #741: a failed rail search shows the same degradation notice the page has
+/// always shown for a failed fetch — never a 500, and never a stale
+/// full-collection fallback.
+#[tokio::test]
+async fn view_definitions_rail_degrades_when_search_fails() {
+    struct FailingSearchSource;
+
+    #[async_trait::async_trait]
+    impl helios_ui::ConformanceSource for FailingSearchSource {
+        async fn fetch(
+            &self,
+            _resource_type: &str,
+            _version: helios_fhir::FhirVersion,
+            _tenant: &str,
+        ) -> Result<Vec<Value>, String> {
+            Ok(Vec::new())
+        }
+        // `search_page` falls back to the trait's default `Err`.
+    }
+
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(FailingSearchSource),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("The view definition list could not be loaded."));
+    assert!(html.contains("search is not available from this source"));
 }
 
 #[tokio::test]

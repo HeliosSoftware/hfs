@@ -2563,6 +2563,31 @@ select.field__input {
   margin-top: 12px;
 }
 
+/* Shared labelled-value compositions. The flush modifier sets the value that
+   the existing key/value grid consumes in the later page layer, so component
+   ownership does not depend on !important or layer-breaking specificity. */
+:where(.detail__field) {
+  min-width: 0;
+}
+
+:where(.detail__field) > div {
+  overflow-wrap: anywhere;
+}
+
+.detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail-stack > .form-actions {
+  margin-top: 0;
+}
+
+.kv-grid--flush {
+  --kv-grid-margin-bottom: 0;
+}
+
 .json-editor--short {
   min-height: 120px;
 }
@@ -2881,12 +2906,12 @@ details.json-fold[open] > summary .icon {
 
 /* FHIR publication-status tags (HTS browsers + resource detail headers).
    Distinct from the .tag--stored/config/conflict family: those describe
-   configuration/lint outcomes, these describe a resource's own status.
+   configuration/lint outcomes, these describe a resource's own status. */
+.tag--active {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
 
-   `active` is deliberately absent here: the subscription-state block below
-   already defines `.tag--active` with the identical treatment, and defining
-   it twice is what `design-system.spec.ts` forbids. FHIR's `active` status
-   and a live subscription happen to want the same pill. */
 .tag--draft {
   background: var(--warn-soft);
   color: var(--warn);
@@ -2903,22 +2928,38 @@ details.json-fold[open] > summary .icon {
   border: 1px solid var(--surface-border);
   color: var(--muted);
 }
-/* Subscription states (#580): the cards and the STATUS column share this
-   vocabulary — active delivers, idle has no listeners, error needs attention. */
-.tag--active {
-  background: var(--ok-soft);
-  color: var(--ok);
+
+/* Subscription states (#580, reshaped to the frame in #767): the cards and
+   the STATUS column share a dot vocabulary — green delivers, amber has no
+   listeners, red needs attention. */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  border-radius: 50%;
+  vertical-align: baseline;
 }
 
-.tag--idle,
-.tag--requested {
-  background: var(--warn-soft);
-  color: var(--warn);
+.status-dot--ok {
+  background: var(--ok);
 }
 
-.tag--error {
-  background: var(--danger-soft);
-  color: var(--danger);
+.status-dot--danger {
+  background: var(--danger);
+}
+
+.status-dot--warn {
+  background: var(--warn);
+}
+
+.status-dot--muted {
+  background: var(--muted);
+}
+
+/* A failing row carries the frame's red left edge. */
+.data-table tr.row--alert > td:first-child {
+  box-shadow: inset 3px 0 0 var(--danger);
 }
 
 /* Bulk Export job states (#537) — the same status-pill vocabulary. */
@@ -2949,6 +2990,21 @@ details.json-fold[open] > summary .icon {
 .subs-sort summary.btn::-webkit-details-marker {
   display: none;
 }
+
+.subs-sort__label {
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.subs-sort__chevron {
+  transition: transform 120ms ease;
+}
+
+.subs-sort[open] .subs-sort__chevron {
+  transform: rotate(180deg);
+}
 }
 
 @layer pages {
@@ -2962,10 +3018,6 @@ details.json-fold[open] > summary .icon {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 18px 24px;
   align-items: start;
-}
-
-.bulk-import-summary-card > .kv-grid {
-  margin-bottom: 0;
 }
 
 .bulk-import-summary__actions {
@@ -3042,11 +3094,6 @@ details.json-fold[open] > summary .icon {
     gap: 7px;
     padding: 8px;
   }
-}
-
-/* Status cards have no actions or content after their sole grid. */
-#bulk-status.bulk-import-section > .kv-grid:only-child {
-  margin-bottom: 0;
 }
 
 /* Detail panel (right rail on the SearchParameter viewer) */
@@ -3345,7 +3392,7 @@ details.json-fold[open] > summary .icon {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px 18px;
-  margin-bottom: 14px;
+  margin-bottom: var(--kv-grid-margin-bottom, 14px);
 }
 
 .detail__field--wide {

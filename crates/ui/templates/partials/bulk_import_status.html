@@ -3,7 +3,7 @@
      hx-get="/ui/bulk-import/{{ id }}/status"
      hx-trigger="every 5s"
      hx-swap="outerHTML">
-  <div class="kv-grid">
+  <div class="kv-grid kv-grid--flush">
     <div class="detail__field detail__field--wide">
       <span>{{ i18n.t("bulk-import-processing") }}</span>
       <div>{% if !progress.is_empty() %}{{ progress }}{% else %}{{ i18n.t("bulk-import-processing-waiting") }}{% endif %}</div>
@@ -20,7 +20,7 @@
 {% else %}
 {% if !completed_at.is_empty() %}
 <div id="bulk-status" class="card panel bulk-import-section">
-  <div class="kv-grid">
+  <div class="kv-grid kv-grid--flush">
     <div class="detail__field detail__field--wide">
       <span>{{ i18n.t("bulk-import-result") }}</span>
       <div>{{ i18n.t("bulk-import-result-finished") }} <code>{{ completed_at }}</code></div>
