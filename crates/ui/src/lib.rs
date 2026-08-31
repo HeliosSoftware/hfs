@@ -41,6 +41,7 @@
 mod bulk_export;
 mod bulk_import;
 mod capability;
+mod capability_json;
 mod compartments;
 mod conformance;
 mod editor;
@@ -739,6 +740,25 @@ struct JsonViewFragment {
     json_view_paths: bool,
 }
 
+/// A small CapabilityStatement (or subtree) rendered by the unchanged shared
+/// JSON highlighter.
+#[derive(Template)]
+#[template(path = "partials/capability-json-full.html")]
+struct CapabilityJsonFullFragment {
+    i18n: I18n,
+    json_lines: Vec<json_view::JsonLine>,
+    json_view_id: String,
+    json_view_paths: bool,
+}
+
+/// One bounded level of a large CapabilityStatement.
+#[derive(Template)]
+#[template(path = "partials/capability-json-outline.html")]
+struct CapabilityJsonOutlineFragment {
+    i18n: I18n,
+    outline: capability_json::Outline,
+}
+
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
 /// are codegen'd into the binary; a tenant-scoped override layer is open
 /// question 1 on the issue.
@@ -1068,6 +1088,10 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         .route("/ui/compartments", get(compartments_page))
         // Read-only live CapabilityStatement (#653).
         .route("/ui/capability-statement", get(capability_page))
+        .route(
+            "/ui/capability-statement/json-fragment",
+            get(capability_json_fragment),
+        )
         // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
         .route("/ui/batch", get(batch_page))
         // SQL on FHIR workspaces (#649).
@@ -2738,14 +2762,17 @@ struct CapabilityPage {
     active_page: &'static str,
     /// `None` when the self-fetch failed — the page degrades to a warning.
     view: Option<capability::CapabilityView>,
-    /// Highlighted, foldable JSON when the statement fits the render budget.
-    json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
-    /// Pretty-printed raw statement when highlighted rendering exceeds its
-    /// budget. Askama escapes it inside the fallback `<pre>`.
+    /// Pretty-printed JSON for the explicit no-JavaScript fallback. This never
+    /// passes through the highlighted renderer.
     raw: String,
-    raw_fallback: bool,
+    /// Whether this request explicitly asked for the plain JSON fallback.
+    raw_requested: bool,
+    /// Version- and filter-preserving URL used by the ordinary no-JS link.
+    raw_url: String,
+    /// Bounded, server-driven JSON root loaded by htmx.
+    fragment_url: String,
+    /// Effective version carried by the resource filter's ordinary GET form.
+    effective_version: &'static str,
     /// The server-side resource-type filter, echoed back into the form.
     filter: String,
 }
@@ -2753,6 +2780,100 @@ struct CapabilityPage {
 #[derive(Deserialize, Default)]
 struct CapabilityQuery {
     filter: Option<String>,
+    version: Option<String>,
+    /// A string flag because the public query spelling is `raw=1`, not a Serde
+    /// boolean literal such as `raw=true`.
+    raw: Option<String>,
+}
+
+fn capability_raw_url(filter: &str, version: helios_fhir::FhirVersion) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("raw", "1");
+    query.append_pair("version", version.as_str());
+    query.append_pair("filter", filter);
+    format!("/ui/capability-statement?{}", query.finish())
+}
+
+#[derive(Deserialize, Default)]
+struct CapabilityJsonQuery {
+    version: Option<String>,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+fn bounded_capability_fragment<T: Template>(template: T) -> Response {
+    match template.render() {
+        Ok(html) if html.len() <= capability_json::MAX_FRAGMENT_HTML_BYTES => {
+            Html(html).into_response()
+        }
+        Ok(_) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "CapabilityStatement fragment exceeds the rendering budget",
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render error: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn capability_json_fragment(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<CapabilityJsonQuery>,
+) -> Response {
+    let version = match query.version.as_deref() {
+        Some(value) => match search_params::version_from_str(value) {
+            Some(version) => version,
+            None => return (StatusCode::BAD_REQUEST, "Unsupported FHIR version").into_response(),
+        },
+        None => rv.0,
+    };
+    let statement = match state.conformance.metadata(version, &rt.id).await {
+        Ok(statement) => statement,
+        Err(error) => {
+            tracing::warn!("CapabilityStatement fragment fetch failed: {error}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CapabilityStatement is unavailable",
+            )
+                .into_response();
+        }
+    };
+    let limit = query.limit.unwrap_or(capability_json::DEFAULT_PAGE_SIZE);
+    match capability_json::plan(&statement, &query.path, query.offset, limit, version) {
+        Ok(capability_json::View::Full(json_lines)) => {
+            bounded_capability_fragment(CapabilityJsonFullFragment {
+                i18n: I18n::new(locale),
+                json_lines,
+                json_view_id: if query.path.is_empty() {
+                    "capability-json".to_string()
+                } else {
+                    String::new()
+                },
+                json_view_paths: false,
+            })
+        }
+        Ok(capability_json::View::Outline(outline)) => {
+            bounded_capability_fragment(CapabilityJsonOutlineFragment {
+                i18n: I18n::new(locale),
+                outline,
+            })
+        }
+        Err(capability_json::Error::NotFound) => {
+            (StatusCode::NOT_FOUND, "JSON path not found").into_response()
+        }
+        Err(capability_json::Error::InvalidPointer | capability_json::Error::InvalidPage) => {
+            (StatusCode::BAD_REQUEST, "Invalid JSON fragment request").into_response()
+        }
+    }
 }
 
 async fn capability_page(
@@ -2763,51 +2884,42 @@ async fn capability_page(
     Query(query): Query<CapabilityQuery>,
 ) -> Response {
     let filter = query.filter.unwrap_or_default();
-    let fetched = state.conformance.metadata(rv.0, &rt.id).await;
-    let (view, json_lines, raw, raw_fallback) = match fetched {
+    let version = query
+        .version
+        .as_deref()
+        .and_then(search_params::version_from_str)
+        .unwrap_or(rv.0);
+    let raw_requested = query.raw.as_deref() == Some("1");
+    let raw_url = capability_raw_url(&filter, version);
+    let fetched = state.conformance.metadata(version, &rt.id).await;
+    let (view, raw) = match fetched {
         Ok(statement) => {
-            let mut view = capability::build_view(&statement, rv.0);
+            let mut view = capability::build_view(&statement, version);
             if !filter.is_empty() {
                 let needle = filter.to_lowercase();
                 view.resources
                     .retain(|r| r.resource_type.to_lowercase().contains(&needle));
             }
-            const MAX_LINES: usize = 4_000;
-            const MAX_ESTIMATED_HTML_BYTES: usize = 2 * 1024 * 1024;
-            match json_view::try_lines(
-                &statement,
-                json_view::RenderOptions {
-                    include_paths: false,
-                    budget: Some(json_view::RenderBudget {
-                        max_lines: MAX_LINES,
-                        max_estimated_html_bytes: MAX_ESTIMATED_HTML_BYTES,
-                    }),
-                },
-            ) {
-                Ok(lines) => (Some(view), lines, String::new(), false),
-                Err(_) => (
-                    Some(view),
-                    Vec::new(),
-                    serde_json::to_string_pretty(&statement).unwrap_or_default(),
-                    true,
-                ),
-            }
+            let raw = raw_requested
+                .then(|| serde_json::to_string_pretty(&statement).unwrap_or_default())
+                .unwrap_or_default();
+            (Some(view), raw)
         }
         Err(error) => {
             tracing::warn!("CapabilityStatement self-fetch failed: {error}");
-            (None, Vec::new(), String::new(), false)
+            (None, String::new())
         }
     };
     render(CapabilityPage {
-        status: current_status(&state, rv.0, &rt),
+        status: current_status(&state, version, &rt),
         i18n: I18n::new(locale),
         active_page: "capability-statement",
         view,
-        json_lines,
-        json_view_id: "capability-json".to_string(),
-        json_view_paths: false,
         raw,
-        raw_fallback,
+        raw_requested,
+        raw_url,
+        fragment_url: capability_json::root_fragment_url(version),
+        effective_version: version.as_str(),
         filter,
     })
 }

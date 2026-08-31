@@ -102,6 +102,27 @@ test("the CapabilityStatement filter submits a GET form with no JavaScript", asy
   await expect(capabilityStatement.resourceRow("Observation")).toHaveCount(0);
 });
 
+test("the CapabilityStatement raw fallback is plain JSON with no JavaScript", async ({
+  page,
+  capabilityStatement,
+}) => {
+  await capabilityStatement.goto("?filter=Patient");
+  await capabilityStatement.rawSummary.click();
+  await expect(capabilityStatement.rawLoading).toBeHidden();
+  await capabilityStatement.rawLoadLink.click();
+
+  const url = new URL(page.url());
+  expect(url.pathname).toBe("/ui/capability-statement");
+  expect(url.searchParams.get("raw")).toBe("1");
+  expect(url.searchParams.get("version")).toBe("R4");
+  expect(url.searchParams.get("filter")).toBe("Patient");
+  await expect(capabilityStatement.rawDisclosure).toHaveAttribute("open", "");
+  await expect(capabilityStatement.rawBody.locator("pre.detail__code")).toBeVisible();
+  await expect(capabilityStatement.rawBody.getByText("Plain JSON fallback", { exact: false })).toBeVisible();
+  await expect(capabilityStatement.jsonView).toHaveCount(0);
+  await expect(capabilityStatement.rawBody.locator(".json-line")).toHaveCount(0);
+});
+
 test("a hard navigation returns the full page, not an htmx fragment", async ({ page, chrome }) => {
   // /ui/status is fragment-or-full depending on HX-Request; a plain load (no JS,
   // no htmx header) must get the whole document.

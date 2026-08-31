@@ -1,5 +1,9 @@
 import { test, expect } from "../pages/fixtures";
 
+type CapabilityJsonBody = HTMLElement & {
+  capabilityJsonXhr?: XMLHttpRequest | null;
+};
+
 test("Capability Statement links follow the active FHIR version", async ({
   capabilityStatement,
   chrome,
@@ -31,11 +35,170 @@ test("Capability Statement links follow the active FHIR version", async ({
   }[version];
   expect(expected, `No Capability Statement expectation is defined for ${version}`).toBeTruthy();
 
+  await expect(capabilityStatement.resourceFilterVersion).toHaveValue(version);
   await expect(capabilityStatement.fhirVersionSummary).toHaveText(expected!.summary);
   await expect(capabilityStatement.resourceLink("Patient")).toHaveAttribute(
     "href",
     expected!.patientHref,
   );
+});
+
+test("Capability Statement JSON expands in bounded reloadable fragments", async ({
+  page,
+  capabilityStatement,
+  chrome,
+}) => {
+  test.setTimeout(120_000);
+  const fragmentRequests = new Map<string, number>();
+  let releaseRoot!: () => void;
+  const rootGate = new Promise<void>((resolve) => {
+    releaseRoot = resolve;
+  });
+  let releaseRest!: () => void;
+  const restGate = new Promise<void>((resolve) => {
+    releaseRest = resolve;
+  });
+  let releaseRestItem!: () => void;
+  const restItemGate = new Promise<void>((resolve) => {
+    releaseRestItem = resolve;
+  });
+  const fragmentPath = (url: string): string | null => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== "/ui/capability-statement/json-fragment") return null;
+    return parsed.searchParams.get("path");
+  };
+  page.on("request", (request) => {
+    const path = fragmentPath(request.url());
+    if (path !== null) fragmentRequests.set(path, (fragmentRequests.get(path) ?? 0) + 1);
+  });
+  await page.route("**/ui/capability-statement/json-fragment?*", async (route) => {
+    const path = fragmentPath(route.request().url());
+    if (path === "") await rootGate;
+    if (path === "/rest" && fragmentRequests.get(path) === 1) await restGate;
+    if (path === "/rest/0" && fragmentRequests.get(path) === 1) await restItemGate;
+    await route.continue();
+  });
+
+  await capabilityStatement.goto("?filter=Patient");
+  const version = await chrome.currentVersion();
+  await expect(capabilityStatement.jsonView).toHaveCount(0);
+
+  const rootResponse = page.waitForResponse((response) => fragmentPath(response.url()) === "");
+  await capabilityStatement.rawSummary.click();
+  await expect(capabilityStatement.rawLoading).toBeVisible();
+  releaseRoot();
+  const response = await rootResponse;
+  expect(response.ok()).toBeTruthy();
+  const requested = new URL(response.url());
+  expect(requested.searchParams.get("version")).toBe(version);
+  expect(requested.searchParams.get("path")).toBe("");
+  expect(requested.searchParams.get("limit")).toBe("100");
+  expect(fragmentRequests.get("")).toBe(1);
+
+  await expect(capabilityStatement.jsonOutline).toBeVisible();
+  await expect(capabilityStatement.jsonOutline).toHaveAttribute("data-item-count", /\d+/);
+
+  const format = capabilityStatement.jsonNode(capabilityStatement.jsonOutline, "format");
+  const formatBody = capabilityStatement.nodeBody(format);
+  await format.locator(":scope > summary").click();
+  await expect(formatBody.locator("[data-capability-json-page], .json-view").first()).toBeVisible();
+  await expect(capabilityStatement.rawBody).toHaveCSS("overflow-y", "auto");
+  await expect(formatBody.locator(".json-view")).toHaveCSS("max-height", "none");
+  await expect(formatBody.locator(".json-view")).toHaveCSS("overflow-y", "visible");
+
+  const rest = capabilityStatement.jsonNode(capabilityStatement.jsonOutline, "rest");
+  const restBody = capabilityStatement.nodeBody(rest);
+  // An in-flight request is aborted and its busy state cleared when the node
+  // closes. Opening this sibling also closes and unloads the format branch.
+  await rest.locator(":scope > summary").click();
+  await expect(format).not.toHaveAttribute("open", "");
+  await expect(formatBody.locator("[data-capability-json-page], .json-view")).toHaveCount(0);
+  await expect(restBody).toHaveAttribute("aria-busy", "true");
+  await rest.locator(":scope > summary").click();
+  await expect(restBody).not.toHaveAttribute("aria-busy", "true");
+  releaseRest();
+  await rest.locator(":scope > summary").click();
+  await expect(restBody.locator("[data-capability-json-page], .json-view").first()).toBeVisible();
+  expect(fragmentRequests.get("/rest")).toBe(2);
+
+  // A collapsing ancestor aborts every descendant request before removing its
+  // DOM. Releasing the intercepted response afterward cannot perform a stale
+  // swap into the collapsed branch.
+  const restItem = restBody
+    .locator(":scope > .capability-json-outline > .capability-json-rows > details")
+    .first();
+  const restItemBody = capabilityStatement.nodeBody(restItem);
+  await restItem.locator(":scope > summary").click();
+  await expect(restItemBody).toHaveAttribute("aria-busy", "true");
+  const blockedBody = await restItemBody.elementHandle();
+  expect(blockedBody).not.toBeNull();
+  await expect
+    .poll(() =>
+      blockedBody!.evaluate((body) =>
+        Boolean((body as CapabilityJsonBody).capabilityJsonXhr),
+      ),
+    )
+    .toBe(true);
+  await rest.locator(":scope > summary").click();
+  expect(
+    await blockedBody!.evaluate(
+      (body) => (body as CapabilityJsonBody).capabilityJsonXhr === null,
+    ),
+  ).toBe(true);
+  expect(await blockedBody!.evaluate((body) => body.isConnected)).toBe(false);
+  releaseRestItem();
+  await expect(restBody.locator("[data-capability-json-page], .json-view")).toHaveCount(0);
+  await rest.locator(":scope > summary").click();
+  await expect(restBody.locator("[data-capability-json-page], .json-view").first()).toBeVisible();
+  expect(fragmentRequests.get("/rest")).toBe(3);
+
+  const reloadedRestItem = restBody
+    .locator(":scope > .capability-json-outline > .capability-json-rows > details")
+    .first();
+  const restItemBodyReloaded = capabilityStatement.nodeBody(reloadedRestItem);
+  await reloadedRestItem.locator(":scope > summary").click();
+  await expect(restItemBodyReloaded.locator(":scope > .capability-json-outline")).toBeVisible();
+
+  // The resource array is larger than one page on every supported version.
+  // Paging replaces the current 100-item page instead of accumulating rows.
+  const resource = capabilityStatement.jsonNode(
+    restItemBodyReloaded.locator(":scope > .capability-json-outline"),
+    "resource",
+  );
+  const resourceBody = capabilityStatement.nodeBody(resource);
+  await resource.locator(":scope > summary").click();
+  await expect(resourceBody.locator("[data-capability-json-page]")).toHaveAttribute(
+    "data-item-count",
+    "100",
+  );
+  const next = capabilityStatement.pageControl(resourceBody, "next");
+  await expect(next).toBeEnabled();
+  await next.click();
+  await expect(resourceBody.locator(".capability-json-pagination")).toContainText(/101–/);
+  const focusedPageControl = resourceBody.locator(
+    "[data-capability-json-page-direction]:focus",
+  );
+  await expect(focusedPageControl).toHaveCount(1);
+  const expectedFocusDirection = (await next.isEnabled()) ? "next" : "previous";
+  await expect(focusedPageControl).toHaveAttribute(
+    "data-capability-json-page-direction",
+    expectedFocusDirection,
+  );
+  const secondPageCount = Number(
+    await resourceBody.locator("[data-capability-json-page]").getAttribute("data-item-count"),
+  );
+  expect(secondPageCount).toBeGreaterThan(0);
+  expect(secondPageCount).toBeLessThanOrEqual(100);
+  expect(fragmentRequests.get("/rest/0/resource")).toBe(2);
+
+  // Closing the top-level disclosure unloads the entire incremental tree.
+  await capabilityStatement.rawSummary.click();
+  await expect(capabilityStatement.rawDisclosure).not.toHaveAttribute("open", "");
+  await expect(capabilityStatement.rawBody.locator("[data-capability-json-page], .json-view")).toHaveCount(0);
+  await capabilityStatement.rawSummary.click();
+  await expect(capabilityStatement.rawDisclosure).toHaveAttribute("open", "");
+  await expect(capabilityStatement.jsonOutline).toBeVisible();
+  expect(fragmentRequests.get("")).toBe(2);
 });
 
 test("typing filters resource capabilities live", async ({ capabilityStatement }) => {
