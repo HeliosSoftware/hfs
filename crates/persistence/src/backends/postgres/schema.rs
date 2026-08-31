@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 34;
+pub const SCHEMA_VERSION: i32 = 35;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -354,6 +354,7 @@ async fn migrate_schema(
             31 => migrate_v31_to_v32(client).await?,
             32 => migrate_v32_to_v33(client).await?,
             33 => migrate_v33_to_v34(client).await?,
+            34 => migrate_v34_to_v35(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -3238,6 +3239,58 @@ async fn migrate_v33_to_v34(client: &deadpool_postgres::Client) -> StorageResult
                 "LZ4 TOAST compression is unavailable on this server, keeping PGLZ ({sql}): {e}"
             );
         }
+    }
+
+    Ok(())
+}
+
+/// v34 -> v35: let autovacuum keep up with `search_index`.
+///
+/// `search_index` is by construction the highest-churn table in this schema: a
+/// resource rewrite deletes every one of its ~13.6 rows and inserts ~13.6 new
+/// ones, and a delete removes them all. On run 33400765064's five-minute crud
+/// window that is **35,658,526 inserts and 13,247,435 deletes**, against 18
+/// indexes, on a table holding 19.7M live rows — and autovacuum got through
+/// **two** passes, leaving 5,964,269 dead tuples behind at the end.
+///
+/// The cost of falling behind is not the dead tuples themselves, it is what
+/// they do to the index set. At the end of that run the indexes measured
+/// **10 GB against a 3,644 MB heap**, with `idx_search_token_code` at 3,294 MB
+/// and `idx_search_token_code_recent` at 3,083 MB — roughly twice what their
+/// entry widths account for. Postgres is running with `shared_buffers = 2GB`,
+/// so an index set that is twice its necessary size turns a b-tree descent that
+/// would hit cache into one that reads. The same `INSERT INTO search_index`
+/// costs **11.5 us/row on a local Postgres 18.6 and 0.39 ms/row here**; a
+/// factor of 8.4 of that is the container being saturated 8.4x, and what is
+/// left is buffer misses against those 10 GB.
+///
+/// Autovacuum cannot keep up because of its throttle, not its trigger.
+/// `autovacuum_vacuum_cost_delay` is 2 ms with `vacuum_cost_limit` 200, which
+/// bounds a worker to roughly 8 MB/s of dirty pages — for 13.2M dead tuples and
+/// the ~38M index entries behind them, in 302 seconds, on a 10 GB index set,
+/// that is not close. Raising the per-table cost limit tenfold raises the
+/// ceiling with it while leaving the delay in place, so the worker still yields
+/// rather than running unthrottled; and the scale factor moves the trigger from
+/// 20% of the table (3.9M dead tuples) to 5%, so a pass starts before the
+/// indexes have taken on that much slack.
+///
+/// These are table storage parameters — catalog-only, nothing is rewritten, and
+/// a deployment that disagrees can `ALTER TABLE ... RESET` them. They are set
+/// on `search_index` alone: it is the only table in the schema whose steady
+/// state is delete-and-reinsert.
+async fn migrate_v34_to_v35(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = ["ALTER TABLE search_index SET (\
+             autovacuum_vacuum_scale_factor = 0.05, \
+             autovacuum_vacuum_threshold = 50000, \
+             autovacuum_vacuum_cost_limit = 2000, \
+             autovacuum_analyze_scale_factor = 0.1\
+         )"];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v34->v35 failed: {}", e)))?;
     }
 
     Ok(())
