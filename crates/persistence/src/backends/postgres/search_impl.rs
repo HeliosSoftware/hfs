@@ -96,6 +96,105 @@ fn fast_index_pred(
     PostgresQueryBuilder::single_index_predicate(filter_sql?).map(str::to_string)
 }
 
+/// Whether the fast path's ordered scan needs a guard against an empty match
+/// set.
+///
+/// # The defect this closes
+///
+/// The fast path takes its page from `idx_search_quantity_recent`, which is
+/// keyed `(tenant_id, resource_type, param_name, last_updated DESC,
+/// resource_id)` — the scan streams the parameter slice newest-first and
+/// filters `value_quantity_value` from the payload as it goes, so the `LIMIT`
+/// can stop after 21 matches. Costing that plan needs the *selectivity* of the
+/// value predicate, and Postgres has only a table-wide histogram of
+/// `value_quantity_value` — one column shared by every `param_name` of every
+/// resource type. On the benchmark corpus `Observation.value-quantity` tops out
+/// at 54,786 while `component-value-quantity` rows in the same column reach
+/// 995,710, so `value_quantity_value >= 99999.5` is estimated at a fraction of
+/// a percent of the slice when the true count is **zero**. The planner prices
+/// the ordered scan as "read a few thousand entries and stop"; it walks all
+/// 512,311 entries of the slice and returns nothing.
+///
+/// Measured on run 33213565802: 199.5 s across 23,847 calls — **25.9 % of the
+/// whole search suite's Postgres execution time** — in the single statement
+/// ending `AND (value_quantity_value >= $3) ORDER BY last_updated DESC …
+/// LIMIT 21`, against 15.7 s across 23,823 calls for the two-sided `eq` form of
+/// the same parameter, which Postgres estimates correctly and serves from the
+/// value-first `idx_search_quantity`. 4.65 % of `value-quantity` requests took
+/// over 100 ms (p50 5.3 ms, p99 199.9 ms, max 438 ms), uniformly across the
+/// run, and the two `(value, prefix)` combinations `k6/searchConfig.js` issues
+/// with zero true matches — `gt 99999`, `ge 99999` — are 2 of its 42
+/// combinations, i.e. 4.76 %.
+///
+/// # Why a guard rather than an index or a statistics change
+///
+/// A one-sided range cannot be served by any single index at both densities:
+/// value-first reads only the matches but must sort them all to answer
+/// `ORDER BY last_updated` (500k rows for a broad range), recent-first is
+/// already ordered but must walk the slice until the `LIMIT` fills. Both
+/// indexes exist (v18/v19) precisely so the planner can choose per query, and
+/// that remains right — the estimate is what is wrong, not the index set.
+///
+/// So this adds an **uncorrelated `EXISTS` over the same predicate**. Postgres
+/// cannot pull an uncorrelated `EXISTS` up into a semi-join, so it becomes an
+/// InitPlan evaluated once, before the scan, against the value-first index:
+/// a single seek. When it is false the ordered scan is gated off entirely by a
+/// `One-Time Filter` and the whole statement costs one index descent instead of
+/// a full slice walk. When it is true the guard added one seek and changed
+/// nothing else.
+///
+/// It is a tautology given the outer predicate — the outer `WHERE` already
+/// requires a row satisfying it, so `EXISTS` over the identical predicate can
+/// only be false when the result is empty. No row can be added or removed.
+///
+/// It does **not** fix the sparse-but-non-empty case (say 5 matches in 512,311
+/// rows), which is the same misestimate with a smaller multiplier; that needs
+/// per-`param_name` statistics on `value_quantity_value`, which is a schema
+/// change.
+///
+/// # Scope
+///
+/// Quantity and number only, and only for an open-ended comparator. Both are
+/// built by `numeric_predicate` and both read a column whose value range varies
+/// by orders of magnitude between parameters sharing it.
+///
+/// Not `date`, which has the same query shape and is measurably unaffected:
+/// every date parameter in the table shares one calendar range, so the pooled
+/// `value_date` histogram is a good proxy for each slice. The benchmark issues
+/// `Observation?date=gt2070-01-01T00:00:00` and `Patient?birthdate=gt2070-01-01`
+/// — both zero-match, one over a 689,080-row slice — and both stay at p99
+/// 17 ms because the planner correctly estimates zero and picks the value-first
+/// index. The same latent failure exists for date if a deployment ever mixes
+/// wildly different date ranges under one column, but it is not present here
+/// and a guard is not free.
+///
+/// Not equality forms (token, reference, uri, `_id`): v20/v26 put the value
+/// ahead of the sort key in those indexes, so the scan seeks straight to the
+/// value and the `LIMIT` stops after 21 whatever the selectivity. Selectivity
+/// stops mattering, and there is nothing to guard.
+fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
+    let [param] = query.parameters.as_slice() else {
+        return false;
+    };
+    if !matches!(
+        param.param_type,
+        crate::types::SearchParamType::Quantity | crate::types::SearchParamType::Number
+    ) {
+        return false;
+    }
+    param.values.iter().any(|v| {
+        matches!(
+            v.prefix,
+            crate::types::SearchPrefix::Gt
+                | crate::types::SearchPrefix::Ge
+                | crate::types::SearchPrefix::Lt
+                | crate::types::SearchPrefix::Le
+                | crate::types::SearchPrefix::Sa
+                | crate::types::SearchPrefix::Eb
+        )
+    })
+}
+
 #[async_trait]
 impl SearchProvider for PostgresBackend {
     async fn search(
@@ -192,12 +291,24 @@ impl SearchProvider for PostgresBackend {
         let (sql, has_previous) = if let Some(pred) = &fast_index_pred {
             // `keyset` is always `Some` here: the fast path requires the default
             // sort, which yields the `last_updated` keyset.
+            // Gate the ordered scan on the predicate matching anything at all;
+            // see `open_range_needs_empty_guard`. The subquery is uncorrelated,
+            // so it is an InitPlan run once against the value-first index, and
+            // its unqualified column references bind to its own `g`.
+            let guard = if open_range_needs_empty_guard(query) {
+                format!(
+                    " AND EXISTS (SELECT 1 FROM search_index g \
+                                  WHERE g.tenant_id = $1 AND g.resource_type = $2 AND {pred})"
+                )
+            } else {
+                String::new()
+            };
             let sql = format!(
                 "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
                         r.last_updated AS sort_key \
                  FROM ( \
                    SELECT DISTINCT resource_id, last_updated FROM search_index \
-                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred} \
+                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard} \
                    ORDER BY last_updated DESC, resource_id ASC LIMIT {lim} \
                  ) c \
                  JOIN resources r \
@@ -205,6 +316,7 @@ impl SearchProvider for PostgresBackend {
                  WHERE r.is_deleted = FALSE \
                  ORDER BY c.last_updated DESC, c.resource_id ASC",
                 pred = pred,
+                guard = guard,
                 lim = count + 1,
             );
             (sql, false)

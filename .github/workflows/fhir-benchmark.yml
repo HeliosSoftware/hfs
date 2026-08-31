@@ -91,6 +91,22 @@ on:
         description: "Postgres work_mem (e.g. 10MB, 64MB)"
         required: false
         default: "10MB"
+      pg_max_wal_size:
+        description: "Postgres max_wal_size (upstream postgres.conf uses 8GB; we cap lower for the shared Docker host's disk)"
+        required: false
+        default: "4GB"
+      pg_min_wal_size:
+        description: "Postgres min_wal_size (upstream postgres.conf uses 2GB)"
+        required: false
+        default: "1GB"
+      pg_wal_buffers:
+        description: "Postgres wal_buffers (upstream postgres.conf uses 256MB)"
+        required: false
+        default: "64MB"
+      pg_checkpoint_timeout:
+        description: "Postgres checkpoint_timeout (upstream postgres.conf uses 15min; PG's default is 5min)"
+        required: false
+        default: "15min"
       hfs_pg_max_connections:
         description: "HFS Postgres pool size (crud drives 300 VUs; 32 leaves most of each request queued)"
         required: false
@@ -465,6 +481,27 @@ jobs:
           PG_SHARED_BUFFERS="${{ inputs.pg_shared_buffers || '2GB' }}"
           PG_EFFECTIVE_CACHE="${{ inputs.pg_effective_cache_size || '6GB' }}"
           PG_WORK_MEM="${{ inputs.pg_work_mem || '10MB' }}"
+          # ── WAL / checkpoint sizing ────────────────────────────────────────
+          # These are NOT a tuning experiment: they close a fidelity gap. The
+          # published field's numbers were produced under the benchmark's own
+          # `infra/postgres/postgres.conf`, which ends with
+          #   max_wal_size = '8GB'  min_wal_size = '2GB'
+          #   wal_buffers  = '256MB' checkpoint_timeout = '15min'
+          # (the `max_wal_size = '1GB'` earlier in that file is overridden by
+          # the later line — last assignment wins). This workflow passed only
+          # `-c max_wal_size=1GB` and left checkpoint_timeout at PG's 5min
+          # default, so every run so far checkpointed roughly 8x more often
+          # than aidbox's did and paid a full-page write on the first touch of
+          # every page after each one — a self-inflicted handicap on the two
+          # write suites, not a property of HFS.
+          # max_wal_size is capped below upstream's 8GB because our Docker host
+          # is shared and has taken the repo's testcontainers jobs down before
+          # by filling (see run 30550776427); 4GB still moves checkpoints from
+          # "every few seconds under crud" to "bounded by checkpoint_timeout".
+          PG_MAX_WAL_SIZE="${{ inputs.pg_max_wal_size || '4GB' }}"
+          PG_MIN_WAL_SIZE="${{ inputs.pg_min_wal_size || '1GB' }}"
+          PG_WAL_BUFFERS="${{ inputs.pg_wal_buffers || '64MB' }}"
+          PG_CHECKPOINT_TIMEOUT="${{ inputs.pg_checkpoint_timeout || '15min' }}"
 
           if [ "$PG_SHARED_BUFFERS" = "auto" ]; then
             if [ "$DOCKER_HOST_MEM_GB" -ge 8 ]; then
@@ -501,6 +538,7 @@ jobs:
             *)   SHM_GB=4 ;;
           esac
           echo "Postgres tuning: shared_buffers=$PG_SHARED_BUFFERS effective_cache_size=$PG_EFFECTIVE_CACHE work_mem=$PG_WORK_MEM shm=${SHM_GB}g"
+          echo "Postgres WAL: max_wal_size=$PG_MAX_WAL_SIZE min_wal_size=$PG_MIN_WAL_SIZE wal_buffers=$PG_WAL_BUFFERS checkpoint_timeout=$PG_CHECKPOINT_TIMEOUT"
           {
             echo "### Postgres tuning (${{ matrix.backend }})"
             echo ""
@@ -510,6 +548,10 @@ jobs:
             echo "| shared_buffers | \`$PG_SHARED_BUFFERS\` |"
             echo "| effective_cache_size | \`$PG_EFFECTIVE_CACHE\` |"
             echo "| work_mem | \`$PG_WORK_MEM\` |"
+            echo "| max_wal_size | \`$PG_MAX_WAL_SIZE\` |"
+            echo "| min_wal_size | \`$PG_MIN_WAL_SIZE\` |"
+            echo "| wal_buffers | \`$PG_WAL_BUFFERS\` |"
+            echo "| checkpoint_timeout | \`$PG_CHECKPOINT_TIMEOUT\` |"
           } >> "$GITHUB_STEP_SUMMARY"
           #
           # The data directory is a **named volume**, not the container's
@@ -539,7 +581,10 @@ jobs:
             -c effective_cache_size=$PG_EFFECTIVE_CACHE \
             -c work_mem=$PG_WORK_MEM \
             -c maintenance_work_mem=256MB \
-            -c max_wal_size=1GB \
+            -c max_wal_size=$PG_MAX_WAL_SIZE \
+            -c min_wal_size=$PG_MIN_WAL_SIZE \
+            -c wal_buffers=$PG_WAL_BUFFERS \
+            -c checkpoint_timeout=$PG_CHECKPOINT_TIMEOUT \
             -c random_page_cost=1.1 \
             -c effective_io_concurrency=200 \
             -c max_worker_processes=8 \
