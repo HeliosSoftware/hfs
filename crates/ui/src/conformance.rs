@@ -103,6 +103,48 @@ pub trait ConformanceSource: Send + Sync {
         let _ = (job_id, tenant);
         Err("$sql-export is not available from this source".to_string())
     }
+
+    /// Runs `GET {type}?{params}&_count={count}&_offset={offset}` and returns
+    /// the resulting page plus whether the server advertised a `next` link.
+    /// Unlike [`fetch`](ConformanceSource::fetch), which pulls the whole
+    /// collection into memory, this issues exactly one request per page so a
+    /// page can filter and paginate server-side (#741).
+    async fn search_page(
+        &self,
+        resource_type: &str,
+        params: &[(String, String)],
+        count: usize,
+        offset: usize,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<SearchPage, String> {
+        let _ = (resource_type, params, count, offset, version, tenant);
+        Err("search is not available from this source".to_string())
+    }
+
+    /// `GET /{resource_type}/{id}`, or an `Err` message when it fails —
+    /// including a 404, surfaced as text rather than `Option` so the caller
+    /// can show the reason without a second request (#741).
+    async fn read_resource(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Value, String> {
+        let _ = (resource_type, id, version, tenant);
+        Err("reading a resource by id is not available from this source".to_string())
+    }
+}
+
+/// One page of a server-side search (#741): the resources that page holds,
+/// plus whether the server advertised a `next` link — the UI uses this to
+/// decide whether to render a "next" control without fetching an extra page
+/// just to find out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchPage {
+    pub resources: Vec<Value>,
+    pub has_next: bool,
 }
 
 /// What a `$sql-export` status poll answered (#649).
@@ -375,6 +417,94 @@ impl ConformanceSource for HttpConformanceSource {
             .json::<Vec<Value>>()
             .await
             .map_err(|e| format!("parsing $sql-run rows failed: {e}"))
+    }
+
+    /// `GET {base}/{resource_type}?{params}&_count={count}&_offset={offset}`
+    /// on the loopback base, a single request per page. Storage holds the
+    /// seeded default version only, so a non-default version degrades the
+    /// same way `sql_run` does rather than answering from the spec bundles —
+    /// those bundles have no search index to page over, and ViewDefinitions
+    /// (the first caller of this method) only exist in storage anyway.
+    async fn search_page(
+        &self,
+        resource_type: &str,
+        params: &[(String, String)],
+        count: usize,
+        offset: usize,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<SearchPage, String> {
+        if version != self.default_version {
+            return Err(format!(
+                "search reads stored data, which holds the server default (FHIR {}); switch the sidebar back to search this type",
+                self.default_version.as_str(),
+            ));
+        }
+        let url = format!("{}/{resource_type}", self.base_url);
+        let mut query: Vec<(String, String)> = params.to_vec();
+        query.push(("_count".to_string(), count.to_string()));
+        query.push(("_offset".to_string(), offset.to_string()));
+        let request = self.client.get(&url).query(&query).header(
+            "Accept",
+            format!(
+                "application/fhir+json; fhirVersion={}",
+                version.as_mime_param()
+            ),
+        );
+        let request = self.authorized(request, tenant).await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("{url} returned {}", response.status()));
+        }
+        let bundle: Value = response
+            .json()
+            .await
+            .map_err(|e| format!("parsing {resource_type} search results failed: {e}"))?;
+        Ok(SearchPage {
+            resources: extract_bundle_resources(&bundle),
+            has_next: next_link(&bundle).is_some(),
+        })
+    }
+
+    /// `GET {base}/{resource_type}/{id}` on the loopback base. Same
+    /// non-default-version degradation as [`search_page`](Self::search_page):
+    /// storage only holds the server default.
+    async fn read_resource(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Value, String> {
+        if version != self.default_version {
+            return Err(format!(
+                "reading {resource_type}/{id} reads stored data, which holds the server default (FHIR {}); switch the sidebar back to read this resource",
+                self.default_version.as_str(),
+            ));
+        }
+        let url = format!("{}/{resource_type}/{id}", self.base_url);
+        let request = self.client.get(&url).header(
+            "Accept",
+            format!(
+                "application/fhir+json; fhirVersion={}",
+                version.as_mime_param()
+            ),
+        );
+        let request = self.authorized(request, tenant).await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("{url} returned {}", response.status()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("parsing {resource_type}/{id} failed: {e}"))
     }
 
     async fn save_resource(
@@ -761,6 +891,83 @@ impl ConformanceSource for StaticConformanceSource {
             .unwrap_or_else(|| Err("no manifest seeded".to_string()))
     }
 
+    /// Filters and paginates the seeded resources in memory. Implements the
+    /// subset of search semantics the View Definitions page actually sends
+    /// (#741): `name:contains` (case-insensitive substring on `name`) and
+    /// `_sort=name` (also the default with no `_sort` param, matching the
+    /// server's own default order). Other params are accepted but ignored —
+    /// this is a test double standing in for the real search engine, not a
+    /// reimplementation of it.
+    async fn search_page(
+        &self,
+        resource_type: &str,
+        params: &[(String, String)],
+        count: usize,
+        offset: usize,
+        version: FhirVersion,
+        _tenant: &str,
+    ) -> Result<SearchPage, String> {
+        let mut resources = self
+            .map
+            .get(&(resource_type.to_string(), version))
+            .cloned()
+            .unwrap_or_default();
+
+        if let Some((_, needle)) = params.iter().find(|(name, _)| name == "name:contains") {
+            let needle = needle.to_lowercase();
+            resources.retain(|r| {
+                r.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| n.to_lowercase().contains(&needle))
+            });
+        }
+
+        let sort = params
+            .iter()
+            .find(|(name, _)| name == "_sort")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("name");
+        if sort == "name" {
+            resources.sort_by(|a, b| {
+                let name_of = |r: &Value| {
+                    r.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string()
+                };
+                name_of(a).cmp(&name_of(b))
+            });
+        }
+
+        let total = resources.len();
+        let page: Vec<Value> = resources.into_iter().skip(offset).take(count).collect();
+        let has_next = offset + page.len() < total;
+        Ok(SearchPage {
+            resources: page,
+            has_next,
+        })
+    }
+
+    /// The seeded resource with matching `id`, or an `Err` when none exists —
+    /// the same failure the HTTP source reports for a 404 (#741).
+    async fn read_resource(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: FhirVersion,
+        _tenant: &str,
+    ) -> Result<Value, String> {
+        self.map
+            .get(&(resource_type.to_string(), version))
+            .and_then(|resources| {
+                resources
+                    .iter()
+                    .find(|r| r.get("id").and_then(Value::as_str) == Some(id))
+            })
+            .cloned()
+            .ok_or_else(|| format!("no {resource_type} with id {id}"))
+    }
+
     /// Echoes the resource back with an id, so the save handler's redirect
     /// (and a test's assertion on it) has something stable to point at.
     async fn save_resource(
@@ -923,5 +1130,301 @@ mod tests {
             .map(|r| r["id"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(ids, vec!["sp-0", "sp-1"]);
+    }
+
+    /// #741: `search_page` issues one request with the given params plus
+    /// `_count`/`_offset`, and derives `has_next` from the response Bundle's
+    /// `next` link (present or absent).
+    #[tokio::test]
+    async fn http_search_page_sends_params_count_offset_and_reports_has_next() {
+        use axum::extract::Query;
+        use axum::{Router, routing::get};
+        use std::collections::HashMap;
+
+        async fn page(Query(q): Query<HashMap<String, String>>) -> axum::Json<Value> {
+            // Echo the received query back as the entry resource, so the
+            // test can assert on exactly what the client sent.
+            let mut echo = serde_json::json!({ "resourceType": "QueryEcho" });
+            if let Some(map) = echo.as_object_mut() {
+                for (k, v) in &q {
+                    map.insert(k.clone(), Value::String(v.clone()));
+                }
+            }
+            let mut bundle = serde_json::json!({
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [{"resource": echo}]
+            });
+            // Only the first page (offset 0) advertises a next link.
+            if q.get("_offset").map(String::as_str) == Some("0") {
+                bundle["link"] = serde_json::json!([
+                    {"relation": "next", "url": "http://x/ViewDefinition?_offset=50"}
+                ]);
+            }
+            axum::Json(bundle)
+        }
+
+        let app = Router::new().route("/ViewDefinition", get(page));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+
+        let first = source
+            .search_page(
+                "ViewDefinition",
+                &[("name:contains".to_string(), "pat".to_string())],
+                50,
+                0,
+                FhirVersion::R4,
+                "",
+            )
+            .await
+            .expect("search succeeds");
+        assert_eq!(first.resources[0]["name:contains"], "pat");
+        assert_eq!(first.resources[0]["_count"], "50");
+        assert_eq!(first.resources[0]["_offset"], "0");
+        assert!(first.has_next, "server advertised a next link");
+
+        let second = source
+            .search_page("ViewDefinition", &[], 50, 50, FhirVersion::R4, "")
+            .await
+            .expect("search succeeds");
+        assert!(!second.has_next, "no next link on the last page");
+    }
+
+    /// #741: the tenant header rides `search_page` and `read_resource` the
+    /// same way it does the other self-calls — sent when the tenant is not
+    /// empty, absent otherwise.
+    #[tokio::test]
+    async fn http_search_page_sends_the_tenant_header_only_when_present() {
+        use axum::extract::Path;
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+        use axum::{Router, routing::get};
+
+        fn echo_tenant(headers: &HeaderMap) -> axum::Json<Value> {
+            let tenant = headers
+                .get("x-tenant-id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let mut resource =
+                serde_json::json!({ "resourceType": "ViewDefinition", "id": "vd-1" });
+            if let Some(t) = tenant {
+                resource["tenant"] = Value::String(t);
+            }
+            axum::Json(resource)
+        }
+
+        async fn get_one(headers: HeaderMap, Path(_id): Path<String>) -> axum::response::Response {
+            echo_tenant(&headers).into_response()
+        }
+
+        let app = Router::new().route("/ViewDefinition/{id}", get(get_one));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+
+        let with_tenant = source
+            .read_resource("ViewDefinition", "vd-1", FhirVersion::R4, "clinic-a")
+            .await
+            .expect("read succeeds");
+        assert_eq!(with_tenant["tenant"], "clinic-a");
+
+        let without_tenant = source
+            .read_resource("ViewDefinition", "vd-1", FhirVersion::R4, "")
+            .await
+            .expect("read succeeds");
+        assert!(
+            without_tenant.get("tenant").is_none(),
+            "no X-Tenant-ID sent for an empty tenant"
+        );
+    }
+
+    /// #741: a non-default FHIR version degrades with `Err` for both new
+    /// methods, the same as `sql_run` — storage only holds the server
+    /// default, and there is no search index or single-resource lookup over
+    /// the spec bundles to fall back to.
+    #[cfg(feature = "R4B")]
+    #[tokio::test]
+    async fn non_default_version_degrades_search_and_read() {
+        let source = HttpConformanceSource::new(
+            "http://127.0.0.1:1".to_string(),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+
+        let err = source
+            .search_page("ViewDefinition", &[], 50, 0, FhirVersion::R4B, "")
+            .await
+            .expect_err("non-default version has no stored data to search");
+        assert!(err.contains(FhirVersion::R4.as_str()), "{err}");
+
+        let err = source
+            .read_resource("ViewDefinition", "vd-1", FhirVersion::R4B, "")
+            .await
+            .expect_err("non-default version has no stored data to read");
+        assert!(err.contains(FhirVersion::R4.as_str()), "{err}");
+    }
+
+    /// #741: `read_resource` surfaces both success and a 404 as the caller
+    /// expects — the same distinction the View Definitions detail view needs
+    /// to render "not found" rather than a generic error.
+    #[tokio::test]
+    async fn http_read_resource_succeeds_and_reports_404() {
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::{Router, routing::get};
+
+        async fn get_one(Path(id): Path<String>) -> axum::response::Response {
+            if id == "vd-1" {
+                axum::Json(serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "id": "vd-1",
+                    "name": "Patients"
+                }))
+                .into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
+
+        let app = Router::new().route("/ViewDefinition/{id}", get(get_one));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+
+        let found = source
+            .read_resource("ViewDefinition", "vd-1", FhirVersion::R4, "")
+            .await
+            .expect("resource exists");
+        assert_eq!(found["name"], "Patients");
+
+        let missing = source
+            .read_resource("ViewDefinition", "missing", FhirVersion::R4, "")
+            .await
+            .expect_err("404 surfaces as an Err");
+        assert!(missing.contains("404"), "{missing}");
+    }
+
+    /// #741: the static double's `name:contains` filter is case-insensitive,
+    /// the default order is ascending by `name`, and `has_next` is correct on
+    /// the exact boundary (total is a multiple of the page size).
+    #[tokio::test]
+    async fn static_search_page_filters_sorts_and_paginates() {
+        fn vd(id: &str, name: &str) -> Value {
+            serde_json::json!({ "resourceType": "ViewDefinition", "id": id, "name": name })
+        }
+
+        let source = StaticConformanceSource::empty().with(
+            "ViewDefinition",
+            FhirVersion::default(),
+            vec![
+                vd("vd-3", "Charlie"),
+                vd("vd-1", "alpha-patients"),
+                vd("vd-2", "Bravo"),
+                vd("vd-4", "another-alpha"),
+            ],
+        );
+
+        // `name:contains` is case-insensitive on a substring.
+        let filtered = source
+            .search_page(
+                "ViewDefinition",
+                &[("name:contains".to_string(), "ALPHA".to_string())],
+                50,
+                0,
+                FhirVersion::default(),
+                "",
+            )
+            .await
+            .expect("search succeeds");
+        let names: Vec<_> = filtered
+            .resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alpha-patients", "another-alpha"]);
+        assert!(!filtered.has_next);
+
+        // Default order (no `_sort`) is ascending by name.
+        let sorted = source
+            .search_page("ViewDefinition", &[], 50, 0, FhirVersion::default(), "")
+            .await
+            .expect("search succeeds");
+        let names: Vec<_> = sorted
+            .resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Bravo", "Charlie", "alpha-patients", "another-alpha"]
+        );
+
+        // Pagination on the exact boundary: 4 resources, page size 2 — the
+        // first page has a next, the second does not.
+        let page1 = source
+            .search_page("ViewDefinition", &[], 2, 0, FhirVersion::default(), "")
+            .await
+            .expect("search succeeds");
+        assert_eq!(page1.resources.len(), 2);
+        assert!(page1.has_next, "two more resources remain");
+
+        let page2 = source
+            .search_page("ViewDefinition", &[], 2, 2, FhirVersion::default(), "")
+            .await
+            .expect("search succeeds");
+        assert_eq!(page2.resources.len(), 2);
+        assert!(!page2.has_next, "exactly consumed the total");
+    }
+
+    /// #741: the static double's `read_resource` finds the seeded resource by
+    /// id, or reports an `Err` when none matches.
+    #[tokio::test]
+    async fn static_read_resource_finds_by_id_or_errs() {
+        let source = StaticConformanceSource::empty().with(
+            "ViewDefinition",
+            FhirVersion::default(),
+            vec![serde_json::json!({
+                "resourceType": "ViewDefinition",
+                "id": "vd-1",
+                "name": "Patients"
+            })],
+        );
+
+        let found = source
+            .read_resource("ViewDefinition", "vd-1", FhirVersion::default(), "")
+            .await
+            .expect("resource exists");
+        assert_eq!(found["name"], "Patients");
+
+        let missing = source
+            .read_resource("ViewDefinition", "missing", FhirVersion::default(), "")
+            .await
+            .expect_err("no such id");
+        assert!(missing.contains("missing"), "{missing}");
     }
 }

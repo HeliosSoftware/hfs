@@ -1894,10 +1894,14 @@ struct SqlViewDefinitionsPage {
     rail: Vec<sql_views::VdSummary>,
     /// The rail's server-side name filter, echoed back into the search box.
     filter: String,
-    /// The list fetch failed — the page says so instead of showing an empty rail.
+    /// The rail's "previous" link, `None` on the first page (#741).
+    prev_href: Option<String>,
+    /// The rail's "next" link, `None` when the search reported no further page.
+    next_href: Option<String>,
+    /// The list search failed — the page says so instead of showing an empty rail.
     degraded: Option<String>,
-    /// `?vd=` (or the first entry): id, name, and pretty JSON. `None` only
-    /// when the store holds no views and none is being created.
+    /// `?vd=` (or the rail's first visible entry): id, name, and pretty JSON.
+    /// `None` only when the store holds no views and none is being created.
     selected: Option<SelectedVd>,
     /// `?vd=new`: the JSON below is the starter document, not a stored view.
     is_new: bool,
@@ -1919,8 +1923,20 @@ struct SqlVdQuery {
     filter: Option<String>,
     run: Option<String>,
     saved: Option<String>,
+    /// 1-based (#741). Kept as raw text rather than `Option<usize>` so a
+    /// non-numeric value fails the `parse` below instead of the whole
+    /// extractor — an invalid page falls back to 1, it never 400s.
+    page: Option<String>,
 }
 
+/// `GET /ui/sql/view-definitions`: the rail is one page of a server-side
+/// `ViewDefinition` search (#741) — `name:contains`, `_sort=name`,
+/// `_count`/`_offset` — never the full-collection fetch this page used
+/// before #741. The old in-memory filter also matched the resource-type
+/// column (`ViewDefinition.resource`); that match is dropped on purpose, not
+/// carried over into `name:contains` — it was never a documented part of
+/// #649 and has no standard FHIR search expression (see
+/// [`sql_views::rail_search_params`] for why).
 async fn sql_view_definitions_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -1929,28 +1945,44 @@ async fn sql_view_definitions_page(
     Query(query): Query<SqlVdQuery>,
 ) -> Response {
     let filter = query.filter.unwrap_or_default();
-    let (mut rail, degraded) = match state
+    // Absent or non-numeric falls back to page 1 rather than 400ing — a
+    // stale or hand-edited `?page=` is a navigation mistake, not an error.
+    let page = query
+        .page
+        .as_deref()
+        .and_then(|p| p.parse::<usize>().ok())
+        .filter(|&p| p >= 1)
+        .unwrap_or(1);
+    let offset = (page - 1) * sql_views::PAGE_SIZE;
+
+    // The rail is one page of a server-side search (#741): filtered by
+    // `name:contains`, ordered by `_sort=name`, sliced by `_count`/`_offset`.
+    // It never pulls the tenant's whole ViewDefinition collection into memory
+    // the way the page's other consumers of `ConformanceSource::fetch`
+    // (SearchParameters, Compartments, SQL Export) still do.
+    let params = sql_views::rail_search_params(&filter);
+    let (mut page_resources, has_next, degraded) = match state
         .conformance
-        .fetch("ViewDefinition", rv.0, &rt.id)
+        .search_page(
+            "ViewDefinition",
+            &params,
+            sql_views::PAGE_SIZE,
+            offset,
+            rv.0,
+            &rt.id,
+        )
         .await
     {
-        Ok(resources) => (resources, None),
+        Ok(page) => (page.resources, page.has_next, None),
         Err(error) => {
-            tracing::warn!("ViewDefinition self-fetch failed: {error}");
-            (Vec::new(), Some(error))
+            tracing::warn!("ViewDefinition search failed: {error}");
+            (Vec::new(), false, Some(error))
         }
     };
-    let summaries = {
-        let mut s = sql_views::summarize(&rail);
-        if !filter.is_empty() {
-            let needle = filter.to_lowercase();
-            s.retain(|e| {
-                e.name.to_lowercase().contains(&needle)
-                    || e.resource.to_lowercase().contains(&needle)
-            });
-        }
-        s
-    };
+    let summaries = sql_views::summarize(&page_resources);
+    let prev_href =
+        (page > 1).then(|| sql_views::page_href(&filter, query.vd.as_deref(), page - 1));
+    let next_href = has_next.then(|| sql_views::page_href(&filter, query.vd.as_deref(), page + 1));
 
     let is_new = query.vd.as_deref() == Some("new");
     let (selected, selected_value) = if is_new {
@@ -1963,17 +1995,44 @@ async fn sql_view_definitions_page(
             None,
         )
     } else {
-        // ?vd=<id>, defaulting to the first rail entry. The full resource is
-        // taken from the fetch — no second round trip.
+        // ?vd=<id>, defaulting to the rail's first visible entry. When the id
+        // is on the visible page the resource is taken from the search
+        // above — no second round trip; otherwise (a different page, or a
+        // filter that no longer matches it) it's read directly by id, so
+        // selection stays independent of what the rail currently shows
+        // (#741).
         let wanted = query
             .vd
             .clone()
             .or_else(|| summaries.first().map(|e| e.id.clone()));
-        let found = wanted.and_then(|id| {
-            rail.iter()
-                .position(|vd| vd.get("id").and_then(serde_json::Value::as_str) == Some(&id))
+        let on_page = wanted.as_deref().and_then(|id| {
+            page_resources
+                .iter()
+                .position(|vd| vd.get("id").and_then(serde_json::Value::as_str) == Some(id))
         });
-        match found.map(|i| rail.swap_remove(i)) {
+        let resource = match on_page {
+            Some(i) => Some(page_resources.swap_remove(i)),
+            None => match &wanted {
+                Some(id) => {
+                    match state
+                        .conformance
+                        .read_resource("ViewDefinition", id, rv.0, &rt.id)
+                        .await
+                    {
+                        Ok(vd) => Some(vd),
+                        Err(error) => {
+                            // A stale or mistyped id is ordinary navigation,
+                            // not an operator concern — the page just falls
+                            // back to its no-selection state below.
+                            tracing::debug!("ViewDefinition read failed for vd={id}: {error}");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+        };
+        match resource {
             Some(vd) => {
                 let id = vd
                     .get("id")
@@ -2008,6 +2067,8 @@ async fn sql_view_definitions_page(
         active_page: "sql-view-definitions",
         rail: summaries,
         filter,
+        prev_href,
+        next_href,
         degraded,
         selected,
         is_new,
@@ -2047,6 +2108,8 @@ async fn sql_view_definitions_save(
             active_page: "sql-view-definitions",
             rail: Vec::new(),
             filter: String::new(),
+            prev_href: None,
+            next_href: None,
             degraded: None,
             selected: Some(SelectedVd {
                 name: if is_new { String::new() } else { id.clone() },

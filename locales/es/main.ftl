@@ -805,6 +805,9 @@ vd-delete-failed = No se pudo eliminar la definición de vista.
 vd-json-heading = Definición (JSON)
 vd-results-heading = Resultados
 vd-results-empty = La vista no produjo filas.
+vd-pagination-label = Páginas de definiciones de vistas
+vd-page-prev = Anterior
+vd-page-next = Siguiente
 
 ## Espacios de consultas y vistas SQL (#649)
 

@@ -3,9 +3,12 @@
 {#
   View Definitions workspace (#649, Figma 420-2): rail of stored
   ViewDefinitions (name left, resource type right), the selected one in a
-  collapsible JSON fold, and a $sql-run Results preview. Save/Duplicate are
-  submit buttons of one plain form (POST back to this route); Run is a plain
-  link (?run=1); Delete rides conformance-crud.js like the other conformance
+  collapsible JSON fold, and a $sql-run Results preview. The rail is one page
+  of a server-side search (#741) — the search box filters by name, and plain
+  previous/next links at its foot page through the rest — so it never loads
+  the tenant's whole ViewDefinition collection. Save/Duplicate are submit
+  buttons of one plain form (POST back to this route); Run is a plain link
+  (?run=1); Delete rides conformance-crud.js like the other conformance
   viewers. Everything works without JavaScript.
 #}
 
@@ -51,6 +54,16 @@
       <p class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("vd-none") }}</p>
       {% endif %}
     </div>
+    {% if prev_href.is_some() || next_href.is_some() %}
+    <nav class="pagination" aria-label="{{ i18n.t("vd-pagination-label") }}">
+      {% if let Some(href) = prev_href %}
+      <a class="btn" href="{{ href }}">{{ i18n.t("vd-page-prev") }}</a>
+      {% endif %}
+      {% if let Some(href) = next_href %}
+      <a class="btn" href="{{ href }}">{{ i18n.t("vd-page-next") }}</a>
+      {% endif %}
+    </nav>
+    {% endif %}
   </aside>
 
   <div class="filter-center">
