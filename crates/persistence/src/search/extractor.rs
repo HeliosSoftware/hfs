@@ -1929,3 +1929,127 @@ mod tests {
         }
     }
 }
+
+/// Local-only profiler for the import path. Not compiled into a release build
+/// and a no-op unless `HFS_PROFILE_CORPUS` names a directory of Synthea
+/// transaction bundles.
+#[cfg(test)]
+mod import_profile {
+    use super::*;
+    use helios_fhir::FhirVersion;
+    use helios_fhir::search::SearchParameterLoader;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn extractor() -> SearchParameterExtractor {
+        let loader = SearchParameterLoader::new(FhirVersion::R4);
+        let mut registry = SearchParameterRegistry::new();
+        if let Ok(params) = loader.load_embedded() {
+            for p in params {
+                let _ = registry.register(p);
+            }
+        }
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        if let Ok(params) = loader.load_from_spec_file(&data_dir) {
+            for p in params {
+                let _ = registry.register(p);
+            }
+        }
+        SearchParameterExtractor::new(Arc::new(RwLock::new(registry)))
+    }
+
+    #[test]
+    fn profile_extract_over_corpus() {
+        let Ok(dir) = std::env::var("HFS_PROFILE_CORPUS") else {
+            return;
+        };
+        let limit: usize = std::env::var("HFS_PROFILE_BUNDLES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+            .collect();
+        files.sort();
+        files.truncate(limit);
+
+        let ex = extractor();
+
+        // Collect the resources first so file IO is out of the timings.
+        let mut resources: Vec<(String, Value)> = Vec::new();
+        for f in &files {
+            let b: Value = serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
+            for e in b.get("entry").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+                if let Some(r) = e.get("resource") {
+                    if let Some(rt) = r.get("resourceType").and_then(|v| v.as_str()) {
+                        resources.push((rt.to_string(), r.clone()));
+                    }
+                }
+            }
+        }
+
+        // Warm caches (prepared expressions are memoised per (expr, type)).
+        for (rt, r) in resources.iter().take(200) {
+            let _ = ex.extract(r, rt);
+        }
+
+        let t0 = Instant::now();
+        let mut rows = 0usize;
+        for (rt, r) in &resources {
+            rows += ex.extract(r, rt).map(|v| v.len()).unwrap_or(0);
+        }
+        let total = t0.elapsed();
+
+        // Split: context construction alone.
+        let t1 = Instant::now();
+        for (_, r) in &resources {
+            let _ = SearchParameterExtractor::evaluation_context(r).unwrap();
+        }
+        let ctx = t1.elapsed();
+
+        let n = resources.len() as f64;
+        println!(
+            "PROFILE resources={} extracted_values={} total={:?} per_resource={:.1}us \
+             ctx_only={:.1}us ({:.0}%) params_loop={:.1}us",
+            resources.len(),
+            rows,
+            total,
+            total.as_secs_f64() * 1e6 / n,
+            ctx.as_secs_f64() * 1e6 / n,
+            100.0 * ctx.as_secs_f64() / total.as_secs_f64(),
+            (total.as_secs_f64() - ctx.as_secs_f64()) * 1e6 / n,
+        );
+
+        // Per-resource-type breakdown.
+        let mut by_type: HashMap<String, (usize, f64)> = HashMap::new();
+        for (rt, r) in &resources {
+            let t = Instant::now();
+            let _ = ex.extract(r, rt);
+            let e = by_type.entry(rt.clone()).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += t.elapsed().as_secs_f64();
+        }
+        let mut v: Vec<_> = by_type.into_iter().collect();
+        v.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap());
+        println!(
+            "PROFILE  {:<28} {:>7} {:>10} {:>10}",
+            "resourceType", "n", "total_ms", "us/res"
+        );
+        for (rt, (n, s)) in v.iter().take(15) {
+            println!(
+                "PROFILE  {:<28} {:>7} {:>10.1} {:>10.1}",
+                rt,
+                n,
+                s * 1e3,
+                s * 1e6 / *n as f64
+            );
+        }
+    }
+}

@@ -899,7 +899,7 @@ impl IndexRow {
 fn dedup_rows<'a>(
     rows: impl IntoIterator<Item = (&'a str, &'a str, &'a IndexRow)>,
 ) -> Vec<(&'a str, &'a str, &'a IndexRow)> {
-    let mut seen: HashSet<RowKey<'a>> = HashSet::new();
+    let mut seen: HashSet<RowKey<'a>, BuildFxHasher> = HashSet::default();
     let mut kept = Vec::new();
     for (resource_type, resource_id, row) in rows {
         if seen.insert(row.key(resource_type, resource_id)) {
@@ -907,6 +907,85 @@ fn dedup_rows<'a>(
         }
     }
     kept
+}
+
+/// The hasher [`dedup_rows`] uses, in place of the standard library's SipHash.
+///
+/// A [`RowKey`] is 28 fields — most of them `Option<&String>` — so hashing one
+/// feeds a few hundred bytes through the hasher, once per index row. SipHash is
+/// a keyed MAC chosen for resistance to collision attacks on hash maps whose
+/// keys an attacker controls; nothing here is a durable map, the keys live for
+/// one resource's write and are discarded, and a collision costs one extra
+/// `RowKey` equality comparison rather than anything an attacker could exploit.
+/// The set is still keyed on full equality, so **no row can be dropped by a
+/// hash collision** — only the bucket distribution changes.
+///
+/// This is the FxHash mix (one multiply and a rotate per 8 bytes) rustc uses
+/// for its own interned tables. On the benchmark's import replay `dedup_rows`
+/// was 8.3% of the server's CPU profile, essentially all of it hashing.
+#[derive(Default, Clone, Copy)]
+struct BuildFxHasher;
+
+impl std::hash::BuildHasher for BuildFxHasher {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher { hash: 0 }
+    }
+}
+
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(Self::SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while bytes.len() >= 8 {
+            self.add(u64::from_ne_bytes(bytes[..8].try_into().unwrap()));
+            bytes = &bytes[8..];
+        }
+        if bytes.len() >= 4 {
+            self.add(u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64);
+            bytes = &bytes[4..];
+        }
+        for &b in bytes {
+            self.add(b as u64);
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
 }
 
 /// PostgreSQL implementation of SearchIndexWriter.
