@@ -34,7 +34,7 @@ export const ROUTES = [
 // append it to ROUTES so the detail layout is guarded too.
 export async function seedBulkImportDetail(request: APIRequestContext): Promise<string> {
   const res = await request.post("/ui/bulk-import", {
-    form: { name: "e2e-guard" },
+    form: { name: "e2e-guard", manifest_url: "https://example.test/manifest.json" },
     maxRedirects: 0,
   });
   const location = res.headers()["location"];

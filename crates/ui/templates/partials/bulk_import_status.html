@@ -9,6 +9,13 @@
       <div>{% if !progress.is_empty() %}{{ progress }}{% else %}{{ i18n.t("bulk-import-processing-waiting") }}{% endif %}</div>
     </div>
   </div>
+  {% if can_abort %}
+  <div class="detail__actions">
+    <form method="post" action="/ui/bulk-import/{{ id }}/abort">
+      <button type="submit" class="btn">{% include "icons/stop-circle.svg" %}{{ i18n.t("bulk-import-abort") }}</button>
+    </form>
+  </div>
+  {% endif %}
 </div>
 {% else %}
 {% if !completed_at.is_empty() %}

@@ -17,7 +17,7 @@
 use askama::Template;
 use axum::{
     Extension,
-    extract::{Path, RawQuery, State},
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
 };
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::i18n::{I18n, RequestLocale};
-use crate::{RequestTenant, RequestVersion, WebState, current_status, query_value, render};
+use crate::{RequestTenant, RequestVersion, WebState, current_status, render};
 
 fn public_url_with_segments<'a>(
     public_base_url: &str,
@@ -238,16 +238,7 @@ struct SubmissionRow {
     name: String,
     status_label: String,
     created_date: String,
-    manifest_count: usize,
     destination: String,
-}
-
-struct ManifestRow {
-    id: String,
-    manifest_url: String,
-    created_at: String,
-    can_submit: bool,
-    can_abort: bool,
 }
 
 struct LogLine {
@@ -285,16 +276,13 @@ struct BulkImportDetailPage {
     id: String,
     name: String,
     recipient: String,
+    manifest_url: String,
     submitter_display: String,
     created_at: String,
     status_label: String,
     auth: String,
     client_id: String,
     token_url: String,
-    can_finalize: bool,
-    terminal: bool,
-    sort: &'static str,
-    manifests: Vec<ManifestRow>,
     log: Vec<LogLine>,
     error: Option<String>,
     edit_open: bool,
@@ -311,10 +299,6 @@ struct TestAuthResult {
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
-
-fn is_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "stopped")
-}
 
 fn conflict(message: &str) -> Response {
     (StatusCode::CONFLICT, message.to_string()).into_response()
@@ -339,7 +323,6 @@ pub async fn page(
                 id,
                 status_label: status_label(&i18n, &s.status),
                 created_date: s.created_at.clone(),
-                manifest_count: s.manifests.len(),
                 destination: s.recipient_base_url,
                 name: s.name,
             });
@@ -361,6 +344,7 @@ pub async fn page(
 #[derive(Deserialize)]
 pub struct CreateForm {
     pub name: String,
+    pub manifest_url: String,
     #[serde(default)]
     pub auth: String,
     #[serde(default)]
@@ -372,23 +356,23 @@ pub struct CreateForm {
     #[serde(default)]
     pub submitter_value: String,
     #[serde(default)]
-    pub submission_id: String,
+    pub output_format: String,
+    #[serde(default)]
+    pub file_request_headers: String,
 }
 
-/// `POST /ui/bulk-import` — create a submission, then land on its detail page.
+/// `POST /ui/bulk-import` — one-shot create: a submission carries exactly one
+/// manifest, and creating it fires the kick-off immediately. The submission id
+/// is generated (unique per submitter); the FHIR base URL derives from the
+/// manifest URL's origin at kick-off time.
 pub async fn create(
     State(state): State<WebState>,
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
     axum::Form(form): axum::Form<CreateForm>,
 ) -> Response {
-    // The user may pin the submission id (it must be unique per submitter,
-    // coordinated with the recipient); empty generates one.
-    let id = match form.submission_id.trim() {
-        "" => uuid::Uuid::new_v4().to_string(),
-        pinned => pinned.to_string(),
-    };
-    let submission = Submission {
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut submission = Submission {
         name: form.name.trim().to_string(),
         // The recipient is always this server's HFS_BASE_URL (#689) — typing
         // it per submission is how a submission ended up pointed at something
@@ -411,6 +395,21 @@ pub async fn create(
         manifests: serde_json::Map::new(),
         log: Vec::new(),
     };
+    let manifest = Manifest {
+        manifest_url: form.manifest_url.trim().to_string(),
+        fhir_base_url: String::new(),
+        output_format: form.output_format.trim().to_string(),
+        file_request_headers: form.file_request_headers.trim().to_string(),
+        created_at: now_stamp(),
+        last_submitted_at: String::new(),
+        aborted_at: String::new(),
+    };
+    let mid = uuid::Uuid::new_v4().to_string();
+    submission.manifests.insert(
+        mid.clone(),
+        serde_json::to_value(&manifest).unwrap_or(Value::Null),
+    );
+    submit_one_with_id(&mut submission, &id, &mid).await;
     match save(&state, &rt, &id, &submission, Some(0)).await {
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
@@ -425,7 +424,6 @@ pub async fn detail(
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
-    RawQuery(query): RawQuery,
 ) -> Response {
     let i18n = I18n::new(locale);
     let status = current_status(&state, rv.0, &rt);
@@ -434,12 +432,7 @@ pub async fn detail(
         return Redirect::to("/ui/bulk-import").into_response();
     };
 
-    let sort = match query_value(query.as_deref(), "sort").as_deref() {
-        Some("oldest") => "oldest",
-        _ => "recent",
-    };
-
-    render_detail_page(i18n, status, id, s, None, false, sort)
+    render_detail_page(i18n, status, id, s, None, false)
 }
 
 fn render_detail_page(
@@ -449,34 +442,16 @@ fn render_detail_page(
     s: Submission,
     error: Option<String>,
     edit_open: bool,
-    sort: &'static str,
 ) -> Response {
-    let terminal = is_terminal(&s.status);
-    let mut manifests: Vec<ManifestRow> = s
+    // One-shot model: a submission carries exactly one manifest.
+    let manifest_url = s
         .manifests
-        .iter()
-        .map(|(mid, value)| {
-            let m: Manifest = serde_json::from_value(value.clone()).unwrap_or_default();
-            ManifestRow {
-                id: mid.clone(),
-                manifest_url: m.manifest_url,
-                created_at: m.created_at,
-                can_submit: !terminal && m.last_submitted_at.is_empty() && m.aborted_at.is_empty(),
-                can_abort: !terminal && !m.last_submitted_at.is_empty() && m.aborted_at.is_empty(),
-            }
-        })
-        .collect();
-    manifests.sort_by(|a, b| {
-        let order = a
-            .created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.id.cmp(&b.id));
-        if sort == "oldest" {
-            order
-        } else {
-            order.reverse()
-        }
-    });
+        .values()
+        .next()
+        .and_then(|value| value.get("manifestUrl"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
 
     let log: Vec<LogLine> = s
         .log
@@ -517,15 +492,12 @@ fn render_detail_page(
         id,
         name: s.name,
         recipient: s.recipient_base_url,
+        manifest_url,
         created_at: s.created_at,
         status_label: label,
         auth: s.auth.clone(),
         client_id: s.client_id,
         token_url: s.token_url,
-        can_finalize: matches!(s.status.as_str(), "in-progress" | "failed"),
-        terminal,
-        sort,
-        manifests,
         log,
         error,
         edit_open,
@@ -601,67 +573,11 @@ pub async fn edit(
                 s,
                 Some(e),
                 true,
-                "recent",
             );
             *response.status_mut() = StatusCode::BAD_GATEWAY;
             response
         }
     }
-}
-
-#[derive(Deserialize)]
-pub struct ManifestForm {
-    pub manifest_url: String,
-    #[serde(default)]
-    pub fhir_base_url: String,
-    #[serde(default)]
-    pub output_format: String,
-    #[serde(default)]
-    pub file_request_headers: String,
-}
-
-/// `POST /ui/bulk-import/{id}/manifests` — add a manifest.
-pub async fn add_manifest(
-    State(state): State<WebState>,
-    rt: RequestTenant,
-    _principal: Option<Extension<helios_auth::Principal>>,
-    Path(id): Path<String>,
-    axum::Form(form): axum::Form<ManifestForm>,
-) -> Response {
-    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
-        return Redirect::to("/ui/bulk-import").into_response();
-    };
-    if is_terminal(&s.status) {
-        return conflict("terminal submissions cannot accept new manifests");
-    }
-    let manifest = Manifest {
-        manifest_url: form.manifest_url.trim().to_string(),
-        fhir_base_url: form.fhir_base_url.trim().to_string(),
-        output_format: form.output_format.trim().to_string(),
-        file_request_headers: form.file_request_headers.trim().to_string(),
-        created_at: now_stamp(),
-        last_submitted_at: String::new(),
-        aborted_at: String::new(),
-    };
-    let mid = uuid::Uuid::new_v4().to_string();
-    s.manifests
-        .insert(mid, serde_json::to_value(&manifest).unwrap_or(Value::Null));
-    save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
-    Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
-}
-
-/// `POST /ui/bulk-import/{id}/manifests/{mid}/delete`.
-pub async fn delete_manifest(
-    State(state): State<WebState>,
-    rt: RequestTenant,
-    _principal: Option<Extension<helios_auth::Principal>>,
-    Path((id, mid)): Path<(String, String)>,
-) -> Response {
-    if let Some((mut s, sv)) = load_one(&state, &rt, &id).await {
-        s.manifests.remove(&mid);
-        save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
-    }
-    Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -675,7 +591,6 @@ fn kickoff_parameters(
     id: &str,
     status: &str,
     manifest: Option<&Manifest>,
-    replaces: Option<&str>,
 ) -> Value {
     let system = if submission.submitter_system.is_empty() {
         "urn:helios:hfs:bulk-submit"
@@ -718,9 +633,6 @@ fn kickoff_parameters(
                 ]}));
             }
         }
-    }
-    if let Some(old) = replaces {
-        parameter.push(json!({ "name": "replacesManifestUrl", "valueUrl": old }));
     }
     json!({ "resourceType": "Parameters", "parameter": parameter })
 }
@@ -910,7 +822,7 @@ fn summarize_error_body(content_type: &str, body: &str) -> String {
 async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, String> {
     let target = public_url_with_segments(&submission.recipient_base_url, ["$bulk-submit-status"]);
     // Only the identifying parameters ride the status kick-off.
-    let parameters = kickoff_parameters(submission, id, "", None, None);
+    let parameters = kickoff_parameters(submission, id, "", None);
     let identifying: Vec<Value> = parameters["parameter"]
         .as_array()
         .into_iter()
@@ -1033,74 +945,8 @@ async fn poll_status(submission: &mut Submission) {
     }
 }
 
-/// `POST /ui/bulk-import/{id}/manifests/{mid}/submit`.
-pub async fn submit_manifest(
-    State(state): State<WebState>,
-    rt: RequestTenant,
-    _principal: Option<Extension<helios_auth::Principal>>,
-    Path((id, mid)): Path<(String, String)>,
-) -> Response {
-    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
-        return Redirect::to("/ui/bulk-import").into_response();
-    };
-    if is_terminal(&s.status) || !manifest_can_submit(&s, &mid) {
-        return conflict("manifest is not eligible for submission");
-    }
-    submit_with_id(&mut s, &id, Some(&mid)).await;
-    save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
-    Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
-}
-
-/// `POST /ui/bulk-import/{id}/submit-all`.
-pub async fn submit_all(
-    State(state): State<WebState>,
-    rt: RequestTenant,
-    _principal: Option<Extension<helios_auth::Principal>>,
-    Path(id): Path<String>,
-) -> Response {
-    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
-        return Redirect::to("/ui/bulk-import").into_response();
-    };
-    if is_terminal(&s.status) || !s.manifests.keys().any(|mid| manifest_can_submit(&s, mid)) {
-        return conflict("submission has no eligible manifests");
-    }
-    submit_with_id(&mut s, &id, None).await;
-    save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
-    Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
-}
-
-fn parsed_manifest(submission: &Submission, mid: &str) -> Option<Manifest> {
-    submission
-        .manifests
-        .get(mid)
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
-}
-
-fn manifest_can_submit(submission: &Submission, mid: &str) -> bool {
-    parsed_manifest(submission, mid).is_some_and(|manifest| {
-        manifest.last_submitted_at.is_empty() && manifest.aborted_at.is_empty()
-    })
-}
-
-fn manifest_can_abort(submission: &Submission, mid: &str) -> bool {
-    parsed_manifest(submission, mid).is_some_and(|manifest| {
-        !manifest.last_submitted_at.is_empty() && manifest.aborted_at.is_empty()
-    })
-}
-
-async fn submit_with_id(submission: &mut Submission, id: &str, only: Option<&str>) {
-    let mids: Vec<String> = submission.manifests.keys().cloned().collect();
-    for mid in mids {
-        if only.is_some_and(|o| o != mid) {
-            continue;
-        }
-        if !manifest_can_submit(submission, &mid) {
-            continue;
-        }
-        submit_one_with_id(submission, id, &mid).await;
-    }
-}
-
+/// Fires the kick-off for one manifest and records the outcome on the
+/// submission (status, log, poll URL).
 async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
     let Some(m) = submission
         .manifests
@@ -1113,7 +959,7 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
         submission,
         format!("Submitting manifest \"{}\"...", m.manifest_url),
     );
-    let parameters = kickoff_parameters(submission, id, "in-progress", Some(&m), None);
+    let parameters = kickoff_parameters(submission, id, "in-progress", Some(&m));
     match post_kickoff(submission, &parameters).await {
         Ok((status, _, _)) if (200..300).contains(&status) => {
             push_log(
@@ -1176,16 +1022,6 @@ pub async fn abort(
     set_status(state, rt, _principal, id, "stopped").await
 }
 
-/// `POST /ui/bulk-import/{id}/complete` — status-only kick-off, `completed`.
-pub async fn complete(
-    State(state): State<WebState>,
-    rt: RequestTenant,
-    _principal: Option<Extension<helios_auth::Principal>>,
-    Path(id): Path<String>,
-) -> Response {
-    set_status(state, rt, _principal, id, "completed").await
-}
-
 async fn set_status(
     state: WebState,
     rt: RequestTenant,
@@ -1200,7 +1036,7 @@ async fn set_status(
         return conflict("only in-progress or failed submissions can change terminal status");
     }
     push_log(&mut s, format!("Marking submission {status}..."));
-    let parameters = kickoff_parameters(&s, &id, status, None, None);
+    let parameters = kickoff_parameters(&s, &id, status, None);
     match post_kickoff(&s, &parameters).await {
         Ok((code, _, _)) if (200..300).contains(&code) => {
             push_log(&mut s, format!("Recipient acknowledged ({code})."));
@@ -1232,6 +1068,7 @@ struct StatusCard {
     i18n: I18n,
     id: String,
     polling: bool,
+    can_abort: bool,
     progress: String,
     outputs: u64,
     errors: u64,
@@ -1258,6 +1095,7 @@ pub async fn status_fragment(
         i18n,
         id,
         polling: !s.poll_url.is_empty(),
+        can_abort: matches!(s.status.as_str(), "in-progress" | "failed"),
         progress: s.progress.clone(),
         outputs: s.result["outputs"].as_u64().unwrap_or(0),
         errors: s.result["errors"].as_u64().unwrap_or(0),
@@ -1276,8 +1114,7 @@ pub async fn keys() -> Response {
 }
 
 /// `GET /ui/bulk-import/empty-manifest.json` — an empty Bulk Export Manifest.
-/// Kept as a public compatibility endpoint for existing integrations; new
-/// per-manifest aborts use a replace-only kick-off.
+/// Kept as a public compatibility endpoint for existing integrations.
 pub async fn empty_manifest() -> Response {
     axum::Json(json!({
         "transactionTime": now_stamp(),
@@ -1287,126 +1124,6 @@ pub async fn empty_manifest() -> Response {
         "error": []
     }))
     .into_response()
-}
-
-/// `POST /ui/bulk-import/{id}/manifests/{mid}/replace` — submit a new
-/// manifest carrying `replacesManifestUrl` = the old one, then store the
-/// replacement under the same id.
-pub async fn replace_manifest(
-    State(state): State<WebState>,
-    rt: RequestTenant,
-    _principal: Option<Extension<helios_auth::Principal>>,
-    Path((id, mid)): Path<(String, String)>,
-    axum::Form(form): axum::Form<ManifestForm>,
-) -> Response {
-    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
-        return Redirect::to("/ui/bulk-import").into_response();
-    };
-    if is_terminal(&s.status) || !manifest_can_abort(&s, &mid) {
-        return conflict("manifest is not eligible for replacement");
-    }
-    let old_url = s
-        .manifests
-        .get(&mid)
-        .and_then(|m| m["manifestUrl"].as_str())
-        .unwrap_or_default()
-        .to_string();
-    if !old_url.is_empty() {
-        let replacement = Manifest {
-            manifest_url: form.manifest_url.trim().to_string(),
-            fhir_base_url: form.fhir_base_url.trim().to_string(),
-            output_format: form.output_format.trim().to_string(),
-            file_request_headers: form.file_request_headers.trim().to_string(),
-            created_at: s
-                .manifests
-                .get(&mid)
-                .and_then(|value| value.get("createdAt"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            last_submitted_at: String::new(),
-            aborted_at: String::new(),
-        };
-        push_log(
-            &mut s,
-            format!(
-                "Replacing manifest \"{old_url}\" with \"{}\"...",
-                replacement.manifest_url
-            ),
-        );
-        let parameters =
-            kickoff_parameters(&s, &id, "in-progress", Some(&replacement), Some(&old_url));
-        match post_kickoff(&s, &parameters).await {
-            Ok((code, _, _)) if (200..300).contains(&code) => {
-                push_log(&mut s, format!("Replacement accepted ({code})."));
-                let mut entry = serde_json::to_value(&replacement).unwrap_or(Value::Null);
-                entry["lastSubmittedAt"] = json!(now_stamp());
-                s.manifests.insert(mid, entry);
-            }
-            Ok((code, content_type, body)) => {
-                push_log(
-                    &mut s,
-                    format!(
-                        "Replacement rejected: {code}: {}",
-                        summarize_error_body(&content_type, &body)
-                    ),
-                );
-            }
-            Err(e) => {
-                push_log(&mut s, format!("Replacement failed: {e}"));
-            }
-        }
-        save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
-    }
-    Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
-}
-
-/// `POST /ui/bulk-import/{id}/manifests/{mid}/abort` — retire one submitted
-/// manifest with a replace-only kick-off.
-pub async fn abort_manifest(
-    State(state): State<WebState>,
-    rt: RequestTenant,
-    _principal: Option<Extension<helios_auth::Principal>>,
-    Path((id, mid)): Path<(String, String)>,
-) -> Response {
-    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
-        return Redirect::to("/ui/bulk-import").into_response();
-    };
-    if is_terminal(&s.status) || !manifest_can_abort(&s, &mid) {
-        return conflict("manifest is not eligible for abort");
-    }
-    let old_url = s
-        .manifests
-        .get(&mid)
-        .and_then(|m| m["manifestUrl"].as_str())
-        .unwrap_or_default()
-        .to_string();
-    if !old_url.is_empty() {
-        push_log(&mut s, format!("Aborting manifest \"{old_url}\"..."));
-        let parameters = kickoff_parameters(&s, &id, "in-progress", None, Some(&old_url));
-        match post_kickoff(&s, &parameters).await {
-            Ok((code, _, _)) if (200..300).contains(&code) => {
-                push_log(&mut s, format!("Abort accepted ({code})."));
-                if let Some(entry) = s.manifests.get_mut(&mid) {
-                    entry["abortedAt"] = json!(now_stamp());
-                }
-            }
-            Ok((code, content_type, body)) => {
-                push_log(
-                    &mut s,
-                    format!(
-                        "Abort rejected: {code}: {}",
-                        summarize_error_body(&content_type, &body)
-                    ),
-                );
-            }
-            Err(e) => {
-                push_log(&mut s, format!("Abort failed: {e}"));
-            }
-        }
-        save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
-    }
-    Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
 #[derive(Deserialize)]

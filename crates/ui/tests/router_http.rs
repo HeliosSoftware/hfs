@@ -2236,6 +2236,7 @@ fn view_definitions_app(source: helios_ui::StaticConformanceSource) -> Router {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     )
 }
 
@@ -2437,6 +2438,7 @@ async fn view_definitions_rail_degrades_when_search_fails() {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     );
 
     let response = app
