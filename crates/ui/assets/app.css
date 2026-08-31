@@ -2459,6 +2459,13 @@ select.field__input {
   font-weight: 700;
 }
 
+/* The Recently used heading sits inside its group, so the group's 2px item
+   gap is all that separates it from the first entry; the All Types heading
+   is a rail child and gets the rail's 10px. Top up to the same 10px (#785). */
+.filter-rail__group > .filter-rail__heading--group {
+  margin-bottom: 8px;
+}
+
 /* Between the Recently used group and the general list. Hidden by default —
    shown only when it directly follows a *populated* (non-`hidden`) recent
    group, so there is nothing to divide from before resource-filter.js has
