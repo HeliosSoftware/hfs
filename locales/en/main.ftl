@@ -677,7 +677,7 @@ subs-state-off = Off
 
 bulk-export-title = Bulk Export
 bulk-export-lede = Pull data out of this server as NDJSON files with the FHIR Bulk Data $export operation.
-bulk-export-active-title = Active Exports
+bulk-export-active-title = Exports
 bulk-export-new = New Export
 bulk-export-unavailable = The storage backend does not host the settings store, so export jobs cannot be tracked.
 bulk-export-scope = What are you exporting?
@@ -721,6 +721,14 @@ bulk-export-finished-in = finished in
 bulk-export-error = Error
 bulk-export-cancel = Cancel
 bulk-export-retry = Retry
+bulk-export-download-all = Download All Resources
+bulk-export-download-all-aria = Download all resources from { $name }
+bulk-export-delete = Delete
+bulk-export-delete-aria = Delete export { $name }
+bulk-export-delete-warning = Delete { $name } and its output files from the server? This cannot be undone.
+bulk-export-delete-confirm = Delete export
+bulk-export-delete-cancel = Keep export
+bulk-export-delete-error = The export could not be deleted safely. Its card was kept so you can try again.
 
 # CapabilityStatement page (#653)
 cap-title = Capability Statement

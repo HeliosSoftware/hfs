@@ -5550,7 +5550,7 @@ details.json-fold[open] > summary .icon {
   color: var(--muted);
 }
 
-/* ---- Active Exports job cards (#735) --------------------------------- */
+/* ---- Exports job cards (#735, #795) ---------------------------------- */
 
 .job-card {
   padding: 14px;
@@ -5573,7 +5573,41 @@ details.json-fold[open] > summary .icon {
 .job-card__actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 10px;
+}
+
+.job-card__delete {
+  position: relative;
+}
+
+.job-card__delete > summary {
+  list-style: none;
+}
+
+.job-card__delete > summary::-webkit-details-marker {
+  display: none;
+}
+
+.job-card__delete-confirm {
+  position: absolute;
+  z-index: var(--z-dialog-panel);
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(320px, calc(100vw - 32px));
+  padding: 12px;
+  color: var(--text);
+}
+
+.job-card__delete-confirm p {
+  margin: 0 0 10px;
+}
+
+.job-card__delete-confirm form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .progress {

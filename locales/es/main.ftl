@@ -674,7 +674,7 @@ subs-state-off = Apagada
 
 bulk-export-title = Exportación masiva
 bulk-export-lede = Extrae datos de este servidor como archivos NDJSON con la operación $export de FHIR Bulk Data.
-bulk-export-active-title = Exportaciones activas
+bulk-export-active-title = Exportaciones
 bulk-export-new = Nueva exportación
 bulk-export-unavailable = El backend de almacenamiento no aloja el settings store; no se pueden rastrear los trabajos de exportación.
 bulk-export-scope = ¿Qué desea exportar?
@@ -718,6 +718,14 @@ bulk-export-finished-in = terminada en
 bulk-export-error = Error
 bulk-export-cancel = Cancelar
 bulk-export-retry = Reintentar
+bulk-export-download-all = Descargar todos los recursos
+bulk-export-download-all-aria = Descargar todos los recursos de { $name }
+bulk-export-delete = Eliminar
+bulk-export-delete-aria = Eliminar la exportación { $name }
+bulk-export-delete-warning = ¿Eliminar { $name } y sus archivos de salida del servidor? Esta acción no se puede deshacer.
+bulk-export-delete-confirm = Eliminar exportación
+bulk-export-delete-cancel = Conservar exportación
+bulk-export-delete-error = No se pudo eliminar la exportación de forma segura. Se conservó la tarjeta para que pueda volver a intentarlo.
 
 # Página CapabilityStatement (#653)
 cap-title = Declaración de capacidades

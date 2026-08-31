@@ -1,4 +1,4 @@
-{# One export job against the Active Exports frame (#735): name and the
+{# One export job against the Exports frame (#735): name and the
    status action row up top, the full-width progress track, one meta line.
    In-progress cards poll their own fragment every 5s. #}
 {% if card.status == "in-progress" %}
@@ -21,6 +21,27 @@
       <form method="post" action="/ui/bulk-export/active/{{ card.id }}/retry">
         <button type="submit" class="btn">{{ i18n.t("bulk-export-retry") }}</button>
       </form>
+      {% endif %}
+      {% if card.status == "complete" && !card.files.is_empty() %}
+      <a class="btn" href="/ui/bulk-export/active/{{ card.id }}/download"
+         aria-label="{{ i18n.t_arg("bulk-export-download-all-aria", "name", card.name.clone()) }}">
+        <span class="icon">{% include "icons/import.svg" %}</span>{{ i18n.t("bulk-export-download-all") }}
+      </a>
+      {% endif %}
+      {% if card.can_delete %}
+      <details class="job-card__delete">
+        <summary class="btn btn--danger"
+                 aria-label="{{ i18n.t_arg("bulk-export-delete-aria", "name", card.name.clone()) }}">
+          {{ i18n.t("bulk-export-delete") }}
+        </summary>
+        <div class="job-card__delete-confirm card notice notice--warn">
+          <p>{{ i18n.t_arg("bulk-export-delete-warning", "name", card.name.clone()) }}</p>
+          <form method="post" action="/ui/bulk-export/active/{{ card.id }}/delete">
+            <button type="submit" class="btn btn--danger">{{ i18n.t("bulk-export-delete-confirm") }}</button>
+            <a class="btn" href="/ui/bulk-export">{{ i18n.t("bulk-export-delete-cancel") }}</a>
+          </form>
+        </div>
+      </details>
       {% endif %}
       <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
     </div>

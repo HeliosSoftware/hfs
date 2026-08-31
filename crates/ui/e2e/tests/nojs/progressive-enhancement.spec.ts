@@ -150,7 +150,7 @@ test("Bulk Import one-shot create and delete work without JavaScript", async ({ 
   await expect(page).toHaveURL(/\/ui\/bulk-import$/);
 });
 
-test("Bulk Export list and builder navigation work without JavaScript", async ({ page }) => {
+test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await page.goto("/ui/bulk-export");
   const newExport = page.getByRole("link", { name: "New Export" });
 
@@ -177,5 +177,25 @@ test("Bulk Export list and builder navigation work without JavaScript", async ({
   await form.locator('input[name="scope"][value="system"]').check();
   await startExport.click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
-  await expect(page.locator(".job-card").filter({ hasText: exportName })).toBeVisible();
+  let card = page.locator(".job-card").filter({ hasText: exportName });
+  await expect(card).toBeVisible();
+
+  await card.getByRole("button", { name: "Cancel" }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  card = page.locator(".job-card").filter({ hasText: exportName });
+  await expect(card).toContainText("Cancelled");
+
+  const disclosure = card.locator("details.job-card__delete");
+  await disclosure.locator("summary").click();
+  await expect(disclosure).toHaveAttribute("open", "");
+  await disclosure.getByRole("link", { name: "Keep export" }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  card = page.locator(".job-card").filter({ hasText: exportName });
+  await expect(card).toBeVisible();
+
+  const reopened = card.locator("details.job-card__delete");
+  await reopened.locator("summary").click();
+  await reopened.getByRole("button", { name: "Delete export" }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
 });

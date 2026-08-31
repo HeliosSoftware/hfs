@@ -19,6 +19,10 @@
   {% endif %}
 </header>
 
+{% if delete_error %}
+<div class="card notice notice--warn" role="alert">{{ i18n.t("bulk-export-delete-error") }}</div>
+{% endif %}
+
 {% if !available %}
 <div class="card notice">{{ i18n.t("bulk-export-unavailable") }}</div>
 {% else %}

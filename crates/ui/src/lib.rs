@@ -133,6 +133,9 @@ struct WebState {
     /// submissions target as their recipient (#689). Distinct from the
     /// loopback self-call base the conformance source uses.
     public_base_url: String,
+    /// Trusted loopback base used for UI calls back into this HFS process.
+    /// Unlike `public_base_url`, this never carries a reverse-proxy prefix.
+    self_base_url: String,
     /// Whether canonical tenant URLs include the selected tenant as a path.
     tenant_path_routing: bool,
     /// The server's default FHIR version, used when seeding a new tenant.
@@ -923,12 +926,12 @@ pub fn mount_with_body_limit_and_tenant_routing(
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
-        self_base_url,
+        self_base_url.clone(),
         outbound_auth,
         fhir_version,
         data_dir.clone(),
     ));
-    mount_with_conformance_source_and_body_limit_and_tenant_routing(
+    mount_internal(
         fhir_app,
         hfs_version,
         data_dir,
@@ -939,6 +942,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
         source,
         fhir_version,
         terminology,
+        self_base_url,
         public_base_url,
         max_body_size,
         tenant_path_routing,
@@ -1038,7 +1042,52 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> Router {
+    mount_internal(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        source,
+        fhir_version,
+        terminology,
+        public_base_url.clone(),
+        public_base_url,
+        max_body_size,
+        tenant_path_routing,
+        bulk_provider,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mount_internal(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    self_base_url: String,
+    public_base_url: String,
+    max_body_size: usize,
+    tenant_path_routing: bool,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+) -> Router {
     let nl_enabled = nl.enabled;
+    let mut parsed_self_base = reqwest::Url::parse(&self_base_url)
+        .expect("UI mount requires a valid HTTP(S) self base URL");
+    let trimmed_path = parsed_self_base.path().trim_end_matches('/').to_string();
+    parsed_self_base.set_path(&trimmed_path);
+    let self_base_url = parsed_self_base
+        .to_string()
+        .trim_end_matches('/')
+        .to_string();
     let mut parsed_public_base = reqwest::Url::parse(&public_base_url)
         .expect("UI mount requires a valid HTTP(S) public base URL");
     let trimmed_path = parsed_public_base.path().trim_end_matches('/').to_string();
@@ -1124,6 +1173,14 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
             axum::routing::post(bulk_export::retry),
         )
         .route(
+            "/ui/bulk-export/active/{id}/delete",
+            axum::routing::post(bulk_export::delete),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/download",
+            get(bulk_export::download_all),
+        )
+        .route(
             "/ui/bulk-import",
             get(bulk_import::page).post(bulk_import::create),
         )
@@ -1181,6 +1238,7 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         fhir_version,
         default_tenant,
         terminology,
+        self_base_url,
         public_base_url,
         tenant_path_routing,
     };
