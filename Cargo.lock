@@ -3750,6 +3750,7 @@ dependencies = [
  "helios-fhir-validator",
  "helios-observability",
  "helios-persistence",
+ "helios-sof",
  "http-body-util",
  "json-patch",
  "jsonwebtoken",
