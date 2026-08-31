@@ -419,11 +419,13 @@ async fn capability_statement_page_renders_summary_and_degrades() {
                 {"name": "unsafe", "definition": "javascript:alert(1)"}
             ],
             "resource": [
-                {"type": "Patient", "profile": "https://example.org/StructureDefinition/Patient|2.0",
+                {"type": "Patient", "profile": "http://hl7.org/fhir/StructureDefinition/Patient",
                  "interaction": [{"code": "read"}, {"code": "delete"}],
                  "searchParam": [{"name": "name"}]},
-                {"type": "Observation", "profile": "urn:oid:1.2.3",
+                {"type": "Observation", "profile": "https://example.org/StructureDefinition/Observation|2.0",
                  "interaction": [{"code": "create"}, {"code": "future-code"}]},
+                {"type": "Encounter", "profile": "urn:oid:1.2.3",
+                 "interaction": [{"code": "read"}]},
                 {"type": "NotARealResource", "profile": "https://example.org/custom|1.0",
                  "interaction": [{"code": "read"}]},
                 {"type": "UnknownUnsafe", "profile": "javascript:alert(2)",
@@ -486,13 +488,17 @@ async fn capability_statement_page_renders_summary_and_degrades() {
     assert!(html.contains("javascript:alert(1)"));
     assert!(!html.contains(r#"href="javascript:"#));
     assert!(html.contains("$export"));
-    // Resource profiles take precedence, unsafe profiles fall back to the
-    // versioned core definition, and unknown types remain plain text.
+    // The real HFS core profile becomes a versioned documentation link. Safe
+    // custom profiles stay intact, unsafe known profiles use the core page,
+    // and unknown unsafe types remain plain text.
     assert!(html.contains(
-        r#"href="https://example.org/StructureDefinition/Patient" target="_blank" rel="noopener">Patient</a>"#
+        r#"href="https://hl7.org/fhir/R4/patient.html" target="_blank" rel="noopener">Patient</a>"#
     ));
     assert!(html.contains(
-        r#"href="https://hl7.org/fhir/R4/observation.html" target="_blank" rel="noopener">Observation</a>"#
+        r#"href="https://example.org/StructureDefinition/Observation" target="_blank" rel="noopener">Observation</a>"#
+    ));
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R4/encounter.html" target="_blank" rel="noopener">Encounter</a>"#
     ));
     assert!(html.contains(
         r#"href="https://example.org/custom" target="_blank" rel="noopener">NotARealResource</a>"#

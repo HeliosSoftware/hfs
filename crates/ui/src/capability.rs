@@ -244,16 +244,18 @@ pub(crate) fn build_view(statement: &Value, version: FhirVersion) -> CapabilityV
         .map(|r| {
             let resource_type = str_at(r, &["type"]).to_string();
             let advertised_profile = str_at(r, &["profile"]);
-            let resource_href = safe_canonical_href(advertised_profile).unwrap_or_else(|| {
-                if registry
-                    .resolve(&resource_type)
-                    .is_some_and(|schema| editor::is_resource(&schema))
-                {
-                    resource_definition_href(version, &resource_type)
-                } else {
-                    String::new()
-                }
-            });
+            let is_core_resource = registry
+                .resolve(&resource_type)
+                .is_some_and(|schema| editor::is_resource(&schema));
+            let safe_profile = safe_canonical_href(advertised_profile);
+            let resource_href = if is_core_resource
+                && (safe_profile.is_none()
+                    || is_core_resource_canonical(advertised_profile, &resource_type))
+            {
+                resource_definition_href(version, &resource_type)
+            } else {
+                safe_profile.unwrap_or_default()
+            };
             ResourceRow {
                 resource_type,
                 resource_href,
@@ -292,7 +294,7 @@ fn fhir_docs_root(version: FhirVersion) -> &'static str {
         #[cfg(feature = "R5")]
         FhirVersion::R5 => "https://hl7.org/fhir/R5/",
         #[cfg(feature = "R6")]
-        FhirVersion::R6 => "https://build.fhir.org/",
+        FhirVersion::R6 => "https://hl7.org/fhir/6.0.0-ballot4/",
     }
 }
 
@@ -315,6 +317,26 @@ fn resource_definition_href(version: FhirVersion, resource_type: &str) -> String
         fhir_docs_root(version),
         resource_slug = resource_type.to_ascii_lowercase()
     )
+}
+
+/// Whether an advertised profile is the exact HL7 core canonical for the
+/// advertised resource type. A FHIR canonical may carry one `|version`
+/// qualifier, which does not change the profile identity.
+fn is_core_resource_canonical(canonical: &str, resource_type: &str) -> bool {
+    let (base, version) = canonical
+        .split_once('|')
+        .map_or((canonical, None), |(base, version)| (base, Some(version)));
+    if version.is_some_and(|version| {
+        version.is_empty()
+            || version.contains('|')
+            || version.contains('?')
+            || version.contains('#')
+    }) {
+        return false;
+    }
+
+    base == format!("http://hl7.org/fhir/StructureDefinition/{resource_type}")
+        || base == format!("https://hl7.org/fhir/StructureDefinition/{resource_type}")
 }
 
 /// Returns an absolute HTTP(S) canonical stripped of its optional FHIR
@@ -421,25 +443,34 @@ mod tests {
         #[cfg(feature = "R5")]
         assert_eq!(fhir_docs_root(FhirVersion::R5), "https://hl7.org/fhir/R5/");
         #[cfg(feature = "R6")]
-        assert_eq!(fhir_docs_root(FhirVersion::R6), "https://build.fhir.org/");
+        assert_eq!(
+            fhir_docs_root(FhirVersion::R6),
+            "https://hl7.org/fhir/6.0.0-ballot4/"
+        );
     }
 
     #[test]
-    fn core_resource_fallbacks_follow_each_enabled_version_root() {
-        fn assert_fallback(version: FhirVersion, expected: &str) {
-            let statement = json!({"rest": [{"resource": [{"type": "Patient"}]}]});
+    fn hfs_core_profiles_follow_each_enabled_version_root() {
+        fn assert_core_profile(version: FhirVersion, expected: &str) {
+            let statement = json!({"rest": [{"resource": [{
+                "type": "Patient",
+                "profile": "http://hl7.org/fhir/StructureDefinition/Patient"
+            }]}]});
             let view = build_view(&statement, version);
             assert_eq!(view.resources[0].resource_href, expected);
         }
 
         #[cfg(feature = "R4")]
-        assert_fallback(FhirVersion::R4, "https://hl7.org/fhir/R4/patient.html");
+        assert_core_profile(FhirVersion::R4, "https://hl7.org/fhir/R4/patient.html");
         #[cfg(feature = "R4B")]
-        assert_fallback(FhirVersion::R4B, "https://hl7.org/fhir/R4B/patient.html");
+        assert_core_profile(FhirVersion::R4B, "https://hl7.org/fhir/R4B/patient.html");
         #[cfg(feature = "R5")]
-        assert_fallback(FhirVersion::R5, "https://hl7.org/fhir/R5/patient.html");
+        assert_core_profile(FhirVersion::R5, "https://hl7.org/fhir/R5/patient.html");
         #[cfg(feature = "R6")]
-        assert_fallback(FhirVersion::R6, "https://build.fhir.org/patient.html");
+        assert_core_profile(
+            FhirVersion::R6,
+            "https://hl7.org/fhir/6.0.0-ballot4/patient.html",
+        );
     }
 
     #[test]
@@ -512,7 +543,7 @@ mod tests {
         #[cfg(feature = "R5")]
         assert_links(FhirVersion::R5, "https://hl7.org/fhir/R5/");
         #[cfg(feature = "R6")]
-        assert_links(FhirVersion::R6, "https://build.fhir.org/");
+        assert_links(FhirVersion::R6, "https://hl7.org/fhir/6.0.0-ballot4/");
     }
 
     #[test]
@@ -567,10 +598,13 @@ mod tests {
 
     #[test]
     #[cfg(feature = "R4")]
-    fn safe_profiles_precede_known_fallbacks_and_unknown_unsafe_types_stay_plain() {
+    fn core_profiles_are_versioned_while_custom_profiles_are_preserved() {
         let statement = json!({"rest": [{"resource": [
+            {"type": "Patient", "profile": "http://hl7.org/fhir/StructureDefinition/Patient"},
+            {"type": "Patient", "profile": "https://hl7.org/fhir/StructureDefinition/Patient|4.0.1"},
             {"type": "Patient", "profile": "https://example.org/Patient|2.0"},
             {"type": "Observation", "profile": "javascript:alert(1)"},
+            {"type": "Encounter"},
             {"type": "NotARealResource", "profile": "https://example.org/custom"},
             {"type": "UnknownUnsafe", "profile": "javascript:alert(2)"},
             {"type": "UnknownMissing"},
@@ -580,19 +614,132 @@ mod tests {
 
         assert_eq!(
             view.resources[0].resource_href,
-            "https://example.org/Patient"
+            "https://hl7.org/fhir/R4/patient.html"
         );
         assert_eq!(
             view.resources[1].resource_href,
-            "https://hl7.org/fhir/R4/observation.html"
+            "https://hl7.org/fhir/R4/patient.html"
         );
         assert_eq!(
             view.resources[2].resource_href,
+            "https://example.org/Patient"
+        );
+        assert_eq!(
+            view.resources[3].resource_href,
+            "https://hl7.org/fhir/R4/observation.html"
+        );
+        assert_eq!(
+            view.resources[4].resource_href,
+            "https://hl7.org/fhir/R4/encounter.html"
+        );
+        assert_eq!(
+            view.resources[5].resource_href,
             "https://example.org/custom"
         );
-        assert!(view.resources[3].resource_href.is_empty());
-        assert!(view.resources[4].resource_href.is_empty());
-        assert!(view.resources[5].resource_href.is_empty());
+        assert!(view.resources[6].resource_href.is_empty());
+        assert!(view.resources[7].resource_href.is_empty());
+        assert!(view.resources[8].resource_href.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "R4")]
+    fn core_profile_near_misses_are_not_rewritten() {
+        let profiles = [
+            "https://hl7.org.example.com/fhir/StructureDefinition/Patient",
+            "https://hl7.org/fhir/StructureDefinition/Observation",
+            "https://hl7.org/fhir/StructureDefinition/Patient?mode=custom",
+            "https://hl7.org/fhir/StructureDefinition/Patient#custom",
+            "https://hl7.org/fhir/StructureDefinition/Patient|4.0.1#custom",
+            "https://hl7.org/fhir/StructureDefinition/Patient|4.0.1?mode=custom",
+            "https://hl7.org/fhir/StructureDefinition/Patient|4.0.1|extra",
+        ];
+        let statement = json!({"rest": [{"resource": profiles.map(|profile| json!({
+            "type": "Patient",
+            "profile": profile
+        }))}]});
+        let view = build_view(&statement, FhirVersion::R4);
+
+        for (row, profile) in view.resources.iter().zip(profiles) {
+            assert_eq!(
+                row.resource_href,
+                safe_canonical_href(profile).unwrap(),
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_specific_resource_links_require_a_resource_schema() {
+        fn assert_link(version: FhirVersion, resource_type: &str, expected: &str) {
+            let statement = json!({"rest": [{"resource": [{"type": resource_type}]}]});
+            let view = build_view(&statement, version);
+            assert_eq!(view.resources[0].resource_href, expected, "{resource_type}");
+        }
+
+        #[cfg(feature = "R4")]
+        {
+            assert_link(
+                FhirVersion::R4,
+                "DocumentManifest",
+                "https://hl7.org/fhir/R4/documentmanifest.html",
+            );
+            assert_link(
+                FhirVersion::R4,
+                "Media",
+                "https://hl7.org/fhir/R4/media.html",
+            );
+            assert_link(FhirVersion::R4, "SubscriptionTopic", "");
+            assert_link(FhirVersion::R4, "ActorDefinition", "");
+        }
+        #[cfg(feature = "R4B")]
+        {
+            assert_link(
+                FhirVersion::R4B,
+                "DocumentManifest",
+                "https://hl7.org/fhir/R4B/documentmanifest.html",
+            );
+            assert_link(
+                FhirVersion::R4B,
+                "SubscriptionTopic",
+                "https://hl7.org/fhir/R4B/subscriptiontopic.html",
+            );
+            assert_link(
+                FhirVersion::R4B,
+                "Media",
+                "https://hl7.org/fhir/R4B/media.html",
+            );
+            assert_link(FhirVersion::R4B, "ActorDefinition", "");
+        }
+        #[cfg(feature = "R5")]
+        {
+            assert_link(
+                FhirVersion::R5,
+                "SubscriptionTopic",
+                "https://hl7.org/fhir/R5/subscriptiontopic.html",
+            );
+            assert_link(
+                FhirVersion::R5,
+                "ActorDefinition",
+                "https://hl7.org/fhir/R5/actordefinition.html",
+            );
+            assert_link(FhirVersion::R5, "DocumentManifest", "");
+            assert_link(FhirVersion::R5, "Media", "");
+        }
+        #[cfg(feature = "R6")]
+        {
+            assert_link(
+                FhirVersion::R6,
+                "SubscriptionTopic",
+                "https://hl7.org/fhir/6.0.0-ballot4/subscriptiontopic.html",
+            );
+            assert_link(
+                FhirVersion::R6,
+                "ActorDefinition",
+                "https://hl7.org/fhir/6.0.0-ballot4/actordefinition.html",
+            );
+            assert_link(FhirVersion::R6, "DocumentManifest", "");
+            assert_link(FhirVersion::R6, "Media", "");
+        }
     }
 
     #[test]

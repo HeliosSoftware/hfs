@@ -22,4 +22,18 @@ export class CapabilityStatementPage {
       has: this.page.getByRole("link", { name: resourceType, exact: true }),
     });
   }
+
+  resourceLink(resourceType: string): Locator {
+    return this.resourceRow(resourceType).getByRole("link", {
+      name: resourceType,
+      exact: true,
+    });
+  }
+
+  get fhirVersionSummary(): Locator {
+    return this.page
+      .locator(".detail__field")
+      .filter({ has: this.page.getByText("FHIR version", { exact: true }) })
+      .locator(":scope > div");
+  }
 }

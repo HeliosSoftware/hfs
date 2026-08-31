@@ -1,5 +1,43 @@
 import { test, expect } from "../pages/fixtures";
 
+test("Capability Statement links follow the active FHIR version", async ({
+  capabilityStatement,
+  chrome,
+}) => {
+  await capabilityStatement.goto("?filter=Patient");
+
+  const version = await chrome.currentVersion();
+  const configuredVersion = process.env.HFS_DEFAULT_FHIR_VERSION;
+  if (configuredVersion) {
+    expect(version).toBe(configuredVersion);
+  }
+  const expected = {
+    R4: {
+      summary: "4.0.1",
+      patientHref: "https://hl7.org/fhir/R4/patient.html",
+    },
+    R4B: {
+      summary: "4.3.0",
+      patientHref: "https://hl7.org/fhir/R4B/patient.html",
+    },
+    R5: {
+      summary: "5.0.0",
+      patientHref: "https://hl7.org/fhir/R5/patient.html",
+    },
+    R6: {
+      summary: "6.0.0",
+      patientHref: "https://hl7.org/fhir/6.0.0-ballot4/patient.html",
+    },
+  }[version];
+  expect(expected, `No Capability Statement expectation is defined for ${version}`).toBeTruthy();
+
+  await expect(capabilityStatement.fhirVersionSummary).toHaveText(expected!.summary);
+  await expect(capabilityStatement.resourceLink("Patient")).toHaveAttribute(
+    "href",
+    expected!.patientHref,
+  );
+});
+
 test("typing filters resource capabilities live", async ({ capabilityStatement }) => {
   await capabilityStatement.goto();
   await expect(capabilityStatement.resourceRow("Patient")).toBeVisible();

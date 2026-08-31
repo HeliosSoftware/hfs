@@ -167,9 +167,23 @@ jobs:
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
 
       - name: Build HFS (R4 + R4B + R5 + R6)
+        env:
+          DOCS_RS: "1"
         run: |
+          set -euo pipefail
+          assert_clean_source() {
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "::error::Multi-version build modified the source checkout"
+              git status --short
+              git diff
+              git diff --cached
+              exit 1
+            fi
+          }
+          assert_clean_source
           cargo build -p helios-hfs --no-default-features \
             --features R4,R4B,R5,R6,ui,sqlite
+          assert_clean_source
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v7
@@ -247,8 +261,8 @@ jobs:
                 exit 1
               fi
               HFS_E2E_BASE_URL=http://127.0.0.1:8080 \
-                npx playwright test tests/queries.spec.ts tests/resources.spec.ts \
-                  --grep "escaped commas|literal commas|malformed FHIR|empty alternatives|drilling preserves|create eligibility follows"
+                npx playwright test tests/queries.spec.ts tests/resources.spec.ts tests/capability-statement.spec.ts \
+                  --grep "escaped commas|literal commas|malformed FHIR|empty alternatives|drilling preserves|create eligibility follows|Capability Statement links follow the active FHIR version"
               if [ "$HFS_DEFAULT_FHIR_VERSION" = R6 ]; then
                 HFS_E2E_BASE_URL=http://127.0.0.1:8080 \
                   npx playwright test tests/dashboard-multiversion.spec.ts
