@@ -445,7 +445,7 @@ impl Transaction for PostgresTransaction {
             .get("id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(crate::types::new_resource_id);
 
         // Build the resource with id and resourceType
         let mut data = resource.clone();

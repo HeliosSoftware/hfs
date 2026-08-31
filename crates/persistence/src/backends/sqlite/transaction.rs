@@ -86,7 +86,7 @@ impl SqliteTransaction {
 
     /// Generate a new ID for a resource.
     fn generate_id() -> String {
-        uuid::Uuid::new_v4().to_string()
+        crate::types::new_resource_id()
     }
 
     /// Index a resource for search.
