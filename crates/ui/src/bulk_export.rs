@@ -245,7 +245,6 @@ struct BulkExportPage {
     active_page: &'static str,
     available: bool,
     resource_types: Vec<String>,
-    active_count: usize,
     error: Option<String>,
 }
 
@@ -255,6 +254,7 @@ struct ActiveExportsPage {
     status: crate::Status,
     i18n: I18n,
     active_page: &'static str,
+    available: bool,
     total: usize,
     running: usize,
     cards: Vec<JobCard>,
@@ -271,30 +271,22 @@ struct JobCardFragment {
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// `GET /ui/bulk-export` — the export builder.
+/// `GET /ui/bulk-export/new` — the export builder.
 pub async fn page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
 ) -> Response {
     let i18n = I18n::new(locale);
     let status = current_status(&state, rv.0, &rt);
-    let user_key = settings_user_key(principal.as_deref());
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
-    let active_count = load_jobs(&state, &user_key, &rt.id)
-        .await
-        .values()
-        .filter(|j| j["status"] == "in-progress")
-        .count();
     render(BulkExportPage {
         status,
         i18n,
         active_page: "bulk-export",
         available: state.settings.is_some(),
         resource_types,
-        active_count,
         error: None,
     })
 }
@@ -372,7 +364,7 @@ pub async fn start(
     let id = uuid::Uuid::new_v4().to_string();
     kickoff(&mut job, &headers, &rt.id).await;
     let _ = store_job(&state, &user_key, &rt.id, &id, &job).await;
-    Redirect::to("/ui/bulk-export/active").into_response()
+    Redirect::to("/ui/bulk-export").into_response()
 }
 
 /// Performs the `$export` kick-off self-call, recording the poll URL or the
@@ -439,7 +431,7 @@ async fn kickoff(job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
     }
 }
 
-/// `GET /ui/bulk-export/active` — the job list.
+/// `GET /ui/bulk-export` — the job list.
 pub async fn active(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -449,8 +441,13 @@ pub async fn active(
 ) -> Response {
     let i18n = I18n::new(locale);
     let status = current_status(&state, rv.0, &rt);
+    let available = state.settings.is_some();
     let user_key = settings_user_key(principal.as_deref());
-    let jobs = load_jobs(&state, &user_key, &rt.id).await;
+    let jobs = if available {
+        load_jobs(&state, &user_key, &rt.id).await
+    } else {
+        serde_json::Map::new()
+    };
     let mut entries: Vec<(String, ExportJob)> = jobs
         .iter()
         .map(|(id, v)| (id.clone(), parse_job(v)))
@@ -468,10 +465,16 @@ pub async fn active(
         status,
         i18n: I18n::new(locale),
         active_page: "bulk-export",
+        available,
         total: entries.len(),
         running,
         cards,
     })
+}
+
+/// `GET /ui/bulk-export/active` — permanent compatibility redirect.
+pub async fn active_redirect() -> Redirect {
+    Redirect::permanent("/ui/bulk-export")
 }
 
 /// `GET /ui/bulk-export/active/{id}/card` — one poll, then the refreshed card.
@@ -566,7 +569,7 @@ pub async fn cancel(
         job.progress = String::new();
         let _ = store_job(&state, &user_key, &rt.id, &id, &job).await;
     }
-    Redirect::to("/ui/bulk-export/active").into_response()
+    Redirect::to("/ui/bulk-export").into_response()
 }
 
 /// `POST /ui/bulk-export/active/{id}/retry` — same parameters, fresh kick-off.
@@ -590,5 +593,5 @@ pub async fn retry(
         kickoff(&mut job, &headers, &rt.id).await;
         let _ = store_job(&state, &user_key, &rt.id, &id, &job).await;
     }
-    Redirect::to("/ui/bulk-export/active").into_response()
+    Redirect::to("/ui/bulk-export").into_response()
 }

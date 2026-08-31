@@ -81,10 +81,11 @@ fn mock_fhir_app(state: MockExport) -> Router {
 
 /// Serves the mounted UI (over the mock FHIR app) on a real port; returns the
 /// base URL and the mock's state handles.
-async fn serve() -> (String, MockExport) {
+async fn serve_with_settings(settings_available: bool) -> (String, MockExport) {
     let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
     backend.init_schema().expect("init schema");
-    let settings: Arc<dyn SettingsStore> = Arc::new(backend);
+    let settings: Option<Arc<dyn SettingsStore>> =
+        settings_available.then(|| Arc::new(backend) as Arc<dyn SettingsStore>);
 
     let mock = MockExport::default();
     let app = helios_ui::mount_with_conformance_source(
@@ -93,7 +94,7 @@ async fn serve() -> (String, MockExport) {
         Some(std::path::PathBuf::from("../../data")),
         helios_ui::NlSearch::default(),
         None,
-        Some(settings),
+        settings,
         "default".to_string(),
         Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
             std::path::Path::new("../../data"),
@@ -107,6 +108,10 @@ async fn serve() -> (String, MockExport) {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (format!("http://{addr}"), mock)
+}
+
+async fn serve() -> (String, MockExport) {
+    serve_with_settings(true).await
 }
 
 fn client() -> reqwest::Client {
@@ -138,21 +143,40 @@ async fn post_form(base: &str, path: &str, form: &[(&str, &str)]) -> (u16, Strin
 }
 
 #[tokio::test]
-async fn the_export_page_offers_scopes_types_and_filters() {
-    let (base, _) = serve().await;
+async fn the_root_is_the_management_page_and_new_is_the_builder() {
+    let (base, mock) = serve().await;
+    let assert_export_nav_is_current = |html: &str| {
+        assert!(html.contains(r#"<a class="nav-item" href="/ui/bulk-export" aria-current="page""#));
+    };
+
     let (status, html) = get_text(&base, "/ui/bulk-export").await;
     assert_eq!(status, 200);
+    assert_export_nav_is_current(&html);
+    assert!(html.contains("Active Exports"));
+    assert!(html.contains(r#"href="/ui/bulk-export/new""#));
+    assert!(!html.contains(r#"<form method="post" action="/ui/bulk-export""#));
+    assert!(!html.contains(r#"class="back-link""#));
+
+    let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
+    assert_eq!(status, 200);
+    assert_export_nav_is_current(&html);
     assert!(html.contains("What are you exporting?"));
     assert!(html.contains("Everything"));
     assert!(html.contains(r#"name="types" value="Patient""#));
     assert!(html.contains("Narrow it down"));
     assert!(html.contains("Start Export"));
+    assert!(html.contains(r#"<form method="post" action="/ui/bulk-export""#));
+    assert!(!html.contains("toolbar__count"));
+
+    let (status, _) = post_form(&base, "/ui/bulk-export/new", &[("scope", "system")]).await;
+    assert_eq!(status, 405);
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn the_export_page_uses_form_panels_with_name_and_hint_up_top() {
     let (base, _) = serve().await;
-    let (status, html) = get_text(&base, "/ui/bulk-export").await;
+    let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
     assert_eq!(status, 200);
 
     // The scope choices are the designed radio-card row (#735), and nothing
@@ -176,9 +200,9 @@ async fn the_export_page_uses_form_panels_with_name_and_hint_up_top() {
 }
 
 #[tokio::test]
-async fn the_active_exports_page_uses_the_shared_back_link() {
+async fn the_export_builder_uses_the_localized_shared_back_link() {
     let (base, _) = serve().await;
-    let (status, html) = get_text(&base, "/ui/bulk-export/active").await;
+    let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
     assert_eq!(status, 200);
 
     let assert_back_link =
@@ -202,7 +226,7 @@ async fn the_active_exports_page_uses_the_shared_back_link() {
                 "spacing must come from CSS, not the former literal chevron and space"
             );
         };
-    assert_back_link(&html, "Bulk Export");
+    assert_back_link(&html, "Active Exports");
     let header_start = html
         .find(r#"<header class="page-head page-head--back-link">"#)
         .expect("shared back-link header");
@@ -213,14 +237,37 @@ async fn the_active_exports_page_uses_the_shared_back_link() {
     let header = &html[header_start..header_end];
     let back_link_position = header.find(r#"class="back-link""#).unwrap();
     let copy_position = header.find(r#"class="page-head__copy""#).unwrap();
-    let action_position = header.find(r#"class="page-head__action""#).unwrap();
-    assert!(back_link_position < copy_position && copy_position < action_position);
-    for (lang, label) in [("es", "Exportación masiva"), ("de", "Massenexport")] {
+    assert!(back_link_position < copy_position);
+    assert!(!header.contains(r#"class="page-head__action""#));
+    for (lang, label) in [("es", "Exportaciones activas"), ("de", "Aktive Exporte")] {
         let (status, localized_html) =
-            get_text(&base, &format!("/ui/bulk-export/active?lang={lang}")).await;
+            get_text(&base, &format!("/ui/bulk-export/new?lang={lang}")).await;
         assert_eq!(status, 200);
         assert_back_link(&localized_html, label);
     }
+}
+
+#[tokio::test]
+async fn the_legacy_active_route_permanently_redirects_to_the_fixed_root() {
+    let (base, _) = serve().await;
+    let res = client()
+        .get(format!("{base}/ui/bulk-export/active?lang=es"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(res.headers()["location"], "/ui/bulk-export");
+}
+
+#[tokio::test]
+async fn the_management_page_reports_unavailable_settings_without_a_new_action() {
+    let (base, _) = serve_with_settings(false).await;
+    let (status, html) = get_text(&base, "/ui/bulk-export").await;
+    assert_eq!(status, 200);
+    assert!(html.contains("export jobs cannot be tracked"));
+    assert!(!html.contains(r#"href="/ui/bulk-export/new""#));
+    assert!(!html.contains("No exports yet"));
+    assert!(!html.contains("0 exports · 0 running"));
 }
 
 #[tokio::test]
@@ -241,7 +288,7 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     )
     .await;
     assert_eq!(status, 303);
-    assert_eq!(location, "/ui/bulk-export/active");
+    assert_eq!(location, "/ui/bulk-export");
 
     // The mock saw one kick-off with the narrowed parameters.
     let kickoffs = mock.kickoffs.lock().unwrap().clone();
@@ -253,7 +300,7 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     assert!(q.contains("_since="), "{q}");
 
     // The Active Exports page shows it in progress.
-    let (_, html) = get_text(&base, "/ui/bulk-export/active").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
     assert!(html.contains("Everything"));
     assert!(html.contains("In progress"));
     // The card's own poll URL (not the layout's tenant-menu hx-get).
@@ -308,7 +355,7 @@ async fn a_rejected_kickoff_lands_as_failed_and_retry_reruns_it() {
     )
     .await;
 
-    let (_, html) = get_text(&base, "/ui/bulk-export/active").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
     assert!(html.contains("Failed"));
     assert!(html.contains("ran out of time"));
     assert!(html.contains("Retry"));
@@ -321,10 +368,11 @@ async fn a_rejected_kickoff_lands_as_failed_and_retry_reruns_it() {
         .and_then(|s| s.split('"').next())
         .expect("retry action")
         .to_string();
-    let (status, _) = post_form(&base, &retry_path, &[]).await;
+    let (status, location) = post_form(&base, &retry_path, &[]).await;
     assert_eq!(status, 303);
+    assert_eq!(location, "/ui/bulk-export");
 
-    let (_, html) = get_text(&base, "/ui/bulk-export/active").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
     assert!(html.contains("In progress"), "{html}");
     assert_eq!(mock.kickoffs.lock().unwrap().len(), 2);
 }
@@ -334,17 +382,18 @@ async fn cancelling_deletes_the_job_server_side() {
     let (base, mock) = serve().await;
     post_form(&base, "/ui/bulk-export", &[("scope", "system")]).await;
 
-    let (_, html) = get_text(&base, "/ui/bulk-export/active").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
     let cancel_path = html
         .split("action=\"")
         .find(|s| s.starts_with("/ui/bulk-export/active/") && s.contains("/cancel"))
         .and_then(|s| s.split('"').next())
         .expect("cancel action")
         .to_string();
-    let (status, _) = post_form(&base, &cancel_path, &[]).await;
+    let (status, location) = post_form(&base, &cancel_path, &[]).await;
     assert_eq!(status, 303);
+    assert_eq!(location, "/ui/bulk-export");
 
     assert_eq!(*mock.cancels.lock().unwrap(), 1, "DELETE reached the API");
-    let (_, html) = get_text(&base, "/ui/bulk-export/active").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
     assert!(html.contains("Cancelled"));
 }

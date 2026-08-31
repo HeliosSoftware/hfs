@@ -1110,9 +1110,10 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         .route("/ui/history/diff", axum::routing::post(history_diff))
         .route(
             "/ui/bulk-export",
-            get(bulk_export::page).post(bulk_export::start),
+            get(bulk_export::active).post(bulk_export::start),
         )
-        .route("/ui/bulk-export/active", get(bulk_export::active))
+        .route("/ui/bulk-export/new", get(bulk_export::page))
+        .route("/ui/bulk-export/active", get(bulk_export::active_redirect))
         .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
         .route(
             "/ui/bulk-export/active/{id}/cancel",

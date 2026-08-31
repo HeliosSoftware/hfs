@@ -282,7 +282,7 @@ test("shared query-builder actions stay 30px while their inputs keep the field s
   }
 });
 
-test("shared back links match the Figma geometry on both consumers", async ({
+test("shared back links match the Figma geometry on every consumer", async ({
   page,
   request,
 }) => {
@@ -332,7 +332,7 @@ test("shared back links match the Figma geometry on both consumers", async ({
 
   const consumers = [
     { name: "bulk import detail", route: await seedBulkImportDetail(request) },
-    { name: "active bulk exports", route: "/ui/bulk-export/active" },
+    { name: "new bulk export", route: "/ui/bulk-export/new" },
   ];
   for (const theme of ["light", "dark"] as const) {
     await page.goto("/ui");
@@ -354,12 +354,15 @@ test("shared back links match the Figma geometry on both consumers", async ({
         const label = link.locator(":scope > span").last();
         const title = page.locator(".page-head__title");
         const action = page.locator(".page-head--back-link > .page-head__action");
-        const actionControl = action.locator(
-          ":scope > a.btn, :scope > details > summary.btn",
-        );
-        await expect(action).toHaveCount(1);
-        await expect(actionControl).toHaveCount(1);
-        await expect(actionControl).toBeVisible();
+        const actionCount = await action.count();
+        expect(actionCount).toBeLessThanOrEqual(1);
+        if (actionCount === 1) {
+          const actionControl = action.locator(
+            ":scope > a.btn, :scope > details > summary.btn",
+          );
+          await expect(actionControl).toHaveCount(1);
+          await expect(actionControl).toBeVisible();
+        }
         // Grid items are blockified, so the authored inline-flex computes to
         // flex here. The source-rule assertion above guards the shared value.
         await expect(link).toHaveCSS("display", "flex");
@@ -369,22 +372,24 @@ test("shared back links match the Figma geometry on both consumers", async ({
         await expect(icon).toHaveAttribute("width", "5");
         await expect(icon).toHaveAttribute("height", "8");
 
-        const [linkBox, iconBox, labelBox, titleBox, actionBox] = await Promise.all([
+        const [linkBox, iconBox, labelBox, titleBox] = await Promise.all([
           link.boundingBox(),
           icon.boundingBox(),
           label.boundingBox(),
           title.boundingBox(),
-          action.boundingBox(),
         ]);
         expect(linkBox).not.toBeNull();
         expect(iconBox).not.toBeNull();
         expect(labelBox).not.toBeNull();
         expect(titleBox).not.toBeNull();
-        expect(actionBox).not.toBeNull();
         expect(Math.abs(labelBox!.x - (iconBox!.x + iconBox!.width) - 7)).toBeLessThanOrEqual(1);
         expect(Math.abs(titleBox!.y - (linkBox!.y + linkBox!.height) - 24)).toBeLessThanOrEqual(1);
-        expect(actionBox!.y).toBeGreaterThan(linkBox!.y + linkBox!.height);
-        expect(Math.abs(actionBox!.y - titleBox!.y)).toBeLessThanOrEqual(1);
+        if (actionCount === 1) {
+          const actionBox = await action.boundingBox();
+          expect(actionBox).not.toBeNull();
+          expect(actionBox!.y).toBeGreaterThan(linkBox!.y + linkBox!.height);
+          expect(Math.abs(actionBox!.y - titleBox!.y)).toBeLessThanOrEqual(1);
+        }
 
         const normal = await link.evaluate((element) => {
           const style = getComputedStyle(element);
