@@ -379,8 +379,8 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
 }
 
 /// #653: the CapabilityStatement page renders the live /metadata answer —
-/// summary, the batch/transaction distinction, linkified local operation
-/// definitions, the filterable per-resource table, and the raw fold. Without
+/// summary, safe external documentation links, semantic interaction tags, the
+/// progressively enhanced resource filter, and highlighted raw JSON. Without
 /// a fetchable statement it degrades to the warning, never fabricates.
 #[tokio::test]
 async fn capability_statement_page_renders_summary_and_degrades() {
@@ -409,12 +409,25 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         "implementation": {"description": "Helios FHIR Server", "url": "http://t/"},
         "rest": [{
             "mode": "server",
-            "interaction": [{"code": "batch"}, {"code": "transaction"}],
-            "operation": [{"name": "export", "definition": "http://t/OperationDefinition/export"}],
+            "interaction": [
+                {"code": "batch"}, {"code": "transaction"}, {"code": "transaction"},
+                {"code": "search-system"}, {"code": "history-system"},
+                {"code": "future-code"}
+            ],
+            "operation": [
+                {"name": "export", "definition": "https://example.org/OperationDefinition/export|1.2.3"},
+                {"name": "unsafe", "definition": "javascript:alert(1)"}
+            ],
             "resource": [
-                {"type": "Patient", "interaction": [{"code": "read"}],
+                {"type": "Patient", "profile": "https://example.org/StructureDefinition/Patient|2.0",
+                 "interaction": [{"code": "read"}, {"code": "delete"}],
                  "searchParam": [{"name": "name"}]},
-                {"type": "Observation", "interaction": [{"code": "read"}]}
+                {"type": "Observation", "profile": "urn:oid:1.2.3",
+                 "interaction": [{"code": "create"}, {"code": "future-code"}]},
+                {"type": "NotARealResource", "profile": "https://example.org/custom|1.0",
+                 "interaction": [{"code": "read"}]},
+                {"type": "UnknownUnsafe", "profile": "javascript:alert(2)",
+                 "interaction": [{"code": "read"}]}
             ]
         }]
     }));
@@ -444,13 +457,56 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         .unwrap();
     let html = body_text(response).await;
     assert!(html.contains("4.0.1"));
-    assert!(html.contains(">batch<"));
-    assert!(html.contains(">transaction<"));
-    // The transaction-is-conditional note renders alongside the chips.
-    assert!(html.contains("atomic transactions"));
-    // Local operation definitions are clickable, at their local path.
-    assert!(html.contains(r#"href="/OperationDefinition/export""#));
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R4/http.html#batch" target="_blank" rel="noopener">batch</a>"#
+    ));
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R4/http.html#transaction" target="_blank" rel="noopener">transaction</a>"#
+    ));
+    assert!(html.contains(r#"href="https://hl7.org/fhir/R4/http.html#search""#));
+    assert!(html.contains(r#"href="https://hl7.org/fhir/R4/http.html#history""#));
+    assert!(html.contains(r#"class="tag tag--muted">future-code</span>"#));
+    // Duplicate transaction declarations still produce one subordinate note.
+    assert_eq!(html.matches("atomic transactions").count(), 1);
+    assert!(html.contains(r#"<p class="cap-transaction-note">"#));
+    assert!(!html.contains(r#"<p class="page-head__lede">atomic transactions"#));
+    assert!(html.contains("#primarysecondary-role-matrix"));
+    // Absolute HTTP(S) canonicals are clickable and their FHIR `|version`
+    // qualifier is omitted from href while remaining visible as link text.
+    assert!(html.contains(
+        r#"href="https://example.org/OperationDefinition/export" target="_blank" rel="noopener">https://example.org/OperationDefinition/export|1.2.3</a>"#
+    ));
+    assert!(html.contains("javascript:alert(1)"));
+    assert!(!html.contains(r#"href="javascript:"#));
     assert!(html.contains("$export"));
+    // Resource profiles take precedence, unsafe profiles fall back to the
+    // versioned core definition, and unknown types remain plain text.
+    assert!(html.contains(
+        r#"href="https://example.org/StructureDefinition/Patient" target="_blank" rel="noopener">Patient</a>"#
+    ));
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R4/observation.html" target="_blank" rel="noopener">Observation</a>"#
+    ));
+    assert!(html.contains(
+        r#"href="https://example.org/custom" target="_blank" rel="noopener">NotARealResource</a>"#
+    ));
+    assert!(html.contains("<span>UnknownUnsafe</span>"));
+    assert!(!html.contains(r#"href="javascript:alert(2)""#));
+    assert!(html.contains(r#"class="tag tag--member">read</span>"#));
+    assert!(html.contains(r#"class="tag tag--config">create</span>"#));
+    assert!(html.contains(r#"class="tag tag--excluded">delete</span>"#));
+    // The raw statement uses the shared foldable, highlighted JSON renderer.
+    assert!(html.contains(r#"class="json-view" id="capability-json""#));
+    assert!(html.contains(r#"class="jt--key""#));
+    assert!(html.contains("data-fold="));
+    assert!(!html.contains(r#"<pre class="detail__code">"#));
+    // The real GET form remains the fallback while htmx enhances live input.
+    assert!(html.contains(r#"method="get" action="/ui/capability-statement""#));
+    assert!(html.contains(r#"hx-get="/ui/capability-statement" hx-include="closest form""#));
+    assert!(html.contains(r#"hx-trigger="input changed delay:300ms, search""#));
+    assert!(html.contains(r##"hx-target="#cap-resource-table" hx-select="#cap-resource-table""##));
+    assert!(html.contains(r#"class="card table-card cap-resource-card""#));
+    assert!(html.contains(r#"class="filter-rail__search cap-resource-filter""#));
     // Both resource rows, then the server-side filter narrows to one.
     assert!(html.contains(">Patient<") && html.contains(">Observation<"));
     let response = app
@@ -463,8 +519,47 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         .unwrap();
     let html = body_text(response).await;
     assert!(!html.contains(">Patient<") && html.contains(">Observation<"));
-    // The raw statement rides in the fold.
+}
+
+#[tokio::test]
+async fn capability_statement_raw_json_falls_back_with_http_200_over_budget() {
+    let oversized = Value::Array((0..4_001).map(|index| Value::from(index as u64)).collect());
+    let source =
+        helios_ui::StaticConformanceSource::from_data_dir(std::path::Path::new("../../data"))
+            .with_metadata(serde_json::json!({
+                "resourceType": "CapabilityStatement",
+                "fhirVersion": "4.0.1",
+                "extension": oversized,
+                "rest": [{"mode": "server"}]
+            }));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/capability-statement")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<pre class="detail__code">"#));
     assert!(html.contains("CapabilityStatement"));
+    assert!(!html.contains(r#"id="capability-json""#));
 }
 
 #[tokio::test]
@@ -2130,7 +2225,7 @@ async fn user_menu_carries_language_and_the_signed_out_state() {
     // English is the negotiated default: its option is current, once.
     assert!(html.contains(r#"href="?lang=en" aria-current="true""#));
     assert!(!html.contains(r#"href="?lang=es" aria-current="true""#));
-    assert!(html.contains("Local user"));
+    assert!(html.contains("Anonymous user"));
     assert!(html.contains("Authentication is disabled"));
     assert!(!html.contains("/ui/logout"));
 }

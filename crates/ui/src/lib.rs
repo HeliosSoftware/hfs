@@ -2683,8 +2683,14 @@ struct CapabilityPage {
     active_page: &'static str,
     /// `None` when the self-fetch failed — the page degrades to a warning.
     view: Option<capability::CapabilityView>,
-    /// Pretty-printed raw statement for the foldable block.
+    /// Highlighted, foldable JSON when the statement fits the render budget.
+    json_lines: Vec<json_view::JsonLine>,
+    json_view_id: String,
+    json_view_paths: bool,
+    /// Pretty-printed raw statement when highlighted rendering exceeds its
+    /// budget. Askama escapes it inside the fallback `<pre>`.
     raw: String,
+    raw_fallback: bool,
     /// The server-side resource-type filter, echoed back into the form.
     filter: String,
 }
@@ -2703,20 +2709,38 @@ async fn capability_page(
 ) -> Response {
     let filter = query.filter.unwrap_or_default();
     let fetched = state.conformance.metadata(rv.0, &rt.id).await;
-    let (view, raw) = match fetched {
+    let (view, json_lines, raw, raw_fallback) = match fetched {
         Ok(statement) => {
-            let mut view = capability::build_view(&statement);
+            let mut view = capability::build_view(&statement, rv.0);
             if !filter.is_empty() {
                 let needle = filter.to_lowercase();
                 view.resources
                     .retain(|r| r.resource_type.to_lowercase().contains(&needle));
             }
-            let raw = serde_json::to_string_pretty(&statement).unwrap_or_default();
-            (Some(view), raw)
+            const MAX_LINES: usize = 4_000;
+            const MAX_ESTIMATED_HTML_BYTES: usize = 2 * 1024 * 1024;
+            match json_view::try_lines(
+                &statement,
+                json_view::RenderOptions {
+                    include_paths: false,
+                    budget: Some(json_view::RenderBudget {
+                        max_lines: MAX_LINES,
+                        max_estimated_html_bytes: MAX_ESTIMATED_HTML_BYTES,
+                    }),
+                },
+            ) {
+                Ok(lines) => (Some(view), lines, String::new(), false),
+                Err(_) => (
+                    Some(view),
+                    Vec::new(),
+                    serde_json::to_string_pretty(&statement).unwrap_or_default(),
+                    true,
+                ),
+            }
         }
         Err(error) => {
             tracing::warn!("CapabilityStatement self-fetch failed: {error}");
-            (None, String::new())
+            (None, Vec::new(), String::new(), false)
         }
     };
     render(CapabilityPage {
@@ -2724,7 +2748,11 @@ async fn capability_page(
         i18n: I18n::new(locale),
         active_page: "capability-statement",
         view,
+        json_lines,
+        json_view_id: "capability-json".to_string(),
+        json_view_paths: false,
         raw,
+        raw_fallback,
         filter,
     })
 }
