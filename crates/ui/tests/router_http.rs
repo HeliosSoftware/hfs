@@ -83,6 +83,7 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     )
 }
 
@@ -123,6 +124,7 @@ fn resources_app_with_statement(statement: Value) -> Router {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     )
 }
 
@@ -142,6 +144,7 @@ fn app_with_body_limit(max_body_size: usize) -> Router {
         None,
         "http://localhost:8080".to_string(),
         max_body_size,
+        None,
     )
 }
 
@@ -159,6 +162,7 @@ fn production_app() -> Router {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     )
 }
 
@@ -177,6 +181,7 @@ fn app_with_unavailable_settings() -> Router {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     )
 }
 
@@ -363,6 +368,7 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     )
     .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
     .await
@@ -437,6 +443,7 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     );
 
     let response = app
@@ -544,6 +551,7 @@ async fn capability_statement_raw_json_falls_back_with_http_200_over_budget() {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     );
 
     let response = app
@@ -654,6 +662,7 @@ async fn compartments_degrade_to_a_warning_when_the_fetch_is_empty() {
         // No terminology server: this test is about the conformance fetch.
         None,
         "http://localhost:8080".to_string(),
+        None,
     )
     .oneshot(
         Request::get("/ui/compartments")
@@ -1434,6 +1443,7 @@ fn app_with_terminology(terminology: Option<String>) -> Router {
         helios_fhir::FhirVersion::R4,
         terminology,
         "http://localhost:8080".to_string(),
+        None,
     )
 }
 
@@ -1889,6 +1899,7 @@ async fn sql_export_and_files_follow_a_job_through_the_manifest() {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     );
 
     // The form offers both stored subjects.
@@ -2009,6 +2020,7 @@ async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     );
 
     // The Queries page lists only the sql-query Library and decodes its SQL.
@@ -2101,6 +2113,7 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     );
 
     let response = app
@@ -2174,6 +2187,7 @@ async fn view_definitions_save_roundtrips_and_rejects_bad_json() {
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     );
 
     let body = "id=&action=save&json=%7B%22resourceType%22%3A%22ViewDefinition%22%2C%22name%22%3A%22x%22%7D";

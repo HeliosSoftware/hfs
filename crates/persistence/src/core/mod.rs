@@ -93,6 +93,7 @@ pub mod backend;
 pub mod bulk_export;
 pub mod bulk_export_output;
 pub mod bulk_export_worker;
+pub mod bulk_provider;
 pub mod bulk_submit;
 pub mod bulk_submit_input;
 pub mod bulk_submit_worker;
@@ -121,6 +122,7 @@ pub use bulk_export_worker::{
     BulkExportJobStore, DefaultExportWorker, ExportClaimStrategy, ExportJobLease,
     ExportResourceProvider, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
 };
+pub use bulk_provider::{BulkProviderStore, StoredProviderSubmission};
 pub use bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, IMPORT_MODE_PARAMETER_URL,

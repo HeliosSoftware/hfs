@@ -875,6 +875,13 @@ impl ResourceStorage for PostgresBackend {
         // by the deletes above — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313). Same transaction, so an
         // offboarding cannot half-apply.
+        // Provider-side Bulk Submit submissions are tenant-keyed rows (#772).
+        tx.execute(
+            "DELETE FROM bulk_provider_submissions WHERE tenant_id = $1",
+            &[&id],
+        )
+        .await
+        .or_query_error("purge provider submissions")?;
         let settings = PostgresBackend::purge_tenant_settings_in_txn(&tx, id).await?;
         tx.commit().await.or_query_error("purge commit")?;
         if settings > 0 {

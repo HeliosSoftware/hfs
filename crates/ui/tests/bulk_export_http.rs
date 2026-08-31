@@ -101,6 +101,7 @@ async fn serve() -> (String, MockExport) {
         FhirVersion::R4,
         None,
         "http://localhost:8080".to_string(),
+        None,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

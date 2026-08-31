@@ -360,6 +360,141 @@ async fn a_file_slower_than_the_lease_stays_leased_to_completion() {
     assert_eq!(total as usize, LINES);
 }
 
+/// The starvation half of the mid-file heartbeat: a stream that is always
+/// Ready (a fast local file server, a fully buffered response) lets the ingest
+/// future run poll after poll without ever returning Pending, so a renewal
+/// sharing that future via `select!` never gets to fire. The lease then
+/// silently expires mid-file even though the worker is healthy, and the
+/// manifest is reclaimed and restarted from its first file, forever. The
+/// renewal must therefore live on its own task. This reader never returns
+/// Pending and burns wall-clock inside `poll_read`, which starves any
+/// same-future timer deterministically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ready_heavy_stream_still_renews_the_lease() {
+    use helios_persistence::backends::local_fs::LocalFsOutputStore;
+    use helios_persistence::core::{
+        BulkSubmitJobStore, DefaultSubmitWorker, ExportOutputStore, RemoteFile, RemoteManifest,
+        SubmitInputFetcher, WorkerId,
+    };
+    use helios_persistence::error::StorageResult;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    const LINES: usize = 120;
+
+    struct BusyReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl tokio::io::AsyncRead for BusyReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.pos < self.data.len() {
+                std::thread::sleep(Duration::from_millis(40));
+                let end = (self.pos + 64).min(self.data.len());
+                let start = self.pos;
+                buf.put_slice(&self.data[start..end]);
+                self.pos = end;
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct BusyFetcher {
+        manifest: RemoteManifest,
+        lines: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl SubmitInputFetcher for BusyFetcher {
+        async fn fetch_manifest(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> StorageResult<RemoteManifest> {
+            Ok(self.manifest.clone())
+        }
+
+        async fn open_file_stream(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _requires_access_token: bool,
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+            Ok(Box::new(tokio::io::BufReader::new(BusyReader {
+                data: self.lines.clone(),
+                pos: 0,
+            })))
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = SqliteBackend::with_config(
+        tmp.path().join("submit-busy.db").to_str().unwrap(),
+        SqliteBackendConfig::default(),
+    )
+    .unwrap();
+    backend.init_schema().unwrap();
+    let backend = Arc::new(backend);
+    let _ = seed(&backend, "busy").await;
+
+    let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(BusyFetcher {
+        manifest: RemoteManifest {
+            output: vec![RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: "https://provider.example/busy/file-0.ndjson".to_string(),
+                count: None,
+            }],
+            ..Default::default()
+        },
+        lines: ndjson("busy-0", LINES),
+    });
+    let jobs: Arc<dyn BulkSubmitJobStore> = backend.clone();
+    let output: Arc<dyn ExportOutputStore> = Arc::new(LocalFsOutputStore::new(
+        tmp.path().join("out"),
+        "http://localhost:8080",
+    ));
+
+    let lease = Duration::from_secs(2);
+    let worker_id = WorkerId::new("busy-worker");
+    let claimed = jobs
+        .claim_next_manifest(&worker_id, lease)
+        .await
+        .unwrap()
+        .expect("a pending manifest to claim");
+    let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id);
+    let run = tokio::spawn(async move { worker.run_job(claimed).await.unwrap() });
+
+    // Well past the original expiry, mid-file: a rival claim succeeding here
+    // means the renewal starved and the restart loop is back.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let rival = WorkerId::new("rival-worker");
+    assert!(
+        jobs.claim_next_manifest(&rival, lease)
+            .await
+            .unwrap()
+            .is_none(),
+        "the lease lapsed mid-file under a Ready-heavy stream"
+    );
+
+    tokio::time::timeout(Duration::from_secs(120), run)
+        .await
+        .expect("busy-stream ingestion did not finish")
+        .unwrap();
+
+    use helios_persistence::core::ResourceStorage;
+    let total = backend.count(&tenant(), Some("Patient")).await.unwrap();
+    assert_eq!(total as usize, LINES);
+}
+
 /// The abort half of the mid-file heartbeat: a worker whose lease was
 /// genuinely taken over must notice at its next beat and stop quietly,
 /// ingesting nothing further under the stale fencing token.
