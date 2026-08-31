@@ -427,14 +427,18 @@ jobs:
       - name: Start HFS server
         run: |
           HFS_LOG="/tmp/hfs-${{ matrix.suite_id }}-${{ matrix.backend }}.log"
+          HFS_BASE_URL="http://$RUNNER_IP:$HFS_PORT"
           echo "HFS_LOG=$HFS_LOG" >> $GITHUB_ENV
+          echo "HFS_BASE_URL=$HFS_BASE_URL" >> $GITHUB_ENV
 
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
+            HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
             HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres" ]; then
+            HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=postgres \
             HFS_PG_HOST=$DOCKER_HOST_IP \
             HFS_PG_PORT=$PG_PORT \
@@ -444,11 +448,13 @@ jobs:
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
             MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_inferno_${{ matrix.suite_id }}_${{ github.run_id }}_${{ github.run_attempt }}" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
+            HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=s3-elasticsearch \
             HFS_S3_BUCKET=${{ secrets.HFS_S3_BUCKET }} \
             HFS_S3_PREFIX=ci/${{ matrix.suite_id }}/ \
@@ -457,6 +463,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
+            HFS_BASE_URL="$HFS_BASE_URL" \
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           fi
           echo $! > /tmp/hfs.pid
