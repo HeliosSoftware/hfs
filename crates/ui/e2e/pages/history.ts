@@ -16,6 +16,9 @@ export class HistoryPage {
   get subject(): Locator {
     return this.page.locator("#history-subject");
   }
+  get path(): Locator {
+    return this.page.locator("#history-path");
+  }
   get controls(): Locator {
     return this.page.locator("#history-controls");
   }
