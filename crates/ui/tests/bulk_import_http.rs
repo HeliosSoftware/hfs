@@ -320,7 +320,7 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
     )));
     assert!(html.contains(r#"<span>Submitter</span><code>"#));
     assert!(html.contains(r#"<span>Created</span><code>"#));
-    assert!(html.contains(r#"<span>Status</span><div>"#));
+    assert!(html.contains(r#"<span>Status</span><div id="submission-status">"#));
     assert!(html.contains(r#"<span>Authentication</span><div>"#));
 
     let assert_back_link =
@@ -843,6 +843,13 @@ async fn a_retry_after_holds_the_next_poll() {
     assert_eq!(*polls.lock().unwrap(), 1);
     assert!(html.contains("processing 10% complete"), "{html}");
     assert!(html.contains("every 5s"), "the card keeps refreshing");
+    // A reported percentage renders the determinate bar, and the summary's
+    // STATUS cell rides along out-of-band so it can never go stale.
+    assert!(html.contains(r#"aria-valuenow="10""#), "{html}");
+    assert!(
+        html.contains(r#"<div id="submission-status" hx-swap-oob="true">In Progress</div>"#),
+        "{html}"
+    );
 
     // The htmx cadence fires again immediately — the recipient must not.
     let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
@@ -1161,10 +1168,13 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert_eq!(submitter["value"], "acme");
 
     // First status fetch: one poll happens -> 202 progress recorded, the
-    // fragment keeps polling, and the in-progress card offers Abort.
+    // fragment keeps polling, and the in-progress card offers Abort. A 0%
+    // report renders the indeterminate bar (manifest-granular percentages
+    // sit at 0 for a one-shot submission's whole run).
     let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("processing 0% complete"), "{html}");
+    assert!(html.contains("progress-track--indeterminate"), "{html}");
     assert!(html.contains("every 5s"), "keeps polling: {html}");
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
     assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
@@ -1175,10 +1185,15 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert!(!html.contains(r#"class="card detail""#));
 
     // Second fetch: the mock flips to 200 -> result summary, polling stops,
-    // and the finished card carries no abort.
+    // the finished card carries no abort, and the out-of-band STATUS cell
+    // flips to Completed with it — no page reload required.
     let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert!(!html.contains("every 5s"), "polling stopped: {html}");
     assert!(html.contains("Output files"), "{html}");
+    assert!(
+        html.contains(r#"<div id="submission-status" hx-swap-oob="true">Completed</div>"#),
+        "{html}"
+    );
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
     assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
     assert!(html.contains("Processing finished at <code>"), "{html}");

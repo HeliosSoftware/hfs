@@ -1123,10 +1123,15 @@ struct StatusCard {
     id: String,
     polling: bool,
     can_abort: bool,
+    /// Determinate progress when the recipient reports one; `None` renders
+    /// the indeterminate bar.
+    percent: Option<u8>,
     progress: String,
     outputs: u64,
     errors: u64,
     completed_at: String,
+    /// Rides out-of-band into the summary card's STATUS cell.
+    status_label: String,
 }
 
 /// `GET /ui/bulk-import/{id}/status` — at most one recipient poll, then the
@@ -1149,16 +1154,30 @@ pub async fn status_fragment(
         poll_status(&mut s).await;
         save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
+    let label = status_label(&i18n, &s.status);
     render(StatusCard {
-        i18n,
         id,
         polling: !s.poll_url.is_empty(),
         can_abort: matches!(s.status.as_str(), "in-progress" | "failed"),
+        percent: progress_percent(&s.progress),
         progress: s.progress.clone(),
         outputs: s.result["outputs"].as_u64().unwrap_or(0),
         errors: s.result["errors"].as_u64().unwrap_or(0),
         completed_at: s.result["completedAt"].as_str().unwrap_or("").to_string(),
+        status_label: label,
+        i18n,
     })
+}
+
+/// The determinate share of the recipient's `X-Progress`, when it reports
+/// one. The percentage is manifest-granular, so a one-shot submission reads
+/// `0%` for its whole run — that renders as an indeterminate bar rather than
+/// a permanently empty one.
+fn progress_percent(progress: &str) -> Option<u8> {
+    let rest = progress.strip_prefix("processing ")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let pct: u8 = digits.parse().ok().filter(|p| *p > 0 && *p <= 100)?;
+    Some(pct)
 }
 
 /// `GET /ui/bulk-import/keys` — redirects to the canonical JWKS endpoint.
