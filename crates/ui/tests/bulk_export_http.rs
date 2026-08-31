@@ -20,6 +20,9 @@ use helios_persistence::core::SettingsStore;
 
 const REST_JOB_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+type SeenKickoff = (String, String, Option<String>);
+type SeenPoll = (String, Option<String>);
+
 #[derive(Debug, Clone)]
 struct MockOutput {
     resource_type: String,
@@ -42,8 +45,8 @@ struct RequestGate {
 #[derive(Clone)]
 struct MockExport {
     /// (path, query, tenant header) of each kick-off received.
-    kickoffs: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
-    poll_requests: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    kickoffs: Arc<Mutex<Vec<SeenKickoff>>>,
+    poll_requests: Arc<Mutex<Vec<SeenPoll>>>,
     /// Public prefix advertised in status and output URLs. The mock is still
     /// reached through its separate loopback listener.
     advertised_base: Arc<Mutex<Option<String>>>,
