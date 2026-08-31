@@ -379,6 +379,15 @@ jobs:
           fi
           echo "Canary OK — host has writable space."
 
+          # How MUCH writable space, recorded so a future run can size
+          # max_wal_size against a number instead of a guess. The canary above
+          # only proves 256 MB is writable; `max_wal_size` reserves several GB
+          # of WAL segments on top of the Synthea corpus, and this host is
+          # shared with every other testcontainers job in the repo.
+          echo "── Docker host storage ──"
+          docker run --rm --name "hfs-bench-df-$RUN_ID" -v /:/hostroot:ro alpine:3 \
+            df -h /hostroot 2>/dev/null || docker system df 2>/dev/null || true
+
       # ── tgz bundle server ────────────────────────────────────────────────
       # The import suite pulls the Synthea `bulk_1k` corpus from this service
       # (`GET /reset`, `GET /<bundle>.json`). Built from the benchmark repo's
