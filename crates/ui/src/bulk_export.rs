@@ -306,6 +306,7 @@ pub struct StartForm {
     pub name: String,
     pub scope: String,
     pub group_id: String,
+    pub all_types: bool,
     pub types: Vec<String>,
     pub elements: String,
     pub type_filter: String,
@@ -321,6 +322,10 @@ fn parse_start_form(body: &str) -> StartForm {
             "name" => form.name = value,
             "scope" => form.scope = value,
             "group_id" => form.group_id = value,
+            // Presence is the HTML checkbox contract. Its value is deliberately
+            // ignored so field order and manipulated payloads cannot make
+            // individual types override "All Resources".
+            "all_types" => form.all_types = true,
             "types" => form.types.push(value),
             "elements" => form.elements = value,
             "type_filter" => form.type_filter = value,
@@ -361,7 +366,11 @@ pub async fn start(
             _ => "system".to_string(),
         },
         group_id: form.group_id.trim().to_string(),
-        types: form.types.join(","),
+        types: if form.all_types {
+            String::new()
+        } else {
+            form.types.join(",")
+        },
         elements: form.elements.trim().to_string(),
         type_filter: form.type_filter.trim().to_string(),
         since: since_instant(&form.since_preset, &form.since_custom),

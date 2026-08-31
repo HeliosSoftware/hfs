@@ -112,6 +112,7 @@ it exists to be called by the others.
 | `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
+| `bulk-export.js` | All Resources and individual resource-type selection on the Bulk Export builder |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
 | `resource-filter.js`, `conformance-crud.js` | The conformance viewers' rail filter and write half |

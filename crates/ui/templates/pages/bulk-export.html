@@ -61,12 +61,12 @@
   <section class="card">
     <div class="card-head">
       <h3><span class="icon">{% include "icons/layers.svg" %}</span> {{ i18n.t("bulk-export-types") }}</h3>
-      <!-- No JS on this page: reset clears back to the form's defaults, which
-           are exactly "system scope, nothing checked". -->
       <button type="reset" class="btn">{{ i18n.t("bulk-export-clear") }}</button>
     </div>
     <div class="card__body">
-      <p class="field__hint">{{ i18n.t("bulk-export-types-hint") }}</p>
+      <!-- Keep the individual inputs enabled in server-rendered HTML so a
+           no-JavaScript client can uncheck All Resources and narrow the export. -->
+      <label class="typegrid__item"><input type="checkbox" name="all_types" checked> {{ i18n.t("bulk-export-all-resources") }}</label>
       <div class="typegrid">
         {% for t in resource_types %}
         <label class="typegrid__item"><input type="checkbox" name="types" value="{{ t }}"> {{ t }}</label>
@@ -124,4 +124,5 @@
   </div>
 </form>
 {% endif %}
+<script src="/ui/assets/bulk-export.js" defer></script>
 {% endblock %}

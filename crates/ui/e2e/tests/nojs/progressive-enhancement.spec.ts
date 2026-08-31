@@ -149,3 +149,40 @@ test("Bulk Import one-shot create and delete work without JavaScript", async ({ 
   await page.locator("form[action$='/delete'] > button").click();
   await expect(page).toHaveURL(/\/ui\/bulk-import$/);
 });
+
+test("Bulk Export can narrow through a conflicting native form without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+
+  await expect(bulkExport.allResources).toBeChecked();
+  await expect(bulkExport.typeCheckboxes).not.toHaveCount(0);
+  expect(
+    await bulkExport.typeCheckboxes.evaluateAll((types) =>
+      types.every(
+        (type) => !(type as HTMLInputElement).checked && !(type as HTMLInputElement).disabled,
+      ),
+    ),
+  ).toBe(true);
+
+  // With no JavaScript the user can select a resource type while the native
+  // All Resources checkbox remains checked. The UI handler resolves this
+  // intentionally conflicting payload in favor of All Resources.
+  await bulkExport.typeCheckbox("Patient").check();
+  await expect(bulkExport.allResources).toBeChecked();
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+
+  const request = await submitted;
+  const params = new URLSearchParams(request.postData() ?? "");
+  expect(params.get("all_types")).toBe("on");
+  expect(params.getAll("types")).toEqual(["Patient"]);
+});

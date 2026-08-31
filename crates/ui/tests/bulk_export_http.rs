@@ -137,6 +137,13 @@ async fn post_form(base: &str, path: &str, form: &[(&str, &str)]) -> (u16, Strin
     (res.status().as_u16(), location)
 }
 
+fn query_values(query: &str, name: &str) -> Vec<String> {
+    form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+        .collect()
+}
+
 #[tokio::test]
 async fn the_export_page_offers_scopes_types_and_filters() {
     let (base, _) = serve().await;
@@ -144,13 +151,14 @@ async fn the_export_page_offers_scopes_types_and_filters() {
     assert_eq!(status, 200);
     assert!(html.contains("What are you exporting?"));
     assert!(html.contains("Everything"));
+    assert!(html.contains("All Resources"));
     assert!(html.contains(r#"name="types" value="Patient""#));
     assert!(html.contains("Narrow it down"));
     assert!(html.contains("Start Export"));
 }
 
 #[tokio::test]
-async fn the_export_page_uses_form_panels_with_name_and_hint_up_top() {
+async fn the_export_page_uses_form_panels_with_name_and_all_resources_up_top() {
     let (base, _) = serve().await;
     let (status, html) = get_text(&base, "/ui/bulk-export").await;
     assert_eq!(status, 200);
@@ -165,14 +173,32 @@ async fn the_export_page_uses_form_panels_with_name_and_hint_up_top() {
     let scope_pos = html.find(r#"name="scope""#).expect("scope radios present");
     assert!(name_pos < scope_pos, "Name should precede the scope radios");
 
-    // The types hint sits above the checkbox grid, not below it.
-    let hint_pos = html
-        .find("Leave everything unchecked to export every type.")
-        .expect("types hint present");
+    // All Resources is the explicit default above the checkbox grid. The old
+    // implicit "leave everything unchecked" hint is retired.
+    let all_types_pos = html
+        .find(r#"<input type="checkbox" name="all_types" checked>"#)
+        .expect("checked All Resources input present");
     let grid_pos = html
         .find(r#"class="typegrid""#)
         .expect("types grid present");
-    assert!(hint_pos < grid_pos, "hint should precede the types grid");
+    assert!(
+        all_types_pos < grid_pos,
+        "All Resources should precede the types grid"
+    );
+    assert!(!html.contains("Leave everything unchecked to export every type."));
+
+    // The server-rendered fallback leaves individual types unchecked and
+    // enabled. bulk-export.js enhances this state when JavaScript is present.
+    let patient_pos = html
+        .find(r#"<input type="checkbox" name="types" value="Patient">"#)
+        .expect("Patient type input present");
+    let patient_end = patient_pos
+        + html[patient_pos..]
+            .find("</label>")
+            .expect("Patient type label closes");
+    let patient = &html[patient_pos..patient_end];
+    assert!(!patient.contains("checked"));
+    assert!(!patient.contains("disabled"));
 }
 
 #[tokio::test]
@@ -248,9 +274,9 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     assert_eq!(kickoffs.len(), 1);
     assert_eq!(kickoffs[0].0, "/$export");
     let q = &kickoffs[0].1;
-    assert!(q.contains("_type=Patient%2CObservation"), "{q}");
-    assert!(q.contains("_elements=id%2Cmeta"), "{q}");
-    assert!(q.contains("_since="), "{q}");
+    assert_eq!(query_values(q, "_type"), vec!["Patient,Observation"], "{q}");
+    assert_eq!(query_values(q, "_elements"), vec!["id,meta"], "{q}");
+    assert_eq!(query_values(q, "_since").len(), 1, "{q}");
 
     // The Active Exports page shows it in progress.
     let (_, html) = get_text(&base, "/ui/bulk-export/active").await;
@@ -278,6 +304,31 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
 }
 
 #[tokio::test]
+async fn all_resources_omits_type_even_when_a_hostile_form_sends_types() {
+    let (base, mock) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("scope", "system"),
+            ("types", "Patient"),
+            ("all_types", "not-a-boolean"),
+            ("types", "Observation"),
+            ("elements", "id,meta"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 1);
+    let q = &kickoffs[0].1;
+    assert!(query_values(q, "_type").is_empty(), "{q}");
+    assert_eq!(query_values(q, "_elements"), vec!["id,meta"], "{q}");
+}
+
+#[tokio::test]
 async fn patient_and_group_scopes_hit_their_export_paths() {
     let (base, mock) = serve().await;
 
@@ -293,6 +344,12 @@ async fn patient_and_group_scopes_hit_their_export_paths() {
     let paths: Vec<&str> = kickoffs.iter().map(|(p, _)| p.as_str()).collect();
     assert!(paths.contains(&"/Patient/$export"), "{paths:?}");
     assert!(paths.contains(&"/Group/cohort-7/$export"), "{paths:?}");
+    for (_, query) in &kickoffs {
+        assert!(
+            query_values(query, "_type").is_empty(),
+            "older clients that omit all_types and types still export all resources: {query}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -326,7 +383,14 @@ async fn a_rejected_kickoff_lands_as_failed_and_retry_reruns_it() {
 
     let (_, html) = get_text(&base, "/ui/bulk-export/active").await;
     assert!(html.contains("In progress"), "{html}");
-    assert_eq!(mock.kickoffs.lock().unwrap().len(), 2);
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 2);
+    for (_, query) in &kickoffs {
+        assert!(
+            query_values(query, "_type").is_empty(),
+            "retry should preserve the empty all-resources type list: {query}"
+        );
+    }
 }
 
 #[tokio::test]
