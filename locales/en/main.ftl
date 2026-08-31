@@ -808,6 +808,9 @@ vd-delete-failed = Could not delete the view definition.
 vd-json-heading = Definition (JSON)
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
+vd-pagination-label = View definition pages
+vd-page-prev = Previous
+vd-page-next = Next
 
 ## SQL Queries / SQL Views workspaces (#649)
 

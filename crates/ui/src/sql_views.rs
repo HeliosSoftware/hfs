@@ -2,10 +2,19 @@
 //!
 //! The page lists the tenant's stored `ViewDefinition`s in a filter rail,
 //! shows the selected one as editable JSON, and previews its output through
-//! `$sql-run`. Everything here is a pure function over resource JSON; the
-//! fetching and running live behind [`crate::ConformanceSource`].
+//! `$sql-run`. Everything here is a pure function over resource JSON or over
+//! the page's query state; the fetching, searching, and running live behind
+//! [`crate::ConformanceSource`].
+//!
+//! The rail itself is filtered, sorted, and paginated server-side (#741) —
+//! this module only shapes what the server already narrowed down to one page,
+//! plus the plain-link pagination controls at its foot.
 
 use serde_json::Value;
+
+/// The rail's page size: how many ViewDefinitions `search_page` returns per
+/// request, and the stride between `?page=` values (#741).
+pub(crate) const PAGE_SIZE: usize = 50;
 
 /// One rail entry: a stored ViewDefinition summarized for the picker.
 pub(crate) struct VdSummary {
@@ -38,6 +47,57 @@ pub(crate) fn summarize(resources: &[Value]) -> Vec<VdSummary> {
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
     entries
+}
+
+/// The `search_page` params for the rail's current filter (#741): `_sort=name`
+/// always (the order the rail has always shown), plus `name:contains=<filter>`
+/// only when the search box is non-empty — an empty modifier value would
+/// search for the empty string rather than mean "no filter".
+///
+/// Deliberately narrower than the old in-memory filter it replaces, which
+/// also matched the resource type column (`ViewDefinition.resource`): that
+/// match was never a documented part of #649 (it fell out of filtering in
+/// memory over both fields) and has no standard FHIR search expression —
+/// `resource` is a `token` param, and `:contains` is a `string` modifier the
+/// server rejects on token params. Dropping it is a deliberate, spec-driven
+/// narrowing (#741), not a regression.
+pub(crate) fn rail_search_params(filter: &str) -> Vec<(String, String)> {
+    let mut params = vec![("_sort".to_string(), "name".to_string())];
+    if !filter.is_empty() {
+        params.push(("name:contains".to_string(), filter.to_string()));
+    }
+    params
+}
+
+/// Builds an `/ui/sql/view-definitions` href for a rail pagination link,
+/// preserving the rail's current `filter` and the URL's current `vd`
+/// selection alongside the target `page` (#741). `page` 1 is the implicit
+/// default and is omitted from the URL, matching the bare route the rail's
+/// search form itself submits.
+pub(crate) fn page_href(filter: &str, vd: Option<&str>, page: usize) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if !filter.is_empty() {
+        params.push(format!("filter={}", urlencode(filter)));
+    }
+    if let Some(id) = vd {
+        params.push(format!("vd={}", urlencode(id)));
+    }
+    if page > 1 {
+        params.push(format!("page={page}"));
+    }
+    if params.is_empty() {
+        "/ui/sql/view-definitions".to_string()
+    } else {
+        format!("/ui/sql/view-definitions?{}", params.join("&"))
+    }
+}
+
+/// `application/x-www-form-urlencoded` percent-encoding — the same encoding
+/// a browser's own `<form method="get">` submission produces, so a
+/// pagination link round-trips through [`axum::extract::Query`] identically
+/// to a search-box submit.
+fn urlencode(value: &str) -> String {
+    form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 /// The view's output column names, in declaration order: a depth-first walk of
@@ -177,5 +237,30 @@ mod tests {
         let vd: Value = serde_json::from_str(&starter_view_definition()).unwrap();
         assert_eq!(vd["resourceType"], "ViewDefinition");
         assert_eq!(column_names(&vd), ["id"]);
+    }
+
+    #[test]
+    fn rail_search_params_always_sorts_and_only_filters_when_non_empty() {
+        assert_eq!(
+            rail_search_params(""),
+            vec![("_sort".to_string(), "name".to_string())],
+        );
+        assert_eq!(
+            rail_search_params("Blood"),
+            vec![
+                ("_sort".to_string(), "name".to_string()),
+                ("name:contains".to_string(), "Blood".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn page_href_omits_empty_parts_and_page_one() {
+        assert_eq!(page_href("", None, 1), "/ui/sql/view-definitions");
+        assert_eq!(page_href("", None, 2), "/ui/sql/view-definitions?page=2");
+        assert_eq!(
+            page_href("blood pressure", Some("vd-1"), 3),
+            "/ui/sql/view-definitions?filter=blood+pressure&vd=vd-1&page=3"
+        );
     }
 }
