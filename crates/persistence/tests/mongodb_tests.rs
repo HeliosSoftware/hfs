@@ -3334,6 +3334,109 @@ async fn mongodb_integration_settings_get_missing_is_none() {
     assert!(backend.get_settings(&user).await.unwrap().is_none());
 }
 
+/// The tenant-scoped provider-submission store (#772): whole-document CRUD
+/// under optimistic versioning, with listings isolated per tenant.
+#[tokio::test]
+async fn mongodb_integration_provider_submissions_crud_and_tenant_scope() {
+    use helios_persistence::core::BulkProviderStore;
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+
+    let Some(backend) = settings_mongo::backend("provider_crud").await else {
+        eprintln!(
+            "Skipping mongodb_integration_provider_submissions_crud_and_tenant_scope (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = |id: &str| TenantContext::new(TenantId::new(id), TenantPermissions::full_access());
+    let (alpha, beta) = (unique_user_key("prov-a"), unique_user_key("prov-b"));
+    let (t_a, t_b) = (tenant(&alpha), tenant(&beta));
+
+    assert!(
+        backend
+            .get_provider_submission(&t_a, "s1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .list_provider_submissions(&t_a)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Some(0) asserts creation; the stored version is 1.
+    let stored = backend
+        .put_provider_submission(&t_a, "s1", json!({"name": "one"}), Some(0))
+        .await
+        .unwrap();
+    assert_eq!(stored.version, 1);
+
+    // Some(0) against an existing entry and a stale version both conflict.
+    assert!(
+        backend
+            .put_provider_submission(&t_a, "s1", json!({"name": "dupe"}), Some(0))
+            .await
+            .is_err()
+    );
+    assert!(
+        backend
+            .put_provider_submission(&t_a, "s1", json!({"name": "stale"}), Some(9))
+            .await
+            .is_err()
+    );
+    let stored = backend
+        .put_provider_submission(&t_a, "s1", json!({"name": "two"}), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(stored.version, 2);
+
+    let read = backend
+        .get_provider_submission(&t_a, "s1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.document["name"], "two");
+    assert_eq!(read.version, 2);
+
+    // Listings stay tenant-scoped.
+    backend
+        .put_provider_submission(&t_a, "s2", json!({"name": "second"}), None)
+        .await
+        .unwrap();
+    backend
+        .put_provider_submission(&t_b, "other", json!({"name": "beta"}), None)
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = backend
+        .list_provider_submissions(&t_a)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["s1", "s2"]);
+    assert_eq!(
+        backend.list_provider_submissions(&t_b).await.unwrap().len(),
+        1
+    );
+
+    assert!(
+        backend
+            .delete_provider_submission(&t_a, "s1")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !backend
+            .delete_provider_submission(&t_a, "s1")
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn mongodb_integration_settings_put_get_and_version() {
     let Some(backend) = settings_mongo::backend("settings_round_trip").await else {
