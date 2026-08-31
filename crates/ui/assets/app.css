@@ -3013,6 +3013,12 @@ details.json-fold[open] > summary .icon {
   margin-bottom: 16px;
 }
 
+/* The processing card's Abort row: .detail__actions carries a 10px bottom
+   margin that doubled up with the card padding (#789). */
+#bulk-status .detail__actions {
+  margin-bottom: 0;
+}
+
 .bulk-import-summary-card {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
