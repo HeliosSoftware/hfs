@@ -3013,6 +3013,56 @@ details.json-fold[open] > summary .icon {
   margin-bottom: 16px;
 }
 
+/* The processing card's Abort row: .detail__actions carries a 10px bottom
+   margin that doubled up with the card padding (#789). */
+#bulk-status .detail__actions {
+  margin-bottom: 0;
+}
+
+/* The processing card's progress bar. Determinate when the recipient
+   reports a percentage; indeterminate (sweeping) while only the entry
+   counter moves. */
+.progress-track {
+  overflow: hidden;
+  position: relative;
+  height: 6px;
+  margin: 8px 0 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 400ms ease;
+}
+
+.progress-track--indeterminate .progress-fill {
+  position: absolute;
+  width: 30%;
+  animation: progress-sweep 1.6s ease-in-out infinite;
+}
+
+@keyframes progress-sweep {
+  0% {
+    left: -30%;
+  }
+
+  100% {
+    left: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-track--indeterminate .progress-fill {
+    animation: none;
+    left: 0;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+
 .bulk-import-summary-card {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

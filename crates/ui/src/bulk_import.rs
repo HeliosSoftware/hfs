@@ -94,6 +94,10 @@ pub struct Submission {
     /// Content-Location) plus the latest poll observations.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub poll_url: String,
+    /// The recipient's `Retry-After`, materialized: no poll goes out before
+    /// this instant (#790). Empty means poll freely.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub next_poll_at: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub progress: String,
     #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -386,6 +390,7 @@ pub async fn create(
         submitter_system: form.submitter_system.trim().to_string(),
         submitter_value: form.submitter_value.trim().to_string(),
         poll_url: String::new(),
+        next_poll_at: String::new(),
         progress: String::new(),
         result: Value::Null,
         client_id: form.client_id.trim().to_string(),
@@ -852,9 +857,34 @@ async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, Str
         .ok_or_else(|| format!("status kick-off answered {status} without Content-Location"))
 }
 
+/// Whether the recipient asked us to hold off: a stored `next_poll_at` still
+/// in the future means a poll now would only burn the rate limit (#790).
+fn poll_due(submission: &Submission) -> bool {
+    submission.next_poll_at.is_empty()
+        || chrono::DateTime::parse_from_rfc3339(&submission.next_poll_at)
+            .map(|t| Utc::now() >= t.with_timezone(&Utc))
+            .unwrap_or(true)
+}
+
+/// Materializes a `Retry-After` delta (seconds) into `next_poll_at`.
+fn hold_polls_for(submission: &mut Submission, seconds: u64) {
+    submission.next_poll_at = (Utc::now() + chrono::Duration::seconds(seconds as i64))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+}
+
+fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+}
+
 /// One poll of the recipient's status URL: `202` records `X-Progress`, `200`
 /// records the status manifest as the submission's result, anything else is
-/// logged and polling stops (the poll URL is cleared).
+/// logged and polling stops (the poll URL is cleared). `202` and `429` carry
+/// `Retry-After`; both push `next_poll_at` out so the card's refresh cadence
+/// never turns into a poll the recipient would reject (#790).
 async fn poll_status(submission: &mut Submission) {
     let poll_url = submission.poll_url.clone();
     let response = match reqwest::Client::new()
@@ -872,6 +902,7 @@ async fn poll_status(submission: &mut Submission) {
     };
     match response.status().as_u16() {
         202 => {
+            let retry_after = retry_after_seconds(&response);
             let progress = response
                 .headers()
                 .get("x-progress")
@@ -882,11 +913,32 @@ async fn poll_status(submission: &mut Submission) {
                 push_log(submission, format!("Status: {progress}"));
             }
             submission.progress = progress;
+            hold_polls_for(submission, retry_after.unwrap_or(5));
         }
         200 => {
             let manifest: Value = response.json().await.unwrap_or(Value::Null);
             let outputs = manifest["output"].as_array().map(Vec::len).unwrap_or(0);
-            let errors = manifest["error"].as_array().map(Vec::len).unwrap_or(0);
+            // STU4 status manifests carry OperationOutcome files under
+            // `outcome`; `error` is the bulk-export-manifest vocabulary some
+            // recipients still use. Reading only `error` made a truncated
+            // ingest look like a clean completion. An `outcome` entry counts
+            // as an error unless its countSeverity says none are.
+            let outcome_errors = manifest["outcome"]
+                .as_array()
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter(|file| {
+                            file.get("countSeverity").is_none_or(|cs| {
+                                cs.get("error").and_then(Value::as_u64).unwrap_or(0)
+                                    + cs.get("fatal").and_then(Value::as_u64).unwrap_or(0)
+                                    > 0
+                            })
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            let errors = manifest["error"].as_array().map(Vec::len).unwrap_or(0) + outcome_errors;
             submission.result = json!({
                 "completedAt": now_stamp(),
                 "outputs": outputs,
@@ -894,6 +946,7 @@ async fn poll_status(submission: &mut Submission) {
             });
             submission.progress = String::new();
             submission.poll_url = String::new();
+            submission.next_poll_at = String::new();
             // The recipient's status manifest is submission-scoped, so its
             // verdict is the submission's (#764, #765): errors mark it
             // failed; a clean completion completes it. Complete remains
@@ -918,10 +971,10 @@ async fn poll_status(submission: &mut Submission) {
             }
         }
         429 => {
-            push_log(
-                submission,
-                "Status poll throttled (429); backing off.".to_string(),
-            );
+            // A throttled poll is backoff bookkeeping, not a run event — it
+            // never reaches the log (#790).
+            let retry_after = retry_after_seconds(&response);
+            hold_polls_for(submission, retry_after.unwrap_or(5).max(5));
         }
         other => {
             // Polling can never resume (the URL is dropped), so the submission
@@ -935,6 +988,7 @@ async fn poll_status(submission: &mut Submission) {
             });
             submission.progress = String::new();
             submission.poll_url = String::new();
+            submission.next_poll_at = String::new();
             push_log(
                 submission,
                 format!(
@@ -1069,13 +1123,22 @@ struct StatusCard {
     id: String,
     polling: bool,
     can_abort: bool,
+    /// Determinate progress when the recipient reports one; `None` renders
+    /// the indeterminate bar.
+    percent: Option<u8>,
     progress: String,
     outputs: u64,
     errors: u64,
     completed_at: String,
+    /// Rides out-of-band into the summary card's STATUS cell.
+    status_label: String,
 }
 
-/// `GET /ui/bulk-import/{id}/status` — one poll, then the refreshed card.
+/// `GET /ui/bulk-import/{id}/status` — at most one recipient poll, then the
+/// refreshed card. The card's htmx cadence only refreshes *this server's*
+/// view; the recipient is contacted when its `Retry-After` window has passed
+/// (#790), so the fragment stays cheap to re-fetch and the rate limit is
+/// never burned on polls that would 429.
 pub async fn status_fragment(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -1087,20 +1150,34 @@ pub async fn status_fragment(
     let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !s.poll_url.is_empty() {
+    if !s.poll_url.is_empty() && poll_due(&s) {
         poll_status(&mut s).await;
         save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
+    let label = status_label(&i18n, &s.status);
     render(StatusCard {
-        i18n,
         id,
         polling: !s.poll_url.is_empty(),
         can_abort: matches!(s.status.as_str(), "in-progress" | "failed"),
+        percent: progress_percent(&s.progress),
         progress: s.progress.clone(),
         outputs: s.result["outputs"].as_u64().unwrap_or(0),
         errors: s.result["errors"].as_u64().unwrap_or(0),
         completed_at: s.result["completedAt"].as_str().unwrap_or("").to_string(),
+        status_label: label,
+        i18n,
     })
+}
+
+/// The determinate share of the recipient's `X-Progress`, when it reports
+/// one. The percentage is manifest-granular, so a one-shot submission reads
+/// `0%` for its whole run — that renders as an indeterminate bar rather than
+/// a permanently empty one.
+fn progress_percent(progress: &str) -> Option<u8> {
+    let rest = progress.strip_prefix("processing ")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let pct: u8 = digits.parse().ok().filter(|p| *p > 0 && *p <= 100)?;
+    Some(pct)
 }
 
 /// `GET /ui/bulk-import/keys` — redirects to the canonical JWKS endpoint.

@@ -777,6 +777,10 @@ where
             m.status == helios_persistence::core::ManifestStatus::Processing
                 && m.lease_expiry.is_some_and(|e| now - e > stall_after)
         });
+        // The percentage is manifest-granular, so a single-manifest
+        // submission reads 0% until the very end; the entry counter is what
+        // actually moves while a file streams in (#790).
+        let entries: u64 = manifests.iter().map(|m| m.processed_entries).sum();
         let progress = if stalled {
             tracing::warn!(
                 submission = %sub_id,
@@ -784,6 +788,8 @@ where
                  worker lease expired without renewal or reclaim"
             );
             format!("stalled at {pct}% - a worker stopped without handoff; see server logs")
+        } else if entries > 0 {
+            format!("processing {pct}% complete ({entries} entries ingested)")
         } else {
             format!("processing {pct}% complete")
         };
