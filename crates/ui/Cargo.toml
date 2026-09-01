@@ -85,6 +85,11 @@ base64 = "0.22"
 # Markup lives in templates/, never in Rust source.
 askama = "0.16"
 
+# Chrome shared with the HTS admin UI (#799): the topbar account menu's markup
+# lives there once and both products render it, so they cannot drift the way
+# they did before — see crates/ui-chrome/README.md.
+helios-ui-chrome = { path = "../ui-chrome", version = "0.2.1" }
+
 # Typed htmx header handling: the infallible `HxRequest` extractor for the
 # fragment-vs-full-page branch, and `AutoVaryLayer` for correct HTTP caching
 # (`Vary: HX-Request`) so an htmx fragment is never served for a hard navigation.

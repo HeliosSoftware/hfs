@@ -17,6 +17,9 @@ on:
     branches: [main, "feat/**"]
     paths:
       - "crates/ui/**"
+      # The topbar account menu's markup lives in helios-ui-chrome (#799) and is
+      # shared with crates/hts-ui, so editing it changes what /ui renders.
+      - "crates/ui-chrome/**"
       - "locales/**"
       - ".github/workflows/ui-tests.yml"
   workflow_dispatch:

@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { openUserMenu } from "../../../ui/e2e/pages/user-menu";
 
 // Phase 2 Slice A blocker smoke: the Home page renders live cards fed by
 // /health and /metadata?mode=terminology, the sidebar lists every canonical
@@ -60,24 +61,34 @@ test.describe("HTS home (Phase 2 Slice A)", () => {
     }
   });
 
-  test("the topbar carries exactly HFS's three controls, and nothing more", async ({ page }) => {
+  test("the topbar carries exactly HFS's two controls, and nothing more", async ({ page }) => {
     await page.goto("/ui/hts");
     const tools = page.locator(".topbar__tools");
-    // HFS's topbar is the language switcher, the theme toggle and the
-    // avatar — in that order. HTS is the same system to an operator, so its
-    // chrome must not diverge.
-    await expect(tools.locator(".lang-switcher")).toHaveCount(1);
+    // HFS's topbar is the theme toggle and the account menu — in that order,
+    // and only those two. HTS is the same system to an operator, so its
+    // chrome must not diverge. (This test claimed "three" until 2026-08-31:
+    // it counted HTS's standalone `.lang-switcher`, which HFS never had.)
     await expect(tools.locator(".theme-toggle")).toHaveCount(1);
-    await expect(tools.locator(".topbar__avatar")).toHaveText("K");
-    // A fourth control — a "dialect: en" disclosure — was removed on
+    // #799: the switcher's links moved inside the account menu and the
+    // hardcoded "K" avatar became that menu's summary. The menu itself is a
+    // `<details>`, so the topbar now has exactly one — see
+    // `user-menu.spec.ts` for its full shape.
+    await expect(tools.locator(".lang-switcher")).toHaveCount(0);
+    await expect(tools.locator("details.menu--user")).toHaveCount(1);
+    await expect(tools.locator("details")).toHaveCount(1);
+    // A further control — a "dialect: en" disclosure — was removed on
     // 2026-08-28. It shipped non-functional in its first commit and HFS has
-    // no counterpart. Nothing in the topbar may open a menu.
-    await expect(tools.locator("details")).toHaveCount(0);
+    // no counterpart.
     await expect(page.locator(".dialect-chip, .dialect-chip__value")).toHaveCount(0);
   });
 
   test("language switcher lands us in Spanish when we click ES", async ({ page }) => {
     await page.goto("/ui/hts");
+    // #799: the language links live behind the account menu's `<details>`,
+    // which ships closed — the link is in the DOM but not actionable until
+    // the summary is clicked. Its accessible name still comes from the
+    // `aria-label` (`language-es` = "Spanish"), so the query is unchanged.
+    await openUserMenu(page);
     await page.getByRole("link", { name: "Spanish", exact: false }).click();
     // Spanish stub for hts-nav-home is "Inicio" (mirrors HFS `nav-home = Inicio`).
     await expect(page.getByRole("navigation").getByText("Inicio", { exact: false })).toBeVisible();

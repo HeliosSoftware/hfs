@@ -1,0 +1,25 @@
+[package]
+name = "helios-ui-chrome"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/ui-chrome"
+description = "Shared Askama chrome partials for the HFS and HTS web UIs"
+keywords = ["helios-software", "hl7", "fhir", "helios-fhir-server", "askama"]
+
+# Published like every other workspace member (`release.toml` sets
+# `shared-version = true` and `publish = true`). It is not opted out, and must
+# not be: `helios-ui` and `helios-hts-ui` are published and depend on it, and
+# cargo refuses to publish a crate whose dependency is absent from the registry.
+#
+# Treat the API as internal all the same. It exists so the two products link
+# the SAME chrome markup instead of each keeping a copy — a trait with two
+# methods and a plain struct — and it is reshaped whenever the chrome needs it.
+
+[dependencies]
+# Re-exported as `helios_ui_chrome::askama` so a consumer can name
+# `askama::Error` (the error type of `user_menu()`) without having to keep its
+# own askama version in lockstep with ours.
+askama = "0.16"
