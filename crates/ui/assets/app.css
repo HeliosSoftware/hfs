@@ -5895,7 +5895,11 @@ details.json-fold[open] > summary .icon {
   color: var(--muted);
 }
 
-/* ---- Exports job cards (#735, #795) ---------------------------------- */
+/* ---- Exports builder and job cards (#735, #795, #832) ---------------- */
+
+[data-bulk-export-name-heading] {
+  overflow-wrap: anywhere;
+}
 
 .job-card {
   padding: 14px;
@@ -5909,10 +5913,12 @@ details.json-fold[open] > summary .icon {
 }
 
 .job-card__name {
+  min-width: 0;
   margin: 0;
   font-size: 15px;
   font-weight: 600;
   color: var(--text-strong);
+  overflow-wrap: anywhere;
 }
 
 .job-card__actions {

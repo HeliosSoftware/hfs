@@ -743,6 +743,9 @@ async fn the_root_is_the_management_page_and_new_is_the_builder() {
     assert!(html.contains(r#"<span class="typegrid__label">Patient</span>"#));
     assert!(html.contains("Narrow it down"));
     assert!(html.contains("Start Export"));
+    assert!(html.contains(
+        r#"<h1 class="page-head__title" data-bulk-export-name-heading>Bulk Export</h1>"#
+    ));
     assert!(html.contains(r#"<script src="/ui/assets/resource-filter.js" defer></script>"#));
     assert!(html.contains(r#"<script src="/ui/assets/bulk-export.js" defer></script>"#));
     assert!(html.contains(r#"<form method="post" action="/ui/bulk-export""#));
@@ -930,7 +933,7 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
         &base,
         "/ui/bulk-export",
         &[
-            ("name", "Everything"),
+            ("name", "  Everything <img src=x>  "),
             ("scope", "system"),
             ("types", "Patient"),
             ("types", "Observation"),
@@ -953,7 +956,10 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
 
     // The Exports page shows it in progress.
     let (_, html) = get_text(&base, "/ui/bulk-export").await;
-    assert!(html.contains("Everything"));
+    assert!(
+        html.contains(r#"<h2 class="job-card__name">Everything &#60;img src=x&#62;</h2>"#),
+        "{html}"
+    );
     assert!(html.contains("In progress"));
     // The card's own poll URL (not the layout's tenant-menu hx-get).
     let card_path = html
@@ -965,11 +971,19 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
 
     // First card fetch: one poll -> 202 with progress, still polling.
     let (_, html) = get_text(&base, &card_path).await;
+    assert!(
+        html.contains(r#"<h2 class="job-card__name">Everything &#60;img src=x&#62;</h2>"#),
+        "{html}"
+    );
     assert!(html.contains("18% complete"), "{html}");
     assert!(html.contains("every 5s"));
 
     // Second: the mock flips to 200 -> complete with two files, no polling.
     let (_, html) = get_text(&base, &card_path).await;
+    assert!(
+        html.contains(r#"<h2 class="job-card__name">Everything &#60;img src=x&#62;</h2>"#),
+        "{html}"
+    );
     assert!(html.contains("Complete"), "{html}");
     assert!(html.contains("Patient"));
     assert!(html.contains("Observation"));

@@ -31,6 +31,94 @@ test("All Resources is the enhanced default", async ({ bulkExport }) => {
   ).toBe(true);
 });
 
+test("Name updates the heading as safe text and clearing restores the default", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+
+  const defaultDocumentTitle = await page.title();
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
+  await expect(bulkExport.nameHeading).not.toHaveAttribute("aria-live", /.+/);
+  await expect(bulkExport.nameHeading).not.toHaveAttribute("role", "status");
+
+  await bulkExport.nameInput.fill("  Diabetes registry 2024  ");
+  await expect(bulkExport.nameHeading).toHaveText("Diabetes registry 2024");
+  await expect(page).toHaveTitle(defaultDocumentTitle);
+
+  await bulkExport.nameInput.fill("<img src=x>");
+  await expect(bulkExport.nameHeading).toHaveText("<img src=x>");
+  await expect(bulkExport.nameHeading.locator("img")).toHaveCount(0);
+
+  await bulkExport.nameInput.fill("   ");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
+
+  await page.goto("/ui/bulk-export/new?lang=es", { waitUntil: "networkidle" });
+  await expect(bulkExport.nameHeading).toHaveText("Exportación masiva");
+  await bulkExport.nameInput.fill("Registro de diabetes");
+  await expect(bulkExport.nameHeading).toHaveText("Registro de diabetes");
+  await bulkExport.nameInput.fill("");
+  await expect(bulkExport.nameHeading).toHaveText("Exportación masiva");
+});
+
+test("a long unbroken Name stays inside the heading and card at narrow width", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await bulkExport.goto();
+  const longName = "Export".repeat(41);
+
+  await bulkExport.nameInput.fill(longName);
+  await expect(bulkExport.nameHeading).toHaveText(longName);
+  const headingGeometry = await bulkExport.nameHeading.evaluate((heading) => {
+    const headingRect = heading.getBoundingClientRect();
+    const containerRect = heading.parentElement!.getBoundingClientRect();
+    return {
+      withinContainer:
+        headingRect.left >= containerRect.left - 1 &&
+        headingRect.right <= containerRect.right + 1,
+      noPageOverflow:
+        document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    };
+  });
+  expect(headingGeometry).toEqual({ withinContainer: true, noPageOverflow: true });
+
+  await bulkExport.form.evaluate((form, name) => {
+    const card = document.createElement("div");
+    card.className = "card job-card";
+    const head = document.createElement("div");
+    head.className = "job-card__head";
+    const cardName = document.createElement("h2");
+    cardName.className = "job-card__name";
+    cardName.textContent = name;
+    const actions = document.createElement("div");
+    actions.className = "job-card__actions";
+    const status = document.createElement("span");
+    status.className = "tag tag--in-progress";
+    status.textContent = "In progress";
+    actions.append(status);
+    head.append(cardName, actions);
+    card.append(head);
+    form.after(card);
+  }, longName);
+
+  const card = page.locator(".job-card");
+  const cardName = card.locator(".job-card__name");
+  await expect(cardName).toHaveText(longName);
+  const cardGeometry = await cardName.evaluate((name) => {
+    const nameRect = name.getBoundingClientRect();
+    const cardRect = name.closest(".job-card")!.getBoundingClientRect();
+    return {
+      withinCard:
+        nameRect.left >= cardRect.left - 1 && nameRect.right <= cardRect.right + 1,
+      noPageOverflow:
+        document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    };
+  });
+  expect(cardGeometry).toEqual({ withinCard: true, noPageOverflow: true });
+});
+
 test("long resource names stay in their grid cell and reveal the full name", async ({
   page,
   bulkExport,
@@ -454,6 +542,7 @@ test("server rejects an impossible Custom date without creating an export", asyn
 
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
   await expect(bulkExport.nameInput).toHaveValue(exportName);
+  await expect(bulkExport.nameHeading).toHaveText(exportName);
   await expect(bulkExport.nameError).toBeHidden();
   await expect(bulkExport.scopeRadio("group")).toBeChecked();
   await expect(bulkExport.form.locator('input[name="group_id"]')).toHaveValue(
@@ -786,6 +875,7 @@ test("re-checking and Clear restore the All Resources state", async ({ bulkExpor
   await bulkExport.clearButton.click();
 
   await expect(bulkExport.nameInput).toHaveValue("");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
   await expect(bulkExport.scopeRadio("system")).toBeChecked();
   await expect(bulkExport.sincePreset).toHaveValue("");
   await expect(bulkExport.sinceCustom).toHaveValue("");
