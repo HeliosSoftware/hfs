@@ -1,24 +1,48 @@
 //! AWS S3 backend — struct definition, capability matrix, and Backend trait
 //! implementation.
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use parking_lot::RwLock;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageError, StorageResult};
+use crate::search::{SearchParameterDefinition, TenantSearchRegistries};
 use crate::tenant::{TenantContext, TenantId};
 
 use super::client::{AwsS3Client, AwsS3ClientOptions, S3Api, S3ClientError};
 use super::config::{S3BackendConfig, S3TenancyMode};
 use super::keyspace::S3Keyspace;
 
+/// Sync in-memory cache of each tenant's stored (POSTed) active SearchParameter
+/// definitions, keyed by tenant id. S3 has no query capability of its own for
+/// "every SearchParameter for tenant X" the way a database does, and the
+/// per-tenant registry loader must be sync anyway, so the async reload paths
+/// (SearchParameter writes, startup, TTL refresh — see `reload_stored_cache*`
+/// in `storage.rs`) populate this map by scanning S3 and the loader reads it.
+pub(crate) type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
+
 /// AWS S3 backend for object-storage persistence.
 #[derive(Clone)]
 pub struct S3Backend {
     pub(crate) config: S3BackendConfig,
     pub(crate) client: Arc<dyn S3Api>,
+    /// Per-tenant search parameter registries (shared base + per-tenant
+    /// overlay). The base starts empty here — S3 has no `data_dir`/FHIR
+    /// version of its own to load embedded/spec params from, so a composite's
+    /// starter function (e.g. `start_s3_elasticsearch`) populates
+    /// `tenant_registries().base()` after construction, the same way the
+    /// registry used to be built standalone. What S3 *does* own is the
+    /// real per-tenant overlay: a stored (POSTed) SearchParameter now takes
+    /// effect immediately via the write hooks in `storage.rs` (#787), instead
+    /// of never applying at all (the previous `base_only()` registry's loader
+    /// unconditionally returned an empty overlay for every tenant).
+    pub(crate) registries: Arc<TenantSearchRegistries>,
+    /// Sync cache of each tenant's stored params, read by the registry loader.
+    pub(crate) stored_by_tenant: StoredByTenant,
 }
 
 impl std::fmt::Debug for S3Backend {
@@ -120,6 +144,31 @@ impl S3Backend {
         capabilities
     }
 
+    /// Builds a fresh, empty-base per-tenant registry container and its
+    /// backing stored-param cache. Shared by every constructor.
+    fn new_registries() -> (Arc<TenantSearchRegistries>, StoredByTenant) {
+        let stored_by_tenant: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
+        let loader_cache = stored_by_tenant.clone();
+        let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
+            move |tenant_id: &str| {
+                loader_cache
+                    .read()
+                    .get(tenant_id)
+                    .cloned()
+                    .unwrap_or_default()
+            },
+        )));
+        (registries, stored_by_tenant)
+    }
+
+    /// The per-tenant registry container. Its base is empty until a composite
+    /// starter populates it (see the field doc on [`S3Backend::registries`]);
+    /// shared with a co-located Elasticsearch backend via
+    /// `ElasticsearchBackend::with_shared_registry`.
+    pub fn tenant_registries(&self) -> &Arc<TenantSearchRegistries> {
+        &self.registries
+    }
+
     /// Creates a new S3 backend using AWS standard credential provider chain.
     pub fn new(config: S3BackendConfig) -> StorageResult<Self> {
         Self::from_env(config)
@@ -163,7 +212,13 @@ impl S3Backend {
             },
         ));
 
-        let backend = Self { config, client };
+        let (registries, stored_by_tenant) = Self::new_registries();
+        let backend = Self {
+            config,
+            client,
+            registries,
+            stored_by_tenant,
+        };
 
         if backend.config.validate_buckets_on_startup {
             backend.validate_buckets().await?;
@@ -181,7 +236,13 @@ impl S3Backend {
         client: Arc<dyn S3Api>,
     ) -> StorageResult<Self> {
         config.validate()?;
-        Ok(Self { config, client })
+        let (registries, stored_by_tenant) = Self::new_registries();
+        Ok(Self {
+            config,
+            client,
+            registries,
+            stored_by_tenant,
+        })
     }
 
     /// Verifies that every bucket referenced in the configuration exists and
