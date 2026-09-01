@@ -1,6 +1,9 @@
 # ViewDefinition editor: a richer editing surface (decision record)
 
-**Status:** Proposed — evaluation POC on `feat/753-vd-editor-evaluation`, not merged. See
+**Status:** Implemented — the seed landed as
+[#820](https://github.com/HeliosSoftware/hfs/pull/820) (`feat/753-vd-editor-evaluation`),
+ready for review; the follow-up implementation issue (completion, test coverage, i18n,
+generalization — §9) is Blocked by it. See
 [#753](https://github.com/HeliosSoftware/hfs/issues/753) for the original request and the
 comment this doc's findings are summarized into.
 **Scope:** the JSON editor for a ViewDefinition on `/ui/sql/view-definitions`
@@ -243,20 +246,23 @@ either:
   or the configured FHIR version, and the FHIR REST API itself is completely unaware it
   exists.
 
-**If the README amendment is not accepted**, Alternative C (§3) is the fallback: extend the
-existing `editor-sync.js` mirror technique and the `jt--*` CSS tokens (RF6, §3) into a
-text-scanning JSON + FHIRPath highlighter with no build step. What is lost, concretely:
+**The README amendment (§6) was accepted and is applied in this PR.** Alternative C (§3)
+was the fallback this decision record weighed if it were not: extend the existing
+`editor-sync.js` mirror technique and the `jt--*` CSS tokens (RF6, §3) into a text-scanning
+JSON + FHIRPath highlighter with no build step. What would have been lost, concretely:
 **folding** (no tree, no foldable ranges), the **completion popup** (no infrastructure to
 attach suggestions to), and **precise diagnostic locating** (regex/line-counting instead of a
 pointer-to-tree-node walk — every diagnostic would degrade to "somewhere on this line").
-Highlighting alone — the one cell every candidate in §3 supports natively — is achievable
+Highlighting alone — the one cell every candidate in §3 supports natively — was achievable
 either way.
 
-## 6. README amendment (proposed)
+## 6. README amendment (applied)
 
-This epic **does not modify `crates/ui/README.md`.** The following is the exact text this
-decision record proposes for the implementation issue to apply, replacing/extending the
-"no bundler…" and "Assets: vendored & embedded" passages:
+This PR applies the amendment below to `crates/ui/README.md`, replacing/extending the "no
+bundler…" intro paragraph, the "Assets: vendored & embedded" section (a new "The one
+exception: a vendored, prebuilt bundle" subsection), and the "Rules of the road" list — see
+`crates/ui/README.md` itself for the applied wording. Quoted here as the record of what
+changed and why:
 
 > Third-party browser code may be vendored as a prebuilt single-file bundle produced by a
 > documented, checked-in, one-off script under `crates/ui/vendor/`; pinned versions and a
@@ -326,8 +332,9 @@ epic's architecture — not #752's — is what should decide highlighting/comple
 
 ## 9. Out of scope / next
 
-Implementation issue (title provisional): **"ui: ViewDefinition editor — CodeMirror 6 with
-server-side lint and FHIRPath-aware completion (from #753)"**.
+Implementation issue, **Blocked by**
+[#820](https://github.com/HeliosSoftware/hfs/pull/820): **"ui: ViewDefinition editor —
+CodeMirror 6 with server-side lint and FHIRPath-aware completion (from #753)"**.
 
 What the POC branch already has:
 
@@ -337,6 +344,7 @@ What the POC branch already has:
 - A public, structured `helios_sof::lint` with 9 of 10 planned diagnostic codes implemented,
   an endpoint, and an async client-side linter with a gutter (ticket 03).
 - This decision record, screenshots, and the two GitHub drafts.
+- `crates/ui/README.md`'s vendoring-exception amendment (§6), applied.
 
 What is missing (all of it, deliberately, per the epic's own scoping):
 
@@ -349,7 +357,6 @@ What is missing (all of it, deliberately, per the epic's own scoping):
   parser entry point than the one ticket 03 added).
 - Reusing `helios_sof::lint` from `$sql-run` itself for its 422 responses (today it still uses
   the private, first-error-only `validate_view_definition`).
-- `crates/ui/README.md`'s amendment, actually applied (§6 only proposes the text).
 - New Rust + Playwright tests for the editor and the endpoint (`chromium`, `nojs`, `no-cdn`,
   axe) beyond what already incidentally passed against the POC.
 - i18n: no new user-visible strings exist yet (lint messages are English-only from
