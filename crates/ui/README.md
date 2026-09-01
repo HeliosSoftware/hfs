@@ -107,14 +107,15 @@ it exists to be called by the others.
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
-| `saved-queries.js` | Saved queries, the visual search builder, and the `/_user/settings` read/modify/write cycle |
+| `saved-queries.js` | Saved queries, the visual search builder, the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
 | `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
-| `resource-filter.js`, `conformance-crud.js` | The conformance viewers' rail filter and write half |
+| `resource-filter.js` | Every type rail's tooltip for a clipped label and its scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
+| `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.
@@ -429,9 +430,14 @@ falls through to the normal REST surface.
   the same rendering path. Counts reflect the **default tenant** only — an
   operator view, never exported to the public Prometheus `/metrics` endpoint.
 - **Per-user preferences** (theme, nav state, FHIR version, tenant, saved and
-  recent queries) roam in the `/_user/settings` document: weak `ETag`, JSON merge
-  patch, `If-Match` on write. Tenant-derived keys live under a reserved
-  `byTenant` map so a tenant purge can reach them.
+  recent queries, and — since #754/#755 — every sidebar rail's `rails.<page>`
+  record of `last`/`recent`, tenant-scoped, see `rail_state`) roam in the
+  `/_user/settings` document: weak `ETag`, JSON merge patch, `If-Match` on
+  write. Tenant-derived keys live under a reserved `byTenant` map so a tenant
+  purge can reach them. The server renders the "Recently used" group from
+  `recent` on every rail but Compartments — its 4-5 definitions make a group
+  noise, so it remembers only `last`; with no settings store configured, there
+  is nothing to render and every rail opens on its page default instead.
 
 ### Internationalization
 

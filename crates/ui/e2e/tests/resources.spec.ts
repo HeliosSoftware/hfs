@@ -1,5 +1,6 @@
 import { test, expect } from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
+import type { ResourcesPage } from "../pages/resources";
 
 // The Resources workspace beyond the edit flows: the type rail (filter + live
 // counts), the modal's open/close/tab surface, the delete flow, and the promise
@@ -39,6 +40,33 @@ test("picking a rail type updates the URL and back navigates", async ({ resource
   await expect(resources.railItem("Patient")).toHaveAttribute("aria-current", "true");
   await expect(resources.builder.url).toHaveValue("GET /Patient");
   await expect(resources.createLabel).toHaveText("Create new Patient");
+});
+
+// "Tests esperados" #11: the server remembers the selection (RF3), so
+// leaving through the nav and returning with no `?type=` at all opens back
+// on it — not the current-request-only history entry `page.goBack()` above
+// exercises, but the actual stored `rails.resources.last`.
+test("picking a type and returning through the nav (no ?type=) restores it", async ({
+  resources,
+  chrome,
+  page,
+}) => {
+  await resources.goto("Patient");
+  const persisted = page.waitForResponse(
+    (response) =>
+      response.url().includes("/_user/settings") && response.request().method() === "PATCH",
+  );
+  await resources.pickType("Observation");
+  await persisted;
+
+  await chrome.navLink("/ui/search-parameters").click();
+  await page.waitForLoadState("networkidle");
+  await chrome.navLink("/ui/resources").click();
+  await page.waitForLoadState("networkidle");
+
+  expect(new URL(page.url()).searchParams.has("type")).toBe(false);
+  await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
+  await expect(resources.createLabel).toHaveText("Create new Observation");
 });
 
 // Opening in Patient context (#605): the client takes the same path as a
@@ -321,9 +349,12 @@ test("create eligibility follows the effective FHIR version", async ({ resources
   await expect(resources.page.locator("#type-rail-list [aria-current='true']")).toHaveCount(0);
 });
 
-// "Recently used" group (#603): a per-browser convenience, populated by
-// resource-filter.js from explicit rail picks and re-rendered on load.
-test("the recently-used group caps at five, keeps MRU order, deduplicates, and preserves counts", async ({
+// "Recently used" group (#603, server-rendered per page since #754/#755):
+// saved-queries.js repaints it in-page on every rail click (RF4, cloning the
+// live list item — no reload needed to see the effect), and the server keeps
+// the authoritative `rails.resources.recent` list the group would render from
+// on a fresh load.
+test("picking rail types repaints the recently-used group in MRU order, capped at five, deduplicated, with live counts", async ({
   resources,
 }) => {
   await resources.goto("Patient");
@@ -335,9 +366,6 @@ test("the recently-used group caps at five, keeps MRU order, deduplicates, and p
   await resources.pickType("AppointmentResponse");
   await resources.pickType("AllergyIntolerance"); // re-selection: moves to front, no duplicate
 
-  // The group is client-rendered from localStorage on load, so it only
-  // reflects the picks above once the page (re)loads.
-  await resources.goto("Patient");
   await expect(resources.recentGroup).toBeVisible();
   // The divider and "All Types" heading (#603 follow-up) give the general
   // list its own clearly separated section once Recently used has entries.
@@ -362,78 +390,156 @@ test("the recently-used group caps at five, keeps MRU order, deduplicates, and p
   }
 });
 
+// The in-page repaint above happens before the server write lands
+// (RF4: "sin esperar la respuesta del servidor"); this proves the write
+// itself lands, by waiting for the settings PATCH explicitly before
+// reloading — a plain navigation right after a click races an in-flight
+// fetch, which a fresh page load would otherwise cancel.
+test("the recently-used selection survives a reload", async ({ resources, page }) => {
+  // No explicit `?type=` on either navigation: RF3 only ever records an
+  // explicit selection, so neither the blank-slate start nor the "reload"
+  // below writes anything on its own — only the two picks in between do.
+  await resources.goto();
+  await resources.pickType("Encounter");
+  const persisted = page.waitForResponse(
+    (response) =>
+      response.url().includes("/_user/settings") && response.request().method() === "PATCH",
+  );
+  await resources.pickType("Observation");
+  await persisted;
+
+  await resources.goto();
+  await expect(resources.recentGroup).toBeVisible();
+  const types = await resources.recentGroup
+    .locator("a.filter-rail__item[data-type]")
+    .evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.type!));
+  expect(types).toEqual(["Observation", "Encounter"]);
+});
+
+// "Tests esperados" #13: recents are per page (#603's shared-across-pages
+// model is gone) — a type picked in Resources must not surface in Search's
+// or Saved Queries' own group.
+test("recents are scoped per page, not shared across Resources, Search, and Saved Queries", async ({
+  resources,
+  search,
+  queries,
+  page,
+}) => {
+  await resources.goto("Patient");
+  const persisted = page.waitForResponse(
+    (response) =>
+      response.url().includes("/_user/settings") && response.request().method() === "PATCH",
+  );
+  await resources.pickType("Encounter");
+  await persisted;
+
+  await search.goto();
+  await expect(search.recentGroup).toBeHidden();
+  await queries.goto();
+  await expect(queries.recentGroup).toBeHidden();
+
+  // And the reverse: Resources never sees what those pages record either.
+  await search.goto();
+  const searchPersisted = page.waitForResponse(
+    (response) =>
+      response.url().includes("/_user/settings") && response.request().method() === "PATCH",
+  );
+  await search.pickType("Condition");
+  await searchPersisted;
+  await resources.goto("Patient");
+  await expect(resources.recentGroup.locator("[data-type='Condition']")).toHaveCount(0);
+});
+
+// Shared by the three `test.step`s below: the pinning assertions are
+// id-based (`#type-rail-recent`, `#type-rail-list`, …) and identical on
+// every rail, so `resources`'s locators work regardless of which of the
+// three pages is actually loaded — the same reuse the pre-#754/#755 version
+// of this test already relied on.
+async function assertRecentsStayPinnedWhileScrolling(resources: ResourcesPage) {
+  const recent = resources.recentGroup;
+  const divider = resources.recentDivider;
+  const allTypes = resources.generalHeading;
+  const pinned = recent.or(divider).or(allTypes);
+  const list = resources.typeList;
+  const firstType = list.locator("a.filter-rail__item[data-type]").first();
+
+  await expect(recent).toBeVisible();
+  await expect(divider).toBeVisible();
+  await expect(allTypes).toBeVisible();
+
+  const pinnedTopsBefore = await pinned.evaluateAll((elements) =>
+    elements.map((element) => element.getBoundingClientRect().top),
+  );
+  const firstTypeTopBefore = await firstType.evaluate(
+    (element) => element.getBoundingClientRect().top,
+  );
+  const before = await list.evaluate((element) => ({
+    scrollTop: element.scrollTop,
+    maxScrollTop: element.scrollHeight - element.clientHeight,
+  }));
+  expect(before.maxScrollTop).toBeGreaterThan(0);
+
+  await list.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  await expect
+    .poll(() => list.evaluate((element) => element.scrollTop))
+    .toBeGreaterThan(before.scrollTop);
+
+  const pinnedTopsAfter = await pinned.evaluateAll((elements) =>
+    elements.map((element) => element.getBoundingClientRect().top),
+  );
+  const firstTypeTopAfter = await firstType.evaluate(
+    (element) => element.getBoundingClientRect().top,
+  );
+
+  expect(pinnedTopsAfter).toHaveLength(pinnedTopsBefore.length);
+  pinnedTopsAfter.forEach((top, index) => {
+    expect(Math.abs(top - pinnedTopsBefore[index])).toBeLessThanOrEqual(1);
+  });
+  expect(firstTypeTopAfter).toBeLessThan(firstTypeTopBefore);
+}
+
 test("the type rails keep recents and the All Types heading fixed while type items scroll", async ({
   resources,
+  search,
+  queries,
   page,
 }) => {
   await page.setViewportSize({ width: 1280, height: 700 });
-  await resources.goto("Account");
-  for (const type of [
+  // Recents are per page (#754/#755): each page needs its own picks before
+  // its group has anything to pin.
+  const picks = [
     "ActivityDefinition",
     "AdverseEvent",
     "AllergyIntolerance",
     "Appointment",
     "Observation",
-  ]) {
-    await resources.pickType(type);
-  }
+  ];
 
-  for (const [name, path] of [
-    ["Resources", "/ui/resources?type=Account"],
-    ["Search", "/ui/search?type=Account"],
-    ["Saved queries", "/ui/queries?type=Account"],
-  ] as const) {
-    await test.step(name, async () => {
-      await page.goto(path, { waitUntil: "networkidle" });
+  await test.step("Resources", async () => {
+    await resources.goto("Account");
+    for (const type of picks) await resources.pickType(type);
+    await assertRecentsStayPinnedWhileScrolling(resources);
+  });
 
-      const recent = resources.recentGroup;
-      const divider = resources.recentDivider;
-      const allTypes = resources.generalHeading;
-      const pinned = recent.or(divider).or(allTypes);
-      const list = resources.typeList;
-      const firstType = list.locator("a.filter-rail__item[data-type]").first();
+  await test.step("Search", async () => {
+    await search.goto("Account");
+    for (const type of picks) await search.pickType(type);
+    await assertRecentsStayPinnedWhileScrolling(resources);
+  });
 
-      await expect(recent).toBeVisible();
-      await expect(divider).toBeVisible();
-      await expect(allTypes).toBeVisible();
-
-      const pinnedTopsBefore = await pinned
-        .evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().top));
-      const firstTypeTopBefore = await firstType.evaluate(
-        (element) => element.getBoundingClientRect().top,
-      );
-      const before = await list.evaluate((element) => ({
-        scrollTop: element.scrollTop,
-        maxScrollTop: element.scrollHeight - element.clientHeight,
-      }));
-      expect(before.maxScrollTop).toBeGreaterThan(0);
-
-      await list.evaluate((element) => {
-        element.scrollTop = element.scrollHeight;
-      });
-      await expect.poll(() => list.evaluate((element) => element.scrollTop)).toBeGreaterThan(
-        before.scrollTop,
-      );
-
-      const pinnedTopsAfter = await pinned
-        .evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().top));
-      const firstTypeTopAfter = await firstType.evaluate(
-        (element) => element.getBoundingClientRect().top,
-      );
-
-      expect(pinnedTopsAfter).toHaveLength(pinnedTopsBefore.length);
-      pinnedTopsAfter.forEach((top, index) => {
-        expect(Math.abs(top - pinnedTopsBefore[index])).toBeLessThanOrEqual(1);
-      });
-      expect(firstTypeTopAfter).toBeLessThan(firstTypeTopBefore);
-    });
-  }
+  await test.step("Saved queries", async () => {
+    await queries.goto("Account");
+    for (const type of picks) await queries.pickType(type);
+    await assertRecentsStayPinnedWhileScrolling(resources);
+  });
 });
 
 test("clicking a recently-used entry selects that type for real", async ({ resources, page }) => {
   await resources.goto("Patient");
   await resources.pickType("Encounter");
-  await resources.goto("Patient"); // reload to populate the group
+  await resources.pickType("Condition"); // Condition is now current; Encounter sits in the group
 
   await resources.recentItem("Encounter").click();
   await expect(page).toHaveURL(/\/ui\/resources\?type=Encounter/);
@@ -441,16 +547,18 @@ test("clicking a recently-used entry selects that type for real", async ({ resou
 });
 
 test("Create new does not register a recently-used entry", async ({ resources }) => {
-  // Create is a <button>, not a rail `<a>`, so resource-filter.js's
-  // click listener (scoped to real rail items) never matches it — even
-  // though the default selection (Patient, unpicked) still names it in the
-  // button's label.
-  await resources.goto("Patient");
+  // Create is a <button>, not a rail `<a>`, so saved-queries.js's rail click
+  // handler (scoped to `a.filter-rail__item` inside the list or the group,
+  // #754/#755) never matches it — even though the default selection
+  // (Patient, unpicked) still names it in the button's label. `goto()` with
+  // no explicit `?type=` resolves to that default without recording it
+  // (RF3: only an explicit selection is ever written).
+  await resources.goto();
   await resources.createButton.click();
   await resources.modal.waitOpen();
   await resources.modal.closeWithEscape();
 
-  await resources.goto("Patient");
+  await resources.goto();
   await expect(resources.recentGroup).toBeHidden();
   // Nothing to divide from: the divider stays hidden too, but the general
   // list still carries its own heading.
