@@ -1670,14 +1670,69 @@ impl SubmitWorkerStorage for MongoBackend {
     }
 
     async fn count_active_submissions(&self, tenant: &TenantContext) -> StorageResult<u64> {
-        self.submissions()
+        let tenant_id = tenant.tenant_id().as_str();
+        let cursor = self
+            .submissions()
             .await?
-            .count_documents(doc! {
-                "tenant_id": tenant.tenant_id().as_str(),
+            .find(doc! {
+                "tenant_id": tenant_id,
                 "status": SubmissionStatus::InProgress.to_string(),
             })
             .await
-            .map_err(|e| internal_error(format!("count active submissions: {e}")))
+            .map_err(|e| internal_error(format!("count active submissions: {e}")))?;
+        let subs = collect(cursor).await?;
+        if subs.is_empty() {
+            return Ok(0);
+        }
+
+        let keys: Vec<Document> = subs
+            .iter()
+            .filter_map(|d| {
+                Some(doc! {
+                    "submitter": opt_str(d, "submitter")?,
+                    "submission_id": opt_str(d, "submission_id")?,
+                })
+            })
+            .collect();
+        let cursor = self
+            .manifests()
+            .await?
+            .find(doc! { "tenant_id": tenant_id, "$or": keys })
+            .await
+            .map_err(|e| internal_error(format!("count active submissions: {e}")))?;
+        // (submitter, submission_id) → has a non-terminal manifest. Presence in
+        // the map at all means the submission has manifests.
+        let mut manifests: std::collections::HashMap<(String, String), bool> =
+            std::collections::HashMap::new();
+        for m in &collect(cursor).await? {
+            let (Some(submitter), Some(submission_id)) =
+                (opt_str(m, "submitter"), opt_str(m, "submission_id"))
+            else {
+                continue;
+            };
+            let live = matches!(
+                m.get_str("status").unwrap_or_default(),
+                "pending" | "processing"
+            );
+            *manifests.entry((submitter, submission_id)).or_insert(false) |= live;
+        }
+
+        Ok(subs
+            .iter()
+            .filter(|d| {
+                let (Some(submitter), Some(submission_id)) =
+                    (opt_str(d, "submitter"), opt_str(d, "submission_id"))
+                else {
+                    return false;
+                };
+                // No manifests yet → awaiting its first kick-off; otherwise it
+                // counts only while a manifest is still pending/processing.
+                manifests
+                    .get(&(submitter, submission_id))
+                    .copied()
+                    .unwrap_or(true)
+            })
+            .count() as u64)
     }
 
     async fn list_expired_submissions(

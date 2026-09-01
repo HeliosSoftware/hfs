@@ -1967,8 +1967,17 @@ impl SubmitWorkerStorage for PostgresBackend {
         let client = self.get_client().await?;
         let row = client
             .query_one(
-                "SELECT COUNT(*) FROM bulk_submissions
-                 WHERE tenant_id = $1 AND status = 'in-progress'",
+                "SELECT COUNT(*) FROM bulk_submissions s
+                 WHERE s.tenant_id = $1 AND s.status = 'in-progress'
+                   AND (NOT EXISTS (SELECT 1 FROM bulk_manifests m
+                                    WHERE m.tenant_id = s.tenant_id
+                                      AND m.submitter = s.submitter
+                                      AND m.submission_id = s.submission_id)
+                        OR EXISTS (SELECT 1 FROM bulk_manifests m
+                                   WHERE m.tenant_id = s.tenant_id
+                                     AND m.submitter = s.submitter
+                                     AND m.submission_id = s.submission_id
+                                     AND m.status IN ('pending', 'processing')))",
                 &[&tenant.tenant_id().as_str()],
             )
             .await

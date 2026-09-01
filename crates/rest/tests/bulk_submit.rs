@@ -331,6 +331,55 @@ async fn test_completed_status_finalizes_submission() {
     );
 }
 
+/// #850: a drained submission — every manifest terminal, but never closed
+/// with `submissionStatus=completed` — must not hold a tenant concurrency
+/// slot. A submitter that ingests and walks away used to leak its slot
+/// forever, until the tenant's every kick-off returned 429.
+#[tokio::test]
+async fn test_drained_submission_frees_its_concurrency_slot() {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            max_concurrent_per_tenant: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // First submission ingests to the end; the submitter never closes it.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("leak-1", "in-progress"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    drain_submit(&backend, &fetcher, &output).await;
+
+    // Drained, the open submission holds no slot: a second one is admitted.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("leak-2", "in-progress"))
+            .await
+            .status_code(),
+        StatusCode::OK,
+        "a drained submission must not consume the tenant's only slot"
+    );
+
+    // The second one's manifest is still pending, so the cap is now real.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("leak-3", "in-progress"))
+            .await
+            .status_code(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a submission with work in flight must still count toward the cap"
+    );
+}
+
 /// A completed submission's already-registered manifests SHALL still be ingested.
 ///
 /// `completed` means "no further manifests are coming", not "stop processing".

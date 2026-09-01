@@ -607,6 +607,7 @@ bulk-import-detail-created = Creada
 bulk-import-detail-status = Estado
 bulk-import-detail-auth = Autenticación
 bulk-import-abort = Abortar
+bulk-import-mark-completed = Marcar completada
 bulk-import-delete = Eliminar
 bulk-import-edit = Editar
 bulk-import-edit-title = Editar submission

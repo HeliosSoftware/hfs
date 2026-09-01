@@ -324,7 +324,17 @@ pub trait SubmitWorkerStorage: Send + Sync {
         id: &SubmissionId,
     ) -> StorageResult<()>;
 
-    /// Counts non-terminal submissions for a tenant (per-tenant concurrency cap).
+    /// Counts submissions with work in flight for a tenant (per-tenant
+    /// concurrency cap).
+    ///
+    /// A submission counts while it is `in-progress` **and** still has work
+    /// pending: either no manifests yet (opened, awaiting its first kick-off)
+    /// or at least one non-terminal manifest. A drained submission — open per
+    /// the spec so `replacesManifestUrl` can still land, but with every
+    /// manifest terminal — holds no slot: the cap bounds concurrent
+    /// ingestion, and a submitter that never sends the closing
+    /// `submissionStatus=completed` must not leak its tenant's slots forever
+    /// (#850). A new manifest on a drained submission makes it count again.
     async fn count_active_submissions(&self, tenant: &TenantContext) -> StorageResult<u64>;
 
     /// Lists submissions whose `updated_at` is older than `now - ttl`, across all

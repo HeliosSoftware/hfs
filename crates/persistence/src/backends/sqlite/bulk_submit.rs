@@ -2035,8 +2035,17 @@ impl SubmitWorkerStorage for SqliteBackend {
         let conn = self.get_connection()?;
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM bulk_submissions
-                 WHERE tenant_id = ?1 AND status = 'in-progress'",
+                "SELECT COUNT(*) FROM bulk_submissions s
+                 WHERE s.tenant_id = ?1 AND s.status = 'in-progress'
+                   AND (NOT EXISTS (SELECT 1 FROM bulk_manifests m
+                                    WHERE m.tenant_id = s.tenant_id
+                                      AND m.submitter = s.submitter
+                                      AND m.submission_id = s.submission_id)
+                        OR EXISTS (SELECT 1 FROM bulk_manifests m
+                                   WHERE m.tenant_id = s.tenant_id
+                                     AND m.submitter = s.submitter
+                                     AND m.submission_id = s.submission_id
+                                     AND m.status IN ('pending', 'processing')))",
                 params![tenant.tenant_id().as_str()],
                 |r| r.get(0),
             )

@@ -53,7 +53,7 @@ use uuid::Uuid;
 use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
-    ManifestStatus, SubmissionId, SubmissionManifest, SubmissionStatus,
+    BulkSubmitProvider, ManifestStatus, SubmissionId, SubmissionManifest, SubmissionStatus,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -1034,15 +1034,42 @@ impl SubmitWorkerStorage for S3Backend {
         // result. Submissions written before the index existed carry no entry
         // and so do not count toward the cap; that under-counts an old backlog
         // rather than wrongly rejecting new work.
-        Ok(self
+        let tenant_id = tenant.tenant_id().as_str();
+        let open: Vec<SubmitIndexEntry> = self
             .list_index_entries(REGISTRY_NAMESPACE)
             .await?
             .into_iter()
             .filter(|entry| {
-                entry.tenant_id == tenant.tenant_id().as_str()
-                    && entry.status == Some(SubmissionStatus::InProgress)
+                entry.tenant_id == tenant_id && entry.status == Some(SubmissionStatus::InProgress)
             })
-            .count() as u64)
+            .collect();
+        if open.is_empty() {
+            return Ok(0);
+        }
+        // The claim queue holds one entry per pending/processing manifest, so
+        // queue presence is "work in flight". An open submission with no queue
+        // entry counts only while it has no manifests at all (awaiting its
+        // first kick-off); with every manifest terminal it is drained and
+        // holds no slot.
+        let queued: std::collections::HashSet<(String, String)> = self
+            .list_index_entries(QUEUE_NAMESPACE)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.tenant_id == tenant_id)
+            .map(|entry| (entry.submitter, entry.submission_id))
+            .collect();
+        let mut active = 0u64;
+        for entry in open {
+            if queued.contains(&(entry.submitter.clone(), entry.submission_id.clone())) {
+                active += 1;
+                continue;
+            }
+            let id = SubmissionId::new(entry.submitter, entry.submission_id);
+            if self.list_manifests(tenant, &id).await?.is_empty() {
+                active += 1;
+            }
+        }
+        Ok(active)
     }
 
     async fn list_expired_submissions(
