@@ -1,0 +1,87 @@
+{#
+  SHARED CHROME -- the user menu: avatar, account card, language segmented
+  control, sign-out link.
+
+  Rendered by `helios_ui_chrome::user_menu()` and consumed by BOTH
+  `crates/ui` (HFS) and `crates/hts-ui` (HTS) through that one function.
+  One edit here changes both products at once. Do NOT copy this markup back
+  into either crate's own templates: that fork is exactly the drift this
+  crate exists to make impossible.
+
+  Contract: `i18n` is a `&dyn ChromeLabels` (`t(key)` / `lang()`); `user` is
+  a `UserIdentity`. The `{% include "icons/..." %}` calls resolve against
+  THIS crate's `templates/` root, because the `#[derive(Template)]` that
+  owns this file lives here.
+
+  Notes for whoever edits this next:
+
+  * The markup below is a byte-verbatim extract of the block that used to
+    live at `crates/ui/templates/layouts/base.html:233-267`, so the HFS page
+    bytes are unchanged by the move. Keep the 8/10/12/14-space indentation
+    and the attribute order exactly as they are. Do not reflow, do not
+    reformat, do not tidy.
+
+  * This comment deliberately closes welded to the `<details>` line instead
+    of ending on a line of its own. Closing it with a whitespace-suppressing
+    marker would look neater, but askama strips ALL adjacent whitespace,
+    which would eat the 8 spaces of indentation that the caller's topbar
+    expects. Closing it plainly, with no newline in between, preserves them.
+
+  * The file ends with an empty whitespace-suppressing comment. It is
+    load-bearing; read the note above it before touching it.
+#}        <details class="menu menu--user">
+          <summary class="topbar__avatar" aria-label="{{ i18n.t("user-menu-label") }}">
+            {% if let Some(photo) = user.photo %}
+            <img class="topbar__avatar-img" src="{{ photo }}" alt="">
+            {% else %}
+            {% if let Some(initials) = user.initials %}{{ initials }}{% else %}<span class="icon">{% include "icons/user.svg" %}</span>{% endif %}
+            {% endif %}
+          </summary>
+          <!-- Account-card layout (#725, proposal B): centered identity,
+               language as a segmented row, Sign out full width. -->
+          <div class="menu__panel menu__panel--right">
+            <div class="user-menu__id">
+              <span class="user-menu__avatar" aria-hidden="true">
+                {% if let Some(photo) = user.photo %}
+                <img class="topbar__avatar-img" src="{{ photo }}" alt="">
+                {% else %}
+                {% if let Some(initials) = user.initials %}{{ initials }}{% else %}<span class="icon">{% include "icons/user.svg" %}</span>{% endif %}
+                {% endif %}
+              </span>
+              <div class="user-menu__name">{% if let Some(name) = user.display %}{{ name }}{% else %}{{ i18n.t("user-anonymous") }}{% endif %}</div>
+              <div class="user-menu__hint">{% if let Some(secondary) = user.secondary %}{{ secondary }}{% else %}{{ i18n.t("user-local-hint") }}{% endif %}</div>
+            </div>
+            <div class="menu__heading">{{ i18n.t("language-label") }}</div>
+            <div class="user-menu__seg">
+              <a href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-en") }}">EN</a>
+              <a href="?lang=es"{% if i18n.lang() == "es" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-es") }}">ES</a>
+              <a href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-de") }}">DE</a>
+            </div>
+            {% if user.can_logout %}
+            <a class="user-menu__out" href="{{ user.logout_href }}">
+              <span class="icon">{% include "icons/logout.svg" %}</span> {{ i18n.t("user-logout") }}
+            </a>
+            {% endif %}
+          </div>
+        </details>
+        {#- Sentinel -- NOT decoration, and NOT removable.
+
+             The caller supplies the newline that follows `</details>`: in
+             HFS that is the "\n      </div>" which sat at
+             `crates/ui/templates/layouts/base.html:268`. So this partial
+             must render WITHOUT a trailing newline, or every page grows a
+             stray blank line and byte parity with the pre-extraction HFS
+             output is lost.
+
+             This is an empty askama comment carrying a whitespace-suppress
+             marker on BOTH sides. The opening marker swallows the newline
+             and indentation that precede it; the closing marker swallows
+             this file's final newline. Net rendered output: nothing, and
+             the render ends at `</details>`.
+
+             The space between the two suppress hyphens is REQUIRED: written
+             with no space between them the parser rejects the sequence as
+             ambiguous.
+
+             `crates/ui-chrome/tests/user_menu.rs::renders_without_a_trailing_newline`
+             fails the moment this line goes away. -#}

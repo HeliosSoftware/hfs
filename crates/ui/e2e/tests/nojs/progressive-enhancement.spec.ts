@@ -3,6 +3,7 @@ import {
   CANONICAL_BUTTON_GEOMETRY,
   readButtonGeometries,
 } from "../../pages/button-geometry";
+import { langLink, openUserMenu } from "../../pages/user-menu";
 
 // This whole file runs in the `nojs` project (javaScriptEnabled: false), which
 // exercises the README's core promise: the UI works with JavaScript off. htmx,
@@ -33,17 +34,19 @@ test("the sidebar brand is an accessible native Home link", async ({ page }) => 
   await expect(page.locator("h1.page-head__title")).toHaveText("Home");
 });
 
-test("the language switcher works as plain links (en → es → de)", async ({ page, chrome }) => {
+test("the language switcher works as plain links (en → es → de)", async ({ page }) => {
   await page.goto("/ui");
-  // #725: the language options live behind the avatar's <details> menu,
-  // which opens natively — no JS involved.
-  await chrome.userMenu.locator("summary").click();
-  await expect(chrome.langLink("es")).toHaveAttribute("href", /lang=es/);
-  await chrome.langLink("es").click();
+  // #725: the language options live behind the avatar's <details> menu, which
+  // opens natively — no JS involved. `openUserMenu` (#799) is the shared
+  // summary-click idiom; it must never become `evaluate(d => d.open = true)`,
+  // which would be a no-op in this project.
+  await openUserMenu(page);
+  await expect(langLink(page, "es")).toHaveAttribute("href", /lang=es/);
+  await langLink(page, "es").click();
   await expect(page.locator("html")).toHaveAttribute("lang", "es");
 
-  await chrome.userMenu.locator("summary").click();
-  await chrome.langLink("de").click();
+  await openUserMenu(page);
+  await langLink(page, "de").click();
   await expect(page.locator("html")).toHaveAttribute("lang", "de");
 });
 

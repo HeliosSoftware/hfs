@@ -221,6 +221,28 @@ impl I18n {
     }
 }
 
+/// Lets the shared chrome partials resolve catalog keys against this request's
+/// locale (#799).
+///
+/// A forwarding shim, not an adapter: the shared markup needs only the
+/// *intersection* of the two products' `I18n` surfaces — a locale tag and a
+/// message lookup — and both this type and `helios_hts_ui::I18n` already spell
+/// those exactly that way. Nothing is translated, renamed or defaulted here, so
+/// the trait cannot become a place where the two implementations quietly
+/// diverge. HFS-only methods (`t_arg`) deliberately stay off the trait: they
+/// are page-level vocabulary, and widening the shared contract to fit them
+/// would force HTS to grow methods its own templates never call.
+/// `crates/hts-ui/src/i18n.rs` carries the identical shim.
+impl helios_ui_chrome::ChromeLabels for I18n {
+    fn lang(&self) -> String {
+        I18n::lang(self)
+    }
+
+    fn t(&self, key: &str) -> String {
+        I18n::t(self, key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
