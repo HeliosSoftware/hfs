@@ -72,6 +72,11 @@ fn load_tenant_stored_params(
 static MEMORY_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// SQLite backend for FHIR resource storage.
+///
+/// Cloning is cheap — the pool and the registries are shared handles — and
+/// lets a [`SqliteTransaction`](super::transaction::SqliteTransaction) carry
+/// its parent backend so both write paths index identically.
+#[derive(Clone)]
 pub struct SqliteBackend {
     pool: Pool<SqliteConnectionManager>,
     config: SqliteBackendConfig,

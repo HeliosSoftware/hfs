@@ -320,7 +320,7 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
     )));
     assert!(html.contains(r#"<span>Submitter</span><code>"#));
     assert!(html.contains(r#"<span>Created</span><code>"#));
-    assert!(html.contains(r#"<span>Status</span><div>"#));
+    assert!(html.contains(r#"<span>Status</span><div id="submission-status">"#));
     assert!(html.contains(r#"<span>Authentication</span><div>"#));
 
     let assert_back_link =
@@ -773,6 +773,113 @@ async fn mock_token_endpoint(status: StatusCode, body: &'static str) -> String {
     format!("http://{addr}/token")
 }
 
+/// A recipient whose poll URL always answers with the given status and a
+/// `Retry-After`, counting how many polls actually arrive (#790).
+async fn mock_recipient_counting_polls(
+    poll_status: StatusCode,
+    retry_after: &'static str,
+) -> (String, Arc<std::sync::Mutex<u32>>) {
+    use axum::extract::State as AxState;
+    #[derive(Clone)]
+    struct S {
+        polls: Arc<std::sync::Mutex<u32>>,
+        base: Arc<std::sync::Mutex<String>>,
+    }
+    let state = S {
+        polls: Arc::new(std::sync::Mutex::new(0)),
+        base: Arc::new(std::sync::Mutex::new(String::new())),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    *state.base.lock().unwrap() = format!("http://{addr}");
+    let polls = Arc::clone(&state.polls);
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"resourceType": "OperationOutcome"}))
+            }),
+        )
+        .route(
+            "/$bulk-submit-status",
+            axum::routing::post(|AxState(s): AxState<S>| async move {
+                let base = s.base.lock().unwrap().clone();
+                (
+                    StatusCode::ACCEPTED,
+                    [("content-location", format!("{base}/poll"))],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/poll",
+            axum::routing::get(move |AxState(s): AxState<S>| async move {
+                *s.polls.lock().unwrap() += 1;
+                (
+                    poll_status,
+                    [
+                        ("retry-after", retry_after.to_string()),
+                        ("x-progress", "processing 10% complete".to_string()),
+                    ],
+                    String::new(),
+                )
+            }),
+        )
+        .with_state(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), polls)
+}
+
+/// #790: a `202` carrying `Retry-After` holds the next recipient poll — the
+/// card keeps refreshing from stored state, but the recipient is not asked
+/// again until the window passes.
+#[tokio::test]
+async fn a_retry_after_holds_the_next_poll() {
+    let (recipient_url, polls) = mock_recipient_counting_polls(StatusCode::ACCEPTED, "120").await;
+    let ctx = ctx(&recipient_url);
+    let detail_path = create_submission(&ctx).await;
+
+    let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(*polls.lock().unwrap(), 1);
+    assert!(html.contains("processing 10% complete"), "{html}");
+    assert!(html.contains("every 5s"), "the card keeps refreshing");
+    // A reported percentage renders the determinate bar, and the summary's
+    // STATUS cell rides along out-of-band so it can never go stale.
+    assert!(html.contains(r#"aria-valuenow="10""#), "{html}");
+    assert!(
+        html.contains(r#"<div id="submission-status" hx-swap-oob="true">In Progress</div>"#),
+        "{html}"
+    );
+
+    // The htmx cadence fires again immediately — the recipient must not.
+    let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(*polls.lock().unwrap(), 1, "poll held by Retry-After");
+    assert!(html.contains("processing 10% complete"), "cached: {html}");
+    assert!(html.contains("every 5s"));
+}
+
+/// #790: a throttled poll is backoff bookkeeping — no run-log line, and the
+/// next fetch inside the `Retry-After` window sends nothing.
+#[tokio::test]
+async fn a_throttled_poll_backs_off_and_stays_out_of_the_log() {
+    let (recipient_url, polls) =
+        mock_recipient_counting_polls(StatusCode::TOO_MANY_REQUESTS, "60").await;
+    let ctx = ctx(&recipient_url);
+    let detail_path = create_submission(&ctx).await;
+
+    let _ = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(*polls.lock().unwrap(), 1);
+    let _ = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(*polls.lock().unwrap(), 1, "429's Retry-After held the poll");
+
+    let (_, detail) = get(&ctx, &detail_path).await;
+    assert!(
+        !detail.contains("throttled"),
+        "backoff is not a run event: {detail}"
+    );
+    assert!(detail.contains("In Progress"), "{detail}");
+}
+
 /// One sequential test for everything that reads the process-wide signing-key
 /// environment variable — phases must not run concurrently with each other,
 /// and nothing else in this binary reads the variable.
@@ -1011,6 +1118,9 @@ async fn mock_recipient_with_status() -> (String, Arc<std::sync::Mutex<Vec<serde
                         [
                             ("x-progress", "processing 0% complete".to_string()),
                             ("content-type", "text/plain".to_string()),
+                            // An expired window: the next fetch may poll again
+                            // immediately, so the flip to 200 stays reachable.
+                            ("retry-after", "0".to_string()),
                         ],
                         String::new(),
                     )
@@ -1058,10 +1168,13 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert_eq!(submitter["value"], "acme");
 
     // First status fetch: one poll happens -> 202 progress recorded, the
-    // fragment keeps polling, and the in-progress card offers Abort.
+    // fragment keeps polling, and the in-progress card offers Abort. A 0%
+    // report renders the indeterminate bar (manifest-granular percentages
+    // sit at 0 for a one-shot submission's whole run).
     let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("processing 0% complete"), "{html}");
+    assert!(html.contains("progress-track--indeterminate"), "{html}");
     assert!(html.contains("every 5s"), "keeps polling: {html}");
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
     assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
@@ -1072,10 +1185,15 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert!(!html.contains(r#"class="card detail""#));
 
     // Second fetch: the mock flips to 200 -> result summary, polling stops,
-    // and the finished card carries no abort.
+    // the finished card carries no abort, and the out-of-band STATUS cell
+    // flips to Completed with it — no page reload required.
     let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert!(!html.contains("every 5s"), "polling stopped: {html}");
     assert!(html.contains("Output files"), "{html}");
+    assert!(
+        html.contains(r#"<div id="submission-status" hx-swap-oob="true">Completed</div>"#),
+        "{html}"
+    );
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
     assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
     assert!(html.contains("Processing finished at <code>"), "{html}");
@@ -1213,11 +1331,17 @@ async fn run_one_manifest_to_poll(recipient_url: &str) -> (Ctx, String, String) 
 }
 
 /// #765: a clean `200` status manifest completes the submission by itself —
-/// no manual Complete press required.
+/// no manual Complete press required. An `outcome` file whose countSeverity
+/// records no errors does not spoil the completion.
 #[tokio::test]
 async fn a_clean_completion_manifest_completes_the_submission() {
     let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
         "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://x/oo.ndjson",
+            "countSeverity": {"error": 0, "fatal": 0, "warning": 2}
+        }],
         "error": []
     })))
     .await;
@@ -1227,10 +1351,31 @@ async fn a_clean_completion_manifest_completes_the_submission() {
     assert!(detail.contains("submission completed"), "{detail}");
 }
 
-/// #764: a completion manifest carrying `error[]` entries fails the
-/// submission, and a failed submission can still be finalized.
+/// #764: a completion manifest carrying error files fails the submission.
+/// The STU4 status manifest lists them under `outcome` (with a countSeverity
+/// tally); reading only the export-style `error` key made a truncated ingest
+/// read "finished cleanly".
 #[tokio::test]
 async fn a_completion_manifest_with_errors_fails_the_submission() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://x/e.ndjson",
+            "countSeverity": {"error": 1}
+        }]
+    })))
+    .await;
+    let (_ctx, _path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(detail.contains("Failed"), "{detail}");
+    assert!(!detail.contains("In Progress"), "{detail}");
+    assert!(detail.contains("marked failed"), "{detail}");
+}
+
+/// The export-manifest vocabulary (`error[]`) still counts for recipients
+/// that answer with it.
+#[tokio::test]
+async fn an_export_style_error_array_also_fails_the_submission() {
     let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
         "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
         "error": [{"type": "OperationOutcome", "url": "http://x/e.ndjson"}]
@@ -1238,7 +1383,6 @@ async fn a_completion_manifest_with_errors_fails_the_submission() {
     .await;
     let (_ctx, _path, detail) = run_one_manifest_to_poll(&recipient).await;
     assert!(detail.contains("Failed"), "{detail}");
-    assert!(!detail.contains("In Progress"), "{detail}");
     assert!(detail.contains("marked failed"), "{detail}");
 }
 
