@@ -974,12 +974,14 @@ mod tests {
             provisioning: Default::default(),
             data_dir: None,
             public_base_url: "http://localhost:8080".to_string(),
+            self_base_url: "http://localhost:8080".to_string(),
             tenant_path_routing: false,
             fhir_version: helios_fhir::FhirVersion::R4,
             default_tenant: "default".to_string(),
             terminology: None,
             settings,
             bulk_provider: None,
+            patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
