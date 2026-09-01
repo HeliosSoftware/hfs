@@ -325,23 +325,38 @@ impl S3Backend {
     ///
     /// Shares the `list_current_keys` + `get_json_object` walk used by bulk
     /// export ([`super::bulk_export`]); used by the in-process SQL-on-FHIR
-    /// runner to feed the `helios-sof` engine.
+    /// runner to feed the `helios-sof` engine, and by the SearchParameter
+    /// overlay reload (`reload_stored_cache_for_tenant`).
+    ///
+    /// Fetches concurrently (same `bulk_write_concurrency` fan-out the seeder
+    /// uses for writes, `search/seeder.rs`) — a resource type can hold
+    /// thousands of objects (every seeded spec `SearchParameter` is a real,
+    /// individually-keyed object here, indistinguishable from a stored one),
+    /// and one GET per object sequentially turned a same-tenant SearchParameter
+    /// write into a ~30s stall that Inferno's client then timed out on (#787).
     pub(crate) async fn scan_live_resources(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
     ) -> StorageResult<Vec<Value>> {
+        use futures::stream::{self, StreamExt};
+
         let location = self.tenant_location(tenant)?;
         let keys = self
             .list_current_keys(&location, Some(resource_type))
             .await?;
 
+        let bucket = &location.bucket;
+        let fetched: Vec<StorageResult<Option<(StoredResource, ObjectMetadata)>>> =
+            stream::iter(keys)
+                .map(|key| async move { self.get_json_object::<StoredResource>(bucket, &key).await })
+                .buffer_unordered(self.bulk_write_concurrency())
+                .collect()
+                .await;
+
         let mut resources = Vec::new();
-        for key in keys {
-            let Some((resource, _)) = self
-                .get_json_object::<StoredResource>(&location.bucket, &key)
-                .await?
-            else {
+        for result in fetched {
+            let Some((resource, _)) = result? else {
                 continue;
             };
             if resource.is_deleted() {
