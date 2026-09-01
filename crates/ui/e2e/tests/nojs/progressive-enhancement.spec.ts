@@ -181,7 +181,9 @@ test("Bulk Export can narrow through a conflicting native form without JavaScrip
   bulkExport,
 }) => {
   await page.goto("/ui/bulk-export/new");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
   await bulkExport.nameInput.fill("No-JS All Resources");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
 
   await expect(bulkExport.allResources).toBeChecked();
   await expect(bulkExport.typeCheckboxes).not.toHaveCount(0);
@@ -340,12 +342,13 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await expect(startExport).toBeVisible();
 
   const exportName = `no-js-export-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  await form.locator('input[name="name"]').fill(exportName);
+  await form.locator('input[name="name"]').fill(`  ${exportName}  `);
   await form.locator('input[name="scope"][value="system"]').check();
   await startExport.click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
   let card = page.locator(".job-card").filter({ hasText: exportName });
   await expect(card).toBeVisible();
+  await expect(card.locator(".job-card__name")).toHaveText(exportName);
 
   await card.getByRole("button", { name: "Cancel" }).click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);

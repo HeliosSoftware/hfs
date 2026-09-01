@@ -10,6 +10,8 @@
   var allTypes = form.querySelector('input[name="all_types"]');
   var types = Array.prototype.slice.call(form.querySelectorAll('input[name="types"]'));
   var nameInput = form.querySelector('input[name="name"]');
+  var nameHeading = document.querySelector("[data-bulk-export-name-heading]");
+  var defaultHeading = nameHeading ? nameHeading.textContent : "";
   var nameError = form.querySelector("#bulk-export-name-error");
   var sincePreset = form.querySelector('select[name="since_preset"]');
   var sinceCustom = form.querySelector('input[name="since_custom"]');
@@ -48,6 +50,11 @@
     var invalid = Boolean(nameInput && !nameInput.value.trim());
     setFieldError(nameInput, nameError, invalid);
     return !invalid;
+  }
+
+  function synchronizeName() {
+    if (!nameInput || !nameHeading) return;
+    nameHeading.textContent = nameInput.value.trim() || defaultHeading;
   }
 
   function isValidFhirInstant(value) {
@@ -128,6 +135,7 @@
   // their restored individual selections; only the default checked state
   // upgrades the grid to its checked-and-disabled presentation.
   synchronizeTypes(false);
+  synchronizeName();
   synchronizeSince();
   synchronizePatientScope();
 
@@ -139,6 +147,7 @@
 
   if (nameInput) {
     nameInput.addEventListener("input", function () {
+      synchronizeName();
       if (validationStarted) validateName();
     });
   }
@@ -179,6 +188,7 @@
     validationStarted = false;
     window.setTimeout(function () {
       synchronizeTypes(false);
+      synchronizeName();
       synchronizeSince();
       synchronizePatientScope();
       setFieldError(nameInput, nameError, false);

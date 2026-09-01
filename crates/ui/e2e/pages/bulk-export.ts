@@ -13,6 +13,10 @@ export class BulkExportPage {
     return this.page.locator("form.bulk-export-form");
   }
 
+  get nameHeading(): Locator {
+    return this.page.locator("[data-bulk-export-name-heading]");
+  }
+
   get nameInput(): Locator {
     return this.form.locator('input[name="name"]');
   }
