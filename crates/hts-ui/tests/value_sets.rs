@@ -402,7 +402,7 @@ async fn browser_renders_full_page_with_translated_heading() {
     );
     for key in [
         "hts-vs-browser-title",
-        "hts-vs-browser-filter-search",
+        "hts-vs-browser-filter-reset",
         "hts-vs-browser-column-url",
         "hts-vs-browser-load-more",
         "hts-vs-expand-heading",
