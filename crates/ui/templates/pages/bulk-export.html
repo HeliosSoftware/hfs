@@ -27,32 +27,35 @@
 
 <!-- #735, Figma Export frame: scope as a radio-card row, the type grid and
      narrow-down filters as icon-headed cards, the actions on a footer row. -->
-<form method="post" action="/ui/bulk-export" class="bulk-export-form">
+<form method="post" action="/ui/bulk-export" class="bulk-export-form" novalidate{% if rejected %} data-validation-started="true"{% endif %}>
   <label class="field bulk-export-form__name">
     <span class="field__label">{{ i18n.t("bulk-export-field-name") }}</span>
-    <input class="field__input" type="text" name="name" autocomplete="off"
+    <input class="field__input" type="text" name="name" required autocomplete="off"
+           value="{{ form.name }}"
+           {% if name_error.is_some() %}autofocus aria-invalid="true" aria-describedby="bulk-export-name-error"{% endif %}
            placeholder="{{ i18n.t("bulk-export-field-name-placeholder") }}">
+    <span id="bulk-export-name-error" class="field__hint field__hint--error" role="alert"{% if name_error.is_none() %} hidden{% endif %}>{% match name_error %}{% when Some(message) %}{{ message }}{% when None %}{{ i18n.t("bulk-export-name-required") }}{% endmatch %}</span>
   </label>
 
   <h2 class="form-legend">{{ i18n.t("bulk-export-scope") }}</h2>
   <div class="choice-grid">
     <label class="choice-card">
       <span class="choice-card__title">
-        <input type="radio" name="scope" value="system" checked>
+        <input type="radio" name="scope" value="system"{% if form.scope == "system" %} checked{% endif %}>
         {{ i18n.t("bulk-export-scope-system") }}
       </span>
       <span class="choice-card__hint">{{ i18n.t("bulk-export-scope-system-hint") }}</span>
     </label>
     <label class="choice-card">
       <span class="choice-card__title">
-        <input type="radio" name="scope" value="patient">
+        <input type="radio" name="scope" value="patient"{% if form.scope == "patient" %} checked{% endif %}>
         {{ i18n.t("bulk-export-scope-patient") }}
       </span>
       <span class="choice-card__hint">{{ i18n.t("bulk-export-scope-patient-hint") }}</span>
     </label>
     <label class="choice-card">
       <span class="choice-card__title">
-        <input type="radio" name="scope" value="group">
+        <input type="radio" name="scope" value="group"{% if form.scope == "group" %} checked{% endif %}>
         {{ i18n.t("bulk-export-scope-group") }}
       </span>
       <span class="choice-card__hint">{{ i18n.t("bulk-export-scope-group-hint") }}</span>
@@ -61,7 +64,8 @@
 
   <label class="field field--group-id">
     <span class="field__label">{{ i18n.t("bulk-export-field-group-id") }}</span>
-    <input class="field__input" type="text" name="group_id" autocomplete="off">
+    <input class="field__input" type="text" name="group_id" autocomplete="off"
+           value="{{ form.group_id }}">
     <span class="field__hint">{{ i18n.t("bulk-export-field-group-id-hint") }}</span>
   </label>
 
@@ -76,22 +80,28 @@
     "/ui/bulk-export/patient-options",
     "combobox--scope-patient",
     i18n.t("bulk-export-field-patients-id-only-hint"),
-    i18n.t("bulk-export-field-patients-id-only-placeholder")
+    i18n.t("bulk-export-field-patients-id-only-placeholder"),
+    "q",
+    patient_value
   ) %}{% endcall %}
 
   <section class="card">
     <div class="card-head">
       <h3><span class="icon">{% include "icons/layers.svg" %}</span> {{ i18n.t("bulk-export-types") }}</h3>
+      {% if rejected %}
+      <a class="btn" href="/ui/bulk-export/new">{{ i18n.t("bulk-export-clear") }}</a>
+      {% else %}
       <button type="reset" class="btn">{{ i18n.t("bulk-export-clear") }}</button>
+      {% endif %}
     </div>
     <div class="card__body">
       <!-- Keep the individual inputs enabled in server-rendered HTML so a
            no-JavaScript client can uncheck All Resources and narrow the export. -->
-      <label class="typegrid__item"><input type="checkbox" name="all_types" checked> {{ i18n.t("bulk-export-all-resources") }}</label>
+      <label class="typegrid__item"><input type="checkbox" name="all_types"{% if form.all_types %} checked{% endif %}> {{ i18n.t("bulk-export-all-resources") }}</label>
       <div class="typegrid">
         {% for t in resource_types %}
         <label class="typegrid__item" data-full-name="{{ t }}" title="{{ t }}">
-          <input type="checkbox" name="types" value="{{ t }}">
+          <input type="checkbox" name="types" value="{{ t }}"{% if form.has_type(t) %} checked{% endif %}>
           <span class="typegrid__label">{{ t }}</span>
         </label>
         {% endfor %}
@@ -108,28 +118,33 @@
         <label class="field">
           <span class="field__label">{{ i18n.t("bulk-export-field-elements") }}</span>
           <input class="field__input" type="text" name="elements" autocomplete="off"
+                 value="{{ form.elements }}"
                  placeholder="id,meta,name">
         </label>
         <label class="field">
           <span class="field__label">{{ i18n.t("bulk-export-field-type-filter") }}</span>
           <input class="field__input" type="text" name="type_filter" autocomplete="off"
+                 value="{{ form.type_filter }}"
                  placeholder="Patient?active=true">
         </label>
         <label class="field">
           <span class="field__label">{{ i18n.t("bulk-export-field-since") }}</span>
           <select class="field__input" name="since_preset">
-            <option value="">{{ i18n.t("bulk-export-since-all") }}</option>
-            <option value="day">{{ i18n.t("bulk-export-since-day") }}</option>
-            <option value="week">{{ i18n.t("bulk-export-since-week") }}</option>
-            <option value="month">{{ i18n.t("bulk-export-since-month") }}</option>
-            <option value="custom">{{ i18n.t("bulk-export-since-custom") }}</option>
+            <option value=""{% if form.since_preset.is_empty() %} selected{% endif %}>{{ i18n.t("bulk-export-since-all") }}</option>
+            <option value="day"{% if form.since_preset == "day" %} selected{% endif %}>{{ i18n.t("bulk-export-since-day") }}</option>
+            <option value="week"{% if form.since_preset == "week" %} selected{% endif %}>{{ i18n.t("bulk-export-since-week") }}</option>
+            <option value="month"{% if form.since_preset == "month" %} selected{% endif %}>{{ i18n.t("bulk-export-since-month") }}</option>
+            <option value="custom"{% if form.since_preset == "custom" %} selected{% endif %}>{{ i18n.t("bulk-export-since-custom") }}</option>
           </select>
         </label>
         <label class="field">
           <span class="field__label">{{ i18n.t("bulk-export-field-since-custom") }}</span>
           <input class="field__input" type="text" name="since_custom" autocomplete="off"
+                 value="{{ form.since_custom }}"
+                 data-pattern="([0-9]([0-9]([0-9][1-9]|[1-9]0)|[1-9]00)|[1-9]000)-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?(Z|[+\-]((0[0-9]|1[0-3]):[0-5][0-9]|14:00))"
+                 {% if since_custom_error.is_some() %}{% if name_error.is_none() %}autofocus {% endif %}aria-invalid="true" aria-describedby="bulk-export-since-custom-error"{% endif %}
                  placeholder="2026-08-01T00:00:00Z">
-          <span class="field__hint">{{ i18n.t("bulk-export-field-since-custom-hint") }}</span>
+          <span id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert"{% if since_custom_error.is_none() %} hidden{% endif %}>{% match since_custom_error %}{% when Some(message) %}{{ message }}{% when None %}{{ i18n.t("bulk-export-since-invalid") }}{% endmatch %}</span>
         </label>
       </div>
     </div>

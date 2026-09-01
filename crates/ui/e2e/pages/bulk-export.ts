@@ -13,6 +13,14 @@ export class BulkExportPage {
     return this.page.locator("form.bulk-export-form");
   }
 
+  get nameInput(): Locator {
+    return this.form.locator('input[name="name"]');
+  }
+
+  get nameError(): Locator {
+    return this.form.locator("#bulk-export-name-error");
+  }
+
   get allResources(): Locator {
     return this.form.locator('input[name="all_types"]');
   }
@@ -45,6 +53,10 @@ export class BulkExportPage {
 
   get sinceCustom(): Locator {
     return this.form.locator('input[name="since_custom"]');
+  }
+
+  get sinceCustomError(): Locator {
+    return this.form.locator("#bulk-export-since-custom-error");
   }
 
   scopeRadio(scope: "system" | "patient" | "group"): Locator {
@@ -81,6 +93,10 @@ export class BulkExportPage {
 
   get clearButton(): Locator {
     return this.form.getByRole("button", { name: "Clear", exact: true });
+  }
+
+  get clearLink(): Locator {
+    return this.form.getByRole("link", { name: "Clear", exact: true });
   }
 
   get startButton(): Locator {

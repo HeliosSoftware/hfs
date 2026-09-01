@@ -1454,6 +1454,15 @@ textarea.field__input {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+.field__input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.field__input[aria-invalid="true"]:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
 /* The native dropdown arrow hugs the border regardless of padding, so draw
    our own chevron with the same inset the text gets. The muted gray reads on
    both themes. */

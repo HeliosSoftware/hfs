@@ -157,18 +157,133 @@ test("fractional clipping still reveals ImmunizationRecommendation", async ({
   await expect(bulkExport.typeTooltip).toHaveText(resourceType);
 });
 
+test("Start Export reveals both inline errors and enables reactive validation", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+  let submissions = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/ui/bulk-export") && request.method() === "POST") {
+      submissions += 1;
+    }
+  });
+
+  await expect(bulkExport.nameInput).toHaveAttribute("required", "");
+  await expect(bulkExport.form).toHaveAttribute("novalidate", "");
+  await bulkExport.nameInput.fill("   ");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("not-an-instant");
+  await bulkExport.sinceCustom.press("Tab");
+
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+  await expect(bulkExport.nameInput).not.toHaveAttribute("aria-invalid", /.+/);
+  await expect(bulkExport.sinceCustom).not.toHaveAttribute("aria-invalid", /.+/);
+
+  await bulkExport.startButton.click();
+
+  await expect(bulkExport.nameInput).toBeFocused();
+  await expect(bulkExport.nameInput).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.nameInput).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-name-error",
+  );
+  await expect(bulkExport.nameError).toBeVisible();
+  await expect(bulkExport.nameError).toHaveText("Enter a name for this export.");
+  await expect(bulkExport.sinceCustom).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.sinceCustom).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-since-custom-error",
+  );
+  await expect(bulkExport.sinceCustomError).toBeVisible();
+  await expect(bulkExport.sinceCustomError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+  expect(submissions).toBe(0);
+
+  const errorColors = await bulkExport.nameInput.evaluate((input) => {
+    const error = document.querySelector("#bulk-export-name-error")!;
+    return {
+      border: getComputedStyle(input).borderColor,
+      text: getComputedStyle(error).color,
+    };
+  });
+  expect(errorColors.border).toBe(errorColors.text);
+
+  await bulkExport.nameInput.fill("Reactive export");
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.nameInput).not.toHaveAttribute("aria-invalid", /.+/);
+  await bulkExport.nameInput.fill("");
+  await expect(bulkExport.nameError).toBeVisible();
+
+  await bulkExport.sinceCustom.fill("  2026-08-01T03:30:00.123+03:30  ");
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+  await expect(bulkExport.sinceCustom).not.toHaveAttribute("aria-invalid", /.+/);
+  await bulkExport.sinceCustom.fill("invalid-again");
+  await expect(bulkExport.sinceCustomError).toBeVisible();
+
+  for (const instant of [
+    "2026-13-01T00:00:00Z",
+    "2026-04-31T00:00:00Z",
+    "2026-08-01T24:00:00Z",
+    "2026-08-01T00:00:00+24:00",
+  ]) {
+    await bulkExport.sinceCustom.fill(instant);
+    await expect(bulkExport.sinceCustomError).toBeVisible();
+  }
+
+  await bulkExport.sincePreset.selectOption("week");
+  await expect(bulkExport.sinceCustom).toBeDisabled();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+  await bulkExport.sincePreset.selectOption("custom");
+  await expect(bulkExport.sinceCustom).toBeEnabled();
+  await expect(bulkExport.sinceCustomError).toBeVisible();
+
+  await bulkExport.nameInput.fill("Reactive export");
+  await bulkExport.sinceCustom.fill("   ");
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+  await submitted;
+  expect(submissions).toBe(1);
+});
+
 test("Custom instant follows the Since preset and form serialization", async ({ bulkExport }) => {
   await bulkExport.goto();
+  await bulkExport.nameInput.fill("Preset validation");
 
   for (const preset of ["", "day", "week", "month"]) {
     await bulkExport.sincePreset.selectOption(preset);
     await expect(bulkExport.sinceCustom).toBeDisabled();
+    await expect(bulkExport.sinceCustom).not.toHaveAttribute("pattern", /.+/);
   }
 
   const instant = "2026-08-01T00:00:00Z";
   await bulkExport.sincePreset.selectOption("custom");
   await expect(bulkExport.sinceCustom).toBeEnabled();
+  await expect(bulkExport.sinceCustom).not.toHaveAttribute("pattern", /.+/);
+  const customPattern = await bulkExport.sinceCustom.getAttribute("data-pattern");
+  expect(customPattern).not.toBeNull();
+
+  await bulkExport.sinceCustom.fill("   ");
+  await expect(bulkExport.sinceCustom).not.toHaveAttribute("pattern", /.+/);
+
+  const paddedInstant = `  ${instant}  `;
+  await bulkExport.sinceCustom.fill(paddedInstant);
+  await expect(bulkExport.sinceCustom).not.toHaveAttribute("pattern", /.+/);
+
   await bulkExport.sinceCustom.fill(instant);
+  await expect(bulkExport.sinceCustom).not.toHaveAttribute("pattern", /.+/);
 
   await bulkExport.sincePreset.selectOption("week");
   await expect(bulkExport.sinceCustom).toBeDisabled();
@@ -187,6 +302,197 @@ test("Custom instant follows the Since preset and form serialization", async ({ 
       (form) => new FormData(form as HTMLFormElement).get("since_custom"),
     ),
   ).toBe(instant);
+
+  await bulkExport.sinceCustom.fill("not-an-instant");
+  expect(
+    await bulkExport.sinceCustom.evaluate(
+      (input) => (input as HTMLInputElement).validity.patternMismatch,
+    ),
+  ).toBe(false);
+
+  await bulkExport.sincePreset.selectOption("week");
+  await expect(bulkExport.sinceCustom).toBeDisabled();
+  await expect(bulkExport.sinceCustom).not.toHaveAttribute("pattern", /.+/);
+  await expect(bulkExport.sinceCustom).toHaveValue("not-an-instant");
+});
+
+test("FHIR R4 leap second and timezone offset boundaries validate reactively", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+  await bulkExport.nameInput.fill("FHIR R4 instant boundaries");
+  await bulkExport.sincePreset.selectOption("custom");
+  let submissions = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/ui/bulk-export") && request.method() === "POST") {
+      submissions += 1;
+    }
+  });
+
+  await bulkExport.sinceCustom.fill("not-an-instant");
+  await bulkExport.startButton.click();
+  await expect(bulkExport.sinceCustomError).toBeVisible();
+  expect(submissions).toBe(0);
+
+  for (const instant of ["2026-12-31T23:59:60Z", "2026-08-01T00:00:00+14:00"]) {
+    await bulkExport.sinceCustom.fill(instant);
+    await expect(bulkExport.sinceCustomError).toBeHidden();
+  }
+
+  for (const instant of [
+    "0000-08-01T00:00:00Z",
+    "2026-08-01T00:00:00+14:01",
+    "2026-08-01T00:00:00+15:00",
+  ]) {
+    await bulkExport.sinceCustom.fill(instant);
+    await expect(bulkExport.sinceCustomError).toBeVisible();
+    await bulkExport.startButton.click();
+    expect(submissions).toBe(0);
+  }
+});
+
+test("keyboard submit starts inline validation", async ({ bulkExport }) => {
+  await bulkExport.goto();
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("not-an-instant");
+  await bulkExport.nameInput.focus();
+  await bulkExport.nameInput.press("Enter");
+
+  await expect(bulkExport.nameError).toBeVisible();
+  await expect(bulkExport.sinceCustomError).toBeVisible();
+  await expect(bulkExport.nameInput).toBeFocused();
+});
+
+test("inactive malformed Custom does not block submission", async ({ page, bulkExport }) => {
+  await bulkExport.goto();
+  await bulkExport.nameInput.fill("Inactive custom value");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("not-an-instant");
+  await bulkExport.sincePreset.selectOption("week");
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+
+  const params = new URLSearchParams((await submitted).postData() ?? "");
+  expect(params.get("since_preset")).toBe("week");
+  expect(params.has("since_custom")).toBe(false);
+});
+
+test("a patient-only server rejection starts reactive field validation", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+  await bulkExport.nameInput.fill("Patient-only rejection");
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
+  await bulkExport.form.evaluate((form) => {
+    const patient = document.createElement("input");
+    patient.type = "hidden";
+    patient.name = "patient";
+    patient.value = "Patient/not/valid";
+    form.append(patient);
+  });
+
+  const submitted = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/ui/bulk-export") &&
+      response.request().method() === "POST",
+  );
+  await bulkExport.startButton.click();
+  expect((await submitted).status()).toBe(400);
+
+  await expect(bulkExport.form).toHaveAttribute("data-validation-started", "true");
+  await expect(page.locator(".notice")).toContainText("valid logical Patient IDs");
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+
+  await bulkExport.nameInput.fill("");
+  await expect(bulkExport.nameError).toBeVisible();
+  await bulkExport.sinceCustom.fill("not-an-instant");
+  await expect(bulkExport.sinceCustomError).toBeVisible();
+});
+
+test("server rejects an impossible Custom date without creating an export", async ({
+  page,
+  bulkExport,
+}) => {
+  const exportName = "Browser impossible date must not start";
+  await bulkExport.goto();
+  await bulkExport.nameInput.fill(exportName);
+  await bulkExport.scopeRadio("group").check();
+  await bulkExport.form.locator('input[name="group_id"]').fill("preserved-group");
+  await bulkExport.allResources.uncheck();
+  await bulkExport.typeCheckbox("Patient").check();
+  await bulkExport.typeCheckbox("Observation").check();
+  await bulkExport.form.locator('input[name="elements"]').fill("id,meta");
+  await bulkExport.form
+    .locator('input[name="type_filter"]')
+    .fill("Patient?active=true");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("2026-02-31T00:00:00Z");
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+
+  const submitted = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/ui/bulk-export") &&
+      response.request().method() === "POST",
+  );
+  // Bypass the enhanced submit handler to exercise the authoritative server
+  // response exactly as a no-JavaScript or hostile client can.
+  await bulkExport.form.evaluate((form) => (form as HTMLFormElement).submit());
+  expect((await submitted).status()).toBe(400);
+
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(bulkExport.nameInput).toHaveValue(exportName);
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.scopeRadio("group")).toBeChecked();
+  await expect(bulkExport.form.locator('input[name="group_id"]')).toHaveValue(
+    "preserved-group",
+  );
+  await expect(bulkExport.allResources).not.toBeChecked();
+  await expect(bulkExport.typeCheckbox("Patient")).toBeChecked();
+  await expect(bulkExport.typeCheckbox("Observation")).toBeChecked();
+  await expect(bulkExport.form.locator('input[name="elements"]')).toHaveValue("id,meta");
+  await expect(bulkExport.form.locator('input[name="type_filter"]')).toHaveValue(
+    "Patient?active=true",
+  );
+  await expect(bulkExport.sincePreset).toHaveValue("custom");
+  await expect(bulkExport.sinceCustom).toHaveValue("2026-02-31T00:00:00Z");
+  await expect(bulkExport.sinceCustom).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.sinceCustom).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-since-custom-error",
+  );
+  await expect(bulkExport.sinceCustomError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+  await expect(bulkExport.sinceCustom).toBeFocused();
+  await expect(bulkExport.clearLink).toHaveAttribute("href", "/ui/bulk-export/new");
+
+  await bulkExport.sinceCustom.fill("2025-02-29T00:00:00Z");
+  await expect(bulkExport.sinceCustomError).toBeVisible();
+  await expect(bulkExport.sinceCustom).toHaveAttribute("aria-invalid", "true");
+  await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
+  await expect(bulkExport.sinceCustomError).toBeHidden();
+  await expect(bulkExport.sinceCustom).not.toHaveAttribute("aria-invalid", /.+/);
+  await bulkExport.sinceCustom.fill("not-an-instant");
+  await expect(bulkExport.sinceCustomError).toBeVisible();
+
+  const { violations } = await new AxeBuilder({ page }).analyze();
+  expect(violations, axeSummary(violations)).toEqual([]);
+
+  await page.goto("/ui/bulk-export");
+  await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
 });
 
 test("Patient combobox supports keyboard selection, dedupe, removal, and scope serialization", async ({
@@ -409,6 +715,7 @@ test("keyboard narrowing submits exactly the two selected resource types", async
   bulkExport,
 }) => {
   await bulkExport.goto();
+  await bulkExport.nameInput.fill("Two selected resource types");
 
   await bulkExport.allResources.focus();
   await bulkExport.allResources.press("Space");
@@ -472,21 +779,29 @@ test("re-checking and Clear restore the All Resources state", async ({ bulkExpor
   ).toBe(true);
 
   await bulkExport.typeCheckbox("Observation").check();
-  await bulkExport.form.locator('input[name="name"]').fill("temporary name");
+  await bulkExport.nameInput.fill("temporary name");
   await bulkExport.scopeRadio("patient").check();
   await bulkExport.sincePreset.selectOption("custom");
   await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
   await bulkExport.clearButton.click();
 
-  await expect(bulkExport.form.locator('input[name="name"]')).toHaveValue("");
+  await expect(bulkExport.nameInput).toHaveValue("");
   await expect(bulkExport.scopeRadio("system")).toBeChecked();
   await expect(bulkExport.sincePreset).toHaveValue("");
   await expect(bulkExport.sinceCustom).toHaveValue("");
   await expect(bulkExport.sinceCustom).toBeDisabled();
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
   await expect(bulkExport.allResources).toBeChecked();
   expect(
     await bulkExport.typeCheckboxes.evaluateAll((types) =>
       types.every((type) => (type as HTMLInputElement).checked && (type as HTMLInputElement).disabled),
     ),
   ).toBe(true);
+
+  await bulkExport.nameInput.fill("   ");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("not-an-instant");
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
 });
