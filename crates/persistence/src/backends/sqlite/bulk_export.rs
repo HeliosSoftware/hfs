@@ -53,6 +53,31 @@ fn parse_part_segment(part: &str) -> Option<(String, u32)> {
     Some((resource_type.to_string(), part_index))
 }
 
+/// Appends the `_since` / `_until` window to an export query and binds the
+/// bounds.
+///
+/// Both are inclusive, matching the S3 backend's `last_modified() < since` /
+/// `> until` skips. Every export query path uses this, so a job's count and its
+/// emitted rows cannot disagree about the window.
+///
+/// The placeholders are anonymous on purpose. SQLite gives each `?` one more
+/// than the highest index used so far, so a query that binds only the upper
+/// bound cannot mis-number it the way a hard-coded `?3` would.
+fn push_export_window(
+    query: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    request: &ExportRequest,
+) {
+    if let Some(since) = request.since {
+        query.push_str(" AND last_updated >= ?");
+        params.push(Box::new(since.to_rfc3339()));
+    }
+    if let Some(until) = request.until {
+        query.push_str(" AND last_updated <= ?");
+        params.push(Box::new(until.to_rfc3339()));
+    }
+}
+
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "sqlite".to_string(),
@@ -1094,11 +1119,7 @@ impl ExportDataProvider for SqliteBackend {
             Box::new(resource_type.to_string()),
         ];
 
-        // Apply _since filter if present
-        if let Some(since) = request.since {
-            query.push_str(" AND last_updated >= ?3");
-            params_vec.push(Box::new(since.to_rfc3339()));
-        }
+        push_export_window(&mut query, &mut params_vec, request);
 
         let params_slice: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
@@ -1127,11 +1148,7 @@ impl ExportDataProvider for SqliteBackend {
             Box::new(resource_type.to_string()),
         ];
 
-        // Apply _since filter if present
-        if let Some(since) = request.since {
-            query.push_str(" AND last_updated >= ?");
-            params_vec.push(Box::new(since.to_rfc3339()));
-        }
+        push_export_window(&mut query, &mut params_vec, request);
 
         // Apply cursor (keyset pagination)
         if let Some(cursor) = cursor {
@@ -1208,6 +1225,12 @@ impl PatientExportProvider for SqliteBackend {
         let mut query = "SELECT id FROM resources WHERE tenant_id = ?1 AND resource_type = 'Patient' AND is_deleted = 0".to_string();
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(tenant_id.to_string())];
 
+        // `_since` only, deliberately: this selects WHICH patients are in scope,
+        // not which of their resources are exported. Bounding it above by
+        // `_until` would drop a patient whose own record was touched after the
+        // window and take their in-window compartment resources with them. The
+        // Patient resource itself is still bounded, by the compartment fetch.
+        // S3 makes the same distinction (`backends/s3/bulk_export.rs:216`).
         if let Some(since) = request.since {
             query.push_str(" AND last_updated >= ?");
             params_vec.push(Box::new(since.to_rfc3339()));
@@ -1279,6 +1302,15 @@ impl PatientExportProvider for SqliteBackend {
             ];
             for id in patient_ids {
                 params_vec.push(Box::new(id.clone()));
+            }
+
+            // Upper bound only. This branch has never applied `_since` either —
+            // that gap is #658, which replaces both of these with
+            // `push_export_window`. Bind before the cursor so the anonymous
+            // placeholders stay in the order they were pushed.
+            if let Some(until) = request.until {
+                query.push_str(" AND last_updated <= ?");
+                params_vec.push(Box::new(until.to_rfc3339()));
             }
 
             if let Some(cursor) = cursor {
@@ -1357,10 +1389,7 @@ impl PatientExportProvider for SqliteBackend {
              WHERE tenant_id = ? AND resource_type = ? AND is_deleted = 0"
             .to_string();
 
-        if let Some(since) = request.since {
-            query.push_str(" AND last_updated >= ?");
-            params_vec.push(Box::new(since.to_rfc3339()));
-        }
+        push_export_window(&mut query, &mut params_vec, request);
 
         let placeholders: Vec<&str> = patient_refs.iter().map(|_| "?").collect();
         let in_list = placeholders.join(",");
@@ -2094,6 +2123,170 @@ mod tests {
 
         assert_eq!(batch2.lines.len(), 2);
         assert!(batch2.is_last);
+    }
+
+    /// Pins a stored resource's `last_updated` so a window test does not depend
+    /// on wall-clock timing.
+    fn pin_last_updated(backend: &SqliteBackend, id: &str, rfc3339: &str) {
+        let conn = backend.get_connection().unwrap();
+        conn.execute(
+            "UPDATE resources SET last_updated = ?1 WHERE id = ?2",
+            rusqlite::params![rfc3339, id],
+        )
+        .unwrap();
+    }
+
+    async fn seed_patient_at(backend: &SqliteBackend, tenant: &TenantContext, at: &str) -> String {
+        let stored = backend
+            .create(
+                tenant,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = stored.id().to_string();
+        pin_last_updated(backend, &id, at);
+        id
+    }
+
+    fn instant(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// `_until` excludes a resource modified after the bound — and the count
+    /// agrees with what the fetch emits, so a job's total cannot promise rows
+    /// the export never writes.
+    #[tokio::test]
+    async fn until_excludes_resources_modified_after_the_bound() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let early = seed_patient_at(&backend, &tenant, "2026-01-01T00:00:00+00:00").await;
+        let _late = seed_patient_at(&backend, &tenant, "2026-03-01T00:00:00+00:00").await;
+
+        let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+
+        let count = backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap();
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1, "count must apply the upper bound");
+        assert_eq!(batch.lines.len(), 1, "fetch must apply the upper bound");
+        assert_eq!(
+            count as usize,
+            batch.lines.len(),
+            "count and fetch must agree"
+        );
+        assert!(
+            batch.lines[0].contains(&early),
+            "the surviving row is the early one"
+        );
+    }
+
+    /// The bound is inclusive, matching S3's `last_modified() > until` skip: a
+    /// resource sitting exactly on `_until` is exported.
+    #[tokio::test]
+    async fn until_is_inclusive() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        seed_patient_at(&backend, &tenant, "2026-02-01T00:00:00+00:00").await;
+
+        let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "a resource exactly on the bound is included"
+        );
+    }
+
+    /// `_since` and `_until` together produce a bounded window: rows on either
+    /// side are dropped and only the middle one survives.
+    #[tokio::test]
+    async fn since_and_until_together_bound_the_window() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let _before = seed_patient_at(&backend, &tenant, "2025-12-01T00:00:00+00:00").await;
+        let inside = seed_patient_at(&backend, &tenant, "2026-01-15T00:00:00+00:00").await;
+        let _after = seed_patient_at(&backend, &tenant, "2026-03-01T00:00:00+00:00").await;
+
+        let request = ExportRequest::system()
+            .with_since(instant("2026-01-01T00:00:00Z"))
+            .with_until(instant("2026-02-01T00:00:00Z"));
+
+        let count = backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap();
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(batch.lines.len(), 1);
+        assert!(
+            batch.lines[0].contains(&inside),
+            "only the in-window row survives"
+        );
+    }
+
+    /// An unbounded request is unchanged by the window plumbing — the bound is
+    /// opt-in, so nothing regresses for callers that pass neither parameter.
+    #[tokio::test]
+    async fn no_bounds_exports_everything() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        seed_patient_at(&backend, &tenant, "2025-12-01T00:00:00+00:00").await;
+        seed_patient_at(&backend, &tenant, "2026-03-01T00:00:00+00:00").await;
+
+        let request = ExportRequest::system();
+        let count = backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    /// The patient-compartment path applies the bound too. Exercised through
+    /// the `Patient` branch, which builds its own query separate from
+    /// `fetch_export_batch`.
+    #[tokio::test]
+    async fn until_bounds_the_patient_compartment_fetch() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let early = seed_patient_at(&backend, &tenant, "2026-01-01T00:00:00+00:00").await;
+        let late = seed_patient_at(&backend, &tenant, "2026-03-01T00:00:00+00:00").await;
+
+        let request = ExportRequest::patient().with_until(instant("2026-02-01T00:00:00Z"));
+        let ids = vec![early.clone(), late.clone()];
+
+        let batch = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &ids, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "the compartment fetch applies the upper bound"
+        );
+        assert!(batch.lines[0].contains(&early));
     }
 
     #[tokio::test]

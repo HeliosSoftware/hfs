@@ -4275,3 +4275,151 @@ mod bulk_submit {
         );
     }
 }
+
+// ============================================================================
+// Bulk Export — the `_since` / `_until` window (#657).
+// ============================================================================
+
+/// Pins a stored resource's `last_updated` so a window test does not depend on
+/// wall-clock timing.
+async fn pin_last_updated(backend: &MongoBackend, id: &str, at: chrono::DateTime<chrono::Utc>) {
+    use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
+    let db = backend.get_database().await.unwrap();
+    let resources = db.collection::<Document>("resources");
+    resources
+        .update_one(
+            doc! { "id": id },
+            doc! { "$set": { "last_updated": BsonDateTime::from_millis(at.timestamp_millis()) } },
+        )
+        .await
+        .unwrap();
+}
+
+async fn seed_patient_at(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let stored = backend
+        .create(
+            tenant,
+            "Patient",
+            serde_json::json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let id = stored.id().to_string();
+    pin_last_updated(backend, &id, at).await;
+    id
+}
+
+fn instant(s: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+/// `_until` excludes a resource modified after the bound, and the count agrees
+/// with what the fetch emits.
+#[tokio::test]
+async fn mongodb_integration_export_until_bounds_count_and_fetch() {
+    use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
+
+    let Some(backend) = create_backend("export_until").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_until_bounds_count_and_fetch (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-until");
+
+    let early = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+    let _late = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+    let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+
+    let count = backend
+        .count_export_resources(&tenant, &request, "Patient")
+        .await
+        .unwrap();
+    let batch = backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(count, 1, "count must apply the upper bound");
+    assert_eq!(batch.lines.len(), 1, "fetch must apply the upper bound");
+    assert_eq!(
+        count as usize,
+        batch.lines.len(),
+        "count and fetch must agree about the window"
+    );
+    assert!(batch.lines[0].contains(&early));
+}
+
+/// `_since` and `_until` together bound the window at both ends.
+///
+/// This is the case that catches the document-shape trap: `last_updated` is one
+/// key, so writing the two bounds as two `insert`s would keep only the second.
+#[tokio::test]
+async fn mongodb_integration_export_since_and_until_bound_the_window() {
+    use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
+
+    let Some(backend) = create_backend("export_window").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_since_and_until_bound_the_window (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-window");
+
+    let _before = seed_patient_at(&backend, &tenant, instant("2025-12-01T00:00:00Z")).await;
+    let inside = seed_patient_at(&backend, &tenant, instant("2026-01-15T00:00:00Z")).await;
+    let _after = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+    let request = ExportRequest::system()
+        .with_since(instant("2026-01-01T00:00:00Z"))
+        .with_until(instant("2026-02-01T00:00:00Z"));
+
+    let count = backend
+        .count_export_resources(&tenant, &request, "Patient")
+        .await
+        .unwrap();
+    let batch = backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(count, 1, "both bounds must survive into one range document");
+    assert_eq!(batch.lines.len(), 1);
+    assert!(batch.lines[0].contains(&inside));
+}
+
+/// The bound is inclusive, matching S3.
+#[tokio::test]
+async fn mongodb_integration_export_until_is_inclusive() {
+    use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
+
+    let Some(backend) = create_backend("export_until_incl").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_until_is_inclusive (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-until-incl");
+
+    seed_patient_at(&backend, &tenant, instant("2026-02-01T00:00:00Z")).await;
+
+    let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+    let batch = backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        batch.lines.len(),
+        1,
+        "a resource exactly on the bound is included"
+    );
+}

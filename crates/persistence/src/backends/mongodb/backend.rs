@@ -519,7 +519,15 @@ impl MongoBackend {
     }
 
     /// Returns the configured MongoDB database handle.
-    pub(crate) async fn get_database(&self) -> StorageResult<Database> {
+    ///
+    /// `#[doc(hidden)] pub` rather than `pub(crate)` only so the out-of-crate
+    /// bulk-export window tests (`tests/mongodb_tests.rs`) can pin a stored
+    /// resource's `last_updated` and assert on `_since`/`_until` without
+    /// depending on wall-clock timing. It hands out a raw database handle that
+    /// bypasses tenant scoping, so it is not stable API — workspace callers
+    /// should use the `ResourceStorage`/`SearchProvider` methods instead.
+    #[doc(hidden)]
+    pub async fn get_database(&self) -> StorageResult<Database> {
         let client = self.get_client().await?;
         Ok(client.database(&self.config.database_name))
     }
