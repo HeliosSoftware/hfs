@@ -194,7 +194,6 @@ history-tab-instance = Instanz
 history-tab-type = Typ-Feed
 history-tab-system = System-Feed
 history-versions-label = Versionen
-history-pick-instance = Instanz wählen
 history-current = aktuell
 history-from = Von
 history-to = Bis

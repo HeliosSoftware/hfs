@@ -198,7 +198,6 @@ history-tab-instance = Instance
 history-tab-type = Type Feed
 history-tab-system = System Feed
 history-versions-label = Versions
-history-pick-instance = Pick an instance
 history-current = current
 history-from = From
 history-to = To

@@ -40,10 +40,10 @@
   <div class="history__split">
     <!-- Version rail: newest first, each with the interaction that produced it
          (create / update / patch), fetched from /{type}/{id}/_history. -->
-    <aside class="card history__rail" aria-label="{{ i18n.t("history-versions-label") }}">
+    <aside class="card history__rail" aria-labelledby="history-subject">
       <div class="history__rail-head">
         <span class="icon">{% include "icons/history.svg" %}</span>
-        <span id="history-subject">{{ i18n.t("history-pick-instance") }}</span>
+        <span id="history-subject">{{ i18n.t("history-versions-label") }}</span>
       </div>
       <div class="history__rail-path" id="history-path"></div>
       <div class="history__versions" id="history-versions"></div>
