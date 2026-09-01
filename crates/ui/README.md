@@ -19,9 +19,12 @@ partial page updates. Handlers return **full pages** on hard navigations and
 thin.
 
 **There is no React, Vue, Svelte, Alpine, or jQuery here — and no bundler, no
-npm dependency, and no build step for the browser code.** The only vendored
-third-party script is htmx itself; everything else under `assets/` is
-hand-written vanilla JS in an IIFE. Do not introduce a framework.
+npm dependency, and no build step for the browser code, with one narrow,
+documented exception** (see "Assets: vendored & embedded" below). Two
+third-party scripts are vendored: htmx, and — as a prebuilt, never-built-here
+bundle — CodeMirror 6, for the ViewDefinition editor (#753). Everything else
+under `assets/` is hand-written vanilla JS in an IIFE. Do not introduce a
+framework.
 
 Why, over a SPA + JSON API:
 
@@ -92,6 +95,29 @@ stale.
 
 To update htmx, replace `assets/htmx.min.js` with the new pinned release and
 note the version bump in the commit.
+
+### The one exception: a vendored, prebuilt bundle
+
+"No bundler" (above) is the default, not an absolute: a third-party script that
+is a real parser or grammar — not a widget — cannot reasonably be hand-written
+in the style every other asset in this crate uses. For that narrow case:
+
+> Third-party browser code may be vendored as a prebuilt single-file bundle produced by a
+> documented, checked-in, one-off script under `crates/ui/vendor/`; pinned versions and a
+> lockfile are committed alongside it; the script is never executed at build time or in CI;
+> the resulting bundle is never loaded from a CDN; and the bundle ships with its license
+> banner intact.
+
+CodeMirror 6 is the first, and so far only, case this applies to (#753):
+[`crates/ui/vendor/codemirror/`](vendor/codemirror/README.md) is the vendoring
+ritual (pinned npm dependencies, a committed lockfile, a rollup + terser recipe
+run by hand, never by `cargo build` or CI); its one output,
+[`assets/vendor/codemirror.bundle.js`](assets/vendor/codemirror.bundle.js), is
+the vendored bundle itself — embedded and served exactly like every other
+asset in this crate (above), nothing bundler-specific about how it ships. It
+backs the ViewDefinition editor on `/ui/sql/view-definitions`; see
+[`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
+for the full evaluation this amendment is drawn from.
 
 ### Client-side scripts
 
@@ -205,8 +231,10 @@ Errors follow one convention across the Fluent catalogs
   persistence or terminology logic here.
 - **No new browser-facing JSON API** to feed the UI. htmx consumes HTML
   fragments, not JSON.
-- **No SPA framework, no bundler, no npm dependency** for browser code. (The
-  `e2e/` directory has a `package.json`, but that is test-only and never ships.)
+- **No SPA framework, no bundler, no npm dependency** for browser code, with
+  one documented exception — see "Assets: vendored & embedded" above. (The
+  `e2e/` directory also has a `package.json`, but that is test-only and never
+  ships.)
 - **No inline `<script>` blobs or scattered JS.** Prefer `hx-*` attributes
   (Locality of Behaviour); where JS is truly needed, use small pinned assets.
   Inert `type="application/json"` data carriers are the one allowed exception,

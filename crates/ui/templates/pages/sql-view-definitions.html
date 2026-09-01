@@ -10,6 +10,14 @@
   buttons of one plain form (POST back to this route); Run is a plain link
   (?run=1); Delete rides conformance-crud.js like the other conformance
   viewers. Everything works without JavaScript.
+
+  #753 (evaluation POC, not merged): the JSON fold below still posts the
+  plain `<textarea name="json">`, but vd-editor.js progressively enhances it
+  into a CodeMirror 6 editor with JSON + FHIRPath highlighting, provided the
+  vendored bundle it depends on loaded first. The textarea stays in the DOM
+  as the form's real value and is what nojs, no-cdn, and every other
+  Playwright project see — without the bundle, without JS, or if the mount
+  fails, this page is unchanged.
 #}
 
 {% block title %}{{ i18n.t("sql-vd-title") }} — {{ i18n.t("app-title") }}{% endblock %}
@@ -156,4 +164,9 @@
 </div>
 
 <script src="/ui/assets/conformance-crud.js" defer></script>
+<!-- #753 evaluation POC: the CodeMirror 6 vendored bundle (ticket 01) must
+     load before vd-editor.js, which reads window.HfsCodeMirror at the top
+     of its IIFE. Loaded only on this page. -->
+<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
+<script src="/ui/assets/vd-editor.js" defer></script>
 {% endblock %}
