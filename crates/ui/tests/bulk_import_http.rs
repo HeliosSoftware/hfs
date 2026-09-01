@@ -598,6 +598,31 @@ async fn abort_sends_a_status_only_kickoff() {
     assert_eq!(status_code, "stopped");
 }
 
+/// #850: "Mark completed" is the Data Provider's closing signal — without it
+/// the recipient keeps the submission open and its concurrency slot held.
+#[tokio::test]
+async fn complete_sends_a_status_only_kickoff() {
+    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let ctx = ctx(&recipient_url);
+
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "in-progress").await;
+    post_form(&ctx, &format!("{detail_path}/complete"), "").await;
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains("Completed"), "{html}");
+    assert!(html.contains("Recipient acknowledged (200)"), "{html}");
+
+    let bodies = received.lock().unwrap().clone();
+    let params = bodies.last().unwrap()["parameter"].as_array().unwrap();
+    assert!(params.iter().all(|p| p["name"] != "manifestUrl"));
+    let status_code = params
+        .iter()
+        .find(|p| p["name"] == "submissionStatus")
+        .and_then(|p| p["valueCoding"]["code"].as_str())
+        .unwrap();
+    assert_eq!(status_code, "completed");
+}
+
 #[tokio::test]
 async fn a_rejected_status_change_keeps_the_status_and_logs_it() {
     let (recipient_url, _) = mock_recipient(StatusCode::CONFLICT).await;
@@ -1183,6 +1208,10 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert!(
         html.contains(&format!(r#"action="{detail_path}/abort""#)),
         "abort on the progress card: {html}"
+    );
+    assert!(
+        html.contains(&format!(r#"action="{detail_path}/complete""#)),
+        "mark-completed on the progress card: {html}"
     );
     assert!(!html.contains(r#"class="card detail""#));
 

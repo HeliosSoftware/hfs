@@ -1076,6 +1076,19 @@ pub async fn abort(
     set_status(state, rt, _principal, id, "stopped").await
 }
 
+/// `POST /ui/bulk-import/{id}/complete` — status-only kick-off, `completed`:
+/// the Data Provider's signal that no further manifests are coming. The
+/// recipient keeps draining already-registered manifests and frees the
+/// submission's concurrency slot (#850).
+pub async fn complete(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    _principal: Option<Extension<helios_auth::Principal>>,
+    Path(id): Path<String>,
+) -> Response {
+    set_status(state, rt, _principal, id, "completed").await
+}
+
 async fn set_status(
     state: WebState,
     rt: RequestTenant,

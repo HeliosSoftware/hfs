@@ -1297,6 +1297,10 @@ pub fn mount_with_conformance_source_and_runtime(
             "/ui/bulk-import/{id}/abort",
             axum::routing::post(bulk_import::abort),
         )
+        .route(
+            "/ui/bulk-import/{id}/complete",
+            axum::routing::post(bulk_import::complete),
+        )
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
