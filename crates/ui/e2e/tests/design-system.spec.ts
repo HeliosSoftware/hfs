@@ -282,7 +282,7 @@ test("shared query-builder actions stay 30px while their inputs keep the field s
   }
 });
 
-test("shared back links match the Figma geometry on both consumers", async ({
+test("shared back links match the Figma geometry on every consumer", async ({
   page,
   request,
 }) => {
@@ -334,7 +334,7 @@ test("shared back links match the Figma geometry on both consumers", async ({
   // copy column simply spans. The shared link geometry still binds both.
   const consumers = [
     { name: "bulk import detail", route: await seedBulkImportDetail(request), hasAction: false },
-    { name: "active bulk exports", route: "/ui/bulk-export/active", hasAction: true },
+    { name: "new bulk export", route: "/ui/bulk-export/new", hasAction: false },
   ];
   for (const theme of ["light", "dark"] as const) {
     await page.goto("/ui");
