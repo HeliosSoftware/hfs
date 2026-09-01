@@ -5,9 +5,15 @@
 {% block breadcrumb %}{% endblock %}
 
 {% block content %}
-<header class="page-head">
-  <h1 class="page-head__title">{{ i18n.t("bulk-export-title") }}</h1>
-  <p class="page-head__lede">{{ i18n.t("bulk-export-lede") }}</p>
+<header class="page-head page-head--back-link">
+  <a class="back-link" href="/ui/bulk-export">
+    <span aria-hidden="true">{% include "icons/chevron-left.svg" %}</span>
+    <span>{{ i18n.t("bulk-export-active-title") }}</span>
+  </a>
+  <div class="page-head__copy">
+    <h1 class="page-head__title">{{ i18n.t("bulk-export-title") }}</h1>
+    <p class="page-head__lede">{{ i18n.t("bulk-export-lede") }}</p>
+  </div>
 </header>
 
 {% if !available %}
@@ -112,11 +118,6 @@
   </section>
 
   <div class="form-actions">
-    <a class="btn" href="/ui/bulk-export/active">
-      <span class="icon">{% include "icons/history.svg" %}</span>
-      {{ i18n.t("bulk-export-active-link") }}
-      <span class="toolbar__count">{{ active_count }}</span>
-    </a>
     <button type="submit" class="btn btn--primary">
       <span class="icon">{% include "icons/export.svg" %}</span>
       {{ i18n.t("bulk-export-start") }}
