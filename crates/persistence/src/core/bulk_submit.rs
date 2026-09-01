@@ -289,6 +289,14 @@ pub struct SubmissionManifest {
     /// stall signal the status poll surfaces (#646).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_expiry: Option<DateTime<Utc>>,
+    /// Bytes consumed so far across the manifest's files — the status
+    /// endpoint's real percentage while a file streams in.
+    #[serde(default)]
+    pub bytes_processed: u64,
+    /// Summed advertised size of the files opened so far; `0` when no file
+    /// carried a length, which degrades the status to count-only progress.
+    #[serde(default)]
+    pub bytes_total: u64,
 }
 
 impl SubmissionManifest {
@@ -304,6 +312,8 @@ impl SubmissionManifest {
             processed_entries: 0,
             failed_entries: 0,
             lease_expiry: None,
+            bytes_processed: 0,
+            bytes_total: 0,
         }
     }
 

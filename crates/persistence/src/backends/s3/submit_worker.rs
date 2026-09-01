@@ -670,6 +670,19 @@ impl SubmitWorkerStorage for S3Backend {
         .await
     }
 
+    async fn update_manifest_bytes(
+        &self,
+        lease: &ManifestLease,
+        bytes_processed: u64,
+        bytes_total: u64,
+    ) -> Result<(), LeaseError> {
+        self.fenced_mutate(lease, |state| {
+            state.manifest.bytes_processed = bytes_processed;
+            state.manifest.bytes_total = bytes_total;
+        })
+        .await
+    }
+
     async fn record_submit_file(
         &self,
         lease: &ManifestLease,

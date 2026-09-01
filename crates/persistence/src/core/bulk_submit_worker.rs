@@ -223,6 +223,17 @@ pub trait SubmitWorkerStorage: Send + Sync {
         last_processed_line: u64,
     ) -> Result<(), LeaseError>;
 
+    /// Idempotent update of the manifest's byte progress — bytes consumed so
+    /// far across its files, and the summed advertised size of the files
+    /// opened so far (both monotonic within a run). What the status
+    /// endpoint's percentage is computed from. Fenced.
+    async fn update_manifest_bytes(
+        &self,
+        lease: &ManifestLease,
+        bytes_processed: u64,
+        bytes_total: u64,
+    ) -> Result<(), LeaseError>;
+
     /// Idempotent upsert of a finalized status-manifest artifact row. Fenced.
     async fn record_submit_file(
         &self,
@@ -373,6 +384,55 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     worker_id: WorkerId,
 }
 
+/// Byte-level ingest progress shared between the streaming reader, the
+/// [`LeaseKeeper`] (which flushes it on every heartbeat), and `run_job`.
+#[derive(Clone, Default)]
+struct ByteProgress {
+    /// Bytes the ingestion engine has consumed across the manifest's files.
+    consumed: Arc<std::sync::atomic::AtomicU64>,
+    /// Summed advertised size of the files opened so far; stays `0` unless
+    /// every opened file carried a length, so a partial total never inflates
+    /// the percentage.
+    total: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// A pass-through [`AsyncBufRead`] that adds every consumed byte to a shared
+/// counter — the live half of the status endpoint's percentage.
+struct CountingReader {
+    inner: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+    consumed: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl tokio::io::AsyncRead for CountingReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            let read = buf.filled().len() - before;
+            self.consumed.fetch_add(read as u64, Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl tokio::io::AsyncBufRead for CountingReader {
+    fn poll_fill_buf(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<&[u8]>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_fill_buf(cx)
+    }
+
+    fn consume(mut self: std::pin::Pin<&mut Self>, amt: usize) {
+        self.consumed.fetch_add(amt as u64, Ordering::Relaxed);
+        std::pin::Pin::new(&mut self.inner).consume(amt);
+    }
+}
+
 /// Renews a [`ManifestLease`] from a dedicated task for as long as it is alive.
 ///
 /// The renewal must not share a future with the ingestion: a fast local stream
@@ -383,6 +443,11 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
 /// idempotently. A separately spawned task renews on schedule no matter how the
 /// ingest future behaves.
 ///
+/// The keeper's task also flushes the shared byte progress every few seconds
+/// — a status poll must see the bar move *while* a large file streams, not
+/// once per lease renewal. The flush is a fenced best-effort write; the
+/// heartbeat alone decides lease health.
+///
 /// Dropping the keeper stops the renewal task.
 struct LeaseKeeper {
     lost: Arc<AtomicBool>,
@@ -390,20 +455,35 @@ struct LeaseKeeper {
 }
 
 impl LeaseKeeper {
-    fn spawn<Js>(jobs: Arc<Js>, lease: ManifestLease) -> Self
+    fn spawn<Js>(jobs: Arc<Js>, lease: ManifestLease, progress: ByteProgress) -> Self
     where
         Js: BulkSubmitJobStore + ?Sized + 'static,
     {
+        const FLUSH_EVERY: Duration = Duration::from_secs(3);
         let lost = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&lost);
         let handle = tokio::spawn(async move {
             let mut expiry = lease.lease_expiry;
+            let mut last_flushed: u64 = 0;
             loop {
                 let remaining = (expiry - Utc::now())
                     .to_std()
                     .unwrap_or(Duration::from_secs(1));
                 let wait = (remaining / 3).clamp(Duration::from_secs(1), Duration::from_secs(60));
-                tokio::time::sleep(wait).await;
+                let heartbeat_at = tokio::time::Instant::now() + wait;
+                loop {
+                    let now = tokio::time::Instant::now();
+                    if now >= heartbeat_at {
+                        break;
+                    }
+                    tokio::time::sleep(FLUSH_EVERY.min(heartbeat_at - now)).await;
+                    let total = progress.total.load(Ordering::Relaxed);
+                    let consumed = progress.consumed.load(Ordering::Relaxed);
+                    if total > 0 && consumed != last_flushed {
+                        last_flushed = consumed;
+                        let _ = jobs.update_manifest_bytes(&lease, consumed, total).await;
+                    }
+                }
                 match jobs.heartbeat(&lease).await {
                     Ok(new_expiry) => expiry = new_expiry,
                     Err(LeaseError::LeaseLost { .. }) => {
@@ -514,7 +594,12 @@ where
         // The lease must stay heartbeated *through* a file, not only between
         // files, and independently of how often the ingest future yields; the
         // keeper renews from its own task until dropped.
-        let keeper = LeaseKeeper::spawn(Arc::clone(&self.jobs), lease.clone());
+        let progress = ByteProgress::default();
+        // Percentages need every file's size; one sizeless file (e.g. a
+        // gzip-decompressed stream) poisons the total for the whole manifest
+        // and the status endpoint falls back to manifest-count progress.
+        let mut totals_known = true;
+        let keeper = LeaseKeeper::spawn(Arc::clone(&self.jobs), lease.clone(), progress.clone());
 
         // 2. Ingest each output file via the existing streaming engine.
         for file in &manifest.output {
@@ -525,7 +610,7 @@ where
                 .resource_type
                 .clone()
                 .unwrap_or_else(|| "Resource".into());
-            let stream = match self
+            let (stream, file_bytes_total) = match self
                 .fetcher
                 .open_file_stream(
                     &file.url,
@@ -548,6 +633,21 @@ where
                     continue;
                 }
             };
+            match file_bytes_total {
+                Some(len) if totals_known => {
+                    progress.total.fetch_add(len, Ordering::Relaxed);
+                }
+                Some(_) => {}
+                None => {
+                    totals_known = false;
+                    progress.total.store(0, Ordering::Relaxed);
+                }
+            }
+            let stream: Box<dyn tokio::io::AsyncBufRead + Send + Unpin> =
+                Box::new(CountingReader {
+                    inner: stream,
+                    consumed: Arc::clone(&progress.consumed),
+                });
 
             // Per-file options: the file url is part of every entry result's
             // identity, since line numbers restart in each file (#457).
@@ -586,6 +686,13 @@ where
             {
                 return Err(e);
             }
+            let total = progress.total.load(Ordering::Relaxed);
+            if total > 0 {
+                let _ = self
+                    .jobs
+                    .update_manifest_bytes(&lease, progress.consumed.load(Ordering::Relaxed), total)
+                    .await;
+            }
         }
 
         // 2b. Process `deleted` files — transaction Bundles / resource refs to remove.
@@ -605,7 +712,7 @@ where
                 )
                 .await
             {
-                Ok(reader) => {
+                Ok((reader, _)) => {
                     self.process_deleted_stream(&lease, reader, &mut deleted_refs)
                         .await;
                 }
@@ -1021,11 +1128,13 @@ mod tests {
             _requires_access_token: bool,
             _oauth: &[String],
             _encryption_key: Option<&Value>,
-        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
             let data = self.files.get(url).cloned().unwrap_or_default();
-            Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
-                data,
-            ))))
+            let len = data.len() as u64;
+            Ok((
+                Box::new(tokio::io::BufReader::new(std::io::Cursor::new(data))),
+                Some(len),
+            ))
         }
     }
 
@@ -1111,6 +1220,10 @@ mod tests {
             crate::core::bulk_submit::ManifestStatus::Completed
         );
 
+        // Byte progress reached the file's full advertised size.
+        assert_eq!(manifests[0].bytes_total, ndjson.len() as u64);
+        assert_eq!(manifests[0].bytes_processed, ndjson.len() as u64);
+
         // An `output` artifact for Patient was recorded.
         let files = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
         assert!(
@@ -1146,10 +1259,11 @@ mod tests {
             _r: bool,
             _o: &[String],
             _k: Option<&Value>,
-        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
-            Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
-                Vec::new(),
-            ))))
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            Ok((
+                Box::new(tokio::io::BufReader::new(std::io::Cursor::new(Vec::new()))),
+                Some(0),
+            ))
         }
     }
 

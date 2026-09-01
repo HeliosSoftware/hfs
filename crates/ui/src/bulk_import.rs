@@ -1170,13 +1170,13 @@ pub async fn status_fragment(
 }
 
 /// The determinate share of the recipient's `X-Progress`, when it reports
-/// one. The percentage is manifest-granular, so a one-shot submission reads
-/// `0%` for its whole run — that renders as an indeterminate bar rather than
-/// a permanently empty one.
+/// one. `0%` counts: HFS reports byte-level progress, so an early zero is a
+/// bar about to fill, not a percentage that never moves — the indeterminate
+/// sweep is reserved for recipients that report no percentage at all.
 fn progress_percent(progress: &str) -> Option<u8> {
     let rest = progress.strip_prefix("processing ")?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    let pct: u8 = digits.parse().ok().filter(|p| *p > 0 && *p <= 100)?;
+    let pct: u8 = digits.parse().ok().filter(|p| *p <= 100)?;
     Some(pct)
 }
 

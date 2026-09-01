@@ -474,6 +474,8 @@ impl BulkSubmitProvider for SqliteBackend {
             processed_entries: 0,
             failed_entries: 0,
             lease_expiry: None,
+            bytes_processed: 0,
+            bytes_total: 0,
         })
     }
 
@@ -487,7 +489,7 @@ impl BulkSubmitProvider for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
 
         let result = conn.query_row(
-            "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry
+            "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total
              FROM bulk_manifests
              WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
             params![tenant_id, &submission_id.submitter, &submission_id.submission_id, manifest_id],
@@ -501,6 +503,8 @@ impl BulkSubmitProvider for SqliteBackend {
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             },
         );
@@ -515,6 +519,8 @@ impl BulkSubmitProvider for SqliteBackend {
                 processed,
                 failed,
                 lease_expiry,
+                bytes_processed,
+                bytes_total,
             )) => {
                 let status: ManifestStatus = status_str.parse().map_err(|_| {
                     internal_error(format!("Invalid manifest status: {}", status_str))
@@ -533,6 +539,8 @@ impl BulkSubmitProvider for SqliteBackend {
                     total_entries: total as u64,
                     processed_entries: processed as u64,
                     failed_entries: failed as u64,
+                    bytes_processed: bytes_processed.max(0) as u64,
+                    bytes_total: bytes_total.max(0) as u64,
                     lease_expiry: lease_expiry.and_then(|s| {
                         chrono::DateTime::parse_from_rfc3339(&s)
                             .ok()
@@ -1598,6 +1606,38 @@ impl SubmitWorkerStorage for SqliteBackend {
                 ],
             )
             .map_err(|e| LeaseError::Storage(internal_error(format!("update progress: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn update_manifest_bytes(
+        &self,
+        lease: &ManifestLease,
+        bytes_processed: u64,
+        bytes_total: u64,
+    ) -> Result<(), LeaseError> {
+        let conn = self.get_connection().map_err(LeaseError::Storage)?;
+        let affected = conn
+            .execute(
+                "UPDATE bulk_manifests
+                 SET bytes_processed = ?1, bytes_total = ?2
+                 WHERE tenant_id = ?3 AND submitter = ?4 AND submission_id = ?5
+                   AND manifest_id = ?6 AND worker_id = ?7 AND fencing_token = ?8",
+                params![
+                    bytes_processed as i64,
+                    bytes_total as i64,
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .map_err(|e| LeaseError::Storage(internal_error(format!("update bytes: {e}"))))?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {

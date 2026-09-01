@@ -505,6 +505,8 @@ impl BulkSubmitProvider for PostgresBackend {
             processed_entries: 0,
             failed_entries: 0,
             lease_expiry: None,
+            bytes_processed: 0,
+            bytes_total: 0,
         })
     }
 
@@ -519,7 +521,7 @@ impl BulkSubmitProvider for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry
+                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total
                  FROM bulk_manifests
                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
                 &[
@@ -545,6 +547,8 @@ impl BulkSubmitProvider for PostgresBackend {
         let processed: i32 = row.get(5);
         let failed: i32 = row.get(6);
         let lease_expiry: Option<chrono::DateTime<Utc>> = row.get(7);
+        let bytes_processed: i64 = row.get(8);
+        let bytes_total: i64 = row.get(9);
 
         let status: ManifestStatus = status_str
             .parse()
@@ -560,6 +564,8 @@ impl BulkSubmitProvider for PostgresBackend {
             processed_entries: processed as u64,
             failed_entries: failed as u64,
             lease_expiry,
+            bytes_processed: bytes_processed.max(0) as u64,
+            bytes_total: bytes_total.max(0) as u64,
         }))
     }
 
@@ -1527,6 +1533,39 @@ impl SubmitWorkerStorage for PostgresBackend {
             )
             .await
             .map_err(|e| LeaseError::Storage(internal_error(format!("update progress: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn update_manifest_bytes(
+        &self,
+        lease: &ManifestLease,
+        bytes_processed: u64,
+        bytes_total: u64,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "UPDATE bulk_manifests
+                 SET bytes_processed = $1, bytes_total = $2
+                 WHERE tenant_id = $3 AND submitter = $4 AND submission_id = $5
+                   AND manifest_id = $6 AND worker_id = $7 AND fencing_token = $8",
+                &[
+                    &(bytes_processed as i64),
+                    &(bytes_total as i64),
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("update bytes: {e}"))))?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {

@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 17;
+pub const SCHEMA_VERSION: i32 = 18;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -298,6 +298,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             14 => migrate_v14_to_v15(conn)?,
             15 => migrate_v15_to_v16(conn)?,
             16 => migrate_v16_to_v17(conn)?,
+            17 => migrate_v17_to_v18(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1385,6 +1386,20 @@ fn migrate_v16_to_v17(conn: &Connection) -> StorageResult<()> {
         [],
     )
     .map_err(|e| migration_err(format!("create bulk_provider_submissions table: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 17 to version 18: byte-level ingest
+/// progress on manifests, so the status endpoint can report a real
+/// percentage while a file streams in.
+fn migrate_v17_to_v18(conn: &Connection) -> StorageResult<()> {
+    for sql in [
+        "ALTER TABLE bulk_manifests ADD COLUMN bytes_processed INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_manifests ADD COLUMN bytes_total INTEGER NOT NULL DEFAULT 0",
+    ] {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("add manifest byte columns: {e}")))?;
+    }
     Ok(())
 }
 

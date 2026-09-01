@@ -202,6 +202,8 @@ fn decode_manifest(doc: &Document) -> StorageResult<SubmissionManifest> {
         total_entries: doc.get_i64("total_entries").unwrap_or(0).max(0) as u64,
         processed_entries: doc.get_i64("processed_entries").unwrap_or(0).max(0) as u64,
         failed_entries: doc.get_i64("failed_entries").unwrap_or(0).max(0) as u64,
+        bytes_processed: doc.get_i64("bytes_processed").unwrap_or(0).max(0) as u64,
+        bytes_total: doc.get_i64("bytes_total").unwrap_or(0).max(0) as u64,
     })
 }
 
@@ -769,6 +771,8 @@ impl BulkSubmitProvider for MongoBackend {
             processed_entries: 0,
             failed_entries: 0,
             lease_expiry: None,
+            bytes_processed: 0,
+            bytes_total: 0,
         };
 
         let mut document = manifest_filter(tenant, submission_id, &manifest.manifest_id);
@@ -784,6 +788,8 @@ impl BulkSubmitProvider for MongoBackend {
         document.insert("failed_entries", 0_i64);
         document.insert("fencing_token", 0_i64);
         document.insert("last_processed_line", 0_i64);
+        document.insert("bytes_processed", 0_i64);
+        document.insert("bytes_total", 0_i64);
 
         self.manifests()
             .await?
@@ -1342,6 +1348,22 @@ impl SubmitWorkerStorage for MongoBackend {
                 "processed_entries": processed_entries as i64,
                 "failed_entries": failed_entries as i64,
                 "last_processed_line": last_processed_line as i64,
+            }},
+        )
+        .await
+    }
+
+    async fn update_manifest_bytes(
+        &self,
+        lease: &ManifestLease,
+        bytes_processed: u64,
+        bytes_total: u64,
+    ) -> Result<(), LeaseError> {
+        self.fenced_update(
+            lease,
+            doc! { "$set": {
+                "bytes_processed": bytes_processed as i64,
+                "bytes_total": bytes_total as i64,
             }},
         )
         .await

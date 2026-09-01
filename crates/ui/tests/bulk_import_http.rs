@@ -1169,12 +1169,14 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
 
     // First status fetch: one poll happens -> 202 progress recorded, the
     // fragment keeps polling, and the in-progress card offers Abort. A 0%
-    // report renders the indeterminate bar (manifest-granular percentages
-    // sit at 0 for a one-shot submission's whole run).
+    // report renders a determinate bar at zero — the recipient's percentage
+    // is byte-based now, so an early zero fills within seconds instead of
+    // sweeping indeterminately for the whole run.
     let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("processing 0% complete"), "{html}");
-    assert!(html.contains("progress-track--indeterminate"), "{html}");
+    assert!(html.contains(r#"aria-valuenow="0""#), "{html}");
+    assert!(!html.contains("progress-track--indeterminate"), "{html}");
     assert!(html.contains("every 5s"), "keeps polling: {html}");
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
     assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
