@@ -352,6 +352,35 @@ async fn embedded_assets_are_served() {
     }
 }
 
+/// #753 ticket 01: the vendored CodeMirror 6 + lezer-fhirpath bundle is
+/// served like every other embedded asset — same route shape, same
+/// JavaScript content type — with no change to how assets are declared or
+/// served (rust-embed already walks subfolders; `assets/fonts/` is the
+/// existing precedent for `assets/vendor/`).
+#[tokio::test]
+async fn codemirror_vendor_bundle_is_served() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/vendor/codemirror.bundle.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .expect("content-type header present")
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.contains("javascript"),
+        "expected a JavaScript content-type, got {content_type}"
+    );
+}
+
 #[tokio::test]
 async fn non_ui_paths_fall_through_to_the_fhir_app() {
     // Stand-in for the FHIR REST router: proves /ui never shadows it.
@@ -2167,6 +2196,143 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     assert!(html.contains("getResourceKey()"));
 }
 
+/// #753 ticket 02: the CodeMirror 6 bundle (ticket 01) and vd-editor.js load,
+/// in that order, only on the ViewDefinition page — vd-editor.js reads
+/// `window.HfsCodeMirror` at the top of its IIFE, so the bundle must be
+/// first. No other page (checked here: the dashboard and the Resource
+/// Editor) mentions either script.
+#[tokio::test]
+async fn vd_editor_scripts_load_only_on_the_view_definitions_page() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>"#)
+    );
+    assert!(html.contains(r#"<script src="/ui/assets/vd-editor.js" defer></script>"#));
+    assert!(
+        html.find("/ui/assets/vendor/codemirror.bundle.js") < html.find("/ui/assets/vd-editor.js"),
+        "the CodeMirror bundle must load before vd-editor.js"
+    );
+
+    for other in ["/ui", "/ui/editor?type=Patient&id=abc"] {
+        let response = app()
+            .oneshot(Request::get(other).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{other}");
+        let html = body_text(response).await;
+        assert!(
+            !html.contains("/ui/assets/vendor/codemirror.bundle.js"),
+            "{other} must not load the CodeMirror bundle"
+        );
+        assert!(
+            !html.contains("/ui/assets/vd-editor.js"),
+            "{other} must not load vd-editor.js"
+        );
+    }
+}
+
+/// #753 ticket 03: `POST /ui/sql/view-definitions/lint` is the CodeMirror
+/// linter's server call — plain JSON in, `{"diagnostics": [...]}` out, no
+/// htmx swap (the precedent is `/ui/editor/expand`). The rule logic itself
+/// belongs to `helios_sof::lint`; this only checks the handler's own
+/// contract: status codes, the JSON envelope, and the kebab-case/`span`
+/// serialization shape the browser depends on.
+#[tokio::test]
+async fn view_definitions_lint_returns_diagnostics_for_an_invalid_document() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "select": [{
+            "column": [{ "name": "id", "path": "getResourceKey(" }]
+        }],
+        "notAField": "oops"
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    assert!(diagnostics.len() >= 2, "{diagnostics:?}");
+
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for notAField");
+    assert_eq!(unknown_key["pointer"], "/notAField");
+    assert_eq!(unknown_key["severity"], "error");
+    assert!(unknown_key["span"].is_null());
+
+    let syntax = diagnostics
+        .iter()
+        .find(|d| d["code"] == "fhirpath-syntax")
+        .expect("a fhirpath-syntax diagnostic for the unclosed call");
+    assert_eq!(syntax["pointer"], "/select/0/column/0/path");
+    assert_eq!(syntax["severity"], "error");
+    assert!(syntax["span"].is_object());
+    assert!(syntax["span"]["start"].is_u64());
+    assert!(syntax["span"]["end"].is_u64());
+}
+
+#[tokio::test]
+async fn view_definitions_lint_returns_no_diagnostics_for_a_valid_document() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "column": [{ "name": "id", "path": "getResourceKey()" }]
+        }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["diagnostics"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn view_definitions_lint_rejects_a_non_json_body() {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let error = body["error"].as_str().expect("error message");
+    assert!(error.starts_with("invalid JSON: "), "{error}");
+}
+
 /// #649: Save is a plain form post — a valid document redirects to the stored
 /// view, a broken one re-renders with the submitted text preserved so nothing
 /// typed is lost.
@@ -2508,4 +2674,88 @@ async fn user_menu_carries_language_and_the_signed_out_state() {
     assert!(html.contains("Anonymous user"));
     assert!(html.contains("Authentication is disabled"));
     assert!(!html.contains("/ui/logout"));
+}
+
+/// The rendered bytes of the account menu, pinned.
+///
+/// `tests/golden/user-menu-en.html` was captured from the **pristine tree**, in
+/// `42974c22a`, before #799 lifted the block out of
+/// `crates/ui/templates/layouts/base.html` into `crates/ui-chrome`. So a green
+/// here is the proof that the extraction changed nothing: what `/ui` serves
+/// today is byte-identical to what it served when the markup was still inline.
+///
+/// Checked in with `text eol=lf` (see `.gitattributes`), and `body_text`
+/// normalizes the response the same way, so this holds on a Windows checkout
+/// too (#671).
+#[tokio::test]
+async fn user_menu_fragment_is_stable() {
+    const GOLDEN: &str = include_str!("golden/user-menu-en.html");
+
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(
+        html.contains(GOLDEN),
+        "the account menu's rendered bytes moved.\n\n\
+         This fragment is no longer HFS's alone: since #799 it is produced by \
+         `helios-ui-chrome` and spliced into *both* products' topbars, so \
+         whatever drifted here has already shipped to HTS as well. Do not \
+         re-record the golden to make this green — first decide whether the \
+         change was intended for both UIs. If it was, update \
+         `crates/ui-chrome`, re-capture `tests/golden/user-menu-en.html` from \
+         the rendered page, and say so in the commit.\n\n\
+         Expected to find:\n{GOLDEN}",
+    );
+}
+
+/// The page's account menu *is* the shared component's output — not a
+/// look-alike.
+///
+/// Rendering `helios_ui_chrome::user_menu` here and demanding the page contain
+/// it verbatim is stricter than the golden: the golden would still pass if a
+/// future edit re-inlined equivalent markup into the layout and left the shared
+/// crate unused.
+///
+/// Its twin lives in `crates/hts-ui/tests/chrome_parity.rs` (Track G) and
+/// asserts the same function's output against the HTS page. Neither test knows
+/// about the other crate, yet together they are a transitive byte-identity
+/// proof — HFS == `user_menu(..)` == HTS — with no cross-crate dev-dependency
+/// and no second golden to keep in sync.
+#[tokio::test]
+async fn the_account_menu_is_the_shared_component_verbatim() {
+    // `RequestLocale::default()` is `en`, which is also what `/ui` negotiates
+    // for a request carrying no `?lang=`, cookie, or `Accept-Language`.
+    let i18n = helios_ui::I18n::new(helios_ui::RequestLocale::default());
+    // The signed-out shape (#320): `can_logout` defaults to false, so the
+    // Sign out row does not render and `logout_href` is inert — it is spelled
+    // out because it is what `Status::user_menu` passes in production.
+    let expected = helios_ui_chrome::user_menu(
+        &i18n,
+        helios_ui_chrome::UserIdentity {
+            logout_href: "/ui/logout",
+            ..Default::default()
+        },
+    )
+    .expect("the shared user-menu template has no fallible construct")
+    .replace("\r\n", "\n");
+
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(
+        html.contains(&expected),
+        "the /ui topbar does not contain `helios_ui_chrome::user_menu(..)` \
+         verbatim — the account menu has been re-inlined into \
+         `crates/ui/templates/layouts/base.html`, or the layout is passing a \
+         different `UserIdentity` than the signed-out one.\n\n\
+         Expected to find:\n{expected}",
+    );
 }

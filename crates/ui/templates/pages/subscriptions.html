@@ -97,7 +97,16 @@
             <span class="status-dot status-dot--muted" aria-hidden="true"></span>{{ i18n.t("subs-state-off") }}
             {% endif %}
           </td>
-          <td class="col-num">{{ row.last24 }}</td>
+          <td class="col-num">
+            {% if !row.spark_points.is_empty() %}
+            <svg class="spark spark--{{ row.state }}" viewBox="0 0 120 24" role="img" aria-label="{{ row.last24 }}">
+              <title>{{ row.last24 }}</title>
+              <polyline class="spark__line" points="{{ row.spark_points }}"></polyline>
+            </svg>
+            {% else %}
+            {{ row.last24 }}
+            {% endif %}
+          </td>
           <td class="col-num">{{ row.sent }}</td>
           <td class="col-num">{{ row.streak }}</td>
         </tr>

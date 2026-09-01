@@ -27,6 +27,39 @@ test("the rail filter narrows the visible types", async ({ resources }) => {
   await expect(resources.railItem("Patient")).toBeVisible();
 });
 
+test("a clipped rail name keeps its shared hover and focus tooltip", async ({
+  resources,
+  page,
+}) => {
+  const resourceType = "MedicinalProductContraindication";
+  await resources.goto(resourceType);
+  const item = resources.railItem(resourceType);
+  const label = item.locator(".filter-rail__label");
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  // The default desktop rail currently has enough room for every R4 type.
+  // Constrain this representative item so the shared clipped-name path is
+  // exercised independently of production layout widths.
+  await item.evaluate((element) => {
+    element.style.width = "160px";
+  });
+  expect(await label.evaluate((element) => element.scrollWidth > element.clientWidth + 1)).toBe(
+    true,
+  );
+  await label.hover();
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(resourceType);
+
+  await page.mouse.move(0, 0);
+  await item.focus();
+  await expect(item).toHaveAttribute("aria-describedby", "filter-rail-tooltip");
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(resourceType);
+
+  await resources.railItem("Patient").focus();
+  await expect(item).not.toHaveAttribute("aria-describedby", /.+/);
+});
+
 // Picking a type updates the URL (and back navigates) without a full reload —
 // the click handler is an enhancement over the rail's real <a href> (#541).
 test("picking a rail type updates the URL and back navigates", async ({ resources, page }) => {
@@ -356,6 +389,7 @@ test("create eligibility follows the effective FHIR version", async ({ resources
 // on a fresh load.
 test("picking rail types repaints the recently-used group in MRU order, capped at five, deduplicated, with live counts", async ({
   resources,
+  page,
 }) => {
   await resources.goto("Patient");
   await resources.pickType("Account");
@@ -388,6 +422,27 @@ test("picking rail types repaints the recently-used group in MRU order, capped a
     const recentCount = await resources.recentItem(type).locator(".count").textContent();
     expect(recentCount).toBe(listCount);
   }
+
+  // #785: both group headings sit the same distance above their first item.
+  // The list scrolls the selected type into view, so measure from the top.
+  await page.evaluate(() => {
+    document.querySelector("#type-rail-list")!.scrollTop = 0;
+    document.querySelector(".filter-rail")!.scrollTop = 0;
+  });
+  const gapBelow = async (heading: import("@playwright/test").Locator, item: import("@playwright/test").Locator) => {
+    const h = await heading.boundingBox();
+    const i = await item.boundingBox();
+    return i!.y - (h!.y + h!.height);
+  };
+  const recentGap = await gapBelow(
+    resources.recentGroup.locator(".filter-rail__heading--group"),
+    resources.recentGroup.locator("a.filter-rail__item").first(),
+  );
+  const allGap = await gapBelow(
+    resources.generalHeading,
+    page.locator("#type-rail-list a.filter-rail__item").first(),
+  );
+  expect(Math.abs(recentGap - allGap)).toBeLessThanOrEqual(1);
 });
 
 // The in-page repaint above happens before the server write lands

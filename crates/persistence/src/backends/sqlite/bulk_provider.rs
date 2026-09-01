@@ -115,8 +115,17 @@ impl BulkProviderStore for SqliteBackend {
         if_match_version: Option<i64>,
     ) -> StorageResult<StoredProviderSubmission> {
         let mut conn = self.get_connection()?;
+        // IMMEDIATE, not the DEFERRED default: this transaction reads (the
+        // version below) before it writes. Under WAL a deferred transaction
+        // takes a read snapshot on that first read and then fails the
+        // read-to-write upgrade with SQLITE_BUSY_SNAPSHOT if another
+        // connection committed in between — and the busy handler is *not*
+        // invoked for that code, so the configured busy_timeout does not
+        // cover it. With a bulk ingest committing continuously, that race
+        // lost essentially every time (#791). Taking the write lock up
+        // front does.
         let txn = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| backend_err(format!("begin provider submission transaction: {e}")))?;
 
         let current_version: i64 = txn

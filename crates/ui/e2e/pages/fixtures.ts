@@ -12,6 +12,7 @@ import { SearchPage } from "./search";
 import { SearchParametersPage } from "./search-parameters";
 import { TenantsPage } from "./tenants";
 import { BulkImportPage } from "./bulk-import";
+import { BulkExportPage } from "./bulk-export";
 import { CapabilityStatementPage } from "./capability-statement";
 
 type Fixtures = {
@@ -25,6 +26,7 @@ type Fixtures = {
   searchParameters: SearchParametersPage;
   tenants: TenantsPage;
   bulkImport: BulkImportPage;
+  bulkExport: BulkExportPage;
   capabilityStatement: CapabilityStatementPage;
 };
 
@@ -77,6 +79,7 @@ export const test = base.extend<Fixtures>({
   searchParameters: async ({ page }, use) => use(new SearchParametersPage(page)),
   tenants: async ({ page }, use) => use(new TenantsPage(page)),
   bulkImport: async ({ page }, use) => use(new BulkImportPage(page)),
+  bulkExport: async ({ page }, use) => use(new BulkExportPage(page)),
   capabilityStatement: async ({ page }, use) => use(new CapabilityStatementPage(page)),
 });
 

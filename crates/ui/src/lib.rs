@@ -58,9 +58,21 @@ mod tenants;
 #[doc(hidden)]
 pub use conformance::{ConformanceSource, SqlExportStatus, StaticConformanceSource};
 
+/// The locale plumbing, re-exported out of the private `i18n` module.
+///
+/// `mount` needs neither of these, but `tests/router_http.rs` does: it is an
+/// integration test, so it lives outside the crate, and it asserts the topbar
+/// account menu against `helios_ui_chrome::user_menu` rendered from the *real*
+/// Fluent catalogs. Without the re-export that test would have to hard-code
+/// English strings, which is precisely the drift it exists to catch (#799).
+/// `RequestLocale` comes along because it is the only public way to build an
+/// [`I18n`].
+pub use i18n::{I18n, RequestLocale};
+
 use askama::Template;
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{DefaultBodyLimit, Query, RawQuery, State},
     http::StatusCode,
     middleware,
@@ -74,11 +86,10 @@ use helios_observability::dashboard::{
     DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, TypeCount,
 };
 use helios_persistence::core::{BulkProviderStore, ResourceStorage, SettingsStore};
-use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Static UI assets (htmx, CSS) embedded into the binary at compile time.
@@ -104,6 +115,18 @@ pub struct NlSearch {
     /// `HFS_NL_SEARCH_MODEL` â€” shown in the setup state so an operator can see
     /// what they would be billed for.
     pub model: String,
+}
+
+/// Whether the mounted FHIR API can search Patient resources by name.
+///
+/// Exact logical-id reads remain available in both modes. The UI keeps this
+/// capability separate because standalone S3 intentionally has no search
+/// index, while S3 combined with Elasticsearch does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PatientNameSearchSupport {
+    #[default]
+    Enabled,
+    IdOnly,
 }
 
 /// Shared router state: values that are constant for the process lifetime.
@@ -134,6 +157,12 @@ struct WebState {
     /// submissions target as their recipient (#689). Distinct from the
     /// loopback self-call base the conformance source uses.
     public_base_url: String,
+    /// Trusted loopback base used for UI calls back into this HFS process.
+    /// Unlike `public_base_url`, this never carries a reverse-proxy prefix.
+    self_base_url: String,
+    /// Runtime capability cache. A standards-compliant 501 from Patient name
+    /// search downgrades this process to exact-id lookup only.
+    patient_name_search: Arc<AtomicBool>,
     /// Whether canonical tenant URLs include the selected tenant as a path.
     tenant_path_routing: bool,
     /// The server's default FHIR version, used when seeding a new tenant.
@@ -421,6 +450,27 @@ impl Status {
     /// which does not exist yet (#320).
     pub(crate) fn user_can_logout(&self) -> bool {
         false
+    }
+
+    /// The topbar account menu, rendered by `helios-ui-chrome` so HFS and HTS
+    /// cannot drift (#799). `i18n` is a parameter because it is a sibling field
+    /// on every page struct, not part of `Status`.
+    ///
+    /// Takes `&I18n` rather than `I18n` even though the type is `Copy`: askama
+    /// passes template fields to a method call by reference, so the generated
+    /// code hands us `&self.i18n`.
+    pub(crate) fn user_menu(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::user_menu(
+            i18n,
+            helios_ui_chrome::UserIdentity {
+                display: self.user_display(),
+                secondary: self.user_secondary(),
+                initials: self.user_initials(),
+                photo: self.user_photo(),
+                can_logout: self.user_can_logout(),
+                logout_href: "/ui/logout",
+            },
+        )
     }
 
     /// A browser-safe terminology destination, when the configured value is a
@@ -941,6 +991,7 @@ pub fn mount_with_body_limit(
         max_body_size,
         false,
         bulk_provider,
+        PatientNameSearchSupport::Enabled,
     )
 }
 
@@ -962,14 +1013,15 @@ pub fn mount_with_body_limit_and_tenant_routing(
     max_body_size: usize,
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    patient_name_search: PatientNameSearchSupport,
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
-        self_base_url,
+        self_base_url.clone(),
         outbound_auth,
         fhir_version,
         data_dir.clone(),
     ));
-    mount_with_conformance_source_and_body_limit_and_tenant_routing(
+    mount_with_conformance_source_and_runtime(
         fhir_app,
         hfs_version,
         data_dir,
@@ -984,6 +1036,8 @@ pub fn mount_with_body_limit_and_tenant_routing(
         max_body_size,
         tenant_path_routing,
         bulk_provider,
+        self_base_url,
+        patient_name_search,
     )
 }
 
@@ -1079,7 +1133,56 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> Router {
+    mount_with_conformance_source_and_runtime(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        source,
+        fhir_version,
+        terminology,
+        public_base_url.clone(),
+        max_body_size,
+        tenant_path_routing,
+        bulk_provider,
+        public_base_url,
+        PatientNameSearchSupport::Enabled,
+    )
+}
+
+/// Testable mount with explicit same-process FHIR routing and capabilities.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_conformance_source_and_runtime(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    max_body_size: usize,
+    tenant_path_routing: bool,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    self_base_url: String,
+    patient_name_search: PatientNameSearchSupport,
+) -> Router {
     let nl_enabled = nl.enabled;
+    let mut parsed_self_base = reqwest::Url::parse(&self_base_url)
+        .expect("UI mount requires a valid HTTP(S) self base URL");
+    let trimmed_path = parsed_self_base.path().trim_end_matches('/').to_string();
+    parsed_self_base.set_path(&trimmed_path);
+    let self_base_url = parsed_self_base
+        .to_string()
+        .trim_end_matches('/')
+        .to_string();
     let mut parsed_public_base = reqwest::Url::parse(&public_base_url)
         .expect("UI mount requires a valid HTTP(S) public base URL");
     let trimmed_path = parsed_public_base.path().trim_end_matches('/').to_string();
@@ -1116,6 +1219,11 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
             "/ui/sql/view-definitions",
             get(sql_view_definitions_page).post(sql_view_definitions_save),
         )
+        // #753 ticket 03 (evaluation POC): the editor's async server lint.
+        .route(
+            "/ui/sql/view-definitions/lint",
+            axum::routing::post(sql_view_definitions_lint),
+        )
         .route(
             "/ui/sql/queries",
             get(sql_queries_page).post(sql_queries_save),
@@ -1151,9 +1259,14 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         .route("/ui/history/diff", axum::routing::post(history_diff))
         .route(
             "/ui/bulk-export",
-            get(bulk_export::page).post(bulk_export::start),
+            get(bulk_export::active).post(bulk_export::start),
         )
-        .route("/ui/bulk-export/active", get(bulk_export::active))
+        .route("/ui/bulk-export/new", get(bulk_export::page))
+        .route(
+            "/ui/bulk-export/patient-options",
+            axum::routing::post(bulk_export::patient_options),
+        )
+        .route("/ui/bulk-export/active", get(bulk_export::active_redirect))
         .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
         .route(
             "/ui/bulk-export/active/{id}/cancel",
@@ -1162,6 +1275,14 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         .route(
             "/ui/bulk-export/active/{id}/retry",
             axum::routing::post(bulk_export::retry),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/delete",
+            axum::routing::post(bulk_export::delete),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/download",
+            get(bulk_export::download_all),
         )
         .route(
             "/ui/bulk-import",
@@ -1222,6 +1343,11 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         default_tenant,
         terminology,
         public_base_url,
+        self_base_url,
+        patient_name_search: Arc::new(AtomicBool::new(matches!(
+            patient_name_search,
+            PatientNameSearchSupport::Enabled
+        ))),
         tenant_path_routing,
     };
 
@@ -2618,6 +2744,43 @@ async fn sql_view_definitions_save(
         }
         Err(error) => render(error_page(error, form.json, id.is_none(), form.id)),
     }
+}
+
+/// #753 ticket 03 (evaluation POC, not merged upstream): structural +
+/// FHIRPath-syntax lint for the ViewDefinition editor's async CodeMirror 6
+/// linter (ticket 02's `vd-editor.js`, RF7). Delegates entirely to
+/// [`helios_sof::lint::lint_view_definition`] — this handler only decodes
+/// the request body and shapes the response; it never touches storage, the
+/// tenant, or the configured FHIR version, because the lint itself is
+/// purely structural (RF5) and version-agnostic.
+///
+/// Plain JSON in, JSON out — no htmx swap involved, matching the precedent
+/// `/ui/editor/expand` already sets for a browser-facing JSON endpoint that
+/// exists to support an editor rather than to mirror the FHIR REST surface.
+/// The body is read as raw bytes (not the `Json` extractor) so a malformed
+/// body reports RF5's exact `{"error": "..."}` shape instead of axum's
+/// generic rejection body.
+async fn sql_view_definitions_lint(body: Bytes) -> Response {
+    let doc: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(doc) => doc,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {error}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let diagnostics = helios_sof::lint::lint_view_definition(&doc);
+    // NF2: never log the document itself — a ViewDefinition's `constant[]`
+    // can carry PHI — only how many diagnostics it produced.
+    tracing::debug!(
+        diagnostic_count = diagnostics.len(),
+        "linted a ViewDefinition document"
+    );
+
+    Json(serde_json::json!({ "diagnostics": diagnostics })).into_response()
 }
 
 /// What tells the SQL Queries workspace apart from SQL Views: both edit and
@@ -4414,6 +4577,34 @@ mod tests {
         assert!(Assets::get("fonts/figtree-latin.woff2").is_some());
         assert!(Assets::get("fonts/figtree-latin-ext.woff2").is_some());
         assert!(Assets::get("logo.png").is_some());
+    }
+
+    /// #753 ticket 01: the CodeMirror 6 + lezer-fhirpath vendoring ritual's
+    /// one committed output (`crates/ui/vendor/codemirror/README.md`) is
+    /// embedded exactly like any other subfolder asset — `assets/fonts/` is
+    /// the existing precedent for rust-embed walking into `assets/vendor/` —
+    /// and opens with the license banner rollup.config.js generates, wrapping
+    /// the `window.HfsCodeMirror` global tickets 02 and 03 build against.
+    #[test]
+    fn codemirror_vendor_bundle_is_embedded() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        let source = std::str::from_utf8(&file.data).expect("bundle is UTF-8");
+        assert!(
+            source.starts_with("/*!"),
+            "bundle must open with the license banner"
+        );
+        assert!(
+            source.contains("HfsCodeMirror"),
+            "bundle must define the window.HfsCodeMirror global"
+        );
+    }
+
+    /// #753 ticket 02: vd-editor.js — the hand-written mount script that
+    /// progressively enhances the ViewDefinition textarea with the ticket 01
+    /// bundle — is embedded like every other page script.
+    #[test]
+    fn vd_editor_script_is_embedded() {
+        assert!(Assets::get("vd-editor.js").is_some());
     }
 
     /// The theme script persists the choice to the per-user settings document

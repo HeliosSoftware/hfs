@@ -123,6 +123,7 @@ Follow-ups to `resolve()` in SQL-on-FHIR, which today dereferences references ag
 - ClickHouse as a primary store
 - Neo4j as a primary store
 - PostgreSQL with Neo4j as a graph query secondary
+- **PostgreSQL + Citus for horizontal scale** ([#816](https://github.com/HeliosSoftware/hfs/issues/816)) — Distribute the PostgreSQL backend's tables by `tenant_id` using [Citus](https://www.citusdata.com/), so tenant-sharded deployments can scale out across workers instead of vertically. Community testing against a small Citus cluster (discussion [#705](https://github.com/HeliosSoftware/hfs/discussions/705)) found the existing schema already tenant-aware enough for colocation and single-shard routing; the known work is changing `search_index`'s primary key from `(id)` to `(tenant_id, id)` and providing a Citus-aware migration for the `resource_fts` trigger. Also under consideration alongside the ClickHouse item above: PostgreSQL with [pg_clickhouse](https://clickhouse.com/docs/products/managed-postgres/extensions/pg_clickhouse/introduction). Neither is committed — 👍 the issue to signal interest.
 
 ### Persistence Advisor
 

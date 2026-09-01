@@ -19,9 +19,12 @@ partial page updates. Handlers return **full pages** on hard navigations and
 thin.
 
 **There is no React, Vue, Svelte, Alpine, or jQuery here — and no bundler, no
-npm dependency, and no build step for the browser code.** The only vendored
-third-party script is htmx itself; everything else under `assets/` is
-hand-written vanilla JS in an IIFE. Do not introduce a framework.
+npm dependency, and no build step for the browser code, with one narrow,
+documented exception** (see "Assets: vendored & embedded" below). Two
+third-party scripts are vendored: htmx, and — as a prebuilt, never-built-here
+bundle — CodeMirror 6, for the ViewDefinition editor (#753). Everything else
+under `assets/` is hand-written vanilla JS in an IIFE. Do not introduce a
+framework.
 
 Why, over a SPA + JSON API:
 
@@ -93,6 +96,29 @@ stale.
 To update htmx, replace `assets/htmx.min.js` with the new pinned release and
 note the version bump in the commit.
 
+### The one exception: a vendored, prebuilt bundle
+
+"No bundler" (above) is the default, not an absolute: a third-party script that
+is a real parser or grammar — not a widget — cannot reasonably be hand-written
+in the style every other asset in this crate uses. For that narrow case:
+
+> Third-party browser code may be vendored as a prebuilt single-file bundle produced by a
+> documented, checked-in, one-off script under `crates/ui/vendor/`; pinned versions and a
+> lockfile are committed alongside it; the script is never executed at build time or in CI;
+> the resulting bundle is never loaded from a CDN; and the bundle ships with its license
+> banner intact.
+
+CodeMirror 6 is the first, and so far only, case this applies to (#753):
+[`crates/ui/vendor/codemirror/`](vendor/codemirror/README.md) is the vendoring
+ritual (pinned npm dependencies, a committed lockfile, a rollup + terser recipe
+run by hand, never by `cargo build` or CI); its one output,
+[`assets/vendor/codemirror.bundle.js`](assets/vendor/codemirror.bundle.js), is
+the vendored bundle itself — embedded and served exactly like every other
+asset in this crate (above), nothing bundler-specific about how it ships. It
+backs the ViewDefinition editor on `/ui/sql/view-definitions`; see
+[`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
+for the full evaluation this amendment is drawn from.
+
 ### Client-side scripts
 
 Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
@@ -110,11 +136,13 @@ it exists to be called by the others.
 | `saved-queries.js` | Saved queries, the visual search builder, the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
 | `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
+| `combobox.js` | Shared multi-select state, chips, keyboard/ARIA behavior, and progressive fallback upgrade; htmx owns transport and callers own result semantics |
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
+| `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
-| `resource-filter.js` | Every type rail's tooltip for a clipped label and its scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
+| `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
 | `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
@@ -204,8 +232,10 @@ Errors follow one convention across the Fluent catalogs
   persistence or terminology logic here.
 - **No new browser-facing JSON API** to feed the UI. htmx consumes HTML
   fragments, not JSON.
-- **No SPA framework, no bundler, no npm dependency** for browser code. (The
-  `e2e/` directory has a `package.json`, but that is test-only and never ships.)
+- **No SPA framework, no bundler, no npm dependency** for browser code, with
+  one documented exception — see "Assets: vendored & embedded" above. (The
+  `e2e/` directory also has a `package.json`, but that is test-only and never
+  ships.)
 - **No inline `<script>` blobs or scattered JS.** Prefer `hx-*` attributes
   (Locality of Behaviour); where JS is truly needed, use small pinned assets.
   Inert `type="application/json"` data carriers are the one allowed exception,
@@ -248,6 +278,7 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.table-wrap` > `.data-table`, `.col-num`, `.col-actions`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper: ordinary headers and data align left; `.col-num` uses tabular figures without changing alignment; `.col-actions` aligns right; empty-state rows stay centered; the footer hosts pagination. |
 | `.empty-state` | The same centered, muted empty treatment for non-table content. |
 | `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
+| `.combobox`, `.combobox__*` | Shared progressively enhanced multi-select. Render it through `partials/combobox.html`; callers provide localized domain copy and an HTML-fragment endpoint, while `combobox.js` owns selection/keyboard state and repeated hidden inputs. Keep a named textarea fallback usable without JavaScript. |
 | `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
 | `.choice-grid`, `.choice-card`, `.choice-card__title`, `.choice-card__hint` | The radio-group treatment: one selectable card per choice, `:has(:checked)` accent (#735). |
 | `.progress`, `.progress__bar`, `.progress--complete`, `.progress--failed`, `.progress--cancelled` | Full-width job progress track; terminal states recolor the fill. |

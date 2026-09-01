@@ -19,17 +19,22 @@
 
 /* A native `title` exposes truncated names to a pointer, but not visibly to a
    keyboard user. Replace that fallback with one body-level tooltip whenever
-   a rail label is genuinely clipped (#634). Keeping the tooltip outside the
-   scrolling rail avoids overflow clipping, and delegation means the cloned
-   Recently used items follow the same path without duplicate ids. */
+   a rail or resource-grid label is genuinely clipped (#634, #793). Keeping
+   the tooltip outside scrolling and grid containers avoids overflow clipping,
+   and delegation means dynamically added items follow the same path. */
 (function () {
   "use strict";
 
-  var ITEM_SELECTOR = "a.filter-rail__item[data-full-name]";
+  var ITEM_SELECTOR = [
+    "a.filter-rail__item[data-full-name]",
+    "label.typegrid__item[data-full-name]",
+  ].join(", ");
   var tooltip = document.createElement("div");
   var activeItem = null;
+  var activeTrigger = null;
   var hoveredItem = null;
   var focusedItem = null;
+  var focusedTrigger = null;
   tooltip.className = "filter-rail__tooltip";
   tooltip.id = "filter-rail-tooltip";
   tooltip.setAttribute("role", "tooltip");
@@ -44,18 +49,35 @@
 
   function hide(item) {
     if (item && item !== activeItem) return;
-    if (activeItem) activeItem.removeAttribute("aria-describedby");
+    if (activeTrigger) activeTrigger.removeAttribute("aria-describedby");
     activeItem = null;
+    activeTrigger = null;
     tooltip.hidden = true;
   }
 
+  function isClipped(label) {
+    if (label.scrollWidth > label.clientWidth) return true;
+
+    /* scrollWidth/clientWidth are integer-rounded in Chromium, while the
+       ellipsis decision is made from fractional layout geometry. Measure the
+       text run itself so sub-pixel clipping still receives a tooltip (#793). */
+    var range = document.createRange();
+    range.selectNodeContents(label);
+    return range.getBoundingClientRect().width > label.getBoundingClientRect().width + 0.01;
+  }
+
   function show(item) {
-    var label = item && item.querySelector(".filter-rail__label");
+    var label = item && item.querySelector(".filter-rail__label, .typegrid__label");
     var fullName = item && item.getAttribute("data-full-name");
+    var trigger = focusedItem === item && focusedTrigger
+      ? focusedTrigger
+      : item && item.matches("a.filter-rail__item")
+        ? item
+        : item && item.querySelector('input[type="checkbox"]');
     /* HTMX can replace Search Parameters rail items after the initial sweep;
        remove their fallback lazily as well. */
     if (item) item.removeAttribute("title");
-    if (!label || !fullName || label.scrollWidth <= label.clientWidth + 1) {
+    if (!label || !fullName || !trigger || !isClipped(label)) {
       hide();
       return;
     }
@@ -71,11 +93,12 @@
       return;
     }
 
-    if (activeItem && activeItem !== item) {
-      activeItem.removeAttribute("aria-describedby");
+    if (activeTrigger && activeTrigger !== trigger) {
+      activeTrigger.removeAttribute("aria-describedby");
     }
     activeItem = item;
-    activeItem.setAttribute("aria-describedby", tooltip.id);
+    activeTrigger = trigger;
+    activeTrigger.setAttribute("aria-describedby", tooltip.id);
     tooltip.textContent = fullName;
     tooltip.hidden = false;
 
@@ -119,9 +142,15 @@
   function refresh() {
     if (
       focusedItem
-      && (!focusedItem.isConnected || document.activeElement !== focusedItem)
+      && (
+        !focusedItem.isConnected
+        || !focusedTrigger
+        || !focusedTrigger.isConnected
+        || document.activeElement !== focusedTrigger
+      )
     ) {
       focusedItem = null;
+      focusedTrigger = null;
     }
     if (
       hoveredItem
@@ -129,7 +158,9 @@
     ) {
       hoveredItem = null;
     }
-    var item = focusedItem || hoveredItem;
+    /* Pointer intent wins while it is over an item; when it leaves, the
+       still-focused control resumes its keyboard tooltip. */
+    var item = hoveredItem || focusedItem;
     if (item) show(item);
     else hide();
   }
@@ -153,16 +184,21 @@
     var item = closestItem(event.target);
     if (!item) return;
     focusedItem = item;
+    focusedTrigger = event.target instanceof Element ? event.target : null;
     refresh();
   });
 
   document.addEventListener("focusout", function (event) {
     var item = closestItem(event.target);
     if (!item) return;
-    if (focusedItem === item) focusedItem = null;
+    if (focusedItem === item) {
+      focusedItem = null;
+      focusedTrigger = null;
+    }
     refresh();
   });
 
+  document.addEventListener("change", refresh);
   window.addEventListener("resize", refresh);
   var scrollFrame = null;
   document.addEventListener("scroll", function () {
