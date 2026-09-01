@@ -69,7 +69,7 @@ async fn browser_renders_full_page_with_translated_heading() {
     );
     for key in [
         "hts-cs-browser-title",
-        "hts-cs-browser-filter-search",
+        "hts-cs-browser-filter-reset",
         "hts-cs-browser-column-url",
         "hts-cs-browser-load-more",
         "hts-workbench-run",
