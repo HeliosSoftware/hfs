@@ -1545,6 +1545,76 @@ select.field__input {
   color: var(--muted);
 }
 
+/* The CapabilityStatement raw view is a real link without JavaScript. Keep its
+   htmx-only progress message out of that fallback, then reveal it only while
+   htmx marks this explicit indicator as the active request indicator. */
+#capability-json-loading {
+  display: none;
+}
+
+#capability-json-loading.htmx-request {
+  display: inline-flex;
+}
+
+/* Large CapabilityStatements use a page-specific incremental tree. Only the
+   currently expanded, bounded fragments exist in the DOM. */
+#capability-json-body {
+  max-height: 70vh;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.capability-json-outline {
+  padding: 10px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+#capability-json-body .capability-json-outline {
+  max-height: none;
+  overflow: visible;
+}
+
+.capability-json-bracket,
+.capability-json-row {
+  min-height: 24px;
+  padding-right: 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.capability-json-bracket { padding-left: 12px; }
+.capability-json-rows { padding-left: 18px; }
+.capability-json-row { display: flex; align-items: baseline; gap: 6px; }
+.capability-json-row:hover { background: var(--input-bg); }
+.capability-json-row code { font: inherit; min-width: 0; }
+
+.capability-json-node > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.capability-json-node > summary::-webkit-details-marker { display: none; }
+.capability-json-row__fold { flex: 0 0 18px; color: var(--muted); }
+.capability-json-node[open] > summary .capability-json-row__fold { transform: rotate(90deg); }
+.capability-json-node__body { padding-left: 18px; }
+
+.capability-json-truncated {
+  color: var(--muted);
+  font-family: var(--font-sans);
+  font-size: 11px;
+}
+
+.capability-json-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 10px;
+  font-family: var(--font-sans);
+}
+
 /* Centered-popup variant of the addbox (the Bulk Import dialogs, #527): the
    same no-JS <details> mechanics, presented as a modal. While open, the
    summary itself stretches over the viewport as the backdrop, so clicking
@@ -4205,6 +4275,13 @@ details.json-fold[open] > summary .icon {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* The CapabilityStatement owns the only scroll container for its incremental
+   tree. Keep bounded scalar fragments from creating nested 70vh scrollers. */
+#capability-json-body .json-view {
+  max-height: none;
+  overflow: visible;
 }
 
 /* Form ↔ JSON cross-highlight (editor-sync.js): hovering or focusing a form

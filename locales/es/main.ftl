@@ -768,6 +768,15 @@ cap-col-includes = Includes
 cap-col-revincludes = Revincludes
 cap-resources-empty = Ningún tipo de recurso coincide con el filtro.
 cap-raw-toggle = CapabilityStatement en bruto (JSON)
+cap-raw-load = Abrir JSON sin formato
+cap-raw-loading = Cargando JSON resaltado…
+cap-raw-plain = Alternativa en JSON sin formato. El resaltado se carga de forma incremental cuando JavaScript está disponible.
+cap-json-load-error = No se pudo cargar esta sección JSON. Ciérrala y vuelve a abrirla para reintentar.
+cap-json-truncated = visualización truncada
+cap-json-path-too-deep = se alcanzó la profundidad máxima de expansión
+cap-json-pagination-label = Elementos JSON
+cap-json-page-prev = Anterior
+cap-json-page-next = Siguiente
 cap-unavailable = No se pudo obtener la CapabilityStatement del servidor — la autollamada puede necesitar un token saliente cuando la autenticación está activada.
 
 ## Stubs de la sección SQL on FHIR (#649)

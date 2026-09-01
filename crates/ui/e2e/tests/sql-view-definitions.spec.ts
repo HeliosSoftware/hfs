@@ -246,7 +246,15 @@ test("a filtered-out recent stays in the group; deleting the selected view falls
   // shared e2e server's full ViewDefinition collection, not just this test's
   // own two) — but the group still shows the now-deleted entry from its
   // snapshot, since a silent fallback never prunes.
-  await expect(page.locator("textarea[name='json']")).toBeVisible();
+  //
+  // Not `.toBeVisible()`: the CodeMirror editor (#753/#820) progressively
+  // enhances this textarea and hides it once mounted (`vd-editor__source--
+  // mounted`, `display: none`), while staying its form's live source of
+  // truth. A non-empty value proves a real selection landed regardless of
+  // which of the two — raw textarea or its mounted replacement — is the one
+  // actually on screen; the "no selection" render has no textarea at all
+  // (see the pruned case's `toHaveCount(0)` below).
+  await expect(page.locator("textarea[name='json']")).not.toHaveValue("");
   await expect(page.locator(`#vd-rail-list [data-type='${deleteId}']`)).toHaveCount(0);
   await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toBeVisible();
 

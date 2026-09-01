@@ -771,6 +771,15 @@ cap-col-includes = Includes
 cap-col-revincludes = Revincludes
 cap-resources-empty = No resource types match the filter.
 cap-raw-toggle = Raw CapabilityStatement (JSON)
+cap-raw-load = Open plain JSON
+cap-raw-loading = Loading highlighted JSON…
+cap-raw-plain = Plain JSON fallback. Highlighting is loaded incrementally when JavaScript is available.
+cap-json-load-error = This JSON section could not be loaded. Collapse and reopen it to retry.
+cap-json-truncated = display truncated
+cap-json-path-too-deep = maximum expansion depth reached
+cap-json-pagination-label = JSON items
+cap-json-page-prev = Previous
+cap-json-page-next = Next
 cap-unavailable = The CapabilityStatement could not be fetched from the server — the self-call may need an outbound token when authentication is enabled.
 
 ## SQL on FHIR section stubs (#649)
