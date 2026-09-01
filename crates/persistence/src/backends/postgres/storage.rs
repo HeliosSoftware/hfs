@@ -2753,7 +2753,7 @@ impl ConditionalStorage for PostgresBackend {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
                 self.delete(tenant, resource_type, existing.id()).await?;
-                Ok(ConditionalDeleteResult::Deleted)
+                Ok(ConditionalDeleteResult::Deleted(existing))
             }
             n => {
                 // Multiple matches - error condition

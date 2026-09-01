@@ -2573,7 +2573,7 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
         )
         .await
         .unwrap();
-    assert!(matches!(deleted, ConditionalDeleteResult::Deleted));
+    assert!(matches!(deleted, ConditionalDeleteResult::Deleted(_)));
 
     let no_match = backend
         .conditional_delete(

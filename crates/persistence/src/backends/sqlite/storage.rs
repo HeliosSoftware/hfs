@@ -2813,7 +2813,7 @@ impl ConditionalStorage for SqliteBackend {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
                 self.delete(tenant, resource_type, existing.id()).await?;
-                Ok(ConditionalDeleteResult::Deleted)
+                Ok(ConditionalDeleteResult::Deleted(existing))
             }
             n => {
                 // Multiple matches - error condition
@@ -5994,7 +5994,7 @@ mod tests {
             .unwrap();
 
         match result {
-            ConditionalDeleteResult::Deleted => {
+            ConditionalDeleteResult::Deleted(_) => {
                 // Verify resource is deleted (read returns Gone error or None)
                 let read_result = backend.read(&tenant, "Patient", "p1").await;
                 match read_result {

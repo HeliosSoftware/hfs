@@ -4602,7 +4602,7 @@ mod postgres_integration {
             .unwrap();
 
         assert!(
-            matches!(result, ConditionalDeleteResult::Deleted),
+            matches!(result, ConditionalDeleteResult::Deleted(_)),
             "Conditional delete should find and delete resource"
         );
 
