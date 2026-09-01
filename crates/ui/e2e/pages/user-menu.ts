@@ -159,8 +159,7 @@ export async function assertLanguageRoundTrip(
 ): Promise<void> {
   await page.goto(ctx.home);
 
-  await openUserMenu(page);
-  await langLink(page, "es").click();
+  await switchLanguage(page, "es");
   await expect(page.locator("html")).toHaveAttribute("lang", "es");
 
   const cookies = await page.context().cookies();
@@ -170,7 +169,23 @@ export async function assertLanguageRoundTrip(
   ).toBe("es");
 
   // Back to English so the shared server is left as we found it.
-  await openUserMenu(page);
-  await langLink(page, "en").click();
+  await switchLanguage(page, "en");
   await expect(page.locator("html")).toHaveAttribute("lang", "en");
+}
+
+/** Opens the menu, clicks a language link, and waits for the navigation it
+ * starts to actually commit.
+ *
+ * The wait is the whole point. `click()` resolves when the click is dispatched,
+ * not when the page it navigates to has loaded, so asserting straight after it
+ * races a document swap: the execution context the locator resolved against is
+ * torn down mid-poll. It passes on a warm server and fails on a cold one — this
+ * cost one 30s timeout on the first run after a fresh build, which read as a
+ * broken language switch rather than a racy assertion. */
+async function switchLanguage(page: Page, lang: string): Promise<void> {
+  await openUserMenu(page);
+  await Promise.all([
+    page.waitForURL(new RegExp(`[?&]lang=${lang}(&|$)`)),
+    langLink(page, lang).click(),
+  ]);
 }
