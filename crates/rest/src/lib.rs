@@ -1061,6 +1061,11 @@ impl helios_observability::subscriptions::SubscriptionsProvider for EngineSubscr
                     .engine
                     .delivery_stats()
                     .window(&s.tenant_id, &s.id, now);
+                let series = self
+                    .engine
+                    .delivery_stats()
+                    .series(&s.tenant_id, &s.id, now)
+                    .to_vec();
                 SubscriptionRow {
                     id: s.id,
                     topic_url: s.topic_url,
@@ -1073,6 +1078,7 @@ impl helios_observability::subscriptions::SubscriptionsProvider for EngineSubscr
                     delivered_24h: window.delivered,
                     first_try_24h: window.first_try,
                     failed_24h: window.failed,
+                    delivered_series: series,
                 }
             })
             .collect();

@@ -9,10 +9,10 @@
 //! (naming `HFS_SUBSCRIPTIONS_ENABLED` and the `subscriptions` build feature)
 //! when it is not; the sidebar entry is always present (#767).
 //!
-//! The design's 24-hour sparkline needs a per-window time series the
-//! [`SubscriptionsSnapshot`](helios_observability::subscriptions::SubscriptionsSnapshot)
-//! does not carry; the column shows the real count until the engine grows
-//! that series (#555's rule: real figures or none).
+//! The Last 24 hrs column draws the design's sparkline from the engine's
+//! half-hour delivery series (#782), scaled server-side into SVG polyline
+//! points — no client script involved. A snapshot without a series renders
+//! the plain count (#555's rule: real figures or none).
 
 use askama::Template;
 use axum::{extract::RawQuery, extract::State, response::Response};
@@ -36,9 +36,45 @@ pub struct SubscriptionRowView {
     pub sent: String,
     /// Notifications delivered in the last 24 hours (#586).
     pub last24: String,
+    /// The 24-hour delivery series as SVG polyline points (#782), pre-scaled
+    /// to the sparkline's viewBox. Empty when the engine carries no series —
+    /// the cell then shows the count alone rather than a fabricated line.
+    pub spark_points: String,
     /// Consecutive delivery failures; `—` when the channel has no delivery
     /// (an idle websocket).
     pub streak: String,
+}
+
+/// The sparkline's viewBox, shared by the point scaling and the template.
+pub const SPARK_WIDTH: f64 = 120.0;
+pub const SPARK_HEIGHT: f64 = 24.0;
+
+/// Scales a delivery series into `x,y` polyline points for the sparkline's
+/// viewBox — normalized to the series' own peak, with a 2px inset so the
+/// stroke never clips. An empty series yields no points.
+fn spark_points(series: &[u64]) -> String {
+    if series.is_empty() {
+        return String::new();
+    }
+    let peak = series.iter().copied().max().unwrap_or(0).max(1) as f64;
+    let inset = 2.0;
+    let span_x = SPARK_WIDTH - inset * 2.0;
+    let span_y = SPARK_HEIGHT - inset * 2.0;
+    let step = if series.len() > 1 {
+        span_x / (series.len() as f64 - 1.0)
+    } else {
+        0.0
+    };
+    series
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let x = inset + step * i as f64;
+            let y = inset + span_y * (1.0 - (*v as f64 / peak));
+            format!("{x:.1},{y:.1}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The four headline cards.
@@ -127,6 +163,7 @@ pub async fn page(
                 state,
                 sent: grouped(row.events_since_start),
                 last24: grouped(row.delivered_24h),
+                spark_points: spark_points(&row.delivered_series),
                 streak: if idle {
                     "—".to_string()
                 } else {

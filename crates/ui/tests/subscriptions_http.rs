@@ -71,6 +71,7 @@ impl SubscriptionsProvider for Fixed {
                     delivered_24h: 4182,
                     first_try_24h: 4031,
                     failed_24h: 0,
+                    delivered_series: vec![80, 95, 90, 110, 120, 100, 115],
                 },
                 SubscriptionRow {
                     id: "obs-critical".into(),
@@ -84,6 +85,7 @@ impl SubscriptionsProvider for Fixed {
                     delivered_24h: 311,
                     first_try_24h: 290,
                     failed_24h: 7,
+                    delivered_series: vec![40, 35, 20, 8, 0, 0, 0],
                 },
                 SubscriptionRow {
                     id: "admit-feed".into(),
@@ -97,6 +99,7 @@ impl SubscriptionsProvider for Fixed {
                     delivered_24h: 0,
                     first_try_24h: 0,
                     failed_24h: 0,
+                    delivered_series: Vec::new(),
                 },
             ],
         }
@@ -157,6 +160,18 @@ async fn the_page_goes_from_unavailable_to_the_live_dashboard() {
     assert!(html.contains("0 clients"));
     assert!(html.contains(">7<"), "fail streak renders");
     assert!(html.contains("4,182"));
+
+    // The Last 24 hrs sparkline (#782): rows with a series draw a state-tinted
+    // polyline (with the count as its accessible name); the idle websocket has
+    // no series and keeps the plain count.
+    assert!(html.contains(r#"class="spark spark--active""#), "{html}");
+    assert!(html.contains(r#"class="spark spark--error""#));
+    assert!(
+        !html.contains(r#"class="spark spark--idle""#),
+        "no series, no line"
+    );
+    assert!(html.contains(r#"<polyline class="spark__line""#));
+    assert!(html.contains(r#"aria-label="4,182""#));
 
     // Phase 3 — the sort control re-orders: most sent leads with the biggest
     // counter.

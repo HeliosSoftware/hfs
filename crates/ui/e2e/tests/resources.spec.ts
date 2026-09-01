@@ -358,6 +358,7 @@ test("create eligibility follows the effective FHIR version", async ({ resources
 // resource-filter.js from explicit rail picks and re-rendered on load.
 test("the recently-used group caps at five, keeps MRU order, deduplicates, and preserves counts", async ({
   resources,
+  page,
 }) => {
   await resources.goto("Patient");
   await resources.pickType("Account");
@@ -393,6 +394,27 @@ test("the recently-used group caps at five, keeps MRU order, deduplicates, and p
     const recentCount = await resources.recentItem(type).locator(".count").textContent();
     expect(recentCount).toBe(listCount);
   }
+
+  // #785: both group headings sit the same distance above their first item.
+  // The list scrolls the selected type into view, so measure from the top.
+  await page.evaluate(() => {
+    document.querySelector("#type-rail-list")!.scrollTop = 0;
+    document.querySelector(".filter-rail")!.scrollTop = 0;
+  });
+  const gapBelow = async (heading: import("@playwright/test").Locator, item: import("@playwright/test").Locator) => {
+    const h = await heading.boundingBox();
+    const i = await item.boundingBox();
+    return i!.y - (h!.y + h!.height);
+  };
+  const recentGap = await gapBelow(
+    resources.recentGroup.locator(".filter-rail__heading--group"),
+    resources.recentGroup.locator("a.filter-rail__item").first(),
+  );
+  const allGap = await gapBelow(
+    resources.generalHeading,
+    page.locator("#type-rail-list a.filter-rail__item").first(),
+  );
+  expect(Math.abs(recentGap - allGap)).toBeLessThanOrEqual(1);
 });
 
 test("the type rails keep recents and the All Types heading fixed while type items scroll", async ({

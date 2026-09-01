@@ -4,28 +4,35 @@
 //! The pull-based companion to the Bulk Import workspace: the user picks a
 //! scope (everything / patients / group), the resource types, and the
 //! narrowing filters; the workspace kicks off the server's async `$export`,
-//! then tracks the job on the Active Exports page — one server-side status
+//! then tracks the job on the Exports page — one server-side status
 //! poll per htmx fetch, exactly like the import workspace's recipient
 //! polling.
 //!
-//! Kick-offs and polls are self-calls: the target is this same server,
-//! addressed via the request's `Host` header, with the caller's own
-//! `Authorization` and tenant forwarded — so the export runs with the
-//! user's credentials, not a service account.
+//! Kick-offs and polls are self-calls against the configured loopback HFS base,
+//! with the caller's own `Authorization` and tenant forwarded — so the export
+//! runs with the user's credentials, not a service account. Advertised public
+//! paths are validated, but stored URLs are never used as outbound authorities.
 //!
 //! Job state lives in the per-user settings document under
 //! `byTenant.<tenant>.bulkExport.jobs`, object-keyed by id.
 
+use std::collections::{HashMap, HashSet};
+use std::io;
+
 use askama::Template;
+use async_zip::{Compression, ZipEntryBuilder, base::write::ZipFileWriter};
 use axum::{
     Extension,
-    extract::{Path, State},
+    body::{Body, Bytes},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
 };
 use chrono::{Duration, SecondsFormat, Utc};
+use futures_lite::io::AsyncWriteExt as FuturesAsyncWriteExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::{RequestTenant, RequestVersion, WebState, current_status, render, settings_user_key};
@@ -58,6 +65,12 @@ pub struct ExportJob {
     pub status: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub poll_url: String,
+    /// Trust decision captured at kick-off. Legacy records have `unknown`.
+    #[serde(default, skip_serializing_if = "RemoteJobProvenance::is_unknown")]
+    remote_job: RemoteJobProvenance,
+    /// REST job UUID, populated only when `remote_job` is `known`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    remote_job_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub progress: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -71,29 +84,106 @@ pub struct ExportJob {
     pub files: Vec<Value>,
 }
 
-async fn load_jobs(
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum RemoteJobProvenance {
+    /// The request may have reached HFS, but no valid job identity was returned.
+    #[default]
+    Unknown,
+    /// A valid REST job UUID was returned by the trusted kick-off response.
+    Known,
+    /// HFS rejected the kick-off before creating a remotely addressable job.
+    NoRemoteJob,
+}
+
+impl RemoteJobProvenance {
+    fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteJobIdentity {
+    Known(uuid::Uuid),
+    NoRemoteJob,
+    Unknown,
+}
+
+#[derive(Default)]
+struct JobsSnapshot {
+    jobs: serde_json::Map<String, Value>,
+    version: i64,
+}
+
+async fn load_jobs_checked(
     state: &WebState,
     user_key: &str,
     tenant: &str,
-) -> serde_json::Map<String, Value> {
+) -> Result<JobsSnapshot, String> {
     let Some(store) = &state.settings else {
-        return serde_json::Map::new();
+        return Ok(JobsSnapshot::default());
     };
-    store
+    let Some(stored) = store
         .get_settings(user_key)
         .await
-        .ok()
-        .flatten()
-        .and_then(|s| {
-            s.document
-                .get("byTenant")?
-                .get(tenant)?
-                .get("bulkExport")?
-                .get("jobs")?
-                .as_object()
-                .cloned()
-        })
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(JobsSnapshot::default());
+    };
+    let jobs = stored
+        .document
+        .get("byTenant")
+        .and_then(|value| value.get(tenant))
+        .and_then(|value| value.get("bulkExport"))
+        .and_then(|value| value.get("jobs"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    Ok(JobsSnapshot {
+        jobs,
+        version: stored.version,
+    })
+}
+
+async fn load_jobs(state: &WebState, user_key: &str, tenant: &str) -> JobsSnapshot {
+    load_jobs_checked(state, user_key, tenant)
+        .await
         .unwrap_or_default()
+}
+
+fn optional_string(value: &str) -> Value {
+    if value.is_empty() {
+        Value::Null
+    } else {
+        Value::String(value.to_string())
+    }
+}
+
+/// An explicit merge value for every job field. Nulls clear fields left behind
+/// by an earlier lifecycle state, so one CAS patch is enough.
+fn job_merge_value(job: &ExportJob) -> Value {
+    json!({
+        "name": job.name,
+        "scope": job.scope,
+        "groupId": optional_string(&job.group_id),
+        "types": optional_string(&job.types),
+        "elements": optional_string(&job.elements),
+        "typeFilter": optional_string(&job.type_filter),
+        "since": optional_string(&job.since),
+        "status": job.status,
+        "pollUrl": optional_string(&job.poll_url),
+        "remoteJob": match job.remote_job {
+            RemoteJobProvenance::Unknown => Value::Null,
+            RemoteJobProvenance::Known => Value::String("known".to_string()),
+            RemoteJobProvenance::NoRemoteJob => Value::String("no-remote-job".to_string()),
+        },
+        "remoteJobId": optional_string(&job.remote_job_id),
+        "progress": optional_string(&job.progress),
+        "error": optional_string(&job.error),
+        "startedAt": job.started_at,
+        "finishedAt": optional_string(&job.finished_at),
+        "files": if job.files.is_empty() { Value::Null } else { Value::Array(job.files.clone()) },
+    })
 }
 
 async fn store_job(
@@ -102,24 +192,106 @@ async fn store_job(
     tenant: &str,
     id: &str,
     job: &ExportJob,
+    expected_version: i64,
 ) -> Result<(), String> {
     let Some(store) = &state.settings else {
         return Err("settings store unavailable".to_string());
     };
-    // Null first so dropped fields (files, error) don't survive the merge.
-    let clear =
-        json!({ "byTenant": { tenant: { "bulkExport": { "jobs": { id: Value::Null } } } } });
-    store
-        .patch_settings(user_key, clear, None)
-        .await
-        .map_err(|e| e.to_string())?;
-    let value = serde_json::to_value(job).map_err(|e| e.to_string())?;
+    let value = job_merge_value(job);
     let patch = json!({ "byTenant": { tenant: { "bulkExport": { "jobs": { id: value } } } } });
     store
-        .patch_settings(user_key, patch, None)
+        .patch_settings(user_key, patch, Some(expected_version))
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+async fn remove_job(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    id: &str,
+    expected_version: i64,
+) -> Result<(), String> {
+    let Some(store) = &state.settings else {
+        return Err("settings store unavailable".to_string());
+    };
+    let patch =
+        json!({ "byTenant": { tenant: { "bulkExport": { "jobs": { id: Value::Null } } } } });
+    store
+        .patch_settings(user_key, patch, Some(expected_version))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+enum MemberExpectation<'a> {
+    Absent,
+    Unchanged(&'a Value),
+}
+
+impl MemberExpectation<'_> {
+    fn matches(&self, current: Option<&Value>) -> bool {
+        match self {
+            Self::Absent => current.is_none(),
+            Self::Unchanged(expected) => current == Some(*expected),
+        }
+    }
+}
+
+const SETTINGS_CAS_ATTEMPTS: usize = 3;
+
+async fn store_job_conditionally(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    id: &str,
+    job: &ExportJob,
+    mut expected_version: i64,
+    expectation: MemberExpectation<'_>,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..SETTINGS_CAS_ATTEMPTS {
+        match store_job(state, user_key, tenant, id, job, expected_version).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error,
+        }
+        if attempt + 1 == SETTINGS_CAS_ATTEMPTS {
+            break;
+        }
+        let refreshed = load_jobs_checked(state, user_key, tenant).await?;
+        if !expectation.matches(refreshed.jobs.get(id)) {
+            return Err("export job changed concurrently".to_string());
+        }
+        expected_version = refreshed.version;
+    }
+    Err(last_error)
+}
+
+async fn remove_job_conditionally(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    id: &str,
+    expected_member: &Value,
+    mut expected_version: i64,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..SETTINGS_CAS_ATTEMPTS {
+        match remove_job(state, user_key, tenant, id, expected_version).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error,
+        }
+        if attempt + 1 == SETTINGS_CAS_ATTEMPTS {
+            break;
+        }
+        let refreshed = load_jobs_checked(state, user_key, tenant).await?;
+        if refreshed.jobs.get(id) != Some(expected_member) {
+            return Err("export job changed concurrently".to_string());
+        }
+        expected_version = refreshed.version;
+    }
+    Err(last_error)
 }
 
 fn now_stamp() -> String {
@@ -130,13 +302,153 @@ fn parse_job(value: &Value) -> ExportJob {
     serde_json::from_value(value.clone()).unwrap_or_default()
 }
 
-/// The FHIR API base of this same server, from the request's Host header.
-fn self_base(headers: &HeaderMap) -> String {
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost:8080");
-    format!("http://{host}")
+fn base_url_with_segments<'a>(
+    base: &str,
+    tenant: &str,
+    tenant_path_routing: bool,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(base).map_err(|e| e.to_string())?;
+    url.set_query(None);
+    url.set_fragment(None);
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| "HFS base URL cannot carry path segments".to_string())?;
+        path.pop_if_empty();
+        if tenant_path_routing {
+            path.push(tenant);
+        }
+        for segment in segments {
+            path.push(segment);
+        }
+    }
+    Ok(url)
+}
+
+/// Internal self-call URL. This is always based on the trusted loopback base,
+/// never a Host header or an advertised/public authority.
+fn internal_api_url<'a>(
+    state: &WebState,
+    tenant: &str,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> Result<reqwest::Url, String> {
+    base_url_with_segments(
+        &state.self_base_url,
+        tenant,
+        state.tenant_path_routing,
+        segments,
+    )
+}
+
+fn public_api_url<'a>(
+    state: &WebState,
+    tenant: &str,
+    tenant_path_routing: bool,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> Result<reqwest::Url, String> {
+    base_url_with_segments(
+        &state.public_base_url,
+        tenant,
+        tenant_path_routing,
+        segments,
+    )
+}
+
+fn no_redirect_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+fn parse_url_without_credentials(raw: &str) -> Option<reqwest::Url> {
+    let parsed = reqwest::Url::parse(raw)
+        .or_else(|_| reqwest::Url::parse("http://hfs.invalid").and_then(|base| base.join(raw)));
+    let url = parsed.ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url)
+}
+
+/// Accepts only the two legacy path shapes that HFS emitted before the UI
+/// stored an explicit REST job UUID. The stored authority is discarded.
+fn legacy_remote_job_id(state: &WebState, poll_url: &str, tenant: &str) -> Option<uuid::Uuid> {
+    let url = parse_url_without_credentials(poll_url)?;
+    let id = url
+        .path_segments()?
+        .next_back()
+        .and_then(|raw| uuid::Uuid::parse_str(raw).ok())?;
+    let id_text = id.as_hyphenated().to_string();
+    let without_tenant =
+        public_api_url(state, tenant, false, ["export-status", id_text.as_str()]).ok()?;
+    let with_tenant =
+        public_api_url(state, tenant, true, ["export-status", id_text.as_str()]).ok()?;
+    matches!(url.path(), path if path == without_tenant.path() || path == with_tenant.path())
+        .then_some(id)
+}
+
+fn remote_job_identity(job: &ExportJob, state: &WebState, tenant: &str) -> RemoteJobIdentity {
+    match job.remote_job {
+        RemoteJobProvenance::Known => uuid::Uuid::parse_str(&job.remote_job_id)
+            .map(RemoteJobIdentity::Known)
+            .unwrap_or(RemoteJobIdentity::Unknown),
+        RemoteJobProvenance::NoRemoteJob => RemoteJobIdentity::NoRemoteJob,
+        RemoteJobProvenance::Unknown => {
+            if job.poll_url.is_empty() && job.error.starts_with("kick-off answered ") {
+                RemoteJobIdentity::NoRemoteJob
+            } else {
+                legacy_remote_job_id(state, &job.poll_url, tenant)
+                    .map(RemoteJobIdentity::Known)
+                    .unwrap_or(RemoteJobIdentity::Unknown)
+            }
+        }
+    }
+}
+
+fn trusted_kickoff_job_id(
+    state: &WebState,
+    tenant: &str,
+    content_location: &str,
+) -> Option<uuid::Uuid> {
+    let url = parse_url_without_credentials(content_location)?;
+    let id = url
+        .path_segments()?
+        .next_back()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())?;
+    let expected = public_api_url(
+        state,
+        tenant,
+        state.tenant_path_routing,
+        ["export-status", id.as_hyphenated().to_string().as_str()],
+    )
+    .ok()?;
+    (url.path() == expected.path()).then_some(id)
+}
+
+fn status_url(state: &WebState, tenant: &str, id: &uuid::Uuid) -> Result<reqwest::Url, String> {
+    let id = id.as_hyphenated().to_string();
+    internal_api_url(state, tenant, ["export-status", id.as_str()])
+}
+
+fn public_status_url(
+    state: &WebState,
+    tenant: &str,
+    id: &uuid::Uuid,
+) -> Result<reqwest::Url, String> {
+    let id = id.as_hyphenated().to_string();
+    public_api_url(
+        state,
+        tenant,
+        state.tenant_path_routing,
+        ["export-status", id.as_str()],
+    )
 }
 
 /// Forwards the caller's credentials and tenant onto a self-call, so the
@@ -170,6 +482,7 @@ struct JobCard {
     file_count: usize,
     files: Vec<(String, String)>,
     elapsed: String,
+    can_delete: bool,
 }
 
 fn progress_pct(status: &str, progress: &str) -> String {
@@ -209,7 +522,7 @@ fn elapsed(job: &ExportJob) -> String {
     format!("{}m {:02}s", secs / 60, secs % 60)
 }
 
-fn job_card(i18n: &I18n, id: &str, job: &ExportJob) -> JobCard {
+fn job_card(i18n: &I18n, id: &str, job: &ExportJob, state: &WebState, tenant: &str) -> JobCard {
     JobCard {
         id: id.to_string(),
         name: if job.name.is_empty() {
@@ -234,6 +547,8 @@ fn job_card(i18n: &I18n, id: &str, job: &ExportJob) -> JobCard {
             })
             .collect(),
         elapsed: elapsed(job),
+        can_delete: terminal_status(&job.status)
+            && remote_job_identity(job, state, tenant) != RemoteJobIdentity::Unknown,
     }
 }
 
@@ -245,7 +560,6 @@ struct BulkExportPage {
     active_page: &'static str,
     available: bool,
     resource_types: Vec<String>,
-    active_count: usize,
     error: Option<String>,
 }
 
@@ -255,9 +569,11 @@ struct ActiveExportsPage {
     status: crate::Status,
     i18n: I18n,
     active_page: &'static str,
+    available: bool,
     total: usize,
     running: usize,
     cards: Vec<JobCard>,
+    delete_error: bool,
 }
 
 #[derive(Template)]
@@ -267,34 +583,32 @@ struct JobCardFragment {
     card: JobCard,
 }
 
+#[derive(Default, Deserialize)]
+pub(crate) struct ActiveQuery {
+    #[serde(rename = "delete-error")]
+    delete_error: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// `GET /ui/bulk-export` — the export builder.
+/// `GET /ui/bulk-export/new` — the export builder.
 pub async fn page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
-    principal: Option<Extension<helios_auth::Principal>>,
 ) -> Response {
     let i18n = I18n::new(locale);
     let status = current_status(&state, rv.0, &rt);
-    let user_key = settings_user_key(principal.as_deref());
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
-    let active_count = load_jobs(&state, &user_key, &rt.id)
-        .await
-        .values()
-        .filter(|j| j["status"] == "in-progress")
-        .count();
     render(BulkExportPage {
         status,
         i18n,
         active_page: "bulk-export",
         available: state.settings.is_some(),
         resource_types,
-        active_count,
         error: None,
     })
 }
@@ -349,7 +663,7 @@ fn since_instant(preset: &str, custom: &str) -> String {
     }
 }
 
-/// `POST /ui/bulk-export` — kick off the export, then land on Active Exports.
+/// `POST /ui/bulk-export` — kick off the export, then land on Exports.
 pub async fn start(
     State(state): State<WebState>,
     rt: RequestTenant,
@@ -359,6 +673,7 @@ pub async fn start(
 ) -> Response {
     let form = parse_start_form(&String::from_utf8_lossy(&body));
     let user_key = settings_user_key(principal.as_deref());
+    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
     let mut job = ExportJob {
         name: form.name.trim().to_string(),
         scope: match form.scope.as_str() {
@@ -379,19 +694,42 @@ pub async fn start(
         ..Default::default()
     };
     let id = uuid::Uuid::new_v4().to_string();
-    kickoff(&mut job, &headers, &rt.id).await;
-    let _ = store_job(&state, &user_key, &rt.id, &id, &job).await;
-    Redirect::to("/ui/bulk-export/active").into_response()
+    kickoff(&state, &mut job, &headers, &rt.id).await;
+    if store_job_conditionally(
+        &state,
+        &user_key,
+        &rt.id,
+        &id,
+        &job,
+        snapshot.version,
+        MemberExpectation::Absent,
+    )
+    .await
+    .is_err()
+    {
+        cleanup_or_record_recovery(&state, &user_key, &rt.id, &job, &headers).await;
+    }
+    Redirect::to("/ui/bulk-export").into_response()
 }
 
 /// Performs the `$export` kick-off self-call, recording the poll URL or the
 /// failure on the job.
-async fn kickoff(job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
-    let base = self_base(headers);
+async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
+    job.remote_job = RemoteJobProvenance::Unknown;
+    job.remote_job_id.clear();
+    job.poll_url.clear();
     let path = match job.scope.as_str() {
-        "patient" => format!("{base}/Patient/$export"),
-        "group" => format!("{base}/Group/{}/$export", job.group_id),
-        _ => format!("{base}/$export"),
+        "patient" => internal_api_url(state, tenant, ["Patient", "$export"]),
+        "group" => internal_api_url(state, tenant, ["Group", job.group_id.as_str(), "$export"]),
+        _ => internal_api_url(state, tenant, ["$export"]),
+    };
+    let path = match path {
+        Ok(path) => path,
+        Err(e) => {
+            job.status = "failed".to_string();
+            job.error = e;
+            return;
+        }
     };
     let mut query: Vec<(&str, &str)> = Vec::new();
     if !job.types.is_empty() {
@@ -406,9 +744,17 @@ async fn kickoff(job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
     if !job.since.is_empty() {
         query.push(("_since", &job.since));
     }
+    let client = match no_redirect_client() {
+        Ok(client) => client,
+        Err(e) => {
+            job.status = "failed".to_string();
+            job.error = e;
+            return;
+        }
+    };
     let request = forward_identity(
-        reqwest::Client::new()
-            .get(&path)
+        client
+            .get(path)
             .query(&query)
             .header("Accept", "application/fhir+json")
             .header("Prefer", "respond-async")
@@ -417,17 +763,25 @@ async fn kickoff(job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
         tenant,
     );
     match request.send().await {
-        Ok(response) if response.status().as_u16() == 202 => {
+        Ok(response) if response.status() == StatusCode::ACCEPTED => {
             match response
                 .headers()
                 .get("content-location")
                 .and_then(|v| v.to_str().ok())
             {
-                // A relative Content-Location is resolved against this server.
-                Some(poll) if poll.starts_with('/') => {
-                    job.poll_url = format!("{base}{poll}");
-                }
-                Some(poll) => job.poll_url = poll.to_string(),
+                Some(poll) => match trusted_kickoff_job_id(state, tenant, poll) {
+                    Some(id) => {
+                        job.remote_job = RemoteJobProvenance::Known;
+                        job.remote_job_id = id.as_hyphenated().to_string();
+                        job.poll_url = public_status_url(state, tenant, &id)
+                            .map(|url| url.to_string())
+                            .unwrap_or_default();
+                    }
+                    None => {
+                        job.status = "failed".to_string();
+                        job.error = "kick-off returned an invalid Content-Location".to_string();
+                    }
+                },
                 None => {
                     job.status = "failed".to_string();
                     job.error = "kick-off accepted without a Content-Location".to_string();
@@ -435,6 +789,7 @@ async fn kickoff(job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
             }
         }
         Ok(response) => {
+            job.remote_job = RemoteJobProvenance::NoRemoteJob;
             let code = response.status().as_u16();
             let mut body = response.text().await.unwrap_or_default();
             body.truncate(300);
@@ -442,25 +797,132 @@ async fn kickoff(job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
             job.error = format!("kick-off answered {code}: {}", body.replace('\n', " "));
         }
         Err(e) => {
+            job.remote_job = RemoteJobProvenance::Unknown;
             job.status = "failed".to_string();
             job.error = e.to_string();
         }
     }
 }
 
-/// `GET /ui/bulk-export/active` — the job list.
+async fn cleanup_kickoff_job(
+    state: &WebState,
+    job: &ExportJob,
+    headers: &HeaderMap,
+    tenant: &str,
+) -> Result<(), String> {
+    let RemoteJobIdentity::Known(remote_id) = remote_job_identity(job, state, tenant) else {
+        return Ok(());
+    };
+    let client = no_redirect_client()?;
+    let url = status_url(state, tenant, &remote_id)?;
+    let mut last_error = String::new();
+    for attempt in 0..SETTINGS_CAS_ATTEMPTS {
+        let response = forward_identity(
+            client
+                .delete(url.clone())
+                .timeout(std::time::Duration::from_secs(10)),
+            headers,
+            tenant,
+        )
+        .send()
+        .await;
+        match response {
+            Ok(response)
+                if response.status().is_success() || response.status() == StatusCode::NOT_FOUND =>
+            {
+                return Ok(());
+            }
+            Ok(response)
+                if response.status().is_server_error()
+                    || matches!(
+                        response.status(),
+                        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+                    ) =>
+            {
+                last_error = format!("cleanup answered {}", response.status());
+            }
+            Ok(response) => return Err(format!("cleanup answered {}", response.status())),
+            Err(error) => last_error = format!("cleanup request failed: {error}"),
+        }
+        if attempt + 1 < SETTINGS_CAS_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(25 * (attempt + 1) as u64)).await;
+        }
+    }
+    Err(last_error)
+}
+
+async fn cleanup_or_record_recovery(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    job: &ExportJob,
+    headers: &HeaderMap,
+) {
+    let Err(cleanup_error) = cleanup_kickoff_job(state, job, headers, tenant).await else {
+        return;
+    };
+    let mut recovery = job.clone();
+    recovery.name = if job.name.is_empty() {
+        "Export cleanup required".to_string()
+    } else {
+        format!("{} (cleanup required)", job.name)
+    };
+    recovery.status = "failed".to_string();
+    recovery.error = format!(
+        "Automatic cleanup failed ({cleanup_error}). Delete this card to retry remote cleanup."
+    );
+    recovery.progress.clear();
+    recovery.files.clear();
+    recovery.finished_at = now_stamp();
+    let recovery_id = uuid::Uuid::new_v4().to_string();
+    let snapshot = match load_jobs_checked(state, user_key, tenant).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::error!(
+                remote_job_id = %job.remote_job_id,
+                "failed to load settings for export cleanup recovery: {error}"
+            );
+            return;
+        }
+    };
+    if let Err(error) = store_job_conditionally(
+        state,
+        user_key,
+        tenant,
+        &recovery_id,
+        &recovery,
+        snapshot.version,
+        MemberExpectation::Absent,
+    )
+    .await
+    {
+        tracing::error!(
+            remote_job_id = %job.remote_job_id,
+            "failed to persist export cleanup recovery card: {error}"
+        );
+    }
+}
+
+/// `GET /ui/bulk-export` — the job list.
 pub async fn active(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
     principal: Option<Extension<helios_auth::Principal>>,
+    Query(query): Query<ActiveQuery>,
 ) -> Response {
     let i18n = I18n::new(locale);
     let status = current_status(&state, rv.0, &rt);
+    let available = state.settings.is_some();
     let user_key = settings_user_key(principal.as_deref());
-    let jobs = load_jobs(&state, &user_key, &rt.id).await;
+    let jobs = if available {
+        load_jobs(&state, &user_key, &rt.id).await
+    } else {
+        JobsSnapshot::default()
+    };
     let mut entries: Vec<(String, ExportJob)> = jobs
+        .jobs
         .iter()
         .map(|(id, v)| (id.clone(), parse_job(v)))
         .collect();
@@ -471,16 +933,26 @@ pub async fn active(
         .count();
     let cards = entries
         .iter()
-        .map(|(id, j)| job_card(&i18n, id, j))
+        .map(|(id, j)| job_card(&i18n, id, j, &state, &rt.id))
         .collect();
     render(ActiveExportsPage {
         status,
         i18n: I18n::new(locale),
         active_page: "bulk-export",
+        available,
         total: entries.len(),
         running,
         cards,
+        delete_error: matches!(
+            query.delete_error.as_deref(),
+            Some("remote") | Some("local")
+        ),
     })
+}
+
+/// `GET /ui/bulk-export/active` — permanent compatibility redirect.
+pub async fn active_redirect() -> Redirect {
+    Redirect::permanent("/ui/bulk-export")
 }
 
 /// `GET /ui/bulk-export/active/{id}/card` — one poll, then the refreshed card.
@@ -494,23 +966,48 @@ pub async fn card(
 ) -> Response {
     let i18n = I18n::new(locale);
     let user_key = settings_user_key(principal.as_deref());
-    let jobs = load_jobs(&state, &user_key, &rt.id).await;
-    let Some(mut job) = jobs.get(&id).map(parse_job) else {
+    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    let Some(original) = snapshot.jobs.get(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if job.status == "in-progress" && !job.poll_url.is_empty() {
-        poll_job(&mut job, &headers, &rt.id).await;
-        let _ = store_job(&state, &user_key, &rt.id, &id, &job).await;
+    let mut job = parse_job(original);
+    if job.status == "in-progress" {
+        poll_job(&state, &mut job, &headers, &rt.id).await;
+        let _ = store_job_conditionally(
+            &state,
+            &user_key,
+            &rt.id,
+            &id,
+            &job,
+            snapshot.version,
+            MemberExpectation::Unchanged(original),
+        )
+        .await;
     }
-    let card = job_card(&i18n, &id, &job);
+    let card = job_card(&i18n, &id, &job, &state, &rt.id);
     render(JobCardFragment { i18n, card })
 }
 
 /// One poll of the export status endpoint.
-async fn poll_job(job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
+async fn poll_job(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
+    let RemoteJobIdentity::Known(remote_id) = remote_job_identity(job, state, tenant) else {
+        job.status = "failed".to_string();
+        job.error = "status poll unavailable: remote job identity is unknown".to_string();
+        return;
+    };
+    let Ok(url) = status_url(state, tenant, &remote_id) else {
+        job.status = "failed".to_string();
+        job.error = "status poll unavailable: invalid HFS base URL".to_string();
+        return;
+    };
+    let Ok(client) = no_redirect_client() else {
+        job.status = "failed".to_string();
+        job.error = "status poll unavailable: HTTP client setup failed".to_string();
+        return;
+    };
     let request = forward_identity(
-        reqwest::Client::new()
-            .get(&job.poll_url)
+        client
+            .get(url)
             .header("Accept", "application/fhir+json")
             .timeout(std::time::Duration::from_secs(10)),
         headers,
@@ -558,12 +1055,16 @@ pub async fn cancel(
     Path(id): Path<String>,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
-    let jobs = load_jobs(&state, &user_key, &rt.id).await;
-    if let Some(mut job) = jobs.get(&id).map(parse_job) {
-        if !job.poll_url.is_empty() {
+    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    if let Some(original) = snapshot.jobs.get(&id) {
+        let mut job = parse_job(original);
+        if let RemoteJobIdentity::Known(remote_id) = remote_job_identity(&job, &state, &rt.id)
+            && let (Ok(client), Ok(url)) =
+                (no_redirect_client(), status_url(&state, &rt.id, &remote_id))
+        {
             let request = forward_identity(
-                reqwest::Client::new()
-                    .delete(&job.poll_url)
+                client
+                    .delete(url)
                     .timeout(std::time::Duration::from_secs(10)),
                 &headers,
                 &rt.id,
@@ -573,9 +1074,18 @@ pub async fn cancel(
         job.status = "cancelled".to_string();
         job.finished_at = now_stamp();
         job.progress = String::new();
-        let _ = store_job(&state, &user_key, &rt.id, &id, &job).await;
+        let _ = store_job_conditionally(
+            &state,
+            &user_key,
+            &rt.id,
+            &id,
+            &job,
+            snapshot.version,
+            MemberExpectation::Unchanged(original),
+        )
+        .await;
     }
-    Redirect::to("/ui/bulk-export/active").into_response()
+    Redirect::to("/ui/bulk-export").into_response()
 }
 
 /// `POST /ui/bulk-export/active/{id}/retry` — same parameters, fresh kick-off.
@@ -587,8 +1097,9 @@ pub async fn retry(
     Path(id): Path<String>,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
-    let jobs = load_jobs(&state, &user_key, &rt.id).await;
-    if let Some(mut job) = jobs.get(&id).map(parse_job) {
+    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    if let Some(original) = snapshot.jobs.get(&id) {
+        let mut job = parse_job(original);
         job.status = "in-progress".to_string();
         job.error = String::new();
         job.progress = String::new();
@@ -596,8 +1107,400 @@ pub async fn retry(
         job.poll_url = String::new();
         job.finished_at = String::new();
         job.started_at = now_stamp();
-        kickoff(&mut job, &headers, &rt.id).await;
-        let _ = store_job(&state, &user_key, &rt.id, &id, &job).await;
+        kickoff(&state, &mut job, &headers, &rt.id).await;
+        if store_job_conditionally(
+            &state,
+            &user_key,
+            &rt.id,
+            &id,
+            &job,
+            snapshot.version,
+            MemberExpectation::Unchanged(original),
+        )
+        .await
+        .is_err()
+        {
+            cleanup_or_record_recovery(&state, &user_key, &rt.id, &job, &headers).await;
+        }
     }
-    Redirect::to("/ui/bulk-export/active").into_response()
+    Redirect::to("/ui/bulk-export").into_response()
+}
+
+fn terminal_status(status: &str) -> bool {
+    matches!(status, "complete" | "failed" | "cancelled")
+}
+
+fn delete_error_redirect(kind: &str) -> Response {
+    Redirect::to(&format!("/ui/bulk-export?delete-error={kind}")).into_response()
+}
+
+/// `POST /ui/bulk-export/active/{id}/delete` — reclaim server output, then
+/// remove exactly one terminal UI record.
+pub async fn delete(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    let Some(original) = snapshot.jobs.get(&id) else {
+        return Redirect::to("/ui/bulk-export").into_response();
+    };
+    let job = parse_job(original);
+    if !terminal_status(&job.status) {
+        return Redirect::to("/ui/bulk-export").into_response();
+    }
+
+    match remote_job_identity(&job, &state, &rt.id) {
+        RemoteJobIdentity::Known(remote_id) => {
+            let (Ok(client), Ok(url)) =
+                (no_redirect_client(), status_url(&state, &rt.id, &remote_id))
+            else {
+                return delete_error_redirect("remote");
+            };
+            let response = forward_identity(
+                client
+                    .delete(url)
+                    .timeout(std::time::Duration::from_secs(10)),
+                &headers,
+                &rt.id,
+            )
+            .send()
+            .await;
+            match response {
+                Ok(response)
+                    if response.status().is_success()
+                        || response.status() == StatusCode::NOT_FOUND => {}
+                _ => return delete_error_redirect("remote"),
+            }
+        }
+        RemoteJobIdentity::NoRemoteJob => {}
+        RemoteJobIdentity::Unknown => return delete_error_redirect("remote"),
+    }
+
+    match remove_job_conditionally(&state, &user_key, &rt.id, &id, original, snapshot.version).await
+    {
+        Ok(()) => Redirect::to("/ui/bulk-export").into_response(),
+        Err(_) => delete_error_redirect("local"),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FreshManifest {
+    requires_access_token: bool,
+    output: Vec<FreshOutput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FreshOutput {
+    #[serde(rename = "type")]
+    resource_type: String,
+    url: String,
+}
+
+#[derive(Debug, Clone)]
+struct ZipPlanEntry {
+    resource_type: String,
+    ordinal: usize,
+    filename: String,
+    authenticated_url: Option<reqwest::Url>,
+}
+
+async fn fetch_fresh_manifest(
+    state: &WebState,
+    headers: &HeaderMap,
+    tenant: &str,
+    remote_id: &uuid::Uuid,
+) -> Result<FreshManifest, String> {
+    let client = no_redirect_client()?;
+    let url = status_url(state, tenant, remote_id)?;
+    let response = forward_identity(
+        client
+            .get(url)
+            .header("Accept", "application/fhir+json")
+            .timeout(std::time::Duration::from_secs(15)),
+        headers,
+        tenant,
+    )
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("manifest answered {}", response.status()));
+    }
+    let manifest = response
+        .json::<FreshManifest>()
+        .await
+        .map_err(|e| format!("invalid export manifest: {e}"))?;
+    if manifest.output.is_empty() {
+        return Err("export manifest has no output".to_string());
+    }
+    Ok(manifest)
+}
+
+fn trusted_output_url(
+    state: &WebState,
+    tenant: &str,
+    remote_id: &uuid::Uuid,
+    advertised: &str,
+) -> Result<reqwest::Url, String> {
+    let advertised = parse_url_without_credentials(advertised)
+        .ok_or_else(|| "invalid authenticated output URL".to_string())?;
+    let segments: Vec<&str> = advertised
+        .path_segments()
+        .ok_or_else(|| "authenticated output URL has no path".to_string())?
+        .collect();
+    let remote_id_text = remote_id.as_hyphenated().to_string();
+    let part = segments
+        .last()
+        .copied()
+        .filter(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+        .ok_or_else(|| "invalid authenticated output part".to_string())?;
+    let advertised_expected = public_api_url(
+        state,
+        tenant,
+        state.tenant_path_routing,
+        ["export-file", remote_id_text.as_str(), part],
+    )?;
+    if advertised.path() != advertised_expected.path() {
+        return Err("authenticated output URL is not this HFS job".to_string());
+    }
+    internal_api_url(
+        state,
+        tenant,
+        ["export-file", remote_id_text.as_str(), part],
+    )
+}
+
+fn external_output_url(advertised: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(advertised).map_err(|e| e.to_string())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("invalid pre-signed output URL".to_string());
+    }
+    Ok(url)
+}
+
+fn safe_resource_name(resource_type: &str) -> String {
+    let name: String = resource_type
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    if name.is_empty() {
+        "Resource".to_string()
+    } else {
+        name
+    }
+}
+
+fn unique_zip_filename(base: &str, ordinal: usize, used: &mut HashSet<String>) -> String {
+    let stem = format!("{base}-{ordinal:04}");
+    let mut collision = 1;
+    loop {
+        let suffix = if collision == 1 {
+            String::new()
+        } else {
+            format!("-{collision:02}")
+        };
+        let candidate = format!("{stem}{suffix}.ndjson");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        collision += 1;
+    }
+}
+
+fn zip_plan(
+    state: &WebState,
+    tenant: &str,
+    remote_id: &uuid::Uuid,
+    manifest: &FreshManifest,
+) -> Result<Vec<ZipPlanEntry>, String> {
+    let mut ordinals: HashMap<String, usize> = HashMap::new();
+    let mut filenames = HashSet::new();
+    manifest
+        .output
+        .iter()
+        .map(|output| {
+            let ordinal = ordinals.entry(output.resource_type.clone()).or_default();
+            *ordinal += 1;
+            let current = *ordinal;
+            let authenticated_url = manifest
+                .requires_access_token
+                .then(|| trusted_output_url(state, tenant, remote_id, &output.url))
+                .transpose()?;
+            Ok(ZipPlanEntry {
+                resource_type: output.resource_type.clone(),
+                ordinal: current,
+                filename: unique_zip_filename(
+                    &safe_resource_name(&output.resource_type),
+                    current,
+                    &mut filenames,
+                ),
+                authenticated_url,
+            })
+        })
+        .collect()
+}
+
+fn output_by_type_ordinal<'a>(
+    manifest: &'a FreshManifest,
+    resource_type: &str,
+    ordinal: usize,
+) -> Option<&'a FreshOutput> {
+    manifest
+        .output
+        .iter()
+        .filter(|output| output.resource_type == resource_type)
+        .nth(ordinal.saturating_sub(1))
+}
+
+async fn stream_zip(
+    state: WebState,
+    headers: HeaderMap,
+    tenant: String,
+    remote_id: uuid::Uuid,
+    plan: Vec<ZipPlanEntry>,
+    writer: tokio::io::DuplexStream,
+) -> Result<(), String> {
+    let client = no_redirect_client()?;
+    let mut archive = ZipFileWriter::with_tokio(writer);
+    for item in plan {
+        let (url, send_identity) = match item.authenticated_url {
+            Some(url) => (url, true),
+            None => {
+                // Pre-signed URLs expire. Re-poll immediately before every
+                // sequential fetch and select the same type ordinal.
+                let refreshed = fetch_fresh_manifest(&state, &headers, &tenant, &remote_id).await?;
+                if refreshed.requires_access_token {
+                    return Err("export manifest access posture changed".to_string());
+                }
+                let output = output_by_type_ordinal(&refreshed, &item.resource_type, item.ordinal)
+                    .ok_or_else(|| "export manifest output changed".to_string())?;
+                (external_output_url(&output.url)?, false)
+            }
+        };
+        let request = client.get(url).header("Accept", "application/fhir+ndjson");
+        let request = if send_identity {
+            forward_identity(request, &headers, &tenant)
+        } else {
+            request
+        };
+        let mut response = request.send().await.map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("output answered {}", response.status()));
+        }
+
+        let entry = ZipEntryBuilder::new(item.filename.into(), Compression::Stored);
+        let mut entry_writer = archive
+            .write_entry_stream(entry)
+            .await
+            .map_err(|e| e.to_string())?;
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            entry_writer
+                .write_all(&chunk)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        entry_writer.close().await.map_err(|e| e.to_string())?;
+    }
+    archive.close().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `GET /ui/bulk-export/active/{id}/download` — stream a fresh manifest's
+/// complete output set as one ZIP. A late source failure terminates the body;
+/// a concurrent Delete can therefore leave the client with a truncated ZIP.
+pub async fn download_all(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    let Some(job) = snapshot.jobs.get(&id).map(parse_job) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if job.status != "complete" || job.files.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let RemoteJobIdentity::Known(remote_id) = remote_job_identity(&job, &state, &rt.id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let manifest = match fetch_fresh_manifest(&state, &headers, &rt.id, &remote_id).await {
+        Ok(manifest) => manifest,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let plan = match zip_plan(&state, &rt.id, &remote_id, &manifest) {
+        Ok(plan) if !plan.is_empty() => plan,
+        _ => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+
+    let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let stream_state = state.clone();
+    let stream_headers = headers.clone();
+    let tenant = rt.id.clone();
+    tokio::spawn(async move {
+        let result = stream_zip(
+            stream_state,
+            stream_headers,
+            tenant,
+            remote_id,
+            plan,
+            writer,
+        )
+        .await;
+        let _ = done_tx.send(result);
+    });
+
+    let body_stream = async_stream::stream! {
+        let mut buffer = vec![0_u8; 16 * 1024];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => yield Ok::<Bytes, io::Error>(Bytes::copy_from_slice(&buffer[..read])),
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            }
+        }
+        match done_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => yield Err(io::Error::other(message)),
+            Err(_) => yield Err(io::Error::other("ZIP stream task ended unexpectedly")),
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/zip")
+        .header(
+            "Content-Disposition",
+            "attachment; filename=\"bulk-export.zip\"",
+        )
+        .header("Cache-Control", "no-store")
+        .body(Body::from_stream(body_stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }

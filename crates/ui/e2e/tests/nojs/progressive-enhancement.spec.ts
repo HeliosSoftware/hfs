@@ -154,7 +154,7 @@ test("Bulk Export can narrow through a conflicting native form without JavaScrip
   page,
   bulkExport,
 }) => {
-  await bulkExport.goto();
+  await page.goto("/ui/bulk-export/new");
 
   await expect(bulkExport.allResources).toBeChecked();
   await expect(bulkExport.typeCheckboxes).not.toHaveCount(0);
@@ -191,7 +191,7 @@ test("Bulk Export submits an exact custom instant without JavaScript", async ({
   page,
   bulkExport,
 }) => {
-  await bulkExport.goto();
+  await page.goto("/ui/bulk-export/new");
 
   const instant = "2026-08-01T00:00:00Z";
   await bulkExport.sincePreset.selectOption("custom");
@@ -212,4 +212,54 @@ test("Bulk Export submits an exact custom instant without JavaScript", async ({
   const params = new URLSearchParams(request.postData() ?? "");
   expect(params.get("since_preset")).toBe("custom");
   expect(params.get("since_custom")).toBe(instant);
+});
+
+test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
+  await page.goto("/ui/bulk-export");
+  const newExport = page.getByRole("link", { name: "New Export" });
+
+  // Backends without a settings store cannot track jobs and intentionally do
+  // not offer the builder from the management page.
+  if ((await newExport.count()) === 0) {
+    await expect(page.locator(".notice")).toContainText(/settings store/i);
+    return;
+  }
+
+  await newExport.click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export\/new$/);
+
+  const backLink = page.locator("a.back-link");
+  await expect(backLink).toHaveAttribute("href", "/ui/bulk-export");
+  const form = page.locator('form[action="/ui/bulk-export"]');
+  await expect(form).toHaveAttribute("method", "post");
+  await expect(form.locator(".form-actions > a")).toHaveCount(0);
+  const startExport = form.getByRole("button", { name: "Start Export" });
+  await expect(startExport).toBeVisible();
+
+  const exportName = `no-js-export-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await form.locator('input[name="name"]').fill(exportName);
+  await form.locator('input[name="scope"][value="system"]').check();
+  await startExport.click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  let card = page.locator(".job-card").filter({ hasText: exportName });
+  await expect(card).toBeVisible();
+
+  await card.getByRole("button", { name: "Cancel" }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  card = page.locator(".job-card").filter({ hasText: exportName });
+  await expect(card).toContainText("Cancelled");
+
+  const disclosure = card.locator("details.job-card__delete");
+  await disclosure.locator("summary").click();
+  await expect(disclosure).toHaveAttribute("open", "");
+  await disclosure.getByRole("link", { name: "Keep export" }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  card = page.locator(".job-card").filter({ hasText: exportName });
+  await expect(card).toBeVisible();
+
+  const reopened = card.locator("details.job-card__delete");
+  await reopened.locator("summary").click();
+  await reopened.getByRole("button", { name: "Delete export" }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
 });

@@ -15,7 +15,6 @@ use crate::core::{Transaction, TransactionOptions, TransactionProvider};
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
 };
-use crate::search::SearchParameterExtractor;
 use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
@@ -41,10 +40,13 @@ pub struct SqliteTransaction {
     active: bool,
     /// The tenant context for this transaction.
     tenant: TenantContext,
-    /// Search parameter extractor for indexing resources.
-    search_extractor: Arc<SearchParameterExtractor>,
-    /// When true, search indexing is offloaded to a secondary backend.
-    search_offloaded: bool,
+    /// The parent backend: writes in a transaction index through the same
+    /// path as direct writes (dynamic extraction with fallback, FTS,
+    /// contained resources), so the two can never drift (#815 review).
+    backend: SqliteBackend,
+    /// Whether a SearchParameter write in this transaction must invalidate
+    /// the tenant's cached registry once the commit lands.
+    invalidate_registry: bool,
     /// The FHIR version writes in this transaction are stamped with.
     fhir_version: FhirVersion,
 }
@@ -63,8 +65,7 @@ impl SqliteTransaction {
     fn new(
         conn: PooledConnection<SqliteConnectionManager>,
         tenant: TenantContext,
-        search_extractor: Arc<SearchParameterExtractor>,
-        search_offloaded: bool,
+        backend: SqliteBackend,
         fhir_version: FhirVersion,
     ) -> StorageResult<Self> {
         // Start the transaction
@@ -78,10 +79,26 @@ impl SqliteTransaction {
             conn: Arc::new(Mutex::new(conn)),
             active: true,
             tenant,
-            search_extractor,
-            search_offloaded,
+            backend,
+            invalidate_registry: false,
             fhir_version,
         })
+    }
+
+    /// Runs statements on this transaction's connection, so callers can make
+    /// their own rows atomic with the resource writes (e.g. bulk-submit's
+    /// rollback records and per-line receipts, #815 review).
+    pub(crate) fn with_connection<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> StorageResult<T>,
+    ) -> StorageResult<T> {
+        if !self.active {
+            return Err(StorageError::Transaction(
+                TransactionError::InvalidTransaction,
+            ));
+        }
+        let conn = self.conn.lock();
+        f(&conn)
     }
 
     /// Generate a new ID for a resource.
@@ -89,7 +106,10 @@ impl SqliteTransaction {
         uuid::Uuid::new_v4().to_string()
     }
 
-    /// Index a resource for search.
+    /// Index a resource for search — through the backend's own path (dynamic
+    /// extraction with minimal fallback, FTS content, contained resources),
+    /// so transactional writes are searchable exactly like direct ones
+    /// (#815 review).
     fn index_resource(
         &self,
         conn: &rusqlite::Connection,
@@ -98,66 +118,10 @@ impl SqliteTransaction {
         resource_id: &str,
         resource: &Value,
     ) -> StorageResult<()> {
-        // When search is offloaded to a secondary backend, skip local indexing
-        if self.search_offloaded {
-            return Ok(());
-        }
-
-        use super::search::writer::SqliteSearchIndexWriter;
-        use rusqlite::ToSql;
-
-        // First, delete any existing index entries for this resource
-        conn.execute(
-            "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
-            params![tenant_id, resource_type, resource_id],
-        )
-        .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
-
-        // Extract values using the registry-driven extractor
-        let values = self
-            .search_extractor
-            .extract(resource, resource_type)
-            .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
-
-        // Write each extracted value to the index
-        for value in values {
-            let sql_params = SqliteSearchIndexWriter::to_sql_params(
-                tenant_id,
-                resource_type,
-                resource_id,
-                &value,
-            );
-
-            // Build parameter refs for rusqlite
-            let param_refs: Vec<&dyn ToSql> =
-                sql_params.iter().map(Self::sql_value_to_ref).collect();
-
-            conn.execute(SqliteSearchIndexWriter::insert_sql(), param_refs.as_slice())
-                .map_err(|e| {
-                    internal_error(format!("Failed to insert search index entry: {}", e))
-                })?;
-        }
-
-        tracing::debug!(
-            "Indexed resource {}/{} within transaction",
-            resource_type,
-            resource_id
-        );
-
-        Ok(())
-    }
-
-    /// Converts a SqlValue to a rusqlite-compatible reference.
-    fn sql_value_to_ref(value: &super::search::writer::SqlValue) -> &dyn rusqlite::ToSql {
-        use super::search::writer::SqlValue;
-        match value {
-            SqlValue::String(s) => s,
-            SqlValue::OptString(opt) => opt,
-            SqlValue::Int(i) => i,
-            SqlValue::OptInt(opt) => opt,
-            SqlValue::Float(f) => f,
-            SqlValue::Null => &rusqlite::types::Null,
-        }
+        self.backend
+            .delete_search_index(conn, tenant_id, resource_type, resource_id)?;
+        self.backend
+            .index_resource(conn, tenant_id, resource_type, resource_id, resource)
     }
 }
 
@@ -241,6 +205,19 @@ impl Transaction for SqliteTransaction {
 
         // Index the resource for search
         self.index_resource(&conn, tenant_id, resource_type, &id, &data)?;
+        drop(conn);
+
+        // Mirrors the storage path: an overlay-affecting SearchParameter
+        // write invalidates the tenant's cached registry — once the commit
+        // makes it readable.
+        if resource_type == "SearchParameter"
+            && self
+                .backend
+                .tenant_registries()
+                .create_affects_overlay(&data)
+        {
+            self.invalidate_registry = true;
+        }
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -422,6 +399,13 @@ impl Transaction for SqliteTransaction {
 
         // Re-index the resource for search
         self.index_resource(&conn, tenant_id, resource_type, id, &data)?;
+        drop(conn);
+
+        // A SearchParameter write invalidates this tenant's cached registry
+        // (after commit), mirroring the storage path.
+        if resource_type == "SearchParameter" {
+            self.invalidate_registry = true;
+        }
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -490,6 +474,13 @@ impl Transaction for SqliteTransaction {
             params![tenant_id, resource_type, id, new_version_str, data, deleted_at, fhir_version_str],
         )
         .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
+        drop(conn);
+
+        // A SearchParameter delete invalidates this tenant's cached registry
+        // (after commit), mirroring the storage path.
+        if resource_type == "SearchParameter" {
+            self.invalidate_registry = true;
+        }
 
         Ok(())
     }
@@ -507,8 +498,17 @@ impl Transaction for SqliteTransaction {
                 reason: format!("Commit failed: {}", e),
             })
         })?;
+        drop(conn);
 
         self.active = false;
+
+        // Only a landed commit makes the SearchParameter rows readable, so
+        // the registry invalidation waits until here.
+        if self.invalidate_registry {
+            self.backend
+                .tenant_registries()
+                .invalidate(self.tenant.tenant_id().as_str());
+        }
         Ok(())
     }
 
@@ -562,8 +562,7 @@ impl TransactionProvider for SqliteBackend {
         SqliteTransaction::new(
             conn,
             tenant.clone(),
-            Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
-            self.is_search_offloaded(),
+            self.clone(),
             options.fhir_version.unwrap_or(self.config().fhir_version),
         )
     }
