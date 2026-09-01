@@ -1,4 +1,4 @@
-// Bulk Export builder (/ui/bulk-export): scope, All Resources, individual
+// Bulk Export builder (/ui/bulk-export/new): scope, All Resources, individual
 // resource types, narrowing controls, and native form actions.
 import type { Locator, Page } from "@playwright/test";
 
@@ -6,7 +6,7 @@ export class BulkExportPage {
   constructor(readonly page: Page) {}
 
   async goto(): Promise<void> {
-    await this.page.goto("/ui/bulk-export", { waitUntil: "networkidle" });
+    await this.page.goto("/ui/bulk-export/new", { waitUntil: "networkidle" });
   }
 
   get form(): Locator {
@@ -49,6 +49,34 @@ export class BulkExportPage {
 
   scopeRadio(scope: "system" | "patient" | "group"): Locator {
     return this.form.locator(`input[name="scope"][value="${scope}"]`);
+  }
+
+  get patientCombobox(): Locator {
+    return this.form.locator("#bulk-export-patients");
+  }
+
+  get patientFallback(): Locator {
+    return this.patientCombobox.locator('textarea[name="patient"]');
+  }
+
+  get patientSearch(): Locator {
+    return this.patientCombobox.getByRole("combobox");
+  }
+
+  get patientListbox(): Locator {
+    return this.patientCombobox.getByRole("listbox");
+  }
+
+  get patientMessage(): Locator {
+    return this.patientCombobox.locator("[data-combobox-message]");
+  }
+
+  get patientHint(): Locator {
+    return this.patientCombobox.locator("[data-combobox-hint]");
+  }
+
+  get selectedPatients(): Locator {
+    return this.patientCombobox.locator('[data-combobox-selected-input][name="patient"]');
   }
 
   get clearButton(): Locator {

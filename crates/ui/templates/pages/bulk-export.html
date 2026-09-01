@@ -1,4 +1,5 @@
 {% extends "layouts/base.html" %}
+{% import "partials/combobox.html" as combobox %}
 
 {% block title %}{{ i18n.t("bulk-export-title") }} — {{ i18n.t("app-title") }}{% endblock %}
 
@@ -63,6 +64,20 @@
     <input class="field__input" type="text" name="group_id" autocomplete="off">
     <span class="field__hint">{{ i18n.t("bulk-export-field-group-id-hint") }}</span>
   </label>
+
+  {% call combobox::multi_select(
+    "bulk-export-patients",
+    "patient",
+    i18n.t("bulk-export-field-patients"),
+    patient_placeholder,
+    patient_hint,
+    i18n.t("bulk-export-field-patients-fallback-placeholder"),
+    i18n.t("bulk-export-field-patients-fallback-hint"),
+    "/ui/bulk-export/patient-options",
+    "combobox--scope-patient",
+    i18n.t("bulk-export-field-patients-id-only-hint"),
+    i18n.t("bulk-export-field-patients-id-only-placeholder")
+  ) %}{% endcall %}
 
   <section class="card">
     <div class="card-head">
@@ -129,5 +144,6 @@
 </form>
 {% endif %}
 <script src="/ui/assets/resource-filter.js" defer></script>
+<script src="/ui/assets/combobox.js" defer></script>
 <script src="/ui/assets/bulk-export.js" defer></script>
 {% endblock %}

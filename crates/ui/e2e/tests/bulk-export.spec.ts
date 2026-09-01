@@ -1,4 +1,23 @@
 import { test, expect } from "../pages/fixtures";
+import AxeBuilder from "@axe-core/playwright";
+import { axeSummary } from "../pages/axe";
+
+const patientOptions = `
+  <button type="button" class="combobox__option" data-combobox-option
+          data-value="Patient/p-104" data-label="Ana Rivera">Ana Rivera · Patient/p-104</button>
+  <button type="button" class="combobox__option" data-combobox-option
+          data-value="Patient/p-205" data-label="Andrés Silva">Andrés Silva · Patient/p-205</button>`;
+
+function patientMessage(message: string, options: { error?: boolean; alternate?: boolean } = {}) {
+  return `<div id="bulk-export-patients-message" hx-swap-oob="innerHTML">
+    ${options.alternate ? '<span data-combobox-use-alternate hidden></span>' : ""}
+    <span class="field__hint${options.error ? " field__hint--error" : ""}"
+          data-combobox-message-content>${message}</span>
+  </div>`;
+}
+
+const clearPatientMessage =
+  '<div id="bulk-export-patients-message" hx-swap-oob="innerHTML"></div>';
 
 test("All Resources is the enhanced default", async ({ bulkExport }) => {
   await bulkExport.goto();
@@ -168,6 +187,221 @@ test("Custom instant follows the Since preset and form serialization", async ({ 
       (form) => new FormData(form as HTMLFormElement).get("since_custom"),
     ),
   ).toBe(instant);
+});
+
+test("Patient combobox supports keyboard selection, dedupe, removal, and scope serialization", async ({
+  page,
+  bulkExport,
+}) => {
+  const queries: string[] = [];
+  await page.route("**/ui/bulk-export/patient-options", (route) => {
+    queries.push(new URLSearchParams(route.request().postData() ?? "").get("q") ?? "");
+    return route.fulfill({ status: 200, contentType: "text/html", body: patientOptions });
+  });
+  await bulkExport.goto();
+
+  await expect(bulkExport.patientCombobox).toBeHidden();
+  await expect(bulkExport.patientFallback).toBeDisabled();
+  await bulkExport.scopeRadio("patient").check();
+  await expect(bulkExport.patientCombobox).toBeVisible();
+  await expect(bulkExport.patientSearch).toBeEnabled();
+  await expect(bulkExport.patientSearch).toHaveAttribute("aria-expanded", "false");
+
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
+  await expect(bulkExport.patientListbox.getByRole("option")).toHaveCount(2);
+  expect(queries).toEqual(["an"]);
+
+  await bulkExport.patientSearch.press("End");
+  await expect(bulkExport.patientSearch).toHaveAttribute("aria-activedescendant", /option-1$/);
+  await bulkExport.patientSearch.press("Home");
+  await expect(bulkExport.patientSearch).toHaveAttribute("aria-activedescendant", /option-0$/);
+  await bulkExport.patientSearch.press("Escape");
+  await expect(bulkExport.patientListbox).toBeHidden();
+  await bulkExport.patientSearch.press("ArrowDown");
+  await bulkExport.patientSearch.press("Enter");
+
+  await expect(bulkExport.selectedPatients).toHaveCount(1);
+  await expect(bulkExport.selectedPatients).toHaveValue("Patient/p-104");
+  await expect(bulkExport.patientCombobox.getByText("Ana Rivera", { exact: true })).toBeVisible();
+  await expect(bulkExport.patientListbox.getByRole("option").first()).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await expect(bulkExport.patientCombobox.locator("[data-combobox-status]")).toContainText(
+    "Added Ana Rivera",
+  );
+  expect(
+    await bulkExport.form.evaluate((form) =>
+      new FormData(form as HTMLFormElement).getAll("patient"),
+    ),
+  ).toEqual(["Patient/p-104"]);
+  expect(
+    await bulkExport.form.evaluate((form) => new FormData(form as HTMLFormElement).has("q")),
+  ).toBe(false);
+
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
+  await bulkExport.patientListbox.getByRole("option").first().click();
+  await expect(bulkExport.selectedPatients).toHaveCount(1);
+
+  await bulkExport.scopeRadio("system").check();
+  await expect(bulkExport.patientCombobox).toBeHidden();
+  await expect(bulkExport.selectedPatients).toBeDisabled();
+  expect(
+    await bulkExport.form.evaluate((form) =>
+      new FormData(form as HTMLFormElement).has("patient"),
+    ),
+  ).toBe(false);
+
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientCombobox.getByRole("button", { name: "Remove Ana Rivera" }).click();
+  await expect(bulkExport.selectedPatients).toHaveCount(0);
+  await expect(bulkExport.patientSearch).toBeFocused();
+});
+
+test("Patient combobox closes on Tab and Clear removes selected patients", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.route("**/ui/bulk-export/patient-options", (route) =>
+    route.fulfill({ status: 200, contentType: "text/html", body: patientOptions }),
+  );
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
+  await bulkExport.patientSearch.press("Tab");
+  await expect(bulkExport.patientListbox).toBeHidden();
+
+  await bulkExport.patientSearch.focus();
+  await bulkExport.patientSearch.press("ArrowUp");
+  await bulkExport.patientSearch.press("Enter");
+  await expect(bulkExport.selectedPatients).toHaveValue("Patient/p-205");
+  await bulkExport.patientSearch.press("Escape");
+  await bulkExport.clearButton.click();
+  await expect(bulkExport.scopeRadio("system")).toBeChecked();
+  await expect(bulkExport.selectedPatients).toHaveCount(0);
+});
+
+test("open Patient combobox has no automated accessibility violations", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.route("**/ui/bulk-export/patient-options", (route) =>
+    route.fulfill({ status: 200, contentType: "text/html", body: patientOptions }),
+  );
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
+  await bulkExport.patientSearch.press("ArrowDown");
+  await bulkExport.patientSearch.press("Enter");
+
+  const { violations } = await new AxeBuilder({ page }).analyze();
+  expect(violations, axeSummary(violations)).toEqual([]);
+});
+
+test("Patient combobox shows empty and error messages and persists a runtime ID-only downgrade", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.route("**/ui/bulk-export/patient-options", (route) => {
+    const query = new URLSearchParams(route.request().postData() ?? "").get("q");
+    if (query === "transport") {
+      return route.fulfill({ status: 500, contentType: "text/plain", body: "server error" });
+    }
+    let body = patientMessage("No matching patients found.");
+    if (query === "an") {
+      body = patientOptions + clearPatientMessage;
+    } else if (query === "one") {
+      body = patientOptions.split("</button>")[0] + "</button>" + clearPatientMessage;
+    } else if (query === "fail") {
+      body = patientMessage("Suggestions could not be loaded. Try again.", { error: true });
+    } else if (query === "Nobody") {
+      body = patientMessage("No matching patients found.", { alternate: true });
+    }
+    return route.fulfill({ status: 200, contentType: "text/html", body });
+  });
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+
+  await bulkExport.patientSearch.fill("zz");
+  await expect(bulkExport.patientListbox).toBeHidden();
+  await expect(bulkExport.patientMessage).toBeVisible();
+  await expect(bulkExport.patientMessage).toHaveText("No matching patients found.");
+  await expect(bulkExport.patientCombobox.locator("[data-combobox-status]")).toHaveText(
+    "No matching patients found.",
+  );
+  let violations = (await new AxeBuilder({ page }).analyze()).violations;
+  expect(violations, axeSummary(violations)).toEqual([]);
+
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
+  await expect(bulkExport.patientListbox.getByRole("option")).toHaveCount(2);
+  await expect(bulkExport.patientMessage).toBeHidden();
+
+  await bulkExport.patientSearch.press("End");
+  await expect(bulkExport.patientSearch).toHaveAttribute("aria-activedescendant", /option-1$/);
+  await bulkExport.patientSearch.fill("one");
+  await expect(bulkExport.patientListbox.getByRole("option")).toHaveCount(1);
+  await expect(bulkExport.patientSearch).not.toHaveAttribute("aria-activedescendant", /.+/);
+  await bulkExport.patientSearch.press("ArrowDown");
+  await expect(bulkExport.patientSearch).toHaveAttribute("aria-activedescendant", /option-0$/);
+
+  await bulkExport.patientSearch.fill("zz");
+  await expect(bulkExport.patientListbox).toBeHidden();
+  await expect(bulkExport.patientSearch).not.toHaveAttribute("aria-activedescendant", /.+/);
+  await bulkExport.clearButton.click();
+  await bulkExport.scopeRadio("patient").check();
+  await expect(bulkExport.patientMessage).toBeHidden();
+
+  await bulkExport.patientSearch.fill("fail");
+  await expect(bulkExport.patientMessage.locator(".field__hint--error")).toBeVisible();
+  await expect(bulkExport.patientMessage).toContainText("Suggestions could not be loaded");
+  violations = (await new AxeBuilder({ page }).analyze()).violations;
+  expect(violations, axeSummary(violations)).toEqual([]);
+
+  await bulkExport.clearButton.click();
+  await bulkExport.scopeRadio("patient").check();
+  await expect(bulkExport.patientMessage).toBeHidden();
+
+  await bulkExport.patientSearch.fill("transport");
+  await expect(bulkExport.patientListbox).toBeHidden();
+  await expect(bulkExport.patientMessage.locator(".field__hint--error")).toBeVisible();
+  await expect(bulkExport.patientMessage).toContainText("Suggestions could not be loaded");
+  await expect(bulkExport.patientCombobox.locator("[data-combobox-status]")).toHaveText(
+    "Suggestions could not be loaded. Try again.",
+  );
+  violations = (await new AxeBuilder({ page }).analyze()).violations;
+  expect(violations, axeSummary(violations)).toEqual([]);
+
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
+  await bulkExport.patientSearch.evaluate((input) =>
+    input.dispatchEvent(new CustomEvent("htmx:sendError", { bubbles: true })),
+  );
+  await expect(bulkExport.patientListbox).toBeHidden();
+  await expect(bulkExport.patientMessage.locator(".field__hint--error")).toBeVisible();
+  await expect(bulkExport.patientMessage).toContainText("Suggestions could not be loaded");
+
+  await bulkExport.patientSearch.fill("Nobody");
+  await expect(bulkExport.patientMessage).toHaveText("No matching patients found.");
+  await expect(bulkExport.patientCombobox).toHaveAttribute("data-combobox-mode", "alternate");
+  await expect(bulkExport.patientHint).toContainText("exact logical FHIR ID");
+  await expect(bulkExport.patientSearch).toHaveAttribute("placeholder", "Search exact FHIR ID");
+  await expect(bulkExport.patientMessage).not.toHaveText(await bulkExport.patientHint.innerText());
+  await bulkExport.patientSearch.press("Escape");
+  await expect(bulkExport.patientHint).toContainText("exact logical FHIR ID");
+  await expect(bulkExport.patientSearch).toHaveAttribute("placeholder", "Search exact FHIR ID");
+  await bulkExport.clearButton.click();
+  await bulkExport.scopeRadio("patient").check();
+  await expect(bulkExport.patientMessage).toBeHidden();
+  await expect(bulkExport.patientCombobox).toHaveAttribute("data-combobox-mode", "alternate");
+  await expect(bulkExport.patientHint).toContainText("exact logical FHIR ID");
+  await expect(bulkExport.patientSearch).toHaveAttribute("placeholder", "Search exact FHIR ID");
+  violations = (await new AxeBuilder({ page }).analyze()).violations;
+  expect(violations, axeSummary(violations)).toEqual([]);
 });
 
 test("keyboard narrowing submits exactly the two selected resource types", async ({

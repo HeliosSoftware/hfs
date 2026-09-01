@@ -5,13 +5,13 @@
 //! mock FHIR export backend and serve the whole thing on a real socket: the
 //! kick-off and status polls loop back into the mock.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxPath, State as AxState};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::{Json, Router};
 use helios_fhir::FhirVersion;
@@ -34,6 +34,43 @@ struct SeenDownload {
     path: String,
     authorization: Option<String>,
     tenant: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CapturedRequest {
+    method: Method,
+    path: String,
+    query: String,
+    authorization: String,
+    tenant: String,
+    accept: String,
+    content_type: String,
+    body: String,
+}
+
+fn capture(
+    method: Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> CapturedRequest {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    CapturedRequest {
+        method,
+        path: uri.path().to_string(),
+        query: uri.query().unwrap_or_default().to_string(),
+        authorization: header("authorization"),
+        tenant: header("x-tenant-id"),
+        accept: header("accept"),
+        content_type: header("content-type"),
+        body: String::from_utf8_lossy(&body).to_string(),
+    }
 }
 
 #[derive(Default)]
@@ -64,6 +101,11 @@ struct MockExport {
     status_gate: Arc<Mutex<Option<Arc<RequestGate>>>>,
     delete_gate: Arc<Mutex<Option<Arc<RequestGate>>>>,
     kickoff_gate: Arc<Mutex<Option<Arc<RequestGate>>>>,
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    patients: Arc<Mutex<Vec<serde_json::Value>>>,
+    search_status: Arc<Mutex<u16>>,
+    patient_read_status: Arc<Mutex<u16>>,
+    patient_read_body: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for MockExport {
@@ -93,6 +135,11 @@ impl Default for MockExport {
             status_gate: Default::default(),
             delete_gate: Default::default(),
             kickoff_gate: Default::default(),
+            requests: Default::default(),
+            patients: Default::default(),
+            search_status: Arc::new(Mutex::new(200)),
+            patient_read_status: Arc::new(Mutex::new(200)),
+            patient_read_body: Default::default(),
         }
     }
 }
@@ -100,9 +147,15 @@ impl Default for MockExport {
 fn mock_fhir_app(state: MockExport) -> Router {
     async fn kickoff(
         AxState(s): AxState<MockExport>,
+        method: Method,
         headers: HeaderMap,
         uri: axum::http::Uri,
+        body: Bytes,
     ) -> axum::response::Response {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri.clone(), headers.clone(), body));
         s.kickoffs.lock().unwrap().push((
             uri.path().to_string(),
             uri.query().unwrap_or("").to_string(),
@@ -135,9 +188,15 @@ fn mock_fhir_app(state: MockExport) -> Router {
     }
     async fn status(
         AxState(s): AxState<MockExport>,
+        method: Method,
         headers: HeaderMap,
         uri: axum::http::Uri,
+        body: Bytes,
     ) -> axum::response::Response {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri.clone(), headers.clone(), body));
         let gate = s.status_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.reached.notify_one();
@@ -182,7 +241,17 @@ fn mock_fhir_app(state: MockExport) -> Router {
             .into_response()
         }
     }
-    async fn cancel(AxState(s): AxState<MockExport>) -> StatusCode {
+    async fn cancel(
+        AxState(s): AxState<MockExport>,
+        method: Method,
+        headers: HeaderMap,
+        uri: axum::http::Uri,
+        body: Bytes,
+    ) -> StatusCode {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri, headers, body));
         let gate = s.delete_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.reached.notify_one();
@@ -264,13 +333,86 @@ fn mock_fhir_app(state: MockExport) -> Router {
         )
             .into_response()
     }
+
+    async fn patient_search(
+        AxState(s): AxState<MockExport>,
+        method: Method,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri, headers, body));
+        let status = StatusCode::from_u16(*s.search_status.lock().unwrap()).unwrap();
+        if !status.is_success() {
+            return status.into_response();
+        }
+        Json(serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "entry": s.patients.lock().unwrap().iter().cloned()
+                .map(|resource| serde_json::json!({"resource": resource}))
+                .collect::<Vec<_>>()
+        }))
+        .into_response()
+    }
+
+    async fn patient_read(
+        AxState(s): AxState<MockExport>,
+        AxPath(params): AxPath<HashMap<String, String>>,
+        method: Method,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri, headers, body));
+        let status = StatusCode::from_u16(*s.patient_read_status.lock().unwrap()).unwrap();
+        if let Some(body) = s.patient_read_body.lock().unwrap().clone() {
+            return (status, body).into_response();
+        }
+        if !status.is_success() {
+            return status.into_response();
+        }
+        let id = params.get("id").expect("route includes id");
+        s.patients
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|patient| patient["id"] == *id)
+            .cloned()
+            .map(Json)
+            .map(IntoResponse::into_response)
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+    }
+
     Router::new()
-        .route("/$export", axum::routing::get(kickoff))
-        .route("/{tenant}/$export", axum::routing::get(kickoff))
-        .route("/Patient/$export", axum::routing::get(kickoff))
-        .route("/{tenant}/Patient/$export", axum::routing::get(kickoff))
+        .route("/$export", axum::routing::get(kickoff).post(kickoff))
+        .route(
+            "/{tenant}/$export",
+            axum::routing::get(kickoff).post(kickoff),
+        )
+        .route(
+            "/Patient/$export",
+            axum::routing::get(kickoff).post(kickoff),
+        )
+        .route(
+            "/{tenant}/Patient/$export",
+            axum::routing::get(kickoff).post(kickoff),
+        )
         .route("/Group/{id}/$export", axum::routing::get(kickoff))
         .route("/{tenant}/Group/{id}/$export", axum::routing::get(kickoff))
+        .route("/Patient/_search", axum::routing::post(patient_search))
+        .route("/Patient/{id}", axum::routing::get(patient_read))
+        .route(
+            "/{tenant}/Patient/_search",
+            axum::routing::post(patient_search),
+        )
+        .route("/{tenant}/Patient/{id}", axum::routing::get(patient_read))
         .route(
             "/export-status/{id}",
             axum::routing::get(status).delete(cancel),
@@ -349,6 +491,42 @@ async fn serve() -> (String, MockExport, Arc<SqliteBackend>) {
     serve_with_settings(true).await
 }
 
+async fn serve_with_runtime(
+    patient_name_search: helios_ui::PatientNameSearchSupport,
+    tenant_path_routing: bool,
+) -> (String, MockExport, Arc<SqliteBackend>) {
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    let settings: Arc<dyn SettingsStore> = backend.clone();
+    let mock = MockExport::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let app = helios_ui::mount_with_conformance_source_and_runtime(
+        mock_fhir_app(mock.clone()),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        helios_ui::NlSearch::default(),
+        None,
+        Some(settings),
+        "default".to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        FhirVersion::R4,
+        None,
+        base.clone(),
+        10 * 1024 * 1024,
+        tenant_path_routing,
+        None,
+        base.clone(),
+        patient_name_search,
+    )
+    .layer(axum::middleware::from_fn(inject_test_principal));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, mock, backend)
+}
+
 async fn serve_with_separate_public_base(
     public_base: &str,
     tenant_path_routing: bool,
@@ -381,6 +559,7 @@ async fn serve_with_separate_public_base(
         10 * 1024 * 1024,
         tenant_path_routing,
         None,
+        helios_ui::PatientNameSearchSupport::Enabled,
     )
     .layer(axum::middleware::from_fn(inject_test_principal));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -413,6 +592,45 @@ async fn post_form(base: &str, path: &str, form: &[(&str, &str)]) -> (u16, Strin
         .unwrap_or("")
         .to_string();
     (res.status().as_u16(), location)
+}
+
+async fn post_form_body(base: &str, path: &str, form: &[(&str, &str)]) -> (u16, String) {
+    let response = client()
+        .post(format!("{base}{path}"))
+        .form(form)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+async fn post_patient_query(
+    base: &str,
+    path: &str,
+    q: &str,
+    authorization: Option<&str>,
+) -> (u16, HeaderMap, String) {
+    let mut request = client()
+        .post(format!("{base}{path}"))
+        .header("HX-Request", "true")
+        .form(&[("q", q)]);
+    if let Some(authorization) = authorization {
+        request = request.header("Authorization", authorization);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap();
+    (status, headers, body)
+}
+
+fn patient(id: &str, given: &str, family: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "Patient",
+        "id": id,
+        "name": [{"given": [given], "family": family}]
+    })
 }
 
 fn query_values(query: &str, name: &str) -> Vec<String> {
@@ -1696,4 +1914,357 @@ async fn a_malformed_fresh_authenticated_url_causes_no_output_fetch() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(mock.downloads.lock().unwrap().len(), downloads_before);
+}
+
+#[tokio::test]
+async fn patient_options_merge_exact_first_deduplicate_and_limit_results() {
+    let (base, mock, _) = serve().await;
+    *mock.patients.lock().unwrap() = (0..10)
+        .map(|index| {
+            patient(
+                &format!("alice-{index}"),
+                "Alice",
+                &format!("Family {index}"),
+            )
+        })
+        .collect();
+
+    let (status, headers, html) =
+        post_patient_query(&base, "/ui/bulk-export/patient-options", "alice-3", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "private, no-store");
+    assert_eq!(html.matches("data-combobox-option").count(), 8, "{html}");
+    let exact = html.find("Patient/alice-3").unwrap();
+    let first_other = html.find("Patient/alice-0").unwrap();
+    assert!(exact < first_other, "exact id must be first: {html}");
+    assert_eq!(html.matches("Patient/alice-3").count(), 3, "{html}");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    let search = requests
+        .iter()
+        .find(|request| request.path.ends_with("/Patient/_search"))
+        .expect("name search request");
+    let form: HashMap<_, _> = form_urlencoded::parse(search.body.as_bytes()).collect();
+    assert_eq!(
+        form.get("name").map(|value| value.as_ref()),
+        Some("alice-3")
+    );
+    assert_eq!(form.get("_count").map(|value| value.as_ref()), Some("9"));
+    assert_eq!(
+        form.get("_elements").map(|value| value.as_ref()),
+        Some("id,name")
+    );
+}
+
+#[tokio::test]
+async fn patient_options_honor_query_boundaries_and_non_hx_redirect() {
+    let (base, mock, _) = serve().await;
+    *mock.patients.lock().unwrap() = vec![patient("a", "Ada", "Lovelace")];
+
+    let (_, _, html) = post_patient_query(&base, "/ui/bulk-export/patient-options", "", None).await;
+    assert!(html.contains("hx-swap-oob=\"innerHTML\""), "{html}");
+    assert!(!html.contains("data-combobox-message-content"), "{html}");
+    let (_, _, html) =
+        post_patient_query(&base, "/ui/bulk-export/patient-options", "a", None).await;
+    assert!(html.contains("Patient/a"));
+    assert_eq!(
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path.ends_with("/_search"))
+            .count(),
+        0,
+        "one-character queries only attempt exact id"
+    );
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/bulk-export/patient-options",
+        &"x".repeat(65),
+        None,
+    )
+    .await;
+    assert!(html.contains("Suggestions could not be loaded"), "{html}");
+    assert!(html.contains("field__hint--error"), "{html}");
+
+    let response = client()
+        .post(format!("{base}/ui/bulk-export/patient-options"))
+        .form(&[("q", "Ada")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/ui/bulk-export/new");
+}
+
+#[tokio::test]
+async fn exact_patient_read_treats_gone_as_no_match_and_rejects_invalid_success_payloads() {
+    let (base, mock, _) = serve().await;
+    *mock.patient_read_status.lock().unwrap() = 410;
+    *mock.patients.lock().unwrap() = vec![patient("search-result", "Gone", "Replacement")];
+    let (_, _, html) =
+        post_patient_query(&base, "/ui/bulk-export/patient-options", "gone", None).await;
+    assert!(html.contains("Patient/search-result"), "{html}");
+    assert!(
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.path.ends_with("/Patient/_search")),
+        "410 exact reads should continue with name search"
+    );
+
+    for body in [
+        "not json".to_string(),
+        serde_json::json!({"resourceType": "Observation", "id": "broken"}).to_string(),
+        serde_json::json!({"resourceType": "Patient", "id": "not/valid"}).to_string(),
+        serde_json::json!({"resourceType": "Patient", "id": "different"}).to_string(),
+    ] {
+        let (base, mock, _) = serve().await;
+        *mock.patient_read_body.lock().unwrap() = Some(body);
+        let (_, _, html) =
+            post_patient_query(&base, "/ui/bulk-export/patient-options", "broken", None).await;
+        assert!(html.contains("Suggestions could not be loaded"), "{html}");
+        assert_eq!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.path.ends_with("/Patient/_search"))
+                .count(),
+            0,
+            "a malformed successful exact read is a protocol error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn not_implemented_name_search_downgrades_once_but_other_failures_do_not() {
+    let (base, mock, _) = serve().await;
+    *mock.search_status.lock().unwrap() = 501;
+    for _ in 0..2 {
+        let (_, _, html) =
+            post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+        assert!(html.contains("data-combobox-use-alternate"), "{html}");
+    }
+    assert_eq!(
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path.ends_with("/_search"))
+            .count(),
+        1,
+        "a 501 capability downgrade is cached"
+    );
+
+    for status in [403, 500] {
+        let (base, mock, _) = serve().await;
+        *mock.search_status.lock().unwrap() = status;
+        let (_, _, html) =
+            post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+        assert!(html.contains("Suggestions could not be loaded"), "{html}");
+        assert!(!html.contains("data-combobox-use-alternate"), "{html}");
+    }
+}
+
+#[tokio::test]
+async fn id_only_mode_renders_its_hint_and_never_attempts_name_search() {
+    let (base, mock, _) =
+        serve_with_runtime(helios_ui::PatientNameSearchSupport::IdOnly, false).await;
+    *mock.patients.lock().unwrap() = vec![patient("p-1", "Pat", "One")];
+    let (_, page) = get_text(&base, "/ui/bulk-export/new").await;
+    assert!(page.contains("Search by exact logical FHIR ID"), "{page}");
+    assert!(
+        page.contains("placeholder=\"Search exact FHIR ID\""),
+        "{page}"
+    );
+    assert!(
+        !page.contains("placeholder=\"Search name, surname"),
+        "{page}"
+    );
+
+    let (_, _, html) =
+        post_patient_query(&base, "/ui/bulk-export/patient-options", "p-1", None).await;
+    assert!(html.contains("Patient/p-1"), "{html}");
+
+    let (_, _, missing_html) =
+        post_patient_query(&base, "/ui/bulk-export/patient-options", "an", None).await;
+    assert!(
+        missing_html.contains("No matching patients found"),
+        "{missing_html}"
+    );
+    assert!(
+        !missing_html.contains("Search by exact logical FHIR ID"),
+        "the fixed ID-only hint must not be repeated as a search result: {missing_html}"
+    );
+    assert!(
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.path.ends_with("/_search"))
+    );
+}
+
+#[tokio::test]
+async fn patient_lookup_uses_tenant_path_version_and_forwarded_identity() {
+    let (base, mock, _) =
+        serve_with_runtime(helios_ui::PatientNameSearchSupport::Enabled, true).await;
+    *mock.patients.lock().unwrap() = vec![patient("p-1", "Pat", "One")];
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/bulk-export/patient-options",
+        "p-1",
+        Some("Bearer patient-token"),
+    )
+    .await;
+    assert!(html.contains("Patient/p-1"), "{html}");
+    let requests = mock.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path.starts_with("/default/"))
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.authorization == "Bearer patient-token")
+    );
+    assert!(requests.iter().all(|request| request.tenant == "default"));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.accept.contains("fhirVersion=4.0"))
+    );
+}
+
+#[tokio::test]
+async fn selected_patients_use_parameters_and_retry_preserves_the_request() {
+    let (base, mock, _) = serve().await;
+    *mock.reject.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"diagnostics": "Patient/p-2 was not found"}]
+        })
+        .to_string(),
+    );
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Selected people"),
+            ("scope", "patient"),
+            ("patient", " Patient/p-1, p-2\np-1 "),
+            ("patient", "p-3"),
+            ("types", "Observation"),
+            ("elements", "id,meta"),
+            ("type_filter", "Observation?status=final"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-08-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let requests = mock.requests.lock().unwrap().clone();
+    let kickoff = requests.last().unwrap();
+    assert_eq!(kickoff.method, Method::POST);
+    assert_eq!(kickoff.path, "/Patient/$export");
+    assert!(kickoff.query.is_empty());
+    assert!(kickoff.content_type.contains("fhirVersion=4.0"));
+    assert!(kickoff.accept.contains("fhirVersion=4.0"));
+    let parameters: serde_json::Value = serde_json::from_str(&kickoff.body).unwrap();
+    let entries = parameters["parameter"].as_array().unwrap();
+    let patient_refs: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry["name"] == "patient")
+        .filter_map(|entry| entry.pointer("/valueReference/reference")?.as_str())
+        .collect();
+    assert_eq!(patient_refs, ["Patient/p-1", "Patient/p-2", "Patient/p-3"]);
+    for (name, value) in [
+        ("_type", "Observation"),
+        ("_elements", "id,meta"),
+        ("_typeFilter", "Observation?status=final"),
+    ] {
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["name"] == name && entry["valueString"] == value)
+        );
+    }
+    assert!(entries.iter().any(|entry| {
+        entry["name"] == "_since" && entry["valueInstant"] == "2026-08-01T00:00:00Z"
+    }));
+    assert!(
+        entries
+            .iter()
+            .filter(|entry| entry["name"] == "_since")
+            .all(|entry| entry.get("valueString").is_none())
+    );
+
+    *mock.reject.lock().unwrap() = None;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("Patient/p-2 was not found"), "{html}");
+    let retry_path = html
+        .split("action=\"")
+        .find(|part| part.starts_with("/ui/bulk-export/active/") && part.contains("/retry"))
+        .and_then(|part| part.split('"').next())
+        .unwrap();
+    post_form(&base, retry_path, &[]).await;
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
+    assert_eq!(requests[0].accept, requests[1].accept);
+}
+
+#[tokio::test]
+async fn invalid_patient_input_fails_without_export_all_and_other_scopes_ignore_it() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[("scope", "patient"), ("patient", "Patient/not/valid")],
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(html.contains("valid logical Patient IDs"), "{html}");
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(!html.contains("valid logical Patient IDs"), "{html}");
+    assert!(
+        !html.contains("Retry"),
+        "invalid input must not create a card"
+    );
+    let settings = backend.get_settings("l2:").await.unwrap();
+    assert!(
+        settings
+            .as_ref()
+            .and_then(|settings| settings
+                .document
+                .pointer("/byTenant/default/bulkExport/jobs"))
+            .is_none(),
+        "invalid input must not persist any export job"
+    );
+
+    for scope in ["system", "group"] {
+        post_form(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("scope", scope),
+                ("group_id", "g-1"),
+                ("patient", "Patient/not/valid"),
+            ],
+        )
+        .await;
+    }
+    let kickoffs = mock.kickoffs.lock().unwrap();
+    assert_eq!(kickoffs.len(), 2);
+    assert!(kickoffs.iter().any(|(path, _, _)| path == "/$export"));
+    assert!(
+        kickoffs
+            .iter()
+            .any(|(path, _, _)| path == "/Group/g-1/$export")
+    );
 }

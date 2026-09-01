@@ -263,3 +263,32 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
   await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
 });
+
+test("Bulk Export accepts comma- and newline-separated Patient IDs without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.goto("/ui/bulk-export/new");
+  await bulkExport.scopeRadio("patient").check();
+
+  await expect(bulkExport.patientFallback).toBeVisible();
+  await expect(bulkExport.patientFallback).toBeEnabled();
+  const patientRefs = "Patient/p-104, Patient/p-205\nPatient/p-306";
+  await bulkExport.patientFallback.fill(patientRefs);
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+
+  const params = new URLSearchParams((await submitted).postData() ?? "");
+  expect(params.get("scope")).toBe("patient");
+  expect(params.getAll("patient").map((value) => value.replace(/\r\n/g, "\n"))).toEqual([
+    patientRefs,
+  ]);
+});

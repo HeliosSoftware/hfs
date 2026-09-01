@@ -77,7 +77,7 @@ use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Static UI assets (htmx, CSS) embedded into the binary at compile time.
@@ -103,6 +103,18 @@ pub struct NlSearch {
     /// `HFS_NL_SEARCH_MODEL` â€” shown in the setup state so an operator can see
     /// what they would be billed for.
     pub model: String,
+}
+
+/// Whether the mounted FHIR API can search Patient resources by name.
+///
+/// Exact logical-id reads remain available in both modes. The UI keeps this
+/// capability separate because standalone S3 intentionally has no search
+/// index, while S3 combined with Elasticsearch does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PatientNameSearchSupport {
+    #[default]
+    Enabled,
+    IdOnly,
 }
 
 /// Shared router state: values that are constant for the process lifetime.
@@ -136,6 +148,9 @@ struct WebState {
     /// Trusted loopback base used for UI calls back into this HFS process.
     /// Unlike `public_base_url`, this never carries a reverse-proxy prefix.
     self_base_url: String,
+    /// Runtime capability cache. A standards-compliant 501 from Patient name
+    /// search downgrades this process to exact-id lookup only.
+    patient_name_search: Arc<AtomicBool>,
     /// Whether canonical tenant URLs include the selected tenant as a path.
     tenant_path_routing: bool,
     /// The server's default FHIR version, used when seeding a new tenant.
@@ -903,6 +918,7 @@ pub fn mount_with_body_limit(
         max_body_size,
         false,
         bulk_provider,
+        PatientNameSearchSupport::Enabled,
     )
 }
 
@@ -924,6 +940,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
     max_body_size: usize,
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    patient_name_search: PatientNameSearchSupport,
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url.clone(),
@@ -931,7 +948,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
         fhir_version,
         data_dir.clone(),
     ));
-    mount_internal(
+    mount_with_conformance_source_and_runtime(
         fhir_app,
         hfs_version,
         data_dir,
@@ -942,11 +959,12 @@ pub fn mount_with_body_limit_and_tenant_routing(
         source,
         fhir_version,
         terminology,
-        self_base_url,
         public_base_url,
         max_body_size,
         tenant_path_routing,
         bulk_provider,
+        self_base_url,
+        patient_name_search,
     )
 }
 
@@ -1042,7 +1060,7 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> Router {
-    mount_internal(
+    mount_with_conformance_source_and_runtime(
         fhir_app,
         hfs_version,
         data_dir,
@@ -1054,15 +1072,18 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         fhir_version,
         terminology,
         public_base_url.clone(),
-        public_base_url,
         max_body_size,
         tenant_path_routing,
         bulk_provider,
+        public_base_url,
+        PatientNameSearchSupport::Enabled,
     )
 }
 
+/// Testable mount with explicit same-process FHIR routing and capabilities.
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-fn mount_internal(
+pub fn mount_with_conformance_source_and_runtime(
     fhir_app: Router,
     hfs_version: &'static str,
     data_dir: Option<PathBuf>,
@@ -1073,11 +1094,12 @@ fn mount_internal(
     source: Arc<dyn ConformanceSource>,
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
-    self_base_url: String,
     public_base_url: String,
     max_body_size: usize,
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    self_base_url: String,
+    patient_name_search: PatientNameSearchSupport,
 ) -> Router {
     let nl_enabled = nl.enabled;
     let mut parsed_self_base = reqwest::Url::parse(&self_base_url)
@@ -1162,6 +1184,10 @@ fn mount_internal(
             get(bulk_export::active).post(bulk_export::start),
         )
         .route("/ui/bulk-export/new", get(bulk_export::page))
+        .route(
+            "/ui/bulk-export/patient-options",
+            axum::routing::post(bulk_export::patient_options),
+        )
         .route("/ui/bulk-export/active", get(bulk_export::active_redirect))
         .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
         .route(
@@ -1238,8 +1264,12 @@ fn mount_internal(
         fhir_version,
         default_tenant,
         terminology,
-        self_base_url,
         public_base_url,
+        self_base_url,
+        patient_name_search: Arc::new(AtomicBool::new(matches!(
+            patient_name_search,
+            PatientNameSearchSupport::Enabled
+        ))),
         tenant_path_routing,
     };
 
