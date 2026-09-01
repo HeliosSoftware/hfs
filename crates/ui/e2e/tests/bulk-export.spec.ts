@@ -31,6 +31,28 @@ test("All Resources is the enhanced default", async ({ bulkExport }) => {
   ).toBe(true);
 });
 
+test("All Resources is visually separated from the resource grid", async ({
+  page,
+  bulkExport,
+}) => {
+  for (const viewport of [
+    { width: 1280, height: 800 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await bulkExport.goto();
+
+    const allResourcesBottom = await bulkExport.allResources.evaluate(
+      (input) => input.closest("label")!.getBoundingClientRect().bottom,
+    );
+    const firstResourceTop = await bulkExport.typeCheckboxes.first().evaluate(
+      (input) => input.closest("label")!.getBoundingClientRect().top,
+    );
+
+    expect(Math.abs(firstResourceTop - allResourcesBottom - 14)).toBeLessThanOrEqual(0.5);
+  }
+});
+
 test("long resource names stay in their grid cell and reveal the full name", async ({
   page,
   bulkExport,
