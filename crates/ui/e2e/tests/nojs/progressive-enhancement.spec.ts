@@ -97,7 +97,9 @@ test("the CapabilityStatement filter submits a GET form with no JavaScript", asy
   await capabilityStatement.filter.fill("Patient");
   await capabilityStatement.filter.press("Enter");
 
-  await expect(page).toHaveURL(/\/ui\/capability-statement\?filter=Patient$/);
+  await expect(page).toHaveURL(
+    /\/ui\/capability-statement\?version=R4&filter=Patient$/,
+  );
   await expect(capabilityStatement.resourceRow("Patient")).toBeVisible();
   await expect(capabilityStatement.resourceRow("Observation")).toHaveCount(0);
 });

@@ -2900,9 +2900,11 @@ async fn capability_page(
                 view.resources
                     .retain(|r| r.resource_type.to_lowercase().contains(&needle));
             }
-            let raw = raw_requested
-                .then(|| serde_json::to_string_pretty(&statement).unwrap_or_default())
-                .unwrap_or_default();
+            let raw = if raw_requested {
+                serde_json::to_string_pretty(&statement).unwrap_or_default()
+            } else {
+                String::new()
+            };
             (Some(view), raw)
         }
         Err(error) => {
