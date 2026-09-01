@@ -2969,6 +2969,41 @@ details.json-fold[open] > summary .icon {
   box-shadow: inset 3px 0 0 var(--danger);
 }
 
+/* The Last 24 hrs sparkline (#782): the engine's half-hour delivery series,
+   scaled server-side; color follows the row's state — the frame's dotted
+   amber marks a listener-less websocket. */
+.spark {
+  display: block;
+  width: 120px;
+  height: 24px;
+}
+
+.spark__line {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.spark--active .spark__line {
+  stroke: var(--ok);
+}
+
+.spark--error .spark__line {
+  stroke: var(--danger);
+}
+
+.spark--idle .spark__line {
+  stroke: var(--warn);
+  stroke-dasharray: 2 3;
+}
+
+.spark--requested .spark__line,
+.spark--off .spark__line {
+  stroke: var(--muted);
+}
+
 /* Bulk Export job states (#537) — the same status-pill vocabulary. */
 .tag--in-progress {
   background: var(--warn-soft);
