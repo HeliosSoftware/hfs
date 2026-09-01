@@ -674,8 +674,7 @@ subs-state-off = Aus
 
 bulk-export-title = Massenexport
 bulk-export-lede = Daten mit der FHIR-Bulk-Data-Operation $export als NDJSON-Dateien aus diesem Server exportieren.
-bulk-export-active-title = Aktive Exporte
-bulk-export-active-link = Aktive Exporte
+bulk-export-active-title = Exporte
 bulk-export-new = Neuer Export
 bulk-export-unavailable = Das Storage-Backend hostet keinen Settings-Store; Exportaufträge können nicht verfolgt werden.
 bulk-export-scope = Was möchten Sie exportieren?
@@ -707,7 +706,7 @@ bulk-export-running = laufend
 bulk-export-clear = Leeren
 bulk-export-files-word = Dateien
 bulk-export-exports-word = Exporte
-bulk-export-none = Noch keine Exporte. Starten Sie einen auf der Massenexport-Seite.
+bulk-export-none = Noch keine Exporte. Wählen Sie „Neuer Export“, um einen zu starten.
 bulk-export-status-in-progress = Läuft
 bulk-export-status-complete = Abgeschlossen
 bulk-export-status-failed = Fehlgeschlagen
@@ -719,6 +718,14 @@ bulk-export-finished-in = fertig in
 bulk-export-error = Fehler
 bulk-export-cancel = Abbrechen
 bulk-export-retry = Erneut versuchen
+bulk-export-download-all = Alle Ressourcen herunterladen
+bulk-export-download-all-aria = Alle Ressourcen aus { $name } herunterladen
+bulk-export-delete = Löschen
+bulk-export-delete-aria = Export { $name } löschen
+bulk-export-delete-warning = { $name } und die zugehörigen Ausgabedateien vom Server löschen? Dies kann nicht rückgängig gemacht werden.
+bulk-export-delete-confirm = Export löschen
+bulk-export-delete-cancel = Export behalten
+bulk-export-delete-error = Der Export konnte nicht sicher gelöscht werden. Die Karte wurde für einen erneuten Versuch beibehalten.
 
 # CapabilityStatement-Seite (#653)
 cap-title = Capability Statement

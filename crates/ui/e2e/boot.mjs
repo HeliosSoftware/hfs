@@ -101,6 +101,9 @@ const child = spawn(bin, [], {
   env: {
     ...process.env,
     HFS_SERVER_PORT: port,
+    // Self-calls must target this run's reserved listener, not the default
+    // 8080 or a public reverse-proxy address.
+    HFS_BASE_URL: `http://127.0.0.1:${port}`,
     HFS_STORAGE_BACKEND: "sqlite",
     HFS_DATABASE_URL: db,
     // Load the vendored SearchParameter specs (so search works like production),
