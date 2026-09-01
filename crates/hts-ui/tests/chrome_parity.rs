@@ -515,3 +515,178 @@ async fn import_js_is_served_under_hts_assets() {
         "import.js must write into the shared textarea `#hts-import-bundle`",
     );
 }
+
+// ── Track G: the account menu is the shared component, not a copy ─────
+
+// Every other track in this file works the same way: it notices, after the
+// fact, that HTS's chrome has drifted from HFS's. The account menu is the one
+// place where that job has been taken away from testing entirely. #799 moved
+// the markup into `crates/ui-chrome`, and both layouts now render it with a
+// single `{{ … user_menu(…)?|safe }}` call, so there is no second copy left to
+// drift.
+//
+// That only holds while nobody pastes the markup back. This track defends the
+// structure rather than the output: one test pins the page to the shared
+// function's exact bytes, one records that the control HTS carried alone was
+// dead markup (so it does not come back as a "missing feature"), and one fails
+// the moment either product grows its own copy of the block again.
+
+#[tokio::test]
+async fn account_menu_is_the_shared_chrome_component() {
+    // Rendered here through the same public entry point the layout uses, then
+    // demanded verbatim from the page. A look-alike does not pass.
+    //
+    // The HFS twin — `the_account_menu_is_the_shared_component_verbatim` in
+    // `crates/ui/tests/router_http.rs` — asserts this same function's output
+    // against `/ui`. Neither test names the other crate, but together they pin
+    // the two products to each other through `helios-ui-chrome`: HFS ==
+    // user_menu(..) == HTS. That is the property #799 was for, and it needs no
+    // cross-crate dev-dependency to state.
+    //
+    // `RequestLocale::default()` is `en`, which is what a request with no
+    // `?lang=`, no `hts_lang` cookie and no `Accept-Language` negotiates.
+    let i18n = helios_hts_ui::I18n::new(helios_hts_ui::RequestLocale::default());
+    // `UserIdentity::default()` is the signed-out local-operator state both
+    // products render today (#320): no display name, no photo, no Sign out.
+    let expected = helios_ui_chrome::user_menu(&i18n, helios_ui_chrome::UserIdentity::default())
+        .expect("the shared user-menu template has no fallible construct")
+        .replace("\r\n", "\n");
+
+    let response = app()
+        .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await.replace("\r\n", "\n");
+
+    assert!(
+        html.contains(&expected),
+        "the HTS topbar does not contain `helios_ui_chrome::user_menu(..)` \
+         verbatim — either the account menu was re-inlined into \
+         `crates/hts-ui/templates/layouts/base.html`, or `Chrome::user_menu` \
+         is passing something other than `UserIdentity::default()` (#799).\n\n\
+         Expected to find:\n{expected}",
+    );
+}
+
+#[tokio::test]
+async fn dead_language_switcher_and_placeholder_avatar_are_gone() {
+    // Two controls HTS carried that HFS never did. The `<nav
+    // class="lang-switcher">` of three links and the hardcoded `K` initial in
+    // the avatar were both HTS-only inventions; the language options now live
+    // inside the shared menu, and the avatar falls back to the generic user
+    // icon. Only the *markup* went — `?lang=` and the `hts_lang` cookie in
+    // `src/i18n.rs` are untouched and still drive the options in their new home.
+    let response = app()
+        .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(
+        !html.contains("lang-switcher"),
+        "the topbar `lang-switcher` nav must not render — the language options \
+         moved inside the shared account menu (#799)",
+    );
+    assert!(
+        !html.contains(">K<"),
+        "the placeholder `K` avatar initial must not render — the shared menu \
+         falls back to the generic user icon (#799)",
+    );
+
+    // Second leg: *why* it went. HTS adds no CSS of its own (it embeds
+    // `crates/ui/assets` wholesale), and `.lang-switcher` has no rule there —
+    // so those three links were rendering unstyled the whole time. This is the
+    // record that removing them restored nothing and broke nothing.
+    let css = std::fs::read_to_string("../ui/assets/app.css").expect("shared app.css");
+    assert!(
+        !css.contains(".lang-switcher"),
+        "`.lang-switcher` has gained a rule in crates/ui/assets/app.css — if \
+         the control is genuinely coming back it belongs in \
+         `crates/ui-chrome`, rendered by both products, not in HTS alone",
+    );
+}
+
+#[test]
+fn neither_layout_carries_its_own_copy_of_the_account_menu() {
+    // The anti-copy-paste guard, and the point of the whole track.
+    //
+    // Source check, not a rendered check: pasting the block back into a layout
+    // would still render *something* that looks right, and might even satisfy
+    // a substring assertion on the page. What must not exist is a second place
+    // the markup can be edited.
+    //
+    // Read HFS's off disk (as the chart track does) rather than only ours —
+    // the rule binds both products equally, and the point is to notice when
+    // *HFS* re-inlines it.
+    let hfs = std::fs::read_to_string("../ui/templates/layouts/base.html")
+        .expect("HFS base.html must be readable from the hts-ui crate directory");
+    let hts = include_str!("../templates/layouts/base.html");
+
+    // Both layouts document in `{# … #}` prose why the markup left and where
+    // it went, naming these very classes. Explaining the rule must not read as
+    // breaking it.
+    let hfs = strip_askama_comments(&hfs);
+    let hts = strip_askama_comments(hts);
+
+    for (crate_path, source) in [
+        ("crates/ui/templates/layouts/base.html", hfs.as_str()),
+        ("crates/hts-ui/templates/layouts/base.html", hts.as_str()),
+    ] {
+        for marker in [
+            "menu--user",
+            "user-menu__",
+            "topbar__avatar",
+            "icons/user.svg",
+        ] {
+            assert!(
+                !source.contains(marker),
+                "`{marker}` is back in {crate_path}.\n\n\
+                 The account menu has exactly one home: `crates/ui-chrome`. \
+                 Both layouts render it with a single \
+                 `{{{{ … user_menu(…)?|safe }}}}` call and hold none of its \
+                 markup themselves — that is the entire reason #799 exists, \
+                 because the previous arrangement (a comment asserting the two \
+                 copies were byte-for-byte identical) had already silently \
+                 stopped being true. Change the partial in \
+                 `crates/ui-chrome/templates/partials/user-menu.html` instead; \
+                 if the two products genuinely need to differ, that difference \
+                 belongs in `UserIdentity`, not in a second copy of the block.",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn favicon_link_resolves_under_the_hts_mount() {
+    // HFS points its `rel="icon"` at `/ui/assets/logo.png`; HTS must point at
+    // the same file under its own mount. Asserting only the markup would miss
+    // a prefix typo, so the second leg fetches it — the same two-legged shape
+    // `figtree_woff2_is_served_under_hts_assets` uses for the font.
+    let response = app()
+        .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("<link rel=\"icon\" type=\"image/png\" href=\"/ui/hts/assets/logo.png\">"),
+        "HTS must declare a favicon link to /ui/hts/assets/logo.png (HFS parity)",
+    );
+
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/assets/logo.png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the favicon the page links to must actually be served under \
+         /ui/hts/assets/ — a mount-prefix typo shows up here, not in the markup",
+    );
+}

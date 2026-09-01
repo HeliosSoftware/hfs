@@ -57,6 +57,17 @@ mod tenants;
 #[doc(hidden)]
 pub use conformance::{ConformanceSource, SqlExportStatus, StaticConformanceSource};
 
+/// The locale plumbing, re-exported out of the private `i18n` module.
+///
+/// `mount` needs neither of these, but `tests/router_http.rs` does: it is an
+/// integration test, so it lives outside the crate, and it asserts the topbar
+/// account menu against `helios_ui_chrome::user_menu` rendered from the *real*
+/// Fluent catalogs. Without the re-export that test would have to hard-code
+/// English strings, which is precisely the drift it exists to catch (#799).
+/// `RequestLocale` comes along because it is the only public way to build an
+/// [`I18n`].
+pub use i18n::{I18n, RequestLocale};
+
 use askama::Template;
 use axum::{
     Json, Router,
@@ -74,7 +85,6 @@ use helios_observability::dashboard::{
     DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, TypeCount,
 };
 use helios_persistence::core::{BulkProviderStore, ResourceStorage, SettingsStore};
-use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -418,6 +428,27 @@ impl Status {
     /// which does not exist yet (#320).
     pub(crate) fn user_can_logout(&self) -> bool {
         false
+    }
+
+    /// The topbar account menu, rendered by `helios-ui-chrome` so HFS and HTS
+    /// cannot drift (#799). `i18n` is a parameter because it is a sibling field
+    /// on every page struct, not part of `Status`.
+    ///
+    /// Takes `&I18n` rather than `I18n` even though the type is `Copy`: askama
+    /// passes template fields to a method call by reference, so the generated
+    /// code hands us `&self.i18n`.
+    pub(crate) fn user_menu(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::user_menu(
+            i18n,
+            helios_ui_chrome::UserIdentity {
+                display: self.user_display(),
+                secondary: self.user_secondary(),
+                initials: self.user_initials(),
+                photo: self.user_photo(),
+                can_logout: self.user_can_logout(),
+                logout_href: "/ui/logout",
+            },
+        )
     }
 
     /// A browser-safe terminology destination, when the configured value is a

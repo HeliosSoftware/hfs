@@ -54,6 +54,10 @@ chrono.workspace = true
 # `templates/`, never in Rust source.
 askama = "0.16"
 
+# Chrome shared with the HFS UI (#799): the topbar account menu is rendered
+# from markup that lives in that crate, not copied into this one's templates.
+helios-ui-chrome = { path = "../ui-chrome", version = "0.2.1" }
+
 # Typed htmx header handling: `HxRequest` extractor for the fragment-vs-page
 # branch, and `AutoVaryLayer` for correct HTTP caching (`Vary: HX-Request`).
 axum-htmx = { version = "0.8", features = ["auto-vary"] }
