@@ -20,7 +20,7 @@ export const ROUTES = [
   "/ui/editor?type=Patient",
   "/ui/bulk-import",
   "/ui/bulk-export",
-  "/ui/bulk-export/active",
+  "/ui/bulk-export/new",
   "/ui/subscriptions",
   "/ui/sql/view-definitions",
   "/ui/sql/queries",

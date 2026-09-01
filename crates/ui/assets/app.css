@@ -2479,6 +2479,13 @@ select.field__input {
   font-weight: 700;
 }
 
+/* The Recently used heading sits inside its group, so the group's 2px item
+   gap is all that separates it from the first entry; the All Types heading
+   is a rail child and gets the rail's 10px. Top up to the same 10px (#785). */
+.filter-rail__group > .filter-rail__heading--group {
+  margin-bottom: 8px;
+}
+
 /* Between the Recently used group and the general list. Hidden by default —
    shown only when it directly follows a *populated* (non-`hidden`) recent
    group, so there is nothing to divide from before resource-filter.js has
@@ -2982,6 +2989,41 @@ details.json-fold[open] > summary .icon {
   box-shadow: inset 3px 0 0 var(--danger);
 }
 
+/* The Last 24 hrs sparkline (#782): the engine's half-hour delivery series,
+   scaled server-side; color follows the row's state — the frame's dotted
+   amber marks a listener-less websocket. */
+.spark {
+  display: block;
+  width: 120px;
+  height: 24px;
+}
+
+.spark__line {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.spark--active .spark__line {
+  stroke: var(--ok);
+}
+
+.spark--error .spark__line {
+  stroke: var(--danger);
+}
+
+.spark--idle .spark__line {
+  stroke: var(--warn);
+  stroke-dasharray: 2 3;
+}
+
+.spark--requested .spark__line,
+.spark--off .spark__line {
+  stroke: var(--muted);
+}
+
 /* Bulk Export job states (#537) — the same status-pill vocabulary. */
 .tag--in-progress {
   background: var(--warn-soft);
@@ -3031,6 +3073,56 @@ details.json-fold[open] > summary .icon {
 /* Bulk Import detail: consistent rhythm between its non-empty cards. */
 .bulk-import-section {
   margin-bottom: 16px;
+}
+
+/* The processing card's Abort row: .detail__actions carries a 10px bottom
+   margin that doubled up with the card padding (#789). */
+#bulk-status .detail__actions {
+  margin-bottom: 0;
+}
+
+/* The processing card's progress bar. Determinate when the recipient
+   reports a percentage; indeterminate (sweeping) while only the entry
+   counter moves. */
+.progress-track {
+  overflow: hidden;
+  position: relative;
+  height: 6px;
+  margin: 8px 0 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 400ms ease;
+}
+
+.progress-track--indeterminate .progress-fill {
+  position: absolute;
+  width: 30%;
+  animation: progress-sweep 1.6s ease-in-out infinite;
+}
+
+@keyframes progress-sweep {
+  0% {
+    left: -30%;
+  }
+
+  100% {
+    left: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-track--indeterminate .progress-fill {
+    animation: none;
+    left: 0;
+    width: 100%;
+    opacity: 0.5;
+  }
 }
 
 .bulk-import-summary-card {
@@ -5570,7 +5662,7 @@ details.json-fold[open] > summary .icon {
   color: var(--muted);
 }
 
-/* ---- Active Exports job cards (#735) --------------------------------- */
+/* ---- Exports job cards (#735, #795) ---------------------------------- */
 
 .job-card {
   padding: 14px;
@@ -5593,7 +5685,41 @@ details.json-fold[open] > summary .icon {
 .job-card__actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 10px;
+}
+
+.job-card__delete {
+  position: relative;
+}
+
+.job-card__delete > summary {
+  list-style: none;
+}
+
+.job-card__delete > summary::-webkit-details-marker {
+  display: none;
+}
+
+.job-card__delete-confirm {
+  position: absolute;
+  z-index: var(--z-dialog-panel);
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(320px, calc(100vw - 32px));
+  padding: 12px;
+  color: var(--text);
+}
+
+.job-card__delete-confirm p {
+  margin: 0 0 10px;
+}
+
+.job-card__delete-confirm form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .progress {
