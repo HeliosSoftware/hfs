@@ -185,7 +185,7 @@ fn job_merge_value(job: &ExportJob) -> Value {
         } else {
             json!(&job.patient_refs)
         },
-        "fhirVersion": serde_json::to_value(&job.fhir_version).unwrap_or(Value::Null),
+        "fhirVersion": serde_json::to_value(job.fhir_version).unwrap_or(Value::Null),
         "status": job.status,
         "pollUrl": optional_string(&job.poll_url),
         "remoteJob": match job.remote_job {

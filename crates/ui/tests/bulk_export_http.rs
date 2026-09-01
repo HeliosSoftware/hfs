@@ -352,7 +352,7 @@ fn mock_fhir_app(state: MockExport) -> Router {
         Json(serde_json::json!({
             "resourceType": "Bundle",
             "type": "searchset",
-            "entry": s.patients.lock().unwrap().iter().cloned()
+            "entry": s.patients.lock().unwrap().iter()
                 .map(|resource| serde_json::json!({"resource": resource}))
                 .collect::<Vec<_>>()
         }))
