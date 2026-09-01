@@ -261,6 +261,8 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await expect(form.locator(".form-actions > a")).toHaveCount(0);
   const startExport = form.getByRole("button", { name: "Start Export" });
   await expect(startExport).toBeVisible();
+  await expect(startExport).toBeEnabled();
+  expect(await startExport.getAttribute("aria-busy")).toBeNull();
 
   const exportName = `no-js-export-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   await form.locator('input[name="name"]').fill(exportName);

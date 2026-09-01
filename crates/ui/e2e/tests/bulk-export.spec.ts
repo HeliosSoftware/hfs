@@ -448,6 +448,220 @@ test("keyboard narrowing submits exactly the two selected resource types", async
   expect(params.getAll("types").sort()).toEqual(["Observation", "Patient"]);
 });
 
+test("critical destination assets are ready before kickoff navigation starts", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+  await page.evaluate(() => {
+    type PrefetchState = { links: HTMLLinkElement[]; submitCalls: number };
+    type PrefetchWindow = Window & typeof globalThis & { __issue831Prefetch: PrefetchState };
+    const state: PrefetchState = { links: [], submitCalls: 0 };
+    (window as PrefetchWindow).__issue831Prefetch = state;
+
+    const nativeAppendChild = document.head.appendChild.bind(document.head);
+    document.head.appendChild = ((node: Node) => {
+      if (node instanceof HTMLLinkElement && node.rel === "prefetch") {
+        state.links.push(node);
+        return node;
+      }
+      return nativeAppendChild(node);
+    }) as typeof document.head.appendChild;
+    HTMLFormElement.prototype.submit = function () {
+      state.submitCalls++;
+    };
+  });
+
+  let exportRequests = 0;
+  let markPostReceived!: () => void;
+  const postReceived = new Promise<void>((resolve) => {
+    markPostReceived = resolve;
+  });
+  await page.route("**/ui/bulk-export", async (route) => {
+    if (route.request().method() !== "POST") return route.continue().catch(() => {});
+    exportRequests++;
+    markPostReceived();
+    await route
+      .fulfill({ status: 303, headers: { location: "/ui/bulk-export" } })
+      .catch(() => {});
+  });
+
+  const startButton = await bulkExport.startButton.elementHandle();
+  expect(startButton).not.toBeNull();
+  const criticalAssetsReady = page
+    .waitForFunction(() => {
+      type PrefetchWindow = Window &
+        typeof globalThis & { __issue831Prefetch: { links: HTMLLinkElement[] } };
+      return (window as PrefetchWindow).__issue831Prefetch.links.length === 2;
+    })
+    .then(() => "critical-assets" as const);
+  await startButton!.click({ noWaitAfter: true });
+
+  expect(
+    await Promise.race([criticalAssetsReady, postReceived.then(() => "post" as const)]),
+  ).toBe("critical-assets");
+  expect(exportRequests).toBe(0);
+  expect(
+    await page.evaluate(() => {
+      type PrefetchWindow = Window &
+        typeof globalThis & {
+          __issue831Prefetch: { links: HTMLLinkElement[]; submitCalls: number };
+        };
+      const state = (window as PrefetchWindow).__issue831Prefetch;
+      return {
+        assets: state.links.map((link) => [new URL(link.href).pathname, link.as]),
+        submitCalls: state.submitCalls,
+      };
+    }),
+  ).toEqual({
+    assets: [
+      ["/ui/assets/app.css", "style"],
+      ["/ui/assets/theme.js", "script"],
+    ],
+    submitCalls: 0,
+  });
+  expect(
+    await startButton!.evaluate((button) => ({
+      ariaBusy: button.getAttribute("aria-busy"),
+      disabled: button.disabled,
+    })),
+  ).toEqual({ ariaBusy: "true", disabled: true });
+
+  await page.evaluate(() => {
+    type PrefetchWindow = Window &
+      typeof globalThis & { __issue831Prefetch: { links: HTMLLinkElement[] } };
+    for (const link of (window as PrefetchWindow).__issue831Prefetch.links) {
+      link.dispatchEvent(new Event("load"));
+    }
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        type PrefetchWindow = Window &
+          typeof globalThis & { __issue831Prefetch: { submitCalls: number } };
+        return (window as PrefetchWindow).__issue831Prefetch.submitCalls;
+      }),
+    )
+    .toBe(1);
+  expect(exportRequests).toBe(0);
+});
+
+test("Start Export stays busy for the kickoff navigation and ignores repeat clicks", async ({
+  page,
+  bulkExport,
+}) => {
+  let exportRequests = 0;
+  let markRequestReceived!: () => void;
+  const requestReceived = new Promise<void>((resolve) => {
+    markRequestReceived = resolve;
+  });
+  let releaseRequest!: () => void;
+  const parkedRequest = new Promise<void>((resolve) => {
+    releaseRequest = resolve;
+  });
+  await page.route("**/ui/bulk-export", async (route) => {
+    if (route.request().method() !== "POST") return route.continue().catch(() => {});
+    exportRequests++;
+    markRequestReceived();
+    await parkedRequest;
+    await route
+      .fulfill({ status: 303, headers: { location: "/ui/bulk-export" } })
+      .catch(() => {});
+  });
+
+  await bulkExport.goto();
+  const startButton = await bulkExport.startButton.elementHandle();
+  expect(startButton).not.toBeNull();
+  const stateWhileHeld = startButton!.evaluate(async (button) => {
+    await new Promise<void>((resolve) => {
+      if (button.getAttribute("aria-busy") === "true") return resolve();
+      const observer = new MutationObserver(() => {
+        if (button.getAttribute("aria-busy") !== "true") return;
+        observer.disconnect();
+        resolve();
+      });
+      observer.observe(button, { attributes: true, attributeFilter: ["aria-busy"] });
+    });
+    const entered = {
+      ariaBusy: button.getAttribute("aria-busy"),
+      disabled: button.disabled,
+      spinnerContent: getComputedStyle(button, "::after").content,
+      spinnerAnimation: getComputedStyle(button, "::after").animationName,
+    };
+    button.click();
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+    return {
+      entered,
+      held: {
+        ariaBusy: button.getAttribute("aria-busy"),
+        disabled: button.disabled,
+      },
+    };
+  });
+  await startButton!.click({ noWaitAfter: true });
+  await requestReceived;
+
+  const { entered, held } = await stateWhileHeld;
+  expect(entered).toEqual({
+    ariaBusy: "true",
+    disabled: true,
+    spinnerContent: '""',
+    spinnerAnimation: "spin",
+  });
+  expect(exportRequests).toBe(1);
+  expect(held).toEqual({ ariaBusy: "true", disabled: true });
+
+  releaseRequest();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+});
+
+test("a persisted pageshow clears the restored Start Export busy state", async ({
+  page,
+  bulkExport,
+}) => {
+  await bulkExport.goto();
+  await bulkExport.form.evaluate((form) => {
+    HTMLFormElement.prototype.submit = function () {};
+    form.dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
+  });
+
+  await expect(bulkExport.startButton).toHaveAttribute("aria-busy", "true");
+  await expect(bulkExport.startButton).toBeDisabled();
+  await page.evaluate(() => {
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+  });
+  await expect(bulkExport.startButton).toBeEnabled();
+  expect(await bulkExport.startButton.getAttribute("aria-busy")).toBeNull();
+});
+
+test("native validation rejects the form before Start Export becomes busy", async ({
+  page,
+  bulkExport,
+}) => {
+  let exportRequests = 0;
+  await page.route("**/ui/bulk-export", (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    exportRequests++;
+    return route.fulfill({ status: 204 });
+  });
+  await bulkExport.goto();
+
+  const name = bulkExport.form.locator('input[name="name"]');
+  await name.evaluate((input: HTMLInputElement) => {
+    input.required = true;
+  });
+  await bulkExport.startButton.click();
+
+  await expect(name).toBeFocused();
+  expect(await name.evaluate((input: HTMLInputElement) => input.validity.valid)).toBe(false);
+  await expect(bulkExport.startButton).toBeEnabled();
+  expect(await bulkExport.startButton.getAttribute("aria-busy")).toBeNull();
+  expect(exportRequests).toBe(0);
+});
+
 test("re-checking and Clear restore the All Resources state", async ({ bulkExport }) => {
   await bulkExport.goto();
 
