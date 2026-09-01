@@ -148,7 +148,7 @@ impl ResourceStorage for SqliteBackend {
             .get("id")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(crate::types::new_resource_id);
 
         // Check if resource already exists
         let exists: bool = conn

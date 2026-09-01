@@ -137,8 +137,9 @@ where
         &search_params,
     );
 
-    // Convert result to FHIR Bundle
-    let mut bundle = result.to_bundle(&public_base, &self_link);
+    // Convert result to FHIR Bundle (moving, not cloning, each resource).
+    let match_count = result.resources.len();
+    let mut bundle = result.into_bundle(&public_base, &self_link);
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
         state.public_url_for_request(&tenant, [resource_type, id])
     });
@@ -147,7 +148,7 @@ where
         compartment_type = %compartment_type,
         compartment_id = %compartment_id,
         target_type = %target_type,
-        results = result.resources.len(),
+        results = match_count,
         "Compartment search completed"
     );
 
@@ -273,7 +274,8 @@ where
         "*",
         &search_params,
     );
-    let mut bundle = result.to_bundle(&public_base, &self_link);
+    let match_count = result.resources.len();
+    let mut bundle = result.into_bundle(&public_base, &self_link);
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
         state.public_url_for_request(&tenant, [resource_type, id])
     });
@@ -281,7 +283,7 @@ where
     debug!(
         compartment_type = %compartment_type,
         compartment_id = %compartment_id,
-        results = result.resources.len(),
+        results = match_count,
         "Compartment all-types search completed"
     );
 
@@ -307,37 +309,21 @@ fn build_compartment_search_url(
 }
 
 /// Converts a SearchBundle to a serde_json::Value for response.
-fn bundle_to_json(bundle: helios_persistence::types::SearchBundle) -> serde_json::Value {
-    serde_json::json!({
-        "resourceType": "Bundle",
-        "type": bundle.bundle_type,
-        "total": bundle.total,
-        "link": bundle.link.iter().map(|l| {
-            serde_json::json!({
-                "relation": l.relation,
-                "url": l.url
-            })
-        }).collect::<Vec<_>>(),
-        "entry": bundle.entry.iter().map(|e| {
-            let mut entry = serde_json::json!({});
-            if let Some(ref full_url) = e.full_url {
-                entry["fullUrl"] = serde_json::Value::String(full_url.clone());
-            }
-            if let Some(ref resource) = e.resource {
-                entry["resource"] = resource.clone();
-            }
-            if let Some(ref search) = e.search {
-                entry["search"] = serde_json::json!({
-                    "mode": match search.mode {
-                        helios_persistence::types::SearchEntryMode::Match => "match",
-                        helios_persistence::types::SearchEntryMode::Include => "include",
-                        helios_persistence::types::SearchEntryMode::Outcome => "outcome",
-                    }
-                });
-            }
-            entry
-        }).collect::<Vec<_>>()
-    })
+fn bundle_to_json(mut bundle: helios_persistence::types::SearchBundle) -> serde_json::Value {
+    // Compartment search's own rendering never emitted `entry.search.score`,
+    // while the shared one does. Only Elasticsearch ever populates a score, but
+    // adopting the shared renderer should not change what a compartment search
+    // returns on that backend, so drop them explicitly rather than silently
+    // widening the response.
+    for entry in &mut bundle.entry {
+        if let Some(search) = entry.search.as_mut() {
+            search.score = None;
+        }
+    }
+    // Compartment search does not subset, so the resource passes through
+    // untouched — and, unlike the local copy of this rendering it replaces, it
+    // is moved into its entry rather than cloned.
+    crate::responses::bundle::searchset_to_json(bundle, |resource| resource)
 }
 
 // URL encoding helper

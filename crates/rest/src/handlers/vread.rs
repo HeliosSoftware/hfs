@@ -36,6 +36,7 @@ use crate::state::AppState;
 ///
 /// - `200 OK` - Version found, returns the resource
 /// - `404 Not Found` - Resource or version does not exist
+/// - `410 Gone` - The named version is the one that deleted the resource
 ///
 /// # Example
 ///
@@ -69,6 +70,32 @@ where
         .await?;
 
     match stored {
+        Some(stored) if stored.is_deleted() => {
+            // The named version is the tombstone — the interaction that deleted
+            // the resource, not a state it ever had. FHIR's vread interaction
+            // (https://hl7.org/fhir/http.html#vread) answers that with `410
+            // Gone`, and the history Bundle has always agreed: a `Delete` entry
+            // carries `request.method = DELETE` and no `resource` at all
+            // (`history_entry_to_json`). Returning `200` with the body the
+            // resource had *before* the delete, which is what this did,
+            // contradicts both — a deleted version is not a readable version.
+            //
+            // `return_gone` is the same switch a deleted instance read uses, so
+            // a deployment that prefers `404` over `410` for deleted content
+            // keeps one answer for both interactions rather than two.
+            //
+            // The backend is free to stop storing that body once nothing can
+            // ask for it, which the PostgreSQL delete path now does.
+            if state.return_gone() {
+                Err(RestError::Gone { resource_type, id })
+            } else {
+                Err(RestError::VersionNotFound {
+                    resource_type,
+                    id,
+                    version_id,
+                })
+            }
+        }
         Some(stored) => {
             // If the client requested a specific FHIR version, verify it matches.
             if let Some(requested) = version.accept_version() {
