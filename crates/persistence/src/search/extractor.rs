@@ -865,17 +865,6 @@ impl SearchParameterExtractor {
 /// with an empty expression and are already skipped below.
 const NON_INDEXABLE_PARAM_CODES: [&str; 1] = ["_in"];
 
-/// Splits a FHIRPath expression into its top-level union (`|`) members.
-///
-/// A plain `split('|')` also cuts inside string literals and parentheses, and
-/// the fragments it leaves are not parseable FHIRPath. That used to be
-/// harmless — an unbalanced fragment matched no resource-type prefix and was
-/// dropped — but the abstract-base strip accepts a fragment on its prefix
-/// alone, so `Resource.x.where(v = 'a|b')` would hand the evaluator
-/// `x.where(v = 'a`, whose parse error aborts extraction for *every* member of
-/// that parameter, concrete ones included.
-///
-
 /// The resource type in a `.where(resolve() is X)` clause, if the part has one.
 fn resolve_target_type(part: &str) -> Option<String> {
     let start = part.find(".where(resolve() is ")? + ".where(resolve() is ".len();
@@ -909,6 +898,16 @@ fn reference_target_type(reference: &str) -> Option<&str> {
     plain.then_some(ty)
 }
 
+/// Splits a FHIRPath expression into its top-level union (`|`) members.
+///
+/// A plain `split('|')` also cuts inside string literals and parentheses, and
+/// the fragments it leaves are not parseable FHIRPath. That used to be
+/// harmless — an unbalanced fragment matched no resource-type prefix and was
+/// dropped — but the abstract-base strip accepts a fragment on its prefix
+/// alone, so `Resource.x.where(v = 'a|b')` would hand the evaluator
+/// `x.where(v = 'a`, whose parse error aborts extraction for *every* member of
+/// that parameter, concrete ones included.
+///
 /// A `|` inside `(...)`, `[...]`, `'...'` (with `\'` escapes) or a backtick
 /// delimited identifier therefore stays part of its member. Members are
 /// returned trimmed.

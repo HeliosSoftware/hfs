@@ -1201,6 +1201,10 @@ impl PostgresBackend {
     ///
     /// This method uses the SearchParameterExtractor to dynamically extract
     /// searchable values based on the configured SearchParameterRegistry.
+    // Eight arguments, all of them distinct identity/coordinate values the
+    // write path already has in hand; bundling them into a struct would add a
+    // move on the hottest indexing path without removing a single argument.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn index_resource(
         &self,
         client: &deadpool_postgres::Client,

@@ -1396,7 +1396,7 @@ mod tests {
             value_token_code: Some(code.to_string()),
             ..Default::default()
         };
-        let rows = vec![row("a"), row("b"), row("a"), row("c"), row("b")];
+        let rows = [row("a"), row("b"), row("a"), row("c"), row("b")];
         let kept = dedup_rows(rows.iter().map(|r| ("Observation", "obs1", r)));
         let codes: Vec<&str> = kept
             .iter()
@@ -1414,7 +1414,7 @@ mod tests {
             value_token_code: Some("mailto:x@example.org".to_string()),
             ..Default::default()
         };
-        let rows = vec![row(), row(), row()];
+        let rows = [row(), row(), row()];
         let kept = dedup_rows(rows.iter().map(|r| ("Practitioner", "p1", r)));
         assert_eq!(kept.len(), 1);
     }
@@ -1449,7 +1449,8 @@ mod tests {
     #[test]
     fn every_column_distinguishes_two_rows() {
         let base = IndexRow::default();
-        let mutators: Vec<(&str, fn(&mut IndexRow))> = vec![
+        type ColumnMutator = (&'static str, fn(&mut IndexRow));
+        let mutators: Vec<ColumnMutator> = vec![
             ("last_updated", |r| r.last_updated = Some(Utc::now())),
             ("param_name", |r| r.param_name = "x".into()),
             ("param_url", |r| r.param_url = Some("u".into())),
