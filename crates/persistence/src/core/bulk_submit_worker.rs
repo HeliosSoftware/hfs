@@ -22,7 +22,7 @@ use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey};
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
-    ImportMode, StreamingBulkSubmitProvider, SubmissionId,
+    ByteProgress, ImportMode, StreamingBulkSubmitProvider, SubmissionId,
 };
 use crate::core::bulk_submit_input::{SubmitInputFetcher, submission_output_job_id};
 use crate::error::StorageResult;
@@ -384,18 +384,6 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     worker_id: WorkerId,
 }
 
-/// Byte-level ingest progress shared between the streaming reader, the
-/// [`LeaseKeeper`] (which flushes it on every heartbeat), and `run_job`.
-#[derive(Clone, Default)]
-struct ByteProgress {
-    /// Bytes the ingestion engine has consumed across the manifest's files.
-    consumed: Arc<std::sync::atomic::AtomicU64>,
-    /// Summed advertised size of the files opened so far; stays `0` unless
-    /// every opened file carried a length, so a partial total never inflates
-    /// the percentage.
-    total: Arc<std::sync::atomic::AtomicU64>,
-}
-
 /// A pass-through [`AsyncBufRead`] that adds every consumed byte to a shared
 /// counter — the live half of the status endpoint's percentage.
 struct CountingReader {
@@ -443,10 +431,13 @@ impl tokio::io::AsyncBufRead for CountingReader {
 /// idempotently. A separately spawned task renews on schedule no matter how the
 /// ingest future behaves.
 ///
-/// The keeper's task also flushes the shared byte progress every few seconds
-/// — a status poll must see the bar move *while* a large file streams, not
-/// once per lease renewal. The flush is a fenced best-effort write; the
-/// heartbeat alone decides lease health.
+/// The keeper's task also flushes the shared byte progress every few seconds,
+/// best-effort. On backends whose batch bookkeeping persists the counters
+/// itself (SQLite) this is only a fallback — a standalone write can starve
+/// for tens of seconds behind back-to-back batch transactions there, and the
+/// value it finally lands is as old as the wait. All byte writes are
+/// monotonic (`MAX`), so a stale flush can never walk progress backwards.
+/// The heartbeat alone decides lease health.
 ///
 /// Dropping the keeper stops the renewal task.
 struct LeaseKeeper {
@@ -588,13 +579,15 @@ where
                 "ingesting manifest with submission metadata"
             );
         }
-        let opts = BulkProcessingOptions::new().with_import_mode(import_mode);
+        let progress = ByteProgress::default();
+        let opts = BulkProcessingOptions::new()
+            .with_import_mode(import_mode)
+            .with_byte_progress(progress.clone());
         let mut processed: u64 = 0;
         let mut failed: u64 = 0;
         // The lease must stay heartbeated *through* a file, not only between
         // files, and independently of how often the ingest future yields; the
         // keeper renews from its own task until dropped.
-        let progress = ByteProgress::default();
         // Percentages need every file's size; one sizeless file (e.g. a
         // gzip-decompressed stream) poisons the total for the whole manifest
         // and the status endpoint falls back to manifest-count progress.

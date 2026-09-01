@@ -677,8 +677,8 @@ impl SubmitWorkerStorage for S3Backend {
         bytes_total: u64,
     ) -> Result<(), LeaseError> {
         self.fenced_mutate(lease, |state| {
-            state.manifest.bytes_processed = bytes_processed;
-            state.manifest.bytes_total = bytes_total;
+            state.manifest.bytes_processed = state.manifest.bytes_processed.max(bytes_processed);
+            state.manifest.bytes_total = state.manifest.bytes_total.max(bytes_total);
         })
         .await
     }

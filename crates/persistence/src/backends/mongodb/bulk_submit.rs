@@ -1361,7 +1361,7 @@ impl SubmitWorkerStorage for MongoBackend {
     ) -> Result<(), LeaseError> {
         self.fenced_update(
             lease,
-            doc! { "$set": {
+            doc! { "$max": {
                 "bytes_processed": bytes_processed as i64,
                 "bytes_total": bytes_total as i64,
             }},

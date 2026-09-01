@@ -1550,7 +1550,8 @@ impl SubmitWorkerStorage for PostgresBackend {
         let affected = client
             .execute(
                 "UPDATE bulk_manifests
-                 SET bytes_processed = $1, bytes_total = $2
+                 SET bytes_processed = GREATEST(bytes_processed, $1),
+                     bytes_total = GREATEST(bytes_total, $2)
                  WHERE tenant_id = $3 AND submitter = $4 AND submission_id = $5
                    AND manifest_id = $6 AND worker_id = $7 AND fencing_token = $8",
                 &[

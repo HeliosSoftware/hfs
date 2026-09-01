@@ -740,14 +740,30 @@ impl BulkSubmitProvider for SqliteBackend {
         }
 
         // Update manifest counts, on a fresh connection: the loop above is
-        // long and its per-entry calls pool their own.
+        // long and its per-entry calls pool their own. Byte progress rides
+        // this write: it lands right after the batch commit releases the
+        // write lock, while a standalone flush (the lease keeper's) can
+        // starve for tens of seconds against back-to-back batch
+        // transactions. MAX keeps a late keeper flush from regressing it.
         let now = Utc::now().to_rfc3339();
         let conn = self.get_connection()?;
+        let (consumed, bytes_total) = options
+            .byte_progress
+            .as_ref()
+            .map(|bp| {
+                (
+                    bp.consumed.load(std::sync::atomic::Ordering::Relaxed) as i64,
+                    bp.total.load(std::sync::atomic::Ordering::Relaxed) as i64,
+                )
+            })
+            .unwrap_or((0, 0));
         conn.execute(
             "UPDATE bulk_manifests SET
                 total_entries = total_entries + ?1,
                 processed_entries = processed_entries + ?2,
-                failed_entries = failed_entries + ?3
+                failed_entries = failed_entries + ?3,
+                bytes_processed = MAX(bytes_processed, ?8),
+                bytes_total = MAX(bytes_total, ?9)
              WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6 AND manifest_id = ?7",
             params![
                 results.len() as i64,
@@ -756,7 +772,9 @@ impl BulkSubmitProvider for SqliteBackend {
                 tenant_id,
                 &submission_id.submitter,
                 &submission_id.submission_id,
-                manifest_id
+                manifest_id,
+                consumed,
+                bytes_total
             ],
         )
         .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
@@ -1623,7 +1641,8 @@ impl SubmitWorkerStorage for SqliteBackend {
         let affected = conn
             .execute(
                 "UPDATE bulk_manifests
-                 SET bytes_processed = ?1, bytes_total = ?2
+                 SET bytes_processed = MAX(bytes_processed, ?1),
+                     bytes_total = MAX(bytes_total, ?2)
                  WHERE tenant_id = ?3 AND submitter = ?4 AND submission_id = ?5
                    AND manifest_id = ?6 AND worker_id = ?7 AND fencing_token = ?8",
                 params![
