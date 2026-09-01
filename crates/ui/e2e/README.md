@@ -16,6 +16,16 @@ import `{ test, expect }` from `../pages/fixtures` and receive page objects as
 fixtures (`async ({ resources, history }) => …`); `pages/api.ts` seeds resources
 over the REST API for state-dependent tests.
 
+The suite shares one server and one user (`l2:`, the default when auth is
+disabled) across every test. The server-side rail state introduced by the
+754/755 epic — "recently used" + "last selected" per page, stored in `rails`
+under `/_user/settings` — is therefore per-*user*, not per-test: without a
+reset, a selection recorded by one test would still be there for the next one
+to restore from. `pages/fixtures.ts`'s `page` fixture resets `rails` (a merge
+patch of `{"rails": null}`) before every test runs, tolerating a `501` (no
+settings store configured for this run) as "nothing to reset". Nothing else
+under `/_user/settings` is touched by the reset.
+
 | Path | What it covers |
 |------|----------------|
 | `tests/a11y.spec.ts` | axe-core WCAG 2.2 AA over every full page, light × dark |
@@ -27,7 +37,7 @@ over the REST API for state-dependent tests.
 | `tests/resources-editor.spec.ts` | edit flows: Create targets the picked type, inline binding validation, Save blocked on invalid, raw-edit round-trips |
 | `tests/editor-controls.spec.ts` | fold/expand, add-node (+filter), remove, `value[x]` choice, ad-hoc extension, standalone `/ui/editor` |
 | `tests/history.spec.ts` | version rail, from/to selects, the **show-metadata diff checkbox**, deep-link, not-found |
-| `tests/compartments.spec.ts` | rail + tabs, and the membership tester's four outcomes (member/self/not-member/fan-out) |
+| `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), and the stored `last` restore through the nav |
 | `tests/queries.spec.ts` | query builder: run → results, pagination, add-condition, per-type param datalist, Recent |
 | `tests/nl-search.spec.ts` | NL mode toggle; translation lands a query and never runs it; refusal; example chips (stubbed `/$nl-search`) |
 | `tests/search-parameters.spec.ts` | registry table, htmx rail filter, facet narrowing, row → detail |
