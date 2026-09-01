@@ -409,7 +409,7 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
 
 /// #653: the CapabilityStatement page renders the live /metadata answer —
 /// summary, safe external documentation links, semantic interaction tags, the
-/// progressively enhanced resource filter, and highlighted raw JSON. Without
+/// progressively enhanced resource filter, and bounded raw JSON shell. Without
 /// a fetchable statement it degrades to the warning, never fabricates.
 #[tokio::test]
 async fn capability_statement_page_renders_summary_and_degrades() {
@@ -434,6 +434,7 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         "resourceType": "CapabilityStatement",
         "status": "active", "kind": "instance", "date": "2026-08-24",
         "fhirVersion": "4.0.1",
+        "rawOnlyMarker": "RAW_ONLY_CAPABILITY_MARKER",
         "format": ["application/fhir+json"],
         "implementation": {"description": "Helios FHIR Server", "url": "http://t/"},
         "rest": [{
@@ -448,11 +449,13 @@ async fn capability_statement_page_renders_summary_and_degrades() {
                 {"name": "unsafe", "definition": "javascript:alert(1)"}
             ],
             "resource": [
-                {"type": "Patient", "profile": "https://example.org/StructureDefinition/Patient|2.0",
+                {"type": "Patient", "profile": "http://hl7.org/fhir/StructureDefinition/Patient",
                  "interaction": [{"code": "read"}, {"code": "delete"}],
                  "searchParam": [{"name": "name"}]},
-                {"type": "Observation", "profile": "urn:oid:1.2.3",
+                {"type": "Observation", "profile": "https://example.org/StructureDefinition/Observation|2.0",
                  "interaction": [{"code": "create"}, {"code": "future-code"}]},
+                {"type": "Encounter", "profile": "urn:oid:1.2.3",
+                 "interaction": [{"code": "read"}]},
                 {"type": "NotARealResource", "profile": "https://example.org/custom|1.0",
                  "interaction": [{"code": "read"}]},
                 {"type": "UnknownUnsafe", "profile": "javascript:alert(2)",
@@ -515,13 +518,17 @@ async fn capability_statement_page_renders_summary_and_degrades() {
     assert!(html.contains("javascript:alert(1)"));
     assert!(!html.contains(r#"href="javascript:"#));
     assert!(html.contains("$export"));
-    // Resource profiles take precedence, unsafe profiles fall back to the
-    // versioned core definition, and unknown types remain plain text.
+    // The real HFS core profile becomes a versioned documentation link. Safe
+    // custom profiles stay intact, unsafe known profiles use the core page,
+    // and unknown unsafe types remain plain text.
     assert!(html.contains(
-        r#"href="https://example.org/StructureDefinition/Patient" target="_blank" rel="noopener">Patient</a>"#
+        r#"href="https://hl7.org/fhir/R4/patient.html" target="_blank" rel="noopener">Patient</a>"#
     ));
     assert!(html.contains(
-        r#"href="https://hl7.org/fhir/R4/observation.html" target="_blank" rel="noopener">Observation</a>"#
+        r#"href="https://example.org/StructureDefinition/Observation" target="_blank" rel="noopener">Observation</a>"#
+    ));
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R4/encounter.html" target="_blank" rel="noopener">Encounter</a>"#
     ));
     assert!(html.contains(
         r#"href="https://example.org/custom" target="_blank" rel="noopener">NotARealResource</a>"#
@@ -531,13 +538,64 @@ async fn capability_statement_page_renders_summary_and_degrades() {
     assert!(html.contains(r#"class="tag tag--member">read</span>"#));
     assert!(html.contains(r#"class="tag tag--config">create</span>"#));
     assert!(html.contains(r#"class="tag tag--excluded">delete</span>"#));
-    // The raw statement uses the shared foldable, highlighted JSON renderer.
-    assert!(html.contains(r#"class="json-view" id="capability-json""#));
-    assert!(html.contains(r#"class="jt--key""#));
-    assert!(html.contains("data-fold="));
+    // The ordinary page carries only a lazy shell. It neither renders nor
+    // pretty-prints the large CapabilityStatement before the fold is opened.
+    assert!(html.contains(r#"id="capability-json-fold""#));
+    assert!(html.contains(r#"id="capability-json-body""#));
+    assert!(html.contains(r#"data-fragment-url="/ui/capability-statement/json-fragment?"#));
+    assert!(html.contains("/ui/capability-statement/json-fragment?"));
+    assert!(html.contains("raw=1"));
+    assert!(html.contains("version=R4"));
+    assert!(html.contains("Open plain JSON"));
+    assert!(html.contains(r#"role="status""#));
+    assert!(!html.contains(r#"id="capability-json""#));
+    assert!(!html.contains(r#"class="json-line"#));
     assert!(!html.contains(r#"<pre class="detail__code">"#));
+    assert!(!html.contains("RAW_ONLY_CAPABILITY_MARKER"));
+
+    // An explicit raw request is the no-JavaScript fallback: plain JSON in an
+    // open disclosure, never the expensive highlighted DOM.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/capability-statement?raw=1&version=R4&filter=Patient")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw_html = body_text(response).await;
+    assert!(raw_html.contains(r#"id="capability-json-fold" open"#));
+    assert!(raw_html.contains(r#"<pre class="detail__code">"#));
+    assert!(raw_html.contains("RAW_ONLY_CAPABILITY_MARKER"));
+    assert!(raw_html.contains("Plain JSON fallback"));
+    assert!(!raw_html.contains(r#"class="json-view""#));
+    assert!(!raw_html.contains(r#"class="json-line"#));
+    assert!(!raw_html.contains(r#"data-capability-json-body""#));
+
+    // This small statement still uses the unchanged shared renderer when the
+    // bounded fragment endpoint is requested.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?version=R4&path=&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let fragment = body_text(response).await;
+    assert!(fragment.contains(r#"class="json-view" id="capability-json""#));
+    assert!(fragment.contains(r#"class="jt--key""#));
+    assert!(fragment.contains("data-fold="));
     // The real GET form remains the fallback while htmx enhances live input.
     assert!(html.contains(r#"method="get" action="/ui/capability-statement""#));
+    assert!(html.contains(r#"<input type="hidden" name="version" value="R4">"#));
+    assert!(!html.contains(r#"name="raw""#));
     assert!(html.contains(r#"hx-get="/ui/capability-statement" hx-include="closest form""#));
     assert!(html.contains(r#"hx-trigger="input changed delay:300ms, search""#));
     assert!(html.contains(r##"hx-target="#cap-resource-table" hx-select="#cap-resource-table""##));
@@ -557,9 +615,78 @@ async fn capability_statement_page_renders_summary_and_degrades() {
     assert!(!html.contains(">Patient<") && html.contains(">Observation<"));
 }
 
+#[cfg(feature = "R5")]
 #[tokio::test]
-async fn capability_statement_raw_json_falls_back_with_http_200_over_budget() {
-    let oversized = Value::Array((0..4_001).map(|index| Value::from(index as u64)).collect());
+async fn capability_statement_filter_preserves_explicit_non_default_version() {
+    let source =
+        helios_ui::StaticConformanceSource::from_data_dir(std::path::Path::new("../../data"))
+            .with_metadata(serde_json::json!({
+                "resourceType": "CapabilityStatement",
+                "status": "active",
+                "kind": "instance",
+                "fhirVersion": "5.0.0",
+                "rest": [{
+                    "mode": "server",
+                    "resource": [
+                        {
+                            "type": "Patient",
+                            "profile": "http://hl7.org/fhir/StructureDefinition/Patient",
+                            "interaction": [{"code": "read"}]
+                        },
+                        {
+                            "type": "Observation",
+                            "profile": "http://hl7.org/fhir/StructureDefinition/Observation",
+                            "interaction": [{"code": "read"}]
+                        }
+                    ]
+                }]
+            }));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        Arc::new(source),
+        // R4 is deliberately the server default: the query must override it.
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/capability-statement?version=R5&filter=obs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"<input type="hidden" name="version" value="R5">"#));
+    assert!(!html.contains(r#"name="raw""#));
+    assert!(!html.contains(">Patient<") && html.contains(">Observation<"));
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R5/observation.html" target="_blank" rel="noopener">Observation</a>"#
+    ));
+    assert!(
+        html.contains(r#"data-fragment-url="/ui/capability-statement/json-fragment?version=R5"#)
+    );
+    assert!(html.contains("FHIR R5"));
+}
+
+#[tokio::test]
+async fn capability_statement_large_json_is_plain_without_js_and_paged_with_htmx() {
+    let oversized = Value::Array(
+        (0..100_001)
+            .map(|index| Value::from(index as u64))
+            .collect(),
+    );
     let source =
         helios_ui::StaticConformanceSource::from_data_dir(std::path::Path::new("../../data"))
             .with_metadata(serde_json::json!({
@@ -584,8 +711,9 @@ async fn capability_statement_raw_json_falls_back_with_http_200_over_budget() {
     );
 
     let response = app
+        .clone()
         .oneshot(
-            Request::get("/ui/capability-statement")
+            Request::get("/ui/capability-statement?raw=1&version=R4")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -595,7 +723,150 @@ async fn capability_statement_raw_json_falls_back_with_http_200_over_budget() {
     let html = body_text(response).await;
     assert!(html.contains(r#"<pre class="detail__code">"#));
     assert!(html.contains("CapabilityStatement"));
-    assert!(!html.contains(r#"id="capability-json""#));
+    assert!(html.contains("100000"));
+    assert!(!html.contains(r#"class="json-view""#));
+    assert!(!html.contains(r#"class="json-line"#));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?version=R4&path=&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let root = body_text(response).await;
+    assert!(root.len() <= 1024 * 1024);
+    assert!(root.contains(r#"data-capability-json-page"#));
+    assert!(root.contains(r#"data-item-count="4""#));
+    assert!(root.contains("extension"), "{root}");
+    assert!(root.contains("[ 100001 ]"));
+    assert!(root.contains("path=%2Fextension"));
+    assert!(!root.contains("100000"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?version=R4&path=%2Fextension&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let first_page = body_text(response).await;
+    assert!(first_page.len() <= 1024 * 1024);
+    assert!(first_page.contains(r#"data-item-count="100""#));
+    assert!(first_page.contains("1–100 / 100001"));
+    assert!(first_page.contains("offset=100"));
+    assert!(!first_page.contains(">100<"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?version=R4&path=%2Fextension&offset=100000&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let last_page = body_text(response).await;
+    assert!(last_page.contains(r#"data-item-count="1""#));
+    assert!(last_page.contains("100001–100001 / 100001"));
+
+    for uri in [
+        "/ui/capability-statement/json-fragment?version=R4&path=not-a-pointer",
+        "/ui/capability-statement/json-fragment?version=R4&path=%2Fextension&limit=101",
+        "/ui/capability-statement/json-fragment?version=R4&path=%2Fextension&offset=100002",
+        "/ui/capability-statement/json-fragment?version=R7&path=",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?path=%2Frest%2F0%2Fmode&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let subtree = body_text(response).await;
+    assert!(subtree.contains(r#"class="json-view""#));
+    assert!(!subtree.contains(r#"id="capability-json""#));
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/capability-statement/json-fragment?version=R4&path=%2Fmissing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn capability_statement_json_fragment_degrades_when_metadata_is_unavailable() {
+    struct FailingMetadataSource;
+
+    #[async_trait::async_trait]
+    impl helios_ui::ConformanceSource for FailingMetadataSource {
+        async fn fetch(
+            &self,
+            _resource_type: &str,
+            _version: helios_fhir::FhirVersion,
+            _tenant: &str,
+        ) -> Result<Vec<Value>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        Arc::new(FailingMetadataSource),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/capability-statement/json-fragment")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body_text(response).await,
+        "CapabilityStatement is unavailable"
+    );
 }
 
 #[tokio::test]
