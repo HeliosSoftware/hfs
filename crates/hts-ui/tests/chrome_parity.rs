@@ -198,39 +198,125 @@ const CS_DETAIL: &str = include_str!("../templates/pages/cs-detail.html");
 const VS_DETAIL: &str = include_str!("../templates/pages/vs-detail.html");
 const CM_DETAIL: &str = include_str!("../templates/pages/cm-detail.html");
 
+/// Assert one detail template carries the shared HFS back-navigation idiom.
+///
+/// Slices the `<a class="back-link" …>` element out of the template source
+/// and asserts on the slice rather than pinning the whole anchor verbatim
+/// (the shape is modelled on `crates/ui/tests/bulk_export_http.rs`). That
+/// way the chevron icon markup can be revised without breaking this ring —
+/// only the contract (href, label key, two spans, ordering) is pinned.
+fn assert_back_link(source: &str, page: &str, href: &str, key: &str) {
+    assert!(
+        source.contains("<header class=\"page-head page-head--back-link\">"),
+        "{page} must wrap its header in `<header class=\"page-head page-head--back-link\">` (#801)",
+    );
+
+    let marker = format!("<a class=\"back-link\" href=\"{href}\">");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{page} must contain the shared back link `{marker}` (#801)"));
+    let end = start
+        + source[start..]
+            .find("</a>")
+            .unwrap_or_else(|| panic!("{page}'s back link has no closing `</a>`"))
+        + "</a>".len();
+    let back_link = &source[start..end];
+
+    assert!(
+        back_link.contains("{% include \"icons/chevron-left.svg\" %}"),
+        "{page}'s back link must inline the shared chevron via `{{% include \"icons/chevron-left.svg\" %}}`",
+    );
+    assert!(
+        back_link.contains(&format!("<span>{{{{ chrome.i18n.t(\"{key}\") }}}}</span>")),
+        "{page}'s back link must label itself with the `{key}` Fluent key inside a bare <span>",
+    );
+    assert_eq!(
+        back_link.matches("<span").count(),
+        2,
+        "{page}'s back link must hold exactly two spans (icon + label): {back_link}",
+    );
+    assert!(
+        !source.contains("class=\"row-link\""),
+        "{page} must not fall back to `.row-link` — that was the #801 regression",
+    );
+    assert!(
+        !source.contains('\u{2039}'),
+        "{page} must not carry the former literal chevron and space — spacing now comes from CSS",
+    );
+
+    let back_link_position = source
+        .find("class=\"back-link\"")
+        .expect("back link marker was located above");
+    let copy_position = source.find("class=\"page-head__copy\"").unwrap_or_else(|| {
+        panic!("{page}'s header children must live inside `<div class=\"page-head__copy\">` (#801)")
+    });
+    assert!(
+        back_link_position < copy_position,
+        "{page}'s back link must precede `.page-head__copy` inside the header",
+    );
+}
+
 #[test]
 fn cs_detail_template_carries_backlink_to_code_systems_browser() {
-    // §14.5: Category C clone of `crates/ui/templates/pages/bulk-import-detail.html`
-    // — hardcoded href to the list page, chevron U+2039, Fluent title key.
-    // The hook is `.row-link`, not the old `.backlink`: the V3 layout pass
-    // dropped every HTS-only class, and `.backlink` has no rule in
-    // `crates/ui/assets/app.css`.
-    // Template-source check because the backlink lives inside
+    // §14.5 / #801: the hook is `.back-link`, wrapped by
+    // `.page-head--back-link` with the former header children moved into
+    // `.page-head__copy`. Those three are the shared back-navigation
+    // primitives (`crates/ui/assets/app.css:1866-1924`) introduced by #763,
+    // and they reach HTS through the `#[folder = "../ui/assets"]` embed in
+    // `crates/hts-ui/src/lib.rs` — so this idiom needs zero new CSS. The
+    // earlier `.row-link` pick had the right instinct (use a class the
+    // shared stylesheet actually defines) but the wrong class: `.row-link`
+    // styles table rows, which is what #801 reported.
+    //
+    // Template-source check because the back link lives inside
     // `{% if let Some(summary) = self.summary() %}` and closed-loopback
     // summaries are `None`; a source check is both stricter and cheaper
     // than standing up a per-resource mock upstream.
-    let needle = "<a class=\"row-link\" href=\"/ui/hts/code-systems\">\u{2039} {{ chrome.i18n.t(\"hts-cs-browser-title\") }}</a>";
-    assert!(
-        CS_DETAIL.contains(needle),
-        "cs-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
+    assert_back_link(
+        CS_DETAIL,
+        "cs-detail.html",
+        "/ui/hts/code-systems",
+        "hts-cs-browser-title",
     );
 }
 
 #[test]
 fn vs_detail_template_carries_backlink_to_value_sets_browser() {
-    let needle = "<a class=\"row-link\" href=\"/ui/hts/value-sets\">\u{2039} {{ chrome.i18n.t(\"hts-vs-browser-title\") }}</a>";
-    assert!(
-        VS_DETAIL.contains(needle),
-        "vs-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
+    assert_back_link(
+        VS_DETAIL,
+        "vs-detail.html",
+        "/ui/hts/value-sets",
+        "hts-vs-browser-title",
     );
 }
 
 #[test]
 fn cm_detail_template_carries_backlink_to_concept_maps_browser() {
-    let needle = "<a class=\"row-link\" href=\"/ui/hts/concept-maps\">\u{2039} {{ chrome.i18n.t(\"hts-cm-browser-title\") }}</a>";
-    assert!(
-        CM_DETAIL.contains(needle),
-        "cm-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
+    assert_back_link(
+        CM_DETAIL,
+        "cm-detail.html",
+        "/ui/hts/concept-maps",
+        "hts-cm-browser-title",
+    );
+}
+
+/// The back-link chevron is a deliberate *copy*, not a shared include.
+///
+/// Neither crate ships an `askama.toml`, so Askama defaults each template
+/// root to its own `$CARGO_MANIFEST_DIR/templates`: an `{% include %}` in
+/// `crates/hts-ui` simply cannot reach `crates/ui/templates/`. The icon is
+/// therefore duplicated at `crates/hts-ui/templates/icons/chevron-left.svg`.
+/// This test makes the duplication safe by refusing to let the two copies
+/// drift — HFS and HTS back links must render the same glyph at the same
+/// size, since both are styled by the one shared `.back-link` rule.
+#[test]
+fn chevron_left_icon_matches_hfs() {
+    let hfs_icon = include_str!("../../ui/templates/icons/chevron-left.svg");
+    let hts_icon = include_str!("../templates/icons/chevron-left.svg");
+    assert_eq!(
+        hfs_icon, hts_icon,
+        "chevron-left.svg drifted between crates/ui/templates/icons/ and \
+         crates/hts-ui/templates/icons/ — re-copy the HFS original",
     );
 }
 

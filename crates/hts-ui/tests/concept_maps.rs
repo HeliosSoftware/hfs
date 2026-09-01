@@ -1256,14 +1256,19 @@ fn cm_detail_templates_only_use_classes_that_exist_in_app_css() {
     );
 }
 
-/// The V3 compact header on the ConceptMap detail page.
+/// The V3 compact header on the ConceptMap detail page. Since #801 it also
+/// takes the HFS back-link idiom: a `.page-head--back-link` modifier, a
+/// leading `.back-link`, and the rest of the head wrapped in
+/// `.page-head__copy`.
 #[test]
 fn cm_detail_page_uses_the_v3_compact_header_shape() {
     const PAGE: &str = include_str!("../templates/pages/cm-detail.html");
     let body = strip_template_comments(PAGE);
 
     for hook in [
-        r#"<header class="page-head">"#,
+        r#"<header class="page-head page-head--back-link">"#,
+        r#"class="back-link""#,
+        r#"class="page-head__copy""#,
         r#"class="page-head__title""#,
         r#"class="facets facets--bare""#,
         r#"class="detail__field detail__field--wide""#,
@@ -1279,6 +1284,7 @@ fn cm_detail_page_uses_the_v3_compact_header_shape() {
         "addbox",
         "hts-cm-detail__",
         "backlink",
+        "row-link",
         "<dl",
     ] {
         assert!(
