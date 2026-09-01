@@ -568,7 +568,7 @@ impl ResourceStorage for MongoBackend {
             .get("id")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(crate::types::new_resource_id);
 
         // Check if resource already exists (including deleted resources).
         let identity_filter = doc! {
@@ -2875,7 +2875,7 @@ impl MongoBackend {
             .get("id")
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(crate::types::new_resource_id);
 
         let existing = resources
             .find_one(doc! {

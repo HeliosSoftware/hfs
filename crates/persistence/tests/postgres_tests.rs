@@ -187,23 +187,35 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        // Default string search is starts-with. `LIKE`, not `ILIKE`: both the stored
-        // column and the bound pattern are already case-folded by `fold_text`, and
-        // `ILIKE` cannot use a btree index (#224). The raw-column fallback is wrapped
-        // in `lower()` so un-backfilled rows keep matching case-insensitively.
+        // Default string search is starts-with, emitted since schema v34 as an
+        // explicit bytewise range on the folded expression rather than a `LIKE`:
+        // a `LIKE` whose pattern is a bind parameter cannot be turned into an
+        // index range by the planner, so the bounds are derived in Rust. Never
+        // `ILIKE`, which cannot use a btree at all (#224); both the stored column
+        // and the bound values are already case-folded by `fold_text`, and the
+        // raw-column fallback is wrapped in `lower()` so un-backfilled rows keep
+        // matching case-insensitively.
         assert!(
             fragment
                 .sql
-                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE"),
+                .contains("COALESCE(value_string_folded, lower(value_string)) ~>=~ $3")
+                && fragment
+                    .sql
+                    .contains("COALESCE(value_string_folded, lower(value_string)) ~<~ $4"),
             "string search must target the indexed folded expression: {}",
             fragment.sql
         );
         assert!(!fragment.sql.contains("ILIKE"));
         assert!(fragment.sql.contains("param_name = 'name'"));
-        // Parameter should be "Smith%"
-        match &fragment.params[0] {
-            SqlParam::Text(s) => assert!(s.ends_with('%')),
-            _ => panic!("Expected Text param"),
+        // Two bounds, both folded: the prefix itself and the exclusive successor
+        // of its last character.
+        assert_eq!(fragment.params.len(), 2);
+        match (&fragment.params[0], &fragment.params[1]) {
+            (SqlParam::Text(lo), SqlParam::Text(hi)) => {
+                assert_eq!(lo, "smith");
+                assert_eq!(hi, "smiti");
+            }
+            other => panic!("Expected two Text params, got {:?}", other),
         }
     }
 
@@ -380,10 +392,18 @@ mod query_builder_tests {
         });
 
         let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
-        // Correlated subquery against the target's 'identifier' index rows.
+        // The identifier lookup drives and yields the target's `Type/id`; the
+        // reference index is seeked with it. The correlated-EXISTS form this
+        // replaced measured 285.6 ms against 1.4 ms on the same replica — see
+        // `build_reference_identifier_condition`.
         assert!(fragment.sql.contains("param_name = 'identifier'"));
         assert!(fragment.sql.contains("idx.value_token_system"));
         assert!(fragment.sql.contains("idx.value_token_code"));
+        assert!(
+            !fragment.sql.contains("EXISTS") && !fragment.sql.contains("SUBSTRING"),
+            "{}",
+            fragment.sql
+        );
     }
 
     #[test]
@@ -503,7 +523,15 @@ mod query_builder_tests {
         assert!(result.is_some());
         let fragment = result.unwrap();
         assert!(fragment.sql.contains("value_token_system"));
-        assert!(!fragment.sql.contains("value_token_code"));
+        // The `system|` form binds the system and nothing else — still exactly
+        // one parameter. It does carry `value_token_code IS NOT NULL` as of
+        // schema v31, which is not a second binding: it is the conjunct that
+        // makes the partial `idx_search_token_code_recent` reachable for this
+        // shape, and it excludes no row (`IndexValue::Token.code` is a
+        // non-optional `String`). What must stay true is that no code VALUE is
+        // compared, which is what would make the search wrong.
+        assert!(fragment.sql.contains("value_token_code IS NOT NULL"));
+        assert!(!fragment.sql.contains("value_token_code ="));
         assert_eq!(fragment.params.len(), 1);
     }
 
@@ -774,7 +802,12 @@ mod postgres_integration {
         SHARED_PG
             .get_or_init(|| async {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                // Pin the major version. testcontainers-modules defaults to
+                // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
+                // the backend sends as a startup option, so PG 11 rejects every
+                // connection FATAL. The rest of the repo runs 16.
                 let container = Postgres::default()
+                    .with_tag("16-alpine")
                     .with_label("github.run_id", &run_id)
                     .start()
                     .await
@@ -1414,6 +1447,142 @@ mod postgres_integration {
             other => {
                 panic!("Expected Gone error or None, got: {:?}", other);
             }
+        }
+    }
+
+    /// A tombstone's version comes from the row, not from an earlier read.
+    ///
+    /// `delete` used to `SELECT version_id`, add one in Rust, and
+    /// compare-and-swap. It now computes the increment inside the `UPDATE`'s
+    /// target list, so this pins the arithmetic that replaced the Rust: after
+    /// two updates the live row is v3 and the tombstone must be v4, with a
+    /// contiguous, duplicate-free version chain behind it.
+    #[tokio::test]
+    async fn postgres_integration_delete_tombstone_version_follows_the_row() {
+        use helios_persistence::core::VersionedStorage;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("delete-tombstone-version");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "active": true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.version_id(), "1");
+
+        let v2 = backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType": "Patient", "active": false}),
+            )
+            .await
+            .unwrap();
+        let v3 = backend
+            .update(
+                &tenant,
+                &v2,
+                json!({"resourceType": "Patient", "active": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v3.version_id(), "3");
+
+        backend
+            .delete(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+
+        let mut versions = backend
+            .list_versions(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        versions.sort_by_key(|v| v.parse::<u64>().unwrap());
+        assert_eq!(
+            versions,
+            vec!["1", "2", "3", "4"],
+            "the tombstone must continue the chain at current + 1"
+        );
+    }
+
+    /// Concurrent writers on one row must never produce an internal error.
+    ///
+    /// This is the failure the removed compare-and-swap existed to prevent: a
+    /// version computed from a stale read colliding with one another writer had
+    /// already inserted, tripping `resource_history`'s
+    /// `PRIMARY KEY (tenant_id, resource_type, id, version_id)`. Deriving the
+    /// version inside the statement makes that unreachable, because PostgreSQL
+    /// re-evaluates the target list against the committed new tuple when it
+    /// unblocks. Every outcome here must therefore be a success or an ordinary
+    /// `NotFound`/`VersionConflict` — never a `Backend` error — and the surviving
+    /// history must have no duplicate versions.
+    #[tokio::test]
+    async fn postgres_integration_concurrent_update_and_delete_never_collide() {
+        use helios_persistence::core::VersionedStorage;
+        use std::sync::Arc;
+
+        let backend = Arc::new(create_backend().await);
+        let tenant = create_tenant("concurrent-update-delete");
+
+        for _ in 0..12 {
+            let created = backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "active": true}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            let id = created.id().to_string();
+
+            let (b1, b2, t1, t2, id1, id2) = (
+                backend.clone(),
+                backend.clone(),
+                tenant.clone(),
+                tenant.clone(),
+                id.clone(),
+                id.clone(),
+            );
+            let updater = tokio::spawn(async move {
+                b1.update(
+                    &t1,
+                    &created,
+                    json!({"resourceType": "Patient", "active": false}),
+                )
+                .await
+                .map(|_| ())
+            });
+            let deleter = tokio::spawn(async move { b2.delete(&t2, "Patient", &id1).await });
+
+            for outcome in [updater.await.unwrap(), deleter.await.unwrap()] {
+                match outcome {
+                    Ok(())
+                    | Err(StorageError::Resource(ResourceError::NotFound { .. }))
+                    | Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                        ..
+                    })) => {}
+                    other => panic!("concurrent update/delete produced {:?}", other),
+                }
+            }
+
+            let versions = backend
+                .list_versions(&tenant, "Patient", &id2)
+                .await
+                .unwrap();
+            let mut unique = versions.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                versions.len(),
+                "duplicate history versions for {id2}: {versions:?}"
+            );
         }
     }
 
