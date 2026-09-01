@@ -34,21 +34,29 @@ export const test = base.extend<Fixtures>({
   // left content edge and intercepting clicks. Park the pointer in the topbar
   // after every navigation; tests that exercise the hover do so explicitly.
   //
-  // Rail state (the 754/755 epic) is server-side and per-user: the suite runs
-  // every test as the same default `l2:` user (no auth), so a "last selected"
-  // or "recently used" recorded by one test would otherwise leak into the
-  // next one's rail. Reset the `rails` record before each test with a merge
-  // patch that deletes it (`null`), same shape and endpoint `saved-queries.js`
-  // and the theme toggle already use. A `501` means no settings store is
-  // configured for this run (e.g. an Elasticsearch-only leg) — there is
-  // nothing to reset, so it is not a failure.
+  // Rail state (the 754/755 epic) is server-side and per-user: on the
+  // default (no-auth) projects every test runs as the same `l2:` user, so a
+  // "last selected" or "recently used" recorded by one test would otherwise
+  // leak into the next one's rail. Reset the `rails` record before each test
+  // with a merge patch that deletes it (`null`), same shape and endpoint
+  // `saved-queries.js` and the theme toggle already use.
+  //
+  // Purely a test-isolation convenience, so this must be 100% best-effort:
+  // it must never fail a test regardless of what the server does with it.
+  // The `auth`/`auth-degraded` projects run against `HFS_AUTH`-enabled
+  // servers and this fixture carries no bearer token, so the request comes
+  // back 401/403 there; other legs can 501 (no settings store configured) or
+  // anything else. Any response status is fine, and a network-level failure
+  // (refused connection, timeout) is caught rather than propagated — none of
+  // that is worth ever taking down a test over.
   page: async ({ page }, use) => {
-    const reset = await page.request.patch("/_user/settings", {
-      headers: { "Content-Type": "application/json" },
-      data: { rails: null },
-    });
-    if (!reset.ok() && reset.status() !== 501) {
-      throw new Error(`resetting rails before test failed: ${reset.status()} ${await reset.text()}`);
+    try {
+      await page.request.patch("/_user/settings", {
+        headers: { "Content-Type": "application/json" },
+        data: { rails: null },
+      });
+    } catch {
+      // Best-effort; see above.
     }
 
     const goto = page.goto.bind(page);

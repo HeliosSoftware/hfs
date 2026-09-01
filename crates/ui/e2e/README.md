@@ -16,15 +16,23 @@ import `{ test, expect }` from `../pages/fixtures` and receive page objects as
 fixtures (`async ({ resources, history }) => …`); `pages/api.ts` seeds resources
 over the REST API for state-dependent tests.
 
-The suite shares one server and one user (`l2:`, the default when auth is
+Most projects share one server and one user (`l2:`, the default when auth is
 disabled) across every test. The server-side rail state introduced by the
 754/755 epic — "recently used" + "last selected" per page, stored in `rails`
 under `/_user/settings` — is therefore per-*user*, not per-test: without a
 reset, a selection recorded by one test would still be there for the next one
 to restore from. `pages/fixtures.ts`'s `page` fixture resets `rails` (a merge
-patch of `{"rails": null}`) before every test runs, tolerating a `501` (no
-settings store configured for this run) as "nothing to reset". Nothing else
-under `/_user/settings` is touched by the reset.
+patch of `{"rails": null}`) before every test runs. Nothing else under
+`/_user/settings` is touched by the reset.
+
+The reset is **100% best-effort** and never fails a test over its own result:
+the whole request is wrapped in `try`/`catch`, and no response status is
+checked at all. This matters beyond the plain SQLite leg — the `auth` and
+`auth-degraded` projects run against `HFS_AUTH`-enabled servers and this
+fixture carries no bearer token, so the reset there always comes back
+401/403; other legs can 501 (no settings store configured) or fail to connect
+outright. All of that is silently swallowed; only navigation failures a test
+actually depends on should ever fail it.
 
 | Path | What it covers |
 |------|----------------|
