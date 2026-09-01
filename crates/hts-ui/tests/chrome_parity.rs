@@ -690,3 +690,59 @@ async fn favicon_link_resolves_under_the_hts_mount() {
          /ui/hts/assets/ — a mount-prefix typo shows up here, not in the markup",
     );
 }
+
+#[test]
+fn workbench_input_group_wrappers_all_carry_the_field_class() {
+    // `.field` (`display: block; margin-bottom: 14px` in the shared app.css)
+    // is what gives a form group its trailing gap. A `role="group"` wrapper
+    // without it contributes no margin of its own and inherits whatever its
+    // last child happens to leave behind — in the case this pins (#807) that
+    // was a `.field` whose own bottom margin collapsed out through the
+    // unstyled wrapper, so the rendered geometry happened to match. That is a
+    // coincidence of margin collapsing, not a design: give such a group a
+    // non-`.field` last child (a `.facets--bare` row, say, as the Direction
+    // group above it has) or put padding on the wrapper, and its spacing
+    // silently drops to zero.
+    //
+    // Source check across all three workbench forms rather than one rendered
+    // page: the omission was in the Forward *and* Reverse branches of the
+    // translate form, and only one of those is in the DOM at a time.
+    let templates = [
+        (
+            "crates/hts-ui/templates/partials/hts-cs-validate-input.html",
+            include_str!("../templates/partials/hts-cs-validate-input.html"),
+        ),
+        (
+            "crates/hts-ui/templates/partials/hts-cm-translate-input.html",
+            include_str!("../templates/partials/hts-cm-translate-input.html"),
+        ),
+        (
+            "crates/hts-ui/templates/partials/hts-vs-expand-input.html",
+            include_str!("../templates/partials/hts-vs-expand-input.html"),
+        ),
+    ];
+
+    let mut groups = 0usize;
+    for (path, template) in templates {
+        // `role="group"` is also discussed in these files' prose.
+        let body = strip_askama_comments(template);
+        for chunk in body.split('<').skip(1) {
+            let Some(tag) = chunk.split('>').next() else {
+                continue;
+            };
+            if !tag.contains(r#"role="group""#) {
+                continue;
+            }
+            groups += 1;
+            assert!(
+                tag.contains(r#"class="field""#),
+                "a `role=\"group\"` wrapper in {path} is missing `class=\"field\"`, \
+                 so it drops out of the form's vertical rhythm:\n\n<{tag}>",
+            );
+        }
+    }
+    assert_eq!(
+        groups, 8,
+        "expected the scan to reach all eight workbench group wrappers",
+    );
+}
