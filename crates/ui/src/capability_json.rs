@@ -296,6 +296,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn expect_outline(view: View) -> Outline {
+        match view {
+            View::Outline(outline) => outline,
+            View::Full(_) => panic!("expected an outline"),
+        }
+    }
+
+    fn expect_full(view: View) -> Vec<json_view::JsonLine> {
+        match view {
+            View::Full(lines) => lines,
+            View::Outline(_) => panic!("expected the shared renderer"),
+        }
+    }
+
     #[test]
     fn rejects_invalid_or_excessively_deep_pointers() {
         let version = FhirVersion::default_enabled();
@@ -312,25 +326,29 @@ mod tests {
             plan(&json!({}), &deep, 0, 10, version).err(),
             Some(Error::InvalidPointer)
         );
+        let overlong = format!("/{}", "x".repeat(MAX_POINTER_BYTES));
+        assert_eq!(
+            plan(&json!({}), &overlong, 0, 10, version).err(),
+            Some(Error::InvalidPointer)
+        );
+        assert_eq!(
+            plan(&json!(true), "", 1, 10, version).err(),
+            Some(Error::InvalidPointer)
+        );
     }
 
     #[test]
     fn large_arrays_are_paged_and_keep_pointer_escaping() {
         let version = FhirVersion::default_enabled();
         let document = json!({"a/b~c": (0..205).collect::<Vec<_>>()});
-        let View::Outline(first) = plan(&document, "/a~1b~0c", 0, MAX_PAGE_SIZE, version).unwrap()
-        else {
-            panic!("large array should use an outline");
-        };
+        let first = expect_outline(plan(&document, "/a~1b~0c", 0, MAX_PAGE_SIZE, version).unwrap());
         assert_eq!(first.rows.len(), 100);
         assert_eq!((first.first_item, first.last_item), (1, 100));
         assert!(first.has_next);
         assert!(first.next_url.contains("offset=100"));
 
-        let View::Outline(last) = plan(&document, "/a~1b~0c", 200, MAX_PAGE_SIZE, version).unwrap()
-        else {
-            panic!("last array page should use an outline");
-        };
+        let last =
+            expect_outline(plan(&document, "/a~1b~0c", 200, MAX_PAGE_SIZE, version).unwrap());
         assert_eq!(last.rows.len(), 5);
         assert_eq!((last.first_item, last.last_item), (201, 205));
         assert!(!last.has_next);
@@ -339,20 +357,64 @@ mod tests {
 
     #[test]
     fn small_values_keep_using_the_shared_renderer() {
-        let View::Full(lines) = plan(
+        let lines = expect_full(
+            plan(
+                &json!({"ok": true}),
+                "",
+                0,
+                100,
+                FhirVersion::default_enabled(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.tokens.iter().any(|token| token.kind == "key"))
+        );
+    }
+
+    #[test]
+    fn object_rows_and_long_scalars_expose_bounded_summaries() {
+        let version = FhirVersion::default_enabled();
+        let object = row(
+            Some("nested"),
+            &json!({"value": true}),
+            Some("/nested".to_string()),
+            false,
+            version,
+        );
+        assert_eq!(object.summary, "{ 1 }");
+        assert!(object.expandable);
+
+        assert_eq!(truncate("abcdef", 3), ("abc…".to_string(), true));
+    }
+
+    #[test]
+    #[should_panic(expected = "expected an outline")]
+    fn outline_test_helper_rejects_full_views() {
+        let view = plan(
             &json!({"ok": true}),
             "",
             0,
             100,
             FhirVersion::default_enabled(),
         )
-        .unwrap() else {
-            panic!("small JSON should use the shared renderer");
-        };
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.tokens.iter().any(|token| token.kind == "key"))
-        );
+        .unwrap();
+        expect_outline(view);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the shared renderer")]
+    fn full_test_helper_rejects_outlines() {
+        let view = plan(
+            &json!((0..101).collect::<Vec<_>>()),
+            "",
+            0,
+            100,
+            FhirVersion::default_enabled(),
+        )
+        .unwrap();
+        expect_full(view);
     }
 }

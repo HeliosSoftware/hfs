@@ -768,6 +768,22 @@ async fn capability_statement_large_json_is_plain_without_js_and_paged_with_htmx
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
     }
     let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?path=%2Frest%2F0%2Fmode&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let subtree = body_text(response).await;
+    assert!(subtree.contains(r#"class="json-view""#));
+    assert!(!subtree.contains(r#"id="capability-json""#));
+
+    let response = app
         .oneshot(
             Request::get("/ui/capability-statement/json-fragment?version=R4&path=%2Fmissing")
                 .body(Body::empty())
@@ -776,6 +792,52 @@ async fn capability_statement_large_json_is_plain_without_js_and_paged_with_htmx
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn capability_statement_json_fragment_degrades_when_metadata_is_unavailable() {
+    struct FailingMetadataSource;
+
+    #[async_trait::async_trait]
+    impl helios_ui::ConformanceSource for FailingMetadataSource {
+        async fn fetch(
+            &self,
+            _resource_type: &str,
+            _version: helios_fhir::FhirVersion,
+            _tenant: &str,
+        ) -> Result<Vec<Value>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        Arc::new(FailingMetadataSource),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/capability-statement/json-fragment")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body_text(response).await,
+        "CapabilityStatement is unavailable"
+    );
 }
 
 #[tokio::test]

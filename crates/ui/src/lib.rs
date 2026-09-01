@@ -3726,8 +3726,44 @@ fn unix_timestamp_seconds() -> u64 {
 mod tests {
     use super::*;
 
+    #[derive(Template)]
+    #[template(source = "{{ value }}", ext = "html")]
+    struct BoundedFragmentTestTemplate<'a> {
+        value: &'a str,
+    }
+
+    struct FailingDisplay;
+
+    impl std::fmt::Display for FailingDisplay {
+        fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Err(std::fmt::Error)
+        }
+    }
+
+    #[derive(Template)]
+    #[template(source = "{{ value }}", ext = "html")]
+    struct FailingFragmentTestTemplate {
+        value: FailingDisplay,
+    }
+
     fn i18n(tag: &str) -> I18n {
         I18n::from_tag(tag).expect("supported locale")
+    }
+
+    #[test]
+    fn capability_fragments_enforce_the_rendering_budget() {
+        let oversized = "x".repeat(capability_json::MAX_FRAGMENT_HTML_BYTES + 1);
+        let response =
+            bounded_capability_fragment(BoundedFragmentTestTemplate { value: &oversized });
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn capability_fragments_report_template_errors() {
+        let response = bounded_capability_fragment(FailingFragmentTestTemplate {
+            value: FailingDisplay,
+        });
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Builds an `IndexPage` from the sample snapshot for template-rendering tests.
