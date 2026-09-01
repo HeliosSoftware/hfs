@@ -5783,6 +5783,7 @@ details.json-fold[open] > summary .icon {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 6px 18px;
+  margin-top: 8px;
   padding: 6px 0;
 }
 
