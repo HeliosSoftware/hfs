@@ -142,7 +142,7 @@ test("Bulk Import one-shot create and delete work without JavaScript", async ({ 
   // The Advanced fold is a native disclosure — it opens without JS.
   await create.locator(".disclosure__summary").click();
   await expect(create.locator("input[name='output_format']")).toBeVisible();
-  await create.getByRole("button", { name: "Create & Submit" }).click();
+  await create.getByRole("button", { name: "Submit", exact: true }).click();
   await expect(page).toHaveURL(/\/ui\/bulk-import\/[0-9a-f-]+$/);
   await expect(page.locator(".kv-grid")).toContainText("https://example.test/manifest.json");
 
