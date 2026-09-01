@@ -31,6 +31,9 @@
 //! body is also echoed verbatim into the "Raw response" workbench panel per
 //! §7.3, so nothing is discarded.
 
+use helios_ui_chrome::capability::{
+    CoreResourceCatalog, DocsVersion, build_view as build_capability_view,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -4045,53 +4048,30 @@ fn parse_closure_edges(resource: &Value) -> Vec<ClosureEdge> {
 // dashboard chart; the capability page folds the raw *CapabilityStatement*
 // instead, mirroring HFS.
 
-/// Projection of a FHIR `CapabilityStatement` for the Capability &
-/// Conformance page.
+/// What the Capability & Conformance page needs from `GET /metadata`.
 ///
-/// Field-for-field this mirrors HFS's `crates/ui/src/capability.rs`
-/// (`CapabilitySummary` + `OperationRow` + `ResourceRow`) so the two pages
-/// can share templates and Fluent keys. It is a documentation surface, not
-/// a machine consumer, so unknown fields are silently dropped.
+/// The projection itself is [`helios_ui_chrome::capability::CapabilityView`]
+/// (#808) — the same one HFS renders, produced by the same parser, so the two
+/// pages cannot disagree about what a statement says and a fix to either
+/// lands on both. HTS adds only what is genuinely its own: a byte-capped copy
+/// of the raw document.
 #[derive(Clone, Debug, Default)]
 pub struct CapabilityView {
-    pub url: String,
-    pub version: String,
-    pub name: String,
-    pub title: String,
-    pub status: String,
-    pub date: String,
-    /// `implementation.description` — HFS shows this as the first summary row.
-    pub description: String,
-    pub fhir_version: String,
-    pub kind: String,
-    /// `format[]` — the wire formats the server accepts.
-    pub formats: Vec<String>,
-    /// System-level `rest[].interaction[].code`.
+    /// The shared projection, fed straight to
+    /// [`helios_ui_chrome::capability::CapabilityCards`].
+    pub cards: helios_ui_chrome::capability::CapabilityView,
+    /// Pretty-printed statement for the foldable raw block.  Retained from
+    /// the response already in hand — no second fetch.
     ///
-    /// **Empty against HTS today**: HTS serves `POST /` (batch) but does not
-    /// advertise it in `rest[].interaction`. The template therefore renders
-    /// this card only when the list is non-empty, so it appears on its own
-    /// if HTS ever declares them — rather than showing a permanently blank
-    /// card or, worse, a fabricated list.
-    pub interactions: Vec<String>,
-    /// System-level `rest[].operation[]`.
-    pub operations: Vec<CapabilityOperation>,
-    /// Flattened `rest[].resource[]` summary — resource type + the list of
-    /// advertised interaction verbs (`read`, `search-type`, ...). Empty
-    /// when the upstream response does not carry a `rest[]` section.
-    pub resources: Vec<CapabilityRestResource>,
-    /// Pretty-printed statement for the foldable raw block, mirroring the
-    /// `raw` field HFS keeps on its `CapabilityPage`. Retained from the
-    /// response already in hand — no second fetch.
-    ///
-    /// **Capped at [`RAW_STATEMENT_BYTE_CAP`].** HFS can inline its whole
-    /// statement because that document is a fixed size; HTS's grows with
-    /// the data, because it carries one
-    /// `capabilitystatement-supported-system` extension per loaded code
-    /// system. Against the bundled seed set that is ~1,975 extensions and a
-    /// 422 KB block — 95% of the page — on every load, `<details>` or not.
-    /// The cap is never silent: [`Self::raw_truncated`] drives a note that
-    /// states both sizes and links to `/metadata` for the complete document.
+    /// **Capped at [`RAW_STATEMENT_BYTE_CAP`].** HFS can afford to serve its
+    /// whole statement (and does, through a paginated fragment endpoint)
+    /// because that document is a fixed size; HTS's grows with the data,
+    /// because it carries one `capabilitystatement-supported-system`
+    /// extension per loaded code system. Against the bundled seed set that is
+    /// ~1,975 extensions and a 422 KB block — 95% of the page — on every
+    /// load, `<details>` or not. The cap is never silent:
+    /// [`Self::raw_truncated`] drives a note that states both sizes and links
+    /// to `/metadata` for the complete document.
     pub raw: String,
     /// Whether [`Self::raw`] was cut short by the cap.
     pub raw_truncated: bool,
@@ -4107,26 +4087,22 @@ pub struct CapabilityView {
 /// terminology server — exactly the case where inlining it would be wrong.
 pub const RAW_STATEMENT_BYTE_CAP: usize = 16 * 1024;
 
-/// One row in [`CapabilityView::operations`].
+/// The resource types a Helios terminology server can advertise.
 ///
-/// HFS's equivalent (`OperationRow`) also carries a `definition_path` for
-/// operations whose canonical resolves to a same-server
-/// `/OperationDefinition/{id}`. Every operation HTS advertises points at an
-/// `hl7.org` canonical instead, so there is nothing to link and the field
-/// is omitted rather than always-empty.
-#[derive(Clone, Debug, Default)]
-pub struct CapabilityOperation {
-    pub name: String,
-    pub definition: String,
-}
+/// HTS's `/metadata` declares exactly CodeSystem, ValueSet and ConceptMap
+/// (`crates/hts/src/operations/metadata.rs`), and all three are core
+/// resources in every release from R4 to R6 — so answering the shared
+/// projection's catalog question needs no schema pack, which is what keeps
+/// this crate off the validator's embedded core packs. A resource type HTS
+/// grows later is simply not linked into the specification until it is added
+/// here; an unlinked row is the safe failure, a link to a page that does not
+/// exist is not.
+struct TerminologyResources;
 
-/// One row in [`CapabilityView::resources`].
-#[derive(Clone, Debug, Default)]
-pub struct CapabilityRestResource {
-    pub resource_type: String,
-    pub interactions: Vec<String>,
-    /// `searchParam[].len()` — HFS shows the same count as a numeric column.
-    pub search_param_count: usize,
+impl CoreResourceCatalog for TerminologyResources {
+    fn is_core_resource(&self, resource_type: &str) -> bool {
+        matches!(resource_type, "CodeSystem" | "ValueSet" | "ConceptMap")
+    }
 }
 
 /// Projection of the `TerminologyCapabilities` fields the Diagnostics
@@ -4168,7 +4144,16 @@ pub struct TerminologyCapabilitiesView {
 impl UpstreamClient {
     /// `GET /metadata` — the FHIR `CapabilityStatement`. Feeds the
     /// Capability &amp; Conformance page.
-    pub async fn capability_statement(&self) -> Result<CapabilityView, UpstreamError> {
+    ///
+    /// `version` is the release this binary was built for, and decides which
+    /// FHIR specification the rendered links point at. It is taken from the
+    /// caller rather than read off the statement's own `fhirVersion` so the
+    /// page links at the spec the *server* implements even when an upstream
+    /// answers with something else.
+    pub async fn capability_statement(
+        &self,
+        version: DocsVersion,
+    ) -> Result<CapabilityView, UpstreamError> {
         let url = format!("{}/metadata", self.base_url);
         let response = self
             .client
@@ -4190,7 +4175,7 @@ impl UpstreamClient {
             url: url.clone(),
             message: e.to_string(),
         })?;
-        Ok(parse_capability_statement(&body))
+        Ok(parse_capability_statement(&body, version))
     }
 
     /// `GET /metadata?mode=terminology` — the FHIR
@@ -4254,89 +4239,9 @@ impl UpstreamClient {
     }
 }
 
-fn parse_capability_statement(body: &Value) -> CapabilityView {
-    let get_str = |key: &str| -> String {
-        body.get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let resources = body
-        .get("rest")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .flat_map(|rest| {
-                    rest.get("resource")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                        .unwrap_or_default()
-                })
-                .map(|resource| CapabilityRestResource {
-                    resource_type: resource
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_owned(),
-                    interactions: resource
-                        .get("interaction")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|i| {
-                                    i.get("code").and_then(|c| c.as_str()).map(|s| s.to_owned())
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    search_param_count: resource
-                        .get("searchParam")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // System-level `rest[].interaction[]` and `rest[].operation[]`. Both are
-    // flattened across every `rest[]` entry for the same reason `resources`
-    // is: a server may legitimately publish more than one mode.
-    let rest = |key: &str| -> Vec<Value> {
-        body.get("rest")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .flat_map(|r| {
-                        r.get(key)
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let interactions = rest("interaction")
-        .iter()
-        .filter_map(|i| i.get("code").and_then(|c| c.as_str()).map(str::to_owned))
-        .collect();
-    let operations = rest("operation")
-        .iter()
-        .map(|o| CapabilityOperation {
-            name: o
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_owned(),
-            definition: o
-                .get("definition")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_owned(),
-        })
-        .collect();
-
+/// Project the statement through the shared parser, then keep a capped copy
+/// of the document itself for the raw fold.
+fn parse_capability_statement(body: &Value, version: DocsVersion) -> CapabilityView {
     // Pretty-printed so the foldable block is readable, then capped — see
     // `CapabilityView::raw`. Cut on a char boundary; `floor_char_boundary`
     // is still unstable, so walk back to one.
@@ -4353,32 +4258,7 @@ fn parse_capability_statement(body: &Value) -> CapabilityView {
     };
 
     CapabilityView {
-        url: get_str("url"),
-        version: get_str("version"),
-        name: get_str("name"),
-        title: get_str("title"),
-        status: get_str("status"),
-        date: get_str("date"),
-        description: body
-            .get("implementation")
-            .and_then(|i| i.get("description"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_owned(),
-        fhir_version: get_str("fhirVersion"),
-        kind: get_str("kind"),
-        formats: body
-            .get("format")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|f| f.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        interactions,
-        operations,
-        resources,
+        cards: build_capability_view(body, version, &TerminologyResources),
         raw,
         raw_truncated: raw_full_bytes > RAW_STATEMENT_BYTE_CAP,
         raw_full_bytes,

@@ -36,6 +36,10 @@
 //! supplies the newline after `</details>`, so the render must not end with
 //! one. See `tests/user_menu.rs::renders_without_a_trailing_newline`.
 //!
+//! [`capability`] shares more than markup: the CapabilityStatement projection
+//! itself lives there, because HFS and HTS were each parsing the same document
+//! into their own `CapabilityView` and each fixing the result separately.
+//!
 //! # What is deliberately *not* shared here
 //!
 //! CSS. `crates/ui/assets/app.css` is already shared byte-for-byte by
@@ -67,6 +71,12 @@
 //! [`user_menu`] about why that is sound.
 
 use askama::Template;
+
+/// The CapabilityStatement read model and cards shared by both products
+/// (#808). Markup *and* projection, unlike the chrome above, because the two
+/// pages disagreeing about what `/metadata` says would be worse than the two
+/// topbars disagreeing about a button.
+pub mod capability;
 
 /// The localisation surface the shared chrome needs from its host.
 ///

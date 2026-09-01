@@ -2914,6 +2914,49 @@ async fn sql_files_page(
     })
 }
 
+/// The shared cards, already HTML.
+///
+/// Rendered in the handler rather than from the template so the page keeps
+/// one error path: `CapabilityCards` returns `Result`, and a template that
+/// called it would have to decide what a half-rendered page looks like.
+struct RenderedCapabilityCards {
+    summary: String,
+    interactions: String,
+    operations: String,
+    resources: String,
+}
+
+impl RenderedCapabilityCards {
+    /// HFS's dialect of the shared cards: the backend-role footnote, the
+    /// include/revinclude columns its search layer actually populates, and
+    /// the progressively enhanced type filter its ~150-row table needs.
+    fn render(
+        i18n: &I18n,
+        view: &helios_ui_chrome::capability::CapabilityView,
+        version: helios_fhir::FhirVersion,
+        filter: &str,
+    ) -> Result<Self, askama::Error> {
+        let cards = helios_ui_chrome::capability::CapabilityCards::new(i18n, view)
+            .transaction_note_href(Some(ROLE_MATRIX_URL))
+            .show_include_columns(true)
+            .filter(Some(helios_ui_chrome::capability::ResourceFilter {
+                action: "/ui/capability-statement",
+                version: version.as_str(),
+                value: filter,
+            }));
+        Ok(Self {
+            summary: cards.summary()?,
+            interactions: cards.interactions()?,
+            operations: cards.operations()?,
+            resources: cards.resources()?,
+        })
+    }
+}
+
+/// Where the `transaction` footnote sends an operator asking why the verb is
+/// advertised here and not on another deployment.
+const ROLE_MATRIX_URL: &str = "https://github.com/HeliosSoftware/hfs/blob/main/crates/persistence/README.md#primarysecondary-role-matrix";
+
 /// The read-only CapabilityStatement page (#653): the live `/metadata`
 /// answer for the sidebar's tenant and FHIR version, summarized and filterable,
 /// with the raw statement one fold away.
@@ -2923,8 +2966,10 @@ struct CapabilityPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    /// `None` when the self-fetch failed — the page degrades to a warning.
-    view: Option<capability::CapabilityView>,
+    /// The four cards shared with HTS, pre-rendered (#808). `None` when the
+    /// self-fetch failed — HFS degrades the whole page to one warning, where
+    /// HTS degrades card by card, because HFS has a single source to fail.
+    cards: Option<RenderedCapabilityCards>,
     /// Pretty-printed JSON for the explicit no-JavaScript fallback. This never
     /// passes through the highlighted renderer.
     raw: String,
@@ -2934,10 +2979,6 @@ struct CapabilityPage {
     raw_url: String,
     /// Bounded, server-driven JSON root loaded by htmx.
     fragment_url: String,
-    /// Effective version carried by the resource filter's ordinary GET form.
-    effective_version: &'static str,
-    /// The server-side resource-type filter, echoed back into the form.
-    filter: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -3054,8 +3095,9 @@ async fn capability_page(
         .unwrap_or(rv.0);
     let raw_requested = query.raw.as_deref() == Some("1");
     let raw_url = capability_raw_url(&filter, version);
+    let i18n = I18n::new(locale);
     let fetched = state.conformance.metadata(version, &rt.id).await;
-    let (view, raw) = match fetched {
+    let (cards, raw) = match fetched {
         Ok(statement) => {
             let mut view = capability::build_view(&statement, version);
             if !filter.is_empty() {
@@ -3068,7 +3110,16 @@ async fn capability_page(
             } else {
                 String::new()
             };
-            (Some(view), raw)
+            match RenderedCapabilityCards::render(&i18n, &view, version, &filter) {
+                Ok(cards) => (Some(cards), raw),
+                Err(error) => {
+                    // The shared partials have no fallible construct, so this
+                    // is unreachable in practice — but a blank page is not an
+                    // acceptable way to find that out.
+                    tracing::error!("CapabilityStatement card render failed: {error}");
+                    (None, String::new())
+                }
+            }
         }
         Err(error) => {
             tracing::warn!("CapabilityStatement self-fetch failed: {error}");
@@ -3077,15 +3128,13 @@ async fn capability_page(
     };
     render(CapabilityPage {
         status: current_status(&state, version, &rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: "capability-statement",
-        view,
+        cards,
         raw,
         raw_requested,
         raw_url,
         fragment_url: capability_json::root_fragment_url(version),
-        effective_version: version.as_str(),
-        filter,
     })
 }
 

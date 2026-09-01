@@ -4,11 +4,14 @@
 //! `/__mock_ready` before firing so the mock's TCP listener has finished
 //! accepting on Windows.
 //!
-//! **Shape of record (2026-08-27).** The page mirrors HFS's
-//! `crates/ui/templates/pages/capability-statement.html`: same sidebar
-//! label and icon, same route shape, and the same stacked
-//! `<section class="card">` blocks. It was previously "Diagnostics" at
-//! `/ui/hts/diagnostics`; that path now 308s here.
+//! **Shape of record (2026-09-01, #808).** Four of the six cards are no
+//! longer this crate's markup at all: they are rendered by
+//! `helios_ui_chrome::capability::CapabilityCards`, the same code HFS's
+//! `/ui/capability-statement` renders. These tests therefore assert the
+//! *page* — which cards appear, in what order, fed by which fetch, degrading
+//! how — and leave the cards' internals to the shared crate's own unit tests.
+//! The page was previously "Diagnostics" at `/ui/hts/diagnostics`; that path
+//! now 308s here.
 //!
 //! The tests exercise:
 //!
@@ -24,8 +27,11 @@
 //!    moved to Home, and the round-trips went with them.
 //! 7. The old `/ui/hts/diagnostics` path still resolves, as a 308.
 //! 8. A 5xx on one source degrades only its own card.
-//! 9. (sync) Every CSS class the template names has a real rule in the
-//!    shared `crates/ui/assets/app.css` — the page adds no CSS.
+//! 9. The shared cards arrive with HFS's spec links and colour-coded
+//!    interaction chips — the two improvements this page did not have while
+//!    it kept its own copy of the markup.
+//! 10. (sync) Every CSS class the page names — its own *and* the shared
+//!    cards' — has a real rule in the shared `crates/ui/assets/app.css`.
 
 use axum::{
     Router,
@@ -366,6 +372,27 @@ async fn capability_page_mirrors_hfs_and_declares_terminology_capabilities() {
         "CodeSystem advertises 5 search params and the count column should say so",
     );
 
+    // ── #808: the shared cards bring HFS's links and colour coding ──────
+    // This page rendered plain text here while it kept its own copy of the
+    // markup. The links follow the release the binary was built for, so an
+    // R4 build never sends the operator at the current-release page (#797).
+    assert!(
+        html.contains(
+            r#"<a href="https://hl7.org/fhir/R4/codesystem.html" target="_blank" rel="noopener">CodeSystem</a>"#
+        ),
+        "resource types should link into the release's own specification",
+    );
+    assert!(
+        html.contains(r#"<span class="tag tag--member">read</span>"#),
+        "per-resource interaction verbs should carry HFS's semantic classes",
+    );
+    assert!(
+        html.contains(
+            r#"<a class="url" href="http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup""#
+        ),
+        "operation definitions should link when the canonical is safe",
+    );
+
     // ── System Interactions is absent, not blank ────────────────────────
     // HTS serves `POST /` but declares no `rest[].interaction[]`. The card
     // must not appear at all rather than render an empty chip row.
@@ -489,9 +516,21 @@ async fn interactions_appear_when_declared_and_one_failure_degrades_only_its_car
         html.contains("System Interactions"),
         "the card should appear once the server declares interactions",
     );
+    // #808: the chips arrive from the shared card, so they carry HFS's
+    // semantic colour classes and HFS's link into the release's HTTP
+    // specification. Before the unification this page emitted a bare
+    // `<span class="tag">`.
     assert!(
-        html.contains(r#"<span class="tag">batch</span>"#),
-        "declared interactions should render as `.tag` chips",
+        html.contains(
+            r#"<a class="tag tag--config" href="https://hl7.org/fhir/R4/http.html#batch""#
+        ),
+        "declared interactions should be colour-coded chips linked into the spec",
+    );
+    assert!(
+        html.contains(
+            r#"<a class="tag tag--config" href="https://hl7.org/fhir/R4/http.html#transaction""#
+        ),
+        "every declared verb should be linked, not just the first",
     );
 
     // A 500 on the terminology probe degrades only the terminology card;
@@ -573,33 +612,80 @@ async fn interactions_appear_when_declared_and_one_failure_degrades_only_its_car
 /// a rule in the shared stylesheet, so a future edit cannot smuggle in a
 /// reintroduced HTS-only style hook.
 ///
+/// The scan covers the shared cards too (#808). They are the bulk of the
+/// page now, and they are edited from `crates/ui-chrome` — where nothing
+/// otherwise checks that a class reaches an HTS page with a rule behind it,
+/// because that crate carries no stylesheet of its own.
+///
 /// A plain `#[test]`: it reads files and never touches the runtime, so it
 /// stays outside the `#[tokio::test]` budget this file works to.
 #[test]
-fn capability_template_only_uses_classes_that_exist_in_app_css() {
-    const PAGE: &str = include_str!("../templates/pages/capability-statement.html");
+fn capability_markup_only_uses_classes_that_exist_in_app_css() {
     const APP_CSS: &str = include_str!("../../ui/assets/app.css");
-
-    // Skip only the `{#- … -#}` *header* comment, which quotes CSS
-    // selectors and `class="…"` fragments in prose. `split_once` (first
-    // match), not `rsplit_once`: the template carries a short comment above
-    // each card, and splitting on the last one would skip nearly the whole
-    // file — silently reducing this guard to a couple of classes.
-    let body = PAGE.split_once("-#}").map(|(_, rest)| rest).unwrap_or(PAGE);
+    const SOURCES: [(&str, &str); 5] = [
+        (
+            "the HTS page",
+            include_str!("../templates/pages/capability-statement.html"),
+        ),
+        (
+            "the shared summary card",
+            include_str!("../../ui-chrome/templates/partials/capability-summary-card.html"),
+        ),
+        (
+            "the shared interactions card",
+            include_str!("../../ui-chrome/templates/partials/capability-interactions-card.html"),
+        ),
+        (
+            "the shared operations card",
+            include_str!("../../ui-chrome/templates/partials/capability-operations-card.html"),
+        ),
+        (
+            "the shared resources card",
+            include_str!("../../ui-chrome/templates/partials/capability-resources-card.html"),
+        ),
+    ];
 
     let mut checked = 0usize;
-    for chunk in body.split(r#"class=""#).skip(1) {
-        let value = chunk.split('"').next().unwrap_or_default();
-        for class in value.split_whitespace() {
-            assert!(
-                APP_CSS.contains(&format!(".{class}")),
-                "class `{class}` used by the Capability template has no rule in crates/ui/assets/app.css",
-            );
-            checked += 1;
+    for (label, source) in SOURCES {
+        // Skip only the leading `{#- … -#}` / `{# … #}` header comment, which
+        // quotes CSS selectors and `class="…"` fragments in prose. First
+        // match, not last: these files carry a short comment above each card,
+        // and splitting on the last one would skip nearly the whole file —
+        // silently reducing this guard to a couple of classes.
+        let body = source
+            .split_once("-#}")
+            .or_else(|| source.split_once("#}"))
+            .map(|(_, rest)| rest)
+            .unwrap_or(source);
+        for chunk in body.split(r#"class=""#).skip(1) {
+            let value = chunk.split('"').next().unwrap_or_default();
+            // A `class` attribute may interpolate: `class="tag {{ i.tag_class }}"`.
+            // Strip the expression and check the literal classes around it —
+            // the interpolated values are `&'static str`s chosen in Rust, and
+            // the shared crate's unit tests pin them.
+            let literals = value
+                .split("{{")
+                .enumerate()
+                .map(|(i, part)| {
+                    if i == 0 {
+                        part
+                    } else {
+                        part.split_once("}}").map(|(_, rest)| rest).unwrap_or("")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            for class in literals.split_whitespace() {
+                assert!(
+                    APP_CSS.contains(&format!(".{class}")),
+                    "class `{class}` used by {label} has no rule in crates/ui/assets/app.css",
+                );
+                checked += 1;
+            }
         }
     }
     assert!(
-        checked >= 10,
-        "expected the scan to reach the template's class attributes, only saw {checked}",
+        checked >= 20,
+        "expected the scan to reach the markup's class attributes, only saw {checked}",
     );
 }
