@@ -360,6 +360,87 @@ async fn a_file_slower_than_the_lease_stays_leased_to_completion() {
     assert_eq!(total as usize, LINES);
 }
 
+/// #791: the UI's provider-submission record is written continuously while a
+/// bulk ingest is committing resources on other connections. A DEFERRED
+/// transaction read a WAL snapshot before writing and then failed the
+/// read-to-write upgrade with SQLITE_BUSY_SNAPSHOT — a code the busy handler
+/// is never invoked for — so under a live ingest essentially every
+/// provider-submission write was lost. The store now takes the write lock up
+/// front (IMMEDIATE). The synthetic race here cannot force a commit into the
+/// microsecond snapshot window on demand, so treat this as a concurrency
+/// smoke over the write path, not a proof; the deterministic guarantee is
+/// the transaction mode itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_submission_writes_survive_a_concurrent_ingest() {
+    use helios_persistence::core::{BulkProviderStore, ResourceStorage};
+    use serde_json::json;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // A short busy timeout keeps the broken (DEFERRED) shape from stalling
+    // half a minute per write before erroring; the fixed shape queues briefly
+    // behind the ingest's commits and proceeds.
+    let backend = SqliteBackend::with_config(
+        tmp.path().join("provider-writes.db").to_str().unwrap(),
+        SqliteBackendConfig {
+            busy_timeout_ms: 1_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    backend.init_schema().unwrap();
+    let backend = Arc::new(backend);
+
+    // A stand-in for the ingest: uninterrupted resource commits.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let backend = Arc::clone(&backend);
+        let stop = Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut i = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let patient = json!({
+                    "resourceType": "Patient",
+                    "id": format!("ingest-{i}"),
+                    "gender": "female"
+                });
+                backend
+                    .create(
+                        &tenant(),
+                        "Patient",
+                        patient,
+                        helios_fhir::FhirVersion::default_enabled(),
+                    )
+                    .await
+                    .unwrap();
+                i += 1;
+            }
+        })
+    };
+
+    // The status card's save loop: forty versioned writes, none may be lost.
+    for version in 0..40i64 {
+        backend
+            .put_provider_submission(
+                &tenant(),
+                "ui-submission",
+                json!({"status": "in-progress", "tick": version}),
+                Some(version),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("versioned write {version} lost to the ingest: {e}"));
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.await.unwrap();
+
+    let stored = backend
+        .get_provider_submission(&tenant(), "ui-submission")
+        .await
+        .unwrap()
+        .expect("the record persisted");
+    assert_eq!(stored.version, 40);
+}
+
 /// The starvation half of the mid-file heartbeat: a stream that is always
 /// Ready (a fast local file server, a fully buffered response) lets the ingest
 /// future run poll after poll without ever returning Pending, so a renewal

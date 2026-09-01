@@ -6,6 +6,15 @@
   <div class="kv-grid kv-grid--flush">
     <div class="detail__field detail__field--wide">
       <span>{{ i18n.t("bulk-import-processing") }}</span>
+      {% if let Some(pct) = percent %}
+      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ pct }}" aria-label="{{ i18n.t("bulk-import-processing") }}">
+        <div class="progress-fill" style="width: {{ pct }}%"></div>
+      </div>
+      {% else %}
+      <div class="progress-track progress-track--indeterminate" role="progressbar" aria-label="{{ i18n.t("bulk-import-processing") }}">
+        <div class="progress-fill"></div>
+      </div>
+      {% endif %}
       <div>{% if !progress.is_empty() %}{{ progress }}{% else %}{{ i18n.t("bulk-import-processing-waiting") }}{% endif %}</div>
     </div>
   </div>
@@ -39,3 +48,6 @@
 <div id="bulk-status"></div>
 {% endif %}
 {% endif %}
+{# The summary card's STATUS cell rides along out-of-band, so the page-level
+   status never goes stale while the card polls (#765 follow-up). #}
+<div id="submission-status" hx-swap-oob="true">{{ status_label }}</div>
