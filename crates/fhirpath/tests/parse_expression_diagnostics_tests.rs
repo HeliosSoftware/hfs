@@ -70,4 +70,3 @@ fn parse_expression_unchanged_alongside_the_new_function() {
     assert!(helios_fhirpath::parse_expression("Patient.name.family").is_ok());
     assert!(helios_fhirpath::parse_expression("Patient.name.").is_err());
 }
-
