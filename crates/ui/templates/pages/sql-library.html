@@ -1,11 +1,19 @@
 {% extends "layouts/base.html" %}
+{% import "partials/rail_recent.html" as recent %}
 
 {#
   SQL Queries / SQL Views workspace (#649): the View Definitions shape over
   Library resources of the route's kind. The SQL pane edits the decoded
   application/sql attachment; the JSON fold edits the rest of the Library.
-  Save/Duplicate are one plain form; Run is a plain link; Delete rides
-  conformance-crud.js. Everything works without JavaScript.
+  Above the list, a server-rendered "Recently used" group (#754/#755 ticket
+  03) restores the last-picked library on arrival and remembers up to
+  `max_recent` more, with a `{id, name, meta}` snapshot so a recent still
+  renders when the search box filters it out — the page key (`rail_page`) and
+  heading (`all_heading_key`) come from the route's `LibraryKind`, never
+  hardcoded here, so SQL Queries and SQL Views never share or contaminate
+  each other's record. Save/Duplicate are one plain form; Run is a plain
+  link; Delete rides conformance-crud.js. Everything works without
+  JavaScript.
 #}
 
 {% block title %}{{ i18n.t(title_key) }} — {{ i18n.t("app-title") }}{% endblock %}
@@ -37,6 +45,9 @@
       <input type="search" name="filter" value="{{ filter }}"
              placeholder="{{ i18n.t("lib-filter") }}" aria-label="{{ i18n.t("lib-filter") }}">
     </form>
+    {% call recent::group("lib-rail-recent", "lib-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries) %}{% endcall %}
+    <div class="filter-rail__divider" aria-hidden="true"></div>
+    <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t(all_heading_key) }}</div>
     <div class="filter-rail__list" id="lib-rail-list">
       {% for item in rail %}
       <a class="filter-rail__item" data-type="{{ item.id }}" data-full-name="{{ item.name }}"
@@ -151,5 +162,6 @@
   </div>
 </div>
 
+<script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/conformance-crud.js" defer></script>
 {% endblock %}

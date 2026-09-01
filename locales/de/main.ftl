@@ -803,6 +803,7 @@ vd-new = Neu erstellen
 vd-new-title = Neue View-Definition
 vd-rail-label = View-Definitionen
 vd-rail-heading = View-Definitionen
+vd-rail-all-heading = Alle View-Definitionen
 vd-filter = Views filtern
 vd-none = Noch keine View-Definitionen.
 vd-empty-lede = Lege mit „Neu erstellen" die erste ViewDefinition an.
@@ -826,6 +827,8 @@ vd-page-next = Weiter
 
 sql-queries-new-title = Neue SQL-Abfrage
 sql-views-new-title = Neue SQL-View
+sql-queries-rail-all-heading = Alle SQL-Abfragen
+sql-views-rail-all-heading = Alle SQL-Views
 lib-filter = Bibliotheken filtern
 lib-none = Noch keine Bibliotheken.
 lib-empty-lede = Lege mit „Neu erstellen" die erste Bibliothek an.

@@ -806,6 +806,7 @@ vd-new = Create New
 vd-new-title = New View Definition
 vd-rail-label = View definitions
 vd-rail-heading = View Definitions
+vd-rail-all-heading = All View Definitions
 vd-filter = Filter views
 vd-none = No view definitions yet.
 vd-empty-lede = Create your first ViewDefinition with Create New.
@@ -829,6 +830,8 @@ vd-page-next = Next
 
 sql-queries-new-title = New SQL Query
 sql-views-new-title = New SQL View
+sql-queries-rail-all-heading = All SQL Queries
+sql-views-rail-all-heading = All SQL Views
 lib-filter = Filter libraries
 lib-none = No libraries yet.
 lib-empty-lede = Create your first library with Create New.
