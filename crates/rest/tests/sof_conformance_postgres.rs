@@ -2,7 +2,7 @@
 //!
 //! Mirrors `sof_conformance.rs` (which targets SQLite) but wires the
 //! HTTP server's storage backend to a PostgreSQL container via
-//! `testcontainers`. Same fixture set (`crates/sof/tests/sql-on-fhir-v2/tests/`),
+//! `testcontainers`. Same fixture set (`crates/sof/tests/sql-on-fhir/tests/`),
 //! same comparator, same regression-floor pattern.
 //!
 //! Requires Docker (testcontainers spins up a real PostgreSQL instance).
@@ -158,7 +158,7 @@ mod sof_conformance_postgres_tests {
     }
 
     fn load_fixtures() -> Vec<Fixture> {
-        let dir = std::path::Path::new("../sof/tests/sql-on-fhir-v2/tests");
+        let dir = std::path::Path::new("../sof/tests/sql-on-fhir/tests");
         assert!(
             dir.exists(),
             "conformance fixture directory not found: {}",

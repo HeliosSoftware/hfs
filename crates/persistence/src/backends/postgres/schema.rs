@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 35;
+pub const SCHEMA_VERSION: i32 = 36;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -169,7 +169,7 @@ async fn create_schema_v1(client: &deadpool_postgres::Client) -> StorageResult<(
                 value_token_code_2 TEXT,
                 value_number_2 DOUBLE PRECISION
                 -- NOTE: there is deliberately no FOREIGN KEY to `resources`
-                -- here. See `migrate_v22_to_v23` — every path that removes a
+                -- here. See `migrate_v23_to_v24` — every path that removes a
                 -- resource row deletes this table's rows explicitly, and the
                 -- constraint charged one extra SELECT plus a FOR KEY SHARE lock
                 -- on the parent for every one of the ~39.5M index rows written.
@@ -194,8 +194,8 @@ async fn create_schema_v1(client: &deadpool_postgres::Client) -> StorageResult<(
 /// `create_schema_v1` is always followed by the whole migration chain, which
 /// rebuilds, narrows or drops most of these against an empty table at no cost.
 /// The chain is the single source of truth for the live index set — several
-/// indexes named below (`idx_search_composite` in v26; `idx_search_reference`,
-/// `idx_search_token_display` in v27) no longer exist by the time the schema is
+/// indexes named below (`idx_search_composite` in v27; `idx_search_reference`,
+/// `idx_search_token_display` in v28) no longer exist by the time the schema is
 /// current.
 async fn create_indexes(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let indexes = [
@@ -256,7 +256,7 @@ async fn create_fts_tables(client: &deadpool_postgres::Client) -> StorageResult<
                 narrative_tsvector TSVECTOR,
                 content_tsvector TSVECTOR
                 -- NOTE: there is deliberately no FOREIGN KEY to `resources`
-                -- here. See `migrate_v26_to_v27`, and `migrate_v22_to_v23`
+                -- here. See `migrate_v27_to_v28`, and `migrate_v23_to_v24`
                 -- for the same decision on `search_index`: every path that
                 -- removes a resource row deletes this table's row explicitly,
                 -- and the constraint charged one extra SELECT plus a
@@ -301,7 +301,7 @@ async fn create_fts_tables(client: &deadpool_postgres::Client) -> StorageResult<
     // may be added back: the writer supplies them directly and leaves
     // `narrative_text` / `full_content` unbound, so a trigger reading those
     // columns would overwrite both vectors with the tsvector of an empty
-    // string. See `migrate_v24_to_v25`.
+    // string. See `migrate_v25_to_v26`.
     let _ = client
         .execute(
             "DROP TRIGGER IF EXISTS trg_update_fts_vectors ON resource_fts",
@@ -355,6 +355,7 @@ async fn migrate_schema(
             32 => migrate_v32_to_v33(client).await?,
             33 => migrate_v33_to_v34(client).await?,
             34 => migrate_v34_to_v35(client).await?,
+            35 => migrate_v35_to_v36(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -902,9 +903,9 @@ async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// The layout of `search_index`, recorded once at the v16 -> v17 migration.
+/// The layout of `search_index`, recorded once at the v17 -> v18 migration.
 ///
-/// v17 denormalizes the pagination sort key (`last_updated`) onto every index
+/// v18 denormalizes the pagination sort key (`last_updated`) onto every index
 /// row so that `ORDER BY last_updated DESC LIMIT n` can be answered from
 /// `search_index` alone. Only the write path can populate it — the value belongs
 /// to the resource, and a resource has many index rows — so an existing table
@@ -916,11 +917,11 @@ async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult
 pub enum IndexLayout {
     /// Every `search_index` row carries `last_updated`.
     Denormalized,
-    /// Rows predate v17 and have no sort key; read paths must use the v16 form.
+    /// Rows predate v18 and have no sort key; read paths must use the v16 form.
     Legacy,
 }
 
-/// Reads the recorded layout. Databases that never ran the v17 migration, and
+/// Reads the recorded layout. Databases that never ran the v18 migration, and
 /// any database whose marker is unreadable, are treated as [`IndexLayout::Legacy`]
 /// — the conservative direction, since it selects the query form that works
 /// against both layouts.
@@ -941,7 +942,29 @@ pub async fn read_index_layout(client: &deadpool_postgres::Client) -> IndexLayou
     }
 }
 
-/// v16 -> v17: denormalize the pagination sort key onto `search_index`.
+/// v16 -> v17: Add the provider-side Bulk Submit store (#772) - the
+/// submissions the Bulk Import workspace sends, previously misfiled in the
+/// per-user user_settings document. One opaque JSONB document per
+/// (tenant, submission), whole-document writes under a monotonic version.
+async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS bulk_provider_submissions (
+                tenant_id  TEXT NOT NULL,
+                id         TEXT NOT NULL,
+                data       JSONB NOT NULL,
+                version    BIGINT NOT NULL DEFAULT 1,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, id)
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+    Ok(())
+}
+
+/// v17 -> v18: denormalize the pagination sort key onto `search_index`.
 ///
 /// Every search ends `ORDER BY last_updated DESC, id ASC LIMIT n`, and that key
 /// lived only on `resources`. For a filter that matches many rows the planner
@@ -962,14 +985,14 @@ pub async fn read_index_layout(client: &deadpool_postgres::Client) -> IndexLayou
 /// before. A fresh database is marked `denormalized`. (Promoting a populated
 /// database, by re-extracting under `$reindex` and flipping the marker, is not
 /// implemented here.)
-async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .execute(
             "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ",
             &[],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v17->v18 failed: {}", e)))?;
 
     client
         .execute(
@@ -977,14 +1000,14 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
             &[],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v17->v18 failed: {}", e)))?;
 
     // A fresh database runs every migration in sequence against an empty table,
     // so emptiness here is exactly "no row predates the column".
     let populated = client
         .query_one("SELECT EXISTS (SELECT 1 FROM search_index LIMIT 1)", &[])
         .await
-        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?
+        .map_err(|e| pg_error(format!("Migration v17->v18 failed: {}", e)))?
         .get::<_, bool>(0);
 
     let layout = if populated { "legacy" } else { "denormalized" };
@@ -992,18 +1015,18 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
     client
         .execute("DELETE FROM search_index_layout", &[])
         .await
-        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v17->v18 failed: {}", e)))?;
     client
         .execute(
             "INSERT INTO search_index_layout (layout) VALUES ($1)",
             &[&layout],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v17->v18 failed: {}", e)))?;
 
     if populated {
         tracing::info!(
-            "search_index predates v17; keeping the v16 search form. Existing \
+            "search_index predates v18; keeping the v16 search form. Existing \
              deployments are unaffected and see no change in behaviour."
         );
         return Ok(());
@@ -1044,13 +1067,13 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v17->v18 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v21 -> v22: stop paying for a surrogate key and a composite index nobody
+/// v22 -> v23: stop paying for a surrogate key and a composite index nobody
 /// asks about on rows that have no composite.
 ///
 /// Search is now 1.6x off the best published server while import is 11.1x off,
@@ -1060,7 +1083,7 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
 /// **`search_index.id BIGSERIAL PRIMARY KEY`.** Nothing reads it — no query in
 /// the backend selects, filters, orders by, joins on, or returns it; rows are
 /// addressed by (tenant_id, resource_type, resource_id), which is what the FK
-/// cascade used too (the FK itself is gone as of v23). `ROW_COLUMNS` in the writer never mentions it. It is a surrogate
+/// cascade used too (the FK itself is gone as of v24). `ROW_COLUMNS` in the writer never mentions it. It is a surrogate
 /// key that exists because the table was written with one by habit, and on run
 /// 33013229956 its index was **963 MB with 0 scans** — as it was in every run
 /// today. Each inserted row pays a sequence `nextval()`, a btree insert into
@@ -1088,9 +1111,9 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
 /// Deliberately NOT dropped: `idx_search_composite_token_token`, 1571 MB at 0
 /// scans in every run today. It is already partial on `composite_group`, and it
 /// serves token-token composites that this benchmark never issues but real
-/// callers do. Same rule as `idx_search_string` in v18 — zero scans here means
+/// callers do. Same rule as `idx_search_string` in v19 — zero scans here means
 /// the benchmark misses the shape, not that nobody needs it.
-async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v22_to_v23(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = [
         // Drops the PRIMARY KEY constraint, its 963 MB index, and the sequence
         // with it.
@@ -1105,13 +1128,13 @@ async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v21->v22 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v22->v23 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v23 -> v24: give `idx_search_token` the payload and the sort key that every
+/// v24 -> v25: give `idx_search_token` the payload and the sort key that every
 /// other token index already has, and make the folded-string pattern index
 /// reachable.
 ///
@@ -1175,7 +1198,7 @@ async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// `idx_search_token` is `(tenant_id, resource_type, param_name,
 /// value_token_system, value_token_code)` with **no payload and no sort key** —
-/// the one token index v19 never rebuilt. So the fast path's
+/// the one token index v20 never rebuilt. So the fast path's
 ///
 /// ```sql
 /// SELECT DISTINCT resource_id, last_updated FROM search_index
@@ -1200,7 +1223,7 @@ async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult
 /// ## The fix, and why it does not depend on the planner
 ///
 /// Add `last_updated DESC, resource_id ASC` as **key** columns — not `INCLUDE`,
-/// which is payload and cannot satisfy an ORDER BY (v19). Every column ahead of
+/// which is payload and cannot satisfy an ORDER BY (v20). Every column ahead of
 /// them is bound by equality in this predicate, so the remaining key order is
 /// exactly the order the fast path asks for: the scan becomes index-only,
 /// `DISTINCT` becomes a streaming `Unique`, and the LIMIT stops it at 22
@@ -1220,7 +1243,7 @@ async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult
 /// ~92 bytes per entry). Import already pays one insert per such row; what
 /// changes is the entry width, +8 bytes for `last_updated` and ~40 for
 /// `resource_id`, so ~157 MB -> ~240 MB. That is +83 MB against 20 GB of
-/// indexes and no new index insert for the other ~37.9M rows. For scale, v21
+/// indexes and no new index insert for the other ~37.9M rows. For scale, v22
 /// re-added 5.6 GB.
 ///
 /// ## Second change: the folded-string pattern index was unreachable
@@ -1243,7 +1266,7 @@ async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// The pattern index went unused because it is partial on
 /// `WHERE value_string IS NOT NULL` and nothing in the query implied that
-/// predicate — the exact hazard v22's docstring flags as the reason *not* to put
+/// predicate — the exact hazard v23's docstring flags as the reason *not* to put
 /// a predicate on `idx_search_string_folded`. `build_string_condition` now emits
 /// `value_string IS NOT NULL AND …` explicitly, which is sound because the
 /// writer only ever sets `value_string_folded` alongside `value_string`
@@ -1256,7 +1279,7 @@ async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult
 /// that can serve an ORDER BY on a string parameter. The wider payload is paid
 /// on ~250k rows — the size of the partial set, inferred from the 25 MB
 /// footprint — i.e. tens of megabytes.
-async fn migrate_v23_to_v24(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v24_to_v25(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let index_stmts = [
         "DROP INDEX IF EXISTS idx_search_token",
         "CREATE INDEX IF NOT EXISTS idx_search_token
@@ -1275,13 +1298,13 @@ async fn migrate_v23_to_v24(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v23->v24 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v24->v25 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v24 -> v25: stop storing the text `resource_fts` only ever indexed.
+/// v25 -> v26: stop storing the text `resource_fts` only ever indexed.
 ///
 /// `resource_fts` held four columns for two questions. `narrative_text` and
 /// `full_content` carried the raw strings — the latter being every string value
@@ -1309,17 +1332,17 @@ async fn migrate_v23_to_v24(client: &deadpool_postgres::Client) -> StorageResult
 /// search.
 ///
 /// The columns themselves are deliberately left in the table, on the same
-/// reasoning as `param_url` in v22: `DROP COLUMN` runs against real databases
+/// reasoning as `param_url` in v23: `DROP COLUMN` runs against real databases
 /// and cannot be undone, and unbound they cost one bit each in the null bitmap.
 /// Rows written before this keep their text; nothing reads it either way.
-async fn migrate_v24_to_v25(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .execute(
             "DROP TRIGGER IF EXISTS trg_update_fts_vectors ON resource_fts",
             &[],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v24->v25 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v25->v26 failed: {}", e)))?;
     let _ = client
         .execute("DROP FUNCTION IF EXISTS update_fts_vectors()", &[])
         .await;
@@ -1327,7 +1350,7 @@ async fn migrate_v24_to_v25(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// v25 -> v26: stop indexing rows the index in question can never answer for.
+/// v26 -> v27: stop indexing rows the index in question can never answer for.
 ///
 /// `search_index` is one wide table holding every parameter of every resource
 /// type, and the write path is where the whole benchmark lives: 79% of the
@@ -1369,7 +1392,7 @@ async fn migrate_v24_to_v25(client: &deadpool_postgres::Client) -> StorageResult
 /// `value_string_folded` is NULL, one insert each, so that a string search on
 /// `Patient.name` can find the ~250k that are not.
 ///
-/// The predicate is reachable because v24 already made it so: it changed
+/// The predicate is reachable because v25 already made it so: it changed
 /// `build_string_condition` to emit `value_string IS NOT NULL AND …` explicitly
 /// (for the pattern index's benefit), and every remaining site that touches the
 /// folded column does the same or uses a strict operator on `value_string`
@@ -1407,11 +1430,11 @@ async fn migrate_v24_to_v25(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// ## 3. `idx_search_composite` is dropped
 ///
-/// v22 made it partial on `composite_group IS NOT NULL` and recorded the reason
+/// v23 made it partial on `composite_group IS NOT NULL` and recorded the reason
 /// it could be: anything probing it without constraining `composite_group`
 /// "falls back to `idx_search_resource` (tenant_id, resource_type,
 /// resource_id), a column prefix of it". That fallback is the whole story. After
-/// v22 the index holds only composite rows, and its key still leads
+/// v23 the index holds only composite rows, and its key still leads
 /// `(tenant_id, resource_type, resource_id, …)`, so the only predicate that can
 /// seek it is one that seeks `idx_search_resource` too — which is smaller, has
 /// no predicate to prove, and is already the hottest index in the schema.
@@ -1453,16 +1476,16 @@ async fn migrate_v24_to_v25(client: &deadpool_postgres::Client) -> StorageResult
 /// is not used, for the reason v15 gives: a process death mid-build leaves an
 /// INVALID index that a later `IF NOT EXISTS` skips forever.
 ///
-/// A pre-v17 database is left completely alone. Every predicate above is stated
+/// A pre-v18 database is left completely alone. Every predicate above is stated
 /// in terms of the denormalized composite layout — one row per composite
 /// instance — and a legacy database stores one row per *component*, where
 /// `build_composite_condition_legacy` reads the base value columns of rows that
-/// these predicates would exclude. Such a database keeps the v25 index set and
+/// these predicates would exclude. Such a database keeps the v26 index set and
 /// behaves exactly as before.
-async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v26_to_v27(client: &deadpool_postgres::Client) -> StorageResult<()> {
     if read_index_layout(client).await != IndexLayout::Denormalized {
         tracing::info!(
-            "search_index predates v17; keeping the v25 index set. Existing \
+            "search_index predates v18; keeping the v26 index set. Existing \
              deployments are unaffected and see no change in behaviour."
         );
         return Ok(());
@@ -1470,7 +1493,7 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
 
     let stmts = [
         // 1. Only rows that have a string value can answer a string search.
-        //    v24 made `build_string_condition` emit `value_string IS NOT NULL`.
+        //    v25 made `build_string_condition` emit `value_string IS NOT NULL`.
         "DROP INDEX IF EXISTS idx_search_string_folded",
         "CREATE INDEX IF NOT EXISTS idx_search_string_folded
          ON search_index (tenant_id, resource_type, param_name, value_string_folded)
@@ -1499,14 +1522,14 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v25->v26 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v26->v27 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v26 -> v27: give the composite covering indexes the fast path's sort key —
-/// as KEY columns — and give them back the payload v26 took away.
+/// v27 -> v28: give the composite covering indexes the fast path's sort key —
+/// as KEY columns — and give them back the payload v27 took away.
 ///
 /// ## The regression this repairs
 ///
@@ -1522,21 +1545,21 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
 /// `k6/searchConfig.js`.
 ///
 /// Worse, `composite Observation combo-code-value-quantity` p99 went **88 ms ->
-/// 114 ms** between runs 33029355759 (v25) and 33086933938 (v26), in absolute
-/// terms, against an environment 1.58x friendlier. v26 is the only schema
+/// 114 ms** between runs 33029355759 (v26) and 33086933938 (v27), in absolute
+/// terms, against an environment 1.58x friendlier. v27 is the only schema
 /// change between them, and the cause is in its diff rather than its reasoning:
 ///
 /// ```text
-/// v17:  INCLUDE (resource_id, last_updated)   WHERE composite_group IS NOT NULL
-/// v26:  INCLUDE (resource_id)                 WHERE composite_group IS NOT NULL
+/// v18:  INCLUDE (resource_id, last_updated)   WHERE composite_group IS NOT NULL
+/// v27:  INCLUDE (resource_id)                 WHERE composite_group IS NOT NULL
 ///                                               AND value_quantity_value IS NOT NULL
 /// ```
 ///
-/// v26's docstring argues only about the predicate; it never mentions the
+/// v27's docstring argues only about the predicate; it never mentions the
 /// payload. The `INCLUDE (resource_id)` text was copied from `create_indexes`
-/// (the v1 shape) instead of from `migrate_v16_to_v17` (the shape actually in
+/// (the v1 shape) instead of from `migrate_v17_to_v18` (the shape actually in
 /// the database), so `last_updated` was dropped silently. A single-parameter
-/// composite search takes the v17 fast path —
+/// composite search takes the v18 fast path —
 /// `build_composite_condition` emits exactly one `id IN (SELECT resource_id
 /// FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND …)`, which
 /// `single_index_predicate` extracts (pinned by
@@ -1571,15 +1594,15 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
 /// ## The general fix: stop sorting the match set
 ///
 /// Restoring `last_updated` to `INCLUDE` would undo the regression and leave
-/// the shape where v25 had it — still 17.85 ms, because payload is not
-/// ordering. This is trap 6 and v19's own finding: **`INCLUDE` columns are
+/// the shape where v26 had it — still 17.85 ms, because payload is not
+/// ordering. This is trap 6 and v20's own finding: **`INCLUDE` columns are
 /// payload, not key columns, and cannot satisfy an `ORDER BY`.** With the sort
 /// key only in the payload the plan must read *every* matching index row and
 /// sort it to find 21. `code-value-quantity=8302-2$gt170` (body height over
 /// 170 cm) matches a large fraction of a code slice that is tens of thousands
 /// of rows; the LIMIT buys nothing.
 ///
-/// v20 settled how to fix that for an equality predicate: put the value ahead
+/// v21 settled how to fix that for an equality predicate: put the value ahead
 /// of the sort key and you get both — the scan seeks straight to the one value,
 /// and *within* that value the rows are already in `last_updated DESC,
 /// resource_id ASC` order, so `DISTINCT` becomes a streaming `Unique` and the
@@ -1587,7 +1610,7 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
 /// token+quantity search is an equality on the token component and a range on
 /// the quantity component, so the token component leads the key and the
 /// quantity column moves to the payload, where the scan filters it without
-/// touching the heap — the identical trade v20 made for `value_token_system` on
+/// touching the heap — the identical trade v21 made for `value_token_system` on
 /// `idx_search_token_code`, and the reason that column is proven to work as an
 /// index-only filter here.
 ///
@@ -1599,7 +1622,7 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
 /// token+token gets the same treatment with *both* equality columns ahead of
 /// the sort key. The benchmark never issues that family — 20 of the 46 R4
 /// composites are in it and real callers do — so this is not measured here; it
-/// is the same defect (v26 dropped its `last_updated` too) and the same repair.
+/// is the same defect (v27 dropped its `last_updated` too) and the same repair.
 ///
 /// ## The trade, stated plainly
 ///
@@ -1627,7 +1650,7 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
 /// ## Write-side cost
 ///
 /// **No new index and no new index insert.** Both indexes keep exactly the row
-/// set v26 gave them — the same partial predicates, unchanged — so the number
+/// set v27 gave them — the same partial predicates, unchanged — so the number
 /// of btree insertions per imported row is identical. What changes is the width
 /// of an entry in two indexes that between them hold roughly 2.3M of the 22.6M
 /// index rows (`combo-code-value-quantity` alone is 1,149,190):
@@ -1643,26 +1666,26 @@ async fn migrate_v25_to_v26(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// Neither index deduplicates today (btree deduplication is disabled for any
 /// index with `INCLUDE` columns), so no compression is lost either. For scale,
-/// v24 accepted +83 MB for the same shape of change on the token index and v21
+/// v25 accepted +83 MB for the same shape of change on the token index and v22
 /// re-added 5.6 GB.
 ///
 /// The migration cost on a real database is two `CREATE INDEX`es over the
 /// partial row sets, holding a `SHARE` lock on `search_index` — writes block
 /// for their duration, at startup, under `initialize_schema`'s advisory lock.
-/// That is smaller than v26's three full-heap builds because both are partial
+/// That is smaller than v27's three full-heap builds because both are partial
 /// over a ~10% slice, but it is an outage window and is stated rather than
 /// hidden. `CREATE INDEX CONCURRENTLY` is not used, for v15's reason: a process
 /// death mid-build leaves an INVALID index that a later `IF NOT EXISTS` skips
 /// forever.
 ///
-/// A pre-v17 database is left alone, exactly as v26 leaves it: every predicate
+/// A pre-v18 database is left alone, exactly as v27 leaves it: every predicate
 /// here is stated in terms of the denormalized one-row-per-composite-instance
 /// layout, and `build_composite_condition_legacy` reads columns of rows these
 /// predicates exclude.
-async fn migrate_v26_to_v27(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v27_to_v28(client: &deadpool_postgres::Client) -> StorageResult<()> {
     if read_index_layout(client).await != IndexLayout::Denormalized {
         tracing::info!(
-            "search_index predates v17; keeping the v26 index set. The composite \
+            "search_index predates v18; keeping the v27 index set. The composite \
              fast path does not run against a legacy layout."
         );
         return Ok(());
@@ -1692,26 +1715,26 @@ async fn migrate_v26_to_v27(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v26->v27 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v27->v28 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v27 -> v28: four indexes on `search_index` that no predicate the query
+/// v28 -> v29: four indexes on `search_index` that no predicate the query
 /// builder emits can seek, and that a surviving index already covers.
 ///
-/// After v26 the write path is still 85% of the import suite's Postgres time —
+/// After v27 the write path is still 85% of the import suite's Postgres time —
 /// 2,603.6 s of 3,063.8 s over 22,565,546 rows, 0.115 ms per row (run
 /// 33086933938). Batching is finished (1,679 rows per statement; statement
 /// count fell 42,875,393 -> 56,610), and rows per resource already fell
 /// 24.2 -> 13.9. What is left is arithmetic: rows x indexes-each-row-enters x
-/// cost per btree insert. v26 attacked the middle factor with partial
+/// cost per btree insert. v27 attacked the middle factor with partial
 /// predicates. This attacks it again, by removing indexes outright — and
-/// unlike v26 it is a catalog-only migration, because every drop is proved
+/// unlike v27 it is a catalog-only migration, because every drop is proved
 /// against a surviving index rather than replaced by a rebuilt one.
 ///
-/// The standard used here is the one v18 and v22 set and v26 restated: a
+/// The standard used here is the one v19 and v23 set and v27 restated: a
 /// zero-scan index in this benchmark means the benchmark misses that shape,
 /// not that nobody needs it. So none of the four below is dropped for being
 /// cold. Each is dropped because the SQL this backend emits **cannot seek
@@ -1724,7 +1747,7 @@ async fn migrate_v26_to_v27(client: &deadpool_postgres::Client) -> StorageResult
 /// row of each kind populates) crossed with every surviving index predicate.
 ///
 /// ```text
-/// row kind                     v26  v27
+/// row kind                     v27  v28
 /// reference, with display        4    2
 /// reference, no display          3    2
 /// string                         4    3
@@ -1819,14 +1842,14 @@ async fn migrate_v26_to_v27(client: &deadpool_postgres::Client) -> StorageResult
 /// about the reverse direction), so its fourth key column is unreachable by
 /// construction.
 ///
-/// Its first three key columns and its v26 predicate (`value_string IS NOT
+/// Its first three key columns and its v27 predicate (`value_string IS NOT
 /// NULL`) are identical to `idx_search_string_folded_pattern`'s, and that index
-/// is both the one the string predicate actually seeks — v24 made it reachable
+/// is both the one the string predicate actually seeks — v25 made it reachable
 /// by having `build_string_condition` emit the `value_string IS NOT NULL`
-/// conjunct — and strictly better for the scan, since v24 gave it
+/// conjunct — and strictly better for the scan, since v25 gave it
 /// `INCLUDE (resource_id, last_updated)` and the fast path needs exactly those
 /// two columns. `:exact` is unaffected: it emits `value_string = $n` against
-/// the bare column and is served by `idx_search_string`, which v18 kept for
+/// the bare column and is served by `idx_search_string`, which v19 kept for
 /// that reason and this does not touch.
 ///
 /// ## Read-side risk, and how it is bounded
@@ -1854,13 +1877,13 @@ async fn migrate_v26_to_v27(client: &deadpool_postgres::Client) -> StorageResult
 /// once it has the lock. The space the four indexes occupied is returned to the
 /// filesystem immediately rather than left as bloat.
 ///
-/// Unlike v26 this is applied to a legacy (pre-v17) `search_index` too. Every
+/// Unlike v27 this is applied to a legacy (pre-v18) `search_index` too. Every
 /// argument above is about which operator classes and which columns the emitted
 /// SQL can use, and `build_composite_condition_legacy` shares
 /// `build_composite_component` with the denormalized form — its string
 /// component is the same non-sargable `value_string ILIKE $n`, and it reads no
 /// display column and no folded column. Nothing here depends on the row layout.
-async fn migrate_v27_to_v28(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = [
         // 1. Same key columns, same predicate, and `text_pattern_ops` carries
         //    `=`. The pattern index additionally serves the prefix `LIKE`s that
@@ -1880,13 +1903,13 @@ async fn migrate_v27_to_v28(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v27->v28 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v28->v29 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v28 -> v29: make one resource's full-text row unique, and stop charging a
+/// v29 -> v30: make one resource's full-text row unique, and stop charging a
 /// foreign-key check for writing it.
 ///
 /// `INSERT INTO resource_fts` was the second-largest statement in the crud
@@ -1920,7 +1943,7 @@ async fn migrate_v27_to_v28(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// ## `fk_fts_resource` goes
 ///
-/// The same trade `migrate_v22_to_v23` made for `search_index`, for the same
+/// The same trade `migrate_v23_to_v24` made for `search_index`, for the same
 /// reason: Postgres enforces a FK with a per-row `AFTER INSERT` trigger that
 /// runs `SELECT 1 FROM ONLY resources … FOR KEY SHARE`, so every full-text write
 /// paid an extra index probe, a `FOR KEY SHARE` lock on the parent row, and the
@@ -1939,15 +1962,15 @@ async fn migrate_v27_to_v28(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// A `DELETE` of duplicate rows (normally none), then a `DROP INDEX` and a
 /// `CREATE UNIQUE INDEX` over one row per resource — a fraction of the
-/// `search_index` rebuilds v26 performs — and a catalog-only
+/// `search_index` rebuilds v27 performs — and a catalog-only
 /// `ALTER TABLE … DROP CONSTRAINT`. It runs at startup under
 /// `initialize_schema`'s advisory lock.
 ///
-/// Rows written before v27 keep the lexemes they were built with, including the
+/// Rows written before v28 keep the lexemes they were built with, including the
 /// ids and references `collect_strings` no longer indexes. That is a superset of
 /// what the new writer produces, so nothing that used to be findable stops being
 /// findable without a rewrite; `$reindex` rebuilds them on the narrower rule.
-async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = [
         // 1. One row per resource, so the unique index can be built.
         "DELETE FROM resource_fts a
@@ -1968,13 +1991,13 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v28->v29 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v29->v30 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v29 -> v30: the token family is 62% of the index footprint and one of its
+/// v30 -> v31: the token family is 62% of the index footprint and one of its
 /// three indexes is 2,283 MB of redundancy.
 ///
 /// ## The regime this is trying to change
@@ -2009,12 +2032,12 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 /// S1  value_token_code = $n                                bare code, and the `|code` form
 /// S2  value_token_system = $n                              the `system|` form
 /// S3  (value_token_system = $s AND value_token_code = $c)   the `system|code` form
-/// S4  value_token_display ILIKE $n                         :text / :code-text (index dropped in v27)
+/// S4  value_token_display ILIKE $n                         :text / :code-text (index dropped in v28)
 /// ```
 ///
-/// Traced to the LIVE definitions — v20's for `idx_search_token_code`, v21's
-/// for `idx_search_token_code_recent`, v24's for `idx_search_token`, NOT the v1
-/// shapes in `create_indexes`, which is the mistake that cost v26 a 26 ms
+/// Traced to the LIVE definitions — v21's for `idx_search_token_code`, v22's
+/// for `idx_search_token_code_recent`, v25's for `idx_search_token`, NOT the v1
+/// shapes in `create_indexes`, which is the mistake that cost v27 a 26 ms
 /// regression:
 ///
 /// - **S1** implies `value_token_code IS NOT NULL`, so it reaches both
@@ -2027,7 +2050,7 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// **S3 does not need a system-first index.** `idx_search_token_code` is
 /// `(tenant_id, resource_type, param_name, value_token_code, last_updated DESC,
-/// resource_id ASC) INCLUDE (value_token_system)`, and v20 built that payload
+/// resource_id ASC) INCLUDE (value_token_system)`, and v21 built that payload
 /// for precisely this: the scan seeks the code, the remaining key columns are
 /// the fast path's `ORDER BY` so `DISTINCT` is a streaming `Unique` and the
 /// `LIMIT` stops it, and the system is filtered from the payload without
@@ -2046,7 +2069,7 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// `idx_search_token` is
 /// `(tenant_id, resource_type, param_name, value_token_system, value_token_code,
-/// last_updated DESC, resource_id ASC)`. v24 added the last two as KEY columns
+/// last_updated DESC, resource_id ASC)`. v25 added the last two as KEY columns
 /// and argued — correctly, for S3 — that "every column ahead of them is bound
 /// by equality in this predicate". For **S2** that is false: `value_token_code`
 /// sits at key position 5 and S2 does not bind it, so the sort key is not
@@ -2058,7 +2081,7 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 ///          rows=66667 scanned to return 22, 1074 buffers, 45.8 ms
 /// ```
 ///
-/// The whole match set is read and sorted. That is the exact pathology v24 was
+/// The whole match set is read and sorted. That is the exact pathology v25 was
 /// written to remove, still present in the one shape this index exists for.
 ///
 /// ## 1. `idx_search_token` is replaced by a seek-only index
@@ -2074,7 +2097,7 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 /// and no `resource_id` in the key, every row of a
 /// (tenant, type, param, system) group is a *duplicate key*, so btree
 /// deduplication collapses the group to one key plus a posting list of 6-byte
-/// TIDs. (`INCLUDE` disables deduplication outright, which is why the v20/v21
+/// TIDs. (`INCLUDE` disables deduplication outright, which is why the v21/v22
 /// shapes get none of this.)
 ///
 /// Measured on the replica — 4M token rows, 3.1M with a system (the 77.5% ratio
@@ -2084,7 +2107,7 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 /// (real T1/T3 1.016 vs 1.021, real T2/T3 1.311 vs 1.252), so its ratios carry:
 ///
 /// ```text
-/// idx_search_token          (v24 shape)                445 MB
+/// idx_search_token          (v25 shape)                445 MB
 /// idx_search_token_system   (this)                      22 MB   = 4.9%
 /// idx_search_token minus only value_token_code         416 MB   = 93.5%  (rejected, below)
 /// ```
@@ -2111,7 +2134,7 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// `build_token_condition` therefore now emits `value_token_code IS NOT NULL`
 /// alongside the system equality for the `system|` form. That is the same device
-/// v24 used to make `idx_search_string_folded_pattern` reachable, and it makes
+/// v25 used to make `idx_search_string_folded_pattern` reachable, and it makes
 /// `idx_search_token_code_recent` — `(tenant_id, resource_type, param_name,
 /// last_updated DESC, resource_id ASC) INCLUDE (value_token_code)`, partial on
 /// `value_token_code IS NOT NULL` — a legal candidate for S2. That index scans
@@ -2124,7 +2147,7 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 /// ```
 ///
 /// Both regimes are covered and the planner chooses: seek the system when it is
-/// selective, stream recent-first when it is not — the division v19 and v21
+/// selective, stream recent-first when it is not — the division v20 and v22
 /// established for date, quantity and token-code.
 ///
 /// **Soundness of the added conjunct.** It excludes a row only if some row has
@@ -2157,7 +2180,7 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 /// table carrying only the old index and then only the new one:
 ///
 /// ```text
-/// v24 idx_search_token       535 MB WAL   5,245 ms
+/// v25 idx_search_token       535 MB WAL   5,245 ms
 /// idx_search_token_system    390 MB WAL   3,834 ms      -27% both
 /// ```
 ///
@@ -2217,12 +2240,12 @@ async fn migrate_v28_to_v29(client: &deadpool_postgres::Client) -> StorageResult
 /// CONCURRENTLY` is not used, for the reason v15 gives: a process death
 /// mid-build leaves an INVALID index that a later `IF NOT EXISTS` skips forever.
 ///
-/// Unlike v26 and v27 this is applied to a legacy (pre-v17) `search_index` too.
-/// All three token indexes were created or rebuilt by ungated migrations (v18,
-/// v19, v20, v21, v24), so both layouts hold the identical token family, and the
+/// Unlike v27 and v28 this is applied to a legacy (pre-v18) `search_index` too.
+/// All three token indexes were created or rebuilt by ungated migrations (v19,
+/// v20, v21, v22, v25), so both layouts hold the identical token family, and the
 /// writer invariant the new conjunct rests on is a property of `IndexValue`
 /// rather than of the row layout.
-async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = [
         // Its only unique shape is `system|`, and it never gave that shape the
         // sort key: `value_token_code` sits between the system and
@@ -2240,24 +2263,24 @@ async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v29->v30 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v30->v31 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v30 -> v31: v30's replacement index became an attractive nuisance, and the
+/// v31 -> v32: v31's replacement index became an attractive nuisance, and the
 /// recent-first token index cannot answer a `system|code` predicate without the
 /// heap.
 ///
-/// ## What v30 got right, and what it got wrong
+/// ## What v31 got right, and what it got wrong
 ///
 /// Run 33176893776 against run 33128380492, same runner (`github-agent1`), so
 /// the comparison is same-hardware:
 ///
 /// ```text
-///                 baseline      v30      ratio
-/// all_indexes      12 GB      9605 MB    -2,395 MB   <- the point of v30
+///                 baseline      v31      ratio
+/// all_indexes      12 GB      9605 MB    -2,395 MB   <- the point of v31
 /// heap_only        3682 MB    3682 MB     unchanged
 /// import           3.1 RPS    3.4 RPS     1.09x
 /// crud             3629 RPS   3933 RPS    1.08x
@@ -2273,20 +2296,20 @@ async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult
 /// per posting list. The write-side prediction landed too — import and crud
 /// moved +9% and +8% together, which is one fewer btree insert per token row.
 ///
-/// What v30 got wrong is one sentence of its own docstring: "S3 is served by
+/// What v31 got wrong is one sentence of its own docstring: "S3 is served by
 /// `idx_search_token_code`". It *can* be, and sections AD, AE and AF of the plan
 /// capture show it being served exactly that way — `Index Only Scan using
-/// idx_search_token_code`, `Heap Fetches: 0`, 5 buffers. But v30 never asked
+/// idx_search_token_code`, `Heap Fetches: 0`, 5 buffers. But v31 never asked
 /// whether the planner would *choose* it, and for one parameter it does not:
 ///
 /// ```text
-/// shape                        base p99   v30 p99
+/// shape                        base p99   v31 p99
 /// token Encounter class            26 ms    358 ms
 /// ```
 ///
 /// ## The measured mechanism
 ///
-/// `pg_stat_user_indexes` from the v30 run:
+/// `pg_stat_user_indexes` from the v31 run:
 ///
 /// ```text
 /// index                          scans   tuples_read    size     tuples/scan
@@ -2313,9 +2336,9 @@ async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult
 /// ```
 ///
 /// **rows=210 estimated, 67,692 actual — a 322x under-estimate.** That is the
-/// same (system, code) independence error v24 documented; v24 neutralised it by
+/// same (system, code) independence error v25 documented; v25 neutralised it by
 /// making the index the planner preferred *cheap*, at a cost of 2,283 MB, and
-/// v30 removed that index without removing the error. `Encounter.class` is where
+/// v31 removed that index without removing the error. `Encounter.class` is where
 /// it bites because the parameter has ~10 distinct codes over one system, so
 /// seeking the system alone returns essentially the whole slice. The p50 stayed
 /// at 8 ms and only the p99 moved, which is the signature: the plan is fine when
@@ -2333,31 +2356,31 @@ async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// Steering the planner was rejected. An extended statistic on
 /// (`value_token_system`, `value_token_code`) would correct the 322x estimate,
-/// but it is a bet on an estimate rather than a property of the schema, and v24
+/// but it is a bet on an estimate rather than a property of the schema, and v25
 /// already recorded the objection: it "would leave the cliff in place for every
 /// value whose estimate is still wrong". Instead, both changes below make the
 /// *reachable* plans safe, so the estimate stops mattering.
 ///
-/// **1. `idx_search_token_system` is dropped.** v30 created it one migration ago
+/// **1. `idx_search_token_system` is dropped.** v31 created it one migration ago
 /// and it is dropped here on its own measurement. It exists for `system|`, but
 /// it is seekable by `system|code` too — both forms are strict in
 /// `value_token_system` and there is no predicate that separates them — and for
 /// `system|code` it is the worst plan in the family. Its 96 MB is not the point;
 /// the 80 million heap-fetched tuples are.
 ///
-/// This meets the drop rule v18/v22/v26/v28 set. The slice `system|` seeks it
+/// This meets the drop rule v19/v23/v27/v29 set. The slice `system|` seeks it
 /// for is served by `idx_search_token_code_recent` over a **superset** of its
 /// rows: that index is partial on `value_token_code IS NOT NULL`, and every row
 /// with a system has a code (`IndexValue::Token` declares `code: String`; pinned
 /// by `a_token_row_never_has_a_system_without_a_code`), it shares the identical
 /// leading three key columns, and change 2 below puts the system in its payload
-/// so the scan is index-only. v30's `value_token_code IS NOT NULL` conjunct in
+/// so the scan is index-only. v31's `value_token_code IS NOT NULL` conjunct in
 /// `build_token_condition` is what makes that index provable for the `system|`
 /// form, and it becomes load-bearing here rather than merely helpful: without
 /// it, `system|` would have no index at all.
 ///
 /// **2. `idx_search_token_code_recent` gets `value_token_system` in its
-/// payload.** Traced to its LIVE definition — v21's, verified against
+/// payload.** Traced to its LIVE definition — v22's, verified against
 /// `pg_indexes` on a database migrated through the whole chain, *not* the v1
 /// shape in `create_indexes`:
 ///
@@ -2368,7 +2391,7 @@ async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// The key is untouched. `last_updated DESC, resource_id ASC` are already KEY
 /// columns and stay KEY columns — this migration adds a second `INCLUDE` column
-/// and nothing else, so the streaming property v19 established and v27 had to
+/// and nothing else, so the streaming property v20 established and v28 had to
 /// restore is not at risk here. Only the payload changes, and payload is exactly
 /// what an index-only filter needs.
 ///
@@ -2390,7 +2413,7 @@ async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult
 /// target of 4000:
 ///
 /// ```text
-///                              v30                          v31
+///                              v31                          v32
 /// system|code class|AMB    Index Scan token_system,      Index Only Scan token_code
 ///                          22,500 heap rows + Sort,      Heap Fetches 0, 5 buffers
 ///                          1,478 buffers
@@ -2408,7 +2431,7 @@ async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult
 /// nothing now walks its parameter's slice instead of seeking to an empty range
 /// — index-only, no heap, no random I/O, bounded by one `(resource_type,
 /// param_name)` slice. On the replica that is 1,419 buffers and 14 ms for a
-/// zero-match `class` system, against 4 buffers under v30. That is the honest
+/// zero-match `class` system, against 4 buffers under v31. That is the honest
 /// price, it is paid by a shape this benchmark does not send, and it is an order
 /// of magnitude better than the 808 ms the index cost when the planner pointed
 /// `system|code` at it.
@@ -2424,7 +2447,7 @@ async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult
 /// round can check the key columns from the artifact instead of from
 /// `create_indexes`.
 ///
-/// The write path keeps most of what v30 bought: the dropped index removes one
+/// The write path keeps most of what v31 bought: the dropped index removes one
 /// btree insert per system-bearing row, exactly as before, and change 2 widens
 /// entries in an index those rows already entered rather than adding a new one.
 ///
@@ -2454,15 +2477,15 @@ async fn migrate_v29_to_v30(client: &deadpool_postgres::Client) -> StorageResult
 /// death mid-build leaves an INVALID index that a later `IF NOT EXISTS` skips
 /// forever.
 ///
-/// Applied to a legacy (pre-v17) layout too, for v30's reason: both token
-/// indexes here were created by ungated migrations (v19, v20, v21), so both
+/// Applied to a legacy (pre-v18) layout too, for v31's reason: both token
+/// indexes here were created by ungated migrations (v20, v21, v22), so both
 /// layouts hold the identical shapes.
-async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = [
         // 1. Seekable by `system|code`, which it cannot answer without a heap
         //    fetch per row and a sort. 5,334 scans, 80,089,347 tuples read.
         "DROP INDEX IF EXISTS idx_search_token_system",
-        // 2. v21's key verbatim — `last_updated DESC, resource_id ASC` stay KEY
+        // 2. v22's key verbatim — `last_updated DESC, resource_id ASC` stay KEY
         //    columns — with `value_token_system` added to the payload so a
         //    `system|code` or `system|` filter is evaluated from the index
         //    instead of from the heap.
@@ -2477,13 +2500,13 @@ async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v30->v31 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v31->v32 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v31 -> v32: store `value_reference` in its version-agnostic base form, and
+/// v32 -> v33: store `value_reference` in its version-agnostic base form, and
 /// delete the `LIKE` that existed only because it was not.
 ///
 /// `build_reference_condition` emitted, for the `Type/id` form that is every
@@ -2520,7 +2543,7 @@ async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// ```text
 /// = OR LIKE (today)   1.496  1.525  1.510 ms/call
-/// = only  (v32)       0.479  0.494  0.418 ms/call        -3.1x
+/// = only  (v33)       0.479  0.494  0.418 ms/call        -3.1x
 /// ```
 ///
 /// The saving is not the extra index descent, which is ~4 buffers of ~149. It
@@ -2607,7 +2630,7 @@ async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult
 /// replica: **1.06 s over 3.4M rows / 561 MB**, ~530 MB/s, which puts the
 /// benchmark's 3,682 MB heap at roughly 7 s. That is a one-off cost inside
 /// `initialize_schema`'s advisory lock, an order of magnitude below the
-/// `CREATE INDEX`es v15/v18/v24/v26 already take there, and on the benchmark it
+/// `CREATE INDEX`es v15/v19/v25/v27 already take there, and on the benchmark it
 /// is free: migrations run against an empty database before the import.
 ///
 /// It is deliberately *not* limited to the denormalized layout — this is a
@@ -2616,14 +2639,14 @@ async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// The unmigrated combinations are all safe, in both directions:
 ///
-/// - **v31 data, v32 code** cannot happen. `initialize_schema` runs the chain
+/// - **v32 data, v33 code** cannot happen. `initialize_schema` runs the chain
 ///   under an advisory lock before the instance serves traffic, and a failure
 ///   aborts startup rather than continuing.
-/// - **v32 data, v31 code** (a binary rollback) is safe because the pre-v32
-///   predicate is a strict superset of the post-v32 one:
+/// - **v33 data, v32 code** (a binary rollback) is safe because the pre-v33
+///   predicate is a strict superset of the post-v33 one:
 ///   `= OR LIKE '<base>/\_history/%'` still matches a row holding `<base>`.
-/// - A v32 database written by a *later* rollback to a pre-v32 writer would
-///   store suffixes again, and a v32 reader would stop matching those rows.
+/// - A v33 database written by a *later* rollback to a pre-v33 writer would
+///   store suffixes again, and a v33 reader would stop matching those rows.
 ///   That is the one lossy direction and it requires downgrading the binary,
 ///   writing, then upgrading; `set_schema_version` leaves the recorded version
 ///   at 32, so the `UPDATE` does not run again. It is called out here rather
@@ -2633,7 +2656,7 @@ async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult
 /// ## The index is deliberately left alone
 ///
 /// The obvious follow-through is to give `idx_search_reference_pattern` the fast
-/// path's sort key, as v24 did for the token indexes: with the `OR` gone the
+/// path's sort key, as v25 did for the token indexes: with the `OR` gone the
 /// value predicate is a clean equality, so `(…, value_reference, last_updated
 /// DESC, resource_id ASC)` would make `DISTINCT` a streaming `Unique`, stop the
 /// scan at the `LIMIT`, and read 22 index tuples with **zero** heap fetches
@@ -2657,8 +2680,8 @@ async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult
 /// The live index is 550 MB. The bound that follows from the two extreme
 /// bytes-per-row figures is 5.5M-18.2M reference rows, so the sort-key shape
 /// would be **880 MB to 2,912 MB** — between +330 MB and +2.4 GB on an 11 GB
-/// host whose whole index set is 12 GB and where v30 has just spent a migration
-/// recovering 2.2 GB. The upper half of that range gives back more than v30
+/// host whose whole index set is 12 GB and where v31 has just spent a migration
+/// recovering 2.2 GB. The upper half of that range gives back more than v31
 /// gained, and nothing available here narrows it: the row census the run
 /// captures would, and this seat did not have one.
 ///
@@ -2666,7 +2689,7 @@ async fn migrate_v30_to_v31(client: &deadpool_postgres::Client) -> StorageResult
 /// 366 MB vs 382 MB on the replica, because included columns disable
 /// deduplication as surely as key columns do, and it gives up the ordering as
 /// well. Neither is done here.
-async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v32_to_v33(client: &deadpool_postgres::Client) -> StorageResult<()> {
     // `left(v, strpos(v, '/_history/') - 1)` rather than a `LIKE`/`substring`
     // pair: no escape character to get wrong (LIKE's default escape is the
     // backslash, so the pattern would have to be `'%/\_history/%'` for the
@@ -2681,12 +2704,12 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
             &[],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v31->v32 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v32->v33 failed: {}", e)))?;
 
     Ok(())
 }
 
-/// v32 -> v33: make FHIR `string` search seek instead of scan.
+/// v33 -> v34: make FHIR `string` search seek instead of scan.
 ///
 /// String search was the single most expensive statement of run 33128380492:
 /// **268.2 s of ~885 s** of k6-window Postgres execution — 30% of all search
@@ -2702,22 +2725,22 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
 /// ```
 ///
 /// 3,120 tuples read per scan through a generic index, and the 495 MB index
-/// `migrate_v23_to_v24` built *for this query* had zero scans for the third run
-/// running. v28 dropped its competitor `idx_search_string_folded` on the theory
+/// `migrate_v24_to_v25` built *for this query* had zero scans for the third run
+/// running. v29 dropped its competitor `idx_search_string_folded` on the theory
 /// that the planner was merely preferring the smaller sibling; that did not
-/// move it either. It has been pure write cost since v24.
+/// move it either. It has been pure write cost since v25.
 ///
 /// ## Two independent reasons, both reproduced
 ///
 /// Measured on a local 22.6M-row `search_index` built to the run's proportions
 /// (110k rows with a string value, `(Patient, address)` slice 5,000 rows,
-/// `(Patient, name)` 3,542 — the artifact's own numbers), with the v29 index set
-/// and the index set as of v29 (this seat's baseline; the migration is
-/// renumbered to v33 in the round-4 merge) and the v15/v16 extended statistics.
+/// `(Patient, name)` 3,542 — the artifact's own numbers), with the v30 index set
+/// and the index set as of v30 (this seat's baseline; the migration is
+/// renumbered to v34 in the round-4 merge) and the v15/v16 extended statistics.
 ///
 /// ### 1. The `IS NOT NULL` conjunct destroys the row estimate
 ///
-/// v24 added `value_string IS NOT NULL` to `build_string_condition` so the
+/// v25 added `value_string IS NOT NULL` to `build_string_condition` so the
 /// pattern index — partial on exactly that — could be *proved* usable, since
 /// `COALESCE(a, b) LIKE …` does not imply it (COALESCE is not strict). That
 /// reasoning was right, and the conjunct did make the index legal. But it is
@@ -2792,7 +2815,7 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
 /// ## Measured, paired, same database, after VACUUM ANALYZE
 ///
 /// ```text
-/// shape                                  before (v29 base)          after
+/// shape                                  before (v30 base)          after
 /// Patient?address=Springfield (22)   1,709 buffers 1.07ms      25 buffers 0.09ms
 /// Patient?name=Zzz       (0 matches) 1,183 buffers 1.15ms       4 buffers 0.10ms
 /// Patient?family=Smith (whole slice)   725 buffers 1.79ms     733 buffers 1.65ms
@@ -2833,7 +2856,7 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
 /// `search-plans.txt` section AL reports. Same key columns, same payload, same
 /// population; only the predicate is reworded. The rebuild takes a `SHARE` lock
 /// and runs at startup under `initialize_schema`'s advisory lock, before this
-/// instance serves traffic, as v15/v17/v18/v24/v26 all do.
+/// instance serves traffic, as v15/v18/v19/v25/v27 all do.
 ///
 /// It also reclaims the index. 205,918 entries of ~130 bytes is ~27 MB; the run
 /// measured **495 MB**, ~18x, which is churn bloat on an index that has never
@@ -2842,7 +2865,7 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// ## Measured on the real dataset: run 33179839720
 ///
-/// The index is alive for the first time since v24 built it:
+/// The index is alive for the first time since v25 built it:
 ///
 /// ```text
 ///                                    scans    tuples_read  tuples/scan
@@ -2903,13 +2926,13 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
 /// ```text
 ///                                       buffers    time
 /// before (btree slice scan)               1,709   1.03 ms
-/// v33    (trigram bitmap scan)              58   0.41 ms
+/// v34    (trigram bitmap scan)              58   0.41 ms
 /// zero-match term ("NON-EXISTS")             28   0.25 ms   (was 1,709)
 /// broad term matching the whole slice        93   (warm)    (was 725)
 /// 2-character term (no full trigram)      1,715             unchanged, correctly
 /// ```
 ///
-/// Run 33179839720 measured the pre-v33 shape at 5,138 buffers / 10.5 ms on the real
+/// Run 33179839720 measured the pre-v34 shape at 5,138 buffers / 10.5 ms on the real
 /// dataset (section AJ), against 1,709 / 1.03 ms locally, so the local ratios
 /// understate what the host should see.
 ///
@@ -2940,13 +2963,13 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
 /// ships both as contrib. A locked-down deployment can still refuse. That path
 /// is warned about and skipped, not fatal: the substring form's strict `~~` also
 /// proves `idx_search_string_folded_pattern`'s predicate, so it degrades to a
-/// parameter-slice scan measured at 1,709 buffers — the pre-v33 plan exactly.
+/// parameter-slice scan measured at 1,709 buffers — the pre-v34 plan exactly.
 /// A search parameter shorter than one full trigram degrades the same way, which
 /// PostgreSQL decides for itself (measured above at 1,715 buffers for `%bo%`).
 ///
-/// ## Why the v24 `INCLUDE (resource_id, last_updated)` is dropped
+/// ## Why the v25 `INCLUDE (resource_id, last_updated)` is dropped
 ///
-/// v24 added it to keep "the fast path's scan index-only once it can seek". It
+/// v25 added it to keep "the fast path's scan index-only once it can seek". It
 /// can now seek, and the scan is still not index-only — in run 33179839720
 /// (sections AG and AI), and locally on a table whose visibility map is 100%
 /// all-visible. It is not a costing preference: with `enable_indexscan`,
@@ -2988,13 +3011,13 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
 /// exactly as it does today (verified: same plan, same 1,709 buffers). A new
 /// binary against an un-migrated database is not reachable: migrations complete
 /// under the advisory lock before the instance serves.
-async fn migrate_v32_to_v33(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v33_to_v34(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = [
-        // Same key columns and same population as v24 built. Two things
+        // Same key columns and same population as v25 built. Two things
         // change: the predicate is reworded onto the expression the query
         // actually compares, so a strict operator on it — `~>=~`, `~<~`, `~~` —
         // proves the index usable with no help from a separate conjunct; and
-        // v24's `INCLUDE (resource_id, last_updated)` goes, because an
+        // v25's `INCLUDE (resource_id, last_updated)` goes, because an
         // index-only scan over this index is impossible by construction (see
         // the docstring) and the payload's real cost is that it disables btree
         // deduplication.
@@ -3009,7 +3032,7 @@ async fn migrate_v32_to_v33(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v32->v33 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v33->v34 failed: {}", e)))?;
     }
 
     // The trigram index for `:contains` / `:text`. Best-effort as a unit: both
@@ -3017,7 +3040,7 @@ async fn migrate_v32_to_v33(client: &deadpool_postgres::Client) -> StorageResult
     // install them without superuser, but a locked-down deployment may still
     // refuse — and `pg_trgm` failing makes the `CREATE INDEX` fail too. Where
     // that happens the substring form falls back to `idx_search_string_folded_pattern`,
-    // which its strict `~~` also proves, at parity with the pre-v33 plan
+    // which its strict `~~` also proves, at parity with the pre-v34 plan
     // (measured: 1,709 buffers either way). Search stays correct; only
     // `:contains` stays slow.
     //
@@ -3042,7 +3065,7 @@ async fn migrate_v32_to_v33(client: &deadpool_postgres::Client) -> StorageResult
     for sql in trigram_stmts {
         if let Err(e) = client.execute(sql, &[]).await {
             tracing::warn!(
-                "Migration v32->v33: trigram index unavailable, `:contains` string \
+                "Migration v33->v34: trigram index unavailable, `:contains` string \
                  search falls back to a parameter-slice scan (search remains \
                  correct): {}",
                 e
@@ -3056,7 +3079,7 @@ async fn migrate_v32_to_v33(client: &deadpool_postgres::Client) -> StorageResult
     // here costs plan quality, not correctness.
     if let Err(e) = client.execute("ANALYZE search_index", &[]).await {
         tracing::warn!(
-            "Migration v32->v33: optional ANALYZE failed (plans may be suboptimal \
+            "Migration v33->v34: optional ANALYZE failed (plans may be suboptimal \
              until autovacuum catches up, search remains correct): {}",
             e
         );
@@ -3065,7 +3088,7 @@ async fn migrate_v32_to_v33(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// v33 -> v34: stop maintaining three indexes nothing reads, and compress the
+/// v34 -> v35: stop maintaining three indexes nothing reads, and compress the
 /// two JSONB columns with LZ4 instead of PGLZ.
 ///
 /// Every council round so far has attacked `search_index`. This one attacks the
@@ -3205,7 +3228,7 @@ async fn migrate_v32_to_v33(client: &deadpool_postgres::Client) -> StorageResult
 /// which would extend the same win to `search_index`'s text columns. That table
 /// belongs to another seat and was not measured here, so this migration stays
 /// column-scoped.
-async fn migrate_v33_to_v34(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v34_to_v35(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = [
         // 1-2. Strict prefixes of their tables' primary keys.
         "DROP INDEX IF EXISTS idx_resources_type",
@@ -3219,7 +3242,7 @@ async fn migrate_v33_to_v34(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v33->v34 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v34->v35 failed: {}", e)))?;
     }
 
     // Catalog-only, and optional: a server built without LZ4 rejects the method
@@ -3244,7 +3267,7 @@ async fn migrate_v33_to_v34(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// v34 -> v35: let autovacuum keep up with `search_index`.
+/// v35 -> v36: let autovacuum keep up with `search_index`.
 ///
 /// `search_index` is by construction the highest-churn table in this schema: a
 /// resource rewrite deletes every one of its ~13.6 rows and inserts ~13.6 new
@@ -3278,7 +3301,7 @@ async fn migrate_v33_to_v34(client: &deadpool_postgres::Client) -> StorageResult
 /// a deployment that disagrees can `ALTER TABLE ... RESET` them. They are set
 /// on `search_index` alone: it is the only table in the schema whose steady
 /// state is delete-and-reinsert.
-async fn migrate_v34_to_v35(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v35_to_v36(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = ["ALTER TABLE search_index SET (\
              autovacuum_vacuum_scale_factor = 0.05, \
              autovacuum_vacuum_threshold = 50000, \
@@ -3290,13 +3313,13 @@ async fn migrate_v34_to_v35(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v34->v35 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v35->v36 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v22 -> v23: drop `fk_search_resource`.
+/// v23 -> v24: drop `fk_search_resource`.
 ///
 /// `search_index` carried a composite FK to `resources` with `ON DELETE
 /// CASCADE`. Postgres enforces that with a per-row `AFTER INSERT` trigger, and
@@ -3326,28 +3349,28 @@ async fn migrate_v34_to_v35(client: &deadpool_postgres::Client) -> StorageResult
 /// now load-bearing rather than belt-and-braces: **a new path that deletes from
 /// `resources` must delete from `search_index` too.** The comments at those
 /// call sites say so.
-async fn migrate_v22_to_v23(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v23_to_v24(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .execute(
             "ALTER TABLE search_index DROP CONSTRAINT IF EXISTS fk_search_resource",
             &[],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v22->v23 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v23->v24 failed: {}", e)))?;
 
     Ok(())
 }
 
-/// v20 -> v21: restore the recent-first token index alongside v20's.
+/// v21 -> v22: restore the recent-first token index alongside v21's.
 ///
-/// v20 dropped `idx_search_token_code_recent` on the reasoning that a value-first
+/// v21 dropped `idx_search_token_code_recent` on the reasoning that a value-first
 /// key serves an equality predicate at every selectivity — true, and it fixed
 /// `Observation?code` (1261 ms -> 255 ms p99). But it cost 50x on
 /// `Observation?category` (38 ms -> 1693 ms) and 6x on `Encounter?status`, and
 /// took the search suite from 1645 to 1065 RPS.
 ///
 /// The isolated plan did not show it: single-value `category=laboratory` EXPLAINs
-/// at 0.717 ms under v20, better than v19's 1.408 ms. The regression lives in
+/// at 0.717 ms under v21, better than v20's 1.408 ms. The regression lives in
 /// queries the plan capture did not model. The benchmark's token values include
 /// comma lists —
 ///
@@ -3367,17 +3390,17 @@ async fn migrate_v22_to_v23(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// So the two shapes are not redundant, they are complementary, and which one
 /// wins depends on the predicate rather than on the data:
-/// - one value, any selectivity -> value-first (v20's `idx_search_token_code`)
+/// - one value, any selectivity -> value-first (v21's `idx_search_token_code`)
 /// - several values, or a range -> recent-first (this index)
 ///
-/// Both now exist and the planner picks per query. That is the same division v19
+/// Both now exist and the planner picks per query. That is the same division v20
 /// established for date and quantity, where the sparse range picks value-first
 /// and the broad range picks recent-first — verified in plan sections V and U.
 ///
 /// This re-adds 5.6 GB. The write path pays for it, which is a real cost on an
-/// 11 GB host and the reason v20 was worth trying; the measurement says search
+/// 11 GB host and the reason v21 was worth trying; the measurement says search
 /// buys more than the write path loses.
-async fn migrate_v20_to_v21(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v21_to_v22(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let index_stmts = ["CREATE INDEX IF NOT EXISTS idx_search_token_code_recent
          ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
          INCLUDE (value_token_code)
@@ -3387,16 +3410,16 @@ async fn migrate_v20_to_v21(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v20->v21 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v21->v22 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v19 -> v20: fold the sort key into the token index instead of carrying a
+/// v20 -> v21: fold the sort key into the token index instead of carrying a
 /// second, recent-first copy of it.
 ///
-/// v19 gave the fast path early termination by keying on
+/// v20 gave the fast path early termination by keying on
 /// `(…, last_updated DESC, resource_id)` with the filter column as payload. For
 /// a *range* predicate that is the only option: rows matching `value_date >= x`
 /// are spread across the whole parameter slice, so nothing but the sort key can
@@ -3425,14 +3448,14 @@ async fn migrate_v20_to_v21(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// `value_token_system` moves to the payload. The `system|code` form filters it
 /// from there during the same index-only scan; the `system|` form (system with
-/// no code) is served by `idx_search_token`, which v18 documents and does not
+/// no code) is served by `idx_search_token`, which v19 documents and does not
 /// touch.
 ///
 /// Not applied to date or quantity: their predicates are ranges, and the two
-/// index shapes v19 created remain the right answer there — the planner picks
+/// index shapes v20 created remain the right answer there — the planner picks
 /// value-first when the range is sparse (verified: plan section V) and
 /// recent-first when it is broad (section U).
-async fn migrate_v19_to_v20(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v20_to_v21(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let index_stmts = [
         "DROP INDEX IF EXISTS idx_search_token_code",
         "CREATE INDEX IF NOT EXISTS idx_search_token_code
@@ -3449,16 +3472,16 @@ async fn migrate_v19_to_v20(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v19->v20 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v20->v21 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v18 -> v19: recent-first indexes so the fast path can terminate early.
+/// v19 -> v20: recent-first indexes so the fast path can terminate early.
 ///
 /// Every search ends `ORDER BY last_updated DESC, id ASC LIMIT n`, and the
-/// #279/v17 fast path takes that top-n from `search_index` directly:
+/// #279/v18 fast path takes that top-n from `search_index` directly:
 ///
 /// ```sql
 /// SELECT DISTINCT resource_id, last_updated FROM search_index
@@ -3466,16 +3489,16 @@ async fn migrate_v19_to_v20(client: &deadpool_postgres::Client) -> StorageResult
 /// ORDER BY last_updated DESC, resource_id ASC LIMIT 22
 /// ```
 ///
-/// v17 put `last_updated` on those indexes as `INCLUDE (resource_id,
+/// v18 put `last_updated` on those indexes as `INCLUDE (resource_id,
 /// last_updated)`. **`INCLUDE` columns are payload, not key columns — they
 /// cannot satisfy an `ORDER BY`.** So no index supplied the required order and
-/// Postgres had to read every matching index row and sort it to find 22. v17
+/// Postgres had to read every matching index row and sort it to find 22. v18
 /// paid the storage for the column and got none of the ordering benefit, which
 /// is why the shapes it targeted stayed slow (`Observation?date` p99 4075 ms,
-/// `Observation?category` 4162 ms on run 32994869043) even after v18 freed
+/// `Observation?category` 4162 ms on run 32994869043) even after v19 freed
 /// 13 GB of index footprint — ruling out cache pressure as the cause.
 ///
-/// It also explains the regressions v17 introduced. Before v17 a shape like
+/// It also explains the regressions v18 introduced. Before v18 a shape like
 /// `Encounter?class=AMB` could drive from `idx_resources_search`
 /// (tenant_id, resource_type, last_updated DESC, id ASC), scanning `resources`
 /// already in sort order and probing `search_index` per row, stopping after 22
@@ -3489,16 +3512,16 @@ async fn migrate_v19_to_v20(client: &deadpool_postgres::Client) -> StorageResult
 /// `last_updated DESC, resource_id ASC`, so the `DISTINCT` becomes a streaming
 /// `Unique` over presorted input and the `LIMIT` stops the scan.
 ///
-/// The value-first indexes from v18 are KEPT alongside these: a *selective*
+/// The value-first indexes from v19 are KEPT alongside these: a *selective*
 /// filter is still better served by seeking on the value and joining a handful
 /// of rows, and a recent-first scan would have to walk the whole parameter
 /// slice to find its 22 matches. Two shapes of index for two selectivity
 /// regimes, with the planner choosing — rather than a gate in our SQL trying to
 /// guess selectivity at build time, which it cannot see.
 ///
-/// Partial, for the reason v18 gives: a row carrying a token value must not pay
+/// Partial, for the reason v19 gives: a row carrying a token value must not pay
 /// an index insert into the date and quantity indexes.
-async fn migrate_v18_to_v19(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v19_to_v20(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let index_stmts = [
         "CREATE INDEX IF NOT EXISTS idx_search_date_recent
          ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
@@ -3518,13 +3541,13 @@ async fn migrate_v18_to_v19(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v18->v19 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v19->v20 failed: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// v17 -> v18: make the value-column indexes partial.
+/// v18 -> v19: make the value-column indexes partial.
 ///
 /// `search_index` is one wide table holding every parameter of every resource
 /// type, so for any given row almost every `value_*` column is NULL. An index
@@ -3564,16 +3587,16 @@ async fn migrate_v18_to_v19(client: &deadpool_postgres::Client) -> StorageResult
 ///   value column, and the per-resource probe does not constrain
 ///   `composite_group`, so a predicate on it would not be provable either.
 ///
-/// Rebuilds take a `SHARE` lock. As with v15 and v17 these run at startup under
+/// Rebuilds take a `SHARE` lock. As with v15 and v18 these run at startup under
 /// the `initialize_schema` advisory lock, before the instance serves traffic;
 /// operators with a large existing database can pre-build the replacements
 /// `CONCURRENTLY` by hand, after which `IF NOT EXISTS` makes this a no-op.
 /// `CREATE INDEX CONCURRENTLY` is not used here for the reason given on v15: a
 /// process death mid-build leaves an INVALID index that a later
 /// `IF NOT EXISTS` would skip forever.
-async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v18_to_v19(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let index_stmts = [
-        // The largest index in the schema, and the only one v17 rebuilt while
+        // The largest index in the schema, and the only one v18 rebuilt while
         // leaving its (absent) predicate alone — date and token_code kept theirs.
         // Every quantity predicate is a range comparison on the value.
         "DROP INDEX IF EXISTS idx_search_quantity",
@@ -3599,7 +3622,7 @@ async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult
          WHERE value_reference IS NOT NULL",
         // The `system|` form binds the system alone; this index is what serves it.
         //
-        // SUPERSEDED BY v24, which appends `last_updated DESC, resource_id ASC`
+        // SUPERSEDED BY v25, which appends `last_updated DESC, resource_id ASC`
         // as key columns. As written here the index has neither payload nor sort
         // key, so the `system|code` form — the top statement of the search suite
         // — heap-fetched every matching row and sorted the whole match set.
@@ -3648,7 +3671,7 @@ async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v17->v18 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v18->v19 failed: {}", e)))?;
     }
 
     Ok(())
@@ -3789,11 +3812,11 @@ async fn migrate_v14_to_v15(client: &deadpool_postgres::Client) -> StorageResult
         // index is load-bearing rather than the redundant duplicate it appears
         // to be next to this one. Do not prune it.
         //
-        // SUPERSEDED BY v24. As written here the index is unreachable: it is
+        // SUPERSEDED BY v25. As written here the index is unreachable: it is
         // partial on `value_string IS NOT NULL`, and `COALESCE(a, b) LIKE $n`
         // does not imply that (COALESCE is not strict), so Postgres may not use
         // it — 0 scans in run 33029355759 while the whole string load fell to
-        // `idx_search_string_folded`. v24 rebuilds it with a covering payload,
+        // `idx_search_string_folded`. v25 rebuilds it with a covering payload,
         // and `build_string_condition` now emits the conjunct that makes the
         // predicate provable.
         "CREATE INDEX IF NOT EXISTS idx_search_string_folded_pattern

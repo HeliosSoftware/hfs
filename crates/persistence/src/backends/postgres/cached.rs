@@ -71,7 +71,7 @@
 //! | `Observation?category=laboratory,vitals`  |    464 | 2,453,618 | 5,288x |
 //! | `Observation?code:text=…`                 | 2.2M   |    17.2M  |   7.7x |
 //! | `Observation?code=sys|code` (join form)   | 69,736 |   601,668 |   8.6x |
-//! | `Patient?address=Spring` (v33 range)      |  1,504 |     1,493 |   1.0x |
+//! | `Patient?address=Spring` (v34 range)      |  1,504 |     1,493 |   1.0x |
 //! | token `=`, quantity, uri, date, `_id`, PK |   —    |     —     |   1.0x |
 //!
 //! The reference rows are the `value_reference = $3 OR value_reference LIKE $4
@@ -79,7 +79,7 @@
 //! `Const` and extracts prefix bounds for `idx_search_reference_pattern`; under
 //! a generic plan the pattern is a `Param`, no bounds exist, and the scan reads
 //! the whole `(tenant, type, param_name)` slice. This is the same defect seat J
-//! removed from the string path in v33, on a predicate that still has it. The
+//! removed from the string path in v34, on a predicate that still has it. The
 //! OR-list row is a different mechanism with the same outcome: an `OR` of two
 //! equalities cannot be an index condition either way, and only the custom plan
 //! estimates it well enough to pick the `…_recent` index whose ordering lets the
@@ -107,7 +107,7 @@
 //! is the parse, the parse analysis, the Describe and one of the two round
 //! trips. Planning is still paid per execution. That is the conservative half of
 //! the available win, deliberately: the other half needs the reference predicate
-//! made sargable-under-generic (the same treatment v33 gave the string
+//! made sargable-under-generic (the same treatment v34 gave the string
 //! predicate) before `auto` is safe to switch on.
 
 use deadpool_postgres::Client;

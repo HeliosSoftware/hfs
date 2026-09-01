@@ -14,6 +14,7 @@ mod sof_export_tests {
     use helios_persistence::core::sof_runner::SofRunner;
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
+    use helios_rest::config::{MultitenancyConfig, TenantRoutingMode};
     use helios_rest::export::{
         CompletedFile, ExportJobController, ExportTask, InMemoryController, InMemorySink, JobStatus,
     };
@@ -31,6 +32,16 @@ mod sof_export_tests {
     }
 
     async fn create_test_server_with_export() -> (TestServer, Arc<SqliteBackend>) {
+        let config = ServerConfig {
+            base_url: "http://localhost".to_string(),
+            ..ServerConfig::for_testing()
+        };
+        create_test_server_with_export_config(config).await
+    }
+
+    async fn create_test_server_with_export_config(
+        config: ServerConfig,
+    ) -> (TestServer, Arc<SqliteBackend>) {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
@@ -42,10 +53,9 @@ mod sof_export_tests {
             .expect("SQLiteBackend must provide sof_runner");
 
         // Build in-memory sink and controller
-        let sink = InMemorySink::new("http://localhost");
+        let sink = InMemorySink::new("https://wrong-internal.example");
         let controller = InMemoryController::new(runner, sink, None);
 
-        let config = ServerConfig::for_testing();
         let state = helios_rest::AppState::new(Arc::clone(&backend), config)
             .with_export_controller(Arc::new(controller));
 
@@ -56,7 +66,11 @@ mod sof_export_tests {
     }
 
     async fn seed_patients(backend: &SqliteBackend) {
-        let tenant = test_tenant();
+        seed_patients_for(backend, "test-tenant").await;
+    }
+
+    async fn seed_patients_for(backend: &SqliteBackend, tenant_id: &str) {
+        let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
         for (id, family) in [("p1", "Smith"), ("p2", "Jones")] {
             let resource = json!({
                 "resourceType": "Patient",
@@ -69,6 +83,149 @@ mod sof_export_tests {
                 .await
                 .expect("failed to seed patient");
         }
+    }
+
+    #[tokio::test]
+    async fn path_tenant_and_public_prefix_flow_through_sof_export_urls() {
+        let config = ServerConfig {
+            base_url: "https://public.example/fhir/".to_string(),
+            default_tenant: "default".to_string(),
+            multitenancy: MultitenancyConfig {
+                routing_mode: TenantRoutingMode::UrlPath,
+                ..Default::default()
+            },
+            ..ServerConfig::for_testing()
+        };
+        let (server, backend) = create_test_server_with_export_config(config).await;
+        seed_patients_for(&backend, "acme").await;
+
+        let response = server
+            .post("/acme/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .json(&patient_view())
+            .await;
+        assert_eq!(response.status_code(), StatusCode::ACCEPTED);
+        let status_url = response
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(status_url.starts_with("https://public.example/fhir/acme/export/"));
+        let status_path = status_url
+            .strip_prefix("https://public.example/fhir")
+            .unwrap();
+
+        for _ in 0..40 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let poll = server.get(status_path).await;
+            if poll.status_code() == StatusCode::SEE_OTHER {
+                let result_url = poll.headers().get("location").unwrap().to_str().unwrap();
+                assert!(result_url.starts_with("https://public.example/fhir/acme/export/"));
+                let result_path = result_url
+                    .strip_prefix("https://public.example/fhir")
+                    .unwrap();
+                let result = server.get(result_path).await;
+                assert_eq!(result.status_code(), StatusCode::OK);
+                let manifest: Value = result.json();
+                let output_url = manifest["parameter"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|part| part["name"] == "output")
+                    .and_then(|part| part["part"].as_array())
+                    .and_then(|parts| parts.iter().find(|part| part["name"] == "location"))
+                    .and_then(|part| part["valueUri"].as_str())
+                    .unwrap();
+                assert!(output_url.starts_with("https://public.example/fhir/acme/export/"));
+                return;
+            }
+            assert_eq!(poll.status_code(), StatusCode::ACCEPTED);
+        }
+        panic!("SOF export did not complete");
+    }
+
+    #[tokio::test]
+    async fn both_mode_header_tenant_can_follow_unprefixed_sof_export_urls() {
+        let public_base = "https://public.example/fhir";
+        let config = ServerConfig {
+            base_url: public_base.to_string(),
+            default_tenant: "default".to_string(),
+            multitenancy: MultitenancyConfig {
+                routing_mode: TenantRoutingMode::Both,
+                ..Default::default()
+            },
+            ..ServerConfig::for_testing()
+        };
+        let (server, backend) = create_test_server_with_export_config(config).await;
+        seed_patients_for(&backend, "acme").await;
+
+        let response = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "acme")
+            .json(&patient_view())
+            .await;
+        assert_eq!(response.status_code(), StatusCode::ACCEPTED);
+        let status_url = response
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(status_url.starts_with("https://public.example/fhir/export/"));
+        assert!(!status_url.contains("/acme/"));
+        let status_path = status_url.strip_prefix(public_base).unwrap();
+
+        for _ in 0..40 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let poll = server
+                .get(status_path)
+                .add_header(X_TENANT_ID, "acme")
+                .await;
+            if poll.status_code() == StatusCode::SEE_OTHER {
+                let result_url = poll.headers().get("location").unwrap().to_str().unwrap();
+                assert!(result_url.starts_with("https://public.example/fhir/export/"));
+                let result_path = result_url.strip_prefix(public_base).unwrap();
+                let result = server
+                    .get(result_path)
+                    .add_header(X_TENANT_ID, "acme")
+                    .await;
+                assert_eq!(result.status_code(), StatusCode::OK);
+                let manifest: Value = result.json();
+                let output_url = manifest["parameter"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|part| part["name"] == "output")
+                    .and_then(|part| part["part"].as_array())
+                    .and_then(|parts| parts.iter().find(|part| part["name"] == "location"))
+                    .and_then(|part| part["valueUri"].as_str())
+                    .unwrap();
+                assert!(output_url.starts_with("https://public.example/fhir/export/"));
+                let download_path = output_url.strip_prefix(public_base).unwrap();
+                assert_eq!(
+                    server
+                        .get(download_path)
+                        .add_header(X_TENANT_ID, "acme")
+                        .await
+                        .status_code(),
+                    StatusCode::OK
+                );
+
+                // The URL-path form remains available in `both` mode.
+                assert_eq!(
+                    server
+                        .get(&format!("/acme{result_path}"))
+                        .await
+                        .status_code(),
+                    StatusCode::OK
+                );
+                return;
+            }
+            assert_eq!(poll.status_code(), StatusCode::ACCEPTED);
+        }
+        panic!("SOF export did not complete");
     }
 
     fn patient_view() -> Value {
@@ -1239,7 +1396,7 @@ mod sof_export_tests {
         fn read_shard(&self, _t: &str, _j: &str, _f: &str) -> Option<Vec<u8>> {
             None
         }
-        fn download_url(&self, _t: &str, _j: &str, _f: &str) -> Option<String> {
+        fn download_url(&self, _t: &str, _b: &str, _j: &str, _f: &str) -> Option<String> {
             // This controller only ever reports `Failed`, so the manifest path
             // that resolves download URLs is never exercised.
             None
@@ -1361,7 +1518,7 @@ mod sof_export_tests {
         fn read_shard(&self, _t: &str, _j: &str, _f: &str) -> Option<Vec<u8>> {
             None
         }
-        fn download_url(&self, _t: &str, _j: &str, _f: &str) -> Option<String> {
+        fn download_url(&self, _t: &str, _b: &str, _j: &str, _f: &str) -> Option<String> {
             // Stand in for an S3 pre-signing failure at poll time: the shard
             // exists but no usable URL can be produced.
             None
@@ -1791,6 +1948,43 @@ mod sof_export_tests {
             outcome["issue"][0]["code"].as_str(),
             Some("not-supported"),
             "{outcome}"
+        );
+    }
+
+    // =========================================================================
+    // 23b. The renamed `view` parameter gets a didactic 400 instead of the
+    //      generic "unsupported body parameter" message. The old shape is
+    //      still rejected outright — there is no compatibility window.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_renamed_view_param_gets_didactic_message() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "view", "part": [
+                    {"name": "viewResource", "resource": patient_view()}
+                ]}
+            ]
+        });
+        let resp = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let outcome: Value = resp.json();
+        assert_eq!(
+            outcome["issue"][0]["code"].as_str(),
+            Some("not-supported"),
+            "{outcome}"
+        );
+        let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diagnostics.contains("renamed to `context`"),
+            "expected the didactic rename message, got: {diagnostics}"
         );
     }
 

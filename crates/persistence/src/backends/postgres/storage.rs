@@ -39,7 +39,7 @@ use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 ///
 /// - A create that has already inserted the `resources` row — the insert
 ///   succeeded, so no resource existed under this id, and an index row cannot
-///   outlive its resource. Since schema v23 that last part is upheld by the
+///   outlive its resource. Since schema v24 that last part is upheld by the
 ///   code rather than by a constraint: `purge`, `purge_all` and
 ///   `purge_tenant_data` each delete the `search_index` rows explicitly before
 ///   deleting from `resources`. A new deletion path that skipped that would
@@ -62,7 +62,7 @@ pub(crate) enum IndexWrite {
 /// The full-text upsert, shared by the first attempt and the truncating retry.
 ///
 /// `ON CONFLICT` names the columns of the UNIQUE `idx_fts_lookup` created in
-/// schema v27. Column order in the target list is the table's, not the index's.
+/// schema v28. Column order in the target list is the table's, not the index's.
 ///
 /// # The `WHERE` on the `DO UPDATE` is the point
 ///
@@ -92,12 +92,12 @@ pub(crate) enum IndexWrite {
 /// same four cores.
 ///
 /// `IS DISTINCT FROM`, not `<>`: `narrative_tsvector` is NULL on any row
-/// written before the vectors were bound directly (v25), and `NULL <> x` is
+/// written before the vectors were bound directly (v26), and `NULL <> x` is
 /// NULL, which would suppress the update and strand that row unfixed forever.
 ///
 /// Correctness of the skip rests on these two columns being the only thing the
 /// statement writes. They are: `narrative_text` and `full_content` are
-/// write-only leftovers that this statement has not bound since v25, and the
+/// write-only leftovers that this statement has not bound since v26, and the
 /// three key columns are what the conflict matched on.
 const FTS_UPSERT_SQL: &str = "\
 INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_tsvector, content_tsvector) \
@@ -269,12 +269,12 @@ impl ResourceStorage for PostgresBackend {
         )
         .await?;
 
-        // An *active* SearchParameter write changes a tenant's overlay: reload
-        // the stored cache and drop the per-tenant registries so they rebuild.
-        // Draft copies (the seeded spec set) never overlay, so skip them and
-        // avoid an O(n²) reload storm during bulk seeding.
+        // An overlay-affecting SearchParameter write: reload the stored cache
+        // and drop the per-tenant registries so they rebuild. Seeded spec
+        // copies never affect the overlay (see `create_affects_overlay`),
+        // which keeps bulk seeding from triggering an O(n²) reload storm.
         if resource_type == "SearchParameter"
-            && crate::search::search_parameter_create_affects_overlay(&resource)
+            && self.tenant_registries().create_affects_overlay(&resource)
         {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
@@ -1038,7 +1038,7 @@ impl ResourceStorage for PostgresBackend {
             .or_query_error("purge count")?
             .get(0);
         // These deletes are the only thing that removes the dependent rows:
-        // `search_index` has no foreign key to `resources` (schema v23) and
+        // `search_index` has no foreign key to `resources` (schema v24) and
         // nothing cascades. Same order as purge/purge_all.
         for sql in [
             "DELETE FROM search_index WHERE tenant_id = $1",
@@ -1054,6 +1054,13 @@ impl ResourceStorage for PostgresBackend {
         // by the deletes above — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313). Same transaction, so an
         // offboarding cannot half-apply.
+        // Provider-side Bulk Submit submissions are tenant-keyed rows (#772).
+        tx.execute(
+            "DELETE FROM bulk_provider_submissions WHERE tenant_id = $1",
+            &[&id],
+        )
+        .await
+        .or_query_error("purge provider submissions")?;
         let settings = PostgresBackend::purge_tenant_settings_in_txn(&tx, id).await?;
         tx.commit().await.or_query_error("purge commit")?;
         if settings > 0 {
@@ -1361,7 +1368,7 @@ impl PostgresBackend {
     ///
     /// Populates the resource_fts table using PostgreSQL tsvector/tsquery.
     ///
-    /// The write is an upsert keyed on `idx_fts_lookup`, which schema v27 makes
+    /// The write is an upsert keyed on `idx_fts_lookup`, which schema v28 makes
     /// UNIQUE. Two things follow from that. A rewrite no longer needs its own
     /// `DELETE` — `update` and `restore` leave the row alone and this statement
     /// replaces it in place, which removes one statement and one round trip from
@@ -1458,7 +1465,7 @@ impl PostgresBackend {
         // text — so binding them stored the resource's text a second time, with
         // its TOAST compression and WAL, for no reader. Tokenising happens here
         // instead of in a `BEFORE INSERT` trigger; the trigger is dropped in
-        // schema v25 because it would otherwise overwrite these vectors with
+        // schema v26 because it would otherwise overwrite these vectors with
         // the tsvector of an empty string.
         let result = execute_cached(
             client,
@@ -1530,7 +1537,7 @@ impl PostgresBackend {
     /// This used to take an `FtsRow` telling it whether to drop the full-text
     /// row, because a *re-indexing* caller — `update`, `restore` — wanted only
     /// the `search_index` half cleared: the full-text write is an upsert against
-    /// the UNIQUE `idx_fts_lookup` (schema v27) and replaces the row in place, so
+    /// the UNIQUE `idx_fts_lookup` (schema v28) and replaces the row in place, so
     /// deleting it first was one statement and one round trip of pure waste
     /// (227.3 s over a 5-minute crud run's 192,825 updates, measured on run
     /// 33086933938).
@@ -2538,7 +2545,7 @@ impl PurgableStorage for PostgresBackend {
         }
 
         // Removing the index rows is REQUIRED, not just ordering: `search_index`
-        // has no foreign key to `resources` (schema v23), so nothing cascades.
+        // has no foreign key to `resources` (schema v24), so nothing cascades.
         client
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
@@ -2591,7 +2598,7 @@ impl PurgableStorage for PostgresBackend {
         let count: i64 = row.get(0);
 
         // Removing the index rows is REQUIRED, not just ordering: `search_index`
-        // has no foreign key to `resources` (schema v23), so nothing cascades.
+        // has no foreign key to `resources` (schema v24), so nothing cascades.
         client
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2",
@@ -3774,7 +3781,7 @@ const OPAQUE_ID_KEYS: [&str; 4] = ["id", "reference", "fullUrl", "versionId"];
 /// # It needs no migration, and deliberately does not get one
 ///
 /// `resource_fts` stores the vectors, not their input (`narrative_text` and
-/// `full_content` have been write-only since v25 and are left unbound), so no
+/// `full_content` have been write-only since v26 and are left unbound), so no
 /// SQL migration can recompute a row: the extraction is Rust-side. Rows written
 /// before this change keep their URL lexemes. That direction is safe — a wider
 /// vector *over*-matches, so an old row answers `_content=http://loinc.org` and

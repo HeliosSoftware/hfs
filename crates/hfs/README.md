@@ -79,6 +79,7 @@ Options:
 |----------|---------|-------------|
 | `HFS_SERVER_PORT` | 8080 | Server port |
 | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
+| `HFS_BASE_URL` | http://localhost:8080 | Public HTTP(S) base for response links and `Location` headers |
 | `HFS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
 | `DATABASE_URL` | fhir.db | Database connection string |
 | `HFS_DATA_DIR` | ./data | Path to FHIR data directory (search parameters) |
@@ -92,6 +93,11 @@ Options:
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
 | `HFS_TERMINOLOGY_SERVER` | (none) | Terminology server URL for `:in`/`:not-in` modifiers and FHIRPath `memberOf()`/`subsumes()` |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | Composite-store write sync mode for ES-backed backends (`sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb-elasticsearch`, `s3-elasticsearch`). One of `asynchronous`, `synchronous`, `hybrid`. With `asynchronous` (default) the write returns as soon as the primary commits and the search backend is updated on a background worker — lowest latency, but a follow-up search can race the indexing. Use `synchronous` when callers need read-your-write semantics (e.g. integration tests, bulk-load flows that immediately search). Ignored when the storage backend has no search secondary. |
+
+Set `HFS_BASE_URL` to the public address clients can reach. The value may
+contain a path prefix. It must be an absolute `http` or `https` URL without
+credentials, a query string, or a fragment. HFS rejects invalid values and
+does not infer the public address from request forwarding headers.
 
 ## FHIR Version Support
 
@@ -279,6 +285,7 @@ data/
 ├── search-parameters-r4b.json  # FHIR R4B SearchParameters (HL7 spec)
 ├── search-parameters-r5.json   # FHIR R5 SearchParameters (HL7 spec)
 ├── search-parameters-r6.json   # FHIR R6 SearchParameters (auto-downloaded at build time)
+├── sql-on-fhir-search-parameters.json  # SQL-on-FHIR IG ViewDefinition search params (custom file)
 └── *.json                      # Custom SearchParameter files (see below)
 ```
 
@@ -328,6 +335,17 @@ Or as a Bundle:
   ]
 }
 ```
+
+### SQL-on-FHIR ViewDefinition Search Parameters
+
+`data/sql-on-fhir-search-parameters.json` ships the 17 `ViewDefinition` SearchParameters from the [SQL-on-FHIR IG](http://hl7.org/fhir/uv/sql-on-fhir) as one of these custom Bundle files. Do not edit it by hand — regenerate it from the official IG package with:
+
+```bash
+scripts/sync-sof-search-params.py            # pinned IG release
+scripts/sync-sof-search-params.py --ci-build # preview the IG CI build
+```
+
+The script strips generated narratives and rewrites the composite parameters' legacy `component.definition` canonicals to the core-namespace canonicals the parameters actually declare (an upstream IG inconsistency, reported as [HL7/sql-on-fhir#403](https://github.com/HL7/sql-on-fhir/issues/403); the rewrite becomes a no-op once fixed upstream). Bump `DEFAULT_PACKAGE_URL` in the script when a new IG ballot/release ships.
 
 ### Custom Data Directory
 

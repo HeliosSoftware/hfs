@@ -29,6 +29,9 @@
 (function () {
   "use strict";
 
+  var fhirSearchValue = window.HfsFhirSearchValue;
+  if (!fhirSearchValue) throw new Error("FHIR search-value codec is missing");
+
   var SETTINGS = "/_user/settings";
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
@@ -140,15 +143,42 @@
         return null;
       }
     }
-    var match = /^\/?([A-Za-z]+)(?:\?(.*))?$/.exec(text);
-    if (!match) return null;
-    return { type: match[1], query: (match[2] || "").trim() };
+    var queryAt = text.indexOf("?");
+    var path = queryAt >= 0 ? text.slice(0, queryAt) : text;
+    var query = queryAt >= 0 ? text.slice(queryAt + 1).trim() : "";
+    var segments = path.split("/").filter(Boolean);
+    var resourceType = segments[segments.length - 1] || "";
+    if (!/^[A-Za-z]+$/.test(resourceType)) return null;
+    return { type: resourceType, query: query };
   }
 
   function searchPath(resourceType, query) {
     return (
       "/" + encodeURIComponent(resourceType) + (query ? "?" + query : "")
     );
+  }
+
+  /* The semantic search context is independent from a server-provided pager
+   * URL. FHIR paging links may be opaque and need not contain a resource type. */
+  function resultContext(raw) {
+    var parsed = parseSearchUrl(raw);
+    if (!parsed) return null;
+    var text = (raw || "").trim().replace(/^GET\s+/i, "");
+    try {
+      var url = new URL(text, window.location.href);
+      var segments = url.pathname.split("/").filter(Boolean);
+      segments.pop();
+      url.pathname = "/" + segments.join("/");
+      url.search = "";
+      url.hash = "";
+      return {
+        type: parsed.type,
+        query: parsed.query,
+        baseUrl: url.href.replace(/\/$/, ""),
+      };
+    } catch (e) {
+      return null;
+    }
   }
 
   /* ---- Visual builder: rows kept in two-way sync with the GET URL ------ */
@@ -162,13 +192,23 @@
   /* Comparator prefixes live on the value (ge2020-01-01), not the key. */
   var PREFIXES = ["eq", "ne", "gt", "ge", "lt", "le", "sa", "eb", "ap"];
   var PREFIX_RE = /^(eq|ne|gt|ge|lt|le|sa|eb|ap)(?=[\d])/;
+
+  function parsePrefixedValue(raw) {
+    var match = PREFIX_RE.exec(raw || "");
+    return {
+      comparator: match ? match[1] : "",
+      value: match ? raw.slice(2) : raw,
+    };
+  }
+
   var catalogType = null;
+  var catalogLoadSeq = 0;
 
   /* Per-type parameter metadata from the catalog fragment's data attributes:
    * type -> { code: { type: "reference"|..., targets: ["Patient", ...] } }.
    * Feeds the chaining controls; promise-cached so each type is fetched once. */
   var PARAM_META = {};
-  var paramMetaPromises = {};
+  var paramCatalogPromises = {};
   function parseCatalog(html) {
     var tpl = document.createElement("template");
     tpl.innerHTML = html;
@@ -181,10 +221,10 @@
     });
     return { meta: meta, datalist: tpl.content.querySelector("datalist") };
   }
-  function fetchParams(type) {
-    if (!type) return Promise.resolve({});
-    if (paramMetaPromises[type]) return paramMetaPromises[type];
-    paramMetaPromises[type] = fetch(
+  function fetchCatalog(type) {
+    if (!type) return Promise.resolve({ meta: {}, datalist: null });
+    if (paramCatalogPromises[type]) return paramCatalogPromises[type];
+    paramCatalogPromises[type] = fetch(
       "/ui/queries/params?type=" + encodeURIComponent(type),
       { credentials: "same-origin" },
     )
@@ -192,33 +232,43 @@
         return response.ok ? response.text() : null;
       })
       .then(function (html) {
-        if (!html) return {};
-        var parsed = parseCatalog(html);
+        var parsed = html ? parseCatalog(html) : { meta: {}, datalist: null };
         PARAM_META[type] = parsed.meta;
-        return parsed.meta;
+        return parsed;
+      })
+      .catch(function () {
+        PARAM_META[type] = {};
+        return { meta: {}, datalist: null };
       });
-    return paramMetaPromises[type];
+    return paramCatalogPromises[type];
+  }
+  function fetchParams(type) {
+    return fetchCatalog(type).then(function (catalog) {
+      return catalog.meta;
+    });
   }
 
-  /* Swaps the parameter datalist for the current resource type. The
-   * fragment is server-rendered from the SearchParameter registry. */
+  /* Swaps the parameter datalist for the current resource type. The fragment
+   * is server-rendered from the SearchParameter registry; a render for a
+   * newer type must not install a stale datalist. */
   function loadCatalog(type) {
-    if (!type || type === catalogType) return;
+    if (!type) return Promise.resolve({});
+    var loadSeq = ++catalogLoadSeq;
     catalogType = type;
-    fetch("/ui/queries/params?type=" + encodeURIComponent(type), {
-      credentials: "same-origin",
-    })
-      .then(function (response) {
-        return response.ok ? response.text() : null;
-      })
-      .then(function (html) {
-        if (!html) return;
-        var parsed = parseCatalog(html);
-        PARAM_META[type] = parsed.meta;
-        var current = document.getElementById("param-options");
-        if (parsed.datalist && current) current.replaceWith(parsed.datalist);
-        refreshChainAffordances();
-      });
+    return fetchCatalog(type).then(function (parsed) {
+      if (
+        loadSeq !== catalogLoadSeq ||
+        catalogType !== type ||
+        !sections ||
+        sections.dataset.type !== type
+      )
+        return parsed.meta;
+      var current = document.getElementById("param-options");
+      if (parsed.datalist && current)
+        current.replaceWith(parsed.datalist.cloneNode(true));
+      refreshChainAffordances();
+      return parsed.meta;
+    });
   }
 
   function splitQuery(query) {
@@ -341,15 +391,48 @@
     });
   }
 
-  /* Modifier select + value input + remove button, shared by every row kind. */
   /* One value input inside a row's OR stack (#414). The per-value remove
-   * only renders when the stack has siblings. */
-  function orValueInput(host, value) {
+   * only renders when the stack has siblings. Comparator prefixes belong to
+   * each value, so every alternative owns its own select (#630). */
+  function orValueInput(host, value, wire, escapeError, allowComparator) {
+    allowComparator = allowComparator !== false;
+    var parsed = allowComparator
+      ? parsePrefixedValue(value)
+      : { comparator: "", value: value };
+    var parsedWire =
+      wire === undefined
+        ? null
+        : allowComparator
+          ? parsePrefixedValue(wire)
+          : { comparator: "", value: wire };
     var wrap = document.createElement("span");
     wrap.className = "builder-row__orvalue";
+    var comparator = document.createElement("select");
+    comparator.className = "builder-row__comparator";
+    comparator.setAttribute("aria-label", sections.dataset.msgMatchIs);
+    option(comparator, "", sections.dataset.msgMatchIs, !parsed.comparator);
+    PREFIXES.forEach(function (prefix) {
+      option(comparator, prefix, prefix, parsed.comparator === prefix);
+    });
+    comparator.hidden = !parsed.comparator;
+    if (wire !== undefined && parsed.comparator) {
+      comparator.dataset.comparatorSource = "hydrated";
+    }
+    wrap.appendChild(comparator);
     var input = document.createElement("input");
     input.className = "builder-row__value";
-    input.value = value;
+    input.value = parsed.value;
+    if (wire !== undefined) {
+      /* The comparator is represented by the sibling select. Keeping it in
+       * the preserved wire value would duplicate it when only that select is
+       * edited (for example, `gege1980-01-01`). */
+      input.dataset.fhirWire =
+        parsedWire.comparator === parsed.comparator ? parsedWire.value : wire;
+      input.dataset.fhirDirty = "false";
+    } else {
+      input.dataset.fhirDirty = "true";
+    }
+    if (escapeError) input.dataset.fhirEscapeError = escapeError;
     input.placeholder = sections.dataset.msgValue;
     input.spellcheck = false;
     wrap.appendChild(input);
@@ -368,15 +451,19 @@
    * prefixes only apply to the ordered families. Unknown or unregistered
    * params keep the full lists. */
   var MODS_BY_TYPE = {
-    string: ["exact", "contains", "missing"],
-    token: ["text", "not", "in", "not-in", "of-type", "missing"],
-    reference: ["identifier", "missing"],
-    uri: ["below", "above", "missing"],
+    string: ["exact", "contains", "text", "missing"],
+    token: [
+      "text", "not", "above", "below", "in", "not-in", "of-type", "missing",
+    ],
+    reference: [
+      "contains", "text", "above", "below", "identifier", "missing",
+    ],
+    uri: ["contains", "above", "below", "missing"],
     date: ["missing"],
     number: ["missing"],
     quantity: ["missing"],
-    composite: ["missing"],
-    special: ["missing"],
+    composite: [],
+    special: [],
   };
   var PREFIX_TYPES = ["date", "number", "quantity"];
 
@@ -388,28 +475,375 @@
     return PREFIX_TYPES.indexOf(paramType) >= 0 ? PREFIXES : [];
   }
 
-  /* Rebuilds a row's modifier select and MODIFY chips for its param type. */
-  function refreshModifierControls(row, paramType) {
+  /* A parameter whose type the registry pins down; anything else (unknown
+   * code, ambiguous chain leaf, failed catalog) stays permissive. */
+  function knownParamType(paramType) {
+    return Object.prototype.hasOwnProperty.call(MODS_BY_TYPE, paramType);
+  }
+
+  /* Beyond the chips a type offers, the spec keeps two compatibility
+   * spellings and reference type modifiers legal (#627). */
+  function compatibleModifier(modifier, paramType) {
+    if (!modifier) return true;
+    if ((MODS_BY_TYPE[paramType] || []).indexOf(modifier) >= 0) return true;
+    if (modifier === "text-advanced" || modifier === "code-text") {
+      return paramType === "token" || paramType === "reference";
+    }
+    return paramType === "reference" && /^[A-Z]/.test(modifier);
+  }
+
+  /* Parameter types arrive asynchronously from the registry. A row whose
+   * parameter is being edited must not be runnable in the interval between
+   * the visual edit and that metadata settling: its comparator may still
+   * describe the old parameter. */
+  var typeResolutionSeq = 0;
+
+  function builderHasPendingType() {
+    return !!(
+      sections && sections.querySelector(".builder-row[data-param-pending='true']")
+    );
+  }
+
+  /* A row is `pending` from the moment its type resolution starts until that
+   * metadata settles it as `known` or `unknown`; a deferred consumer (a
+   * saved-query run, a deep link) may not read the builder before then. */
+  function builderCompatibilityPending() {
+    return !!(
+      sections && sections.querySelector(".builder-row[data-compat-state='pending']")
+    );
+  }
+
+  /* Run and Enter wait for the row being edited; Save and Copy additionally
+   * wait for a parameter transition, whose operators may still describe the
+   * old parameter. A malformed escape blocks all of them. */
+  function builderHasParamTransition() {
+    return !!(
+      sections &&
+      sections.querySelector(".builder-row[data-comparator-transition='true']")
+    );
+  }
+
+  function builderRunBlocked() {
+    return builderHasPendingType() || builderHasEscapeError();
+  }
+
+  function builderWriteBlocked() {
+    return builderHasParamTransition() || builderHasEscapeError();
+  }
+
+  function builderHasPendingSerialization() {
+    if (!sections) return false;
+    return Array.prototype.some.call(
+      sections.querySelectorAll(".builder-row"),
+      function (row) {
+        return !!(
+          row._modifierPending || row._comparatorClassificationPending
+        );
+      },
+    );
+  }
+
+  /* Every builder consumer reflects the blocked state, and anything that
+   * deferred until the builder settled is released here. */
+  var pendingBuilderConsumers = [];
+  function refreshRunAvailability() {
+    var runBlocked = builderRunBlocked();
+    var writeBlocked = builderWriteBlocked();
+    if (form) {
+      form.querySelectorAll("[data-intent]").forEach(function (control) {
+        control.disabled =
+          control.dataset.intent === "run" ? runBlocked : writeBlocked;
+      });
+    }
+    var copy = document.getElementById("query-copy");
+    if (copy) copy.disabled = writeBlocked;
+    if (root) {
+      root
+        .querySelectorAll("button[data-action='run']")
+        .forEach(function (control) {
+          control.disabled = runBlocked;
+        });
+    }
+    if (runBlocked || writeBlocked || builderCompatibilityPending()) return;
+    var ready = pendingBuilderConsumers;
+    pendingBuilderConsumers = [];
+    ready.forEach(function (consumer) {
+      if (consumer.revision === builderRevision) consumer.callback();
+    });
+  }
+
+  /* Auto-runs (saved entries, deep links) are one-shot against the builder
+   * revision they were queued for: a user edit in the meantime cancels
+   * them rather than running a query nobody asked for. */
+  function consumeWhenBuilderReady(revision, callback) {
+    if (
+      !builderCompatibilityPending() &&
+      !builderRunBlocked() &&
+      !builderWriteBlocked()
+    ) {
+      if (revision === builderRevision) callback();
+      return;
+    }
+    pendingBuilderConsumers.push({ revision: revision, callback: callback });
+  }
+
+  function noteBuilderUserEdit() {
+    builderRevision += 1;
+  }
+
+  function beginTypeResolution(row, userTransition) {
+    var token = String(++typeResolutionSeq);
+    row.dataset.typeResolution = token;
+    row.dataset.compatState = "pending";
+    if (!userTransition && row._hydrationPending === undefined) {
+      row._hydrationPending = true;
+      row._hydrationToken = token;
+    }
+    if (userTransition) {
+      row.dataset.paramPending = "true";
+      row.dataset.comparatorTransition = "true";
+    }
+    refreshRunAvailability();
+    return token;
+  }
+
+  function finishTypeResolution(row, token, resolvedType) {
+    var isSourceHydration = row._hydrationToken === token;
+    if (isSourceHydration) {
+      classifyHydratedComparators(
+        row,
+        resolvedType,
+        !!row._comparatorClassificationPending,
+      );
+      row._hydrationPending = false;
+      delete row._hydrationToken;
+      if (row._modifierPending) {
+        clearComparatorsForModifier(row);
+        delete row._modifierPending;
+        row._pendingNeedsSerialization = true;
+      }
+      if (row._comparatorClassificationPending) {
+        delete row._comparatorClassificationPending;
+        row._pendingNeedsSerialization = true;
+      }
+    }
+    if (row.dataset.typeResolution !== token) {
+      if (isSourceHydration && row._deferredTypeResolution) {
+        var deferred = row._deferredTypeResolution;
+        delete row._deferredTypeResolution;
+        finishTypeResolution(row, deferred.token, deferred.resolvedType);
+      }
+      return;
+    }
+    if (row.dataset.comparatorTransition === "true" && row._hydrationPending) {
+      row._deferredTypeResolution = { token: token, resolvedType: resolvedType };
+      return;
+    }
+    var mode = row.dataset.comparatorTransition === "true" ? "transition" : "hydrate";
+    var wireChanged = regateModifiers(row, resolvedType, mode);
+    var pendingNeedsSerialization = !!row._pendingNeedsSerialization;
+    delete row._pendingNeedsSerialization;
+    delete row.dataset.comparatorTransition;
+    delete row.dataset.paramPending;
+    delete row.dataset.typeResolution;
+    refreshRunAvailability();
+    if (!row.isConnected) return;
+    /* Only dropping a comparator during a user transition changes the wire.
+     * Hydration must preserve the URL exactly as supplied, including its GET
+     * spelling and percent encoding. Narration still needs the resolved type. */
+    if (wireChanged || pendingNeedsSerialization) updateUrl();
+    else updatePlain();
+  }
+
+  /* Rebuilds a row's modifier select and MODIFY chips for its param type.
+   * Once the registry pins the type down, a modifier it cannot support
+   * belonged to the parameter that was there before and is dropped (#627);
+   * unknown and ambiguous parameters keep pasted operators verbatim.
+   * Returns whether the selection changed, which the wire must follow. */
+  function refreshModifierControls(row, paramType, reconcile) {
     var modifier = row.querySelector(".builder-row__modifier");
-    if (!modifier) return;
-    var selected = modifier.value;
+    if (!modifier) return false;
+    var original = modifier.value;
+    var selected = original;
     var mods = applicableMods(paramType);
-    var prefixes = applicablePrefixes(paramType);
+    if (reconcile && !compatibleModifier(selected, paramType)) selected = "";
     modifier.textContent = "";
     option(modifier, "", sections.dataset.msgMatchIs, !selected);
     mods.forEach(function (m) {
       option(modifier, m, ":" + m, selected === m);
     });
-    prefixes.forEach(function (p) {
-      option(modifier, p, p, selected === p);
-    });
-    /* A modifier from a pasted URL stays selectable even when the type
-     * would not offer it. */
-    if (selected && mods.indexOf(selected) < 0 && prefixes.indexOf(selected) < 0) {
+    /* Compatibility-only and unknown modifiers stay selectable without
+     * joining the visible modifier matrix. */
+    if (selected && mods.indexOf(selected) < 0) {
       option(modifier, selected, ":" + selected, true);
     }
     var panel = row.querySelector(".builder-row__modpanel");
     if (panel) fillModPanel(panel, row, mods);
+    return original !== selected;
+  }
+
+  /* Re-gates the per-value comparator selects. Hydrated values keep their
+   * exact wire: a prefix-looking value on a known string is folded back into
+   * the text input. During a user parameter transition, an incompatible
+   * comparator belongs to the old parameter and is discarded instead. */
+  function foldComparatorIntoLiteral(comparator) {
+    var alternative = comparator.closest(".builder-row__orvalue");
+    var input = alternative && alternative.querySelector(".builder-row__value");
+    if (!input || !comparator.value) return;
+    input.value = comparator.value + input.value;
+    if (input.dataset.fhirWire !== undefined) {
+      input.dataset.fhirWire = comparator.value + input.dataset.fhirWire;
+    }
+    comparator.value = "";
+  }
+
+  function classifyHydratedComparators(row, sourceType, classifySelected) {
+    if (!sourceType || PREFIX_TYPES.indexOf(sourceType) >= 0) return;
+    row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+      if (
+        !classifySelected &&
+        comparator.dataset.comparatorSource !== "hydrated"
+      ) {
+        return;
+      }
+      foldComparatorIntoLiteral(comparator);
+      comparator.dataset.comparatorSource = "literal";
+    });
+  }
+
+  function rowHasSelectedComparator(row) {
+    return Array.prototype.some.call(
+      row.querySelectorAll(".builder-row__comparator"),
+      function (comparator) {
+        return !!comparator.value;
+      },
+    );
+  }
+
+  function beginComparatorClassification(row) {
+    if (!row._hydrationPending) return;
+    row._comparatorClassificationPending = true;
+    row.dataset.paramPending = "true";
+    refreshRunAvailability();
+  }
+
+  function cancelComparatorClassification(row) {
+    if (
+      !row._comparatorClassificationPending ||
+      rowHasSelectedComparator(row)
+    ) {
+      return;
+    }
+    delete row._comparatorClassificationPending;
+    if (
+      !row._modifierPending &&
+      row.dataset.comparatorTransition !== "true"
+    ) {
+      delete row.dataset.paramPending;
+      refreshRunAvailability();
+    }
+  }
+
+  function clearComparatorsForModifier(row) {
+    row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+      comparator.value = "";
+    });
+  }
+
+  function enforceModifierComparatorExclusion(row) {
+    var unresolvedHydratedPrefix =
+      row._hydrationPending &&
+      Array.prototype.some.call(
+        row.querySelectorAll(".builder-row__comparator"),
+        function (comparator) {
+          return (
+            comparator.dataset.comparatorSource === "hydrated" &&
+            !!comparator.value
+          );
+        },
+      );
+    if (unresolvedHydratedPrefix) {
+      row._modifierPending = true;
+      row.dataset.paramPending = "true";
+      refreshRunAvailability();
+      return false;
+    }
+    clearComparatorsForModifier(row);
+    cancelComparatorClassification(row);
+    return true;
+  }
+
+  function cancelPendingModifier(row, retainComparatorClassification) {
+    if (!row._modifierPending) return;
+    delete row._modifierPending;
+    if (retainComparatorClassification) {
+      row._comparatorClassificationPending = true;
+      row.dataset.paramPending = "true";
+      return;
+    }
+    if (row._comparatorClassificationPending) return;
+    if (row.dataset.comparatorTransition !== "true") {
+      delete row.dataset.paramPending;
+      refreshRunAvailability();
+    }
+  }
+
+  function refreshComparatorControls(row, paramType, mode) {
+    var prefixes = applicablePrefixes(paramType);
+    var modifier = row.querySelector(".builder-row__modifier");
+    var hasModifier = !!(modifier && modifier.value);
+    var wireChanged = false;
+    row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+      var selected = comparator.value;
+      var alternative = comparator.closest(".builder-row__orvalue");
+      var input = alternative && alternative.querySelector(".builder-row__value");
+
+      if (paramType && selected && prefixes.indexOf(selected) < 0) {
+        if (mode === "hydrate" && input) {
+          foldComparatorIntoLiteral(comparator);
+        } else if (mode === "transition") {
+          wireChanged = true;
+        }
+        selected = "";
+      } else if (
+        paramType &&
+        prefixes.length &&
+        !selected &&
+        !hasModifier &&
+        mode &&
+        input
+      ) {
+        /* A value previously known to be a string may become ordered after
+         * the user changes its parameter. Reflect a now-valid prefix in the
+         * comparator control rather than leaving DOM and wire semantics out
+         * of sync. */
+        var parsed = parsePrefixedValue(input.value);
+        if (parsed.comparator) {
+          selected = parsed.comparator;
+          input.value = parsed.value;
+          if (input.dataset.fhirWire !== undefined) {
+            var parsedWire = parsePrefixedValue(input.dataset.fhirWire);
+            if (parsedWire.comparator === selected) {
+              input.dataset.fhirWire = parsedWire.value;
+            } else {
+              input.dataset.fhirDirty = "true";
+            }
+          }
+        }
+      }
+
+      comparator.textContent = "";
+      option(comparator, "", sections.dataset.msgMatchIs, !selected);
+      prefixes.forEach(function (prefix) {
+        option(comparator, prefix, prefix, selected === prefix);
+      });
+      /* Unknown/unregistered parameters remain permissive. */
+      if (!paramType && selected && prefixes.indexOf(selected) < 0) {
+        option(comparator, selected, selected, true);
+      }
+      comparator.hidden = prefixes.length === 0 && !selected;
+    });
+    return wireChanged;
   }
 
   /* Best-effort param type for a row's modifier target, from the cached
@@ -423,24 +857,46 @@
       return (((PARAM_META[t] || {})[leaf] || {}).type) || "";
     }
     if (row.classList.contains("builder-row--chain")) {
-      var chainLeaf = leafEl.value.trim();
-      for (var cached in PARAM_META) {
-        var m = PARAM_META[cached][chainLeaf];
-        if (m) return m.type;
-      }
-      return "";
+      /* refillLeaf resolves this against the chain's actual target types.
+       * Do not guess from unrelated resource registries that happen to use
+       * the same search-parameter code. */
+      return row.dataset.modType || "";
     }
     var key = row.querySelector(".builder-row__key");
     if (!key) return "";
     return (((PARAM_META[base] || {})[key.value.trim()] || {}).type) || "";
   }
 
-  /* Re-gates a row's modifier controls when its param type changed. */
-  function regateModifiers(row) {
-    var t = rowParamType(row);
-    if (row.dataset.modType === t) return;
-    row.dataset.modType = t;
-    refreshModifierControls(row, t);
+  /* Settles a row against its resolved param type: an unknown type stays
+   * permissive, a known one reconciles the key modifier before the value
+   * comparators, so a prefix freed by dropping the modifier can move into
+   * the comparator control in the same pass. */
+  function regateModifiers(row, resolvedType, comparatorMode) {
+    var t = arguments.length > 1 ? resolvedType : rowParamType(row);
+    var known = knownParamType(t);
+    var wireChanged = false;
+    if (row.dataset.modType !== t || known) {
+      row.dataset.modType = t;
+      wireChanged = refreshModifierControls(row, t, known && !!comparatorMode);
+    }
+    wireChanged =
+      refreshComparatorControls(row, t, comparatorMode) || wireChanged;
+    row.dataset.compatState = known ? "known" : "unknown";
+    return wireChanged;
+  }
+
+  function resolveDirectParamType(row, userTransition) {
+    var token = beginTypeResolution(row, userTransition);
+    var base = sections.dataset.type || "";
+    var key = row.querySelector(".builder-row__key").value.trim();
+    fetchParams(base).then(
+      function (meta) {
+        finishTypeResolution(row, token, ((meta[key] || {}).type) || "");
+      },
+      function () {
+        finishTypeResolution(row, token, "");
+      },
+    );
   }
 
   /* The MODIFY panel: each applicable modifier as a chip with its
@@ -473,11 +929,17 @@
 
   /* FHIR's OR is a comma list on one parameter (`name=Smith,Jones`): the
    * value column stacks one input per alternative, plus the `+ or` button. */
-  function appendValues(row, rawValue) {
+  function appendValues(row, rawValue, allowComparators) {
     var host = document.createElement("span");
     host.className = "builder-row__values";
-    rawValue.split(",").forEach(function (v) {
-      orValueInput(host, v);
+    fhirSearchValue.parseAlternatives(rawValue).alternatives.forEach(function (alternative) {
+      orValueInput(
+        host,
+        alternative.value,
+        alternative.wire,
+        alternative.error,
+        allowComparators,
+      );
     });
     row.appendChild(host);
 
@@ -492,23 +954,18 @@
   function appendTail(row, part) {
     var value = part.value;
     var selectedMod = part.modifier;
-    var prefix = PREFIX_RE.exec(value);
-    if (!selectedMod && prefix) {
-      selectedMod = prefix[1];
-      value = value.slice(2);
-    }
     var modifier = document.createElement("select");
     modifier.className = "builder-row__modifier";
     option(modifier, "", sections.dataset.msgMatchIs, !selectedMod);
     COLON_MODIFIERS.forEach(function (m) {
       option(modifier, m, ":" + m, selectedMod === m);
     });
-    PREFIXES.forEach(function (p) {
-      option(modifier, p, p, selectedMod === p);
-    });
+    if (selectedMod && COLON_MODIFIERS.indexOf(selectedMod) < 0) {
+      option(modifier, selectedMod, ":" + selectedMod, true);
+    }
     row.appendChild(modifier);
 
-    appendValues(row, value);
+    appendValues(row, value, !selectedMod);
 
     var adv = document.createElement("button");
     adv.type = "button";
@@ -565,6 +1022,7 @@
     appendTail(row, part);
 
     var base = sections.dataset.type || "";
+    var leafRefillSeq = 0;
 
     /* Candidate resource types feeding hop k: the selected type of the
      * previous hop, else all of its registry targets (base type at k=0). */
@@ -636,22 +1094,38 @@
       parentTypes(hops.length, done);
     }
 
-    function refillLeaf() {
+    function refillLeaf(userTransition) {
+      var typeToken = beginTypeResolution(row, userTransition);
+      var refillSeq = ++leafRefillSeq;
+      var leafCode = leaf.input.value.trim();
       leafTypes(function (types) {
         var pending = types.length;
         var codes = [];
         var anyRef = false;
-        if (!pending) return;
+        var resolvedTypes = [];
+        if (!pending) {
+          if (refillSeq === leafRefillSeq) finishTypeResolution(row, typeToken, "");
+          return;
+        }
         types.forEach(function (t) {
           fetchParams(t).then(function (meta) {
             Object.keys(meta).forEach(function (code) {
               if (codes.indexOf(code) < 0) codes.push(code);
             });
-            var m = meta[leaf.input.value.trim()];
+            var m = meta[leafCode];
             if (m && m.type === "reference") anyRef = true;
+            if (m && resolvedTypes.indexOf(m.type) < 0) resolvedTypes.push(m.type);
             if (--pending === 0) {
-              fillList(leaf.list, codes.sort());
-              deeper.hidden = !anyRef;
+              var finalType = resolvedTypes.length === 1 ? resolvedTypes[0] : "";
+              if (refillSeq === leafRefillSeq) {
+                fillList(leaf.list, codes.sort());
+                deeper.hidden = !anyRef;
+                finishTypeResolution(row, typeToken, finalType);
+              } else if (!userTransition) {
+                /* Even when a later leaf edit superseded this UI refill, its
+                 * source type is still needed to classify hydrated values. */
+                finishTypeResolution(row, typeToken, finalType);
+              }
             }
           });
         });
@@ -676,12 +1150,12 @@
       ref.input.addEventListener("input", function () {
         hops[k].ref = ref.input.value.trim();
         segRefill(k);
-        refillLeaf();
+        refillLeaf(true);
       });
       typeSel.addEventListener("change", function () {
         hops[k].type = typeSel.value;
         for (var j = k + 1; j < hops.length; j++) segRefill(j);
-        refillLeaf();
+        refillLeaf(true);
         updateUrl();
       });
 
@@ -692,16 +1166,18 @@
     hops.forEach(function (_, k) {
       addSegment(k);
     });
-    refillLeaf();
+    refillLeaf(false);
 
-    leaf.input.addEventListener("input", refillLeaf);
+    leaf.input.addEventListener("input", function () {
+      refillLeaf(true);
+    });
     deeper.addEventListener("click", function () {
       var refName = leaf.input.value.trim();
       if (!refName) return;
       hops.push({ ref: refName, type: "" });
       leaf.input.value = "";
       addSegment(hops.length - 1);
-      refillLeaf();
+      refillLeaf(true);
       leaf.input.focus();
       updateUrl();
     });
@@ -740,10 +1216,26 @@
     appendTail(row, part);
 
     var base = sections.dataset.type || "";
-    function refillParams() {
+    var paramsRefillSeq = 0;
+    function refillParams(userTransition) {
+      var typeToken = beginTypeResolution(row, userTransition);
+      var refillSeq = ++paramsRefillSeq;
       var t = type.input.value.trim();
-      if (!t) return;
+      if (!t) {
+        finishTypeResolution(row, typeToken, "");
+        return;
+      }
       fetchParams(t).then(function (meta) {
+        var resolvedType = ((meta[leaf.input.value.trim()] || {}).type) || "";
+        if (refillSeq !== paramsRefillSeq) {
+          if (!userTransition) {
+            /* Preserve the original leaf's type classification even after a
+             * newer leaf edit superseded its suggestions. */
+            var sourceType = ((meta[part.key] || {}).type) || "";
+            finishTypeResolution(row, typeToken, sourceType);
+          }
+          return;
+        }
         var codes = Object.keys(meta).sort();
         /* The link must be a reference param that can point at the base
          * type; params with no declared targets stay offered. */
@@ -756,10 +1248,20 @@
           }),
         );
         fillList(leaf.list, codes);
+        finishTypeResolution(
+          row,
+          typeToken,
+          resolvedType,
+        );
       });
     }
-    type.input.addEventListener("input", refillParams);
-    refillParams();
+    type.input.addEventListener("input", function () {
+      refillParams(true);
+    });
+    leaf.input.addEventListener("input", function () {
+      refillParams(true);
+    });
+    refillParams(false);
 
     return row;
   }
@@ -852,7 +1354,9 @@
    * reference, per the registry metadata for the current base type. */
   function refreshChainAffordances() {
     if (!sections) return;
-    var meta = PARAM_META[sections.dataset.type || ""] || {};
+    var type = sections.dataset.type || "";
+    var loaded = Object.prototype.hasOwnProperty.call(PARAM_META, type);
+    var meta = PARAM_META[type] || {};
     sections
       .querySelectorAll("#builder-conditions .builder-row")
       .forEach(function (row) {
@@ -861,9 +1365,14 @@
         var key = row.querySelector(".builder-row__key");
         var drill = row.querySelector("[data-chain-from]");
         if (!key || !drill) return;
+        /* Until the catalog answers there is no basis for the affordance;
+         * the row's own type resolution reveals it. */
+        if (!loaded) {
+          drill.hidden = true;
+          return;
+        }
         var m = meta[key.value.trim()];
         drill.hidden = !(m && m.type === "reference");
-        regateModifiers(row);
       });
   }
 
@@ -907,15 +1416,10 @@
       row.appendChild(drill);
     }
 
-    /* Comparator prefixes render in the modifier select but are rejoined
-     * onto the value; colon modifiers are rejoined onto the key. */
+    /* Colon modifiers are joined onto the key. Comparator prefixes are owned
+     * by each value alternative and rendered by appendValues. */
     var value = part.value;
     var selectedMod = part.modifier;
-    var prefix = PREFIX_RE.exec(value);
-    if (!selectedMod && prefix) {
-      selectedMod = prefix[1];
-      value = value.slice(2);
-    }
 
     if (kind !== "control") {
       var modifier = document.createElement("select");
@@ -927,15 +1431,15 @@
         COLON_MODIFIERS.forEach(function (m) {
           option(modifier, m, ":" + m, selectedMod === m);
         });
-        PREFIXES.forEach(function (p) {
-          option(modifier, p, p, selectedMod === p);
-        });
+        if (selectedMod && COLON_MODIFIERS.indexOf(selectedMod) < 0) {
+          option(modifier, selectedMod, ":" + selectedMod, true);
+        }
       }
       row.appendChild(modifier);
     }
 
     if (kind === "condition") {
-      appendValues(row, value);
+      appendValues(row, value, !selectedMod);
       var adv = document.createElement("button");
       adv.type = "button";
       adv.className = "builder-row__adv";
@@ -966,6 +1470,8 @@
       panel.className = "builder-row__modpanel";
       panel.hidden = true;
       row.appendChild(panel);
+
+      resolveDirectParamType(row, false);
     }
 
     return row;
@@ -992,25 +1498,112 @@
       });
   }
 
-  /* The last URL the rows themselves produced. A native `change` can fire on
-   * the URL input after `updateUrl` rewrote it programmatically (the browser's
-   * dirty-value flag survives), and rebuilding the rows mid-interaction would
-   * yank focus and drop in-flight edits — so re-parsing skips its own echo. */
+  function csvHas(csv, value) {
+    return !!value && (csv || "").split(",").indexOf(value) >= 0;
+  }
+
+  /* Keeps every type-dependent Resources control on the type parsed from the
+   * query URL. Search and Saved Queries share this script and the rail, but do
+   * not render the Resources panel or Create button, so those updates are
+   * deliberately conditional. This helper never rewrites or runs the query. */
+  function syncTypeContext(type) {
+    markRailType(type);
+    var panel = document.getElementById("resources");
+    if (!panel) return;
+    panel.dataset.selectedType = type || "";
+    var createBtn = document.getElementById("resource-create");
+    if (createBtn) {
+      var label = createBtn.querySelector(".resources-create__label");
+      if (label) {
+        label.textContent = type
+          ? createBtn.dataset.msgCreate.replace("{type}", type)
+          : createBtn.dataset.msgCreateGeneric;
+      }
+
+      var reason = "";
+      if (panel.dataset.createMetadata !== "available") {
+        reason = panel.dataset.msgCreateMetadataUnavailable;
+      } else if (!csvHas(panel.dataset.createResourceTypes, type)) {
+        reason = panel.dataset.msgCreateInvalid;
+      } else if (!csvHas(panel.dataset.createAdvertisedTypes, type)) {
+        reason = panel.dataset.msgCreateNotAdvertised;
+      } else if (!csvHas(panel.dataset.createSchemaTypes, type)) {
+        reason = panel.dataset.msgCreateSchemaUnavailable;
+      }
+
+      createBtn.disabled = !!reason;
+      panel.dataset.createEligible = reason ? "false" : "true";
+      panel.dataset.createTarget = reason ? "" : type;
+      var reasonEl = document.getElementById("resource-create-reason");
+      if (reasonEl) {
+        reasonEl.textContent = reason;
+        reasonEl.hidden = !reason;
+      }
+    }
+  }
+
+  /* The next URL echo the rows themselves may produce. A native `change` can
+   * fire on the URL input after `updateUrl` rewrote it programmatically (the
+   * browser's dirty-value flag survives), and rebuilding the rows
+   * mid-interaction would yank focus and drop in-flight edits. The marker is
+   * one-shot: any other render invalidates it so a later external URL cannot
+   * match stale state. */
   var lastSerialized = null;
+
+  /* Bumped by every builder render and every user edit: a deferred auto-run
+   * only fires against the revision it was queued for. */
+  var builderRevision = 0;
+
+  function builderHasEscapeError() {
+    return !!(
+      sections && sections.querySelector(".builder-row__value[data-fhir-escape-error]")
+    );
+  }
+
+  function showEscapeError() {
+    showError(null, messages.msgInvalidFhirEscape);
+    refreshRunAvailability();
+  }
+
+  function serializedConditionAlternative(input) {
+    var visual = input.value.trim();
+    var isClean = input.dataset.fhirDirty !== "true";
+    if (!visual) {
+      return isClean && input.dataset.fhirWire !== undefined ? input.dataset.fhirWire : null;
+    }
+    return isClean && input.dataset.fhirWire !== undefined
+      ? input.dataset.fhirWire
+      : fhirSearchValue.serializeAlternative(visual);
+  }
 
   /* URL → rows. */
   function renderBuilder() {
     if (!sections || !urlInput) return;
-    if (urlInput.value === lastSerialized) return;
+    var isSerializedEcho = urlInput.value === lastSerialized;
+    lastSerialized = null;
     var parsed = parseSearchUrl(urlInput.value);
     if (!parsed) {
+      builderRevision += 1;
       sections.hidden = true;
-      markRailType(null);
+      syncTypeContext("");
+      sections
+        .querySelectorAll(".builder-row[data-compat-state='pending']")
+        .forEach(function (row) {
+          row.dataset.compatState = "unknown";
+        });
+      refreshRunAvailability();
       return;
     }
+    // Context sync must precede the echo guard: even a URL whose rows are
+    // already current may have arrived with conflicting Resources state (#626).
+    syncTypeContext(parsed.type);
+    if (isSerializedEcho) {
+      refreshRunAvailability();
+      return;
+    }
+    builderRevision += 1;
     sections.hidden = false;
     sections.dataset.type = parsed.type;
-    markRailType(parsed.type);
     loadCatalog(parsed.type);
 
     var hosts = builderHosts();
@@ -1021,13 +1614,29 @@
       var kind = bucketFor(part);
       hosts[kind].appendChild(builderRow(kind, part));
     });
+    refreshRunAvailability();
     refreshChainAffordances();
     updatePlain();
+    if (builderHasEscapeError()) showEscapeError();
+    else clearError();
   }
 
   /* Rows → URL. */
   function updateUrl() {
     if (!sections || !urlInput) return;
+    /* Interactions against an unresolved hydrated prefix are transactional:
+     * no edit may expose an unclassified modifier/comparator state through
+     * the URL, Copy, Save, or Run. */
+    if (builderHasPendingSerialization()) {
+      refreshRunAvailability();
+      return;
+    }
+    if (builderHasEscapeError()) {
+      showEscapeError();
+      refreshRunAvailability();
+      return;
+    }
+    clearError();
     var type = sections.dataset.type || "";
     var parts = [];
     sections.querySelectorAll(".builder-row").forEach(function (row) {
@@ -1041,6 +1650,11 @@
           var ref = segs[si].querySelector(".builder-row__chainref").value.trim();
           if (!ref) return;
           var ctype = segs[si].querySelector(".builder-row__ctype").value;
+          if (!ctype && row.chainHops && row.chainHops[si]) {
+            /* Preserve a hydrated qualifier while its async select options
+             * are still loading. User selections update chainHops too. */
+            ctype = row.chainHops[si].type;
+          }
           pieces.push(ref + (ctype ? ":" + ctype : ""));
         }
         key = pieces.join(".") + "." + leaf;
@@ -1067,32 +1681,80 @@
       if (!key) return;
       var modifierEl = row.querySelector(".builder-row__modifier");
       var mod = modifierEl ? modifierEl.value : "";
-      var isPrefix = PREFIXES.indexOf(mod) >= 0;
       var values = [];
-      row.querySelectorAll(".builder-row__value").forEach(function (vi) {
-        var v = vi.value.trim();
-        if (!v) return;
-        if (isPrefix && !PREFIX_RE.test(v)) v = mod + v;
-        values.push(v);
-      });
+      var alternatives = row.querySelectorAll(".builder-row__orvalue");
+      if (alternatives.length) {
+        alternatives.forEach(function (alternative) {
+          var input = alternative.querySelector(".builder-row__value");
+          var wire = serializedConditionAlternative(input);
+          if (wire === null) return;
+          var comparator = alternative.querySelector(".builder-row__comparator");
+          values.push((comparator ? comparator.value : "") + wire);
+        });
+      } else {
+        row.querySelectorAll(".builder-row__value").forEach(function (vi) {
+          var v = vi.value.trim();
+          if (v) values.push(v);
+        });
+      }
       var value = values.join(",");
-      if (!isPrefix && mod) key += ":" + mod;
+      if (mod) key += ":" + mod;
       parts.push(key + "=" + value);
     });
     urlInput.value =
       "GET /" + type + (parts.length ? "?" + parts.join("&") : "");
     lastSerialized = urlInput.value;
     updatePlain();
+    refreshRunAvailability();
   }
 
   if (sections && urlInput) {
+    urlInput.addEventListener("input", noteBuilderUserEdit);
     urlInput.addEventListener("change", renderBuilder);
     sections.addEventListener("input", function (event) {
-      if (event.target.closest(".builder-row")) {
-        updateUrl();
+      var row = event.target.closest(".builder-row");
+      if (row) {
+        var deferUpdate = false;
+        noteBuilderUserEdit();
+        var directKeyChanged =
+          event.target.classList.contains("builder-row__key") &&
+          !row.classList.contains("builder-row--chain") &&
+          !row.classList.contains("builder-row--has");
+        if (directKeyChanged) resolveDirectParamType(row, true);
+        if (event.target.classList.contains("builder-row__value")) {
+          event.target.dataset.fhirDirty = "true";
+          delete event.target.dataset.fhirEscapeError;
+        }
+        /* Key modifiers and value comparators occupied one select before
+         * #630, so preserve their mutual exclusion when either is edited. */
+        if (event.target.classList.contains("builder-row__comparator") && event.target.value) {
+          cancelPendingModifier(
+            row,
+            !!(row._modifierPending && row._hydrationPending),
+          );
+          beginComparatorClassification(row);
+          var rowModifier = row.querySelector(".builder-row__modifier");
+          if (rowModifier) {
+            rowModifier.value = "";
+            var rowPanel = row.querySelector(".builder-row__modpanel");
+            if (rowPanel) {
+              fillModPanel(rowPanel, row, applicableMods(row.dataset.modType || ""));
+            }
+          }
+        } else if (event.target.classList.contains("builder-row__comparator")) {
+          cancelComparatorClassification(row);
+        } else if (event.target.classList.contains("builder-row__modifier") && event.target.value) {
+          deferUpdate = !enforceModifierComparatorExclusion(row);
+          var modifierPanel = row.querySelector(".builder-row__modpanel");
+          if (modifierPanel) {
+            fillModPanel(modifierPanel, row, applicableMods(row.dataset.modType || ""));
+          }
+        } else if (event.target.classList.contains("builder-row__modifier")) {
+          cancelPendingModifier(row);
+        }
+        if (!deferUpdate) updateUrl();
         if (event.target.classList.contains("builder-row__key")) {
           refreshChainAffordances();
-          regateModifiers(event.target.closest(".builder-row"));
         }
       }
     });
@@ -1102,6 +1764,7 @@
       var toggleIterate = event.target.closest("[data-toggle-iterate]");
       var toggleMods = event.target.closest("[data-toggle-mods]");
       if (toggleIterate) {
+        noteBuilderUserEdit();
         var on = toggleIterate.getAttribute("aria-pressed") === "true";
         toggleIterate.setAttribute("aria-pressed", on ? "false" : "true");
         updateUrl();
@@ -1112,7 +1775,7 @@
       if (toggleMods) {
         var modRow = toggleMods.closest(".builder-row");
         var modPanel = modRow.querySelector(".builder-row__modpanel");
-        regateModifiers(modRow);
+        if (modRow.dataset.compatState !== "pending") regateModifiers(modRow);
         if (modPanel.hidden) {
           refreshModifierControls(modRow, modRow.dataset.modType || "");
         }
@@ -1121,49 +1784,78 @@
         return;
       }
       if (modChip) {
+        noteBuilderUserEdit();
         var chipRow = modChip.closest(".builder-row");
         var sel = chipRow.querySelector(".builder-row__modifier");
         sel.value = sel.value === modChip.dataset.modChip ? "" : modChip.dataset.modChip;
+        var modifierDeferred = false;
+        if (sel.value) {
+          modifierDeferred = !enforceModifierComparatorExclusion(chipRow);
+        } else {
+          cancelPendingModifier(chipRow);
+        }
         fillModPanel(
           chipRow.querySelector(".builder-row__modpanel"),
           chipRow,
           applicableMods(chipRow.dataset.modType || ""),
         );
-        updateUrl();
+        if (!modifierDeferred) updateUrl();
         return;
       }
       var removeOr = event.target.closest("[data-remove-or]");
       var add = event.target.closest("[data-add]");
       if (addOr) {
-        var orHost = addOr.closest(".builder-row").querySelector(".builder-row__values");
-        orValueInput(orHost, "").focus();
+        noteBuilderUserEdit();
+        var orRow = addOr.closest(".builder-row");
+        var orHost = orRow.querySelector(".builder-row__values");
+        var addedValue = orValueInput(orHost, "");
+        refreshComparatorControls(orRow, orRow.dataset.modType || "");
+        addedValue.focus();
         return;
       }
       if (removeOr) {
+        noteBuilderUserEdit();
         var orWrap = removeOr.closest(".builder-row__orvalue");
         if (orWrap.parentElement.children.length > 1) {
+          var removeOrRow = orWrap.closest(".builder-row");
           orWrap.remove();
+          cancelComparatorClassification(removeOrRow);
           updateUrl();
         }
         return;
       }
       if (remove) {
+        noteBuilderUserEdit();
         remove.closest(".builder-row").remove();
+        refreshRunAvailability();
         updateUrl();
       } else if (drillFrom) {
         /* Convert the condition row into a forward-chain row for its
          * reference param, keeping the value the user already typed. */
+        if (builderHasEscapeError()) {
+          showEscapeError();
+          return;
+        }
         var from = drillFrom.closest(".builder-row");
         var refParam = from.querySelector(".builder-row__key").value.trim();
-        var kept = from.querySelector(".builder-row__value").value.trim();
+        var keptMod = from.querySelector(".builder-row__modifier").value;
+        var keptValues = [];
+        from.querySelectorAll(".builder-row__orvalue").forEach(function (alternative) {
+          var input = alternative.querySelector(".builder-row__value");
+          var wire = serializedConditionAlternative(input);
+          if (wire === null) return;
+          var comparator = alternative.querySelector(".builder-row__comparator");
+          keptValues.push((comparator ? comparator.value : "") + wire);
+        });
         var chain = chainRow({
           kind: "chain",
           hops: [{ ref: refParam, type: "" }],
           key: "",
-          modifier: "",
-          value: kept,
+          modifier: keptMod,
+          value: keptValues.join(","),
         });
         from.replaceWith(chain);
+        noteBuilderUserEdit();
         chain.querySelector(".builder-row__cparam").focus();
         updateUrl();
       } else if (add) {
@@ -1175,6 +1867,7 @@
             value: "",
           });
           builderHosts().include.appendChild(inc);
+          noteBuilderUserEdit();
           inc.querySelector(kind === "include-rev" ? ".builder-row__itype" : ".builder-row__iparam").focus();
           return;
         }
@@ -1188,6 +1881,7 @@
             value: "",
           });
           builderHosts().condition.appendChild(has);
+          noteBuilderUserEdit();
           has.querySelector(".builder-row__htype").focus();
           return;
         }
@@ -1198,6 +1892,8 @@
         };
         var row = builderRow(kind, part);
         builderHosts()[kind].appendChild(row);
+        noteBuilderUserEdit();
+        if (kind === "condition") refreshChainAffordances();
         row.querySelector(kind === "condition" ? ".builder-row__key" : ".builder-row__value").focus();
       }
     });
@@ -1224,14 +1920,6 @@
    * panel and the button are absent on the Saved Queries / Search pages,
    * where this rail only drives the search. */
   function selectType(type) {
-    var panel = document.getElementById("resources");
-    if (panel) panel.dataset.selectedType = type;
-    var createBtn = document.getElementById("resource-create");
-    if (createBtn && createBtn.dataset.msgCreate) {
-      var label = createBtn.querySelector(".resources-create__label");
-      if (label) label.textContent = createBtn.dataset.msgCreate.replace("{type}", type);
-    }
-    markRailType(type);
     urlInput.value = "GET /" + type;
     renderBuilder();
     runSearch("/" + encodeURIComponent(type), false);
@@ -1246,6 +1934,23 @@
       window.history.pushState({}, "", item.getAttribute("href"));
     });
   }
+
+  function locationSearchValue() {
+    var params = new URLSearchParams(window.location.search);
+    if (params.has("url")) return params.get("url") || "";
+    var type = params.get("type");
+    return "/" + (type || "Patient");
+  }
+
+  function restoreLocationContext() {
+    if (!urlInput || !document.getElementById("resources")) return;
+    urlInput.value = "GET " + locationSearchValue().replace(/^GET\s+/i, "");
+    renderBuilder();
+    var parsed = parseSearchUrl(urlInput.value);
+    if (parsed) runSearch(searchPath(parsed.type, parsed.query), false);
+  }
+
+  window.addEventListener("popstate", restoreLocationContext);
   if (railFilter && railList) {
     railFilter.addEventListener("input", function () {
       var needle = railFilter.value.trim().toLowerCase();
@@ -1282,31 +1987,93 @@
     });
   }
 
-  function plainValue(part) {
+  function partParamType(part, baseType) {
+    if (part.kind === "has") {
+      return ((((PARAM_META[part.hasType] || {})[part.key] || {}).type) || "");
+    }
+    if (part.kind === "chain") {
+      var wanted = part.hops
+        .map(function (hop) {
+          return hop.ref + (hop.type ? ":" + hop.type : "");
+        })
+        .concat([part.key])
+        .join(".");
+      var found = "";
+      if (sections) {
+        sections.querySelectorAll(".builder-row--chain").forEach(function (row) {
+          if (found) return;
+          var pieces = (row.chainHops || []).map(function (hop) {
+            return hop.ref + (hop.type ? ":" + hop.type : "");
+          });
+          pieces.push(row.querySelector(".builder-row__cparam").value.trim());
+          if (pieces.join(".") === wanted) found = row.dataset.modType || "";
+        });
+      }
+      return found;
+    }
+    return ((((PARAM_META[baseType] || {})[part.key] || {}).type) || "");
+  }
+
+  function plainValues(part, paramType) {
     var raw = part.value || "";
     var mod = part.modifier || "";
     if (mod === "missing" && (raw === "true" || raw === "false")) {
-      return { verb: PLAIN.missing[raw], value: "", showValue: false };
+      return [{ verb: PLAIN.missing[raw], value: "", showValue: false }];
     }
-    var alternatives = raw.split(",").filter(Boolean).map(function (v) {
-      var p = PREFIX_RE.exec(v);
-      return p ? v.slice(2) : v;
-    });
-    var prefix = PREFIX_RE.exec(raw);
-    var verbKey = mod || (prefix ? prefix[1] : "");
-    var verb = PLAIN.verbs[verbKey] != null ? PLAIN.verbs[verbKey] : PLAIN.verbs[""];
-    var joined = alternatives
-      .map(function (v) {
-        return "\u201C" + v + "\u201D";
+    var alternatives = fhirSearchValue
+      .parseAlternatives(raw)
+      .alternatives.map(function (alternative) {
+        var parsed = mod || (paramType && PREFIX_TYPES.indexOf(paramType) < 0)
+          ? { comparator: "", value: alternative.value }
+          : parsePrefixedValue(alternative.value);
+        var verbKey = mod || parsed.comparator;
+        var verb = PLAIN.verbs[verbKey] != null ? PLAIN.verbs[verbKey] : PLAIN.verbs[""];
+        var quoted = parsed.value ? "\u201C" + parsed.value + "\u201D" : "";
+        return { verb: verb, value: quoted, showValue: quoted !== "" };
       })
-      .join(" " + PLAIN.or + " ");
-    return { verb: verb, value: joined, showValue: joined !== "" };
+      .filter(function (alternative) {
+        return alternative.showValue;
+      });
+    if (alternatives.length) return alternatives;
+    return [
+      {
+        verb: PLAIN.verbs[mod] != null ? PLAIN.verbs[mod] : PLAIN.verbs[""],
+        value: "",
+        showValue: false,
+      },
+    ];
   }
 
-  function renderPlainClause(withValue, withoutValue, args, plain) {
-    args.verb = plain.verb;
-    if (plain.showValue) args.value = plain.value;
-    return tpl(plain.showValue ? withValue : withoutValue, args);
+  function renderPlainClause(withValue, withoutValue, args, alternatives) {
+    var groups = [];
+    alternatives.forEach(function (alternative) {
+      var previous = groups[groups.length - 1];
+      if (
+        previous &&
+        previous.verb === alternative.verb &&
+        previous.showValue &&
+        alternative.showValue
+      ) {
+        previous.value += " " + PLAIN.or + " " + alternative.value;
+      } else {
+        groups.push({
+          verb: alternative.verb,
+          value: alternative.value,
+          showValue: alternative.showValue,
+        });
+      }
+    });
+    return groups
+      .map(function (group) {
+        var clauseArgs = {};
+        Object.keys(args).forEach(function (key) {
+          clauseArgs[key] = args[key];
+        });
+        clauseArgs.verb = group.verb;
+        if (group.showValue) clauseArgs.value = group.value;
+        return tpl(group.showValue ? withValue : withoutValue, clauseArgs);
+      })
+      .join(" " + PLAIN.or + " ");
   }
 
   function updatePlain() {
@@ -1326,14 +2093,14 @@
           })
           .concat([part.key])
           .join(PLAIN.arrow + " ");
-        var cv = plainValue(part);
+        var cv = plainValues(part, partParamType(part, parsed.type));
         clauses.push(
           renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: path }, cv),
         );
         return;
       }
       if (part.kind === "has") {
-        var hv = plainValue(part);
+        var hv = plainValues(part, partParamType(part, parsed.type));
         clauses.push(
           renderPlainClause(
             PLAIN.has,
@@ -1371,7 +2138,7 @@
         return;
       }
       if (CONTROL_KEYS.indexOf(part.key) >= 0 || !part.key) return;
-      var v = plainValue(part);
+      var v = plainValues(part, partParamType(part, parsed.type));
       clauses.push(
         renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: part.key }, v),
       );
@@ -1389,8 +2156,10 @@
 
   /* ---- Results: the FHIR search response, rendered in-page ------------- */
 
-  /* The last path handed to runSearch — what a data-changed re-run repeats. */
+  /* The last path that rendered successfully. A failed page request must not
+   * replace it, because data-changed re-runs the visible page. */
   var lastSearchPath = null;
+  var lastSearchContext = null;
 
   var results = {
     card: document.getElementById("query-results"),
@@ -1398,6 +2167,7 @@
     body: document.getElementById("query-results-body"),
     meta: document.getElementById("query-results-meta"),
     note: document.getElementById("query-results-note"),
+    error: document.getElementById("query-results-error"),
     open: document.getElementById("query-results-open"),
     prev: document.getElementById("query-results-prev"),
     next: document.getElementById("query-results-next"),
@@ -1475,47 +2245,57 @@
     return null;
   }
 
-  function renderResults(path, ok, body) {
-    var card = results.card;
-    if (!card) return;
-    card.hidden = false;
-    results.open.href = path;
-    results.head.textContent = "";
-    results.body.textContent = "";
-    results.meta.textContent = "";
-    results.note.textContent = "";
-    results.prev.hidden = true;
-    results.next.hidden = true;
-
-    if (!ok || !body || body.resourceType !== "Bundle") {
-      var diagnostics =
-        body &&
-        body.issue &&
-        body.issue[0] &&
-        (body.issue[0].diagnostics ||
-          (body.issue[0].details && body.issue[0].details.text));
-      results.note.textContent = diagnostics || messages.msgError;
-      return;
+  /* Build a complete replacement before touching the visible result. If a
+   * response is not a search Bundle, or its shape cannot be rendered, the
+   * previous page stays intact. */
+  function safeResourceHref(entry, context, resource) {
+    if (entry && typeof entry.fullUrl === "string") {
+      try {
+        var fullUrl = new URL(entry.fullUrl, window.location.href);
+        if (
+          (fullUrl.protocol === "http:" || fullUrl.protocol === "https:") &&
+          !fullUrl.username &&
+          !fullUrl.password
+        ) {
+          return fullUrl.href;
+        }
+      } catch (e) {
+        // Fall through to the route built from the trusted search context.
+      }
     }
+    return (
+      context.baseUrl +
+      "/" +
+      encodeURIComponent(context.type) +
+      "/" +
+      encodeURIComponent(resource.id || "")
+    );
+  }
 
-    var parsed = parseSearchUrl(path) || { type: "", query: "" };
-    var entries = body.entry || [];
+  function prepareResults(body, context) {
+    if (!body || body.resourceType !== "Bundle") return null;
+    if (!context || !/^[A-Za-z]+$/.test(context.type)) return null;
+    var entries = Array.isArray(body.entry) ? body.entry : [];
     var primary = entries.filter(function (entry) {
       return (
-        entry.resource && entry.resource.resourceType === parsed.type
+        entry &&
+        entry.resource &&
+        entry.resource.resourceType === context.type
       );
     });
     var included = entries.length - primary.length;
 
-    var total =
-      typeof body.total === "number" ? body.total : primary.length;
-    var meta = card.dataset.msgTotal.replace("{count}", total);
+    var total = typeof body.total === "number" ? body.total : primary.length;
+    var meta = results.card.dataset.msgTotal.replace("{count}", total);
     if (included > 0)
-      meta += " · " + card.dataset.msgIncluded.replace("{count}", included);
-    results.meta.textContent = meta;
+      meta +=
+        " · " +
+        results.card.dataset.msgIncluded.replace("{count}", included);
 
-    var columns = elementColumns(parsed.query);
-    if (!columns.length) columns = DEFAULT_COLUMNS[parsed.type] || [];
+    var columns = elementColumns(context.query);
+    if (!columns.length) columns = DEFAULT_COLUMNS[context.type] || [];
+
+    var head = document.createDocumentFragment();
     var headRow = document.createElement("tr");
     var th = document.createElement("th");
     th.textContent = "id";
@@ -1526,17 +2306,20 @@
       headRow.appendChild(cellEl);
     });
     var thUpdated = document.createElement("th");
-    thUpdated.textContent = card.dataset.msgUpdated;
+    thUpdated.textContent = results.card.dataset.msgUpdated;
     headRow.appendChild(thUpdated);
-    results.head.appendChild(headRow);
+    head.appendChild(headRow);
 
+    var rows = document.createDocumentFragment();
     primary.forEach(function (entry) {
       var resource = entry.resource;
       var row = document.createElement("tr");
       var idCell = document.createElement("td");
       var link = document.createElement("a");
       link.className = "url";
-      link.href = "/" + parsed.type + "/" + resource.id;
+      link.href = safeResourceHref(entry, context, resource);
+      link.dataset.resourceType = context.type;
+      link.dataset.resourceId = resource.id || "";
       link.target = "_blank";
       link.rel = "noopener";
       link.textContent = resource.id || "";
@@ -1549,39 +2332,101 @@
         row,
         resource.meta && resource.meta.lastUpdated
           ? whenText(resource.meta.lastUpdated)
-          : ""
+          : "",
       );
-      results.body.appendChild(row);
+      rows.appendChild(row);
     });
 
-    if (!primary.length) results.note.textContent = card.dataset.msgEmpty;
+    var sortValue = "";
+    splitQuery(context.query).forEach(function (part) {
+      if (part.key === "_sort") sortValue = part.value;
+    });
 
+    return {
+      head: head,
+      rows: rows,
+      meta: meta,
+      note: primary.length ? "" : results.card.dataset.msgEmpty,
+      sort: sortValue,
+      prev: pagerLink(body, "previous"),
+      next: pagerLink(body, "next"),
+    };
+  }
+
+  function clearResultsError() {
+    if (!results.error) return;
+    results.error.textContent = "";
+    results.error.hidden = true;
+  }
+
+  function renderResults(path, body, context) {
+    var card = results.card;
+    if (!card) return false;
+    var prepared = prepareResults(body, context);
+    if (!prepared) return false;
+
+    card.hidden = false;
+    results.open.href = path;
+    results.head.replaceChildren(prepared.head);
+    results.body.replaceChildren(prepared.rows);
+    results.meta.textContent = prepared.meta;
+    results.note.textContent = prepared.note;
     if (results.sort) {
-      var sortValue = "";
-      splitQuery(parsed.query).forEach(function (part) {
-        if (part.key === "_sort") sortValue = part.value;
-      });
-      results.sort.value = sortValue;
-      if (results.sort.value !== sortValue) results.sort.value = "";
+      results.sort.value = prepared.sort;
+      if (results.sort.value !== prepared.sort) results.sort.value = "";
     }
 
-    var prevUrl = pagerLink(body, "previous");
-    var nextUrl = pagerLink(body, "next");
-    if (prevUrl) {
+    if (prepared.prev) {
       results.prev.hidden = false;
-      results.prev.dataset.url = prevUrl;
+      results.prev.dataset.url = prepared.prev;
+    } else {
+      results.prev.hidden = true;
+      delete results.prev.dataset.url;
     }
-    if (nextUrl) {
+    if (prepared.next) {
       results.next.hidden = false;
-      results.next.dataset.url = nextUrl;
+      results.next.dataset.url = prepared.next;
+    } else {
+      results.next.hidden = true;
+      delete results.next.dataset.url;
     }
+
+    clearResultsError();
+    lastSearchPath = path;
+    lastSearchContext = context;
+    return true;
+  }
+
+  function failedOrigin(path) {
+    try {
+      var origin = new URL(path, window.location.href).origin;
+      return origin && origin !== "null" ? origin : window.location.origin;
+    } catch (e) {
+      return window.location.origin;
+    }
+  }
+
+  function showResultsError(path) {
+    if (results.card) results.card.hidden = false;
+    if (results.error) {
+      results.error.textContent = results.card.dataset.msgFetchError.replace(
+        "{origin}",
+        failedOrigin(path),
+      );
+      results.error.hidden = false;
+    }
+    document.dispatchEvent(
+      new CustomEvent("hfs:data-changed", {
+        detail: { source: "query-results", failed: true },
+      }),
+    );
   }
 
   /* Runs a search against the FHIR API and renders the Bundle in-page.
    * `record` adds it to the roaming recent list (explicit runs only, so
    * paging does not spam recents). */
-  function runSearch(path, record) {
-    lastSearchPath = path;
+  function runSearch(path, record, context) {
+    var requestedContext = context || resultContext(path);
     if (!results.card) {
       window.open(path, "_blank", "noopener");
     } else {
@@ -1590,17 +2435,17 @@
         credentials: "same-origin",
       })
         .then(function (response) {
-          return response
-            .json()
-            .catch(function () {
-              return null;
-            })
-            .then(function (body) {
-              renderResults(path, response.ok, body);
-            });
+          if (!response.ok) return null;
+          return response.json().catch(function () {
+            return null;
+          });
+        })
+        .then(function (body) {
+          if (!renderResults(path, body, requestedContext))
+            showResultsError(path);
         })
         .catch(function () {
-          renderResults(path, false, null);
+          showResultsError(path);
         });
     }
     if (record) recordRecent(path);
@@ -1609,21 +2454,18 @@
   results.card &&
     results.card.addEventListener("click", function (event) {
       var pager = event.target.closest("button[data-url]");
-      if (pager) runSearch(pager.dataset.url, false);
+      if (pager) runSearch(pager.dataset.url, false, lastSearchContext);
     });
 
   /* Sort re-runs the current results path with the picked `_sort` (#416). */
   results.sort &&
     results.sort.addEventListener("change", function () {
-      var current = results.open && results.open.getAttribute("href");
-      if (!current) return;
-      var parsed = parseSearchUrl(current);
-      if (!parsed) return;
-      var parts = (parsed.query || "").split("&").filter(function (p) {
+      if (!lastSearchContext) return;
+      var parts = (lastSearchContext.query || "").split("&").filter(function (p) {
         return p && p.indexOf("_sort=") !== 0;
       });
       if (results.sort.value) parts.push("_sort=" + results.sort.value);
-      runSearch(searchPath(parsed.type, parts.join("&")), false);
+      runSearch(searchPath(lastSearchContext.type, parts.join("&")), false);
     });
 
   /* ---- Recent searches & the saved list -------------------------------- */
@@ -1764,11 +2606,14 @@
   }
 
   function render(doc) {
-    clearError();
+    if (!builderHasEscapeError()) clearError();
     renderRecent(doc);
     /* The Search page renders the builder and the recent list but no saved
      * list; there is nothing further to draw there. */
-    if (!root) return;
+    if (!root) {
+      refreshRunAvailability();
+      return;
+    }
 
     var byType = savedQueries(doc);
     root.textContent = "";
@@ -1843,6 +2688,7 @@
       empty.textContent = messages.msgEmpty;
       root.appendChild(empty);
     }
+    refreshRunAvailability();
   }
 
   /* Errors surface next to the query strip — the control they are almost
@@ -1906,15 +2752,26 @@
 
   /* Loads a query into the builder without running it. */
   function loadIntoBuilder(path) {
-    if (!urlInput) return;
+    if (!urlInput) return builderRevision;
     urlInput.value = "GET " + path;
     renderBuilder();
+    return builderRevision;
+  }
+
+  /* Runs whatever the builder settled on, which may differ from the query
+   * that was loaded once incompatible operators were reconciled. */
+  function runCurrentBuilderSearch(record) {
+    var parsed = parseSearchUrl(urlInput && urlInput.value);
+    if (!parsed) return false;
+    runSearch(searchPath(parsed.type, parsed.query), record);
+    return true;
   }
 
   /* Copy the query exactly as shown: what gets copied is what would run. */
   var copyButton = document.getElementById("query-copy");
   if (copyButton && navigator.clipboard) {
     copyButton.addEventListener("click", function () {
+      if (builderWriteBlocked()) return;
       navigator.clipboard.writeText(urlInput.value || "");
     });
   } else if (copyButton) {
@@ -1938,11 +2795,13 @@
 
         if (target.dataset.action === "run") {
           var path = searchPath(resourceType, entry.query || "");
-          loadIntoBuilder(path);
-          runSearch(path, true);
-          mutate(resourceType, id, {
-            lastAccessedAt: new Date().toISOString(),
-            accessCount: (Number(entry.accessCount) || 0) + 1,
+          var revision = loadIntoBuilder(path);
+          consumeWhenBuilderReady(revision, function () {
+            if (!runCurrentBuilderSearch(true)) return;
+            mutate(resourceType, id, {
+              lastAccessedAt: new Date().toISOString(),
+              accessCount: (Number(entry.accessCount) || 0) + 1,
+            });
           });
         } else if (target.dataset.action === "rename") {
           var name = window.prompt(messages.msgRenamePrompt, entry.name || "");
@@ -2000,6 +2859,7 @@
       event.preventDefault();
       var intent =
         (event.submitter && event.submitter.dataset.intent) || "run";
+      if (builderRunBlocked() || builderWriteBlocked()) return;
       var parsed = parseSearchUrl(form.elements.url.value);
       if (!parsed) {
         reload().then(function () {
@@ -2037,20 +2897,23 @@
    * modal announces it): re-run the last search so the table shows what is
    * actually stored, without recording a new recent. The rail's counts are
    * server-rendered (#541) and catch up on the next full page load. */
-  document.addEventListener("hfs:data-changed", function () {
-    if (lastSearchPath) runSearch(lastSearchPath, false);
+  document.addEventListener("hfs:data-changed", function (event) {
+    if (event.detail && event.detail.source === "query-results") return;
+    if (lastSearchPath)
+      runSearch(lastSearchPath, false, lastSearchContext);
   });
 
   reload();
 
   /* Deep link: /ui/queries?url=/Patient?name=smith loads the builder and
    * runs immediately — also what saved/recent entries could link to. */
-  var deepLink = new URLSearchParams(window.location.search).get("url");
-  if (deepLink && urlInput) {
-    loadIntoBuilder(deepLink.replace(/^GET\s+/i, ""));
-    var parsedDeep = parseSearchUrl(urlInput.value);
-    if (parsedDeep)
-      runSearch(searchPath(parsedDeep.type, parsedDeep.query), true);
+  var locationParams = new URLSearchParams(window.location.search);
+  var deepLink = locationParams.get("url");
+  if (locationParams.has("url") && urlInput) {
+    var deepRevision = loadIntoBuilder(deepLink.replace(/^GET\s+/i, ""));
+    consumeWhenBuilderReady(deepRevision, function () {
+      runCurrentBuilderSearch(true);
+    });
   } else {
     // Resources opens in Patient (or `?type=`) context (#605): the same
     // path as a rail click, so the builder and results match the type the
@@ -2058,7 +2921,10 @@
     // since that only fires on an actual rail click (resource-filter.js).
     var initialPanel = document.getElementById("resources");
     if (initialPanel && urlInput) {
-      selectType(initialPanel.dataset.selectedType || "Patient");
+      renderBuilder();
+      var parsedInitial = parseSearchUrl(urlInput.value);
+      if (parsedInitial)
+        runSearch(searchPath(parsedInitial.type, parsedInitial.query), false);
     } else {
       renderBuilder();
     }

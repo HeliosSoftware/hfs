@@ -46,10 +46,10 @@ fn like_escape(value: &str) -> String {
 ///
 /// ## Why the default (starts-with) form carries no `value_string IS NOT NULL`
 ///
-/// v24 added that conjunct so the pattern index — then partial on
+/// v25 added that conjunct so the pattern index — then partial on
 /// `WHERE value_string IS NOT NULL` — could be *proved* usable, because
 /// `COALESCE(a, b) LIKE …` does not imply it (COALESCE is not strict). It did
-/// make the index legal. It also made it unreachable on cost, and v33 measured
+/// make the index legal. It also made it unreachable on cost, and v34 measured
 /// why: the conjunct is a second, independently-multiplied selectivity factor on
 /// a table where only 0.9% of rows have a string value, and `param_name` already
 /// determines that column. Postgres estimated the `(Patient, address)` slice at
@@ -57,7 +57,7 @@ fn like_escape(value: &str) -> String {
 /// supply the `(tenant, type, param)` prefix — `idx_search_string`, 50 MB —
 /// filtering the rest. See `schema.rs::migrate_v32_to_v33` for the plans.
 ///
-/// v33 moves the reachability proof into the operator instead: `~>=~` and `~~`
+/// v34 moves the reachability proof into the operator instead: `~>=~` and `~~`
 /// are both strict in the expression, so either implies the index's new
 /// `COALESCE(…) IS NOT NULL` predicate on its own, and the conjunct — with its
 /// wrong estimate — is gone from every modifier that reads this expression.
@@ -335,7 +335,7 @@ impl PostgresQueryBuilder {
     ///
     /// Only composite search differs. Under [`IndexLayout::Denormalized`] every
     /// component of one composite instance shares a row, so the match is a plain
-    /// conjunction. A database that predates v17 still stores one row per
+    /// conjunction. A database that predates v18 still stores one row per
     /// component, where that conjunction matches nothing at all — the search
     /// silently returns an empty bundle rather than failing.
     pub fn build_search_query_for(
@@ -400,7 +400,7 @@ impl PostgresQueryBuilder {
         let p1 = param_offset + 1;
 
         // A plain equality. `value_reference` holds the version-agnostic base
-        // (schema v32), so the `LIKE $n || '/_history/%'` arm this used to carry
+        // (schema v33), so the `LIKE $n || '/_history/%'` arm this used to carry
         // could match nothing — and it was the worst-shaped predicate in the
         // backend: the pattern is an `OpExpr` built in SQL rather than a `Const`,
         // so no fixed prefix could be derived from it under *any* plan, and an OR
@@ -814,7 +814,7 @@ impl PostgresQueryBuilder {
     /// - default (starts-with) — a bytewise range on `FOLDED_STRING_EXPR`, which
     ///   `idx_search_string_folded_pattern` seeks. Two bind parameters.
     /// - `:contains`/`:text` — a substring `LIKE`, which no btree can seek;
-    ///   served by the trigram GIN index `idx_search_string_trgm` (v33), and by
+    ///   served by the trigram GIN index `idx_search_string_trgm` (v34), and by
     ///   the btree pattern index where `pg_trgm` is unavailable.
     /// - `:exact` — `value_string = $n` on the bare column, served by
     ///   `idx_search_string`.
@@ -844,14 +844,14 @@ impl PostgresQueryBuilder {
                 // for not-yet-reindexed rows) against a folded pattern.
                 //
                 // A leading `%` is not btree-sargable, so this is served by the
-                // trigram GIN index v33 adds — which is why the
+                // trigram GIN index v34 adds — which is why the
                 // `value_string IS NOT NULL` conjunct is absent here too. It cost
                 // the same 200x row-estimate error it cost the starts-with form,
                 // and on that estimate the planner never costed the GIN scan
                 // competitively. `~~` is strict in the COALESCE, so it proves both
                 // the trigram index's predicate and the btree pattern index's
                 // without help. Where the extension is unavailable the btree
-                // pattern index serves it at parity with the pre-v33 plan.
+                // pattern index serves it at parity with the pre-v34 plan.
                 Some(SearchModifier::Contains | SearchModifier::Text) => {
                     next += 1;
                     SqlFragment::with_params(
@@ -997,16 +997,16 @@ impl PostgresQueryBuilder {
                     //
                     // `value_token_code IS NOT NULL` is a deliberate,
                     // row-set-preserving conjunct, not a filter: it is what makes
-                    // the partial `idx_search_token_code_recent` (v21, `WHERE
+                    // the partial `idx_search_token_code_recent` (v22, `WHERE
                     // value_token_code IS NOT NULL`) a legal candidate for this
                     // shape, so a *broad* system streams recent-first and stops
                     // at the LIMIT instead of heap-fetching and sorting its whole
-                    // match set. v30 measures 1074 buffers -> 26 for a 66,667-row
-                    // system, and it is the reason v30 could replace the 2,283 MB
+                    // match set. v31 measures 1074 buffers -> 26 for a 66,667-row
+                    // system, and it is the reason v31 could replace the 2,283 MB
                     // `idx_search_token` with a seek-only index.
                     //
-                    // As of v31 it is not merely helpful, it is LOAD-BEARING:
-                    // v31 dropped `idx_search_token_system` (the planner pointed
+                    // As of v32 it is not merely helpful, it is LOAD-BEARING:
+                    // v32 dropped `idx_search_token_system` (the planner pointed
                     // `system|code` at it — 80,089,347 tuples read, 358 ms p99),
                     // so `idx_search_token_code_recent` is now the ONLY index a
                     // `system|` predicate can reach. Remove this conjunct and the
@@ -1290,7 +1290,7 @@ impl PostgresQueryBuilder {
         ))
     }
 
-    /// Composite search against a pre-v17 `search_index`, where each component of
+    /// Composite search against a pre-v18 `search_index`, where each component of
     /// a composite instance is its own row.
     ///
     /// A resource matches only when every component is satisfied by some row
@@ -1781,7 +1781,7 @@ impl PostgresQueryBuilder {
     ///
     /// The identifier lookup **drives**; the reference index is seeked with what
     /// it produces. The sub-select yields the target's `Type/id` — the exact
-    /// form the writer stores (schema v32 also strips any `/_history/<vid>`, so
+    /// form the writer stores (schema v33 also strips any `/_history/<vid>`, so
     /// there is no other stored form to consider) — and the enclosing
     /// `value_reference` is compared against that set. This is the shape the
     /// SQLite backend has always used (`build_identifier_condition`), reached
@@ -1924,7 +1924,7 @@ impl PostgresQueryBuilder {
     ///
     /// Matching stays version-agnostic throughout, but from **both** ends now:
     /// the search value is stripped of any `/_history/<vid>` here, and the stored
-    /// value was stripped by the writer (schema v32). The `OR value_reference
+    /// value was stripped by the writer (schema v33). The `OR value_reference
     /// LIKE '<base>/\_history/%'` arm this used to carry is therefore gone —
     /// there is no longer a stored form for it to find. That arm was the second
     /// index probe of every reference search in the benchmark and it forced the
@@ -1945,7 +1945,7 @@ impl PostgresQueryBuilder {
     /// sends `Type/id`, which is why this has never shown up in a run.
     ///
     /// Making it sargable needs a stored bare target id — a column plus an index,
-    /// i.e. one more btree insert per reference row on the write path v27 spent
+    /// i.e. one more btree insert per reference row on the write path v28 spent
     /// a whole migration reducing. It is a separate change with its own
     /// arithmetic; it is written down here rather than guessed at.
     ///
@@ -2024,7 +2024,7 @@ impl PostgresQueryBuilder {
 
                 if base.contains('/') {
                     // `Type/id` or an absolute URL. One equality: the stored
-                    // value is the version-agnostic base (schema v32), so a
+                    // value is the version-agnostic base (schema v33), so a
                     // stored version cannot hide a match from it.
                     let exact = param_num + 1;
                     param_num += 1;
@@ -2239,7 +2239,7 @@ mod tests {
 
     #[test]
     fn legacy_layout_keeps_the_grouped_composite_form() {
-        // A database that predates v17 stores one row per composite component.
+        // A database that predates v18 stores one row per composite component.
         // The denormalized conjunction matches none of them, and would return an
         // empty bundle rather than an error — so the layout must select the form.
         let param = SearchParameter {
@@ -2362,7 +2362,7 @@ mod tests {
         assert_eq!(frag.params.len(), 3);
     }
 
-    /// The two composite spellings, pinned. These are the exact texts the v27
+    /// The two composite spellings, pinned. These are the exact texts the v28
     /// composite indexes are shaped for, and the exact texts whose partial
     /// predicates `predtest.c` has to prove:
     ///
@@ -2372,9 +2372,9 @@ mod tests {
     ///   `value_quantity_value`, so `WHERE value_quantity_value IS NOT NULL` is
     ///   provable;
     /// - the token component is an equality on `value_token_code`, which is why
-    ///   that column leads the index key ahead of the sort key (v20's rule).
+    ///   that column leads the index key ahead of the sort key (v21's rule).
     ///
-    /// If any of these change, the v27 indexes silently stop being reachable
+    /// If any of these change, the v28 indexes silently stop being reachable
     /// and composite search falls back to a full sort. Reachability is not
     /// something a `#[test]` can observe, so it is pinned here instead.
     fn composite_param(name: &str, value: &str) -> SearchParameter {
@@ -2420,7 +2420,7 @@ mod tests {
     #[test]
     fn composite_system_qualified_code_keeps_the_system_in_the_predicate() {
         // The other 6 values, and the second `pg_stat_statements` entry (7,767
-        // calls). `value_token_system` is payload on the v27 index so this
+        // calls). `value_token_system` is payload on the v28 index so this
         // stays index-only rather than fetching the heap per candidate.
         let query = SearchQuery::new("Observation").with_parameter(composite_param(
             "combo-code-value-quantity",
@@ -2805,7 +2805,7 @@ mod tests {
     #[test]
     fn string_search_is_sargable_and_escapes_wildcards() {
         // `ILIKE` can never use a btree, and the raw `COALESCE(folded, value_string)`
-        // could not be matched by any index. v33 goes further than `LIKE`: the
+        // could not be matched by any index. v34 goes further than `LIKE`: the
         // starts-with form is emitted as an explicit bytewise range, because a
         // `LIKE` whose pattern is a bind parameter cannot be turned into an
         // index range by the planner at all (`match_pattern_prefix` needs a
@@ -3025,9 +3025,9 @@ mod tests {
         // `idx_search_string_folded_pattern` is partial, and Postgres only uses
         // a partial index when the query implies its predicate.
         //
-        // v24 got there with an explicit `value_string IS NOT NULL` conjunct,
+        // v25 got there with an explicit `value_string IS NOT NULL` conjunct,
         // because `COALESCE(a, b) LIKE …` does not imply it (COALESCE is not
-        // strict). v33 rewords the index predicate onto the COALESCE itself and
+        // strict). v34 rewords the index predicate onto the COALESCE itself and
         // lets the strict operator do the proving — which also takes the
         // conjunct, and the 200x row-estimate error it caused, out of the
         // starts-with plan. See `migrate_v32_to_v33`.
@@ -3122,7 +3122,7 @@ mod tests {
         }
     }
 
-    /// v27 dropped `idx_search_string_folded`, the btree on the bare
+    /// v28 dropped `idx_search_string_folded`, the btree on the bare
     /// `value_string_folded` column, because no emitted predicate can seek it:
     /// the column is only ever read through `COALESCE(value_string_folded,
     /// lower(value_string))`, which an index on the bare column cannot match,
@@ -3160,7 +3160,7 @@ mod tests {
         );
     }
 
-    /// v27 dropped `idx_search_token_display` and `idx_search_reference_display`.
+    /// v28 dropped `idx_search_token_display` and `idx_search_reference_display`.
     /// Both were btrees in the default operator class, and `ILIKE` is not
     /// sargable against one at any prefix — so they were only ever scanners of
     /// their `(tenant_id, resource_type, param_name)` slice, which
@@ -3221,7 +3221,7 @@ mod tests {
         }
     }
 
-    /// v27 dropped `idx_search_reference` and kept its `text_pattern_ops` twin
+    /// v28 dropped `idx_search_reference` and kept its `text_pattern_ops` twin
     /// `idx_search_reference_pattern`, which has the same key columns and the
     /// same partial predicate. That family carries `=` but NOT the ordering
     /// operators, so the drop holds only while every predicate on
@@ -3255,7 +3255,7 @@ mod tests {
                 assert!(
                     !frag.sql.contains(op),
                     "an ordering comparison on value_reference cannot use the \
-                     text_pattern_ops index that survives v27 (`{op}`): {}",
+                     text_pattern_ops index that survives v28 (`{op}`): {}",
                     frag.sql
                 );
             }
@@ -3264,7 +3264,7 @@ mod tests {
 
     #[test]
     fn system_qualified_token_is_one_extractable_equality_conjunction() {
-        // `Encounter?class=http://…v3-ActCode|AMB`. This is the shape v24's
+        // `Encounter?class=http://…v3-ActCode|AMB`. This is the shape v25's
         // `idx_search_token` is keyed for: every column ahead of the sort key is
         // bound by equality, so the index can return the fast path's rows already
         // ordered. If this ever became a range, an OR, or a second sublink, that
@@ -3322,10 +3322,10 @@ mod tests {
         assert!(!pred.contains("value_token_system"));
     }
 
-    /// v30 replaced `idx_search_token` (2,283 MB, system-first, and unable to
+    /// v31 replaced `idx_search_token` (2,283 MB, system-first, and unable to
     /// give this shape the sort key because `value_token_code` sat between the
     /// system and `last_updated`) with a seek-only `idx_search_token_system`;
-    /// v31 dropped that too, because `system|code` is strict in
+    /// v32 dropped that too, because `system|code` is strict in
     /// `value_token_system` as well and the planner pointed it there —
     /// 80,089,347 tuples read for a 358 ms p99.
     ///
@@ -3419,7 +3419,7 @@ mod tests {
             "reference OR-list must be one sublink: {}",
             frag.sql
         );
-        // One param per type-prefixed value since v32: the base. The stored
+        // One param per type-prefixed value since v33: the base. The stored
         // value is the base too, so there is no second form to match.
         assert_eq!(frag.params.len(), 2);
         assert!(
@@ -3499,7 +3499,7 @@ mod tests {
         );
     }
 
-    /// v32's read-side claim, pinned. The `Type/id` form — every reference
+    /// v33's read-side claim, pinned. The `Type/id` form — every reference
     /// search the benchmark sends, and 18% of the search suite's Postgres time —
     /// must emit ONE equality. A disjunction here forces a `BitmapOr` and a
     /// `Bitmap Heap Scan` whose `Filter` re-evaluates the whole predicate on

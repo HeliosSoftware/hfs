@@ -6,14 +6,20 @@ import type { APIRequestContext } from "@playwright/test";
 
 const FHIR_JSON = "application/fhir+json";
 
-/** POST a resource; returns the server-assigned id. */
+/** POST a resource; returns the server-assigned id. `tenant` scopes the write
+ * via `X-Tenant-ID` (#553 — the default-tenant routes need no header). */
 export async function createResource(
   request: APIRequestContext,
   type: string,
   body: Record<string, unknown>,
+  tenant?: string,
 ): Promise<string> {
   const res = await request.post(`/${type}`, {
-    headers: { "Content-Type": FHIR_JSON, Accept: FHIR_JSON },
+    headers: {
+      "Content-Type": FHIR_JSON,
+      Accept: FHIR_JSON,
+      ...(tenant ? { "X-Tenant-ID": tenant } : {}),
+    },
     data: { resourceType: type, ...body },
   });
   if (!res.ok()) throw new Error(`create ${type} -> ${res.status()}: ${await res.text()}`);
@@ -73,12 +79,13 @@ export async function waitSearchable(
   request: APIRequestContext,
   type: string,
   id: string,
+  tenant?: string,
   timeoutMs = 15_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const res = await request.get(`/${type}?_id=${id}&_summary=count`, {
-      headers: { Accept: FHIR_JSON },
+      headers: { Accept: FHIR_JSON, ...(tenant ? { "X-Tenant-ID": tenant } : {}) },
     });
     if (res.ok() && (((await res.json()).total as number) ?? 0) >= 1) return;
     if (Date.now() > deadline) {

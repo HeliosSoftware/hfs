@@ -180,13 +180,21 @@
 //! - `R5`: FHIR 5.0.0 support
 //! - `R6`: FHIR 6.0.0 support
 
+pub mod app;
 pub mod canonical;
 pub mod compartment;
 pub mod constants;
 pub mod data_source;
+mod error;
 pub mod fhir_format;
+mod handlers;
+/// Structural + FHIRPath-syntax linting for ViewDefinition documents (#753
+/// evaluation POC, ticket 03) - see [`lint::lint_view_definition`].
+pub mod lint;
+mod models;
 pub mod params;
 pub mod parquet_schema;
+mod parquet_zip;
 pub mod reference_collector;
 pub mod remote_fetch;
 pub mod remote_resolver;
@@ -545,6 +553,13 @@ pub enum SofError {
     #[error("CSV writer error: {0}")]
     CsvWriterError(String),
 
+    /// Arrow conversion or IPC serialization error.
+    ///
+    /// This error occurs when building Arrow record batches or writing the
+    /// Arrow IPC stream fails.
+    #[error("Arrow conversion error: {0}")]
+    ArrowConversionError(String),
+
     /// Invalid source parameter value.
     ///
     /// This error occurs when the source parameter contains an invalid URL or path.
@@ -638,6 +653,9 @@ pub enum ContentType {
     NdJson,
     /// Apache Parquet columnar format (not yet implemented)
     Parquet,
+    /// Apache Arrow IPC stream format — the same record batches the Parquet
+    /// path builds, encoded for zero-parse consumption of live query results
+    ArrowIpc,
 }
 
 impl ContentType {
@@ -711,6 +729,7 @@ impl ContentType {
             "json" => Ok(ContentType::Json),
             "ndjson" => Ok(ContentType::NdJson),
             "parquet" => Ok(ContentType::Parquet),
+            "arrow" => Ok(ContentType::ArrowIpc),
             // Full MIME types (for Accept header compatibility)
             "text/csv;header=false" => Ok(ContentType::Csv),
             "text/csv" | "text/csv;header=true" => Ok(ContentType::CsvWithHeader),
@@ -725,6 +744,7 @@ impl ContentType {
             "application/vnd.apache.parquet"
             | "application/octet-stream"
             | "application/parquet" => Ok(ContentType::Parquet),
+            "application/vnd.apache.arrow.stream" => Ok(ContentType::ArrowIpc),
             _ => Err(SofError::UnsupportedContentType(s.to_string())),
         }
     }
@@ -738,6 +758,7 @@ impl ContentType {
             ContentType::Json => "application/json",
             ContentType::NdJson => "application/x-ndjson",
             ContentType::Parquet => "application/vnd.apache.parquet",
+            ContentType::ArrowIpc => "application/vnd.apache.arrow.stream",
         }
     }
 }
@@ -2084,12 +2105,7 @@ pub fn process_ndjson_chunked<R: BufRead, W: Write>(
     config: ChunkConfig,
 ) -> Result<ProcessingStats, SofError> {
     // Validate content type supports streaming
-    if content_type == ContentType::Parquet {
-        return Err(SofError::UnsupportedContentType(
-            "Parquet output is not supported for streaming. Use batch processing instead."
-                .to_string(),
-        ));
-    }
+    reject_columnar_for_streaming(content_type)?;
 
     let mut iterator = NdjsonChunkIterator::new(view_definition, input, config)?;
     let columns = iterator.columns().to_vec();
@@ -2175,11 +2191,28 @@ fn write_chunk_output<W: Write>(
                 output.write_all(json.as_bytes())?;
             }
         }
-        ContentType::Parquet => unreachable!(), // Caller rejects Parquet for streaming
+        // Caller rejects columnar formats via reject_columnar_for_streaming
+        ContentType::Parquet | ContentType::ArrowIpc => unreachable!(),
     }
 
     *is_first_chunk = false;
     Ok(())
+}
+
+/// The columnar formats need the full result (or a stateful writer holding the
+/// schema) and are not supported by the chunk-at-a-time NDJSON drivers.
+fn reject_columnar_for_streaming(content_type: ContentType) -> Result<(), SofError> {
+    match content_type {
+        ContentType::Parquet => Err(SofError::UnsupportedContentType(
+            "Parquet output is not supported for streaming. Use batch processing instead."
+                .to_string(),
+        )),
+        ContentType::ArrowIpc => Err(SofError::UnsupportedContentType(
+            "Arrow IPC output is not supported for streaming. Use batch processing instead."
+                .to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Streaming NDJSON processing with remote `resolve()` enabled.
@@ -2201,12 +2234,7 @@ pub async fn process_ndjson_chunked_remote<R: BufRead, W: Write>(
     config: ChunkConfig,
     remote_config: &RemoteResolveConfig,
 ) -> Result<ProcessingStats, SofError> {
-    if content_type == ContentType::Parquet {
-        return Err(SofError::UnsupportedContentType(
-            "Parquet output is not supported for streaming. Use batch processing instead."
-                .to_string(),
-        ));
-    }
+    reject_columnar_for_streaming(content_type)?;
 
     let version = view_definition.version();
     let prepared = PreparedViewDefinition::new(view_definition)?;
@@ -3969,6 +3997,7 @@ pub fn format_output(
         ContentType::Json => format_json(result),
         ContentType::NdJson => format_ndjson(result),
         ContentType::Parquet => format_parquet(result, parquet_options),
+        ContentType::ArrowIpc => format_arrow_ipc(result),
     }
 }
 
@@ -4084,6 +4113,135 @@ pub fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     Ok(output)
 }
 
+/// Rows-per-batch for the columnar writers, estimated from sampled row sizes
+/// and clamped to keep memory bounded. Shared by Parquet and Arrow IPC so the
+/// two outputs batch identically.
+fn estimate_rows_per_batch(rows: &[ProcessedRow], target_batch_size_bytes: usize) -> usize {
+    const TARGET_ROWS_PER_BATCH: usize = 100_000; // Default batch size
+    const MAX_ROWS_PER_BATCH: usize = 500_000; // Maximum to prevent memory issues
+
+    // Estimate average row size from first 100 rows
+    let sample_size = std::cmp::min(100, rows.len());
+    let mut estimated_row_size = 100; // Default estimate in bytes
+
+    if sample_size > 0 {
+        let sample_json_size: usize = rows[..sample_size]
+            .iter()
+            .map(|row| {
+                row.values
+                    .iter()
+                    .filter_map(|v| v.as_ref())
+                    .map(|v| v.to_string().len())
+                    .sum::<usize>()
+            })
+            .sum();
+        estimated_row_size = (sample_json_size / sample_size).max(50);
+    }
+
+    (target_batch_size_bytes / estimated_row_size).clamp(TARGET_ROWS_PER_BATCH, MAX_ROWS_PER_BATCH)
+}
+
+/// Streams `result`'s rows to `write` as Arrow [`RecordBatch`]es of at most
+/// `batch_size` rows. The shared batch builder behind every columnar output
+/// (Parquet, Arrow IPC) and [`run_view_definition_record_batches`].
+fn for_each_record_batch<F>(
+    schema_ref: &std::sync::Arc<arrow::datatypes::Schema>,
+    result: &ProcessedResult,
+    batch_size: usize,
+    mut write: F,
+) -> Result<(), SofError>
+where
+    F: FnMut(arrow::record_batch::RecordBatch) -> Result<(), SofError>,
+{
+    use arrow::record_batch::RecordBatch;
+
+    let mut row_offset = 0;
+    while row_offset < result.rows.len() {
+        let batch_end = (row_offset + batch_size).min(result.rows.len());
+        let batch_rows = &result.rows[row_offset..batch_end];
+
+        let batch_arrays =
+            parquet_schema::process_to_arrow_arrays(schema_ref, &result.columns, batch_rows)?;
+
+        let batch = RecordBatch::try_new(schema_ref.clone(), batch_arrays).map_err(|e| {
+            SofError::ArrowConversionError(format!(
+                "Failed to create RecordBatch for rows {}-{}: {}",
+                row_offset, batch_end, e
+            ))
+        })?;
+
+        write(batch)?;
+        row_offset = batch_end;
+    }
+    Ok(())
+}
+
+/// Runs a ViewDefinition and returns the result as Arrow record batches with
+/// their schema — the engine-side seam for columnar consumers (Parquet, Arrow
+/// IPC, and external bindings such as pysof).
+///
+/// Schema inference and type mapping are identical to the Parquet output, so
+/// every columnar representation of the same result agrees.
+pub fn run_view_definition_record_batches(
+    view_definition: SofViewDefinition,
+    bundle: SofBundle,
+) -> Result<
+    (
+        std::sync::Arc<arrow::datatypes::Schema>,
+        Vec<arrow::record_batch::RecordBatch>,
+    ),
+    SofError,
+> {
+    let result = process_view_definition(view_definition, bundle)?;
+    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
+    let schema_ref = std::sync::Arc::new(schema);
+    let batch_size = estimate_rows_per_batch(
+        &result.rows,
+        (ParquetOptions::default().row_group_size_mb as usize) * 1024 * 1024,
+    );
+    let mut batches = Vec::new();
+    for_each_record_batch(&schema_ref, &result, batch_size, |batch| {
+        batches.push(batch);
+        Ok(())
+    })?;
+    Ok((schema_ref, batches))
+}
+
+/// Encodes a [`ProcessedResult`] as an Arrow IPC stream
+/// (`application/vnd.apache.arrow.stream`).
+///
+/// Schema inference and type mapping match [`format_parquet`] exactly, so the
+/// columnar outputs always agree. Batches are written incrementally and the
+/// stream carries its schema in-band, so consumers (DuckDB, pyarrow, polars,
+/// pandas) ingest live query results without any client-side parsing.
+pub fn format_arrow_ipc(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
+    use arrow::ipc::writer::StreamWriter;
+
+    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
+    let schema_ref = std::sync::Arc::new(schema);
+    let batch_size = estimate_rows_per_batch(
+        &result.rows,
+        (ParquetOptions::default().row_group_size_mb as usize) * 1024 * 1024,
+    );
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, schema_ref.as_ref()).map_err(|e| {
+            SofError::ArrowConversionError(format!("Failed to create Arrow IPC writer: {}", e))
+        })?;
+        for_each_record_batch(&schema_ref, &result, batch_size, |batch| {
+            writer.write(&batch).map_err(|e| {
+                SofError::ArrowConversionError(format!("Failed to write Arrow IPC batch: {}", e))
+            })
+        })?;
+        writer.finish().map_err(|e| {
+            SofError::ArrowConversionError(format!("Failed to finish Arrow IPC stream: {}", e))
+        })?;
+    }
+
+    Ok(buffer)
+}
+
 /// Encodes a [`ProcessedResult`] as a single Parquet file in memory.
 ///
 /// Schema is inferred from `result.columns` and the row values; type mapping
@@ -4095,7 +4253,6 @@ pub fn format_parquet(
     result: ProcessedResult,
     options: Option<&ParquetOptions>,
 ) -> Result<Vec<u8>, SofError> {
-    use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
@@ -4111,30 +4268,7 @@ pub fn format_parquet(
     // Calculate optimal batch size based on row count and estimated row size
     let target_row_group_size_bytes = (parquet_opts.row_group_size_mb as usize) * 1024 * 1024;
     let target_page_size_bytes = (parquet_opts.page_size_kb as usize) * 1024;
-    const TARGET_ROWS_PER_BATCH: usize = 100_000; // Default batch size
-    const MAX_ROWS_PER_BATCH: usize = 500_000; // Maximum to prevent memory issues
-
-    // Estimate average row size from first 100 rows
-    let sample_size = std::cmp::min(100, result.rows.len());
-    let mut estimated_row_size = 100; // Default estimate in bytes
-
-    if sample_size > 0 {
-        let sample_json_size: usize = result.rows[..sample_size]
-            .iter()
-            .map(|row| {
-                row.values
-                    .iter()
-                    .filter_map(|v| v.as_ref())
-                    .map(|v| v.to_string().len())
-                    .sum::<usize>()
-            })
-            .sum();
-        estimated_row_size = (sample_json_size / sample_size).max(50);
-    }
-
-    // Calculate optimal batch size
-    let optimal_batch_size = (target_row_group_size_bytes / estimated_row_size)
-        .clamp(TARGET_ROWS_PER_BATCH, MAX_ROWS_PER_BATCH);
+    let optimal_batch_size = estimate_rows_per_batch(&result.rows, target_row_group_size_bytes);
 
     // Parse compression algorithm
     use parquet::basic::BrotliLevel;
@@ -4168,33 +4302,11 @@ pub fn format_parquet(
         })?;
 
     // Process data in batches to handle large datasets efficiently
-    let mut row_offset = 0;
-    while row_offset < result.rows.len() {
-        let batch_end = (row_offset + optimal_batch_size).min(result.rows.len());
-        let batch_rows = &result.rows[row_offset..batch_end];
-
-        // Convert batch to Arrow arrays
-        let batch_arrays =
-            parquet_schema::process_to_arrow_arrays(&schema, &result.columns, batch_rows)?;
-
-        // Create RecordBatch for this chunk
-        let batch = RecordBatch::try_new(schema_ref.clone(), batch_arrays).map_err(|e| {
-            SofError::ParquetConversionError(format!(
-                "Failed to create RecordBatch for rows {}-{}: {}",
-                row_offset, batch_end, e
-            ))
-        })?;
-
-        // Write batch
+    for_each_record_batch(&schema_ref, &result, optimal_batch_size, |batch| {
         writer.write(&batch).map_err(|e| {
-            SofError::ParquetConversionError(format!(
-                "Failed to write RecordBatch for rows {}-{}: {}",
-                row_offset, batch_end, e
-            ))
-        })?;
-
-        row_offset = batch_end;
-    }
+            SofError::ParquetConversionError(format!("Failed to write RecordBatch: {}", e))
+        })
+    })?;
 
     writer.close().map_err(|e| {
         SofError::ParquetConversionError(format!("Failed to close Parquet writer: {}", e))

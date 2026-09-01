@@ -27,7 +27,7 @@ use askama::Template;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
 };
 use helios_persistence::core::ResourceStorage;
 use serde::Deserialize;
@@ -142,14 +142,31 @@ struct TenantsPage {
 struct TenantRowsPartial {
     i18n: I18n,
     rows: Vec<TenantRow>,
-    /// Set when a mutation failed; rendered as a banner above the table. The
-    /// fragment is always returned with `200` so htmx swaps it regardless, which
-    /// keeps the error visible without the response-targets extension.
+    /// Set when listing/mutating the rows themselves failed; rendered as a
+    /// banner above the table. The `create` handler no longer routes its own
+    /// submit errors (invalid id, duplicate, already-provisioning) through
+    /// this field — those render inside the Add Tenant dialog instead (#681
+    /// adenda; see [`TenantAddErrorPartial`]), since that fragment lands
+    /// behind the modal scrim and was unreadable there. This field still
+    /// carries `delete`'s own errors and any failure to reload the rows
+    /// themselves. The fragment is always returned with `200` so htmx swaps
+    /// it regardless, which keeps the error visible without the
+    /// response-targets extension.
     error: Option<String>,
     /// At least one row is still provisioning (#581): the fragment embeds a
     /// self-polling `hx-get` so the table keeps refreshing until every job
     /// settles, then the poller stops rendering on its own.
     polling: bool,
+}
+
+/// Out-of-band fragment for the Add Tenant dialog's own submit-error slot
+/// (`#tenant-add-error`, `tenants.html`) — see the template comment on
+/// `partials/tenant_add_error.html` for the mechanism and why it is OOB
+/// rather than folded into [`TenantRowsPartial`].
+#[derive(Template)]
+#[template(path = "partials/tenant_add_error.html")]
+struct TenantAddErrorPartial {
+    message: Option<String>,
 }
 
 /// Query string for the page and the rows fragment (`?q=` search term).
@@ -406,6 +423,45 @@ fn rows_response(i18n: I18n, rows: Vec<TenantRow>, error: Option<String>) -> Res
     })
 }
 
+/// `create`'s own response builder (#681 adenda): the ordinary rows fragment
+/// (`list_error` is a failure to reload the table itself, e.g. the registry
+/// going away mid-request — unrelated to this submission) plus the Add
+/// Tenant dialog's out-of-band error slot (`dialog_message` — the submission
+/// failure itself: invalid id, duplicate, already provisioning). Kept
+/// separate from [`rows_response`] because `delete` and the plain rows
+/// fragment endpoint have no dialog open to report into and must keep
+/// rendering their error as the page-level banner.
+fn create_response(
+    i18n: I18n,
+    rows: Vec<TenantRow>,
+    list_error: Option<String>,
+    dialog_message: Option<String>,
+) -> Response {
+    let polling = rows.iter().any(|r| r.provisioning);
+    let rendered = (|| -> askama::Result<String> {
+        let rows_html = TenantRowsPartial {
+            i18n,
+            rows,
+            error: list_error,
+            polling,
+        }
+        .render()?;
+        let error_html = TenantAddErrorPartial {
+            message: dialog_message,
+        }
+        .render()?;
+        Ok(format!("{rows_html}{error_html}"))
+    })();
+    match rendered {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render error: {error}"),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /ui/tenants` — claim the id and return immediately with the
 /// refreshed rows (with an inline error banner if the id was invalid or
 /// already taken/claimed). On the accepted path the response carries
@@ -427,11 +483,17 @@ pub async fn create(
     };
 
     let id = form.id.trim().to_string();
+    // `err` is this submission's own failure (invalid id, duplicate,
+    // already provisioning) and always renders inside the Add Tenant dialog
+    // (#681 adenda), never as the page-level rows banner — see
+    // `create_response`. A failure to reload the rows themselves while
+    // building this response is a separate, page-level concern and keeps
+    // using the ordinary banner.
     let load = |err: Option<String>| async {
         let jobs = state.provisioning.lock().unwrap().clone();
         match load_rows(storage, "", &jobs).await {
-            Ok(rows) => rows_response(i18n, rows, err),
-            Err(e) => rows_response(i18n, Vec::new(), err.or(Some(e))),
+            Ok(rows) => create_response(i18n, rows, None, err),
+            Err(e) => create_response(i18n, Vec::new(), Some(e), err),
         }
     };
 

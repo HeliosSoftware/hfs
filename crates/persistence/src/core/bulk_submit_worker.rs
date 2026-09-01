@@ -10,6 +10,7 @@
 //! [`BulkSubmitProvider`]: crate::core::bulk_submit::BulkSubmitProvider
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -44,8 +45,22 @@ pub struct ManifestLease {
     pub worker_id: WorkerId,
     /// When the lease expires if not renewed.
     pub lease_expiry: DateTime<Utc>,
+    /// The duration the lease was claimed for; each heartbeat renews by this
+    /// much, so short test leases stay short instead of jumping to a
+    /// constant.
+    pub lease_duration: Duration,
     /// Monotonically increasing token, bumped on every claim.
     pub fencing_token: u64,
+}
+
+impl ManifestLease {
+    /// The expiry a successful heartbeat renews to: now plus the duration the
+    /// lease was claimed with. Shared by every backend's `heartbeat`.
+    pub fn renewed_expiry(&self) -> DateTime<Utc> {
+        Utc::now()
+            + chrono::Duration::from_std(self.lease_duration)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60))
+    }
 }
 
 /// The worker's view of a claimed manifest: everything needed to fetch + ingest it.
@@ -358,9 +373,71 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     worker_id: WorkerId,
 }
 
+/// Renews a [`ManifestLease`] from a dedicated task for as long as it is alive.
+///
+/// The renewal must not share a future with the ingestion: a fast local stream
+/// keeps the ingest future Ready-heavy enough that a sibling `select!` timer arm
+/// is polled too rarely to ever fire, the lease silently expires mid-file, and
+/// the manifest is reclaimed and restarted from its first file — an unbounded
+/// loop, invisible in the counts because re-ingested entries upsert
+/// idempotently. A separately spawned task renews on schedule no matter how the
+/// ingest future behaves.
+///
+/// Dropping the keeper stops the renewal task.
+struct LeaseKeeper {
+    lost: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl LeaseKeeper {
+    fn spawn<Js>(jobs: Arc<Js>, lease: ManifestLease) -> Self
+    where
+        Js: BulkSubmitJobStore + ?Sized + 'static,
+    {
+        let lost = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&lost);
+        let handle = tokio::spawn(async move {
+            let mut expiry = lease.lease_expiry;
+            loop {
+                let remaining = (expiry - Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(1));
+                let wait = (remaining / 3).clamp(Duration::from_secs(1), Duration::from_secs(60));
+                tokio::time::sleep(wait).await;
+                match jobs.heartbeat(&lease).await {
+                    Ok(new_expiry) => expiry = new_expiry,
+                    Err(LeaseError::LeaseLost { .. }) => {
+                        flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(LeaseError::Storage(e)) => {
+                        tracing::debug!(
+                            submission = %lease.submission_id,
+                            manifest = %lease.manifest_id,
+                            error = %e,
+                            "bulk-submit lease heartbeat failed; retrying"
+                        );
+                    }
+                }
+            }
+        });
+        Self { lost, handle }
+    }
+
+    fn lease_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for LeaseKeeper {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl<Js, Fetcher, Os> DefaultSubmitWorker<Js, Fetcher, Os>
 where
-    Js: BulkSubmitJobStore + ?Sized,
+    Js: BulkSubmitJobStore + ?Sized + 'static,
     Fetcher: SubmitInputFetcher + ?Sized,
     Os: ExportOutputStore + ?Sized,
 {
@@ -434,10 +511,14 @@ where
         let opts = BulkProcessingOptions::new().with_import_mode(import_mode);
         let mut processed: u64 = 0;
         let mut failed: u64 = 0;
+        // The lease must stay heartbeated *through* a file, not only between
+        // files, and independently of how often the ingest future yields; the
+        // keeper renews from its own task until dropped.
+        let keeper = LeaseKeeper::spawn(Arc::clone(&self.jobs), lease.clone());
 
         // 2. Ingest each output file via the existing streaming engine.
         for file in &manifest.output {
-            if let Err(LeaseError::LeaseLost { .. }) = self.jobs.heartbeat(&lease).await {
+            if keeper.lease_lost() {
                 return Ok(());
             }
             let resource_type = file
@@ -471,7 +552,7 @@ where
             // Per-file options: the file url is part of every entry result's
             // identity, since line numbers restart in each file (#457).
             let file_opts = opts.clone().with_file_url(&file.url);
-            match self
+            let outcome = self
                 .jobs
                 .process_ndjson_stream(
                     &lease.tenant,
@@ -481,8 +562,8 @@ where
                     stream,
                     &file_opts,
                 )
-                .await
-            {
+                .await;
+            match outcome {
                 Ok(result) => {
                     processed += result.counts.success + result.counts.skipped;
                     failed += result.counts.error_count();
@@ -510,7 +591,7 @@ where
         // 2b. Process `deleted` files — transaction Bundles / resource refs to remove.
         let mut deleted_refs: Vec<String> = Vec::new();
         for file in &manifest.deleted {
-            if let Err(LeaseError::LeaseLost { .. }) = self.jobs.heartbeat(&lease).await {
+            if keeper.lease_lost() {
                 return Ok(());
             }
             match self
@@ -544,6 +625,9 @@ where
         }
 
         // 3. Emit per-type `output` receipts and an aggregated `error` artifact.
+        if keeper.lease_lost() {
+            return Ok(());
+        }
         self.write_result_artifacts(&lease, &manifest_url, view.fhir_version, failed)
             .await?;
 

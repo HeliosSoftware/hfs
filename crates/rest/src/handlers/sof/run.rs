@@ -36,7 +36,7 @@
 //! | `resource` | Resource | FHIR resources to transform instead of server data (ViewDefinition subjects only) |
 //! | `patient` | Reference | Restrict the data feeding the view to these patients' compartments |
 //! | `group` | Reference | Restrict to members of these Groups |
-//! | `_format` | code | Output format: `ndjson`, `csv`, `json`, `parquet`, `fhir` (optional; defaults to `ndjson`; may also come from `Accept`) |
+//! | `_format` | code | Output format: `ndjson`, `csv`, `json`, `parquet`, `arrow`, `fhir` (optional; defaults to `ndjson`; may also come from `Accept`) |
 //! | `_limit` | integer | Maximum number of output rows |
 //! | `_since` | instant | Only include resources modified after this time |
 //!
@@ -71,7 +71,9 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::sqlquery::{SqlQueryRunQuery, run_library_subject};
-use super::subject::{SubjectKind, SubjectRef, resolve_subject};
+use super::subject::{
+    RENAMED_VIEW_PARAM_MESSAGE, RENAMED_VIEW_PARAM_NAME, SubjectKind, SubjectRef, resolve_subject,
+};
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
@@ -83,7 +85,7 @@ use crate::state::AppState;
 /// merged in via [`merge_params`] and take precedence.
 #[derive(Debug, Default, Deserialize)]
 pub struct RunQueryParams {
-    /// Output format: `ndjson`, `csv`, `json`, `parquet`, `fhir`. Optional
+    /// Output format: `ndjson`, `csv`, `json`, `parquet`, `arrow`, `fhir`. Optional
     /// (`0..1`); defaults to `ndjson`. May also be supplied via the `Accept`
     /// header, with `_format` taking precedence.
     #[serde(rename = "_format")]
@@ -149,6 +151,23 @@ where
     S: SearchProvider + Send + Sync + 'static,
 {
     let body_value = body.map(|j| j.0);
+
+    // The extractors below are deliberately permissive and silently ignore
+    // any parameter name they don't recognise — that's the existing,
+    // intentional behavior for `$sql-run`'s unknown parameters, and this
+    // handler does not introduce general strict validation. `view` is the
+    // one exception: it is the pre-ballot spelling of `context`, so a
+    // request naming it gets the same didactic 400 that `$sql-export`
+    // gives, instead of silently falling through to a generic
+    // "requires a subject" error.
+    if let Some(b) = body_value.as_ref() {
+        if body_names_parameter(b, RENAMED_VIEW_PARAM_NAME) {
+            return Err(RestError::BadRequest {
+                message: RENAMED_VIEW_PARAM_MESSAGE.to_string(),
+            });
+        }
+    }
+
     let body_params = body_value
         .as_ref()
         .map(extract_run_params_from_json)
@@ -177,8 +196,9 @@ where
         .unwrap_or(false);
     if has_parameters && !subject.kind.accepts_parameters() {
         return Err(RestError::BadRequest {
-            message: "the 'parameters' parameter requires a SQLQuery or SQLView subject; \
-                      a ViewDefinition declares no parameters"
+            message: "the 'parameters' parameter requires a SQLQuery subject; a ViewDefinition \
+                      declares no parameters, and the SQLView profile constrains \
+                      Library.parameter to 0..0"
                 .to_string(),
         });
     }
@@ -357,7 +377,7 @@ where
         Some(
             parse_content_type(&format, include_header).ok_or_else(|| RestError::BadRequest {
                 message: format!(
-                    "unsupported _format value '{format}'; supported: ndjson, json, csv, parquet, fhir"
+                    "unsupported _format value '{format}'; supported: ndjson, json, csv, parquet, arrow, fhir"
                 ),
             })?,
         )
@@ -429,7 +449,7 @@ where
         return Ok(streaming_ndjson_response(stream, &runner_label));
     }
 
-    // Buffered paths (csv, json array, parquet) — collect the stream first.
+    // Buffered paths (csv, json array, parquet, arrow) — collect the stream first.
     let (ct, body) = format_stream(stream, content_type).await?;
     let (ct, body) = if wants_envelope {
         let wrapped = wrap_in_binary_envelope(ct, &body).map_err(map_sof_lib_error_to_rest)?;
@@ -573,6 +593,7 @@ fn content_type_headers(ct: ContentType) -> (&'static str, &'static str) {
         ContentType::Json => ("application/json", "json"),
         ContentType::NdJson => ("application/x-ndjson", "ndjson"),
         ContentType::Parquet => ("application/vnd.apache.parquet", "parquet"),
+        ContentType::ArrowIpc => ("application/vnd.apache.arrow.stream", "arrow"),
     }
 }
 
@@ -604,6 +625,7 @@ fn validate_limit(limit: Option<usize>) -> Result<(), RestError> {
 /// Accept-header values map: `application/json` → `json`,
 /// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
 /// `application/octet-stream`/`application/parquet` → `parquet`,
+/// `application/vnd.apache.arrow.stream` → `arrow`,
 /// `application/fhir+json` → `fhir`. Unknown or wildcard Accept values fall
 /// through to the `ndjson` default.
 fn resolve_format(format_param: Option<&str>, headers: &HeaderMap) -> String {
@@ -625,6 +647,7 @@ fn resolve_format(format_param: Option<&str>, headers: &HeaderMap) -> String {
                 "application/octet-stream"
                 | "application/parquet"
                 | "application/vnd.apache.parquet" => Some("parquet"),
+                "application/vnd.apache.arrow.stream" => Some("arrow"),
                 "application/fhir+json" => Some("fhir"),
                 _ => None,
             });
@@ -650,6 +673,7 @@ fn parse_content_type(format: &str, include_header: bool) -> Option<ContentType>
         | "application/parquet"
         | "application/octet-stream"
         | "application/vnd.apache.parquet" => Some(ContentType::Parquet),
+        "arrow" | "application/vnd.apache.arrow.stream" => Some(ContentType::ArrowIpc),
         _ => None,
     }
 }
@@ -746,7 +770,7 @@ fn streaming_ndjson_response(
 
 /// Renders a `RowStream` to `(content_type_header, bytes)` for the requested
 /// format. NDJSON has its own dedicated streaming path
-/// ([`streaming_ndjson_response`]); buffered formats (csv, json, parquet) drain
+/// ([`streaming_ndjson_response`]); buffered formats (csv, json, parquet, arrow) drain
 /// here and pass through `helios_sof::format_output` so REST output matches
 /// `sof-server` / `pysof` byte-for-byte. Takes the already-validated
 /// `ContentType` so there's no re-parse-with-`expect` here (audit item #15).

@@ -132,7 +132,7 @@ fn fast_index_pred(
 /// value-first reads only the matches but must sort them all to answer
 /// `ORDER BY last_updated` (500k rows for a broad range), recent-first is
 /// already ordered but must walk the slice until the `LIMIT` fills. Both
-/// indexes exist (v18/v19) precisely so the planner can choose per query, and
+/// indexes exist (v19/v20) precisely so the planner can choose per query, and
 /// that remains right — the estimate is what is wrong, not the index set.
 ///
 /// So this adds an **uncorrelated `EXISTS` over the same predicate**. Postgres
@@ -168,7 +168,7 @@ fn fast_index_pred(
 /// wildly different date ranges under one column, but it is not present here
 /// and a guard is not free.
 ///
-/// Not equality forms (token, reference, uri, `_id`): v20/v26 put the value
+/// Not equality forms (token, reference, uri, `_id`): v21/v27 put the value
 /// ahead of the sort key in those indexes, so the scan seeks straight to the
 /// value and the `LIMIT` stops after 21 whatever the selectivity. Selectivity
 /// stops mattering, and there is nothing to guard.
@@ -250,7 +250,7 @@ impl SearchProvider for PostgresBackend {
         } else {
             None
         };
-        // v17 fast path: resolve the page from `search_index` alone.
+        // v18 fast path: resolve the page from `search_index` alone.
         //
         // The sort key lives on every index row (see `migrate_v16_to_v17`), so a
         // single-parameter search can take its top-n before touching `resources`
@@ -1508,7 +1508,7 @@ mod fast_path_tests {
         );
     }
 
-    /// The string fast path is the statement v33 rewrote — 30% of the search
+    /// The string fast path is the statement v34 rewrote — 30% of the search
     /// suite's Postgres time in run 33128380492 — so pin that its two-parameter
     /// range form still matches `INDEX_MEMBERSHIP_PREFIX` exactly. If it stopped
     /// matching, the page would silently fall back to the join-everything path

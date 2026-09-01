@@ -178,7 +178,7 @@ pub enum PostgresSslMode {
 ///
 /// `Auto` is PostgreSQL's own default and is the larger win — it is what makes
 /// the safe shapes 1.7x rather than 1.2x — but it is not safe to switch on until
-/// the reference predicate is rewritten as an explicit range, the way schema v33
+/// the reference predicate is rewritten as an explicit range, the way schema v34
 /// rewrote the string predicate. The knob exists so that can be A/B'd on the
 /// benchmark host without a code change, not because operators should tune it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]

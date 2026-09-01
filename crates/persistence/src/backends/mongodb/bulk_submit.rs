@@ -198,6 +198,7 @@ fn decode_manifest(doc: &Document) -> StorageResult<SubmissionManifest> {
         replaces_manifest_url: opt_str(doc, "replaces_manifest_url"),
         status,
         added_at: opt_time(doc, "added_at").unwrap_or_else(Utc::now),
+        lease_expiry: opt_time(doc, "lease_expiry"),
         total_entries: doc.get_i64("total_entries").unwrap_or(0).max(0) as u64,
         processed_entries: doc.get_i64("processed_entries").unwrap_or(0).max(0) as u64,
         failed_entries: doc.get_i64("failed_entries").unwrap_or(0).max(0) as u64,
@@ -767,6 +768,7 @@ impl BulkSubmitProvider for MongoBackend {
             total_entries: 0,
             processed_entries: 0,
             failed_entries: 0,
+            lease_expiry: None,
         };
 
         let mut document = manifest_filter(tenant, submission_id, &manifest.manifest_id);
@@ -1253,6 +1255,7 @@ impl SubmitClaimStrategy for MongoBackend {
                 manifest_id: manifest_id.to_string(),
                 worker_id: worker_id.clone(),
                 lease_expiry,
+                lease_duration,
                 fencing_token: claimed.get_i64("fencing_token").unwrap_or(token + 1).max(0) as u64,
             }));
         }
@@ -1261,7 +1264,7 @@ impl SubmitClaimStrategy for MongoBackend {
     }
 
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
-        let new_expiry = now_at_bson_precision() + chrono::Duration::seconds(60);
+        let new_expiry = from_bson_time(&to_bson_time(lease.renewed_expiry()));
         self.fenced_update(
             lease,
             doc! { "$set": { "lease_expiry": to_bson_time(new_expiry) } },

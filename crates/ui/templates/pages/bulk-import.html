@@ -1,4 +1,5 @@
 {% extends "layouts/base.html" %}
+{% import "partials/dialog.html" as dialog %}
 
 {% block title %}{{ i18n.t("bulk-import-title") }} — {{ i18n.t("app-title") }}{% endblock %}
 
@@ -6,86 +7,39 @@
 
 {% block content %}
 <header class="page-head page-head--row">
-  <h1 class="page-head__title">{{ i18n.t("bulk-import-title") }}</h1>
+  <div>
+    <h1 class="page-head__title">{{ i18n.t("bulk-import-title") }}</h1>
+    <p class="page-head__lede">{{ i18n.t("bulk-import-lede") }}</p>
+  </div>
 
   {% if available %}
-  <details class="addbox addbox--modal">
-    <summary class="btn btn--primary">
-      {% include "icons/plus.svg" %}
-      {{ i18n.t("bulk-import-new") }}
-    </summary>
-    <div class="addbox__panel">
-      <div class="addbox__head">
-        <div class="addbox__title">{{ i18n.t("bulk-import-create-title") }}</div>
-        <button type="button" class="addbox__x" data-addbox-close
-                aria-label="{{ i18n.t("ui-close") }}">×</button>
-      </div>
+  {% call dialog::modal(i18n.t("bulk-import-new"), "bulk-import-create-dialog-title", i18n.t("bulk-import-create-title")) %}
       <form method="post" action="/ui/bulk-import">
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-name") }}</span>
-          <input class="field__input" type="text" name="name" required autocomplete="off">
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-recipient") }}</span>
-          <input class="field__input" type="url" name="recipient_base_url" required
-                 autocomplete="off" placeholder="http://localhost:8080">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-recipient-hint") }}</span>
-        </label>
+        {% call dialog::field(i18n.t("bulk-import-field-name"), "name", "text", required=true, initial_focus=true) %}{% endcall %}
+        {% call dialog::field(i18n.t("bulk-import-field-manifest-url"), "manifest_url", "url", required=true, hint=i18n.t("bulk-import-field-manifest-url-hint")) %}{% endcall %}
 
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-submitter-system") }}</span>
-          <input class="field__input" type="text" name="submitter_system" autocomplete="off"
-                 placeholder="urn:helios:hfs:bulk-submit">
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-submitter-value") }}</span>
-          <input class="field__input" type="text" name="submitter_value" autocomplete="off">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-submitter-hint") }}</span>
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-submission-id") }}</span>
-          <input class="field__input" type="text" name="submission_id" autocomplete="off">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-submission-id-hint") }}</span>
-        </label>
+        {% let auth_value = "none" %}
+        {% let client_id_value = "" %}
+        {% let token_url_value = "" %}
+        {% let test_auth_result_id = "test-auth-result" %}
+        {% include "partials/bulk_import_auth_fieldset.html" %}
 
-        <fieldset class="field">
-          <legend class="field__label">{{ i18n.t("bulk-import-auth") }}</legend>
-          <span class="field__hint">{{ i18n.t("bulk-import-auth-hint") }}</span>
-          <label class="field">
-            <input type="radio" name="auth" value="none" checked>
-            {{ i18n.t("bulk-import-auth-none") }}
-            <span class="field__hint">{{ i18n.t("bulk-import-auth-none-hint") }}</span>
-          </label>
-          <label class="field">
-            <input type="radio" name="auth" value="backend-services">
-            {{ i18n.t("bulk-import-auth-backend") }}
-            <span class="field__hint">{{ i18n.t("bulk-import-auth-backend-hint") }}</span>
-          </label>
-          <label class="field">
-            <span class="field__label">{{ i18n.t("bulk-import-field-client-id") }}</span>
-            <input class="field__input" type="text" name="client_id" autocomplete="off">
-            <span class="field__hint">{{ i18n.t("bulk-import-field-client-id-hint") }}</span>
-          </label>
-          <label class="field">
-            <span class="field__label">{{ i18n.t("bulk-import-field-token-url") }}</span>
-            <input class="field__input" type="url" name="token_url" autocomplete="off">
-            <span class="field__hint">{{ i18n.t("bulk-import-field-token-url-hint") }}</span>
-          </label>
-          <p class="field__hint">
-            {{ i18n.t("bulk-import-jwks-hint") }}
-            <a href="/.well-known/bulk-submit-jwks.json" target="_blank" rel="noopener">
-              /.well-known/bulk-submit-jwks.json
-            </a>
-          </p>
-          <button type="submit" class="btn"
-                  formaction="/ui/bulk-import/test-auth"
-                  hx-post="/ui/bulk-import/test-auth"
-                  hx-target="#test-auth-result"
-                  hx-swap="innerHTML">
-            {{ i18n.t("bulk-import-test-auth") }}
-          </button>
-          <div id="test-auth-result" role="status"></div>
-        </fieldset>
+        <details class="disclosure">
+          <summary class="disclosure__summary">
+            <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
+            {{ i18n.t("bulk-import-advanced") }}
+          </summary>
+          <div class="disclosure__body">
+            {% call dialog::field(i18n.t("bulk-import-field-submitter-system"), "submitter_system", "text", placeholder="urn:helios:hfs:bulk-submit") %}{% endcall %}
+            {% call dialog::field(i18n.t("bulk-import-field-submitter-value"), "submitter_value", "text", hint=i18n.t("bulk-import-field-submitter-hint")) %}{% endcall %}
+            {% call dialog::field(i18n.t("bulk-import-field-output-format"), "output_format", "text", placeholder="application/fhir+ndjson", hint=i18n.t("bulk-import-field-output-format-hint")) %}{% endcall %}
+            <label class="field">
+              <span class="field__label">{{ i18n.t("bulk-import-field-headers") }}</span>
+              <textarea class="field__input" name="file_request_headers" rows="2" placeholder="Authorization: Bearer …"></textarea>
+              <span class="field__hint">{{ i18n.t("bulk-import-field-headers-hint") }}</span>
+            </label>
+          </div>
+        </details>
 
         <div class="addbox__actions">
           <button type="button" class="btn" data-addbox-close>{{ i18n.t("ui-cancel") }}</button>
@@ -94,8 +48,7 @@
           </button>
         </div>
       </form>
-    </div>
-  </details>
+  {% endcall %}
   {% endif %}
 </header>
 
@@ -122,7 +75,6 @@
         <th>{{ i18n.t("bulk-import-col-name") }}</th>
         <th>{{ i18n.t("bulk-import-col-status") }}</th>
         <th>{{ i18n.t("bulk-import-col-created") }}</th>
-        <th>{{ i18n.t("bulk-import-col-manifests") }}</th>
         <th>{{ i18n.t("bulk-import-col-destination") }}</th>
       </tr>
     </thead>
@@ -132,12 +84,11 @@
         <td><a href="/ui/bulk-import/{{ row.id }}">{{ row.name }}</a></td>
         <td>{{ row.status_label }}</td>
         <td>{{ row.created_date }}</td>
-        <td>{{ row.manifest_count }}</td>
         <td>{{ row.destination }}</td>
       </tr>
       {% endfor %}
       {% if rows.is_empty() %}
-      <tr class="data-table__empty"><td colspan="5">{{ i18n.t("bulk-import-empty") }}</td></tr>
+      <tr class="data-table__empty"><td colspan="4">{{ i18n.t("bulk-import-empty") }}</td></tr>
       {% endif %}
     </tbody>
   </table>

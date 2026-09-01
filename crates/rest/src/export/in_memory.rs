@@ -7,10 +7,12 @@
 //! one snapshot of the data and written into one manifest:
 //! - **Views** — each named ViewDefinition is run through the `SofRunner` and
 //!   its rows are sharded into output files.
-//! - **SQL queries** — each named SQLQuery/SQLView Library's table sources are
-//!   materialized into an in-memory SQLite engine via the `SofRunner`, the
-//!   (pre-validated) SQL is executed, and the result rows are sharded into
-//!   output files.
+//! - **SQL queries** — each named SQLQuery/SQLView Library's fully-resolved
+//!   dependency graph ([`crate::handlers::sof::graph`]'s two-phase resolver)
+//!   is materialized into an in-memory SQLite engine — leaf ViewDefinitions
+//!   via the `SofRunner`, interior SQLView nodes by running their own
+//!   (already-validated) SQL — then the subject's own SQL is executed and
+//!   the result rows are sharded into output files.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +21,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
 use helios_persistence::core::sof_runner::SofRunner;
-use helios_sof::sqlquery::{InMemorySqlEngine, QueryResult, TableSchema};
+use helios_sof::sqlquery::{InMemorySqlEngine, QueryResult};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -325,11 +327,17 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         self.sink.read_shard(job_id, filename)
     }
 
-    fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String> {
+    fn download_url(
+        &self,
+        tenant_id: &str,
+        public_base_url: &str,
+        job_id: &str,
+        filename: &str,
+    ) -> Option<String> {
         if !self.tenant_matches(tenant_id, job_id) {
             return None;
         }
-        match self.sink.download_url(job_id, filename) {
+        match self.sink.download_url(public_base_url, job_id, filename) {
             Ok(url) => Some(url),
             Err(e) => {
                 warn!(%job_id, %filename, error = %e, "failed to resolve export download URL");
@@ -578,76 +586,37 @@ async fn run_sqlquery_job<Sink: ExportSink>(
     Ok((completed_files, total_rows))
 }
 
-/// Materializes a query's table sources and executes its SQL, enforcing the
-/// same row caps and timeout as the synchronous `$sql-run` operation.
-/// The export operations emit flat formats only (csv/ndjson/parquet/json), so
-/// the result's JSON cell values feed `format_output` directly.
+/// Materializes a query's fully-resolved dependency graph (Phase 2 of the
+/// two-phase resolver — [`crate::handlers::sof::graph::execute_plan`]) and
+/// executes its SQL, enforcing the same row caps and timeout as the
+/// synchronous `$sql-run` operation. The export operations emit flat formats
+/// only (csv/ndjson/parquet/json), so the result's JSON cell values feed
+/// `format_output` directly.
 async fn execute_sql_query(
     runner: &Arc<dyn SofRunner>,
     task: &ExportTask,
     query: &NamedSqlQuery,
     limits: SqlExportLimits,
 ) -> Result<QueryResult, ExportError> {
-    let mut engine = InMemorySqlEngine::open().map_err(|e| ExportError::Runner(e.to_string()))?;
-
-    let mut schemas: Vec<TableSchema> = Vec::with_capacity(query.tables.len());
-    for table in &query.tables {
-        let schema = TableSchema::from_view_definition(&table.view);
-        engine
-            .create_table(&table.label, &schema)
-            .map_err(|e| ExportError::Runner(e.to_string()))?;
-
-        let stream = runner
-            .run_view(&task.tenant, table.view.clone(), task.filters.clone())
-            .await
-            .map_err(|e| {
-                ExportError::Runner(format!(
-                    "table '{}' failed to materialize: {e}",
-                    table.label
-                ))
-            })?;
-        let stream = stream.map(|r| r.map_err(|e| e.to_string()));
-        engine
-            .insert_rows(
-                &table.label,
-                &schema,
-                Box::pin(stream),
-                limits.max_source_rows_per_vd,
-            )
-            .await
-            .map_err(|e| ExportError::Runner(e.to_string()))?;
-        schemas.push(schema);
-    }
-
-    // Run the user SQL on a blocking thread with a watchdog timeout, exactly
-    // like the synchronous `$sql-run` path.
-    let interrupt = engine.interrupt_handle();
-    let timeout_secs = limits.timeout_secs;
-    let watchdog = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
-        interrupt.interrupt();
-    });
-    let sql = query.sql.clone();
-    let bindings = query.bindings.clone();
-    let max_rows = limits.max_rows;
-    let exec_result =
-        tokio::task::spawn_blocking(move || engine.execute_select(&sql, &bindings, max_rows)).await;
-    watchdog.abort();
-
-    let result = match exec_result {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) if e.to_string().contains("interrupted") => {
-            return Err(ExportError::Runner(format!(
-                "query exceeded {timeout_secs}s timeout"
-            )));
-        }
-        Ok(Err(e)) => return Err(ExportError::Runner(e.to_string())),
-        Err(join_err) => {
-            return Err(ExportError::Runner(format!(
-                "sqlquery worker panicked: {join_err}"
-            )));
-        }
+    let engine = InMemorySqlEngine::open().map_err(|e| ExportError::Runner(e.to_string()))?;
+    let exec_limits = crate::handlers::sof::graph::ExecLimits {
+        max_source_rows_per_vd: limits.max_source_rows_per_vd,
+        max_rows: limits.max_rows,
+        timeout_secs: limits.timeout_secs,
     };
+
+    let (result, _leaf_schemas) = crate::handlers::sof::graph::execute_plan(
+        engine,
+        runner,
+        &task.tenant,
+        &task.filters,
+        &query.plan,
+        &query.sql,
+        &query.bindings,
+        exec_limits,
+    )
+    .await
+    .map_err(ExportError::Runner)?;
 
     Ok(result)
 }
@@ -1040,7 +1009,8 @@ mod tests {
             .unwrap();
         assert_eq!(filename, "shard-0.ndjson");
         assert_eq!(
-            sink.download_url("job-1", &filename).unwrap(),
+            sink.download_url("http://localhost", "job-1", &filename)
+                .unwrap(),
             "http://localhost/export/job-1/shard-0.ndjson"
         );
     }
@@ -1065,7 +1035,12 @@ mod tests {
         fn read_shard(&self, _job_id: &str, _filename: &str) -> Option<Vec<u8>> {
             None
         }
-        fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+        fn download_url(
+            &self,
+            _public_base_url: &str,
+            job_id: &str,
+            filename: &str,
+        ) -> Result<String, ExportError> {
             // Each call advances the nonce, mimicking a fresh pre-signature.
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(format!(
@@ -1098,17 +1073,33 @@ mod tests {
         // Two polls yield two distinct URLs — proof the URL is resolved fresh
         // rather than reused from write time.
         let first = controller
-            .download_url("t1", &job_id, "shard-0.ndjson")
+            .download_url(
+                "t1",
+                "https://public.example/fhir/acme",
+                &job_id,
+                "shard-0.ndjson",
+            )
             .expect("owner should resolve a URL");
         let second = controller
-            .download_url("t1", &job_id, "shard-0.ndjson")
+            .download_url(
+                "t1",
+                "https://public.example/fhir/acme",
+                &job_id,
+                "shard-0.ndjson",
+            )
             .expect("owner should resolve a URL");
+        assert!(first.starts_with("https://signed.example/"));
         assert_ne!(first, second, "each poll must re-resolve the download URL");
 
         // A different tenant cannot resolve URLs for this job.
         assert!(
             controller
-                .download_url("other", &job_id, "shard-0.ndjson")
+                .download_url(
+                    "other",
+                    "https://public.example/fhir/other",
+                    &job_id,
+                    "shard-0.ndjson",
+                )
                 .is_none(),
             "cross-tenant resolution must be denied"
         );

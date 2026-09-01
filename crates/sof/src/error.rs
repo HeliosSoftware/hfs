@@ -4,12 +4,12 @@
 //! various error conditions in the server, including proper FHIR OperationOutcome
 //! generation for error responses.
 
+use crate::SofError;
 use axum::{
     Json,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use helios_sof::SofError;
 use std::fmt;
 
 /// Server-specific error type that can be converted to HTTP responses

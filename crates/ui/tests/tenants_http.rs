@@ -48,6 +48,8 @@ fn app(store: &Arc<dyn ResourceStorage>) -> Router {
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
+        None,
     )
 }
 
@@ -89,12 +91,12 @@ async fn post_form(router: &Router, form: &str) -> (StatusCode, String) {
 
 /// Polls the rows fragment until no provisioning row remains (every
 /// background job settled, one way or another), or panics after ~10s. The
-/// marker is the real in-flight row class (`class="provisioning"`), not an
-/// invented one.
+/// marker is the real in-flight row class (`class="busy-status"`, the
+/// shared busy region since #679), not an invented one.
 async fn wait_settled(router: &Router) -> String {
     for _ in 0..200 {
         let (_, html) = get(router, "/ui/tenants/rows").await;
-        if !html.contains(r#"class="provisioning""#) {
+        if !html.contains(r#"class="busy-status""#) {
             return html;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -168,13 +170,13 @@ async fn create_rejects_invalid_id_and_conflicts() {
 
     // Invalid id → the fragment carries an error banner, not a new row.
     let (_, bad) = post_form(&router, "id=has%20space").await;
-    assert!(bad.contains("form-error"));
+    assert!(bad.contains("alert"));
 
     // Valid create, settle, then a duplicate → conflict surfaced as a banner.
     post_form(&router, "id=acme").await;
     wait_settled(&router).await;
     let (_, dup) = post_form(&router, "id=acme").await;
-    assert!(dup.contains("form-error"));
+    assert!(dup.contains("alert"));
     assert!(dup.contains("already exists"));
 }
 
@@ -218,6 +220,8 @@ async fn page_reports_registry_unavailable_without_a_store() {
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
+        None,
     )
     .oneshot(Request::get("/ui/tenants").body(Body::empty()).unwrap())
     .await
@@ -260,11 +264,11 @@ async fn storage_failure_renders_the_error_banner_not_a_silent_empty_table() {
 
     let (status, body) = get(&router, "/ui/tenants/rows?q=").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("form-error"), "rows fragment: {body}");
+    assert!(body.contains("alert"), "rows fragment: {body}");
 
     let (status, body) = post_form(&router, "id=acme&display_name=").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("form-error"), "create fragment: {body}");
+    assert!(body.contains("alert"), "create fragment: {body}");
 
     let res = router
         .clone()
@@ -277,7 +281,7 @@ async fn storage_failure_renders_the_error_banner_not_a_silent_empty_table() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = body_text(res).await;
-    assert!(body.contains("form-error"), "delete fragment: {body}");
+    assert!(body.contains("alert"), "delete fragment: {body}");
 }
 
 #[tokio::test]
@@ -299,6 +303,8 @@ async fn version_choice_persists_to_user_settings_and_redirects_back() {
         "default".to_string(),
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
         None,
     );
 
@@ -368,6 +374,8 @@ async fn version_choice_changes_the_resource_type_lists() {
             )),
             FhirVersion::R4,
             None,
+            "http://localhost:8080".to_string(),
+            None,
         )
     };
 
@@ -428,6 +436,8 @@ async fn tenant_choice_persists_and_the_selector_follows_it() {
             "default".to_string(),
             Arc::new(helios_ui::StaticConformanceSource::empty()),
             FhirVersion::R4,
+            None,
+            "http://localhost:8080".to_string(),
             None,
         )
     };
@@ -532,7 +542,7 @@ async fn delete_refuses_the_reserved_system_tenant() {
     // The page reports the refusal in its error banner rather than 500-ing.
     let body = body_text(res).await;
     assert!(
-        body.contains("form-error"),
+        body.contains("alert"),
         "the refusal must surface as an error banner, got: {body}"
     );
 
@@ -669,7 +679,7 @@ async fn create_signals_success_with_hx_trigger_and_failures_do_not() {
     );
     let ok_body = body_text(ok).await;
     assert!(
-        ok_body.contains(r#"class="provisioning""#),
+        ok_body.contains(r#"class="busy-status""#),
         "the accepted response already shows the in-flight row: {ok_body}"
     );
 
@@ -705,5 +715,5 @@ async fn a_provisioned_tenant_settles_into_a_normal_row() {
     let html = wait_settled(&router).await;
 
     assert!(html.contains(r#"hx-delete="/ui/tenants/acme""#));
-    assert!(!html.contains(r#"class="provisioning""#));
+    assert!(!html.contains(r#"class="busy-status""#));
 }

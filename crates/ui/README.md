@@ -19,9 +19,12 @@ partial page updates. Handlers return **full pages** on hard navigations and
 thin.
 
 **There is no React, Vue, Svelte, Alpine, or jQuery here — and no bundler, no
-npm dependency, and no build step for the browser code.** The only vendored
-third-party script is htmx itself; everything else under `assets/` is
-hand-written vanilla JS in an IIFE. Do not introduce a framework.
+npm dependency, and no build step for the browser code, with one narrow,
+documented exception** (see "Assets: vendored & embedded" below). Two
+third-party scripts are vendored: htmx, and — as a prebuilt, never-built-here
+bundle — CodeMirror 6, for the ViewDefinition editor (#753). Everything else
+under `assets/` is hand-written vanilla JS in an IIFE. Do not introduce a
+framework.
 
 Why, over a SPA + JSON API:
 
@@ -93,28 +96,113 @@ stale.
 To update htmx, replace `assets/htmx.min.js` with the new pinned release and
 note the version bump in the commit.
 
+### The one exception: a vendored, prebuilt bundle
+
+"No bundler" (above) is the default, not an absolute: a third-party script that
+is a real parser or grammar — not a widget — cannot reasonably be hand-written
+in the style every other asset in this crate uses. For that narrow case:
+
+> Third-party browser code may be vendored as a prebuilt single-file bundle produced by a
+> documented, checked-in, one-off script under `crates/ui/vendor/`; pinned versions and a
+> lockfile are committed alongside it; the script is never executed at build time or in CI;
+> the resulting bundle is never loaded from a CDN; and the bundle ships with its license
+> banner intact.
+
+CodeMirror 6 is the first, and so far only, case this applies to (#753):
+[`crates/ui/vendor/codemirror/`](vendor/codemirror/README.md) is the vendoring
+ritual (pinned npm dependencies, a committed lockfile, a rollup + terser recipe
+run by hand, never by `cargo build` or CI); its one output,
+[`assets/vendor/codemirror.bundle.js`](assets/vendor/codemirror.bundle.js), is
+the vendored bundle itself — embedded and served exactly like every other
+asset in this crate (above), nothing bundler-specific about how it ships. It
+backs the ViewDefinition editor on `/ui/sql/view-definitions`; see
+[`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
+for the full evaluation this amendment is drawn from.
+
 ### Client-side scripts
 
-Each is a small, self-contained IIFE loaded with `defer` by the one page that
-needs it — except `theme.js`, which loads **without `defer`**, before first
-paint, to avoid a flash of the wrong theme.
+Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
+`json-view.js` and `busy.js` load from the shared layout because their behavior
+is used across workspaces — `busy.js` ahead of every page script (defer runs in
+document order) because page scripts call into it. `theme.js` loads **without
+`defer`**, before first paint, to avoid a flash of the wrong theme. `busy.js`
+is the crate's one exported global (`window.hfsBusy`): unlike the closed IIFEs
+it exists to be called by the others.
 
 | Asset | Owns |
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
+| `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
 | `saved-queries.js` | Saved queries, the visual search builder, and the `/_user/settings` read/modify/write cycle |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
+| `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
+| `combobox.js` | Shared multi-select state, chips, keyboard/ARIA behavior, and progressive fallback upgrade; htmx owns transport and callers own result semantics |
 | `resources.js` | The Resources workspace edit modal and "Create new" |
-| `batch.js` | Bundle pick → execution plan → per-entry outcomes |
+| `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
+| `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
-| `resource-filter.js`, `conformance-crud.js` | The conformance viewers' rail filter and write half |
+| `resource-filter.js`, `conformance-crud.js` | Shared truncated-name tooltips and the conformance viewers' rail filter/write half |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.
 All of that lives in Rust behind `/ui/editor/render`, where it is tested.
 
 ---
+
+## Copy capitalization (#652)
+
+The English catalog (`locales/en/main.ftl`) follows one convention:
+
+- **Title Case** for page titles, section headings, card titles, nav entries,
+  tab labels, and action buttons/controls (`Server Dashboard`, `Add Tenant`,
+  `Save Changes`). Small words stay lowercase mid-title (`a, an, and, as, at,
+  by, for, from, in, of, on, or, the, to, with`); hyphenated compounds
+  capitalize both halves (`Per-Action Outcomes`).
+- **Sentence case** for anything that reads as a sentence or fragment:
+  ledes, help text, hints, subtitles, placeholders, confirmation prompts,
+  status values, and error messages — even when the key suffix says `-title`
+  or `-heading` (a full-sentence heading stays a sentence).
+- FHIR and spec spellings are verbatim, always: `FHIR`, `SQL on FHIR`,
+  `ViewDefinition`, `NDJSON`, env-var names.
+
+Spanish and German keep their own capitalization norms (both languages use
+sentence case where English uses Title Case); the convention above is for
+`en` only.
+
+## Required-field marker (#680)
+
+Required fields get an accent-colored asterisk, matching the marker already
+used by the resource editor's add-picker (`.editor-add__name em`). This is
+implemented as a single CSS `:has()` rule next to `.field__label` in
+`assets/app.css`, not per-field markup: the `required` attribute on the input
+is the source of truth, and the rule appends `*` after the field's visible
+label whenever it wraps a required input. The one field without a visible
+label — the search builder's query URL — is marked on its `query-builder__tag`
+chip instead. No template renders `*` for this; the only literal `<em>*</em>`
+in the codebase is the editor's own (unrelated) marker. Changing the
+convention later (e.g. an `(optional)` suffix instead) means editing only
+that one CSS rule.
+
+## Error wording (#677)
+
+Errors follow one convention across the Fluent catalogs
+(`locales/{en,es,de}/main.ftl`) and the OperationOutcome diagnostics that
+`crates/rest/src/error.rs` renders into them:
+
+- Full-sentence errors end with a terminal period; fragments, labels, and
+  status values (`Failed`, `failed`, `unavailable`) take none.
+- Operation failures use one shape: a full sentence naming the object, with
+  the cause after an em dash — `Could not add the tenant — that ID is
+  already in use.`
+- Interpolated values are single-quoted: `Content type 'text/csv' is not
+  supported.`
+- Duality: this convention governs what the user sees — the message catalogs
+  and the `diagnostics` field of returned `OperationOutcome`s, which reach
+  the browser verbatim. It does not apply to `RestError`'s `Display` impl in
+  `crates/rest/src/error.rs`, which stays in its own `Label: value` shape —
+  that form is for logs and traces, not the UI, and is intentionally
+  distinct.
 
 ## Rules of the road — where things go
 
@@ -143,8 +231,10 @@ All of that lives in Rust behind `/ui/editor/render`, where it is tested.
   persistence or terminology logic here.
 - **No new browser-facing JSON API** to feed the UI. htmx consumes HTML
   fragments, not JSON.
-- **No SPA framework, no bundler, no npm dependency** for browser code. (The
-  `e2e/` directory has a `package.json`, but that is test-only and never ships.)
+- **No SPA framework, no bundler, no npm dependency** for browser code, with
+  one documented exception — see "Assets: vendored & embedded" above. (The
+  `e2e/` directory also has a `package.json`, but that is test-only and never
+  ships.)
 - **No inline `<script>` blobs or scattered JS.** Prefer `hx-*` attributes
   (Locality of Behaviour); where JS is truly needed, use small pinned assets.
   Inert `type="application/json"` data carriers are the one allowed exception,
@@ -176,12 +266,23 @@ These are the shared primitives. Before styling anything, reach for one; add to
 
 | Class | What it is |
 |---|---|
-| `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current` | The button. Secondary by default; primary is the one blue action on a page. |
+| `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current`, `.btn--icon` | The action button: 30px high, 12px horizontal padding, 12px type, and a 9px radius. Primary, danger, and current change emphasis only; `--icon` makes the control a 30px square with no horizontal padding. |
 | `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
+| `.panel` | Padding for a full-width card that hosts detail fields without rail behavior. |
+| `.detail__field`, `.detail__field--wide` | One labelled value. The field owns the 5px label/value gap; `--wide` spans all columns when the field is inside a key/value grid. |
+| `.detail-stack` | Padding-free vertical composition for detail fields and form actions, with a 12px gap. Direct `.form-actions` children rely on that gap instead of adding their usual top margin. |
+| `.kv-grid`, `.kv-grid--flush` | Responsive two-column key/value layout with 14px row and 18px column gaps; it collapses to one column at 1250px. `--flush` removes the grid's trailing margin when its container already provides the bottom inset. |
 | `.page-head`, `.page-head__title`, `.page-head__lede`, `.page-head--row` | Page heading block; the only `<h1>` treatment; `--row` puts an action on the right. |
-| `.table-wrap` > `.data-table`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper; empty-state row; footer with pagination. |
+| `.back-link` | In-page return link with theme-safe normal, visited, hover, and focus states. |
+| `.table-wrap` > `.data-table`, `.col-num`, `.col-actions`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper: ordinary headers and data align left; `.col-num` uses tabular figures without changing alignment; `.col-actions` aligns right; empty-state rows stay centered; the footer hosts pagination. |
+| `.empty-state` | The same centered, muted empty treatment for non-table content. |
 | `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
+| `.combobox`, `.combobox__*` | Shared progressively enhanced multi-select. Render it through `partials/combobox.html`; callers provide localized domain copy and an HTML-fragment endpoint, while `combobox.js` owns selection/keyboard state and repeated hidden inputs. Keep a named textarea fallback usable without JavaScript. |
 | `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
+| `.choice-grid`, `.choice-card`, `.choice-card__title`, `.choice-card__hint` | The radio-group treatment: one selectable card per choice, `:has(:checked)` accent (#735). |
+| `.progress`, `.progress__bar`, `.progress--complete`, `.progress--failed`, `.progress--cancelled` | Full-width job progress track; terminal states recolor the fill. |
+| `.job-card`, `.job-card__head`, `.job-card__name`, `.job-card__actions`, `.job-card__meta`, `.job-card__files` | One async job: name + action row, progress track, one meta line, download pills. |
+| `.form-legend`, `.field-row` | Standalone section heading between cards; uppercase-labelled fields side by side. |
 | `.menu`, `.menu__panel`, `.menu__heading`, `.menu__option` | The `<details>` dropdown (tenant/version selectors, Recent). |
 | `.notice`, `.notice--warn` | Inline banner. |
 | `.pill` | Large control chip (chart tools). |
@@ -190,10 +291,77 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.toolbar`, `.toolbar__title`, `.toolbar__search`, `.toolbar__count` | In-card section header with optional search. |
 | `.tabs`, `.tab`, `.tab--on` | Tab strip. |
 | `.filter-rail`, `.nav-panel` | Left rails: the filter list inside a page; the type panel flush against the sidebar. |
-| `.icon-button`, `.icon-button--danger` | Bare icon action (table rows). |
+| `.icon-button`, `.icon-button--danger` | Bare 30px-square icon action (table rows), with the action-button 9px radius. |
+| `.busy-status` > `.spinner` | Inline working state: the ring plus a short label, `role="status"` in the markup so it announces. |
+
+Labeled values follow one spacing contract: `.detail__field` owns only its 5px
+internal label/value gap, while its direct parent owns the larger external
+rhythm. Use `.detail-stack`, `.kv-grid`, `.detail`, or `.tester` as that parent;
+do not add outer margins to individual fields or place them directly in a
+generic `.card__body`.
+
+```text
+Parent owns external rhythm (> 5px)
+
+  Wide metadata (> 1250px)                 Compact metadata (<= 1250px)
+  ┌──────────────────────────────────┐      ┌─────────────────────────┐
+  │ DESCRIPTION — full width         │      │ DESCRIPTION — full width│
+  │   ↕ 5px  value                   │      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ BASE URL — full width            │      │ BASE URL — full width   │
+  │   ↕ 5px  value                   │      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ FHIR VERSION       ← 18px → STATUS│      │ FHIR VERSION            │
+  │   ↕ 5px value          ↕ 5px value│      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ KIND               ← 18px → DATE │      │ STATUS                  │
+  │   ↕ 5px value          ↕ 5px value│      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ FORMATS             │              │      │ KIND                    │
+  │   ↕ 5px value       │              │      │   ↕ 5px  value          │
+  └──────────────────────────────────┘      │          ↕ 14px         │
+                                            │ DATE                    │
+                                            │   ↕ 5px  value          │
+                                            │          ↕ 14px         │
+                                            │ FORMATS                 │
+                                            │   ↕ 5px  value          │
+                                            └─────────────────────────┘
+
+  `.detail-stack` uses the same contract vertically: 12px between fields,
+  while each field keeps exactly 5px between its label and value.
+```
 
 Starting a new page: copy `templates/pages/_scaffold.html` (or crib
 `tenants.html`, the smallest real page). Both compose only this vocabulary.
+
+Button emphasis never changes geometry: pair `.btn` with `--primary`,
+`--danger`, or `--current` for color and state, and add `--icon` only for a
+square icon-only action. Inputs keep their own field scale and do not dictate
+button height. The sole fixed-height exception is the open
+`.addbox--modal > summary.btn`: while its native `<details>` is open, that
+summary becomes the full-viewport backdrop (`height: auto`, zero padding and
+radius); its closed state and the actions inside the dialog use the canonical
+button scale.
+
+### Busy states
+
+One convention for "this control is doing something" (#679), in two lanes:
+
+- **Fetch-driven scripts** call `window.hfsBusy` (`assets/busy.js`).
+  `during(buttons, work)` disables the controls, stamps `aria-busy="true"`,
+  and clears when the promise `work()` returns settles — pass a *function*,
+  never a promise, so the re-entrancy guard runs before the request exists;
+  a `work()` that navigates away returns a promise that never settles.
+  `region(el, label)` reveals a pre-rendered `.busy-status` element and
+  labels its `[data-busy-label]`; `opts.region`/`opts.label` on `during` tie
+  one to the same lifetime. The CSS ring keys off `aria-busy`, so the
+  visuals cannot ship without the semantics; reduced motion gets the same
+  ring as a static glyph. The `::after` ring must keep `content: ""` — CSS
+  generated *text* would join the accessible name.
+- **htmx controls** use `hx-disabled-elt` (#581); `hx-indicator` is
+  deliberately absent (the tenants tests pin this). A pending state that
+  outlives the request belongs in the swapped fragment, like the tenants
+  provisioning row.
 
 ---
 
@@ -259,6 +427,7 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/resources` | GET | Resources workspace: type rail with live counts, search, edit modal |
 | `/ui/editor` | GET | Standalone schema-driven resource editor |
 | `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request |
+| `/ui/json-view/render` | POST | Renders raw `application/json` as a highlighted, foldable HTML fragment; applies no FHIR semantics and retains no payload |
 | `/ui/editor/expand` | GET | ValueSet expansion, proxied to `HFS_TERMINOLOGY_SERVER` |
 | `/ui/queries` | GET | Saved FHIR queries per resource type (#234) and the visual search builder |
 | `/ui/queries/params` | GET | Per-type search-parameter catalog backing the builder's datalist |

@@ -3,10 +3,11 @@ import AxeBuilder from "@axe-core/playwright";
 import { ROUTES, seedBulkImportDetail } from "../pages/routes";
 
 // Tier 1 of the strategy (issue #249): WCAG 2.2 AA is the spec, axe-core the
-// harness. Contrast and target-size verdicts differ per theme, so every route
-// is scanned in both light and dark. The route list is shared with the other
-// cross-page guards (#543); the bulk-import detail page has no static URL, so
-// it is seeded and scanned as its own named test below.
+// harness. Contrast differs per theme, so every route is scanned in both light
+// and dark. axe-core does not currently execute its disabled target-size rule;
+// design-system.spec.ts carries an explicit >=24px action-target guard. The
+// route list is shared with the other cross-page guards (#543); the bulk-import
+// detail page has no static URL, so it is seeded and scanned separately below.
 const WCAG = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
 const THEMES = ["light", "dark"] as const;
 
@@ -42,4 +43,69 @@ for (const theme of THEMES) {
       ).toEqual([]);
     });
   }
+
+  test(`open Bulk Import dialogs are free of WCAG 2.2 AA violations — ${theme}`, async ({
+    page,
+    chrome,
+    request,
+  }) => {
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/bulk-import", { waitUntil: "networkidle" });
+    await page.locator("summary.btn", { hasText: "New Submission" }).click();
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+    await page.locator(".disclosure__summary", { hasText: "Advanced options" }).click();
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+    await page.keyboard.press("Escape");
+
+    const detail = await seedBulkImportDetail(request);
+    await page.goto(detail, { waitUntil: "networkidle" });
+    await page.locator("summary.btn", { hasText: "Edit" }).click();
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+  });
+
+  test(`invalid Resources create state is accessible — ${theme}`, async ({ page, chrome }) => {
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/resources?type=patient", { waitUntil: "networkidle" });
+
+    const create = page.locator("#resource-create");
+    const reason = page.locator("#resource-create-reason");
+    await expect(create).toBeDisabled();
+    await expect(create).toHaveAttribute("aria-describedby", "resource-create-reason");
+    await expect(reason).toBeVisible();
+
+    const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+    expect(violations).toEqual([]);
+  });
 }
+
+test("terminal export delete disclosure is accessible and viewport-bound", async ({ page }) => {
+  await page.goto("/ui/bulk-export/new");
+  const exportName = `a11y-terminal-${Date.now()}`;
+  const form = page.locator('form[action="/ui/bulk-export"]');
+  await form.locator('input[name="name"]').fill(exportName);
+  await form.locator('input[name="scope"][value="system"]').check();
+  await form.getByRole("button", { name: "Start Export" }).click();
+  let card = page.locator(".job-card").filter({ hasText: exportName });
+  await card.getByRole("button", { name: "Cancel" }).click();
+
+  for (const viewport of [
+    { width: 1280, height: 800 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.goto("/ui/bulk-export", { waitUntil: "networkidle" });
+    card = page.locator(".job-card").filter({ hasText: exportName });
+    const disclosure = card.locator("details.job-card__delete");
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+
+    await disclosure.locator("summary").click();
+    await expect(disclosure).toHaveAttribute("open", "");
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+    const panel = await disclosure.locator(".job-card__delete-confirm").boundingBox();
+    expect(panel).not.toBeNull();
+    expect(panel!.x).toBeGreaterThanOrEqual(0);
+    expect(panel!.y).toBeGreaterThanOrEqual(0);
+    expect(panel!.x + panel!.width).toBeLessThanOrEqual(viewport.width);
+    expect(panel!.y + panel!.height).toBeLessThanOrEqual(viewport.height);
+  }
+});

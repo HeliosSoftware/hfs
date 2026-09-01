@@ -1,0 +1,19 @@
+# Content that is embedded into the binary byte-verbatim (Askama templates,
+# fluent locales, rust-embed text assets) must check out with LF everywhere:
+# rendered output is compared against LF string literals in tests, and a CRLF
+# Windows checkout fails every multi-line assertion of rendered HTML (#671).
+# Binary assets (fonts, images) carry no attribute and stay untouched.
+crates/ui/templates/** text eol=lf
+crates/ui/assets/**/*.js text eol=lf
+crates/ui/assets/**/*.css text eol=lf
+crates/ui/tests/golden/** text eol=lf
+crates/ui-chrome/templates/** text eol=lf
+crates/ui-chrome/tests/golden/** text eol=lf
+locales/** text eol=lf
+
+# The SQL-on-FHIR conformance fixtures are kept as a byte-verbatim mirror of
+# upstream (see crates/sof/tests/sql-on-fhir/README.md re-sync policy). A
+# CRLF-converting Windows checkout would make `git diff` against a freshly
+# re-synced upstream copy noisy with spurious line-ending churn, defeating the
+# byte-verbatim comparison the re-sync workflow depends on.
+crates/sof/tests/sql-on-fhir/tests/*.json text eol=lf

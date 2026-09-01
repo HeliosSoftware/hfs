@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum_test::TestServer;
+use chrono::Utc;
+use helios_auth::{Principal, ScopeSet};
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
@@ -31,6 +34,26 @@ async fn create_bulk_export_server() -> (
     Arc<LocalFsOutputStore>,
     tempfile::TempDir,
 ) {
+    create_bulk_export_server_with(
+        TenantRoutingMode::HeaderOnly,
+        "http://localhost:8080",
+        "test-tenant",
+        None,
+    )
+    .await
+}
+
+async fn create_bulk_export_server_with(
+    routing_mode: TenantRoutingMode,
+    base_url: &str,
+    default_tenant: &str,
+    principal_tenant: Option<&str>,
+) -> (
+    TestServer,
+    Arc<SqliteBackend>,
+    Arc<LocalFsOutputStore>,
+    tempfile::TempDir,
+) {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -47,16 +70,20 @@ async fn create_bulk_export_server() -> (
     backend.init_schema().expect("init schema");
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+    let output = Arc::new(LocalFsOutputStore::new(
+        tmp.path(),
+        "https://wrong-internal.example",
+    ));
     let file_auth = Arc::new(BearerScopeAuth);
 
     let config = ServerConfig {
         multitenancy: MultitenancyConfig {
-            routing_mode: TenantRoutingMode::HeaderOnly,
+            routing_mode,
+            strict_validation: principal_tenant.is_some(),
             ..Default::default()
         },
-        base_url: "http://localhost:8080".to_string(),
-        default_tenant: "test-tenant".to_string(),
+        base_url: base_url.to_string(),
+        default_tenant: default_tenant.to_string(),
         ..ServerConfig::for_testing()
     };
 
@@ -66,6 +93,28 @@ async fn create_bulk_export_server() -> (
         file_auth,
     );
     let app = helios_rest::routing::fhir_routes::create_routes(state);
+    let app = if let Some(tenant_id) = principal_tenant {
+        let principal = Principal {
+            subject: "bulk-export-client".to_string(),
+            issuer: "https://issuer.example".to_string(),
+            tenant_id: Some(tenant_id.to_string()),
+            scopes: ScopeSet::parse("system/Patient.rs"),
+            jti: None,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            custom_claims: serde_json::Map::new(),
+        };
+        app.layer(axum::middleware::from_fn(
+            move |mut request: axum::extract::Request, next: Next| {
+                let principal = principal.clone();
+                async move {
+                    request.extensions_mut().insert(principal);
+                    next.run(request).await
+                }
+            },
+        ))
+    } else {
+        app
+    };
     let server = TestServer::new(app).expect("create test server");
 
     (server, backend, output, tmp)
@@ -98,7 +147,11 @@ async fn drain_workers(backend: &Arc<SqliteBackend>, output: &Arc<LocalFsOutputS
 
 /// Seeds N Patient resources.
 async fn seed_patients(backend: &Arc<SqliteBackend>, n: usize) {
-    let tenant = test_tenant();
+    seed_patients_for(backend, "test-tenant", n).await;
+}
+
+async fn seed_patients_for(backend: &Arc<SqliteBackend>, tenant_id: &str, n: usize) {
+    let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
     for i in 0..n {
         backend
             .create(
@@ -110,6 +163,116 @@ async fn seed_patients(backend: &Arc<SqliteBackend>, n: usize) {
             .await
             .expect("seed patient");
     }
+}
+
+#[tokio::test]
+async fn authenticated_path_tenant_and_public_prefix_flow_through_bulk_export_urls() {
+    let (server, backend, output, _tmp) = create_bulk_export_server_with(
+        TenantRoutingMode::UrlPath,
+        "https://public.example/fhir/",
+        "default",
+        Some("acme"),
+    )
+    .await;
+    seed_patients_for(&backend, "acme", 1).await;
+
+    let kickoff = server
+        .get("/acme/$export")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .await;
+    assert_eq!(kickoff.status_code(), StatusCode::ACCEPTED);
+    let status_url = kickoff
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(status_url.starts_with("https://public.example/fhir/acme/export-status/"));
+    let status_path = status_url
+        .strip_prefix("https://public.example/fhir")
+        .unwrap();
+
+    drain_workers(&backend, &output).await;
+    let done = server.get(status_path).await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    assert_eq!(
+        manifest["request"],
+        "https://public.example/fhir/acme/$export?_type=Patient"
+    );
+    assert!(
+        manifest["output"][0]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://public.example/fhir/acme/export-file/")
+    );
+}
+
+#[tokio::test]
+async fn both_mode_header_tenant_can_follow_unprefixed_bulk_export_urls() {
+    let public_base = "https://public.example/fhir";
+    let (server, backend, output, _tmp) =
+        create_bulk_export_server_with(TenantRoutingMode::Both, public_base, "default", None).await;
+    seed_patients_for(&backend, "acme", 1).await;
+
+    let kickoff = server
+        .get("/$export")
+        .add_header("x-tenant-id", "acme")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .await;
+    assert_eq!(kickoff.status_code(), StatusCode::ACCEPTED);
+    let status_url = kickoff
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(status_url.starts_with("https://public.example/fhir/export-status/"));
+    assert!(!status_url.contains("/acme/"));
+    let status_path = status_url.strip_prefix(public_base).unwrap();
+
+    assert_eq!(
+        server
+            .get(status_path)
+            .add_header("x-tenant-id", "acme")
+            .await
+            .status_code(),
+        StatusCode::ACCEPTED
+    );
+    drain_workers(&backend, &output).await;
+
+    let done = server
+        .get(status_path)
+        .add_header("x-tenant-id", "acme")
+        .await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    assert_eq!(
+        manifest["request"],
+        "https://public.example/fhir/$export?_type=Patient"
+    );
+    let file_url = manifest["output"][0]["url"].as_str().unwrap();
+    assert!(file_url.starts_with("https://public.example/fhir/export-file/"));
+    let file_path = file_url.strip_prefix(public_base).unwrap();
+    assert_eq!(
+        server
+            .get(file_path)
+            .add_header("x-tenant-id", "acme")
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    // `both` still accepts the canonical URL-path form for the same job.
+    assert_eq!(
+        server
+            .get(&format!("/acme{status_path}"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]

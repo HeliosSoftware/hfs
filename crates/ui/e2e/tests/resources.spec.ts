@@ -10,7 +10,11 @@ test("the type rail lists the full resource-type set", async ({ resources }) => 
   const types = await resources.railTypes();
   // The R4 Patient compartment enumerates the whole resource set (145 types).
   expect(types.length).toBeGreaterThan(140);
-  expect(types).toEqual(expect.arrayContaining(["Patient", "Observation", "Encounter", "Bundle"]));
+  // ViewDefinition rides the generated-enum union (#648), not the spec's
+  // compartment enumeration.
+  expect(types).toEqual(
+    expect.arrayContaining(["Patient", "Observation", "Encounter", "Bundle", "ViewDefinition"]),
+  );
 });
 
 test("the rail filter narrows the visible types", async ({ resources }) => {
@@ -20,6 +24,39 @@ test("the rail filter narrows the visible types", async ({ resources }) => {
   await expect(resources.railItem("Patient")).toBeHidden();
   await resources.railFilter.fill("");
   await expect(resources.railItem("Patient")).toBeVisible();
+});
+
+test("a clipped rail name keeps its shared hover and focus tooltip", async ({
+  resources,
+  page,
+}) => {
+  const resourceType = "MedicinalProductContraindication";
+  await resources.goto(resourceType);
+  const item = resources.railItem(resourceType);
+  const label = item.locator(".filter-rail__label");
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  // The default desktop rail currently has enough room for every R4 type.
+  // Constrain this representative item so the shared clipped-name path is
+  // exercised independently of production layout widths.
+  await item.evaluate((element) => {
+    element.style.width = "160px";
+  });
+  expect(await label.evaluate((element) => element.scrollWidth > element.clientWidth + 1)).toBe(
+    true,
+  );
+  await label.hover();
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(resourceType);
+
+  await page.mouse.move(0, 0);
+  await item.focus();
+  await expect(item).toHaveAttribute("aria-describedby", "filter-rail-tooltip");
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(resourceType);
+
+  await resources.railItem("Patient").focus();
+  await expect(item).not.toHaveAttribute("aria-describedby", /.+/);
 });
 
 // Picking a type updates the URL (and back navigates) without a full reload —
@@ -32,6 +69,9 @@ test("picking a rail type updates the URL and back navigates", async ({ resource
 
   await page.goBack();
   await expect(page).toHaveURL(/\/ui\/resources\?type=Patient/);
+  await expect(resources.railItem("Patient")).toHaveAttribute("aria-current", "true");
+  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.createLabel).toHaveText("Create new Patient");
 });
 
 // Opening in Patient context (#605): the client takes the same path as a
@@ -59,12 +99,168 @@ test("selecting a type updates the Create label and the URL", async ({ resources
   await expect(resources.builder.url).toHaveValue("GET /Observation");
 });
 
+test("switching away and back cannot reuse a stale builder serialization", async ({
+  resources,
+  page,
+}) => {
+  await resources.goto("Patient");
+  const builderMode = page.locator("[data-mode-btn='builder']");
+  if (await builderMode.count()) await builderMode.click();
+  await resources.builder.addButton("condition").click();
+  const firstRow = resources.builder.conditionRows.first();
+  await firstRow.locator(".builder-row__key").fill("name");
+  await firstRow.locator(".builder-row__value").fill("BeforeSwitch");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?name=BeforeSwitch");
+
+  await firstRow.locator("[data-remove-row]").click();
+  await expect(resources.builder.conditionRows).toHaveCount(0);
+  await expect(resources.builder.url).toHaveValue("GET /Patient");
+
+  await resources.pickType("Observation");
+  await resources.pickType("Patient");
+  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.builder.sections).toHaveAttribute("data-type", "Patient");
+  await expect(page.locator("#query-plain-text")).toContainText("Patient");
+
+  await resources.builder.addButton("condition").click();
+  const patientRow = resources.builder.conditionRows.first();
+  await patientRow.locator(".builder-row__key").fill("name");
+  await patientRow.locator(".builder-row__value").fill("AfterSwitch");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?name=AfterSwitch");
+  await expect(page.locator("#query-plain-text")).toContainText("AfterSwitch");
+});
+
 test("a ?url= deep link still wins over the default Patient context", async ({ resources, page }) => {
   await page.goto("/ui/resources?url=" + encodeURIComponent("/Observation?status=final"), {
     waitUntil: "networkidle",
   });
   await expect(resources.builder.url).toHaveValue("GET /Observation?status=final");
+  await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
+  await expect(resources.createLabel).toHaveText("Create new Observation");
   await resources.results.waitShown();
+});
+
+test("invalid, wrong-case, and empty inputs fail closed without losing the typed query", async ({
+  resources,
+  page,
+}) => {
+  for (const [target, expected] of [
+    ["?type=NoLongerValid", "GET /NoLongerValid"],
+    ["?type=patient", "GET /patient"],
+    ["?url=" + encodeURIComponent("/NoLongerValid?name=kept"), "GET /NoLongerValid?name=kept"],
+    ["?type=Patient&url=" + encodeURIComponent("/NoLongerValid"), "GET /NoLongerValid"],
+  ] as const) {
+    await page.goto("/ui/resources" + target, { waitUntil: "networkidle" });
+    await expect(resources.builder.url).toHaveValue(expected);
+    await expect(resources.createButton).toBeDisabled();
+    await expect(page.locator("#resource-create-reason")).toBeVisible();
+    await expect(page.locator("#type-rail-list [aria-current='true']")).toHaveCount(0);
+  }
+
+  await page.goto("/ui/resources?type=", { waitUntil: "networkidle" });
+  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.createButton).toBeEnabled();
+});
+
+test("manual URL edits and popstate keep Create on the effective query type", async ({
+  resources,
+  page,
+}) => {
+  await resources.goto("Patient");
+  await resources.builder.url.fill("GET /patient");
+  await resources.builder.url.dispatchEvent("change");
+  await expect(resources.createButton).toBeDisabled();
+  await expect(page.locator("#resources")).toHaveAttribute("data-selected-type", "patient");
+
+  await resources.builder.url.fill("GET /Observation?status=final");
+  await resources.builder.url.dispatchEvent("change");
+  await expect(resources.createButton).toBeEnabled();
+  await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
+
+  await resources.pickType("Encounter");
+  await page.goBack();
+  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.createButton).toBeEnabled();
+  await expect(resources.railItem("Patient")).toHaveAttribute("aria-current", "true");
+});
+
+test("openNew refuses a disabled target even if script removes the native disabled flag", async ({
+  resources,
+  page,
+}) => {
+  await page.goto("/ui/resources?type=patient", { waitUntil: "networkidle" });
+  await expect(resources.createButton).toBeDisabled();
+  await resources.createButton.evaluate((button: HTMLButtonElement) => {
+    button.disabled = false;
+    button.click();
+  });
+  await expect(resources.modal.root).toBeHidden();
+  await expect(page.locator("#resource-editor-body")).toBeEmpty();
+});
+
+test("a conflicting Resources bookmark uses the query URL type everywhere after reload", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "NavAlpha" }],
+  });
+  await waitSearchable(request, "Patient", patientId);
+
+  const bookmark =
+    "/ui/resources?type=Observation&url=" + encodeURIComponent("/Patient?name=NavAlpha");
+
+  const expectPatientContext = async () => {
+    await expect(resources.railItem("Patient")).toHaveAttribute("aria-current", "true");
+    await expect(resources.railItem("Observation")).not.toHaveAttribute("aria-current", "true");
+    await expect(page.locator("#resources")).toHaveAttribute("data-selected-type", "Patient");
+    await expect(resources.createLabel).toHaveText("Create new Patient");
+    await expect(resources.builder.url).toHaveValue("GET /Patient?name=NavAlpha");
+    await expect(page.locator("#query-plain")).toBeVisible();
+    await expect(page.locator("#query-plain-text")).toContainText("Patient");
+    await expect(page.locator("#query-plain-text")).toContainText("NavAlpha");
+    await resources.results.waitShown();
+    const resultLink = page.locator(
+      `#query-results-body a.url[data-resource-type='Patient'][data-resource-id='${patientId}']`,
+    );
+    await expect(resultLink).toBeVisible();
+    await expect(resultLink).toHaveAttribute(
+      "href",
+      new RegExp(`^https?://[^/]+/Patient/${patientId}$`),
+    );
+    await expect(resources.results.openTab).toHaveAttribute("href", "/Patient?name=NavAlpha");
+  };
+
+  const expectCreateDraft = async (type: string) => {
+    await resources.openCreate();
+    await expect(resources.modal.subject).toContainText(type);
+    expect((await resources.modal.editor.currentDoc()).resourceType).toBe(type);
+    await resources.modal.close();
+  };
+
+  await page.goto(bookmark, { waitUntil: "networkidle" });
+  await expectPatientContext();
+  await expectCreateDraft("Patient");
+
+  await page.reload({ waitUntil: "networkidle" });
+  await expectPatientContext();
+  await expectCreateDraft("Patient");
+
+  await resources.pickType("Observation");
+  await expect(page).toHaveURL(/\/ui\/resources\?type=Observation$/);
+  expect(new URL(page.url()).searchParams.has("url")).toBe(false);
+
+  await page.reload({ waitUntil: "networkidle" });
+  await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
+  await expect(resources.railItem("Patient")).not.toHaveAttribute("aria-current", "true");
+  await expect(page.locator("#resources")).toHaveAttribute("data-selected-type", "Observation");
+  await expect(resources.createLabel).toHaveText("Create new Observation");
+  await expect(resources.builder.url).toHaveValue("GET /Observation");
+  await expect(page.locator("#query-plain-text")).toContainText("Observation");
+  await resources.results.waitShown();
+  await expect(resources.results.openTab).toHaveAttribute("href", "/Observation");
+  await expectCreateDraft("Observation");
 });
 
 // Long type names (#605): the button truncates instead of widening the page
@@ -113,12 +309,17 @@ test("counts render next to each type from the dashboard snapshot", async ({
     .not.toBe("");
 });
 
-test("every resource type is reachable — Create targets each one", async ({ resources }) => {
+test("every rail type is searchable, while Create opens only eligible targets", async ({ resources }) => {
   await resources.goto("Patient");
   const types = await resources.railTypes();
 
   for (const type of types) {
     await resources.pickType(type);
+    if (await resources.createButton.isDisabled()) {
+      await expect(resources.modal.root).toBeHidden();
+      await expect(resources.page.locator("#resource-create-reason")).toBeVisible();
+      continue;
+    }
     await resources.createButton.click();
     await resources.modal.waitOpen();
     expect(
@@ -129,34 +330,158 @@ test("every resource type is reachable — Create targets each one", async ({ re
   }
 });
 
+test("create eligibility follows the effective FHIR version", async ({ resources }) => {
+  const version = process.env.HFS_DEFAULT_FHIR_VERSION || "R4";
+  const boundary = {
+    R4: { accepted: "Media", rejected: "ActorDefinition" },
+    R4B: { accepted: "SubscriptionTopic", rejected: "ActorDefinition" },
+    R5: { accepted: "ActorDefinition", rejected: "DocumentManifest" },
+    R6: { accepted: "ActorDefinition", rejected: "Media" },
+  }[version];
+  expect(boundary, `No Resources boundary is defined for ${version}`).toBeTruthy();
+
+  await resources.goto(boundary!.accepted);
+  await expect(resources.railItem(boundary!.accepted)).toHaveAttribute("aria-current", "true");
+  await expect(resources.createButton).toBeEnabled();
+  await resources.openCreate();
+  expect((await resources.modal.editor.currentDoc()).resourceType).toBe(boundary!.accepted);
+  await resources.modal.close();
+
+  await resources.goto(boundary!.rejected);
+  await expect(resources.builder.url).toHaveValue(`GET /${boundary!.rejected}`);
+  await expect(resources.createButton).toBeDisabled();
+  await expect(resources.page.locator("#resource-create-reason")).toBeVisible();
+  await expect(resources.page.locator("#type-rail-list [aria-current='true']")).toHaveCount(0);
+});
+
 // "Recently used" group (#603): a per-browser convenience, populated by
 // resource-filter.js from explicit rail picks and re-rendered on load.
-test("the recently-used group tracks picks, most-recent-first, with counts matching the full list", async ({
+test("the recently-used group caps at five, keeps MRU order, deduplicates, and preserves counts", async ({
   resources,
+  page,
 }) => {
   await resources.goto("Patient");
-  await resources.pickType("Encounter");
-  await resources.pickType("Observation");
-  await resources.pickType("Encounter"); // re-selection: moves to front, no duplicate
+  await resources.pickType("Account");
+  await resources.pickType("ActivityDefinition");
+  await resources.pickType("AdverseEvent");
+  await resources.pickType("AllergyIntolerance");
+  await resources.pickType("Appointment");
+  await resources.pickType("AppointmentResponse");
+  await resources.pickType("AllergyIntolerance"); // re-selection: moves to front, no duplicate
 
   // The group is client-rendered from localStorage on load, so it only
   // reflects the picks above once the page (re)loads.
   await resources.goto("Patient");
   await expect(resources.recentGroup).toBeVisible();
-  // The divider and "All types" heading (#603 follow-up) give the general
+  // The divider and "All Types" heading (#603 follow-up) give the general
   // list its own clearly separated section once Recently used has entries.
   await expect(resources.recentDivider).toBeVisible();
   await expect(resources.generalHeading).toBeVisible();
 
   const types = await resources.recentGroup
     .locator("a.filter-rail__item[data-type]")
-    .evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.type));
-  expect(types).toEqual(["Encounter", "Observation"]);
+    .evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.type!));
+  expect(types).toEqual([
+    "AllergyIntolerance",
+    "AppointmentResponse",
+    "Appointment",
+    "AdverseEvent",
+    "ActivityDefinition",
+  ]);
 
   for (const type of types) {
     const listCount = await resources.count(type).textContent();
     const recentCount = await resources.recentItem(type).locator(".count").textContent();
     expect(recentCount).toBe(listCount);
+  }
+
+  // #785: both group headings sit the same distance above their first item.
+  // The list scrolls the selected type into view, so measure from the top.
+  await page.evaluate(() => {
+    document.querySelector("#type-rail-list")!.scrollTop = 0;
+    document.querySelector(".filter-rail")!.scrollTop = 0;
+  });
+  const gapBelow = async (heading: import("@playwright/test").Locator, item: import("@playwright/test").Locator) => {
+    const h = await heading.boundingBox();
+    const i = await item.boundingBox();
+    return i!.y - (h!.y + h!.height);
+  };
+  const recentGap = await gapBelow(
+    resources.recentGroup.locator(".filter-rail__heading--group"),
+    resources.recentGroup.locator("a.filter-rail__item").first(),
+  );
+  const allGap = await gapBelow(
+    resources.generalHeading,
+    page.locator("#type-rail-list a.filter-rail__item").first(),
+  );
+  expect(Math.abs(recentGap - allGap)).toBeLessThanOrEqual(1);
+});
+
+test("the type rails keep recents and the All Types heading fixed while type items scroll", async ({
+  resources,
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 700 });
+  await resources.goto("Account");
+  for (const type of [
+    "ActivityDefinition",
+    "AdverseEvent",
+    "AllergyIntolerance",
+    "Appointment",
+    "Observation",
+  ]) {
+    await resources.pickType(type);
+  }
+
+  for (const [name, path] of [
+    ["Resources", "/ui/resources?type=Account"],
+    ["Search", "/ui/search?type=Account"],
+    ["Saved queries", "/ui/queries?type=Account"],
+  ] as const) {
+    await test.step(name, async () => {
+      await page.goto(path, { waitUntil: "networkidle" });
+
+      const recent = resources.recentGroup;
+      const divider = resources.recentDivider;
+      const allTypes = resources.generalHeading;
+      const pinned = recent.or(divider).or(allTypes);
+      const list = resources.typeList;
+      const firstType = list.locator("a.filter-rail__item[data-type]").first();
+
+      await expect(recent).toBeVisible();
+      await expect(divider).toBeVisible();
+      await expect(allTypes).toBeVisible();
+
+      const pinnedTopsBefore = await pinned
+        .evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().top));
+      const firstTypeTopBefore = await firstType.evaluate(
+        (element) => element.getBoundingClientRect().top,
+      );
+      const before = await list.evaluate((element) => ({
+        scrollTop: element.scrollTop,
+        maxScrollTop: element.scrollHeight - element.clientHeight,
+      }));
+      expect(before.maxScrollTop).toBeGreaterThan(0);
+
+      await list.evaluate((element) => {
+        element.scrollTop = element.scrollHeight;
+      });
+      await expect.poll(() => list.evaluate((element) => element.scrollTop)).toBeGreaterThan(
+        before.scrollTop,
+      );
+
+      const pinnedTopsAfter = await pinned
+        .evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().top));
+      const firstTypeTopAfter = await firstType.evaluate(
+        (element) => element.getBoundingClientRect().top,
+      );
+
+      expect(pinnedTopsAfter).toHaveLength(pinnedTopsBefore.length);
+      pinnedTopsAfter.forEach((top, index) => {
+        expect(Math.abs(top - pinnedTopsBefore[index])).toBeLessThanOrEqual(1);
+      });
+      expect(firstTypeTopAfter).toBeLessThan(firstTypeTopBefore);
+    });
   }
 });
 
@@ -199,13 +524,54 @@ test("the modal closes via the X and via Escape", async ({ resources }) => {
   await expect(resources.modal.root).toBeHidden();
 });
 
+test("a result under a public path prefix still opens in the modal", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = await createResource(request, "Patient", {
+    name: [{ family: "PublicPrefix" }],
+  });
+  const queryPath = `/Patient?_id=${id}`;
+  const publicUrl = `https://fhir.example.test/public/fhir/acme/Patient/${id}`;
+
+  await page.route(`**${queryPath}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/fhir+json",
+      body: JSON.stringify({
+        resourceType: "Bundle",
+        type: "searchset",
+        total: 1,
+        entry: [
+          {
+            fullUrl: publicUrl,
+            resource: { resourceType: "Patient", id, name: [{ family: "PublicPrefix" }] },
+          },
+        ],
+      }),
+    });
+  });
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(queryPath.slice(1));
+  await page.locator("[data-intent='run']").click();
+
+  const resultLink = page.locator("#query-results-body a.url").first();
+  await expect(resultLink).toHaveAttribute("href", publicUrl);
+  await expect(resultLink).toHaveAttribute("data-resource-type", "Patient");
+  await expect(resultLink).toHaveAttribute("data-resource-id", id);
+  await resultLink.click();
+  await resources.modal.waitOpen();
+  await expect(resources.modal.subject).toContainText(id);
+});
+
 test("a created resource can be deleted from its modal", async ({ resources, page, request }) => {
   const id = await createResource(request, "Patient", { name: [{ family: "ToDelete" }] });
   await waitSearchable(request, "Patient", id);
 
   // Open it in the modal by searching for it and clicking the result row.
   await resources.goto("Patient");
-  await resources.modal; // ensure page loaded
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
   await page.locator(`#query-results-body a.url`).first().click();

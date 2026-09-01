@@ -8,6 +8,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Compiled extension modules (maturin develop drops these into src/pysof/;
+# committing one shadows locally-built extensions — see issue #308)
+*.so
+*.pyd
+
 # Distribution / packaging
 .Python
 build/

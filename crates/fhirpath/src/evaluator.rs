@@ -1401,6 +1401,19 @@ fn primitive_member_access(
     }
 }
 
+/// A FHIR primitive may have id/extension children without carrying a scalar
+/// value. It still exists as an Element for navigation, but its implicit
+/// System primitive conversion is the empty collection.
+fn is_fhir_primitive_without_value(result: &EvaluationResult) -> bool {
+    matches!(
+        result,
+        EvaluationResult::Object {
+            type_info: Some(type_info),
+            ..
+        } if type_info.namespace == "FHIR" && type_info.name == "Element"
+    )
+}
+
 fn evaluate_with_context(
     expr: &Expression,
     context: EvaluationContext,
@@ -3340,6 +3353,80 @@ fn apply_regex_flags(builder: &mut RegexBuilder, flags: &str) {
     }
 }
 
+/// Functions that consume the *value* of their input (and of their
+/// arguments), as opposed to treating it as a node: string manipulation,
+/// type conversion, and math. A FHIR primitive element that carries
+/// extensions but no value is present as a node (`exists()` is true), but
+/// has no system value, so these functions must receive it as empty input
+/// and return empty (see `EvaluationResult::is_valueless_primitive_element`
+/// and the fhir-test-cases `primitivesWithoutValue` group). Existence and
+/// navigation functions (`exists`, `count`, `extension`, `hasValue`, ...)
+/// are deliberately not listed: for those the node itself is the input.
+const VALUE_CONSUMING_FUNCTIONS: &[&str] = &[
+    // String functions
+    "length",
+    "toChars",
+    "substring",
+    "upper",
+    "lower",
+    "indexOf",
+    "lastIndexOf",
+    "startsWith",
+    "endsWith",
+    "contains",
+    "replace",
+    "matches",
+    "matchesFull",
+    "replaceMatches",
+    "join",
+    "split",
+    "trim",
+    "escape",
+    "unescape",
+    "encode",
+    "decode",
+    // Conversions
+    "toString",
+    "toBoolean",
+    "toInteger",
+    "toLong",
+    "toDecimal",
+    "toDate",
+    "toDateTime",
+    "toTime",
+    "toQuantity",
+    "convertsToBoolean",
+    "convertsToInteger",
+    "convertsToLong",
+    "convertsToDecimal",
+    "convertsToString",
+    "convertsToDate",
+    "convertsToDateTime",
+    "convertsToTime",
+    "convertsToQuantity",
+    // Math
+    "abs",
+    "ceiling",
+    "exp",
+    "floor",
+    "ln",
+    "log",
+    "power",
+    "round",
+    "sqrt",
+    "truncate",
+];
+
+/// Maps a value-less primitive element (extensions but no value) to Empty and
+/// leaves every other result untouched. Used at value-consuming sites only.
+fn valueless_element_as_empty(value: &EvaluationResult) -> &EvaluationResult {
+    if value.is_valueless_primitive_element() {
+        &EvaluationResult::Empty
+    } else {
+        value
+    }
+}
+
 /// Calls a standard FHIRPath function (that doesn't take a lambda).
 fn call_function(
     name: &str,
@@ -3348,6 +3435,26 @@ fn call_function(
     // Add context parameter here, as call_function is called from evaluate_invocation which has context
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
+    // Value-consuming functions see a value-less primitive element as empty
+    // input (empty in -> empty out); each arm below already propagates Empty.
+    let normalized_args: Vec<EvaluationResult>;
+    let (invocation_base, args) = if VALUE_CONSUMING_FUNCTIONS.contains(&name) {
+        let base = valueless_element_as_empty(invocation_base);
+        if args
+            .iter()
+            .any(EvaluationResult::is_valueless_primitive_element)
+        {
+            normalized_args = args
+                .iter()
+                .map(|a| valueless_element_as_empty(a).clone())
+                .collect();
+            (base, normalized_args.as_slice())
+        } else {
+            (base, args)
+        }
+    } else {
+        (invocation_base, args)
+    };
     match name {
         "is" | "as" => {
             if args.len() != 1 {
@@ -4265,6 +4372,9 @@ fn call_function(
             })
         }
         "length" => {
+            if is_fhir_primitive_without_value(invocation_base) {
+                return Ok(EvaluationResult::Empty);
+            }
             // Returns the length of a string
             // Check for singleton first
             if invocation_base.count() > 1 {
@@ -4379,6 +4489,9 @@ fn call_function(
             })
         }
         "substring" => {
+            if is_fhir_primitive_without_value(invocation_base) {
+                return Ok(EvaluationResult::Empty);
+            }
             // Returns a part of the string
             if args.is_empty() || args.len() > 2 {
                 return Err(EvaluationError::InvalidArity(
@@ -4527,6 +4640,9 @@ fn call_function(
             })
         }
         "upper" => {
+            if is_fhir_primitive_without_value(invocation_base) {
+                return Ok(EvaluationResult::Empty);
+            }
             // Check for singleton base
             if invocation_base.count() > 1 {
                 return Err(EvaluationError::SingletonEvaluationError(
@@ -4793,7 +4909,7 @@ fn call_function(
                     // Convert all items to strings and join
                     let mut string_items = Vec::new();
                     for item in items {
-                        match item {
+                        match valueless_element_as_empty(item) {
                             EvaluationResult::String(s, _, _) => string_items.push(s.clone()),
                             EvaluationResult::Empty => {} // Skip empty items (don't add anything)
                             _ => {
@@ -6168,6 +6284,9 @@ fn call_function(
             }
         }
         "toChars" => {
+            if is_fhir_primitive_without_value(invocation_base) {
+                return Ok(EvaluationResult::Empty);
+            }
             // Check for singleton base
             if invocation_base.count() > 1 {
                 return Err(EvaluationError::SingletonEvaluationError(
@@ -6367,14 +6486,9 @@ fn call_function(
             // Returns false if element is empty or is a primitive with extensions but no value
             match invocation_base {
                 EvaluationResult::Empty => Ok(EvaluationResult::boolean(false)),
-                EvaluationResult::Object { type_info, .. } => {
-                    // Check if this is an Element (primitive with extensions but no value)
-                    let is_element = type_info
-                        .as_ref()
-                        .map(|ti| ti.name == "Element")
-                        .unwrap_or(false);
-                    Ok(EvaluationResult::boolean(!is_element))
-                }
+                obj @ EvaluationResult::Object { .. } => Ok(EvaluationResult::boolean(
+                    !obj.is_valueless_primitive_element(),
+                )),
                 _ => Ok(EvaluationResult::boolean(true)),
             }
         }
@@ -7094,6 +7208,8 @@ fn evaluate_indexer(
 
 /// Applies a polarity operator to a value
 fn apply_polarity(op: char, value: &EvaluationResult) -> Result<EvaluationResult, EvaluationError> {
+    // A primitive element with extensions but no value has no system value.
+    let value = valueless_element_as_empty(value);
     match op {
         '+' => Ok(value.clone()), // Unary plus doesn't change the value
         '-' => {
@@ -7128,6 +7244,10 @@ fn apply_multiplicative(
     op: &str,
     right: &EvaluationResult,
 ) -> Result<EvaluationResult, EvaluationError> {
+    // A primitive element with extensions but no value has no system value:
+    // arithmetic treats it as an empty operand.
+    let left = valueless_element_as_empty(left);
+    let right = valueless_element_as_empty(right);
     match op {
         "*" => {
             // Handle multiplication: Int * Int = Int, Quantity * Quantity = Quantity with combined units
@@ -7415,6 +7535,11 @@ fn apply_additive(
 ) -> Result<EvaluationResult, EvaluationError> {
     // The variables left_dec and right_dec were removed as they were unused.
     // The logic below handles type checking and promotion directly.
+
+    // A primitive element with extensions but no value has no system value:
+    // arithmetic treats it as an empty operand.
+    let left = valueless_element_as_empty(left);
+    let right = valueless_element_as_empty(right);
 
     match op {
         "+" => {
@@ -8119,8 +8244,16 @@ fn compare_inequality(
     right: &EvaluationResult,
 ) -> Result<EvaluationResult, EvaluationError> {
     // Changed return type
+    // A primitive element with extensions but no value has no system value:
+    // comparing with it is comparing with empty.
+    let left = valueless_element_as_empty(left);
+    let right = valueless_element_as_empty(right);
     // Handle empty operands: comparison with empty returns empty
-    if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+    if left == &EvaluationResult::Empty
+        || right == &EvaluationResult::Empty
+        || is_fhir_primitive_without_value(left)
+        || is_fhir_primitive_without_value(right)
+    {
         return Ok(EvaluationResult::Empty); // Return Ok(Empty)
     }
 
@@ -8403,6 +8536,19 @@ fn compare_equality(
             (l_val.clone(), items[0].clone())
         }
         _ => (left.clone(), right.clone()), // Default: use original operands (or both are collections/scalars already)
+    };
+
+    // A primitive element with extensions but no value has no system value:
+    // equality against it follows the empty-operand rules below.
+    let l_cmp = if l_cmp.is_valueless_primitive_element() {
+        EvaluationResult::Empty
+    } else {
+        l_cmp
+    };
+    let r_cmp = if r_cmp.is_valueless_primitive_element() {
+        EvaluationResult::Empty
+    } else {
+        r_cmp
     };
 
     // Helper function for string equivalence normalization
@@ -8990,6 +9136,10 @@ fn check_membership(
     right: &EvaluationResult,
     context: &EvaluationContext, // Added context
 ) -> Result<EvaluationResult, EvaluationError> {
+    // A primitive element with extensions but no value has no system value:
+    // membership tests treat it as an empty operand.
+    let left = valueless_element_as_empty(left);
+    let right = valueless_element_as_empty(right);
     // Specific handling for 'in' and 'contains' based on FHIRPath spec regarding empty collections
     match op {
         "in" => {

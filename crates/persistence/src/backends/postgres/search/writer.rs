@@ -20,7 +20,7 @@
 //! Measured on a locally reproduced slice of the benchmark's Synthea corpus —
 //! `bulk_1k`, the two `*Information` seed bundles plus the first 40 patient
 //! bundles, imported through the ordinary transaction path into PostgreSQL 18.6
-//! at schema v34. **59,167 resources, 822,992 index rows, 13.91 rows per
+//! at schema v35. **59,167 resources, 822,992 index rows, 13.91 rows per
 //! resource**, which is the same 13.9 the full 1,632,067-resource corpus
 //! reports, so the shape carries.
 //!
@@ -96,7 +96,7 @@
 //! ## What a row costs
 //!
 //! Measured on the same database, inserting 35,000 real rows of each kind into a
-//! copy of `search_index` carrying the exact v34 index set dumped from
+//! copy of `search_index` carrying the exact v35 index set dumped from
 //! `pg_indexes`, five interleaved rounds, medians:
 //!
 //! ```text
@@ -135,7 +135,7 @@
 //! it charges the rows that actually enter it. That includes the two indexes
 //! whose expression is `COALESCE(value_string_folded, lower(value_string))`:
 //! `lower()` is strict, so a row with no string never calls it, and a row
-//! written by any build since v24 has `value_string_folded` populated and never
+//! written by any build since v25 has `value_string_folded` populated and never
 //! reaches the second `COALESCE` arm.
 //!
 //! The one index every row enters, `idx_search_resource`, is therefore 2.62 of
@@ -445,7 +445,7 @@ static INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
 /// round trip whose latency is paid at 300 VUs against a pool of 32.
 ///
 /// The two halves cannot interfere. `search_index` has no unique constraint and
-/// no foreign key (v22/v23), and a data-modifying CTE and the outer statement
+/// no foreign key (v23/v24), and a data-modifying CTE and the outer statement
 /// see the *same* snapshot: the `INSERT` neither sees the deleted rows nor is
 /// blocked by them, and it is an append of new tuples either way. The ordering
 /// that mattered — old rows gone before the new ones are visible — is a property
@@ -1101,7 +1101,7 @@ impl PostgresSearchIndexWriter {
 
     /// Splits extracted values into the row shapes the database's layout expects.
     ///
-    /// A pre-v17 database is read with the grouped composite form, which only
+    /// A pre-v18 database is read with the grouped composite form, which only
     /// understands one row per component. Folding anyway would leave the table
     /// holding both shapes at once, matching neither reliably — and silently,
     /// since a composite miss returns an empty bundle rather than an error. So
@@ -1212,7 +1212,7 @@ impl PostgresSearchIndexWriter {
     /// `batches` is `(resource_type, resource_id, rows)` in the order the
     /// resources were created, and the flattened row order follows it, so the
     /// table is appended to in exactly the order the unbatched path appended in.
-    /// `search_index` has no unique constraint and no foreign key (v22/v23), so
+    /// `search_index` has no unique constraint and no foreign key (v23/v24), so
     /// nothing about this insert can conflict with, or wait on, a concurrent
     /// writer's rows: it is a pure append of rows keyed by a resource id that
     /// only this transaction is creating.
@@ -1624,7 +1624,7 @@ mod tests {
             .expect("value should map to a row")
     }
 
-    /// A pre-v17 database is read with the grouped composite form, which only
+    /// A pre-v18 database is read with the grouped composite form, which only
     /// understands one row per component. If the write path folded anyway, the
     /// table would hold both shapes and the read form would match neither
     /// reliably — silently, since a composite miss returns an empty bundle.
@@ -1744,10 +1744,10 @@ mod tests {
         }
     }
 
-    /// The load-bearing half of schema v30. `build_token_condition` emits
+    /// The load-bearing half of schema v31. `build_token_condition` emits
     /// `value_token_code IS NOT NULL AND value_token_system = $n` for the
     /// `system|` form, which is row-set-preserving only while no written row has
-    /// a system without a code — and v30 dropped the 2,283 MB `idx_search_token`
+    /// a system without a code — and v31 dropped the 2,283 MB `idx_search_token`
     /// on the strength of that. `IndexValue::Token` makes it a type-level fact
     /// (`code: String`, not `Option<String>`), and both writer paths carry it
     /// through; this pins the behaviour so a later `Option` would fail here
@@ -1765,7 +1765,7 @@ mod tests {
             assert!(row.value_token_system.is_some());
             assert!(
                 row.value_token_code.is_some(),
-                "a system-bearing row with a NULL code would make the v30 \
+                "a system-bearing row with a NULL code would make the v31 \
                  `system|` predicate lose matches"
             );
         }
@@ -1823,7 +1823,7 @@ mod tests {
         assert!(number.value_quantity_value.is_none());
     }
 
-    /// The whole of schema v32 rests on this: `value_reference` holds the
+    /// The whole of schema v33 rests on this: `value_reference` holds the
     /// version-agnostic base, so `build_reference_condition` can emit one
     /// equality instead of `= OR LIKE '<base>/\_history/%'`, and so the three
     /// readers that split the column on `/` (`_revinclude`, `ChainQueryBuilder`,

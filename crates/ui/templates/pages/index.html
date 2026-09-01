@@ -9,7 +9,9 @@
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("card-resource-types") }}</span>
     <span class="stat__value">{{ metrics.resource_types }}</span>
-    <span class="stat__sub">{{ i18n.t_arg("card-resource-types-sub", "version", metrics.fhir_version.to_string()) }}</span>
+    {# The effective request version, same source as the sidebar selector —
+       never the snapshot's boot-time default (#553). #}
+    <span class="stat__sub">{{ i18n.t_arg("card-resource-types-sub", "version", status.fhir_version_label().to_string()) }}</span>
   </article>
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("card-stored-resources") }}</span>
@@ -129,7 +131,7 @@
   <div class="chart-empty">{{ i18n.t("chart-empty") }}</div>
   {% else %}
   <!--
-    Server-rendered from the live per-type cumulative counts (default tenant),
+    Server-rendered from the live per-type cumulative counts (active tenant),
     supplied via helios_observability::dashboard. Axis geometry is computed in
     the handler; see crates/ui/src/lib.rs::build_chart. The wrapper hosts the
     tooltip (assets/dashboard.js) — a hover readout layered on top; the chart

@@ -22,6 +22,7 @@ fn test_content_type_pipeline_integration() {
             ContentType::CsvWithHeader => "csv_with_header", 
             ContentType::NdJson => "ndjson",
             ContentType::Parquet => "parquet",
+            ContentType::ArrowIpc => "arrow",
         };
         
         assert!(!format_str.is_empty());

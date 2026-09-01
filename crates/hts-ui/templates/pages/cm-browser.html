@@ -1,0 +1,86 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ chrome.i18n.t("hts-cm-browser-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
+
+{#-
+  V2 "top strip" browser layout — see `pages/cs-browser.html` for the full
+  rationale.
+
+  CM diverges from CS / VS in the field list: `version` is absent (design
+  doc §7.5 — HTS ignores CM version on `$translate`), and the former
+  Source system / Target system inputs are gone. `GET /ConceptMap` on HTS
+  accepts only `url`, `version`, `name`, `title` and `status`
+  (`crates/hts/src/operations/search.rs`), so `source-uri` / `target-uri`
+  were sent and silently dropped — a filter that looked like it worked and
+  did not. The `.field__hint` under the strip says so, and points the
+  operator at the Mapping column instead.
+-#}
+{% block body_class %}app-shell{% endblock %}
+{% block content_class %} content--app{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 id="hts-cm-browser-heading" class="page-head__title">{{ chrome.i18n.t("hts-cm-browser-title") }}</h1>
+  <p class="page-head__lede">{{ chrome.i18n.t("hts-cm-browser-subtitle") }}</p>
+</section>
+
+<div class="filter-center">
+  <form id="hts-cm-filters"
+        method="get"
+        action="/ui/hts/concept-maps/rows"
+        hx-get="/ui/hts/concept-maps/rows"
+        hx-target="#hts-cm-rows"
+        hx-swap="outerHTML"
+        hx-trigger="input changed delay:300ms, change, submit"
+        aria-label="{{ chrome.i18n.t("hts-cm-browser-filter-legend") }}">
+    <section class="card table-card">
+      <div class="toolbar">
+        <label class="toolbar__search">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M2.28571 6.85714C2.28571 4.33241 4.33241 2.28571 6.85714 2.28571C9.38187 2.28571 11.4286 4.33241 11.4286 6.85714C11.4286 9.38187 9.38187 11.4286 6.85714 11.4286C4.33241 11.4286 2.28571 9.38187 2.28571 6.85714ZM6.85714 0C3.07005 0 0 3.07005 0 6.85714C0 10.6442 3.07005 13.7143 6.85714 13.7143C8.33803 13.7143 9.70928 13.2448 10.8302 12.4466L14.049 15.6655C14.4953 16.1118 15.219 16.1118 15.6653 15.6655C16.1115 15.2192 16.1115 14.4955 15.6653 14.0493L12.4465 10.8305C13.2448 9.7095 13.7143 8.33815 13.7143 6.85714C13.7143 3.07005 10.6442 0 6.85714 0Z" fill="currentColor"/></svg>
+          <input id="filter-name" type="search" name="name"
+                 value="{% if let Some(n) = view.filters.name %}{{ n }}{% endif %}"
+                 placeholder="{{ chrome.i18n.t("hts-cm-browser-filter-name") }}"
+                 aria-label="{{ chrome.i18n.t("hts-cm-browser-filter-name") }}"
+                 autocomplete="off" spellcheck="false">
+        </label>
+        <label class="toolbar__search">
+          <input id="filter-title" type="search" name="title"
+                 value="{% if let Some(t) = view.filters.title %}{{ t }}{% endif %}"
+                 placeholder="{{ chrome.i18n.t("hts-cm-browser-filter-title") }}"
+                 aria-label="{{ chrome.i18n.t("hts-cm-browser-filter-title") }}"
+                 autocomplete="off" spellcheck="false">
+        </label>
+        <label class="toolbar__search">
+          <input id="filter-url" type="search" name="url"
+                 value="{% if let Some(u) = view.filters.url %}{{ u }}{% endif %}"
+                 placeholder="{{ chrome.i18n.t("hts-cm-browser-filter-url") }}"
+                 aria-label="{{ chrome.i18n.t("hts-cm-browser-filter-url") }}"
+                 autocomplete="off" spellcheck="false">
+        </label>
+        <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-cm-browser-filter-search") }}</button>
+        <a class="btn" href="/ui/hts/concept-maps">{{ chrome.i18n.t("hts-cm-browser-filter-reset") }}</a>
+      </div>
+
+      {#- Counts omitted: HTS's search `total` is a page count, not an
+          authoritative match count. -#}
+      <div class="facets facets--bare" role="group" aria-label="{{ chrome.i18n.t("hts-cm-browser-filter-status") }}">
+        <span class="facet-label">{{ chrome.i18n.t("hts-cm-browser-filter-status") }}</span>
+        <a class="chip" href="{{ view.status_url("") }}"{% if view.status_is("") %} aria-current="true"{% endif %}>{{ chrome.i18n.t("hts-facet-status-any") }}</a>
+        <a class="chip" href="{{ view.status_url("active") }}"{% if view.status_is("active") %} aria-current="true"{% endif %}>{{ chrome.i18n.t("hts-cm-status-active") }}</a>
+        <a class="chip" href="{{ view.status_url("draft") }}"{% if view.status_is("draft") %} aria-current="true"{% endif %}>{{ chrome.i18n.t("hts-cm-status-draft") }}</a>
+        <a class="chip" href="{{ view.status_url("retired") }}"{% if view.status_is("retired") %} aria-current="true"{% endif %}>{{ chrome.i18n.t("hts-cm-status-retired") }}</a>
+        <a class="chip" href="{{ view.status_url("unknown") }}"{% if view.status_is("unknown") %} aria-current="true"{% endif %}>{{ chrome.i18n.t("hts-cm-status-unknown") }}</a>
+      </div>
+
+      <div class="field">
+        <span class="field__hint">{{ chrome.i18n.t("hts-cm-browser-filter-hint") }}</span>
+      </div>
+
+      <input type="hidden" name="status" value="{% if let Some(s) = view.filters.status %}{{ s }}{% endif %}">
+      <input type="hidden" name="_count" value="{{ view.filters.effective_count() }}">
+    </section>
+  </form>
+
+  {% include "partials/hts-cm-rows.html" %}
+</div>
+{% endblock %}

@@ -69,6 +69,7 @@
 
 mod backend;
 mod bulk_export;
+mod bulk_provider;
 mod bulk_submit;
 mod schema;
 pub mod search;

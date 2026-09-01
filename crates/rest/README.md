@@ -138,12 +138,18 @@ the background and is polled via `/$reindex-status/[job_id]`.
   built-in set**, not just after an operator edits one. Resources written
   before the upgrade were extracted under the old definitions and have no index
   rows for the new parameter, so it matches nothing on that older data until a
-  `$reindex` runs. Two current cases: `_source` (`meta.source`), which no
-  version of the server indexed before [#523], and `_language`
-  (`Resource.language`) on R5/R6. Neither returns an error on stale data — it
-  simply under-matches, which is the failure mode a reindex exists to clear.
+  `$reindex` runs. Three current cases: `_source` (`meta.source`), which no
+  version of the server indexed before [#523]; `_language`
+  (`Resource.language`) on R5/R6; and the `ViewDefinition` SearchParameters
+  from the SQL-on-FHIR IG (`url`, `name`, `status`, `date`, `context`, …)
+  added in [#570] — `ViewDefinition` resources created before that upgrade are
+  not searchable by those parameters until `POST /ViewDefinition/$reindex` (or
+  a system-wide `$reindex`) runs. None of these return an error on stale
+  data — they simply under-match, which is the failure mode a reindex exists
+  to clear.
 
 [#523]: https://github.com/HeliosSoftware/hfs/issues/523
+[#570]: https://github.com/HeliosSoftware/hfs/issues/570
 
 Both operations emit BALP `AuditEvent`s — purge on completion or failure,
 reindex at start and at its terminal state (complete / cancel / fail, outcome
@@ -372,6 +378,15 @@ enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`. Aligns with the manifest's advertised 24h `Expires`. |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
 
+`$sql-run` and `$sql-export` both accept a repeating `context` parameter
+carrying ViewDefinitions or SQLView Libraries inline, matched to the
+subject's dependency graph by canonical URL at any depth. Resolution is
+**server-first**: for each dependency, storage is checked before `context`,
+so `context` only applies to URLs the server cannot resolve on its own — a
+`context` entry that duplicates an artifact the server already has is
+silently ignored (there is no channel to attach a warning to a streamed
+`$sql-run`/`$sql-export` response).
+
 Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
 job's already-written partial shards immediately; the reaper above reclaims
 *completed* jobs once they age past `HFS_EXPORT_OUTPUT_TTL`.
@@ -414,6 +429,11 @@ curl http://localhost:8080/acme/Patient/123
 curl http://localhost:8080/acme/metadata
 # Returns implementation.url: "http://localhost:8080/acme"
 ```
+
+All advertised URLs use `HFS_BASE_URL`. Set it to the public origin and any
+reverse-proxy prefix, such as `https://fhir.example.com/fhir`. URL-routed
+requests append the selected tenant after that prefix. Header-routed requests
+keep the configured base unchanged. Forwarding headers never override it.
 
 ### URL-Based Routing Setup
 

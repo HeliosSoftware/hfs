@@ -13,6 +13,23 @@ use dashmap::DashMap;
 
 use super::controller::ExportError;
 
+fn server_routed_download_url(
+    public_base_url: &str,
+    job_id: &str,
+    filename: &str,
+) -> Result<String, ExportError> {
+    let mut url = url::Url::parse(public_base_url)
+        .map_err(|error| ExportError::Sink(format!("invalid public base URL: {error}")))?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| ExportError::Sink("public base URL cannot hold path segments".into()))?;
+        path.pop_if_empty();
+        path.extend(["export", job_id, filename]);
+    }
+    Ok(url.to_string())
+}
+
 /// Trait for writing and serving export output files.
 pub trait ExportSink: Send + Sync + Clone + 'static {
     /// Writes `data` as the `shard_index`-th shard for `job_id` and returns the
@@ -46,7 +63,12 @@ pub trait ExportSink: Send + Sync + Clone + 'static {
     /// - [`S3Sink`] returns a freshly pre-signed GET URL, so a client polling
     ///   the manifest hours after completion still receives a usable URL rather
     ///   than one signed (and counting down) since write time.
-    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError>;
+    fn download_url(
+        &self,
+        public_base_url: &str,
+        job_id: &str,
+        filename: &str,
+    ) -> Result<String, ExportError>;
 
     /// Deletes all output shards previously written for `job_id`.
     ///
@@ -68,20 +90,16 @@ pub trait ExportSink: Send + Sync + Clone + 'static {
 #[derive(Clone)]
 pub struct FilesystemSink {
     dir: PathBuf,
-    base_url: String,
 }
 
 impl FilesystemSink {
     /// Creates a new `FilesystemSink`.
     ///
     /// - `dir` — root directory for export files
-    /// - `base_url` — server base URL (e.g. `http://localhost:8080`), used to
-    ///   build public download URLs
-    pub fn new(dir: impl Into<PathBuf>, base_url: impl Into<String>) -> Self {
-        Self {
-            dir: dir.into(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-        }
+    /// The second argument is retained for source compatibility. Request
+    /// handlers now supply the effective public base when resolving a URL.
+    pub fn new(dir: impl Into<PathBuf>, _base_url: impl Into<String>) -> Self {
+        Self { dir: dir.into() }
     }
 }
 
@@ -110,13 +128,15 @@ impl ExportSink for FilesystemSink {
         std::fs::read(path).ok()
     }
 
-    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+    fn download_url(
+        &self,
+        public_base_url: &str,
+        job_id: &str,
+        filename: &str,
+    ) -> Result<String, ExportError> {
         // Stable server-routed URL; served back by the download handler. No
         // expiry, so it is identical on every poll.
-        Ok(format!(
-            "{base}/export/{job_id}/{filename}",
-            base = self.base_url
-        ))
+        server_routed_download_url(public_base_url, job_id, filename)
     }
 
     fn delete_job(&self, job_id: &str) -> Result<(), ExportError> {
@@ -138,15 +158,16 @@ impl ExportSink for FilesystemSink {
 #[derive(Clone)]
 pub struct InMemorySink {
     data: Arc<DashMap<String, Vec<u8>>>,
-    base_url: String,
 }
 
 impl InMemorySink {
-    /// Creates a new `InMemorySink` with the given public base URL.
-    pub fn new(base_url: impl Into<String>) -> Self {
+    /// Creates a new `InMemorySink`.
+    ///
+    /// The argument is retained for source compatibility. Request handlers
+    /// supply the effective public base when resolving a URL.
+    pub fn new(_base_url: impl Into<String>) -> Self {
         Self {
             data: Arc::new(DashMap::new()),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }
 }
@@ -170,12 +191,14 @@ impl ExportSink for InMemorySink {
         self.data.get(&key).map(|v| v.clone())
     }
 
-    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+    fn download_url(
+        &self,
+        public_base_url: &str,
+        job_id: &str,
+        filename: &str,
+    ) -> Result<String, ExportError> {
         // Mirrors the filesystem sink's stable server route.
-        Ok(format!(
-            "{base}/export/{job_id}/{filename}",
-            base = self.base_url
-        ))
+        server_routed_download_url(public_base_url, job_id, filename)
     }
 
     fn delete_job(&self, job_id: &str) -> Result<(), ExportError> {
@@ -186,6 +209,25 @@ impl ExportSink for InMemorySink {
         let prefix = format!("{job_id}/");
         self.data.retain(|k, _| !k.starts_with(&prefix));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filesystem_download_url_uses_the_current_public_base() {
+        let sink = FilesystemSink::new("unused", "https://stale.example");
+        assert_eq!(
+            sink.download_url(
+                "https://public.example/fhir",
+                "job with space",
+                "shard/0.ndjson",
+            )
+            .unwrap(),
+            "https://public.example/fhir/export/job%20with%20space/shard%2F0.ndjson"
+        );
     }
 }
 
@@ -288,7 +330,12 @@ impl ExportSink for S3Sink {
     /// Note: the URL's effective lifetime is also bounded by the signing
     /// credentials' own validity (e.g. an STS session), which can silently
     /// undercut `presign_ttl_secs` when running with temporary credentials.
-    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+    fn download_url(
+        &self,
+        _public_base_url: &str,
+        job_id: &str,
+        filename: &str,
+    ) -> Result<String, ExportError> {
         let key = self.object_key(job_id, filename);
         let bucket = self.bucket.clone();
         let client = Arc::clone(&self.client);

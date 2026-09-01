@@ -187,7 +187,7 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        // Default string search is starts-with, emitted since schema v33 as an
+        // Default string search is starts-with, emitted since schema v34 as an
         // explicit bytewise range on the folded expression rather than a `LIKE`:
         // a `LIKE` whose pattern is a bind parameter cannot be turned into an
         // index range by the planner, so the bounds are derived in Rust. Never
@@ -525,7 +525,7 @@ mod query_builder_tests {
         assert!(fragment.sql.contains("value_token_system"));
         // The `system|` form binds the system and nothing else — still exactly
         // one parameter. It does carry `value_token_code IS NOT NULL` as of
-        // schema v30, which is not a second binding: it is the conjunct that
+        // schema v31, which is not a second binding: it is the conjunct that
         // makes the partial `idx_search_token_code_recent` reachable for this
         // shape, and it excludes no row (`IndexValue::Token.code` is a
         // non-optional `String`). What must stay true is that no code VALUE is

@@ -7,15 +7,25 @@
 {% block content %}
 <header class="page-head page-head--row">
   <div>
-    <a href="/ui/bulk-export">‹ {{ i18n.t("bulk-export-title") }}</a>
-    <h1 class="page-head__title">
-      {{ i18n.t("bulk-export-active-title") }}
-      <span class="toolbar__count">{{ total }} · {{ running }} {{ i18n.t("bulk-export-running") }}</span>
-    </h1>
+    <h1 class="page-head__title">{{ i18n.t("bulk-export-active-title") }}</h1>
+    {% if available %}
+    <p class="page-head__lede">{{ total }} {{ i18n.t("bulk-export-exports-word") }} · {{ running }} {{ i18n.t("bulk-export-running") }}</p>
+    {% endif %}
   </div>
-  <a class="btn btn--primary" href="/ui/bulk-export">{{ i18n.t("bulk-export-new") }}</a>
+  {% if available %}
+  <a class="btn btn--primary" href="/ui/bulk-export/new">
+    <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("bulk-export-new") }}
+  </a>
+  {% endif %}
 </header>
 
+{% if delete_error %}
+<div class="card notice notice--warn" role="alert">{{ i18n.t("bulk-export-delete-error") }}</div>
+{% endif %}
+
+{% if !available %}
+<div class="card notice">{{ i18n.t("bulk-export-unavailable") }}</div>
+{% else %}
 {% if cards.is_empty() %}
 <div class="card notice">{{ i18n.t("bulk-export-none") }}</div>
 {% endif %}
@@ -23,4 +33,5 @@
 {% for card in cards %}
 {% include "partials/bulk_export_card.html" %}
 {% endfor %}
+{% endif %}
 {% endblock %}

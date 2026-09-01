@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 16;
+pub const SCHEMA_VERSION: i32 = 17;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -297,6 +297,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             13 => migrate_v13_to_v14(conn)?,
             14 => migrate_v14_to_v15(conn)?,
             15 => migrate_v15_to_v16(conn)?,
+            16 => migrate_v16_to_v17(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1362,6 +1363,29 @@ fn migration_err(message: String) -> crate::error::StorageError {
         message,
         source: None,
     })
+}
+
+/// Migrate from schema version 16 to version 17.
+///
+/// Adds the `bulk_provider_submissions` table backing the provider-side Bulk
+/// Submit store (#772): the submissions the Bulk Import workspace sends,
+/// previously misfiled in the per-user `user_settings` document. One opaque
+/// JSON document per (tenant, submission), whole-document writes under a
+/// monotonic `version` for optimistic locking.
+fn migrate_v16_to_v17(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bulk_provider_submissions (
+            tenant_id  TEXT NOT NULL,
+            id         TEXT NOT NULL,
+            data       BLOB NOT NULL,
+            version    INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, id)
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create bulk_provider_submissions table: {e}")))?;
+    Ok(())
 }
 
 /// Drop all tables (for testing).

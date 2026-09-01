@@ -128,8 +128,9 @@ where
         })?;
 
     // Build the self link URL
+    let public_base = state.public_base_url_for_request(&tenant);
     let self_link = build_compartment_search_url(
-        state.base_url(),
+        &public_base,
         &compartment_type,
         &compartment_id,
         &target_type,
@@ -138,7 +139,10 @@ where
 
     // Convert result to FHIR Bundle (moving, not cloning, each resource).
     let match_count = result.resources.len();
-    let bundle = result.into_bundle(state.base_url(), &self_link);
+    let mut bundle = result.into_bundle(&public_base, &self_link);
+    crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+        state.public_url_for_request(&tenant, [resource_type, id])
+    });
 
     debug!(
         compartment_type = %compartment_type,
@@ -262,15 +266,19 @@ where
         helios_persistence::types::Page::new(collected, helios_persistence::types::PageInfo::end());
     let result = helios_persistence::core::SearchResult::new(page);
 
+    let public_base = state.public_base_url_for_request(&tenant);
     let self_link = build_compartment_search_url(
-        state.base_url(),
+        &public_base,
         &compartment_type,
         &compartment_id,
         "*",
         &search_params,
     );
     let match_count = result.resources.len();
-    let bundle = result.into_bundle(state.base_url(), &self_link);
+    let mut bundle = result.into_bundle(&public_base, &self_link);
+    crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+        state.public_url_for_request(&tenant, [resource_type, id])
+    });
 
     debug!(
         compartment_type = %compartment_type,
@@ -290,21 +298,14 @@ fn build_compartment_search_url(
     target_type: &str,
     params: &SearchParams,
 ) -> String {
-    let path = format!(
-        "{}/{}/{}/{}",
-        base_url, compartment_type, compartment_id, target_type
-    );
-
     let query: String = params
         .iter()
         .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
         .collect::<Vec<_>>()
         .join("&");
-    if query.is_empty() {
-        path
-    } else {
-        format!("{}?{}", path, query)
-    }
+    crate::public_url::PublicUrl::parse(base_url)
+        .expect("request public base was built from validated configuration")
+        .with_segments_and_query([compartment_type, compartment_id, target_type], &query)
 }
 
 /// Converts a SearchBundle to a serde_json::Value for response.

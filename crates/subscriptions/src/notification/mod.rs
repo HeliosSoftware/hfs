@@ -259,9 +259,13 @@ mod tests {
         };
 
         let resource = json!({"resourceType": "Encounter", "id": "123"});
-        let bundle =
-            build_event_notification(&sub, event, Some(&resource), "http://localhost:8080")
-                .unwrap();
+        let bundle = build_event_notification(
+            &sub,
+            event,
+            Some(&resource),
+            "https://public.example/fhir/test-tenant",
+        )
+        .unwrap();
 
         let entries = bundle["entry"].as_array().unwrap();
         // Status entry + id-only entry.
@@ -269,7 +273,10 @@ mod tests {
 
         // The id-only entry should have fullUrl and request but no resource.
         let id_entry = &entries[1];
-        assert!(id_entry.get("fullUrl").is_some());
+        assert_eq!(
+            id_entry["fullUrl"],
+            "https://public.example/fhir/test-tenant/Encounter/123"
+        );
         assert!(id_entry.get("request").is_some());
         assert!(id_entry.get("resource").is_none());
     }

@@ -283,6 +283,12 @@ pub struct SubmissionManifest {
     pub processed_entries: u64,
     /// Number of entries that failed processing.
     pub failed_entries: u64,
+    /// When the claiming worker's lease expires, for `processing` manifests.
+    /// A lease long past expiry with the manifest still `processing` means the
+    /// worker stopped heartbeating and no healthy worker reclaimed it — the
+    /// stall signal the status poll surfaces (#646).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expiry: Option<DateTime<Utc>>,
 }
 
 impl SubmissionManifest {
@@ -297,6 +303,7 @@ impl SubmissionManifest {
             total_entries: 0,
             processed_entries: 0,
             failed_entries: 0,
+            lease_expiry: None,
         }
     }
 

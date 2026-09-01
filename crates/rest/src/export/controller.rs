@@ -22,30 +22,24 @@ pub struct NamedView {
     pub view: Value,
 }
 
-/// One table source for a SQL query export: a resolved ViewDefinition that is
-/// materialized under `label` for the SQL to query against. Table sources do
-/// not produce their own `output` entries in the manifest.
-#[derive(Debug, Clone)]
-pub struct SqlTableSource {
-    /// Table alias the SQL references (the `relatedArtifact.label`).
-    pub label: String,
-    /// The resolved ViewDefinition JSON.
-    pub view: Value,
-}
-
 /// A single named SQL query to be run as part of a `$sql-export` job.
 ///
-/// The kickoff handler resolves the Library and its `depends-on`
-/// ViewDefinitions, validates the SQL, and binds `Library.parameter` values
-/// before submitting, so the background job only materializes and executes.
+/// The kickoff handler resolves the Library's full dependency graph (Phase 1
+/// of the two-phase resolver in `crate::handlers::sof::graph` — every
+/// ViewDefinition and SQLView Library it reaches, at any depth), validates
+/// the SQL, and binds `Library.parameter` values before submitting, so the
+/// background job only materializes the plan (Phase 2) and executes.
 #[derive(Debug, Clone)]
 pub struct NamedSqlQuery {
     /// `subject.name` from the spec — drives `output.name` in the manifest.
     pub name: String,
     /// The validated (SELECT-only) SQL text from the Library.
     pub sql: String,
-    /// Resolved table sources, in `relatedArtifact` declaration order.
-    pub tables: Vec<SqlTableSource>,
+    /// The subject's fully-resolved dependency graph, ready for Phase 2
+    /// materialization. Not part of the crate's public API — the plan
+    /// structure is an internal contract between the kickoff handler and the
+    /// background export worker.
+    pub(crate) plan: crate::handlers::sof::graph::GraphPlan,
     /// Bound `Library.parameter` values for the SQL's `:name` placeholders.
     pub bindings: Vec<helios_sof::sqlquery::BoundParam>,
 }
@@ -253,5 +247,11 @@ pub trait ExportJobController: Send + Sync + 'static {
     ///
     /// Returns `None` if `tenant_id` does not match the submitting tenant, or if
     /// the sink fails to produce a URL (e.g. an S3 pre-signing error).
-    fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String>;
+    fn download_url(
+        &self,
+        tenant_id: &str,
+        public_base_url: &str,
+        job_id: &str,
+        filename: &str,
+    ) -> Option<String>;
 }

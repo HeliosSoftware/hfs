@@ -82,7 +82,14 @@ where
 }
 
 /// Converts a single [`HistoryEntry`] into a FHIR history Bundle entry.
-fn history_entry_to_json(entry: &HistoryEntry, base_url: &str) -> Value {
+fn history_entry_to_json<S>(
+    entry: &HistoryEntry,
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+) -> Value
+where
+    S: ResourceStorage,
+{
     let resource = &entry.resource;
     let resource_type = resource.resource_type();
     let id = resource.id();
@@ -96,7 +103,7 @@ fn history_entry_to_json(entry: &HistoryEntry, base_url: &str) -> Value {
     };
 
     let mut bundle_entry = json!({
-        "fullUrl": format!("{base_url}/{resource_type}/{id}"),
+        "fullUrl": state.public_url_for_request(tenant, [resource_type, id]),
         "request": {
             "method": method,
             "url": request_url,
@@ -117,10 +124,18 @@ fn history_entry_to_json(entry: &HistoryEntry, base_url: &str) -> Value {
 }
 
 /// Builds a FHIR `history` Bundle from a page of history entries.
-fn build_history_bundle(entries: &[HistoryEntry], base_url: &str, total: u64) -> Value {
+fn build_history_bundle<S>(
+    entries: &[HistoryEntry],
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    total: u64,
+) -> Value
+where
+    S: ResourceStorage,
+{
     let bundle_entries: Vec<Value> = entries
         .iter()
-        .map(|entry| history_entry_to_json(entry, base_url))
+        .map(|entry| history_entry_to_json(entry, state, tenant))
         .collect();
 
     json!({
@@ -198,7 +213,7 @@ where
     }
 
     let total = page.page_info.total.unwrap_or(page.items.len() as u64);
-    let bundle = build_history_bundle(&page.items, state.base_url(), total);
+    let bundle = build_history_bundle(&page.items, &state, &tenant, total);
 
     Ok(respond_with_bundle(
         &bundle,
@@ -242,7 +257,7 @@ where
         })?;
 
     let total = page.page_info.total.unwrap_or(page.items.len() as u64);
-    let bundle = build_history_bundle(&page.items, state.base_url(), total);
+    let bundle = build_history_bundle(&page.items, &state, &tenant, total);
 
     Ok(respond_with_bundle(
         &bundle,
@@ -284,7 +299,7 @@ where
         })?;
 
     let total = page.page_info.total.unwrap_or(page.items.len() as u64);
-    let bundle = build_history_bundle(&page.items, state.base_url(), total);
+    let bundle = build_history_bundle(&page.items, &state, &tenant, total);
 
     Ok(respond_with_bundle(
         &bundle,

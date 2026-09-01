@@ -7,6 +7,8 @@ Public API:
     run_view_definition: Transform FHIR data using ViewDefinition
     run_view_definition_with_options: Transform with filtering/pagination
     run_view_definition_remote: Transform with remote resolve() (trusted servers)
+    process_ndjson_to_file: Stream an NDJSON file to an output file
+    ChunkedProcessor: Iterate an NDJSON file as chunks of transformed rows
     process_ndjson_to_file_remote: Stream NDJSON with remote resolve()
     RemoteResolveConfig: Configuration for remote resolve()
     validate_view_definition: Pre-validate ViewDefinition structure
@@ -32,9 +34,17 @@ Exception hierarchy:
 
 from typing import Any, cast
 
+# ViewDefinitions and Bundles may be passed as Python dicts or as
+# pre-serialized JSON (str or bytes). JSON text skips the Python-object
+# conversion and is parsed with the GIL released, which is faster per call
+# and keeps other Python threads responsive on large bundles.
+JsonResource = dict[str, Any] | str | bytes
+
 try:
     # Import the Rust extension module
     from pysof._pysof import (
+        # NDJSON streaming iterator class
+        ChunkedProcessor,
         CsvError,
         FhirPathError,
         InvalidSourceContentError,
@@ -54,6 +64,7 @@ try:
         __version__,
         py_get_supported_fhir_versions,
         py_parse_content_type,
+        py_process_ndjson_to_file,
         py_process_ndjson_to_file_remote,
         py_run_view_definition,
         py_run_view_definition_with_options,
@@ -64,8 +75,8 @@ try:
 
     # Create Python-friendly wrapper functions
     def run_view_definition(
-        view: dict[str, Any],
-        bundle: dict[str, Any],
+        view: JsonResource,
+        bundle: JsonResource,
         format: str,
         *,
         fhir_version: str = "R4",
@@ -73,8 +84,8 @@ try:
         """Transform FHIR Bundle data using a ViewDefinition.
 
         Args:
-            view: ViewDefinition resource as a Python dictionary
-            bundle: FHIR Bundle resource as a Python dictionary
+            view: ViewDefinition resource as a dict, or pre-serialized JSON (str | bytes)
+            bundle: FHIR Bundle resource as a dict, or pre-serialized JSON (str | bytes)
             format: Output format ("csv", "csv_with_header", "json", "ndjson", "parquet")
             fhir_version: FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
 
@@ -92,8 +103,8 @@ try:
         return py_run_view_definition(view, bundle, format, fhir_version)
 
     def run_view_definition_with_options(
-        view: dict[str, Any],
-        bundle: dict[str, Any],
+        view: JsonResource,
+        bundle: JsonResource,
         format: str,
         *,
         since: str | None = None,
@@ -104,8 +115,8 @@ try:
         """Transform FHIR Bundle data using a ViewDefinition with additional options.
 
         Args:
-            view: ViewDefinition resource as a Python dictionary
-            bundle: FHIR Bundle resource as a Python dictionary
+            view: ViewDefinition resource as a dict, or pre-serialized JSON (str | bytes)
+            bundle: FHIR Bundle resource as a dict, or pre-serialized JSON (str | bytes)
             format: Output format ("csv", "csv_with_header", "json", "ndjson", "parquet")
             since: Filter resources modified after this ISO8601 datetime
             limit: Limit the number of results returned
@@ -134,12 +145,12 @@ try:
         )
 
     def validate_view_definition(
-        view: dict[str, Any], *, fhir_version: str = "R4"
+        view: JsonResource, *, fhir_version: str = "R4"
     ) -> bool:
         """Validate a ViewDefinition structure without executing it.
 
         Args:
-            view: ViewDefinition resource as a Python dictionary
+            view: ViewDefinition resource as a dict, or pre-serialized JSON (str | bytes)
             fhir_version: FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
 
         Returns:
@@ -151,11 +162,11 @@ try:
         """
         return py_validate_view_definition(view, fhir_version)
 
-    def validate_bundle(bundle: dict[str, Any], *, fhir_version: str = "R4") -> bool:
+    def validate_bundle(bundle: JsonResource, *, fhir_version: str = "R4") -> bool:
         """Validate a Bundle structure without executing transformations.
 
         Args:
-            bundle: FHIR Bundle resource as a Python dictionary
+            bundle: FHIR Bundle resource as a dict, or pre-serialized JSON (str | bytes)
             fhir_version: FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
 
         Returns:
@@ -189,8 +200,8 @@ try:
         return py_get_supported_fhir_versions()
 
     def run_view_definition_remote(
-        view: dict[str, Any],
-        bundle: dict[str, Any],
+        view: JsonResource,
+        bundle: JsonResource,
         format: str,
         remote_config: Any,
         *,
@@ -207,8 +218,8 @@ try:
         ``remote_config`` is active (enabled with a non-empty allowlist).
 
         Args:
-            view: ViewDefinition resource as a Python dictionary
-            bundle: FHIR Bundle resource as a Python dictionary
+            view: ViewDefinition resource as a dict, or pre-serialized JSON (str | bytes)
+            bundle: FHIR Bundle resource as a dict, or pre-serialized JSON (str | bytes)
             format: Output format ("csv", "csv_with_header", "json", "ndjson", "parquet")
             remote_config: A :class:`RemoteResolveConfig` instance
             since: Filter resources modified after this ISO8601 datetime
@@ -231,7 +242,7 @@ try:
         )
 
     def process_ndjson_to_file_remote(
-        view: dict[str, Any],
+        view: JsonResource,
         input_path: str,
         output_path: str,
         format: str,
@@ -250,7 +261,7 @@ try:
         cap.
 
         Args:
-            view: ViewDefinition resource as a Python dictionary
+            view: ViewDefinition resource as a dict, or pre-serialized JSON (str | bytes)
             input_path: Path to the input NDJSON file
             output_path: Path to write the output file
             format: Output format ("csv", "csv_with_header", "ndjson", "json")
@@ -268,6 +279,44 @@ try:
             output_path,
             format,
             remote_config,
+            chunk_size=chunk_size,
+            skip_invalid=skip_invalid,
+            fhir_version=fhir_version,
+        )
+
+    def process_ndjson_to_file(
+        view: JsonResource,
+        input_path: str,
+        output_path: str,
+        format: str,
+        *,
+        chunk_size: int = 1000,
+        skip_invalid: bool = False,
+        fhir_version: str = "R4",
+    ) -> dict[str, Any]:
+        """Stream an NDJSON file through a ViewDefinition into an output file.
+
+        The most memory-efficient way to process large NDJSON exports: resources
+        are read, transformed, and written chunk by chunk, so memory use is
+        bounded by ``chunk_size`` rather than file size.
+
+        Args:
+            view: ViewDefinition resource as a dict, or pre-serialized JSON (str | bytes)
+            input_path: Path to the input NDJSON file
+            output_path: Path to write the output file
+            format: Output format ("csv", "csv_with_header", "ndjson", "json")
+            chunk_size: Number of resources per chunk. Defaults to 1000.
+            skip_invalid: Skip invalid JSON lines. Defaults to False.
+            fhir_version: FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
+
+        Returns:
+            Processing statistics as a dictionary
+        """
+        return py_process_ndjson_to_file(
+            view,
+            input_path,
+            output_path,
+            format,
             chunk_size=chunk_size,
             skip_invalid=skip_invalid,
             fhir_version=fhir_version,
@@ -351,8 +400,8 @@ except ImportError as e:
 
     # Define placeholder functions
     def run_view_definition(
-        view: dict[str, Any],
-        bundle: dict[str, Any],
+        view: JsonResource,
+        bundle: JsonResource,
         format: str,
         *,
         fhir_version: str = "R4",
@@ -360,8 +409,8 @@ except ImportError as e:
         raise NotImplementedError("Rust extension module not available")
 
     def run_view_definition_with_options(
-        view: dict[str, Any],
-        bundle: dict[str, Any],
+        view: JsonResource,
+        bundle: JsonResource,
         format: str,
         *,
         since: str | None = None,
@@ -372,11 +421,11 @@ except ImportError as e:
         raise NotImplementedError("Rust extension module not available")
 
     def validate_view_definition(
-        view: dict[str, Any], *, fhir_version: str = "R4"
+        view: JsonResource, *, fhir_version: str = "R4"
     ) -> bool:
         raise NotImplementedError("Rust extension module not available")
 
-    def validate_bundle(bundle: dict[str, Any], *, fhir_version: str = "R4") -> bool:
+    def validate_bundle(bundle: JsonResource, *, fhir_version: str = "R4") -> bool:
         raise NotImplementedError("Rust extension module not available")
 
     def parse_content_type(mime_type: str) -> str:
@@ -396,8 +445,8 @@ except ImportError as e:
             raise NotImplementedError("Rust extension module not available")
 
     def run_view_definition_remote(
-        view: dict[str, Any],
-        bundle: dict[str, Any],
+        view: JsonResource,
+        bundle: JsonResource,
         format: str,
         remote_config: Any,
         *,
@@ -409,7 +458,7 @@ except ImportError as e:
         raise NotImplementedError("Rust extension module not available")
 
     def process_ndjson_to_file_remote(
-        view: dict[str, Any],
+        view: JsonResource,
         input_path: str,
         output_path: str,
         format: str,
@@ -421,6 +470,24 @@ except ImportError as e:
     ) -> dict[str, Any]:
         raise NotImplementedError("Rust extension module not available")
 
+    def process_ndjson_to_file(
+        view: JsonResource,
+        input_path: str,
+        output_path: str,
+        format: str,
+        *,
+        chunk_size: int = 1000,
+        skip_invalid: bool = False,
+        fhir_version: str = "R4",
+    ) -> dict[str, Any]:
+        raise NotImplementedError("Rust extension module not available")
+
+    class ChunkedProcessor:  # type: ignore[no-redef]
+        """NDJSON streaming iterator (placeholder)."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise NotImplementedError("Rust extension module not available")
+
     # Set fallback version when Rust extension is not available
     __version__ = "0.0.0-dev"
 
@@ -430,6 +497,8 @@ __all__: list[str] = [
     "run_view_definition",
     "run_view_definition_with_options",
     "run_view_definition_remote",
+    "process_ndjson_to_file",
+    "ChunkedProcessor",
     "process_ndjson_to_file_remote",
     "RemoteResolveConfig",
     "validate_view_definition",

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="{{ chrome.i18n.lang() }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ chrome.i18n.t("hts-app-title") }}{% endblock %}</title>
+  <link rel="icon" type="image/png" href="/ui/hts/assets/logo.png">
+  <link rel="stylesheet" href="/ui/hts/assets/app.css">
+  <!-- No `defer`: the theme attribute must land on <html> before first paint,
+       or the stored theme flashes its default first. -->
+  <script src="/ui/hts/assets/theme.js"></script>
+  <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
+  <script src="/ui/hts/assets/htmx.min.js" defer></script>
+</head>
+<body class="{% block body_class %}{% endblock %}">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <img class="brand__logo" src="/ui/hts/assets/logo.png" alt="">
+      <div class="brand__text">
+        <span class="brand__name">{{ chrome.i18n.t("hts-app-title") }}</span>
+        <span class="brand__version">hts v{{ chrome.version }}</span>
+      </div>
+    </div>
+
+    <hr class="divider">
+
+    <nav class="nav">
+      <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-work") }}</div>
+      <a class="nav-item" href="/ui/hts"{% if chrome.active_page == "home" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-home") }}">
+        <span class="icon">{% include "icons/home.svg" %}</span>
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-home") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/hts/code-systems"{% if chrome.active_page == "code-systems" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-code-systems") }}">
+        <span class="icon">{% include "icons/book.svg" %}</span>
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-code-systems") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/hts/value-sets"{% if chrome.active_page == "value-sets" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-value-sets") }}">
+        <span class="icon">{% include "icons/bookmark.svg" %}</span>
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-value-sets") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/hts/concept-maps"{% if chrome.active_page == "concept-maps" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-concept-maps") }}">
+        <span class="icon">{% include "icons/sync.svg" %}</span>
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-concept-maps") }}</span>
+      </a>
+
+      <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-tools") }}</div>
+      <a class="nav-item" href="/ui/hts/import"{% if chrome.active_page == "import" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-import") }}">
+        <span class="icon">{% include "icons/import.svg" %}</span>
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-import") }}</span>
+      </a>
+
+      <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-server") }}</div>
+      {#-
+        Same label, same icon and same section as HFS's own entry
+        (`crates/ui/templates/layouts/base.html`): `nav-capability-conformance`
+        + `icons/shield.svg` under "Server". The key is shared, not copied,
+        so the two sidebars cannot drift.
+
+        No `nav-item--soon` here — that modifier is a "coming soon" marker
+        (it sets `cursor: default`), and this page has shipped.
+      -#}
+      <a class="nav-item" href="/ui/hts/capability-statement"{% if chrome.active_page == "capability-statement" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("nav-capability-conformance") }}">
+        <span class="icon">{% include "icons/shield.svg" %}</span>
+        <span class="nav-item__label">{{ chrome.i18n.t("nav-capability-conformance") }}</span>
+      </a>
+    </nav>
+
+    {#-
+      FHIR version selector — visual parity with HFS base.html sidebar__foot.
+      Degenerate: only R4 is available today and it renders as `aria-current`.
+      No `<form action=…>` because HTS does not support switching the version
+      at runtime; the disclosure is display-only to match HFS chrome exactly.
+    -#}
+    <div class="sidebar__foot">
+      <details class="menu menu--up">
+        <summary class="selector selector--outline">
+          <span class="icon">{% include "icons/hierarchy.svg" %}</span>
+          <span class="selector__label">{{ chrome.i18n.t_arg("hts-fhir-version", "version", chrome.fhir_version.to_string()) }}</span>
+          <span class="selector__chevrons">
+            <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
+            <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+          </span>
+        </summary>
+        <div class="menu__panel">
+          <div class="menu__heading">{{ chrome.i18n.t("hts-fhir-version-heading") }}</div>
+          <div class="menu__option" aria-current="true">
+            <span class="avatar">{% include "icons/hierarchy.svg" %}</span>
+            {{ chrome.fhir_version }}
+            <span class="check">{% include "icons/check.svg" %}</span>
+          </div>
+        </div>
+      </details>
+    </div>
+  </aside>
+
+  <div class="pane">
+    <header class="topbar">
+      <div class="topbar__tools">
+        {#-
+          Two controls, in HFS's order — see `crates/ui/templates/layouts/base.html`:
+          the theme toggle, then the account menu. HTS and HFS are one system to
+          an operator, so this chrome must not diverge.
+
+          The account menu's markup is **shared, not copied**: it comes from
+          `helios-ui-chrome` via `Chrome::user_menu` (#799), so it cannot drift
+          again. It had drifted — the comment here used to claim "byte-for-byte
+          the same three controls", while HFS's `.topbar__tools` has only ever
+          had two, and HTS's third was a control HFS does not carry at all.
+
+          The language options live **inside** that menu now. They used to sit
+          in the topbar as a `<nav class="lang-switcher">` of three links,
+          removed on 2026-08-31: `.lang-switcher` has no rule anywhere in
+          `crates/ui/assets/app.css`, so those links rendered unstyled, and
+          HFS's topbar never had them. Only the markup went — the `?lang=`
+          negotiation and the `hts_lang` cookie behind it (`src/i18n.rs`) are
+          untouched and still drive the options in their new home.
+
+          A further control used to sit ahead of these: a "dialect: en"
+          disclosure. It was **removed on 2026-08-28**. It shipped
+          non-functional in its very first commit (03c8e9d4d) — a <details>
+          holding a heading and a hint, with no options, no form and no POST —
+          and the `hts_dialect` cookie its comment promised has never existed
+          in any Rust file in any commit. It looked alive only because it
+          echoed the negotiated locale beside the switcher that actually sets
+          it. HFS has no dialect concept at all, and neither server propagates
+          the UI locale to outgoing requests, so nothing was lost.
+
+          Real `displayLanguage` support is unaffected: it lives as per-operation
+          form fields in the workbenches (`code_systems.rs`, `concepts.rs`).
+        -#}
+        <div class="theme-toggle" role="group" aria-label="{{ chrome.i18n.t("theme-label") }}">
+          <button type="button" data-set-theme="light" aria-label="{{ chrome.i18n.t("theme-light") }}">
+            {% include "icons/sun.svg" %}
+          </button>
+          <button type="button" data-set-theme="dark" aria-label="{{ chrome.i18n.t("theme-dark") }}">
+            {% include "icons/moon.svg" %}
+          </button>
+        </div>
+{{ chrome.user_menu()?|safe }}{# markup: crates/ui-chrome/templates/partials/user-menu.html (#799) #}
+      </div>
+    </header>
+    <main class="content{% block content_class %}{% endblock %}">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

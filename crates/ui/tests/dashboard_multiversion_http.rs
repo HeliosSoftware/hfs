@@ -51,6 +51,8 @@ fn app() -> Router {
         )),
         FhirVersion::R4,
         None,
+        "http://localhost:8080".to_string(),
+        None,
     )
 }
 
@@ -78,6 +80,54 @@ async fn sidebar_lists_every_compiled_fhir_version() {
             "sidebar version selector is missing the compiled-in {label} option"
         );
     }
+}
+
+/// #553: the "Resource types" card's sub-line names the effective request
+/// version and reads "used for", not "enabled for" — the figure above it
+/// counts types with stored data, not a configuration state.
+#[tokio::test]
+async fn resource_types_card_reads_used_for_the_effective_version() {
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains("used for R4"),
+        "the Resource types card should read \"used for R4\" on the default build"
+    );
+}
+
+/// #553: switching the sidebar version moves the card's version label with it.
+/// Before this, the card was pinned to the server's boot-time default
+/// (`DashboardSnapshot::fhir_version`) while the sidebar followed the user's
+/// stored choice — two different versions on one page.
+#[cfg(feature = "R4B")]
+#[tokio::test]
+async fn resource_types_card_follows_the_selected_version() {
+    let app = app();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/version")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("version=R4B"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let response = app
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains("used for R4B"),
+        "the card's version label should follow the selected version, not the boot-time default"
+    );
 }
 
 /// #600: the dashboard's "View all resources" union (#599) follows the

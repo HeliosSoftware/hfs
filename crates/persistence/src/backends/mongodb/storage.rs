@@ -684,12 +684,13 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, &id, &resource, &mut session)
             .await?;
 
-        // An active SearchParameter write changes a tenant's overlay: refresh
-        // the stored-param cache (which the per-tenant loader reads) and drop
-        // the cached registries. Draft copies (the seeded spec set) never
-        // overlay, so skip them — avoids an O(n²) reload storm during seeding.
+        // An overlay-affecting SearchParameter write: refresh the stored-param
+        // cache (which the per-tenant loader reads) and drop the cached
+        // registries. Seeded spec copies never affect the overlay (see
+        // `create_affects_overlay`), which keeps bulk seeding from triggering
+        // an O(n²) reload storm.
         if resource_type == "SearchParameter"
-            && crate::search::search_parameter_create_affects_overlay(&resource)
+            && self.tenant_registries().create_affects_overlay(&resource)
         {
             if let Err(e) = self.reload_stored_cache().await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
@@ -1569,6 +1570,13 @@ impl ResourceStorage for MongoBackend {
                 .await
                 .or_query_error(&format!("purge delete ({collection})"))?;
         }
+        // Provider-side Bulk Submit submissions are tenant-keyed documents (#772).
+        db.collection::<Document>(
+            crate::backends::mongodb::bulk_provider::BULK_PROVIDER_COLLECTION,
+        )
+        .delete_many(doc! { "tenant_id": id })
+        .await
+        .or_query_error("purge delete (bulk_provider_submissions)")?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
         // do not reach them — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313).

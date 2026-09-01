@@ -62,13 +62,14 @@ use helios_sof::fhir_format::accept_requires_unsupported_fhir_xml;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::references::resolve_resource_canonical_or_relative;
 use super::sqlquery::{sqlquery_err_to_rest, validate_select_only};
-use super::subject::{SubjectKind, SubjectRef, resolve_subject};
+use super::subject::{
+    RENAMED_VIEW_PARAM_MESSAGE, RENAMED_VIEW_PARAM_NAME, SubjectKind, SubjectRef, resolve_subject,
+};
 use super::view_sources::extract_table_source_views;
 use crate::error::RestError;
 use crate::export::controller::{
-    ExportTask, ExportWork, JobStatus, NamedSqlQuery, NamedView, SqlExportLimits, SqlTableSource,
+    ExportTask, ExportWork, JobStatus, NamedSqlQuery, NamedView, SqlExportLimits,
 };
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
@@ -322,8 +323,9 @@ where
         if bindings.is_some() && !subject.kind.accepts_parameters() {
             return Err(RestError::BadRequest {
                 message: format!(
-                    "subject '{}' is a ViewDefinition, which declares no parameters; \
-                     the `parameters` part requires a SQLQuery or SQLView subject",
+                    "subject '{}' does not accept the `parameters` part: a ViewDefinition \
+                     declares no parameters, and the SQLView profile constrains \
+                     Library.parameter to 0..0; only a SQLQuery subject accepts `parameters`",
                     subject_output_name(name.as_deref(), &subject.resource, index)
                 ),
             });
@@ -369,12 +371,16 @@ fn subject_output_name(explicit: Option<&str>, resource: &Value, index: usize) -
         })
         .unwrap_or_else(|| format!("output-{index}"))
 }
-/// Parses and validates one SQLQuery Library and packages it as a
-/// [`NamedSqlQuery`]: validates the SQL is a single SELECT, enforces the
-/// depends-on cap, resolves every `depends-on` ViewDefinition (preferring
-/// supplied `view` table sources, matched by canonical `url` or by name
-/// against the depends-on label, then falling back to storage resolution),
-/// and binds `Library.parameter` values.
+/// Parses and validates one SQLQuery or SQLView Library and packages it as a
+/// [`NamedSqlQuery`]: validates the SQL is a single SELECT, resolves the full
+/// dependency graph (Phase 1 of [`super::graph`] — every ViewDefinition and
+/// SQLView Library it reaches, preferring supplied `context` table sources
+/// matched by canonical `url`, then falling back to storage resolution),
+/// enforces the graph-size cap, and binds `Library.parameter` values.
+///
+/// The plan carried on the returned [`NamedSqlQuery`] is fully resolved —
+/// every artifact fetched, every structural check passed — so the background
+/// export job (Phase 2) needs no storage access to materialize it.
 async fn prepare_named_sqlquery<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -389,41 +395,26 @@ where
     let library =
         helios_sof::sqlquery::parse_sqlquery_library(library_json).map_err(sqlquery_err_to_rest)?;
 
-    let max_vds = state.config().sof_sqlquery_max_vds;
-    if library.depends_on.len() > max_vds {
-        return Err(RestError::UnprocessableEntity {
-            message: format!(
-                "Library declares {} depends-on ViewDefinitions; max allowed is {}",
-                library.depends_on.len(),
-                max_vds
-            ),
-        });
-    }
-
     validate_select_only(&library.sql)?;
 
-    let mut tables: Vec<SqlTableSource> = Vec::with_capacity(library.depends_on.len());
-    for dep in &library.depends_on {
-        let view = match table_sources
-            .iter()
-            .find(|vd| vd.get("url").and_then(|u| u.as_str()) == Some(dep.url.as_str()))
-        {
-            Some(vd) => vd.clone(),
-            None => {
-                resolve_resource_canonical_or_relative(
-                    state,
-                    tenant.context(),
-                    "ViewDefinition",
-                    &dep.url,
-                )
-                .await?
-            }
-        };
-        tables.push(SqlTableSource {
-            label: dep.label.clone(),
-            view,
-        });
-    }
+    let is_sql_view = matches!(
+        super::subject::classify_subject(library_json)?,
+        super::subject::SubjectKind::SqlView
+    );
+    let subject_url = library_json.get("url").and_then(|v| v.as_str());
+    let fetcher = super::graph::StorageArtifactFetcher::new(state, tenant.context());
+    let subject_node = super::graph::SubjectNode {
+        identity: subject_url,
+        is_sql_view,
+        parameters_empty: library.parameters.is_empty(),
+        depends_on: &library.depends_on,
+    };
+    let plan = super::graph::build_plan(&fetcher, table_sources, subject_node)
+        .await
+        .map_err(super::graph::errors_to_rest_error)?;
+
+    let max_vds = state.config().sof_sqlquery_max_vds;
+    super::graph::check_max_nodes(&plan, max_vds)?;
 
     let bindings = helios_sof::sqlquery::bind_supplied_params(&library.parameters, supplied_params)
         .map_err(sqlquery_err_to_rest)?;
@@ -440,7 +431,7 @@ where
     Ok(NamedSqlQuery {
         name,
         sql: library.sql,
-        tables,
+        plan,
         bindings,
     })
 }
@@ -647,10 +638,7 @@ where
 
     let job_id = controller.submit(task);
     // Spec: `Content-Location` must be the absolute URL of the status endpoint.
-    let location = format!(
-        "{base}/export/{job_id}/status",
-        base = state.base_url().trim_end_matches('/'),
-    );
+    let location = state.public_url_for_request(tenant, ["export", job_id.as_str(), "status"]);
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -777,10 +765,8 @@ where
         // it never communicates the job's outcome. The outcome (manifest on
         // success, OperationOutcome on failure) is served from the result URL.
         Some(JobStatus::Failed { .. }) | Some(JobStatus::Completed { .. }) => {
-            let result_url = format!(
-                "{base}/export/{job_id}/result",
-                base = state.base_url().trim_end_matches('/'),
-            );
+            let result_url =
+                state.public_url_for_request(&tenant, ["export", job_id.as_str(), "result"]);
             let mut headers = HeaderMap::new();
             if let Ok(v) = HeaderValue::from_str(&result_url) {
                 headers.insert(header::LOCATION, v);
@@ -792,7 +778,7 @@ where
 
 /// Constructs the SQL-on-FHIR v2 completion manifest as a FHIR `Parameters` resource.
 fn build_completion_manifest(
-    base_url: &str,
+    status_url: &str,
     job_id: &str,
     outputs: &[(String, String)],
     submitted_at: chrono::DateTime<chrono::Utc>,
@@ -831,10 +817,6 @@ fn build_completion_manifest(
         })
         .collect();
 
-    let status_url = format!(
-        "{base}/export/{job_id}/status",
-        base = base_url.trim_end_matches('/'),
-    );
     let duration_secs = (completed_at - submitted_at).num_seconds().max(0);
 
     let mut params: Vec<Value> = vec![
@@ -943,8 +925,14 @@ where
             // (e.g. an S3 pre-signing error) must not yield a manifest with a
             // missing/empty `location`, so surface it as a 500 instead.
             let mut outputs: Vec<(String, String)> = Vec::with_capacity(files.len());
+            let public_base_url = state.public_base_url_for_request(&tenant);
             for f in &files {
-                match controller.download_url(tenant.tenant_id(), &job_id, &f.filename) {
+                match controller.download_url(
+                    tenant.tenant_id(),
+                    &public_base_url,
+                    &job_id,
+                    &f.filename,
+                ) {
                     Some(url) => outputs.push((f.view_name.clone(), url)),
                     None => {
                         return Ok((
@@ -976,11 +964,13 @@ where
             if let Ok(v) = HeaderValue::from_str(&expires_str) {
                 headers.insert(header::EXPIRES, v);
             }
+            let status_url =
+                state.public_url_for_request(&tenant, ["export", job_id.as_str(), "status"]);
             Ok((
                 StatusCode::OK,
                 headers,
                 axum::Json(build_completion_manifest(
-                    state.base_url(),
+                    &status_url,
                     &job_id,
                     &outputs,
                     submitted_at,
@@ -1156,12 +1146,20 @@ fn parse_export_query(raw: Option<&str>) -> Result<ExportQueryParams, Response> 
 }
 
 /// Rejects body parameters whose `name` is not in [`ALLOWED_BODY_PARAMS`].
-/// Returns `Some(400 response)` on the first offender.
+/// Returns `Some(400 response)` on the first offender. A parameter named
+/// exactly `view` — the pre-ballot spelling of `context` — gets a didactic
+/// diagnostic naming the rename; any other unrecognised name gets the
+/// generic "unsupported body parameter" message.
 fn validate_unknown_body_params(body: &Value, allowed: &[&str], op: &str) -> Option<Response> {
     let entries = body.get("parameter").and_then(|v| v.as_array())?;
     for entry in entries {
         let name = entry.get("name").and_then(|n| n.as_str())?;
         if !allowed.contains(&name) {
+            let diagnostics = if name == RENAMED_VIEW_PARAM_NAME {
+                RENAMED_VIEW_PARAM_MESSAGE.to_string()
+            } else {
+                format!("unsupported body parameter '{name}' for {op}")
+            };
             return Some(
                 (
                     StatusCode::BAD_REQUEST,
@@ -1170,9 +1168,7 @@ fn validate_unknown_body_params(body: &Value, allowed: &[&str], op: &str) -> Opt
                         "issue": [{
                             "severity": "error",
                             "code": "not-supported",
-                            "diagnostics": format!(
-                                "unsupported body parameter '{name}' for {op}"
-                            )
+                            "diagnostics": diagnostics
                         }]
                     })),
                 )

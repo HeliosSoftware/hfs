@@ -1,146 +1,61 @@
 {% extends "layouts/base.html" %}
+{% import "partials/dialog.html" as dialog %}
 
 {% block title %}{{ name }} — {{ i18n.t("bulk-import-title") }}{% endblock %}
-
 {% block breadcrumb %}{% endblock %}
-
 {% block content %}
-<header class="page-head page-head--row">
-  <div>
-    <a href="/ui/bulk-import">‹ {{ i18n.t("bulk-import-all") }}</a>
+<header class="page-head page-head--back-link">
+  <a class="back-link" href="/ui/bulk-import">
+    <span aria-hidden="true">{% include "icons/chevron-left.svg" %}</span>
+    <span>{{ i18n.t("bulk-import-all") }}</span>
+  </a>
+  <div class="page-head__copy">
     <h1 class="page-head__title">{{ name }}</h1>
+    <p class="page-head__lede">{{ i18n.t("bulk-import-detail-lede") }}</p>
   </div>
-
-  <details class="addbox addbox--modal">
-    <summary class="btn btn--primary">
-      {% include "icons/plus.svg" %}
-      {{ i18n.t("bulk-import-add-manifest") }}
-    </summary>
-    <div class="addbox__panel">
-      <div class="addbox__head">
-        <div class="addbox__title">{{ i18n.t("bulk-import-add-manifest-title") }}</div>
-        <button type="button" class="addbox__x" data-addbox-close
-                aria-label="{{ i18n.t("ui-close") }}">×</button>
-      </div>
-      <form method="post" action="/ui/bulk-import/{{ id }}/manifests">
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-manifest-url") }}</span>
-          <input class="field__input" type="url" name="manifest_url" required autocomplete="off">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-manifest-url-hint") }}</span>
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-fhir-base") }}</span>
-          <input class="field__input" type="url" name="fhir_base_url" autocomplete="off">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-fhir-base-hint") }}</span>
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-output-format") }}</span>
-          <input class="field__input" type="text" name="output_format" autocomplete="off"
-                 placeholder="application/fhir+ndjson">
-          <span class="field__hint">{{ i18n.t("bulk-import-field-output-format-hint") }}</span>
-        </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-import-field-headers") }}</span>
-          <textarea class="field__input" name="file_request_headers" rows="2"
-                    placeholder="Authorization: Bearer …"></textarea>
-          <span class="field__hint">{{ i18n.t("bulk-import-field-headers-hint") }}</span>
-        </label>
-        <div class="addbox__actions">
-          <button type="button" class="btn" data-addbox-close>{{ i18n.t("ui-cancel") }}</button>
-          <button type="submit" class="btn btn--primary">
-            {{ i18n.t("bulk-import-add-manifest-submit") }}
-          </button>
-        </div>
-      </form>
-    </div>
-  </details>
 </header>
 
-{% match error %}{% when Some(message) %}
-<div class="card notice">{{ message }}</div>
-{% when None %}{% endmatch %}
-
-<section class="card detail">
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-recipient") }}</span><code>{{ recipient }}</code></div>
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-id") }}</span><code>{{ id }}</code></div>
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-submitter") }}</span><code>{{ submitter_display }}</code></div>
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-created") }}</span><div>{{ created_at }}</div></div>
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-status") }}</span><div>{{ status_label }}</div></div>
-  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-auth") }}</span><div>{{ auth }}</div></div>
-
-  <div class="detail__actions">
-    <form method="post" action="/ui/bulk-import/{{ id }}/abort">
-      <button type="submit" class="btn">{{ i18n.t("bulk-import-abort") }}</button>
-    </form>
-    <form method="post" action="/ui/bulk-import/{{ id }}/complete">
-      <button type="submit" class="btn">{{ i18n.t("bulk-import-complete") }}</button>
-    </form>
+<section class="card panel bulk-import-section bulk-import-summary-card">
+  <div class="kv-grid kv-grid--flush">
+    <div class="detail__field detail__field--wide"><span>{{ i18n.t("bulk-import-field-manifest-url") }}</span><code>{{ manifest_url }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-recipient") }}</span><code>{{ recipient }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-id") }}</span><code>{{ id }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-submitter") }}</span><code>{{ submitter_display }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-created") }}</span><code>{{ created_at }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-status") }}</span><div id="submission-status">{{ status_label }}</div></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-auth") }}</span><div>{{ auth }}</div></div>
+  </div>
+  <div class="detail__actions bulk-import-summary__actions">
+    {% call dialog::modal(i18n.t("bulk-import-edit"), "bulk-import-edit-title", i18n.t("bulk-import-edit-title"), icon="pencil", primary=false, open=edit_open) %}
+        {% match error %}{% when Some(message) %}<div class="alert" role="alert">{{ message }}</div>{% when None %}{% endmatch %}
+        <form method="post" action="/ui/bulk-import/{{ id }}/edit">
+          {# `value=name` would resolve to the macro's own `name` parameter
+             (macro args shadow the caller's scope), so bind it first. #}
+          {% let submission_name = name.as_str() %}
+          {% call dialog::field(i18n.t("bulk-import-field-name"), "name", "text", required=true, initial_focus=true, value=submission_name) %}{% endcall %}
+          {% let auth_value = auth.as_str() %}
+          {% let client_id_value = client_id.as_str() %}
+          {% let token_url_value = token_url.as_str() %}
+          {% let test_auth_result_id = "edit-test-auth-result" %}
+          {% include "partials/bulk_import_auth_fieldset.html" %}
+          <div class="addbox__actions">
+            <button type="button" class="btn" data-addbox-close>{{ i18n.t("ui-cancel") }}</button>
+            <button type="submit" class="btn btn--primary">{{ i18n.t("bulk-import-edit-submit") }}</button>
+          </div>
+        </form>
+    {% endcall %}
     <form method="post" action="/ui/bulk-import/{{ id }}/delete">
-      <button type="submit" class="btn">{{ i18n.t("bulk-import-delete") }}</button>
+      <button type="submit" class="btn btn--danger">{% include "icons/trash.svg" %}{{ i18n.t("bulk-import-delete") }}</button>
     </form>
   </div>
 </section>
 
-<div hx-get="/ui/bulk-import/{{ id }}/status" hx-trigger="load" hx-swap="outerHTML">
-  <div id="bulk-status"></div>
-</div>
+<div id="bulk-status" hx-get="/ui/bulk-import/{{ id }}/status" hx-trigger="load" hx-swap="outerHTML"></div>
 
 <section class="card table-card">
-  <div class="toolbar">
-    <h2 class="toolbar__title">
-      {{ i18n.t("bulk-import-manifests") }}
-      <span class="toolbar__count">{{ manifests.len() }} {{ i18n.t("bulk-import-records") }}</span>
-    </h2>
-    {% if !manifests.is_empty() %}
-    <form method="post" action="/ui/bulk-import/{{ id }}/submit-all">
-      <button type="submit" class="btn btn--primary">
-        {{ i18n.t("bulk-import-submit-all") }}
-      </button>
-    </form>
-    {% endif %}
-  </div>
-
-  <div class="table-wrap">
-  <table class="data-table">
-    <tbody>
-      {% for m in manifests %}
-      <tr>
-        <td>{{ m.manifest_url }}</td>
-        <td>{{ m.last_submitted_at }}</td>
-        <td>
-          <form method="post" action="/ui/bulk-import/{{ id }}/manifests/{{ m.id }}/submit">
-            <button type="submit" class="btn btn--primary">
-              {{ i18n.t("bulk-import-submit") }}
-            </button>
-          </form>
-        </td>
-        <td>
-          <form method="post" action="/ui/bulk-import/{{ id }}/manifests/{{ m.id }}/abort">
-            <button type="submit" class="btn">{{ i18n.t("bulk-import-abort-manifest") }}</button>
-          </form>
-          <form method="post" action="/ui/bulk-import/{{ id }}/manifests/{{ m.id }}/delete">
-            <button type="submit" class="btn">{{ i18n.t("bulk-import-remove") }}</button>
-          </form>
-        </td>
-      </tr>
-      {% endfor %}
-      {% if manifests.is_empty() %}
-      <tr class="data-table__empty"><td colspan="4">{{ i18n.t("bulk-import-no-manifests") }}</td></tr>
-      {% endif %}
-    </tbody>
-  </table>
-  </div>
-</section>
-
-<section class="card table-card">
-  <div class="toolbar">
-    <h2 class="toolbar__title">{{ i18n.t("bulk-import-log") }}</h2>
-  </div>
-  {% if log.is_empty() %}
-  <p>{{ i18n.t("bulk-import-log-empty") }}</p>
-  {% else %}
-  <pre class="detail__code">{% for line in log %}{{ line.at }}  {{ line.message }}
-{% endfor %}</pre>
-  {% endif %}
+  <div class="toolbar"><h2 class="toolbar__title">{{ i18n.t("bulk-import-log") }}</h2></div>
+  {% if log.is_empty() %}<div class="empty-state">{{ i18n.t("bulk-import-log-empty") }}</div>
+  {% else %}<pre class="detail__code">{% for line in log %}{{ line.at }}  {{ line.message }}
+{% endfor %}</pre>{% endif %}
 </section>
 {% endblock %}

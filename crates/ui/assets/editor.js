@@ -291,62 +291,13 @@
     });
   }
 
-  /* ---- JSON view: folding + raw editing -------------------------------- */
+  /* ---- raw JSON editing ------------------------------------------------- */
 
   function applyView() {
     /* No-op retained as the render hook the round trip calls after a swap. */
   }
 
-  /* Collapses or expands a container: hides every line inside it and shows the
-   * `{ … }` / `[ N ]` summary on the opening line. Pure CSS class toggling —
-   * the fold state is a data attribute JS reads. */
-  function toggleFold(foldId, collapse) {
-    var opener = root.querySelector('.json-line[data-fold-id="' + foldId + '"]');
-    if (opener) opener.classList.toggle("json-line--collapsed", collapse);
-    root.querySelectorAll(".json-line").forEach(function (line) {
-      var parents = (line.dataset.parents || "").split(" ");
-      if (parents.indexOf(foldId) !== -1) {
-        // A line stays hidden if ANY ancestor is collapsed.
-        line.hidden = anyAncestorCollapsed(line);
-      }
-    });
-  }
-
-  function anyAncestorCollapsed(line) {
-    var parents = (line.dataset.parents || "").split(" ");
-    for (var i = 0; i < parents.length; i++) {
-      if (!parents[i]) continue;
-      var opener = root.querySelector('.json-line[data-fold-id="' + parents[i] + '"]');
-      if (opener && opener.classList.contains("json-line--collapsed")) return true;
-    }
-    return false;
-  }
-
-  function foldAll(collapse) {
-    root.querySelectorAll(".json-line--foldable").forEach(function (opener) {
-      // Never fold the root object away entirely.
-      if (!opener.dataset.parents) return;
-      opener.classList.toggle("json-line--collapsed", collapse);
-    });
-    root.querySelectorAll(".json-line").forEach(function (line) {
-      if (line.dataset.parents) line.hidden = anyAncestorCollapsed(line);
-    });
-  }
-
   root.addEventListener("click", function (event) {
-    /* Fold arrow. */
-    var arrow = event.target.closest("[data-fold]");
-    if (arrow) {
-      var id = arrow.dataset.fold;
-      var opener = root.querySelector('.json-line[data-fold-id="' + id + '"]');
-      toggleFold(id, opener && !opener.classList.contains("json-line--collapsed"));
-      return;
-    }
-    var foldAllBtn = event.target.closest("[data-json-fold]");
-    if (foldAllBtn) {
-      foldAll(foldAllBtn.dataset.jsonFold === "all");
-      return;
-    }
     /* Raw-edit toggle: swap the fold view for the textarea and back. */
     if (event.target.id === "editor-json-edit") {
       var raw = document.getElementById("editor-json-raw");

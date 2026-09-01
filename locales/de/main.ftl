@@ -28,6 +28,10 @@ language-label = Sprache
 language-en = Englisch
 language-es = Spanisch
 language-de = Deutsch
+user-menu-label = Kontomenü
+user-anonymous = Anonymer Benutzer
+user-local-hint = Authentifizierung ist deaktiviert
+user-logout = Abmelden
 
 ## Startseite
 
@@ -56,7 +60,7 @@ terminology-lede = Verbinden Sie HFS mit einem FHIR-Terminologieserver.
 terminology-configured-heading = Terminologieserver konfiguriert
 terminology-configured-body = HFS_TERMINOLOGY_SERVER verweist auf eine gültige Server-URL.
 terminology-configured-open = Terminologieserver öffnen
-terminology-invalid-heading = HFS_TERMINOLOGY_SERVER ist ungültig
+terminology-invalid-heading = HFS_TERMINOLOGY_SERVER ist ungültig.
 terminology-invalid-body = Verwenden Sie eine absolute HTTP- oder HTTPS-URL mit einem Host. Pfade und ein abschließender Schrägstrich sind zulässig. Fügen Sie keine Zugangsdaten, Abfrageparameter oder Fragmente ein.
 terminology-invalid-note = Aktualisieren Sie die Umgebungsvariable und starten Sie HFS neu.
 terminology-setup-heading = Terminologieserver verbinden
@@ -78,14 +82,15 @@ action-retry = Erneut versuchen
 
 error-not-found = Die angeforderte Ressource wurde nicht gefunden.
 error-unauthorized = Sie sind nicht berechtigt, diese Aktion auszuführen.
-error-generic = Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.
+error-generic = Etwas ist schiefgelaufen. Versuchen Sie es erneut.
 
-## Dashboard-Gerüst (Figma „Dashboard V1.1“)
+## Dashboard-Gerüst (Figma "Dashboard V1.1")
 
 nav-section-work = Arbeit
 nav-section-batch-data = Batch & Daten
+nav-section-sql-on-fhir = SQL on FHIR
 nav-section-server = Server
-nav-section-conditional = Bedingt
+nav-section-tools = Werkzeuge
 
 nav-home = Startseite
 nav-search = Suche
@@ -95,16 +100,20 @@ nav-compartments = Compartments
 nav-batch-transaction = Batch / Transaktion
 nav-import = Importieren
 nav-export = Exportieren
-nav-sql-on-fhir = SQL-on-FHIR
+nav-sql-view-definitions = View-Definitionen
+nav-sql-queries = SQL-Abfragen
+nav-sql-views = SQL-Views
+nav-sql-export = SQL-Export
+nav-sql-files = Dateien
 nav-capability-conformance = Capability & Konformität
 nav-search-parameters = Suchparameter
-nav-admin-ops = Admin / Betrieb
 nav-subscriptions = Abonnements
 nav-tenants = Mandanten
 
 ## Mandantenverwaltung (/ui/tenants)
 
 tenants-title = Mandantenverwaltung
+tenants-lede = Tenants anlegen, prüfen und löschen, zwischen denen dieser Server Daten isoliert.
 tenants-unavailable = Die Mandantenregistrierung ist auf diesem Speicher-Backend nicht verfügbar.
 tenants-stat-total = Mandanten gesamt
 tenants-stat-total-sub = { $count ->
@@ -130,7 +139,7 @@ tenants-unregistered = nicht registriert
 tenants-delete = Mandant löschen
 tenants-delete-confirm = Mandant „{ $id }" abmelden? Die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
 tenants-row-provisioning = Wird bereitgestellt … das kann einen Moment dauern.
-tenants-row-failed = Bereitstellung fehlgeschlagen
+tenants-row-failed = Der Mandant konnte nicht bereitgestellt werden.
 tenants-dismiss = Verwerfen
 
 tenant-heading = Tenants
@@ -145,7 +154,7 @@ fhir-version = FHIR { $version }
 fhir-version-heading = FHIR-Version
 
 card-resource-types = Ressourcentypen
-card-resource-types-sub = aktiviert für { $version }
+card-resource-types-sub = verwendet für { $version }
 card-stored-resources = Gespeicherte Ressourcen
 card-stored-resources-sub = im aktiven Tenant
 card-export-jobs = Export-Jobs
@@ -185,7 +194,6 @@ history-tab-instance = Instanz
 history-tab-type = Typ-Feed
 history-tab-system = System-Feed
 history-versions-label = Versionen
-history-pick-instance = Instanz wählen
 history-current = aktuell
 history-from = Von
 history-to = Bis
@@ -282,7 +290,7 @@ cmp-new = Neue Compartment-Definition
 cmp-edit = Bearbeiten
 cmp-delete = Löschen
 cmp-delete-confirm = Diese Compartment-Definition löschen? Ihre Compartment-Routen funktionieren dann nicht mehr.
-crud-delete-failed = Löschen fehlgeschlagen
+crud-delete-failed = Das Element konnte nicht gelöscht werden.
 
 ## Compartment-Ansicht & Tester (#237)
 
@@ -335,6 +343,7 @@ queries-recent = Zuletzt
 queries-recent-heading = Letzte Suchen
 queries-recent-empty = Noch keine letzten Suchen — führe eine aus, um sie hier einzutragen.
 queries-invalid-url = Gib eine Suche wie GET /Patient?name=smith ein — der Ressourcentyp kommt aus dem Pfad.
+queries-invalid-fhir-escape = Diese Abfrage enthält eine ungültige FHIR-Escapesequenz. Korrigiere den maskierten Wert, bevor du ihn visuell bearbeitest.
 
 queries-conditions = Bedingungen
 queries-add-condition = Bedingung hinzufügen
@@ -417,6 +426,7 @@ queries-open-tab = In neuem Tab öffnen
 queries-col-updated = Aktualisiert
 queries-prev = Zurück
 queries-next = Weiter
+queries-results-fetch-error = Ergebnisse von { $origin } konnten nicht geladen werden. Prüfen Sie HFS_BASE_URL und versuchen Sie es erneut.
 
 queries-rail-heading = Ressourcentypen
 queries-rail-filter = Typen filtern
@@ -496,6 +506,7 @@ editor-primitive-extension-hint = Dieser Wert trägt eigene Extensions (ein `_`-
 
 editor-collapse-all = Alle einklappen
 editor-expand-all = Alle ausklappen
+json-view-toggle-fold = JSON-Abschnitt umschalten
 editor-edit-raw = Rohtext bearbeiten
 editor-versions = Versionen
 editor-versions-none = Keine früheren Versionen.
@@ -505,7 +516,12 @@ editor-versions-none = Keine früheren Versionen.
 
 resources-heading = Ressourcen
 resources-lede = FHIR-Ressourcen durchsuchen, suchen, erstellen und bearbeiten. In natürlicher Sprache suchen oder die Abfrage selbst bauen, dann ein Ergebnis zum Bearbeiten öffnen.
+resources-create = Ressource erstellen
 resources-create-typed = { $type } erstellen
+resources-create-invalid-type = Dieser Ressourcentyp ist in der ausgewählten FHIR-Version nicht verfügbar. Korrigieren Sie die Abfrage oder wählen Sie einen Typ aus der Liste.
+resources-create-not-advertised = Dieser Server erlaubt das Erstellen dieses Ressourcentyps nicht. Sie können ihn weiterhin durchsuchen.
+resources-create-schema-unavailable = Für diesen Ressourcentyp gibt es in der ausgewählten FHIR-Version kein Editorschema. Die UI kann ihn deshalb nicht sicher erstellen.
+resources-create-metadata-unavailable = Die Serverfähigkeiten sind nicht verfügbar. Das Erstellen bleibt deaktiviert, bis die UI sie prüfen kann.
 resources-save-blocked = Beheben Sie die Validierungsprobleme vor dem Speichern.
 resources-save-invalid = Das JSON ist ungültig — beheben Sie es vor dem Speichern.
 resources-edit-title = Ressource bearbeiten
@@ -523,9 +539,9 @@ batch-lede = Lade ein FHIR-Bundle hoch, prüfe die auszuführenden Aktionen, fü
 batch-upload = Hochladen
 batch-drop-hint = Bundle-JSON-Datei hier ablegen
 batch-drop-browse = oder klicken zum Durchsuchen
-batch-invalid-json = Diese Datei ist kein gültiges JSON
-batch-not-a-bundle = Dieses JSON ist kein FHIR-Bundle
-batch-bad-type = Hier lassen sich nur Bundles vom Typ batch oder transaction ausführen
+batch-invalid-json = Diese Datei ist kein gültiges JSON.
+batch-not-a-bundle = Dieses JSON ist kein FHIR-Bundle.
+batch-bad-type = Hier lassen sich nur Bundles vom Typ batch oder transaction ausführen.
 batch-request = Anfrage
 batch-entries = Einträge
 batch-semantics-batch = Batch: Einträge laufen unabhängig — ein fehlgeschlagener Eintrag stoppt die anderen nicht und macht sie nicht rückgängig.
@@ -534,25 +550,27 @@ batch-tab-actions = Aktionen
 batch-tab-json = Bundle-JSON
 batch-no-body = (kein Body — dieser Eintrag adressiert nur eine Ressource)
 batch-cancel = Abbrechen
-batch-upload-another = Weitere hochladen
 batch-execute = Ausführen
+batch-plan-heading = Ausführungsplan
+batch-done = Fertig
 batch-response-heading = Ergebnisse pro Aktion
 batch-sum-created = erstellt
 batch-sum-updated = aktualisiert
 batch-sum-other = gelesen/sonstige
 batch-sum-failed = fehlgeschlagen
-batch-request-failed = Die Anfrage ist fehlgeschlagen
-batch-back = Zurück zum Bundle
-batch-execute-again = Erneut ausführen
+batch-request-failed = Die Anfrage ist fehlgeschlagen.
+batch-reading = Bundle wird gelesen…
+batch-executing = Wird ausgeführt…
+batch-read-failed = Die Datei konnte nicht gelesen werden.
 
 ## Bulk Import workspace (#527)
 
 bulk-import-title = Massenimport
+bulk-import-lede = Vorkoordinierte FHIR-Datensätze mit der Bulk-Data-Operation $bulk-submit an einen Data Recipient senden.
+bulk-import-detail-lede = Manifeste, Status und Ausführungsprotokoll dieser Übermittlung.
 bulk-import-new = Neue Submission
 bulk-import-create-title = Bulk Submission anlegen
 bulk-import-field-name = Name der Submission
-bulk-import-field-recipient = Basis-URL des Empfängers
-bulk-import-field-recipient-hint = Die Basis-URL des Servers, an den die Daten übermittelt werden.
 bulk-import-auth = Authentifizierung
 bulk-import-auth-hint = Wie gegenüber dem Empfängerserver authentifiziert wird.
 bulk-import-auth-none = Keine
@@ -566,14 +584,14 @@ bulk-import-field-token-url-hint = Token-Endpunkt-URL des Autorisierungsservers.
 bulk-import-jwks-hint = Registrieren Sie den öffentlichen Schlüssel dieses Servers beim Empfänger über die JWKS-URL:
 bulk-import-test-auth = Authentifizierung testen
 bulk-import-test-auth-ok = Authentifizierung erfolgreich.
-bulk-import-create-submit = Submission anlegen
+bulk-import-create-submit = Senden
+bulk-import-advanced = Erweiterte Optionen
 bulk-import-unavailable = Das Storage-Backend hostet keinen Settings-Store; Submissions können nicht gespeichert werden.
 bulk-import-submissions = Submissions
 bulk-import-records = Einträge
 bulk-import-col-name = Name
 bulk-import-col-status = Status
 bulk-import-col-created = Erstellt
-bulk-import-col-manifests = Manifeste
 bulk-import-col-destination = Ziel
 bulk-import-empty = Noch keine Submissions. Legen Sie eine an, um zu beginnen.
 bulk-import-all = Alle Submissions
@@ -581,6 +599,7 @@ bulk-import-status-not-started = Nicht gestartet
 bulk-import-status-in-progress = In Bearbeitung
 bulk-import-status-stopped = Angehalten
 bulk-import-status-completed = Abgeschlossen
+bulk-import-status-failed = Fehlgeschlagen
 bulk-import-detail-recipient = Datenempfänger
 bulk-import-detail-id = Submission-ID
 bulk-import-detail-submitter = Einreicher
@@ -588,40 +607,36 @@ bulk-import-detail-created = Erstellt
 bulk-import-detail-status = Status
 bulk-import-detail-auth = Authentifizierung
 bulk-import-abort = Abbrechen
-bulk-import-complete = Abschließen
 bulk-import-delete = Löschen
-bulk-import-add-manifest = Manifest hinzufügen
-bulk-import-add-manifest-title = Manifest hinzufügen
-bulk-import-add-manifest-submit = Hinzufügen
+bulk-import-edit = Bearbeiten
+bulk-import-edit-title = Submission bearbeiten
+bulk-import-edit-submit = Änderungen speichern
 bulk-import-field-manifest-url = Manifest-URL
 bulk-import-field-manifest-url-hint = URL eines Bulk-Export-Manifests mit einem vorkoordinierten FHIR-Datensatz.
-bulk-import-field-fhir-base = FHIR-Basis-URL
-bulk-import-field-fhir-base-hint = Basis-URL, die der Empfänger beim Auflösen relativer Referenzen verwendet. Leer lassen, um die Basis-URL des Manifests zu verwenden.
-bulk-import-field-output-format = Ausgabeformat
+bulk-import-field-output-format = Format
 bulk-import-field-output-format-hint = Das Format der Bulk-Data-Dateien im Manifest.
 bulk-import-field-headers = Header für Dateiabrufe
 bulk-import-field-headers-hint = HTTP-Header, die der Empfänger beim Abruf einer Datendatei verwenden soll, je Zeile "Name: Wert".
-bulk-import-manifests = Manifeste
-bulk-import-no-manifests = Noch keine Manifeste. Fügen Sie eines hinzu, um Daten zu übermitteln.
-bulk-import-submit = Übermitteln
-bulk-import-submit-all = Alle übermitteln
-bulk-import-remove = Entfernen
 bulk-import-log = Submission-Protokoll
 bulk-import-log-empty = Noch nichts übermittelt.
 bulk-import-field-submitter-system = Einreicher-System
 bulk-import-field-submitter-value = Einreicher-Wert
 bulk-import-field-submitter-hint = Muss einem beim Empfänger registrierten Identifier entsprechen (außerhalb des Protokolls abgestimmt). Leer lassen für die generierten Standardwerte.
-bulk-import-field-submission-id = Submission-ID
-bulk-import-field-submission-id-hint = Eindeutig je Einreicher. Leer lassen, um eine UUID zu generieren.
 bulk-import-processing = Verarbeitung
 bulk-import-processing-waiting = Warten auf den ersten Statusbericht des Empfängers …
 bulk-import-result = Ergebnis
 bulk-import-result-finished = Verarbeitung abgeschlossen um
 bulk-import-result-outputs = Ausgabedateien
 bulk-import-result-errors = Fehlerdateien
-bulk-import-abort-manifest = Abbrechen
 ui-cancel = Abbrechen
 ui-close = Schließen
+ui-combobox-selected-label = Ausgewählte Einträge
+ui-combobox-remove = Entfernen
+ui-combobox-added = Hinzugefügt
+ui-combobox-removed = Entfernt
+ui-combobox-loading = Vorschläge werden geladen …
+ui-combobox-results-updated = Verfügbare Vorschläge:
+ui-combobox-error = Vorschläge konnten nicht geladen werden. Versuchen Sie es erneut.
 editor-orphans-title = Diese Probleme haben noch kein Feld — fügen Sie die Elemente hinzu, um sie zu beheben
 editor-hint-date = FHIR date: YYYY, YYYY-MM oder YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD oder ein vollständiger Zeitstempel mit Zeitzone (2024-05-17T14:30:00+02:00)
@@ -633,11 +648,12 @@ editor-hint-instant = FHIR instant: vollständiger Zeitstempel mit Zeitzone, z. 
 subs-title = Abonnements
 subs-lede = Schreibgeschützte Sicht auf die Abonnement-Engine: jedes registrierte Abonnement, sein Kanal, Live-Status und Zustellzähler.
 subs-unavailable = Die Abonnement-Engine ist auf diesem Server nicht aktiviert.
+subs-unavailable-how = Zum Aktivieren HFS starten mit:
 subs-empty = Für diesen Mandanten sind keine Abonnements registriert.
 subs-card-failing = Fehlgeschlagen
-subs-card-failing-sub = braucht Aufmerksamkeit
+subs-card-failing-sub = Braucht Aufmerksamkeit
 subs-card-idle = Inaktiv
-subs-card-idle-sub = keine Clients
+subs-card-idle-sub = Keine Clients
 subs-card-active = Aktiv
 subs-card-active-sub = wird zugestellt
 subs-card-delivered = Zugestellt in 24 h
@@ -654,17 +670,17 @@ subs-col-status = Status
 subs-col-last24 = Letzte 24 h
 subs-col-sent = Gesendet
 subs-col-fails = Fehlerserie
-subs-state-active = aktiv
+subs-state-active = Aktiv
 subs-state-error = Fehler
 subs-state-idle = 0 Clients
-subs-state-requested = angefragt
-subs-state-off = aus
+subs-state-requested = Angefragt
+subs-state-off = Aus
 
 ## Bulk Export workspace (#537)
 
 bulk-export-title = Massenexport
-bulk-export-active-title = Aktive Exporte
-bulk-export-active-link = Aktive Exporte
+bulk-export-lede = Daten mit der FHIR-Bulk-Data-Operation $export als NDJSON-Dateien aus diesem Server exportieren.
+bulk-export-active-title = Exporte
 bulk-export-new = Neuer Export
 bulk-export-unavailable = Das Storage-Backend hostet keinen Settings-Store; Exportaufträge können nicht verfolgt werden.
 bulk-export-scope = Was möchten Sie exportieren?
@@ -676,10 +692,19 @@ bulk-export-scope-group = Gruppe
 bulk-export-scope-group-hint = Nur die Mitglieder einer bereits definierten Kohorte.
 bulk-export-field-group-id = Gruppen-ID
 bulk-export-field-group-id-hint = Erforderlich für den Gruppen-Umfang: die ID der zu exportierenden FHIR-Group.
+bulk-export-field-patients = Patienten
+bulk-export-field-patients-placeholder = Name, Nachname oder exakte FHIR-ID suchen
+bulk-export-field-patients-hint = Suchen Sie nach dem Anfang eines Vor- oder Familiennamens oder geben Sie eine exakte logische FHIR-ID wie Patient/p-104 ein. Leer lassen, um alle Patienten zu exportieren.
+bulk-export-field-patients-fallback-placeholder = Patient/p-104, Patient/p-205
+bulk-export-field-patients-fallback-hint = Geben Sie exakte logische FHIR-IDs durch Kommas oder Zeilenumbrüche getrennt ein. Leer lassen, um alle Patienten zu exportieren.
+bulk-export-field-patients-id-only-hint = Suchen Sie nach einer exakten logischen FHIR-ID wie Patient/p-104. Leer lassen, um alle Patienten zu exportieren.
+bulk-export-field-patients-id-only-placeholder = Exakte FHIR-ID suchen
+bulk-export-patient-options-empty = Keine passenden Patienten gefunden.
+bulk-export-patient-invalid = Geben Sie nur gültige logische Patient-IDs ein, getrennt durch Kommas oder Zeilenumbrüche.
 bulk-export-field-name = Name
 bulk-export-field-name-placeholder = Diabetes-Register 2024
 bulk-export-types = Ressourcentypen
-bulk-export-types-hint = Nichts ankreuzen, um alle Typen zu exportieren.
+bulk-export-all-resources = Alle Ressourcen
 bulk-export-narrow = Eingrenzen
 bulk-export-field-elements = FHIR-Elemente
 bulk-export-field-type-filter = Typfilter
@@ -693,7 +718,10 @@ bulk-export-field-since-custom = Benutzerdefinierter Zeitpunkt
 bulk-export-field-since-custom-hint = Gilt, wenn Seit auf Benutzerdefiniert steht. RFC 3339, z. B. 2026-08-01T00:00:00Z.
 bulk-export-start = Export starten
 bulk-export-running = laufend
-bulk-export-none = Noch keine Exporte. Starten Sie einen auf der Massenexport-Seite.
+bulk-export-clear = Leeren
+bulk-export-files-word = Dateien
+bulk-export-exports-word = Exporte
+bulk-export-none = Noch keine Exporte. Wählen Sie „Neuer Export“, um einen zu starten.
 bulk-export-status-in-progress = Läuft
 bulk-export-status-complete = Abgeschlossen
 bulk-export-status-failed = Fehlgeschlagen
@@ -705,3 +733,743 @@ bulk-export-finished-in = fertig in
 bulk-export-error = Fehler
 bulk-export-cancel = Abbrechen
 bulk-export-retry = Erneut versuchen
+bulk-export-download-all = Alle Ressourcen herunterladen
+bulk-export-download-all-aria = Alle Ressourcen aus { $name } herunterladen
+bulk-export-delete = Löschen
+bulk-export-delete-aria = Export { $name } löschen
+bulk-export-delete-warning = { $name } und die zugehörigen Ausgabedateien vom Server löschen? Dies kann nicht rückgängig gemacht werden.
+bulk-export-delete-confirm = Export löschen
+bulk-export-delete-cancel = Export behalten
+bulk-export-delete-error = Der Export konnte nicht sicher gelöscht werden. Die Karte wurde für einen erneuten Versuch beibehalten.
+
+# CapabilityStatement-Seite (#653)
+cap-title = Capability Statement
+cap-lede = Was dieser Server aktuell leistet, für den gewählten Tenant und die FHIR-Version — live aus /metadata zusammengesetzt.
+cap-summary-heading = Server-Übersicht
+cap-summary-description = Beschreibung
+cap-summary-url = Basis-URL
+cap-summary-fhir-version = FHIR-Version
+cap-summary-status = Status
+cap-summary-kind = Art
+cap-summary-date = Datum
+cap-summary-formats = Formate
+cap-interactions-heading = System-Interaktionen
+cap-transaction-note = transaction wird angeboten, weil das aktive Backend atomare Transaktionen unterstützt; batch ist immer verfügbar.
+cap-role-matrix = Backend-Rollenmatrix anzeigen.
+cap-operations-heading = Operationen
+cap-col-operation = Operation
+cap-col-definition = Definition
+cap-resources-heading = Fähigkeiten pro Ressource
+cap-filter-placeholder = Typen filtern…
+cap-col-type = Typ
+cap-col-interactions = Interaktionen
+cap-col-search-params = Suchparameter
+cap-col-includes = Includes
+cap-col-revincludes = Revincludes
+cap-resources-empty = Kein Ressourcentyp entspricht dem Filter.
+cap-raw-toggle = Rohes CapabilityStatement (JSON)
+cap-raw-load = Unformatiertes JSON öffnen
+cap-raw-loading = Hervorgehobenes JSON wird geladen…
+cap-raw-plain = Fallback als unformatiertes JSON. Mit JavaScript wird die Hervorhebung schrittweise geladen.
+cap-json-load-error = Dieser JSON-Abschnitt konnte nicht geladen werden. Zum Wiederholen schließen und erneut öffnen.
+cap-json-truncated = Anzeige gekürzt
+cap-json-path-too-deep = maximale Aufklapptiefe erreicht
+cap-json-pagination-label = JSON-Elemente
+cap-json-page-prev = Zurück
+cap-json-page-next = Weiter
+cap-unavailable = Das CapabilityStatement konnte nicht vom Server geladen werden — der Selbstaufruf benötigt bei aktivierter Authentifizierung eventuell ein Ausgangs-Token.
+
+## Stubs der SQL-on-FHIR-Sektion (#649)
+
+
+sql-vd-title = View-Definitionen
+sql-vd-lede = Erstelle und verwalte die ViewDefinitions, mit denen SQL on FHIR Ressourcen abflacht.
+
+sql-queries-title = SQL-Abfragen
+sql-queries-lede = Führe SQL-on-FHIR-Abfragen gegen diesen Server aus.
+
+sql-views-title = SQL-Views
+sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
+
+sql-export-title = SQL-Export
+sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
+
+sql-files-title = Dateien
+sql-files-lede = Manifeste und Ausgabedateien der SQL-Exporte.
+
+## View-Definitionen-Arbeitsbereich (#649)
+
+vd-new = Neu erstellen
+vd-new-title = Neue View-Definition
+vd-rail-label = View-Definitionen
+vd-rail-heading = View-Definitionen
+vd-filter = Views filtern
+vd-none = Noch keine View-Definitionen.
+vd-empty-lede = Lege mit „Neu erstellen" die erste ViewDefinition an.
+vd-degraded = Die Liste der View-Definitionen konnte nicht geladen werden.
+vd-saved = Gespeichert.
+vd-run = Ausführen
+vd-run-failed = Die View konnte nicht ausgeführt werden.
+vd-save = Speichern
+vd-duplicate = Duplizieren
+vd-delete = Löschen
+vd-delete-confirm = View-Definition „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
+vd-delete-failed = Die View-Definition konnte nicht gelöscht werden.
+vd-json-heading = Definition (JSON)
+vd-results-heading = Ergebnisse
+vd-results-empty = Die View hat keine Zeilen erzeugt.
+vd-pagination-label = View-Definitionsseiten
+vd-page-prev = Zurück
+vd-page-next = Weiter
+
+## SQL-Abfragen- / SQL-Views-Arbeitsbereiche (#649)
+
+sql-queries-new-title = Neue SQL-Abfrage
+sql-views-new-title = Neue SQL-View
+lib-filter = Bibliotheken filtern
+lib-none = Noch keine Bibliotheken.
+lib-empty-lede = Lege mit „Neu erstellen" die erste Bibliothek an.
+lib-degraded = Die Bibliotheksliste konnte nicht geladen werden.
+lib-sql-heading = SQL
+lib-delete-confirm = „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
+lib-delete-failed = Die Bibliothek konnte nicht gelöscht werden.
+
+## SQL-Export- und Dateien-Seiten (#649)
+
+export-start-failed = Der Export konnte nicht gestartet werden.
+export-started = Export gestartet.
+export-cancelled = Abbruch angefordert.
+export-job-heading = Exportauftrag
+export-job-id = Auftrags-ID
+export-job-state = Status
+export-state-running = Läuft
+export-state-done = Abgeschlossen
+export-state-unknown = Unbekannter Auftrag — möglicherweise abgebrochen oder bereinigt.
+export-refresh = Aktualisieren
+export-cancel = Auftrag abbrechen
+export-view-files = Dateien anzeigen
+export-new-heading = Neuer Export
+export-no-subjects = Noch nichts zu exportieren — lege zuerst eine ViewDefinition an.
+export-format = Ausgabeformat
+export-start = Export starten
+files-job-heading = Exportauftrag
+files-load = Manifest laden
+files-error = Das Manifest konnte nicht geladen werden.
+files-outputs-heading = Ausgaben
+files-col-output = Ausgabe
+files-col-downloads = Downloads
+files-shard = Datei { $n }
+files-empty = Der Auftrag hat keine Ausgabedateien erzeugt.
+
+## Administrative HTS-UI (crates/hts-ui) — Phase-1-Stubs
+##
+## Schlüssel für die HTS-UI folgen der Konvention
+## hts-<seite>-<rolle>-<control>. Diese Stubs decken Base-Layout,
+## Seitennavigation und den Dashboard-Platzhalter der Phase-1-Blocker-Slice ab.
+## Sie müssen paritätisch zu en/es/main.ftl bleiben.
+
+-hts-app-name = Helios Terminologieserver
+hts-app-title = { -hts-app-name }
+
+hts-nav-section-work = Terminologie
+hts-nav-section-tools = Werkzeuge
+hts-nav-section-server = Server
+hts-nav-home = Startseite
+hts-nav-code-systems = Codesysteme
+hts-nav-value-sets = Wertemengen
+hts-nav-concept-maps = Konzeptzuordnungen
+hts-nav-operations = Operationen
+hts-nav-import = Import
+
+hts-fhir-version-heading = FHIR-Version
+hts-fhir-version = FHIR { $version }
+
+hts-home-title = Startseite
+hts-home-subtitle = Zustand des Terminologieservers, Katalogbestand und Schnellaktionen.
+
+## Dashboard-Zeilen (visuell verborgen, nur für Screenreader).
+
+hts-home-row-status = Serverstatus
+
+## Dashboard-Kacheln.
+
+hts-home-tile-status = Status
+hts-home-tile-uptime = Laufzeit
+hts-home-tile-loaded-systems = Geladene Codesysteme
+hts-home-tile-loaded-systems-hint = Aus TerminologyCapabilities.codeSystem[]
+hts-home-tile-requests = Anfragen
+hts-home-tile-metrics-hint = Seit Serverstart
+
+## Anfragerate-Diagramm der Startseite (Design-Dokument §7.1). Zeigt eine aus
+## den kumulativen `/metrics`-Zählern gebildete Rate, die nur erfasst wird,
+## solange diese Seite geöffnet ist — daher braucht jeder „nichts zu
+## zeichnen“-Zustand einen eigenen Text.
+
+hts-home-chart-title = Anfragen pro Minute
+hts-home-chart-window = Zeitfenster des Diagramms
+hts-home-chart-series = Statusklasse
+hts-home-chart-window-15m = 15 Min.
+hts-home-chart-window-1h = 1 Std.
+hts-home-chart-window-6h = 6 Std.
+hts-home-chart-series-all = Alle
+hts-home-chart-series-2xx = 2xx
+hts-home-chart-series-4xx = 4xx
+hts-home-chart-series-5xx = 5xx
+hts-home-chart-empty-unreachable = /metrics ist nicht erreichbar – es kommen keine neuen Messwerte an.
+hts-home-chart-empty-none = Noch keine Messwerte erfasst.
+hts-home-chart-empty-first = Erstes Intervall wird erfasst — eine Rate benötigt zwei Messwerte.
+hts-home-chart-empty-window = Keine Messwerte in diesem Zeitfenster. Die Erfassung läuft nur, solange diese Seite geöffnet ist.
+hts-home-chart-axis-now = jetzt
+hts-home-chart-axis-minutes = -{ $n } Min.
+hts-home-chart-axis-hours = -{ $n } Std.
+
+## `status`-Werte aus /health, per Schlüssel übersetzbar.
+
+hts-home-status-ok = OK
+
+## Degradiert-Banner (Design-Dokument §7-Kontrakt).
+
+hts-degraded-title = Das Terminologie-Backend ist nicht vollständig verfügbar
+hts-degraded-body = Einige Kacheln werden ausgeblendet, bis HTS wieder erreichbar ist. Interaktive Bedienelemente sind auf betroffenen Seiten deaktiviert.
+hts-degraded-reason-client-build = Der ausgehende HTTP-Client konnte nicht erstellt werden.
+hts-degraded-reason-upstream-down = Der Terminologieserver ist nicht erreichbar.
+hts-degraded-reason-upstream-timeout = Der Terminologieserver hat nicht rechtzeitig geantwortet.
+hts-degraded-reason-upstream-error = Der Terminologieserver hat einen Fehlerstatus zurückgegeben.
+hts-degraded-reason-upstream-shape = Der Terminologieserver hat eine Antwort in unerwarteter Form zurückgegeben.
+hts-degraded-reason-bootstrapping = Der Terminologieserver lädt noch seine Ausgangsdaten.
+hts-degraded-reason-unknown = Der Terminologieserver ist vorübergehend nicht verfügbar.
+
+## Dialekt-Chip (Topbar, sitzungsweiter displayLanguage / Accept-Language — §7.1).
+
+
+## OperationOutcome-Partial (gemeinsam — §7 / §11).
+
+hts-outcome-severity = Schweregrad: { $severity }
+hts-outcome-request-id = Anfrage-ID: { $id }
+hts-outcome-code-not-found = Die angeforderte Ressource wurde nicht gefunden.
+hts-outcome-code-invalid = Die Anfrage wurde als ungültig zurückgewiesen.
+hts-outcome-code-too-costly = Die angeforderte Operation wurde als zu teuer zurückgewiesen.
+hts-outcome-code-unknown = Der Server hat ein Problem gemeldet, das die UI nicht kennt.
+hts-degraded-since = Seit { $timestamp }
+
+## HTS Slice B — CodeSystem-Browser + Detailansicht mit eingebettetem Workbench
+## (Design-Dokument §7.2 + §7.3). Jeder Schlüssel hat ein Pendant in en/es/main.ftl.
+
+## CodeSystem-Statuspillen (Browser-Zeilen und Detail-Kopfzeile).
+
+hts-cs-status-draft = Entwurf
+hts-cs-status-active = aktiv
+hts-cs-status-retired = zurückgezogen
+hts-cs-status-unknown = unbekannt
+
+## CodeSystem-Browserseite.
+
+hts-cs-browser-title = Codesysteme
+hts-cs-browser-subtitle = Durchsuche den CodeSystem-Katalog des Terminologieservers und öffne eine Zeile, um Metadaten und Workbench einzusehen.
+hts-cs-browser-filter-legend = CodeSysteme filtern
+hts-cs-browser-filter-url = Kanonische URL
+hts-cs-browser-filter-version = Version
+hts-cs-browser-filter-name = Name
+hts-cs-browser-filter-title = Titel
+hts-cs-browser-filter-status = Status
+hts-cs-browser-filter-search = Suchen
+hts-cs-browser-filter-reset = Zurücksetzen
+hts-cs-browser-empty = Keine CodeSysteme entsprechen diesen Filtern.
+hts-cs-browser-load-more = Mehr laden
+hts-cs-browser-showing-count = Es werden { $count ->
+    [one] { $count } CodeSystem angezeigt
+   *[other] { $count } CodeSysteme angezeigt
+}
+hts-cs-browser-table-caption = CodeSysteme, die zu den aktiven Filtern passen.
+hts-cs-browser-column-url = URL
+hts-cs-browser-column-version = Version
+hts-cs-browser-column-title = Titel
+hts-cs-browser-column-status = Status
+hts-cs-browser-column-name = Name
+
+## Phase 5 — HTS-Suchformular: gemeinsame Zeichenketten (CS / VS / CM).
+
+hts-search-rail-label = Suchfilter
+hts-search-rail-heading = Filter
+hts-facet-status-any = Jeder Status
+
+## CodeSystem-Detailseite.
+
+hts-cs-detail-title = { $name } · CodeSystem
+hts-cs-detail-title-fallback = CodeSystem
+hts-cs-detail-eyebrow = CodeSystem
+hts-cs-detail-section-identity = Identität
+hts-cs-detail-section-content = Inhalt
+hts-cs-detail-content-mode = Inhaltsmodus
+hts-cs-detail-count = Anzahl Konzepte
+hts-cs-detail-publisher = Herausgeber
+hts-cs-detail-jurisdiction = Zuständigkeit
+hts-cs-detail-supersedes = Ersetzt
+hts-cs-detail-superseded-by = Ersetzt durch
+hts-cs-detail-tabs-label = CodeSystem-Workbench-Abschnitte
+hts-cs-detail-tab-lookup = Nachschlagen
+hts-cs-detail-tab-validate = Validieren
+hts-cs-detail-tab-subsumes = Subsumption
+hts-cs-detail-result-empty = Führe die Operation aus, um das Ergebnis hier zu sehen.
+
+## $lookup-Formular + Ergebnisbeschriftungen.
+
+hts-cs-lookup-heading = Konzept nachschlagen
+hts-cs-lookup-code = Code
+hts-cs-lookup-version = Version
+hts-cs-lookup-display-language = Anzeigesprache
+hts-cs-lookup-display-language-placeholder = z. B. de-DE
+hts-cs-lookup-properties-legend = Eigenschaften
+hts-cs-lookup-designations = Bezeichnungen
+hts-cs-lookup-properties = Eigenschaften
+hts-cs-lookup-no-match = HTS hat kein passendes Konzept zurückgegeben.
+
+## $validate-code-Formular + Ergebnisbeschriftungen.
+
+hts-cs-validate-heading = Code validieren
+hts-cs-validate-mode-legend = Eingabemodus
+hts-cs-validate-mode-code = Einzelcode
+hts-cs-validate-mode-coding = Coding
+hts-cs-validate-code = Code
+hts-cs-validate-display = Anzeige
+hts-cs-validate-coding-legend = Coding
+hts-cs-validate-coding-system = System
+hts-cs-validate-coding-code = Code
+hts-cs-validate-coding-display = Anzeige
+hts-cs-validate-badge-true = gültig
+hts-cs-validate-badge-false = ungültig
+hts-cs-validate-message = Meldung
+
+## $subsumes-Formular + Ergebnisbeschriftungen.
+
+hts-cs-subsumes-heading = Subsumption prüfen
+hts-cs-subsumes-scoped-system = System (festgelegt)
+hts-cs-subsumes-code-a = Code A
+hts-cs-subsumes-code-b = Code B
+hts-cs-subsumes-outcome-equivalent = Die Codes sind äquivalent.
+hts-cs-subsumes-outcome-subsumes = Code A subsumiert Code B.
+hts-cs-subsumes-outcome-subsumed-by = Code A wird von Code B subsumiert.
+hts-cs-subsumes-outcome-not-subsumed = Keiner der Codes subsumiert den anderen.
+
+## Geteilte Workbench-Chrome (auch für Slice C/D/E).
+
+hts-workbench-run = Ausführen
+hts-workbench-raw-response = Rohanfrage und -antwort
+hts-workbench-copy-url = Anfrage-URL
+
+## Zusätzlicher Degradiert-Grund für 404 beim CodeSystem-Read (§7.3).
+
+hts-degraded-reason-upstream-not-found = Der Terminologieserver hat diese Ressource nicht gefunden.
+
+## HTS Slice C — ValueSet-Browser + Detailseite mit $expand-Werkbank
+## (design doc §7.4 + §7.4.1). Jeder Schlüssel hat ein Pendant in en/es/main.ftl.
+
+## Statusabzeichen für ValueSet.
+
+hts-vs-status-draft = Entwurf
+hts-vs-status-active = aktiv
+hts-vs-status-retired = zurückgezogen
+hts-vs-status-unknown = unbekannt
+
+## VS-Browser-Seite.
+
+hts-vs-browser-title = ValueSets
+hts-vs-browser-subtitle = Durchsuche den ValueSet-Katalog des Terminologieservers und öffne eine Zeile, um Metadaten oder eine Expansion einzusehen.
+hts-vs-browser-filter-legend = ValueSets filtern
+hts-vs-browser-filter-url = Kanonische URL
+hts-vs-browser-filter-version = Version
+hts-vs-browser-filter-name = Name
+hts-vs-browser-filter-title = Titel
+hts-vs-browser-filter-status = Status
+hts-vs-browser-filter-search = Suchen
+hts-vs-browser-filter-reset = Zurücksetzen
+hts-vs-browser-empty = Keine ValueSets für diese Filter.
+hts-vs-browser-load-more = Mehr laden
+hts-vs-browser-showing-count = Zeige { $count ->
+    [one] { $count } ValueSet
+   *[other] { $count } ValueSets
+}
+hts-vs-browser-table-caption = ValueSets, die den aktiven Filtern entsprechen.
+hts-vs-browser-column-url = URL
+hts-vs-browser-column-version = Version
+hts-vs-browser-column-title = Titel
+hts-vs-browser-column-status = Status
+hts-vs-browser-column-name = Name
+
+## VS-Detailseite.
+
+hts-vs-detail-title = { $name } · ValueSet
+hts-vs-detail-title-fallback = ValueSet
+hts-vs-detail-eyebrow = ValueSet
+hts-vs-detail-section-identity = Identität
+hts-vs-detail-section-governance = Verwaltung
+hts-vs-detail-publisher = Herausgeber
+hts-vs-detail-jurisdiction = Zuständigkeit
+hts-vs-detail-immutable = Unveränderlich
+hts-vs-detail-immutable-yes = ja
+hts-vs-detail-immutable-no = nein
+hts-vs-detail-purpose = Zweck
+hts-vs-detail-copyright = Urheberrecht
+hts-vs-detail-tabs-label = ValueSet-Werkbank-Abschnitte
+hts-vs-detail-tab-expand = Expandieren
+hts-vs-detail-result-empty = Führe die Operation aus, um das Ergebnis hier zu sehen.
+
+## $expand — Formular und Ergebnisse.
+
+hts-vs-expand-heading = Diesen ValueSet expandieren
+hts-vs-expand-scoped-valueset = ValueSet (fixiert)
+hts-vs-expand-filter = Filter
+hts-vs-expand-filter-placeholder = Code oder Anzeigetext
+hts-vs-expand-count = count
+hts-vs-expand-offset = offset
+hts-vs-expand-display-language = Anzeigesprache
+hts-vs-expand-display-language-placeholder = z. B. de-DE
+hts-vs-expand-flags-legend = Optionen
+hts-vs-expand-active-only = Nur aktive Konzepte
+hts-vs-expand-include-designations = Designationen einschließen
+hts-vs-expand-mode-legend = Ergebnisformat
+hts-vs-expand-mode-flat = Flach
+hts-vs-expand-mode-tree = Baum
+hts-vs-expand-use-supplement-legend = Ergänzungen anwenden
+hts-vs-expand-use-supplement-placeholder = Kanonische URL
+hts-vs-expand-advanced-summary = Erweitert
+hts-vs-expand-date = Datum
+hts-vs-expand-date-placeholder = ISO 8601 (z. B. 2025-06-01)
+hts-vs-expand-property-legend = Eigenschaften
+hts-vs-expand-property-placeholder = Eigenschaftscode
+hts-vs-expand-tx-resource-legend = tx-resource
+hts-vs-expand-tx-resource-placeholder = Kanonische URL oder Referenz
+hts-vs-expand-system-version-legend = system-version
+hts-vs-expand-system-version-placeholder = System|Version
+hts-vs-expand-check-system-version-legend = check-system-version
+hts-vs-expand-force-system-version-legend = force-system-version
+hts-vs-expand-default-valueset-version = default-valueset-version
+hts-vs-expand-threshold = Too-costly-Schwelle
+hts-vs-expand-ceiling-tooltip = UI-Obergrenze: { $ceiling } (höhere Werte werden verworfen)
+hts-vs-expand-ceiling-note = Obergrenze: { $ceiling }
+hts-vs-expand-ceiling-warning-title = Schwelle über der UI-Obergrenze
+hts-vs-expand-ceiling-warning-body = Schwelle { $requested } liegt über der UI-Obergrenze — der Header wurde nicht angehängt.
+hts-vs-expand-ceiling-value = Obergrenze: { $ceiling }
+hts-vs-expand-too-costly-title = Expansion als zu teuer abgelehnt
+hts-vs-expand-too-costly-body = HTS hat die Expansion oberhalb der aktuellen Schwelle abgelehnt. Höher setzen und erneut versuchen, oder den Filter enger fassen.
+hts-vs-expand-raise-threshold = Schwelle anheben auf
+hts-vs-expand-raise-submit = Erneut versuchen
+hts-vs-expand-tree-label = zeige den ganzen Baum { $count ->
+    [one] { $count } Blatt
+   *[other] { $count } Blätter
+}
+hts-vs-expand-total-label = insgesamt { $total }
+hts-vs-expand-total-unknown = insgesamt (unbekannt)
+hts-vs-expand-offset-label = offset { $offset }
+hts-vs-expand-filter-no-match = Kein Element entspricht dem Filter "{ $filter }".
+hts-vs-expand-no-members = Diese Expansion enthält keine Elemente.
+hts-vs-expand-column-code = Code
+hts-vs-expand-column-display = Anzeige
+hts-vs-expand-column-system = System
+hts-vs-expand-load-more = Mehr laden
+hts-vs-expand-echoed-parameters = Echo-Parameter
+
+## HTS Slice D — ConceptMap-Browser und Detail mit eingebettetem
+## $translate-Workbench (Designdokument §7.5). Jeder Schlüssel hat ein
+## Pendant in en/es/main.ftl.
+
+## ConceptMap-Status-Pillen.
+
+hts-cm-status-draft = Entwurf
+hts-cm-status-active = aktiv
+hts-cm-status-retired = ausgemustert
+hts-cm-status-unknown = unbekannt
+
+## CM-Browser-Seite.
+
+hts-cm-browser-title = ConceptMaps
+hts-cm-browser-subtitle = Durchsuche den Katalog der ConceptMaps auf dem Terminologieserver und öffne eine Zeile, um Metadaten anzuzeigen oder eine Übersetzung auszuführen.
+hts-cm-browser-filter-legend = ConceptMaps filtern
+hts-cm-browser-filter-url = Kanonische URL
+hts-cm-browser-filter-name = Name
+hts-cm-browser-filter-title = Titel
+hts-cm-browser-filter-status = Status
+hts-cm-browser-filter-hint = Quell- und Ziel-Canonicals stehen nicht als Filter zur Verfügung: HTS akzeptiert bei der ConceptMap-Suche nur url, version, name, title und status und ignoriert alles andere. Filtern Sie nach URL oder Name und lesen Sie dann die Spalte Zuordnung.
+hts-cm-browser-filter-search = Suchen
+hts-cm-browser-filter-reset = Zurücksetzen
+hts-cm-browser-empty = Keine ConceptMaps entsprechen diesen Filtern.
+hts-cm-browser-load-more = Mehr laden
+hts-cm-browser-showing-count = { $count ->
+    [one] { $count } ConceptMap wird angezeigt
+   *[other] { $count } ConceptMaps werden angezeigt
+}
+hts-cm-browser-table-caption = ConceptMaps, die den aktiven Filtern entsprechen.
+hts-cm-browser-column-url = URL
+hts-cm-browser-column-title = Titel
+hts-cm-browser-column-status = Status
+hts-cm-browser-column-name = Name
+hts-cm-browser-column-source = Quellsystem
+hts-cm-browser-column-target = Zielsystem
+hts-cm-browser-column-mapping = Zuordnung
+hts-cm-browser-mapping-source-prefix = Q:
+hts-cm-browser-mapping-target-prefix = Z:
+
+## CM-Detailseite.
+
+hts-cm-detail-title = { $name } · ConceptMap
+hts-cm-detail-title-fallback = ConceptMap
+hts-cm-detail-eyebrow = ConceptMap
+hts-cm-detail-section-identity = Identität
+hts-cm-detail-section-mapping = Mapping
+hts-cm-detail-publisher = Herausgeber
+hts-cm-detail-jurisdiction = Zuständigkeit
+hts-cm-detail-purpose = Zweck
+hts-cm-detail-source-uri = Quelle
+hts-cm-detail-target-uri = Ziel
+hts-cm-detail-group-count = Gruppen
+hts-cm-detail-tabs-label = Workbench-Bereiche der ConceptMap
+hts-cm-detail-tab-translate = Übersetzen
+hts-cm-detail-result-empty = Führe die Operation aus, um das Ergebnis hier zu sehen.
+
+## $translate-Formular und -Ergebnisse.
+
+hts-cm-translate-heading = Einen Code übersetzen
+hts-cm-translate-scoped-map = ConceptMap (fest)
+hts-cm-translate-direction-legend = Richtung
+hts-cm-translate-direction-forward = Vorwärts
+hts-cm-translate-direction-reverse = Rückwärts
+hts-cm-translate-source-legend = Quellcodierung
+hts-cm-translate-source-system = System
+hts-cm-translate-source-system-placeholder = kanonische URL
+hts-cm-translate-source-code = Code
+hts-cm-translate-source-display = Anzeige
+hts-cm-translate-source-display-placeholder = optional
+hts-cm-translate-reverse-legend = Rückwärts-Quelle
+hts-cm-translate-target-code = Zielcode
+hts-cm-translate-target-code-hint = Im Rückwärtsmodus erforderlich.
+hts-cm-translate-target-legend = Ziel-Einschränkungen
+hts-cm-translate-target-system = Zielsystem
+hts-cm-translate-target-system-placeholder = kanonische URL
+hts-cm-translate-source-url = Quell-ValueSet
+hts-cm-translate-source-url-placeholder = kanonische URL (optional)
+hts-cm-translate-target-url = Ziel-ValueSet
+hts-cm-translate-target-url-placeholder = kanonische URL (optional)
+hts-cm-translate-date = Datum
+hts-cm-translate-date-placeholder = ISO 8601 (z. B. 2025-06-01)
+hts-cm-translate-submit = Übersetzen
+hts-cm-translate-matches-count = { $count ->
+    [one] { $count } Treffer
+   *[other] { $count } Treffer
+}
+hts-cm-translate-no-matches = Keine Treffer für diese Quelle.
+hts-cm-translate-column-code = Code
+hts-cm-translate-column-system = System
+hts-cm-translate-column-display = Anzeige
+hts-cm-translate-column-mapping = { $kind ->
+    [equivalence] Äquivalenz
+    [relationship] Beziehung
+   *[other] Mapping
+}
+hts-cm-translate-column-origin = Ursprung
+
+## HTS Slice E -- Standalone-Operations-Workbench (design doc s7.6).
+
+
+
+
+
+
+hts-vs-expand-advanced = Erweiterte Parameter
+hts-vs-expand-total = Gesamt { $n }
+
+
+
+
+
+## Slice F — Import (§7.7). Erste Uebersetzung; im i18n-Review pruefen
+## (# TODO(F): review de).
+
+hts-import-title = Terminologie importieren
+hts-import-heading = Terminologie importieren
+hts-import-help = Sende ein FHIR-Bundle als JSON. HTS akzeptiert CodeSystem, ValueSet und ConceptMap in einem POST.
+hts-import-source-legend = Quelle
+hts-import-source-paste = JSON einfuegen
+hts-import-source-file = Datei hochladen
+hts-import-bundle-textarea-label = FHIR-Bundle (JSON)
+hts-import-bundle-file-label = Bundle-Datei (JSON)
+hts-import-submit = Importieren
+hts-import-status-empty = Es wurde noch kein Import gesendet.
+hts-import-status-success = Import abgeschlossen
+hts-import-status-partial = Import teilweise erfolgreich
+hts-import-status-rejected = Import abgelehnt
+hts-import-status-too-large = Bundle zu gross
+hts-import-counts-heading = Anzahl pro Ressource
+hts-import-counts-created = Erstellt / aktualisiert
+hts-import-resource-code-system = CodeSystem
+hts-import-resource-value-set = ValueSet
+hts-import-resource-concept-map = ConceptMap
+hts-import-resource-concept = Eingefuegte Konzepte
+hts-import-issues-heading = { $n ->
+    [one] { $n } Hinweis
+   *[other] { $n } Hinweise
+}
+hts-import-too-large-hint = Die Anfrage hat das Serverlimit ueberschritten. Teile das Bundle in kleinere Batches auf und versuche es erneut.
+hts-import-empty-bundle-error = Bitte ein JSON-Bundle einfuegen, bevor du absendest.
+hts-import-invalid-json-error = Der uebermittelte Inhalt ist kein gueltiges JSON.
+
+# Import in Schritten (V3, #551): Quelle waehlen, pruefen, Ergebnis.
+# Schritt 2 zeigt bewusst keine Anzahlen: HTS liefert sie erst in der
+# Antwort auf POST /import.
+hts-import-step-source = Quelle waehlen
+hts-import-step-review = Pruefen
+hts-import-step-result = Ergebnis
+hts-import-file-hint = Nur JSON. Die Datei wird im Browser gelesen und in das Bundle-Feld unten kopiert; gesendet wird erst beim Absenden.
+hts-import-bundle-hint = Das Bundle wird an POST /import auf dem Terminologieserver gesendet. Vorhandene Ressourcen werden ueber url + version zugeordnet.
+hts-import-review-target = Zielserver
+hts-import-review-request = Anfrage
+hts-import-review-accepted = Akzeptierte Ressourcen
+hts-import-review-accepted-value = CodeSystem, ValueSet, ConceptMap
+hts-import-review-existing = Vorhandene Ressourcen
+hts-import-review-existing-value = Werden an Ort und Stelle aktualisiert, wenn url und version uebereinstimmen.
+hts-import-review-note = Vor dem Absenden wird nichts geschrieben. Wie viele Ressourcen tatsaechlich angelegt wurden, meldet der Server im Ergebnis unten.
+hts-import-counts-resource = Ressource
+hts-import-raw-toggle = Rohantwort
+hts-import-rejected-note = Es wurde nichts in den Terminologiespeicher geschrieben.
+hts-import-tag-success = Erfolg
+hts-import-tag-partial = Teilweise
+hts-import-tag-error = Fehler
+
+## Slice G — Diagnose (§7.9). Erste Uebersetzung; im i18n-Review pruefen
+## (# TODO(G): review de).
+
+
+# Konzept-Informationsebene (Richtung B, "Konzept zuerst").
+# Das Konzept ist ein Objekt erster Ordnung mit eigenem Permalink unter
+# /ui/hts/concepts?system=...&code=..., dargestellt in drei Panels:
+# Identitaet, Zuordnungen (ueber alle gespeicherten ConceptMaps) und Subsumption.
+hts-concept-title = Konzept
+hts-concept-lede = Ein Code aus jedem Blickwinkel, den der Terminologieserver beantworten kann: was er ist, worauf er abgebildet wird und wo er in der Hierarchie steht.
+hts-concept-open = Konzept öffnen
+hts-concept-panel-loading = Wird geladen
+hts-concept-panel-open = Dieses Panel öffnen
+
+hts-concept-identity-heading = Identität
+hts-concept-status-active = Aktiv
+hts-concept-status-inactive = Inaktiv
+hts-concept-status-unreported = Aktivität nicht gemeldet
+hts-concept-field-system = System
+hts-concept-field-code = Code
+hts-concept-field-display = Anzeigetext
+hts-concept-field-code-system-name = Name des CodeSystem
+hts-concept-field-version = Version
+hts-concept-field-selectability = Auswählbarkeit
+hts-concept-selectability-abstract = Abstrakt (nicht auswählbar)
+hts-concept-selectability-selectable = Auswählbar
+hts-concept-field-definition = Definition
+hts-concept-field-neighbours = Nachbarn in der Hierarchie
+hts-concept-field-used-supplements = Angewandte Ergänzungen
+hts-concept-designations-heading = Bezeichnungen
+hts-concept-designations-value = Bezeichnung
+hts-concept-designations-language = Sprache
+hts-concept-designations-use = Verwendung
+hts-concept-properties-heading = Eigenschaften
+hts-concept-properties-code = Eigenschaft
+hts-concept-properties-value = Wert
+hts-concept-raw-response = Rohantwort
+
+hts-concept-mappings-heading = Zuordnungen
+hts-concept-mappings-direction-forward = Zuordnungen, in denen dieses Konzept die Quelle ist, über alle gespeicherten ConceptMaps hinweg.
+hts-concept-mappings-direction-reverse = Zuordnungen, in denen dieses Konzept das Ziel ist, über alle gespeicherten ConceptMaps hinweg.
+hts-concept-mappings-switch-forward = Zuordnungen von diesem Konzept anzeigen
+hts-concept-mappings-switch-reverse = Zuordnungen auf dieses Konzept anzeigen
+hts-concept-mappings-empty = Keine ConceptMap bildet dieses Konzept ab.
+hts-concept-mappings-vocabulary = Zuordnungsvokabular
+hts-concept-mappings-vocabulary-equivalence = equivalence (R4 / R4B)
+hts-concept-mappings-vocabulary-relationship = relationship (R5 / R6)
+hts-concept-mappings-vocabulary-unknown = Nicht gemeldet
+hts-concept-mappings-unattributable = Der Server ordnet Treffer im Rückwärtsmodus keiner Quellzuordnung zu, daher lässt sich die Herkunft nicht anzeigen. Wechseln Sie in die Vorwärtsrichtung, um zu sehen, aus welcher ConceptMap jede Zuordnung stammt.
+hts-concept-mappings-origin = Herkunftszuordnung
+hts-concept-mappings-column-code = Code
+hts-concept-mappings-column-system = System
+hts-concept-mappings-column-display = Anzeigetext
+hts-concept-mappings-column-mapping = Beziehung
+
+hts-concept-relations-heading = Subsumption
+hts-concept-relations-lede = Jede Zeile ist eine Subsumptionsprüfung. Der Vorfahrenkandidat wird immer als Code A gesendet, sodass eine in sich stimmige Hierarchie jedes Mal "subsumes" antwortet.
+hts-concept-relation-parent = Übergeordnet
+hts-concept-relation-child = Untergeordnet
+hts-concept-relation-manual = Verglichen
+hts-concept-relations-column-relation = Beziehung
+hts-concept-relations-column-question = Gestellte Frage
+hts-concept-relations-column-outcome = Ergebnis
+hts-concept-relations-subsumes-verb = subsumiert
+hts-concept-subsumes-outcome-equivalent = Gleichwertig
+hts-concept-subsumes-outcome-subsumes = Subsumiert
+hts-concept-subsumes-outcome-subsumed-by = Subsumiert von
+hts-concept-subsumes-outcome-not-subsumed = Nicht subsumiert
+hts-concept-relations-conflict-caveat = Die Konzeptabfrage meldet diese Hierarchiebeziehung, die Subsumptionsprüfung bestätigt sie jedoch nicht. Meist wurde die Subsumptionshülle nach dem erneuten Import des CodeSystem nicht neu aufgebaut; die Hierarchie selbst blieb erhalten.
+hts-concept-relations-empty = Dieses Konzept hat keine über- oder untergeordneten Codes zum Vergleich.
+hts-concept-relations-dropped = { $n } weitere Vergleichscodes wurden nicht geprüft; dieses Panel führt höchstens 20 Subsumptionsaufrufe pro Darstellung aus.
+hts-concept-relations-compare-label = Mit Code vergleichen
+hts-concept-relations-compare-placeholder = Ein anderer Code in diesem System
+hts-concept-relations-compare-hint = Das System ist auf das dieses Konzepts festgelegt, geben Sie daher nur den Code ein. Geprüft wird, ob dieser Code das vorliegende subsumiert.
+hts-concept-relations-compare-submit = Vergleichen
+
+## HTS-Detailseiten -- kompakte Kopfzeile V3 (#551, Slices B/C/D).
+## Gemeinsame Beschriftungen für die Chip-Zeile und die Aufklappbox der
+## CodeSystem-/ValueSet-/ConceptMap-Detailseiten sowie die Überschriften
+## der Ergebnispanels und die beiden Ehrlichkeitshinweise (Baummodus-Pager,
+## originMap im Rückwärtsmodus).
+
+hts-detail-facts-label = Fakten
+hts-detail-canonical-url = Kanonische URL
+hts-detail-version-label = Version
+hts-detail-status-label = Status
+hts-cs-detail-facts-summary = Alle CodeSystem-Fakten
+hts-vs-detail-facts-summary = Alle ValueSet-Fakten
+hts-cm-detail-facts-summary = Alle ConceptMap-Fakten
+hts-cs-lookup-definition = Definition
+hts-cs-validate-result-heading = Validierungsergebnis
+hts-cs-subsumes-result-heading = Subsumtionsergebnis
+hts-vs-expand-result-heading = Expansion
+hts-vs-expand-table-caption = Vom Terminologieserver zurückgegebene Expansionsmitglieder.
+hts-vs-expand-tree-note = Der Baummodus liefert die gesamte Hierarchie; der Pager gibt es nur im flachen Modus.
+hts-cm-translate-table-caption = Vom Terminologieserver zurückgegebene Übersetzungstreffer.
+hts-cm-translate-origin-reverse-note = Im Rückwärtsmodus lässt HTS originMap weg, daher kann ein Treffer keiner bestimmten ConceptMap zugeordnet werden. Jede Herkunftszelle bleibt bewusst ein Gedankenstrich – es fehlt kein Wert.
+
+
+# Capability & Conformance page (HTS mirror of HFS's page). The shared
+# `cap-*` and `nav-capability-conformance` keys carry everything both
+# pages say identically; only what is specific to a terminology server
+# lives here.
+hts-capability-lede = Was dieser Terminologieserver aktuell anbietet — live aus /metadata zusammengestellt.
+hts-capability-operations-empty = Keine Operationen angekündigt.
+hts-capability-rest-empty = Keine REST-Ressourcen angekündigt.
+hts-capability-terminology-heading = Terminologie-Fähigkeiten
+hts-capability-expansion-hierarchical = Hierarchische Expansion
+hts-capability-expansion-paging = Expansions-Paging
+hts-capability-expansion-incomplete = Unvollständige Expansionen
+hts-capability-expansion-parameters = $expand-Parameter
+hts-capability-validate-code-translations = Validate-code-Übersetzungen
+hts-capability-translation-needs-map = Übersetzung benötigt eine Map
+hts-capability-closure = Closure-Pflege
+hts-capability-code-systems-declared = Deklarierte Codesysteme
+hts-capability-flag-true = Ja
+hts-capability-flag-false = Nein
+hts-capability-raw-truncated = Auf die ersten { $shown } von { $total } Bytes gekürzt — die Deklaration dieses Servers wächst mit den geladenen Codesystemen.
+hts-capability-raw-full = Vollständige Deklaration ansehen
+
+# Home V3 tile sub-lines. The mockup folds Backend, FHIR version,
+# Bundled data and Avg latency into the sub-line of the tile each
+# qualifies, instead of giving them tiles of their own.
+hts-home-tile-status-sub = Backend { $backend } · FHIR { $version }
+hts-home-tile-uptime-sub = hts v{ $version } · keine Neustarts seit { $since } UTC
+hts-home-tile-uptime-sub-noclock = hts v{ $version }
+hts-home-tile-loaded-systems-sub = { $mib } MiB auf der Festplatte gebündelt
+hts-home-tile-requests-sub = { $ms } ms Durchschnitt · aus /metrics
+
+# Chart caption, composed from the SELECTED window and status class.
+# Each locale owns its own word order through the two placeables.
+hts-home-chart-hint = { $window }, { $classes }. Wird erfasst, solange diese Seite geöffnet ist. Ohne den eigenen 15-s-Aktualisierungsabruf dieser Seite und /metrics.
+hts-home-chart-hint-window-15m = Letzte 15 Minuten
+hts-home-chart-hint-window-1h = Letzte Stunde
+hts-home-chart-hint-window-6h = Letzte 6 Stunden
+hts-home-chart-hint-series-all = alle Statusklassen
+hts-home-chart-hint-series-2xx = nur 2xx-Antworten
+hts-home-chart-hint-series-4xx = nur 4xx-Antworten
+hts-home-chart-hint-series-5xx = nur 5xx-Antworten

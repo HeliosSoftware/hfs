@@ -1229,6 +1229,131 @@ mod tests {
         SearchParameterExtractor::new(Arc::new(RwLock::new(registry)))
     }
 
+    /// Same as [`create_test_extractor_for`], but also loads the custom
+    /// SearchParameter files from the workspace `data/` directory (e.g.
+    /// `sql-on-fhir-search-parameters.json`), the same additive source a
+    /// real backend loads on startup.
+    fn create_test_extractor_with_custom_for(version: FhirVersion) -> SearchParameterExtractor {
+        let loader = SearchParameterLoader::new(version);
+        let mut registry = SearchParameterRegistry::new();
+
+        if let Ok(params) = loader.load_embedded() {
+            for param in params {
+                let _ = registry.register(param);
+            }
+        }
+
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+
+        if let Ok(params) = loader.load_from_spec_file(&data_dir) {
+            for param in params {
+                let _ = registry.register(param);
+            }
+        }
+
+        if let Ok(params) = loader.load_custom_from_directory(&data_dir) {
+            for param in params {
+                let _ = registry.register(param);
+            }
+        }
+
+        SearchParameterExtractor::new(Arc::new(RwLock::new(registry)))
+    }
+
+    /// Regression test for the composite `context-type-quantity` and
+    /// `context-type-value` ViewDefinition SearchParameters: their
+    /// `component.definition` values must resolve to registered parameters
+    /// through the real registry (`get_by_url` is an exact-match lookup), or
+    /// the extractor silently drops every component of the composite and no
+    /// rows get indexed at all. This exercises the real registry (embedded +
+    /// spec + custom) and the real extractor end-to-end against a
+    /// `ViewDefinition` whose `useContext` matches both composites.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn view_definition_composite_context_params_index_matching_use_context() {
+        let extractor = create_test_extractor_with_custom_for(FhirVersion::R4);
+
+        let view_definition = json!({
+            "resourceType": "ViewDefinition",
+            "id": "test-view",
+            "status": "active",
+            "resource": "Patient",
+            "select": [{"column": [{"path": "id", "name": "id"}]}],
+            "useContext": [
+                {
+                    "code": {
+                        "system": "http://terminology.hl7.org/CodeSystem/usage-context-type",
+                        "code": "focus"
+                    },
+                    "valueCodeableConcept": {
+                        "coding": [{
+                            "system": "http://snomed.info/sct",
+                            "code": "263495000",
+                            "display": "Gender"
+                        }]
+                    }
+                },
+                {
+                    "code": {
+                        "system": "http://terminology.hl7.org/CodeSystem/usage-context-type",
+                        "code": "age"
+                    },
+                    "valueQuantity": {
+                        "value": 42,
+                        "unit": "years",
+                        "system": "http://unitsofmeasure.org",
+                        "code": "a"
+                    }
+                }
+            ]
+        });
+
+        let values = extractor
+            .extract(&view_definition, "ViewDefinition")
+            .expect("extraction should succeed");
+
+        let context_type_quantity: Vec<_> = values
+            .iter()
+            .filter(|v| v.param_name == "context-type-quantity")
+            .collect();
+        assert!(
+            !context_type_quantity.is_empty(),
+            "context-type-quantity should index rows for a useContext with a Quantity value; \
+             an empty result means its component.definition failed to resolve in the registry"
+        );
+
+        let context_type_value: Vec<_> = values
+            .iter()
+            .filter(|v| v.param_name == "context-type-value")
+            .collect();
+        assert!(
+            !context_type_value.is_empty(),
+            "context-type-value should index rows for a useContext with a CodeableConcept value; \
+             an empty result means its component.definition failed to resolve in the registry"
+        );
+
+        // Every row from these composites must carry the composite's own
+        // core canonical URL (the component `definition` URLs are only used
+        // internally to resolve each sub-expression's type).
+        for value in context_type_quantity
+            .iter()
+            .chain(context_type_value.iter())
+        {
+            assert!(
+                value
+                    .param_url
+                    .starts_with("http://hl7.org/fhir/SearchParameter/ViewDefinition-"),
+                "composite row should carry the core canonical URL, got: {}",
+                value.param_url
+            );
+            assert!(value.composite_group.is_some());
+        }
+    }
+
     #[test]
     fn test_extract_patient_name() {
         let extractor = create_test_extractor();

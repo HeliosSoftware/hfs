@@ -45,6 +45,10 @@ pub struct SubscriptionRow {
     /// Deliveries abandoned in the last 24 hours (permanent errors and
     /// exhausted retries).
     pub failed_24h: u64,
+    /// `delivered_24h` as a chronological series — one count per half-hour
+    /// bucket, oldest first (#782). Empty when the engine carries no series;
+    /// the UI then renders no sparkline rather than a fabricated flat line.
+    pub delivered_series: Vec<u64>,
 }
 
 /// The engine's current inventory for one tenant.
@@ -104,6 +108,7 @@ mod tests {
                     delivered_24h: 12,
                     first_try_24h: 11,
                     failed_24h: 1,
+                    delivered_series: vec![0, 4, 8],
                 }],
             }
         }

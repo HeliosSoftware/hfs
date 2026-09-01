@@ -1,26 +1,20 @@
 // The persistent app chrome (layouts/base.html): the sidebar rail (expands on
-// hover, #438), theme buttons, and the language switcher. On every full page.
+// hover, #438), theme buttons, and the account menu. On every full page.
 import type { Page, Locator } from "@playwright/test";
+import { langLink, userMenu } from "./user-menu";
 
 export type Theme = "light" | "dark";
 
 export class AppChrome {
   readonly sidebar: Locator;
-  readonly langSwitcher: Locator;
 
   constructor(readonly page: Page) {
     this.sidebar = page.locator("aside.sidebar");
-    this.langSwitcher = page.locator(".lang-switcher");
   }
 
   /** A primary nav link by its destination path, e.g. "/ui/resources". */
   navLink(href: string): Locator {
     return this.page.locator(`a.nav-item[href='${href}']`);
-  }
-
-  /** A disabled "coming soon" nav entry by its visible label. */
-  soonItem(label: string): Locator {
-    return this.page.locator("span.nav-item--soon", { hasText: label });
   }
 
   themeButton(theme: Theme): Locator {
@@ -41,8 +35,18 @@ export class AppChrome {
     }, theme);
   }
 
+  /** A language option inside the avatar user menu (#725): a real `?lang=`
+   * link behind a `<details>` disclosure, so it works without JS.
+   *
+   * Delegates to `pages/user-menu.ts` — the account menu is one shared
+   * template across HFS and HTS (#799), so it gets one locator definition. */
   langLink(lang: string): Locator {
-    return this.page.locator(`.lang-switcher a[href*='lang=${lang}']`);
+    return langLink(this.page, lang);
+  }
+
+  /** The avatar disclosure in the topbar (#725). */
+  get userMenu(): Locator {
+    return userMenu(this.page);
   }
 
   /** The FHIR-version disclosure in the sidebar footer (#343): a `<details>`
@@ -87,6 +91,56 @@ export class AppChrome {
     // `page.waitForLoadState("networkidle")` themselves afterward.
     await this.page
       .locator(`.sidebar__foot form:has(input[value='${version}']) button[type='submit']`)
+      .click();
+    await this.page.waitForLoadState("networkidle");
+  }
+
+  /** The tenant disclosure at the top of the sidebar (#344). Only rendered on
+   * multi-tenant installs — a second provisioned tenant, or a non-default
+   * stored choice (`show_tenant_picker`, crates/ui/src/lib.rs) — so specs
+   * must provision a tenant before reaching for it. It is the only
+   * `details.menu` that is a direct child of the sidebar; the version
+   * disclosure lives inside `.sidebar__foot`. */
+  get tenantSelector(): Locator {
+    return this.page.locator("aside.sidebar > details.menu");
+  }
+
+  /** Opens the tenant disclosure and waits for its option list — the options
+   * are htmx-lazy (`hx-get=/ui/tenant/options` on the first toggle), so the
+   * forms only exist after that swap lands. Both waits are bounded: the
+   * config sets no actionTimeout, so an unbounded wait here would hang until
+   * the test timeout with no useful failure location (#553). */
+  async openTenantSelector(): Promise<void> {
+    await this.tenantSelector.waitFor({ timeout: 30_000 });
+    if ((await this.tenantSelector.getAttribute("open")) === null) {
+      await this.tenantSelector.locator("summary").click();
+    }
+    // state: "attached", not the "visible" default — the per-option tenant
+    // inputs are type=hidden, so a visibility wait would never resolve.
+    await this.tenantSelector
+      .locator("form input[name='tenant']")
+      .first()
+      .waitFor({ state: "attached", timeout: 30_000 });
+  }
+
+  /** The tenant id the sidebar currently marks as active. */
+  async currentTenant(): Promise<string> {
+    await this.openTenantSelector();
+    const value = await this.tenantSelector
+      .locator("form:has(button[aria-current='true']) input[name='tenant']")
+      .getAttribute("value");
+    if (!value) throw new Error("no tenant is marked current in the sidebar");
+    return value;
+  }
+
+  /** Submits the sidebar's `POST /ui/tenant` for the given tenant id — the
+   * same round trip the disclosure's own form does. The choice persists
+   * server-side (user-global settings), so specs that switch MUST switch
+   * back before finishing or they leak the tenant into later specs. */
+  async selectTenant(tenant: string): Promise<void> {
+    await this.openTenantSelector();
+    await this.tenantSelector
+      .locator(`form:has(input[value='${tenant}']) button[type='submit']`)
       .click();
     await this.page.waitForLoadState("networkidle");
   }

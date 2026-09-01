@@ -141,6 +141,29 @@ async fn create_submit_server_with(
     Arc<LocalFsOutputStore>,
     tempfile::TempDir,
 ) {
+    create_submit_server_with_routing(
+        fetcher,
+        bulk_submit,
+        TenantRoutingMode::HeaderOnly,
+        "http://localhost:8080",
+        "test-tenant",
+    )
+    .await
+}
+
+async fn create_submit_server_with_routing(
+    fetcher: Arc<MockFetcher>,
+    bulk_submit: BulkSubmitConfig,
+    routing_mode: TenantRoutingMode,
+    base_url: &str,
+    default_tenant: &str,
+) -> (
+    TestServer,
+    Arc<SqliteBackend>,
+    Arc<MockFetcher>,
+    Arc<LocalFsOutputStore>,
+    tempfile::TempDir,
+) {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -159,15 +182,18 @@ async fn create_submit_server_with(
     backend.init_schema().expect("init schema");
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+    let output = Arc::new(LocalFsOutputStore::new(
+        tmp.path(),
+        "https://wrong-internal.example",
+    ));
 
     let config = ServerConfig {
         multitenancy: MultitenancyConfig {
-            routing_mode: TenantRoutingMode::HeaderOnly,
+            routing_mode,
             ..Default::default()
         },
-        base_url: "http://localhost:8080".to_string(),
-        default_tenant: "test-tenant".to_string(),
+        base_url: base_url.to_string(),
+        default_tenant: default_tenant.to_string(),
         bulk_submit,
         ..ServerConfig::for_testing()
     };
@@ -212,6 +238,19 @@ fn kickoff_body() -> Value {
             {"name": "submissionId", "valueString": "it-1"},
             {"name": "manifestUrl", "valueUrl": "https://provider/manifest.json"},
             {"name": "fhirBaseUrl", "valueUrl": "https://provider/fhir"}
+        ]
+    })
+}
+
+fn replace_only_body() -> Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "submitter", "valueIdentifier": {"system": "http://ehr", "value": "ehr-1"}},
+            {"name": "submissionId", "valueString": "it-1"},
+            {"name": "submissionStatus", "valueCoding": {
+                "system": "http://hl7.org/fhir/event-status", "code": "in-progress"}},
+            {"name": "replacesManifestUrl", "valueUrl": "https://provider/manifest.json"}
         ]
     })
 }
@@ -385,6 +424,39 @@ async fn test_kickoff_returns_200() {
     let (server, ..) = create_submit_server().await;
     let resp = server.post("/$bulk-submit").json(&kickoff_body()).await;
     assert_eq!(resp.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_replace_only_kickoff_retires_manifest_without_adding_an_empty_one() {
+    let (server, backend, ..) = create_submit_server().await;
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&replace_only_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("test-tenant"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    let sub_id = helios_persistence::core::SubmissionId::new("http://ehr|ehr-1", "it-1");
+    let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+    assert_eq!(manifests.len(), 1, "replace-only must not add a manifest");
+    assert_eq!(
+        manifests[0].status,
+        helios_persistence::core::ManifestStatus::Replaced
+    );
 }
 
 #[tokio::test]
@@ -785,6 +857,154 @@ async fn test_full_lifecycle_ingests_and_polls() {
     );
 }
 
+#[tokio::test]
+async fn path_tenant_and_public_prefix_flow_through_bulk_submit_urls() {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server_with_routing(
+        multi_artifact_fetcher(),
+        BulkSubmitConfig {
+            manifest_page_size: 1,
+            ..Default::default()
+        },
+        TenantRoutingMode::Both,
+        "https://public.example/fhir/",
+        "default",
+    )
+    .await;
+
+    assert_eq!(
+        server
+            .post("/acme/$bulk-submit")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let status = server
+        .post("/acme/$bulk-submit-status")
+        .json(&status_body())
+        .await;
+    assert_eq!(status.status_code(), StatusCode::ACCEPTED);
+    let status_url = status
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(status_url.starts_with("https://public.example/fhir/acme/bulk-submit-status/"));
+    let poll_path = status_url
+        .strip_prefix("https://public.example/fhir")
+        .unwrap();
+    let wrong_tenant_path = poll_path.replacen("/acme/", "/other/", 1);
+    assert_eq!(
+        server.get(&wrong_tenant_path).await.status_code(),
+        StatusCode::NOT_FOUND
+    );
+
+    drain_submit(&backend, &fetcher, &output).await;
+    let done = server.get(poll_path).await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    let artifact_url = ["output", "outcome", "deleted"]
+        .into_iter()
+        .find_map(|kind| manifest[kind][0]["url"].as_str())
+        .expect("first page has an artifact URL");
+    assert!(artifact_url.starts_with("https://public.example/fhir/acme/bulk-submit-file/"));
+    assert!(
+        manifest["link"][0]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(status_url)
+    );
+}
+
+#[tokio::test]
+async fn both_mode_header_tenant_can_follow_unprefixed_bulk_submit_urls() {
+    let public_base = "https://public.example/fhir";
+    let (server, backend, fetcher, output, _tmp) = create_submit_server_with_routing(
+        mock_fetcher(),
+        BulkSubmitConfig::default(),
+        TenantRoutingMode::Both,
+        public_base,
+        "default",
+    )
+    .await;
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .add_header("x-tenant-id", "acme")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let status = server
+        .post("/$bulk-submit-status")
+        .add_header("x-tenant-id", "acme")
+        .json(&status_body())
+        .await;
+    assert_eq!(status.status_code(), StatusCode::ACCEPTED);
+    let status_url = status
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(status_url.starts_with("https://public.example/fhir/bulk-submit-status/"));
+    assert!(!status_url.contains("/acme/"));
+    let poll_path = status_url.strip_prefix(public_base).unwrap();
+
+    assert_eq!(
+        server
+            .get(poll_path)
+            .add_header("x-tenant-id", "acme")
+            .await
+            .status_code(),
+        StatusCode::ACCEPTED
+    );
+    drain_submit(&backend, &fetcher, &output).await;
+
+    let done = server
+        .get(poll_path)
+        .add_header("x-tenant-id", "acme")
+        .await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    let artifact_url = manifest["output"][0]["url"].as_str().unwrap();
+    assert!(artifact_url.starts_with("https://public.example/fhir/bulk-submit-file/"));
+    let artifact_path = artifact_url.strip_prefix(public_base).unwrap();
+    assert_eq!(
+        server
+            .get(artifact_path)
+            .add_header("x-tenant-id", "other")
+            .await
+            .status_code(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        server
+            .delete(poll_path)
+            .add_header("x-tenant-id", "other")
+            .await
+            .status_code(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        server
+            .get(artifact_path)
+            .add_header("x-tenant-id", "acme")
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    // The URL-path form remains available in `both` mode.
+    assert_eq!(
+        server.get(&format!("/acme{poll_path}")).await.status_code(),
+        StatusCode::OK
+    );
+}
+
 // ── Status-poll pacing: Retry-After + rate limiting (issue #399) ──────────────
 
 #[tokio::test]
@@ -871,4 +1091,44 @@ async fn test_poll_rate_limit_of_zero_disables_throttling() {
             "poll rate limiting must be off when the limit is 0"
         );
     }
+}
+
+/// #646: a `processing` manifest whose worker lease expired without renewal
+/// or reclaim used to poll as a quiet "processing" forever — a frozen worker
+/// pool was indistinguishable from progress. The poll now names the stall.
+#[tokio::test]
+async fn test_poll_reports_a_stalled_ingestion() {
+    // lease_duration_secs = 0 makes the stall threshold (3 leases) immediate.
+    let (server, backend, _fetcher, _output, _tmp) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            lease_duration_secs: 0,
+            ..Default::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    // A worker claims the manifest (zero-duration lease: expired on arrival)
+    // and then never heartbeats, finishes, or gets reclaimed — the freeze.
+    let worker_id = WorkerId::new("frozen-worker");
+    backend
+        .claim_next_manifest(&worker_id, Duration::ZERO)
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let progress = resp
+        .headers()
+        .get("x-progress")
+        .expect("X-Progress")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        progress.contains("stalled"),
+        "a dead worker pool must be visible to the poller, got: {progress}"
+    );
 }
