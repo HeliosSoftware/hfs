@@ -93,6 +93,20 @@ Options:
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
 | `HFS_TERMINOLOGY_SERVER` | (none) | Terminology server URL for `:in`/`:not-in` modifiers and FHIRPath `memberOf()`/`subsumes()` |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | Composite-store write sync mode for ES-backed backends (`sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb-elasticsearch`, `s3-elasticsearch`). One of `asynchronous`, `synchronous`, `hybrid`. With `asynchronous` (default) the write returns as soon as the primary commits and the search backend is updated on a background worker — lowest latency, but a follow-up search can race the indexing. Use `synchronous` when callers need read-your-write semantics (e.g. integration tests, bulk-load flows that immediately search). Ignored when the storage backend has no search secondary. |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Elasticsearch index `refresh_interval` for ES-backed backends. Controls how quickly indexed documents become searchable when no per-write refresh is requested. `-1` disables periodic refresh entirely. Applied when an index is created; indices that already exist keep their current setting. |
+| `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | The `refresh` parameter applied to Elasticsearch index/delete operations. One of `false` (no per-write refresh), `wait_for` (block each write until the affected shards refresh), or `true` (force a refresh per write; expensive, low-volume deployments only). |
+
+In the ES-backed composite modes the search secondary is **eventually
+consistent** by default: a write can return `201`/`200` before the resource is
+findable via search. Two independent delays contribute. First, the composite
+forwards the index write to Elasticsearch on a background worker unless
+`HFS_COMPOSITE_SYNC_MODE=synchronous`. Second, Elasticsearch only makes an
+indexed document searchable at the next index refresh, which happens every
+`HFS_ELASTICSEARCH_REFRESH_INTERVAL` unless the write itself requests a refresh
+via `HFS_ELASTICSEARCH_WRITE_REFRESH`. Read-after-write search therefore
+requires **both** `HFS_COMPOSITE_SYNC_MODE=synchronous` and
+`HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`; either setting alone still leaves a
+window in which an immediate follow-up search misses the write.
 
 Set `HFS_BASE_URL` to the public address clients can reach. The value may
 contain a path prefix. It must be an absolute `http` or `https` URL without

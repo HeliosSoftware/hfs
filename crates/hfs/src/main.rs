@@ -148,6 +148,16 @@ fn composite_sync_mode_from_env() -> helios_persistence::composite::SyncMode {
     }
 }
 
+#[cfg(feature = "elasticsearch")]
+fn es_write_refresh_from_config(
+    config: &ServerConfig,
+) -> anyhow::Result<helios_persistence::backends::elasticsearch::WriteRefreshPolicy> {
+    config
+        .elasticsearch_write_refresh
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("{} (from HFS_ELASTICSEARCH_WRITE_REFRESH)", e))
+}
+
 #[cfg(feature = "mongodb")]
 fn build_mongodb_config(config: &ServerConfig, search_offloaded: bool) -> MongoBackendConfig {
     build_mongodb_config_with_env(config, search_offloaded, |name| std::env::var(name).ok())
@@ -1810,6 +1820,8 @@ async fn start_sqlite_elasticsearch(
         index_prefix: config.elasticsearch_index_prefix.clone(),
         auth: es_auth,
         fhir_version: config.default_fhir_version,
+        refresh_interval: config.elasticsearch_refresh_interval.clone(),
+        write_refresh: es_write_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2061,6 +2073,8 @@ async fn start_postgres_elasticsearch(
         index_prefix: config.elasticsearch_index_prefix.clone(),
         auth: es_auth,
         fhir_version: config.default_fhir_version,
+        refresh_interval: config.elasticsearch_refresh_interval.clone(),
+        write_refresh: es_write_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2245,6 +2259,8 @@ async fn start_mongodb_elasticsearch(
         index_prefix: config.elasticsearch_index_prefix.clone(),
         auth: es_auth,
         fhir_version: config.default_fhir_version,
+        refresh_interval: config.elasticsearch_refresh_interval.clone(),
+        write_refresh: es_write_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2641,6 +2657,8 @@ async fn start_s3_elasticsearch(
         index_prefix: config.elasticsearch_index_prefix.clone(),
         auth: es_auth,
         fhir_version: config.default_fhir_version,
+        refresh_interval: config.elasticsearch_refresh_interval.clone(),
+        write_refresh: es_write_refresh_from_config(&config)?,
         ..Default::default()
     };
 
