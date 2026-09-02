@@ -4979,9 +4979,10 @@ mod postgres_integration {
     // Bulk Export — Phase 2 multi-instance job state on Postgres.
     // ========================================================================
 
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use helios_persistence::core::bulk_export::{
-        BulkExportStorage, ExportRequest, ExportStatus, StartExportInput, TypeExportProgress,
+        BulkExportStorage, ExportRequest, ExportStatus, PatientExportProvider, StartExportInput,
+        TypeExportProgress,
     };
     use helios_persistence::core::bulk_export_worker::{
         ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId,
@@ -5069,6 +5070,118 @@ mod postgres_integration {
 
         let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
         assert_eq!(progress.status, ExportStatus::Complete);
+    }
+
+    /// Pins a stored resource's `last_updated` so a window test does not depend
+    /// on wall-clock timing.
+    async fn pin_last_updated(backend: &PostgresBackend, id: &str, at: DateTime<Utc>) {
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "UPDATE resources SET last_updated = $1 WHERE id = $2",
+                &[&at, &id],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn seed_patient_at(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        at: DateTime<Utc>,
+    ) -> String {
+        let stored = backend
+            .create(
+                tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = stored.id().to_string();
+        pin_last_updated(backend, &id, at).await;
+        id
+    }
+
+    fn instant(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// The `Patient` branch of the compartment fetch applies `_since`, the way
+    /// the non-Patient branch below it always has.
+    #[tokio::test]
+    async fn postgres_integration_since_bounds_the_patient_compartment_branch() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("since-patient-branch");
+
+        let stale = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let fresh = seed_patient_at(&backend, &tenant, instant("2026-07-01T00:00:00Z")).await;
+
+        // Both named explicitly, as a group export or an explicit `patient`
+        // parameter would: the id list reaching this method is NOT pre-filtered.
+        let ids = vec![stale.clone(), fresh.clone()];
+        let request = ExportRequest::patient().with_since(instant("2026-06-01T00:00:00Z"));
+
+        let batch = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &ids, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "the stale patient must be filtered out"
+        );
+        assert!(batch.lines[0].contains(&fresh));
+    }
+
+    /// The new bound and the keyset cursor coexist: paging a filtered set
+    /// neither drops nor repeats a row, and the bound does not consume the
+    /// `$4`/`$5` the cursor clause needs.
+    #[tokio::test]
+    async fn postgres_integration_since_and_cursor_page_the_patient_branch() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("since-patient-paging");
+
+        let stale = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let a = seed_patient_at(&backend, &tenant, instant("2026-07-01T00:00:00Z")).await;
+        let b = seed_patient_at(&backend, &tenant, instant("2026-07-02T00:00:00Z")).await;
+        let c = seed_patient_at(&backend, &tenant, instant("2026-07-03T00:00:00Z")).await;
+
+        let ids = vec![stale.clone(), a.clone(), b.clone(), c.clone()];
+        let request = ExportRequest::patient().with_since(instant("2026-06-01T00:00:00Z"));
+
+        let first = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &ids, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.lines.len(), 2);
+        assert!(!first.is_last);
+
+        let second = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &request,
+                "Patient",
+                &ids,
+                first.next_cursor.as_deref(),
+                2,
+            )
+            .await
+            .unwrap();
+
+        let all: Vec<&String> = first.lines.iter().chain(second.lines.iter()).collect();
+        for id in [&a, &b, &c] {
+            let hits = all.iter().filter(|l| l.contains(id.as_str())).count();
+            assert_eq!(hits, 1, "each in-window patient appears exactly once");
+        }
+        assert!(
+            !all.iter().any(|l| l.contains(stale.as_str())),
+            "the stale patient never appears on any page"
+        );
     }
 
     #[tokio::test]

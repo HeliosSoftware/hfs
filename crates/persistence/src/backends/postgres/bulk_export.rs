@@ -1199,7 +1199,16 @@ impl PatientExportProvider for PostgresBackend {
                 Box::new(resource_type.to_string()),
                 Box::new(patient_ids.to_vec()),
             ];
-            let param_idx = 4;
+            // The same `_since` bound the non-Patient branch below applies.
+            // Bound before the cursor clause so it does not consume $4/$5.
+            // Binds as `DateTime<Utc>`: tokio_postgres will not bind a string
+            // to TIMESTAMPTZ, and a `::timestamptz` cast would not change that.
+            let mut param_idx = 4;
+            if let Some(since) = request.since {
+                sql.push_str(&format!(" AND last_updated >= ${}", param_idx));
+                params.push(Box::new(since));
+                param_idx += 1;
+            }
 
             if let Some(cursor) = cursor {
                 let parts: Vec<&str> = cursor.splitn(2, '|').collect();
