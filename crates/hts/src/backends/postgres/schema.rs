@@ -293,6 +293,26 @@ BEGIN
         DELETE FROM bootstrap_imports WHERE path LIKE '%.tgz';
     END IF;
 END $$;
+
+-- ── ICD-9-CM re-import backfill (issue #802) ────────────────────────────────────
+-- The importer previously required a pipe delimiter that the real bundled CMS
+-- file never has, so every code silently failed to parse while the file was
+-- still recorded as a successfully-imported ledger row. Fixing the parser
+-- alone does not repair a database that already has that stale, content-hash-
+-- unchanged row — it would be skipped on every future restart. This clears it
+-- exactly once, using a sentinel row (rather than a new column, since this fix
+-- needs no schema change) to detect whether it has already run. Postgres
+-- LIKE is case-sensitive, unlike SQLite's, hence ILIKE here.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM bootstrap_imports WHERE path = '#migration:icd9cm-space-delimited-802'
+    ) THEN
+        DELETE FROM bootstrap_imports WHERE path ILIKE '%icd-9-cm%' OR path ILIKE '%icd9cm%';
+        INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
+        VALUES ('#migration:icd9cm-space-delimited-802', '', 0);
+    END IF;
+END $$;
 ";
 
 /// Apply the HTS PostgreSQL schema to the given client connection.

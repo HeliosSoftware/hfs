@@ -8,7 +8,9 @@
 
 #![cfg(feature = "elasticsearch")]
 
-use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
+use helios_persistence::backends::elasticsearch::{
+    ElasticsearchBackend, ElasticsearchConfig, WriteRefreshPolicy,
+};
 use helios_persistence::core::{Backend, BackendCapability, BackendKind};
 
 // ============================================================================
@@ -37,6 +39,44 @@ fn test_elasticsearch_config_serialization() {
     let deserialized: ElasticsearchConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.nodes, config.nodes);
     assert_eq!(deserialized.index_prefix, "test");
+}
+
+#[test]
+fn test_write_refresh_policy_default_is_false() {
+    assert_eq!(
+        ElasticsearchConfig::default().write_refresh,
+        WriteRefreshPolicy::False
+    );
+
+    let json = r#"{"nodes": ["http://localhost:9200"]}"#;
+    let config: ElasticsearchConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.write_refresh, WriteRefreshPolicy::False);
+}
+
+#[test]
+fn test_write_refresh_policy_parsing() {
+    assert_eq!(
+        "false".parse::<WriteRefreshPolicy>().unwrap(),
+        WriteRefreshPolicy::False
+    );
+    assert_eq!(
+        "wait_for".parse::<WriteRefreshPolicy>().unwrap(),
+        WriteRefreshPolicy::WaitFor
+    );
+    assert_eq!(
+        "wait-for".parse::<WriteRefreshPolicy>().unwrap(),
+        WriteRefreshPolicy::WaitFor
+    );
+    assert_eq!(
+        "true".parse::<WriteRefreshPolicy>().unwrap(),
+        WriteRefreshPolicy::True
+    );
+    assert_eq!(
+        " WAIT_FOR ".parse::<WriteRefreshPolicy>().unwrap(),
+        WriteRefreshPolicy::WaitFor
+    );
+    assert!("refresh-me".parse::<WriteRefreshPolicy>().is_err());
+    assert!("".parse::<WriteRefreshPolicy>().is_err());
 }
 
 #[test]
@@ -609,7 +649,9 @@ mod es_integration {
     use helios_fhir::FhirVersion;
     use serde_json::json;
 
-    use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
+    use helios_persistence::backends::elasticsearch::{
+        ElasticsearchBackend, ElasticsearchConfig, WriteRefreshPolicy,
+    };
     use helios_persistence::core::{Backend, BackendCapability, BackendKind, ResourceStorage};
     use helios_persistence::error::{ResourceError, StorageError};
     use helios_persistence::search::{
@@ -723,6 +765,13 @@ mod es_integration {
     /// Each call uses a unique index prefix (via UUID) so tests are fully isolated
     /// without needing separate containers.
     async fn create_backend() -> ElasticsearchBackend {
+        create_backend_with("1ms", WriteRefreshPolicy::default()).await
+    }
+
+    async fn create_backend_with(
+        refresh_interval: &str,
+        write_refresh: WriteRefreshPolicy,
+    ) -> ElasticsearchBackend {
         let es = shared_es().await;
         let unique_prefix = format!("hfs_{}", uuid::Uuid::new_v4().simple());
 
@@ -730,7 +779,8 @@ mod es_integration {
             nodes: vec![format!("http://{}:{}", es.host, es.port)],
             index_prefix: unique_prefix,
             number_of_replicas: 0, // single-node, no replicas needed
-            refresh_interval: "1ms".to_string(), // near-instant refresh for tests
+            refresh_interval: refresh_interval.to_string(),
+            write_refresh,
             ..Default::default()
         };
 
@@ -1863,6 +1913,152 @@ mod es_integration {
     }
 
     #[tokio::test]
+    async fn es_integration_write_refresh_wait_for_read_after_write() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend_with("5s", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("raw-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "raw-1",
+                    "name": [{"family": "Readafterwrite", "given": ["Direct"]}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Readafterwrite")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "wait_for write must be searchable immediately"
+        );
+        assert_eq!(result.resources.items[0].id(), "raw-1");
+
+        backend.delete(&tenant, "Patient", "raw-1").await.unwrap();
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert!(
+            result.resources.items.is_empty(),
+            "wait_for delete must drop out of search immediately"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn es_integration_composite_synchronous_wait_for_read_after_write() {
+        use std::collections::HashMap;
+
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, DynSearchProvider, DynStorage, SyncMode,
+        };
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let es = shared_es().await;
+        let unique_prefix = format!("hfs_{}", uuid::Uuid::new_v4().simple());
+        let es_config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            index_prefix: unique_prefix,
+            number_of_replicas: 0,
+            refresh_interval: "5s".to_string(),
+            write_refresh: WriteRefreshPolicy::WaitFor,
+            ..Default::default()
+        };
+        let es_backend = Arc::new(
+            ElasticsearchBackend::with_shared_registry(es_config, build_search_registry())
+                .expect("create ES backend"),
+        );
+        es_backend
+            .initialize()
+            .await
+            .expect("initialize ES backend");
+
+        let sqlite = Arc::new(SqliteBackend::in_memory().expect("create SQLite backend"));
+        sqlite.init_schema().expect("init SQLite schema");
+
+        let composite_config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(SyncMode::Synchronous)
+            .build()
+            .expect("build composite config");
+
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+        backends.insert("es".to_string(), es_backend.clone() as DynStorage);
+
+        let mut search_providers: HashMap<String, DynSearchProvider> = HashMap::new();
+        search_providers.insert("sqlite".to_string(), sqlite.clone() as DynSearchProvider);
+        search_providers.insert("es".to_string(), es_backend.clone() as DynSearchProvider);
+
+        let composite = CompositeStorage::new(composite_config, backends)
+            .expect("create composite storage")
+            .with_search_providers(search_providers)
+            .with_full_primary(sqlite);
+
+        let tenant = create_tenant("raw-composite-tenant");
+        composite
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "raw-composite-1",
+                    "text": {
+                        "status": "generated",
+                        "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Compositeraw Sync</div>"
+                    },
+                    "name": [{"family": "Compositeraw", "given": ["Sync"]}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create through composite");
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_text".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Compositeraw")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = composite
+            .search(&tenant, &query)
+            .await
+            .expect("search through composite");
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "synchronous sync + wait_for must give read-after-write search"
+        );
+        assert_eq!(result.resources.items[0].id(), "raw-composite-1");
+    }
+
+    #[tokio::test]
     async fn es_integration_compartment_search() {
         // Compartment membership: a resource joins the Patient compartment if it
         // references the patient via ANY of the membership params (here `subject`
@@ -2795,6 +2991,64 @@ mod es_integration {
         assert!(
             !result.resources.items.is_empty(),
             "_lastUpdated search should find recently created resource"
+        );
+    }
+
+    /// #892: `ne` must be the complement of the day range, not `eq`.
+    #[tokio::test]
+    async fn es_integration_search_last_updated_ne_excludes_today() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "lu-ne-1"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let today = created.last_modified().format("%Y-%m-%d").to_string();
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let last_updated = |prefix: SearchPrefix| {
+            SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "_lastUpdated".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, &today)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        let eq = backend
+            .search(&tenant, &last_updated(SearchPrefix::Eq))
+            .await
+            .unwrap();
+        assert!(
+            eq.resources.items.iter().any(|r| r.id() == "lu-ne-1"),
+            "eq on the creation day must match the resource"
+        );
+
+        let ne = backend
+            .search(&tenant, &last_updated(SearchPrefix::Ne))
+            .await
+            .unwrap();
+        assert!(
+            ne.resources.items.iter().all(|r| r.id() != "lu-ne-1"),
+            "ne on the creation day must exclude the resource"
         );
     }
 
