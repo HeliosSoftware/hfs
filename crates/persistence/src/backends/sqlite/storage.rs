@@ -3225,6 +3225,15 @@ impl BundleProvider for SqliteBackend {
         // This maps urn:uuid:xxx to ResourceType/assigned-id after creates
         let mut reference_map: HashMap<String, String> = HashMap::new();
 
+        // Whether any entry in this transaction writes a SearchParameter that
+        // affects this tenant's cached overlay (#787: transaction-bundle writes
+        // never invalidated the registry, so a SearchParameter POSTed inside a
+        // Bundle — e.g. by Inferno's US Core setup — never took effect until
+        // the TTL cache refresh). Mirrors the non-transactional create/update/
+        // delete checks below (create is conditional via `create_affects_overlay`;
+        // update/delete are unconditional).
+        let mut search_param_overlay_changed = false;
+
         // Make entries mutable for reference resolution
         let mut entries = entries;
 
@@ -3246,6 +3255,38 @@ impl BundleProvider for SqliteBackend {
                             format!("Entry failed with status {}", entry_result.status),
                         ));
                         break;
+                    }
+
+                    if !search_param_overlay_changed {
+                        search_param_overlay_changed =
+                            match entry_result.status {
+                                // Created (POST, or PUT-as-create): only overlay-affecting
+                                // creates need to invalidate (see `create_affects_overlay`).
+                                201 => entry_result
+                                    .resource
+                                    .as_ref()
+                                    .filter(|r| {
+                                        r.get("resourceType").and_then(|v| v.as_str())
+                                            == Some("SearchParameter")
+                                    })
+                                    .is_some_and(|r| {
+                                        self.tenant_registries().create_affects_overlay(r)
+                                    }),
+                                // Updated (PUT/PATCH): unconditional, like the
+                                // non-transactional update path.
+                                200 => {
+                                    entry_result.resource.as_ref().and_then(|r| {
+                                        r.get("resourceType").and_then(|v| v.as_str())
+                                    }) == Some("SearchParameter")
+                                }
+                                // Deleted: the emptied result carries no resource, so
+                                // parse the type from the entry's URL instead.
+                                204 => self
+                                    .parse_url(&entry.url)
+                                    .map(|(resource_type, _)| resource_type == "SearchParameter")
+                                    .unwrap_or(false),
+                                _ => false,
+                            };
                     }
 
                     // If this was a create (POST) and we have a fullUrl, record the mapping
@@ -3286,6 +3327,14 @@ impl BundleProvider for SqliteBackend {
             .map_err(|e| TransactionError::RolledBack {
                 reason: format!("Commit failed: {}", e),
             })?;
+
+        // A committed SearchParameter write in this transaction changes this
+        // tenant's cached overlay — drop it so the next access rebuilds from
+        // storage (#787).
+        if search_param_overlay_changed {
+            self.tenant_registries()
+                .invalidate(tenant.tenant_id().as_str());
+        }
 
         Ok(BundleResult {
             bundle_type: BundleType::Transaction,

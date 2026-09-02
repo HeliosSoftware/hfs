@@ -1197,6 +1197,38 @@ fn spawn_mongodb_search_param_refresh(backend: Arc<MongoBackend>, config: &Serve
     });
 }
 
+/// S3 flavor of the periodic registry refresh (#235, #787). Before #787, S3
+/// had no such refresh at all — stored SearchParameters never took effect,
+/// not even eventually, because the composite handed Elasticsearch a
+/// `base_only()` registry whose loader unconditionally returned an empty
+/// overlay. S3 now owns a real per-tenant overlay refreshed on every write
+/// (immediate effect) plus this TTL sweep (multi-instance drift), matching
+/// every other backend.
+#[cfg(all(feature = "s3", feature = "elasticsearch"))]
+fn spawn_s3_search_param_refresh(
+    backend: Arc<helios_persistence::backends::s3::S3Backend>,
+    config: &ServerConfig,
+) {
+    let ttl = config.search_param_cache_ttl;
+    if ttl == 0 {
+        return;
+    }
+    let interval = std::time::Duration::from_secs(ttl);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match backend.refresh_stored_search_parameters().await {
+                Ok(stored) => {
+                    tracing::debug!(stored, "SearchParameter registry refreshed from storage")
+                }
+                Err(e) => tracing::warn!(
+                    "SearchParameter registry refresh failed; serving the stale cache: {e}"
+                ),
+            }
+        }
+    });
+}
+
 /// Starts the server with SQLite-only backend.
 #[cfg(feature = "sqlite")]
 async fn start_sqlite(
@@ -2543,38 +2575,6 @@ async fn start_s3(
     )
 }
 
-/// Builds a search parameter registry independently (for backends that don't own one).
-///
-/// Only the composite S3 + Elasticsearch starter needs this; the other composite
-/// starters get their registry from the primary backend.
-#[cfg(all(feature = "s3", feature = "elasticsearch"))]
-fn build_search_registry(
-    fhir_version: helios_fhir::FhirVersion,
-    data_dir: Option<&std::path::Path>,
-) -> std::sync::Arc<helios_persistence::search::TenantSearchRegistries> {
-    use helios_persistence::search::{SearchParameterLoader, TenantSearchRegistries};
-
-    // S3 stores no SearchParameter resources of its own, so tenants have no
-    // stored overlay — every tenant sees the shared base (embedded + spec).
-    let registries = std::sync::Arc::new(TenantSearchRegistries::base_only());
-    let loader = SearchParameterLoader::new(fhir_version);
-    {
-        let mut reg = registries.base().write();
-        if let Ok(params) = loader.load_embedded() {
-            for p in params {
-                let _ = reg.register(p);
-            }
-        }
-        let dir = data_dir.unwrap_or_else(|| std::path::Path::new("./data"));
-        if let Ok(params) = loader.load_from_spec_file(dir) {
-            for p in params {
-                let _ = reg.register(p);
-            }
-        }
-    }
-    registries
-}
-
 /// Starts the server with S3 + Elasticsearch composite backend.
 #[cfg(all(feature = "s3", feature = "elasticsearch"))]
 async fn start_s3_elasticsearch(
@@ -2636,6 +2636,10 @@ async fn start_s3_elasticsearch(
             e
         )
     })?);
+    // Refresh reads from the primary; the ES backend shares its registry Arc
+    // (wired below, once it's populated). Seeding waits for the composite
+    // further down, so the writes also index into ES.
+    spawn_s3_search_param_refresh(s3.clone(), &config);
 
     // --- Elasticsearch backend (search) ---
     let es_nodes: Vec<String> = config
@@ -2672,12 +2676,37 @@ async fn start_s3_elasticsearch(
         "Initializing Elasticsearch backend (search)"
     );
 
-    // Build search registry independently — S3 has no internal registry
-    let search_registry =
-        build_search_registry(config.default_fhir_version, config.data_dir.as_deref());
+    // Populate S3's own per-tenant registry container with the shared base
+    // (embedded + spec) — S3 has no `data_dir`/FHIR version of its own to load
+    // these from, so a composite starter does it once here, the same params
+    // `build_search_registry` used to load into a standalone container. Unlike
+    // before, this container is *S3's real registries* (`s3.tenant_registries()`),
+    // not a throwaway one: S3's own create/update/delete hooks now keep each
+    // tenant's stored SearchParameter overlay on it current (#787), so sharing
+    // it with Elasticsearch below gives ES the same live overlay every other
+    // composite's search backend already gets from its primary.
+    {
+        use helios_persistence::search::SearchParameterLoader;
+        let loader = SearchParameterLoader::new(config.default_fhir_version);
+        let mut base = s3.tenant_registries().base().write();
+        if let Ok(params) = loader.load_embedded() {
+            for p in params {
+                let _ = base.register(p);
+            }
+        }
+        let data_dir = config
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+        if let Ok(params) = loader.load_from_spec_file(&data_dir) {
+            for p in params {
+                let _ = base.register(p);
+            }
+        }
+    }
     let es = Arc::new(ElasticsearchBackend::with_shared_registry(
         es_config,
-        search_registry,
+        s3.tenant_registries().clone(),
     )?);
 
     // --- Composite wiring ---
@@ -2888,18 +2917,6 @@ mod tests {
         let result = create_sqlite_backend(&config);
         let _ = std::fs::remove_file(&path);
         assert!(result.is_ok());
-    }
-
-    // ── build_search_registry() ───────────────────────────────────
-
-    #[cfg(all(feature = "s3", feature = "elasticsearch"))]
-    #[test]
-    fn test_build_search_registry_returns_registry() {
-        use helios_fhir::FhirVersion;
-        let registries = build_search_registry(FhirVersion::R4, None);
-        // The container's base should be populated and every tenant resolves.
-        assert!(!registries.base().read().is_empty());
-        let _guard = registries.for_tenant("default");
     }
 
     #[cfg(feature = "mongodb")]
