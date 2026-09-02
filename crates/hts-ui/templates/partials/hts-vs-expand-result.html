@@ -202,8 +202,11 @@
 
       {% if !result.echoed_parameters.is_empty() %}
       <div class="panel">
-        <details>
-          <summary class="field__label">{{ chrome.i18n.t("hts-vs-expand-echoed-parameters") }}</summary>
+        <details class="disclosure">
+          <summary class="disclosure__summary">
+            <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
+            {{ chrome.i18n.t("hts-vs-expand-echoed-parameters") }}
+          </summary>
           <div class="kv-grid" style="margin:14px 0 0">
             {% for entry in result.echoed_parameters %}
             <div class="detail__field">

@@ -29,8 +29,16 @@
                                             _SIZE_HINT for the tooltip
 
   V3 layout: the form IS the card — `.card-head` heading + `.panel` field
-  stack (design doc §9 form contract); the Advanced disclosure is a bare
-  `<details>` (never `.addbox`, which floats as a dropdown panel).
+  stack (design doc §9 form contract); the Advanced fold is the shared
+  `.disclosure` pattern (never `.addbox`, which floats as a dropdown panel).
+
+  #806: the fold used to be a `<details>` whose `<summary>` carried
+  `.field__label`. That is `display:block`, and a `<summary>` only draws its
+  native ::marker at `display:list-item` — so the triangle was gone in every
+  engine and `.field__label` sets no `cursor`, leaving the fold looking like
+  the inert grey labels around it. `.disclosure` (crates/ui/assets/app.css,
+  shared with HFS via the embedded asset dir) draws an explicit chevron that
+  rotates on `[open]` instead of relying on a marker no styled summary keeps.
 -#}
 <form id="hts-workbench-input"
       class="card"
@@ -121,13 +129,14 @@
       </div>
     </div>
 
-    <details id="expand-advanced">
-      <summary class="field__label"
+    <details class="disclosure" id="expand-advanced">
+      <summary class="disclosure__summary"
                title="{{ chrome.i18n.t_arg("hts-vs-expand-ceiling-tooltip", "ceiling", ceiling.to_string()) }}">
+        <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
         {{ chrome.i18n.t("hts-vs-expand-advanced-summary") }}
       </summary>
 
-      <div style="margin-top:14px">
+      <div class="disclosure__body">
         <div class="field">
           <label class="field__label" for="expand-date">{{ chrome.i18n.t("hts-vs-expand-date") }}</label>
           <input class="field__input" id="expand-date" name="date" type="text" autocomplete="off" spellcheck="false"

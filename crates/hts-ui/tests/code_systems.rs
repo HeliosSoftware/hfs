@@ -666,11 +666,16 @@ fn cs_detail_templates_only_use_classes_that_exist_in_app_css() {
 
 /// The V3 compact header: facts collapse into a `.facets.facets--bare`
 /// chip row plus one `.detail__field--wide` canonical URL, and the full
-/// fact set lives behind a collapsed bare `<details>` — never `.addbox`,
+/// fact set lives behind a collapsed `.disclosure` fold — never `.addbox`,
 /// which is the Add-tenant dropdown and renders as a floating popover.
 /// Since #801 the head also takes the HFS back-link idiom: a
 /// `.page-head--back-link` modifier, a leading `.back-link`, and the rest
 /// of the head wrapped in `.page-head__copy`.
+///
+/// Since #806 the fold is the shared `.disclosure` pattern rather than a
+/// `<summary class="field__label">`: that class is `display: block`, which
+/// suppresses the native `::marker` (it only paints at
+/// `display: list-item`) and sets no `cursor`, so the fold looked inert.
 #[test]
 fn cs_detail_page_uses_the_v3_compact_header_shape() {
     const PAGE: &str = include_str!("../templates/pages/cs-detail.html");
@@ -685,13 +690,21 @@ fn cs_detail_page_uses_the_v3_compact_header_shape() {
         r#"class="facets facets--bare""#,
         r#"class="facet-label""#,
         r#"class="detail__field detail__field--wide""#,
-        r#"<summary class="field__label">"#,
+        r#"<details class="disclosure">"#,
+        r#"<summary class="disclosure__summary">"#,
+        r#"<span class="icon disclosure__chevron" aria-hidden="true">"#,
     ] {
         assert!(
             body.contains(hook),
             "V3 compact header must render `{hook}`"
         );
     }
+    // The summary now spans several lines (chevron span, then the label),
+    // so the label text is asserted separately from the markup shape.
+    assert!(
+        body.contains(r#"{{ chrome.i18n.t("hts-cs-detail-facts-summary") }}"#),
+        "the facts fold must still be labelled by `hts-cs-detail-facts-summary`",
+    );
     for dead in [
         "page-header",
         "addbox",
@@ -721,7 +734,9 @@ fn cs_detail_page_uses_the_v3_compact_header_shape() {
 // 1. The fold had no expand affordance — `<summary class="field__label">`
 //    sets `display: block`, and a `<summary>` only draws the native
 //    disclosure marker at `display: list-item`, so the triangle was gone in
-//    every engine and the cursor never changed.
+//    every engine and the cursor never changed. (#806 fixed this for every
+//    HTS fold with the shared `.disclosure` idiom; the shared partial takes
+//    the same shape.)
 // 2. The payload was an unhighlighted `<pre>` blob.
 // 3. On a failed lookup there was no response JSON at all — `raw_body` was
 //    populated only on the success path — and the request body was never
@@ -817,13 +832,12 @@ async fn raw_fold_reads_as_a_control_and_highlights_both_payloads() {
     .await;
     let html = run_lookup(&base, "code=001").await;
 
-    // 1. The HFS `json-fold` idiom: an explicit chevron on a `.card-head`
-    //    summary, which `details.json-fold > summary` gives `cursor: pointer`
-    //    and strips the (already absent) native marker from.
+    // 1. The shared `.disclosure` idiom (#806): an explicit chevron on a
+    //    `.disclosure__summary`, which app.css gives `cursor: pointer`.
     assert!(
-        html.contains(r#"<details class="card json-fold">"#)
-            && html.contains(r#"<summary class="card-head">"#)
-            && html.contains(r#"<span class="icon">"#),
+        html.contains(r#"<details class="disclosure">"#)
+            && html.contains(r#"<summary class="disclosure__summary">"#)
+            && html.contains(r#"<span class="icon disclosure__chevron" aria-hidden="true">"#),
         "the fold must render the chevron idiom, not a bare summary; got:\n{html}",
     );
     assert!(
@@ -876,7 +890,7 @@ async fn a_failed_lookup_still_shows_the_response_payload() {
         "the structured outcome must still render above the fold",
     );
     assert!(
-        html.contains(r#"<details class="card json-fold">"#),
+        html.contains(r#"<details class="disclosure">"#),
         "a failed lookup must still render the fold; got:\n{html}",
     );
     assert!(
@@ -907,5 +921,60 @@ async fn a_submit_rejected_before_sending_renders_no_fold() {
         .unwrap();
     let html = body_text(response).await;
 
-    assert!(!html.contains("json-fold"), "got:\n{html}");
+    assert!(
+        !html.contains(r#"<details class="disclosure">"#),
+        "got:\n{html}"
+    );
+}
+
+/// Regression guard for #806: no CodeSystem-surface fold may go back to
+/// `<summary class="field__label">`. `.field__label` is `display: block`,
+/// which strips the native `::marker` (a `<summary>` only draws one at
+/// `display: list-item`) and sets no `cursor`, so such a fold renders as an
+/// inert grey label with no disclosure affordance at all. Folds use the
+/// shared `.disclosure` pattern, which ships its own chevron and cursor.
+#[test]
+fn cs_detail_folds_never_reuse_the_markerless_field_label_summary() {
+    // (template, carries a fold of its own). The workbench result includes
+    // the raw fold from `partials/hts-raw-fold.html` (#803), so the shape
+    // is asserted on the partial rather than on the includer.
+    let templates = [
+        (
+            "pages/cs-detail.html",
+            include_str!("../templates/pages/cs-detail.html"),
+            true,
+        ),
+        (
+            "partials/hts-cs-workbench-result.html",
+            include_str!("../templates/partials/hts-cs-workbench-result.html"),
+            false,
+        ),
+        (
+            "partials/hts-raw-fold.html",
+            include_str!("../templates/partials/hts-raw-fold.html"),
+            true,
+        ),
+    ];
+
+    for (name, template, carries_fold) in templates {
+        let body = strip_template_comments(template);
+        assert!(
+            !body.contains(r#"<summary class="field__label""#),
+            "{name} must fold with `.disclosure`, not a markerless \
+             `<summary class=\"field__label\">`",
+        );
+        if !carries_fold {
+            continue;
+        }
+        // …and it must actually carry the replacement, so deleting the fold
+        // outright cannot satisfy the guard above.
+        assert!(
+            body.contains(r#"<summary class="disclosure__summary">"#),
+            "{name} must render the shared `.disclosure__summary` fold",
+        );
+        assert!(
+            body.contains(r#"class="icon disclosure__chevron""#),
+            "{name}'s fold must render the explicit `.disclosure__chevron`",
+        );
+    }
 }

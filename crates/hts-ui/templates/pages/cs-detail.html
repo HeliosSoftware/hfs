@@ -10,11 +10,14 @@
   fact set moves into a collapsed `<details>` disclosure so the workbench
   (tab strip + input form + result) starts high on the page.
 
-  The disclosure is a bare `<details>`/`<summary>` inside a `.card`,
-  exactly the idiom `crates/ui/templates/pages/capability-statement.html`
-  uses for its raw payload. It deliberately does NOT use `.addbox`: that
-  class is the Add-tenant dropdown, whose `.addbox__panel` is
-  `position: absolute` and would render this as a floating popover.
+  The disclosure is the shared `.disclosure` / `.disclosure__summary`
+  pattern from `crates/ui` (see `templates/pages/bulk-import.html`),
+  wrapped in a `.card`. It renders its own chevron `<span>` rather than
+  leaning on the native `::marker`: a `<summary>` paints that marker only
+  at `display: list-item`, so any class that restyles the summary drops
+  it. It deliberately does NOT use `.addbox`: that class is the
+  Add-tenant dropdown, whose `.addbox__panel` is `position: absolute` and
+  would render this as a floating popover.
 
   Zero new CSS: every class here already has a rule in
   `crates/ui/assets/app.css` (guarded by
@@ -108,13 +111,17 @@
     </header>
 
     {#-
-      Full fact set, collapsed. Bare <details>/<summary> so the native
-      disclosure triangle survives (a `display:flex` summary loses its
-      ::marker in every engine).
+      Full fact set, collapsed, on the shared `.disclosure` pattern. The
+      chevron is explicit markup because the native `::marker` only paints
+      at `display: list-item`: a styled summary — the old `.field__label`
+      included — loses the triangle and reads as an inert grey label.
     -#}
     <section class="card panel" style="margin-bottom:16px">
-      <details>
-        <summary class="field__label">{{ chrome.i18n.t("hts-cs-detail-facts-summary") }}</summary>
+      <details class="disclosure">
+        <summary class="disclosure__summary">
+          <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
+          {{ chrome.i18n.t("hts-cs-detail-facts-summary") }}
+        </summary>
         <div class="kv-grid" style="margin:14px 0 0">
           <div class="detail__field detail__field--wide">
             <span>{{ chrome.i18n.t("hts-detail-canonical-url") }}</span>

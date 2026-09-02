@@ -619,10 +619,21 @@ async fn expand_input_shows_advanced_details_and_threshold_field() {
         "Advanced panel must expose a `threshold` numeric input",
     );
     // The V3 layout pass dropped every `hts-*` class hook (none of them had
-    // a rule in app.css); the Advanced disclosure is now addressed by id.
+    // a rule in app.css); the Advanced disclosure is now addressed by id and
+    // takes the shared `.disclosure` pattern from app.css (#806).
     assert!(
-        html.contains(r#"<details id="expand-advanced">"#),
-        "Advanced <details> must render with its stable id",
+        html.contains(r#"<details class="disclosure" id="expand-advanced">"#),
+        "Advanced <details> must render as a `.disclosure` with its stable id",
+    );
+    // Affordance guard (#806): a bare `<summary class="field__label">` has no
+    // marker and no pointer cursor, so the fold reads as an inert label.
+    assert!(
+        html.contains(r#"<summary class="disclosure__summary""#),
+        "the Advanced summary must carry `disclosure__summary`",
+    );
+    assert!(
+        html.contains(r#"<span class="icon disclosure__chevron" aria-hidden="true">"#),
+        "the Advanced summary must render the disclosure chevron",
     );
     assert!(
         html.contains("value=\"tree\"") && html.contains("value=\"flat\""),
@@ -1157,6 +1168,58 @@ fn vs_detail_templates_only_use_classes_that_exist_in_app_css() {
     );
 }
 
+/// #806 regression guard: no ValueSet detail template may fold content
+/// behind a `<summary class="field__label">`. `.field__label` is
+/// `display:block`, and a `<summary>` only paints its native ::marker at
+/// `display:list-item` — so such a fold renders as an inert grey label with
+/// no triangle and no pointer cursor. Every fold must take the shared
+/// `.disclosure` / `.disclosure__summary` pattern from app.css instead.
+#[test]
+fn vs_detail_templates_never_fold_behind_a_bare_field_label_summary() {
+    let templates = [
+        (
+            "pages/vs-detail.html",
+            include_str!("../templates/pages/vs-detail.html"),
+        ),
+        (
+            "partials/hts-vs-expand-input.html",
+            include_str!("../templates/partials/hts-vs-expand-input.html"),
+        ),
+        (
+            "partials/hts-vs-expand-result.html",
+            include_str!("../templates/partials/hts-vs-expand-result.html"),
+        ),
+        // The expand result includes its raw fold from here (#803).
+        (
+            "partials/hts-raw-fold.html",
+            include_str!("../templates/partials/hts-raw-fold.html"),
+        ),
+    ];
+
+    let mut summaries = 0usize;
+    for (name, template) in templates {
+        let body = strip_template_comments(template);
+        assert!(
+            !body.contains(r#"<summary class="field__label""#),
+            "{name} still folds content behind `<summary class=\"field__label\"`; \
+             use the shared `.disclosure` pattern (app.css) so the fold keeps \
+             its marker and pointer cursor",
+        );
+        for chunk in body.split("<summary").skip(1) {
+            let open = chunk.split('>').next().unwrap_or_default();
+            assert!(
+                open.contains(r#"class="disclosure__summary""#),
+                "a <summary> in {name} must carry `disclosure__summary`, got `<summary{open}>`",
+            );
+            summaries += 1;
+        }
+    }
+    assert!(
+        summaries >= 4,
+        "expected the scan to reach every fold, only saw {summaries}",
+    );
+}
+
 /// The V3 compact header on the ValueSet detail page. Since #801 it also
 /// takes the HFS back-link idiom: a `.page-head--back-link` modifier, a
 /// leading `.back-link`, and the rest of the head wrapped in
@@ -1173,7 +1236,11 @@ fn vs_detail_page_uses_the_v3_compact_header_shape() {
         r#"class="page-head__title""#,
         r#"class="facets facets--bare""#,
         r#"class="detail__field detail__field--wide""#,
-        r#"<summary class="field__label">"#,
+        // #806: the facts fold uses the shared `.disclosure` pattern, so it
+        // keeps a native marker and a pointer cursor.
+        r#"<details class="disclosure">"#,
+        r#"<summary class="disclosure__summary">"#,
+        r#"<span class="icon disclosure__chevron" aria-hidden="true">"#,
     ] {
         assert!(
             body.contains(hook),
@@ -1225,7 +1292,13 @@ async fn vs_detail_renders_the_compact_header_from_a_live_summary() {
         r#"class="facets facets--bare""#,
         ">Facts<",
         "http://example.org/vs/example",
-        r#"<summary class="field__label">All ValueSet facts</summary>"#,
+        // #806: the facts fold takes the shared `.disclosure` pattern, so the
+        // summary is a multi-line element (chevron span + label) rather than
+        // the old flat `<summary class="field__label">…</summary>`.
+        r#"<details class="disclosure">"#,
+        r#"<summary class="disclosure__summary">"#,
+        r#"<span class="icon disclosure__chevron" aria-hidden="true">"#,
+        "All ValueSet facts",
     ] {
         assert!(
             html.contains(hook),
@@ -1247,8 +1320,23 @@ async fn vs_detail_renders_the_compact_header_from_a_live_summary() {
     let workbench = html
         .find(r#"id="hts-workbench-input""#)
         .expect("workbench form present");
+    // `All ValueSet facts` is rendered exactly once (only `pages/vs-detail.html`
+    // uses `hts-vs-detail-facts-summary`), so it is a stable ordering anchor
+    // now that the summary itself spans multiple lines.
     let disclosure = html
-        .find(r#"<summary class="field__label">All ValueSet facts</summary>"#)
+        .find("All ValueSet facts")
         .expect("facts disclosure present");
+    // …and that label must sit inside the disclosure summary, not loose in
+    // the body: the affordance and the text belong to the same element.
+    let summary = html
+        .find(r#"<summary class="disclosure__summary">"#)
+        .expect("facts disclosure summary present");
+    assert!(
+        html[summary..]
+            .split("</summary>")
+            .next()
+            .is_some_and(|open| open.contains("All ValueSet facts")),
+        "the facts label must render inside the `.disclosure__summary`",
+    );
     assert!(head < disclosure && disclosure < workbench);
 }
