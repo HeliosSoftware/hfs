@@ -8,7 +8,7 @@ import { expect, test } from "@playwright/test";
 // click, backlink navigation returning to the browser, and the Import
 // FileReader sink populating the paste textarea from a picked file).
 //
-// Seed dependency: seed.mjs already provisions ex-cs-1, ex-vs-1, ex-cm-1
+// Seed dependency: seed.ts already provisions ex-cs-1, ex-vs-1, ex-cm-1
 // through /import, so the detail pages actually render `summary =
 // Some(...)` and the backlink appears. No extra fixture bytes required.
 

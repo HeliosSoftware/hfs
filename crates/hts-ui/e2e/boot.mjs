@@ -9,27 +9,16 @@
 // degraded-state contract).
 
 import { spawn } from "node:child_process";
-import { existsSync, rmSync, statSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import { findHtsBinary } from "./support/find-hts-binary.cjs";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const root = join(here, "..", "..", ".."); // crates/hts-ui/e2e -> repo root
-const exe = process.platform === "win32" ? "hts.exe" : "hts";
-const candidates = [
-  join(root, "target", "release", exe),
-  join(root, "target", "debug", exe),
-];
-// Pick the most recently built binary, not a fixed profile.
-const bin = candidates
-  .filter(existsSync)
-  .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
-if (!bin) {
-  console.error(
-    "hts binary not found. Build it first:\n  cargo build -p helios-hts\nLooked in:\n  " +
-      candidates.join("\n  "),
-  );
+let bin;
+try {
+  bin = findHtsBinary();
+} catch (err) {
+  console.error(err.message);
   process.exit(1);
 }
 
@@ -51,7 +40,7 @@ const child = spawn(bin, [], {
     HTS_LOG_LEVEL: "warn",
     HTS_UI_ENABLED: "true",
     // A tiny expansion ceiling so the value-sets spec's too-costly test
-    // (ex-vs-too-costly seeded in seed.mjs) reliably trips HTS's guard
+    // (ex-vs-too-costly seeded in seed.ts) reliably trips HTS's guard
     // and returns 422 with a `too-costly` OperationOutcome.
     HTS_MAX_EXPANSION_SIZE: "5",
   },
