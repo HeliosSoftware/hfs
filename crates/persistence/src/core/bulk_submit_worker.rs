@@ -595,6 +595,39 @@ where
             .with_byte_progress(progress.clone());
         let mut processed: u64 = 0;
         let mut failed: u64 = 0;
+        // Pre-size the byte denominator: every output file's advertised size
+        // up front, so the percentage never recomputes against a partial
+        // total — learned lazily per file, each newly opened file yanked the
+        // bar backwards on multi-file manifests (#874). Encrypted files are
+        // skipped (wire length ≠ decrypted length); any unknown size falls
+        // back to lazy accumulation below.
+        let mut presized = false;
+        if view.file_encryption_key.is_none() && !manifest.output.is_empty() {
+            let mut sum: u64 = 0;
+            let mut all_known = true;
+            for file in &manifest.output {
+                match self
+                    .fetcher
+                    .file_size(
+                        &file.url,
+                        &view.file_request_headers,
+                        manifest.requires_access_token,
+                        &view.oauth_metadata_urls,
+                    )
+                    .await
+                {
+                    Ok(Some(len)) => sum += len,
+                    _ => {
+                        all_known = false;
+                        break;
+                    }
+                }
+            }
+            if all_known {
+                progress.total.store(sum, Ordering::Relaxed);
+                presized = true;
+            }
+        }
         // The lease must stay heartbeated *through* a file, not only between
         // files, and independently of how often the ingest future yields; the
         // keeper renews from its own task until dropped.
@@ -637,6 +670,7 @@ where
                 }
             };
             match file_bytes_total {
+                _ if presized => {}
                 Some(len) if totals_known => {
                     progress.total.fetch_add(len, Ordering::Relaxed);
                 }
@@ -1139,6 +1173,16 @@ mod tests {
                 Some(len),
             ))
         }
+
+        async fn file_size(
+            &self,
+            url: &str,
+            _headers: &[(String, String)],
+            _requires_access_token: bool,
+            _oauth: &[String],
+        ) -> StorageResult<Option<u64>> {
+            Ok(self.files.get(url).map(|d| d.len() as u64))
+        }
     }
 
     fn tenant() -> TenantContext {
@@ -1226,6 +1270,85 @@ mod tests {
         // Byte progress reached the file's full advertised size.
         assert_eq!(manifests[0].bytes_total, ndjson.len() as u64);
         assert_eq!(manifests[0].bytes_processed, ndjson.len() as u64);
+    }
+
+    /// #874: with every file's size known up front, the byte denominator is
+    /// the full manifest total from the start — the percentage never
+    /// recomputes against a partial sum as later files open.
+    #[tokio::test]
+    async fn test_multi_file_manifest_presizes_the_byte_total() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let f1 = "{\"resourceType\":\"Patient\",\"id\":\"m1\"}\n";
+        let f2 = "{\"resourceType\":\"Patient\",\"id\":\"m2\"}\n{\"resourceType\":\"Patient\",\"id\":\"m3\"}\n";
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/a.ndjson".to_string(),
+            f1.as_bytes().to_vec(),
+        );
+        files.insert(
+            "http://provider/b.ndjson".to_string(),
+            f2.as_bytes().to_vec(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![
+                    RemoteFile {
+                        resource_type: Some("Patient".to_string()),
+                        url: "http://provider/a.ndjson".to_string(),
+                        count: None,
+                    },
+                    RemoteFile {
+                        resource_type: Some("Patient".to_string()),
+                        url: "http://provider/b.ndjson".to_string(),
+                        count: None,
+                    },
+                ],
+                deleted: vec![],
+            },
+        });
+
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("presize-worker"),
+        );
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("presize-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        let expected = (f1.len() + f2.len()) as u64;
+        assert_eq!(manifests[0].bytes_total, expected);
+        assert_eq!(manifests[0].bytes_processed, expected);
 
         // An `output` artifact for Patient was recorded.
         let files = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
