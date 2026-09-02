@@ -2456,6 +2456,45 @@ select.field__input {
   border: 1px solid var(--warn);
 }
 
+/* The HTS OperationOutcome box (`crates/hts-ui/templates/partials/
+   hts-outcome.html`, #805). It is a `.notice` whose body is a stack of
+   `<p>` rows, which the primitive alone cannot spell: HFS's own notices
+   put bare text in the box, so `.notice` carries no paragraph reset and
+   the UA's `margin: 1em 0` pushed the first line ~13px below a box padded
+   for 10px. Scope the rhythm here rather than touching `.notice`, which is
+   shared with every HFS warning surface. */
+.hts-outcome > * {
+  margin: 0;
+}
+
+.hts-outcome > * + * {
+  margin-top: 6px;
+}
+
+/* The box follows result content — the `$validate-code` field grid is
+   pinned flush on the assumption it is the panel's last child. The margin
+   collapses against a preceding notice's 16px, so stacked warnings stay
+   16px apart rather than 30. */
+.hts-outcome:not(:first-child) {
+  margin-top: 14px;
+}
+
+/* Last child of a `.panel` / `.card`: the container's 18px padding is the
+   gap, and the primitive's 16px on top of it reads as a doubled band. */
+.hts-outcome:last-child {
+  margin-bottom: 0;
+}
+
+/* FHIRPath locations. Previously borrowed `.filter-rail__list`, the
+   scrolling type-rail container, which indented them 40px (its rules never
+   touch the UA list padding) inside a needless scroll region. */
+.hts-outcome__locations {
+  display: grid;
+  gap: 2px;
+  padding-left: 0;
+  list-style: none;
+}
+
 /* 280px matches .nav-panel and .queries-layout's rail column (#603 follow-up):
    one rail width across Resources, Search, Saved Queries, and Search
    Parameters. */
