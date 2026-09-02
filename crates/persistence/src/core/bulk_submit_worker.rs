@@ -623,7 +623,9 @@ where
                     }
                 }
             }
-            if all_known {
+            // A zero sum (every file empty, or a source misreporting sizes)
+            // presizes nothing — the lazy path below stays the authority.
+            if all_known && sum > 0 {
                 progress.total.store(sum, Ordering::Relaxed);
                 presized = true;
             }

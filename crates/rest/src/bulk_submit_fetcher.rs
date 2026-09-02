@@ -379,9 +379,15 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         }
         // Strictly best-effort: providers without HEAD support (405, 4xx/5xx,
         // network refusal) degrade to lazy per-file accumulation, never to an
-        // error.
+        // error. The size comes from the Content-Length *header* — a HEAD
+        // response has no payload, so `Response::content_length()` (the body
+        // size hint) reports 0 regardless of what the header advertises.
         match rb.send().await {
-            Ok(resp) if resp.status().is_success() => Ok(resp.content_length()),
+            Ok(resp) if resp.status().is_success() => Ok(resp
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())),
             _ => Ok(None),
         }
     }
