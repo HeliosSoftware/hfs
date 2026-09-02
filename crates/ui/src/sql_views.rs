@@ -122,10 +122,10 @@ fn collect_columns(select: Option<&Value>, names: &mut Vec<String>) {
     for s in selects {
         if let Some(columns) = s.get("column").and_then(Value::as_array) {
             for c in columns {
-                if let Some(name) = c.get("name").and_then(Value::as_str) {
-                    if !names.iter().any(|n| n == name) {
-                        names.push(name.to_string());
-                    }
+                if let Some(name) = c.get("name").and_then(Value::as_str)
+                    && !names.iter().any(|n| n == name)
+                {
+                    names.push(name.to_string());
                 }
             }
         }
@@ -178,8 +178,8 @@ fn cell_text(value: Option<&Value>) -> String {
 }
 
 /// The starter document behind "Create New" — the smallest runnable view.
-pub(crate) fn starter_view_definition() -> String {
-    serde_json::to_string_pretty(&serde_json::json!({
+pub(crate) fn starter_view_definition_value() -> Value {
+    serde_json::json!({
         "resourceType": "ViewDefinition",
         "name": "new_view",
         "status": "draft",
@@ -187,8 +187,15 @@ pub(crate) fn starter_view_definition() -> String {
         "select": [
             { "column": [ { "name": "id", "path": "getResourceKey()" } ] }
         ]
-    }))
-    .expect("static JSON serializes")
+    })
+}
+
+/// The starter document's pretty-printed text, for the editor's textarea.
+/// #843: the page's own render also needs the *value* — to build the
+/// guided-form panel inline — so [`starter_view_definition_value`] is the
+/// one definition and this just formats it.
+pub(crate) fn starter_view_definition() -> String {
+    serde_json::to_string_pretty(&starter_view_definition_value()).expect("static JSON serializes")
 }
 
 #[cfg(test)]

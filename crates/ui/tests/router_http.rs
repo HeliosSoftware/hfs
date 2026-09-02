@@ -2778,6 +2778,156 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     assert!(html.contains(r#"hx-trigger="load""#));
 }
 
+/// #843: the JSON editor and the guided form share one stretched grid row,
+/// and the guided form's card renders server-side on the page's own first
+/// paint — built from the same starter document `?vd=new` seeds into the
+/// textarea — with `needs-js` so it stays hidden without JavaScript until
+/// `vd-editor.js` wires it up.
+#[tokio::test]
+async fn view_definitions_page_renders_the_stretch_grid_and_the_guided_form_inline() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"id="vd-editor-grid""#));
+    assert!(html.contains(r#"class="editor__grid editor__grid--stretch""#));
+    // The guided-form card, hidden without JavaScript — built inline, never
+    // fetched, so it is present on this very response.
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+    // The starter document's `resource: "Patient"` row, flattened by the
+    // same engine the `pane=form` tests above exercise directly.
+    let row = row_html(&html, "resource");
+    assert!(row.contains(r#"data-set="resource""#), "row: {row}");
+    assert!(row.contains(r#"value="Patient""#), "row: {row}");
+    // The JSON editor's own textarea, unchanged (same form, same name).
+    assert!(html.contains(r#"<textarea class="json-editor" name="json""#));
+
+    // The three scripts the guided-form loop needs, in the order it needs
+    // them: the CodeMirror bundle and its mount helper (already asserted
+    // together elsewhere) must load before editor-form.js, which must load
+    // before vd-editor.js — each reads globals the previous one defines.
+    let helper_pos = html
+        .find("/ui/assets/code-editor.js")
+        .expect("code-editor.js");
+    let form_pos = html
+        .find("/ui/assets/editor-form.js")
+        .expect("editor-form.js");
+    let vd_pos = html.find("/ui/assets/vd-editor.js").expect("vd-editor.js");
+    assert!(
+        helper_pos < form_pos,
+        "code-editor.js must load before editor-form.js"
+    );
+    assert!(
+        form_pos < vd_pos,
+        "editor-form.js must load before vd-editor.js"
+    );
+}
+
+/// #843: a stored view's document — not just the starter one — also
+/// gets its guided-form card built inline, and the two disagreeing about the
+/// selected document would be a real bug (the panel out of sync with the
+/// textarea beside it on first paint).
+#[tokio::test]
+async fn view_definitions_page_builds_the_guided_form_from_the_selected_view() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Observation",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![vd],
+    );
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    let row = row_html(&html, "resource");
+    assert!(row.contains(r#"value="Observation""#), "row: {row}");
+}
+
+/// #843: a Save that fails re-renders the page with the guided-form panel
+/// alongside the textarea, built from the exact text the user submitted —
+/// invalid JSON gets the same invalid-JSON notice `pane=form` itself would
+/// render for it, and text that parses (just not into a valid view) still
+/// gets a form built from it.
+#[tokio::test]
+async fn view_definitions_save_error_rerenders_the_guided_form_panel_from_the_submitted_text() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    // Invalid JSON: the panel shows the invalid-JSON notice, same as
+    // `pane=form` itself would for the identical text.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("id=&action=save&json=%7Bnope"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+    assert!(html.contains("class=\"alert\""));
+    assert!(html.contains("{nope"));
+    assert!(!html.contains("editor-row"));
+
+    // Valid JSON, wrong resourceType: Save refuses it before this ever
+    // reaches storage, but the panel still renders — built from exactly
+    // what was submitted, same as any other re-render.
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair(
+            "json",
+            &serde_json::json!({"resourceType": "Patient"}).to_string(),
+        )
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("must have resourceType"));
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+}
+
 /// #752 ticket 02, RF6: `?vd=<id>&saved=1` (Save's own redirect) renders the
 /// just-stored definition's `$sql-run` results server-side — the nojs path
 /// to the playground's live preview. The success case's results card comes

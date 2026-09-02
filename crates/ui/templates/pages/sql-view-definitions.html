@@ -35,6 +35,20 @@
   textarea stays in the DOM as the form's real value (and, unmounted, as the
   target of the live-preview `hx-post` below) — without the bundle, without
   JS, or if the mount fails, this page is unchanged.
+
+  #843: a guided-form card sits beside the editor (`.editor__grid--stretch`),
+  built server-side on this same render (`form_pane`) from the document the
+  textarea above shows — the Resource Editor's own engine
+  (`editor::build_form_pane`), reused rather than duplicated. The two panels
+  share one document, the editor's: a form action posts to `/ui/editor/render`
+  (`pane=form`, via `editor-form.js`, host-agnostic) and the response is
+  dispatched into the editor as one minimal transaction — undoable, and
+  without moving the scroll or the caret; an editor change the form did not
+  itself just cause is parsed 600ms after the last keystroke and, if its
+  canonical form actually changed, re-requests the panel alone. Without
+  JavaScript (or before `theme.js` marks `<html class="js">`) the card stays
+  hidden (`needs-js`) and the grid collapses to the editor alone — the page
+  already works without it, unchanged from #752.
 #}
 
 {% block title %}{{ i18n.t("sql-vd-title") }} — {{ i18n.t("app-title") }}{% endblock %}
@@ -124,33 +138,48 @@
     <p class="notice notice--warn">{{ error }}</p>
     {% endif %}
 
-    <!-- The editor card (#752 ticket 02): always open, no fold — the
-         definition lives in one place and the results below follow it live.
-         The textarea itself carries the live-preview wiring (RF5): htmx
-         reposts it 500ms after the last change (CodeMirror's sync already
-         dispatches `input` on every edit; the plain textarea does too if the
-         bundle never mounted), targeting the notice region below. -->
-    <section class="card">
-      <div class="card-head">
-        <h3>{{ i18n.t("vd-json-heading") }}</h3>
-        <div class="card-head__tools">
-          <p class="editor-legend">
-            <span class="editor-legend__live">{{ i18n.t("vd-run-hint") }}</span>
-          </p>
+    <!-- #843: the JSON editor and the guided form, sharing one height — both
+         cards grow together up to a 70vh cap, each scrolling inside its own
+         content area past that (`.editor__grid--stretch`, app.css). The
+         guided-form card renders server-side, from the same document as the
+         textarea below (`form_pane`, built by `render_vd_form_pane`); it
+         carries `needs-js` (`editor-form-pane.html`) so the grid collapses
+         to the editor alone until `theme.js` marks `<html class="js">` and
+         `vd-editor.js` wires it up. -->
+    <div class="editor__grid editor__grid--stretch" id="vd-editor-grid">
+      <!-- The editor card (#752): always open, no fold — the definition
+           lives in one place and the results below follow it live. The
+           textarea itself carries the live-preview wiring: htmx reposts it
+           500ms after the last change (CodeMirror's sync already dispatches
+           `input` on every edit; the plain textarea does too if the bundle
+           never mounted, or if the guided form drove the change — #843),
+           targeting the notice region below. -->
+      <section class="card">
+        <div class="card-head">
+          <h3>{{ i18n.t("vd-json-heading") }}</h3>
+          <div class="card-head__tools">
+            <p class="editor-legend">
+              <span class="editor-legend__live">{{ i18n.t("vd-run-hint") }}</span>
+            </p>
+          </div>
         </div>
-      </div>
-      <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body">
-        <input type="hidden" name="id" value="{{ sel.id }}">
-        <textarea class="json-editor" name="json" spellcheck="false"
-                  hx-post="/ui/sql/view-definitions/run"
-                  hx-trigger="input changed delay:500ms"
-                  hx-target="#vd-run-notice" hx-swap="outerHTML"
-                  aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
-        <div class="form-actions">
-          <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
-        </div>
-      </form>
-    </section>
+        <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body">
+          <input type="hidden" name="id" value="{{ sel.id }}">
+          <textarea class="json-editor" name="json" spellcheck="false"
+                    hx-post="/ui/sql/view-definitions/run"
+                    hx-trigger="input changed delay:500ms"
+                    hx-target="#vd-run-notice" hx-swap="outerHTML"
+                    aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
+          <div class="form-actions">
+            <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
+          </div>
+        </form>
+      </section>
+
+      {% if let Some(pane) = form_pane %}
+      {{ pane.render()?|safe }}
+      {% endif %}
+    </div>
 
     {#- The $sql-run preview region (#752 ticket 01/02): always renders
         `#vd-run-notice`, and `#vd-results` once the server has something to
@@ -178,11 +207,16 @@
 <script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/conformance-crud.js" defer></script>
 <!-- The ViewDefinition editor (#753, its mount helper generalized for
-     #838): the vendored CodeMirror 6 bundle must load before the shared
-     mount helper, which must load before this page's own editor script -
-     each reads globals (window.HfsCodeMirror, window.HfsCodeEditor) at the
-     top of its IIFE. Loaded only on this page. -->
+     #838; the guided form wired on in #843): the vendored CodeMirror 6
+     bundle must load before the shared mount helper, which must load before
+     the guided form's shared loop, which must load before this page's own
+     editor script — each reads globals (window.HfsCodeMirror,
+     window.HfsCodeEditor, window.HfsEditorForm) at the top of its IIFE.
+     editor-form.js is loaded here, not from base.html, the same as the
+     other three: nothing outside this page drives the guided form through
+     it yet. Loaded only on this page. -->
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
 <script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/editor-form.js" defer></script>
 <script src="/ui/assets/vd-editor.js" defer></script>
 {% endblock %}
