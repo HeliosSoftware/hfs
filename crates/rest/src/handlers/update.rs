@@ -421,10 +421,9 @@ fn build_update_response(
                 }
             })
         }
-        _ => format_resource_response(status, header_map, stored.content(), format).map_err(|_| {
-            RestError::InternalError {
+        _ => format_resource_response(status, header_map, &stored.content_with_meta(), format)
+            .map_err(|_| RestError::InternalError {
                 message: "Failed to serialize response".to_string(),
-            }
-        }),
+            }),
     }
 }

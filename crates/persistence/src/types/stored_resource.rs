@@ -190,6 +190,35 @@ impl StoredResource {
         &self.content
     }
 
+    /// Returns the content with server-populated `meta.versionId` and
+    /// `meta.lastUpdated` merged in from this row's version and timestamp.
+    ///
+    /// Stored resources persist the content as submitted — the version and
+    /// timestamp live in their own columns — so bodies read back without this
+    /// carry no server metadata even though the ETag/Last-Modified headers do
+    /// (#873). Client-supplied `meta` members (`profile`, `tag`, `security`)
+    /// are preserved; `versionId`/`lastUpdated` are overwritten because the
+    /// server's row is authoritative for both.
+    pub fn content_with_meta(&self) -> Value {
+        let mut content = self.content.clone();
+        if let Value::Object(obj) = &mut content {
+            let meta = obj
+                .entry("meta")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Value::Object(meta) = meta {
+                meta.insert("versionId".into(), Value::String(self.version_id.clone()));
+                meta.insert(
+                    "lastUpdated".into(),
+                    Value::String(
+                        self.last_modified
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    ),
+                );
+            }
+        }
+        content
+    }
+
     /// Returns a mutable reference to the resource content.
     pub fn content_mut(&mut self) -> &mut Value {
         &mut self.content

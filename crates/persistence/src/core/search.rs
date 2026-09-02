@@ -138,7 +138,7 @@ impl SearchResult {
         // computed one for this resource (`Bundle.entry.search.score`).
         for resource in &self.resources.items {
             let full_url = format!("{}/{}", base_url, resource.url());
-            let entry = BundleEntry::match_entry(full_url, resource.content().clone())
+            let entry = BundleEntry::match_entry(full_url, resource.content_with_meta())
                 .with_score(self.scores.get(&resource.url()).copied());
             bundle = bundle.with_entry(entry);
         }
@@ -148,7 +148,7 @@ impl SearchResult {
             let full_url = format!("{}/{}", base_url, resource.url());
             bundle = bundle.with_entry(BundleEntry::include_entry(
                 full_url,
-                resource.content().clone(),
+                resource.content_with_meta(),
             ));
         }
 

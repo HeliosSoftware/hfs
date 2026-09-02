@@ -642,15 +642,76 @@ impl PostgresQueryBuilder {
         Some(combined)
     }
 
+    /// Builds a `last_updated` comparison against the `resources` column.
+    ///
+    /// Binds real timestamps — `last_updated` is `TIMESTAMPTZ`, and a text
+    /// parameter fails serialization outright (#871) — and applies the same
+    /// precision-range semantics as [`Self::build_date_condition`]: `eq` at
+    /// day precision means `[day, day+1)`, not a scalar equality that nothing
+    /// can ever hit.
     fn build_last_updated_condition(values: &[SearchValue], offset: usize) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
-        for (i, value) in values.iter().enumerate() {
-            let param_num = offset + i + 1;
-            let op = Self::prefix_to_operator(&value.prefix);
-            conditions.push(SqlFragment::with_params(
-                format!("last_updated {} ${}", op, param_num),
-                vec![SqlParam::text(&value.value)],
-            ));
+        let mut next = offset;
+        for value in values {
+            let (start, end) = date_precision_range(&value.value);
+            let degenerate = start == end;
+            let (sql, params): (String, Vec<SqlParam>) = match value.prefix {
+                SearchPrefix::Eq if !degenerate => {
+                    next += 1;
+                    let a = next;
+                    next += 1;
+                    (
+                        format!("last_updated >= ${a} AND last_updated < ${next}"),
+                        vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
+                    )
+                }
+                SearchPrefix::Ne if !degenerate => {
+                    next += 1;
+                    let a = next;
+                    next += 1;
+                    (
+                        format!("(last_updated < ${a} OR last_updated >= ${next})"),
+                        vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
+                    )
+                }
+                SearchPrefix::Gt | SearchPrefix::Sa if !degenerate => {
+                    next += 1;
+                    (
+                        format!("last_updated >= ${next}"),
+                        vec![SqlParam::Timestamp(end)],
+                    )
+                }
+                SearchPrefix::Lt | SearchPrefix::Eb if !degenerate => {
+                    next += 1;
+                    (
+                        format!("last_updated < ${next}"),
+                        vec![SqlParam::Timestamp(start)],
+                    )
+                }
+                SearchPrefix::Ge if !degenerate => {
+                    next += 1;
+                    (
+                        format!("last_updated >= ${next}"),
+                        vec![SqlParam::Timestamp(start)],
+                    )
+                }
+                SearchPrefix::Le if !degenerate => {
+                    next += 1;
+                    (
+                        format!("last_updated < ${next}"),
+                        vec![SqlParam::Timestamp(end)],
+                    )
+                }
+                other => {
+                    let op = Self::prefix_to_operator(&other);
+                    next += 1;
+                    (
+                        format!("last_updated {op} ${next}"),
+                        vec![SqlParam::Timestamp(start)],
+                    )
+                }
+            };
+            conditions.push(SqlFragment::with_params(sql, params));
         }
         if conditions.is_empty() {
             return None;
@@ -1837,6 +1898,55 @@ mod tests {
             frag.sql
         );
         assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn last_updated_binds_timestamps_with_precision_ranges() {
+        // #871: a text param bound against the TIMESTAMPTZ column fails
+        // serialization, and day-precision eq must mean [day, day+1).
+        let query = SearchQuery::new("Patient").with_parameter(special_param(
+            "_lastUpdated",
+            vec![SearchValue::eq("2026-09-01")],
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("_lastUpdated must produce a condition");
+
+        assert!(
+            frag.sql
+                .contains("last_updated >= $3 AND last_updated < $4"),
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 2);
+        assert!(
+            frag.params
+                .iter()
+                .all(|p| matches!(p, SqlParam::Timestamp(_))),
+            "must bind timestamps, not text: {:?}",
+            frag.params
+        );
+    }
+
+    #[test]
+    fn last_updated_gt_excludes_the_named_day() {
+        let query = SearchQuery::new("Patient").with_parameter(special_param(
+            "_lastUpdated",
+            vec![SearchValue {
+                prefix: SearchPrefix::Gt,
+                value: "2026-09-01".to_string(),
+            }],
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("_lastUpdated gt must produce a condition");
+
+        assert!(frag.sql.contains("last_updated >= $3"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 1);
+        match &frag.params[0] {
+            SqlParam::Timestamp(ts) => {
+                assert_eq!(ts.to_rfc3339(), "2026-09-02T00:00:00+00:00");
+            }
+            other => panic!("must bind the period end as a timestamp: {other:?}"),
+        }
     }
 
     #[test]

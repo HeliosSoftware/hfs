@@ -324,6 +324,6 @@ fn build_patch_response(
             });
             Ok((StatusCode::OK, header_map, Json(outcome)).into_response())
         }
-        _ => Ok((StatusCode::OK, header_map, Json(stored.content().clone())).into_response()),
+        _ => Ok((StatusCode::OK, header_map, Json(stored.content_with_meta())).into_response()),
     }
 }

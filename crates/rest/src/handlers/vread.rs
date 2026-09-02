@@ -106,10 +106,15 @@ where
                 "Returning resource version"
             );
 
-            format_resource_response(StatusCode::OK, headers, stored.content(), negotiated.format)
-                .map_err(|_| RestError::InternalError {
-                    message: "Failed to serialize response".to_string(),
-                })
+            format_resource_response(
+                StatusCode::OK,
+                headers,
+                &stored.content_with_meta(),
+                negotiated.format,
+            )
+            .map_err(|_| RestError::InternalError {
+                message: "Failed to serialize response".to_string(),
+            })
         }
         None => Err(RestError::VersionNotFound {
             resource_type,
