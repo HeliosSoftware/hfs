@@ -177,9 +177,12 @@
 
 <script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/conformance-crud.js" defer></script>
-<!-- #753 evaluation POC: the CodeMirror 6 vendored bundle (ticket 01) must
-     load before vd-editor.js, which reads window.HfsCodeMirror at the top
-     of its IIFE. Loaded only on this page. -->
+<!-- The ViewDefinition editor (#753, its mount helper generalized for
+     #838): the vendored CodeMirror 6 bundle must load before the shared
+     mount helper, which must load before this page's own editor script -
+     each reads globals (window.HfsCodeMirror, window.HfsCodeEditor) at the
+     top of its IIFE. Loaded only on this page. -->
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
+<script src="/ui/assets/code-editor.js" defer></script>
 <script src="/ui/assets/vd-editor.js" defer></script>
 {% endblock %}

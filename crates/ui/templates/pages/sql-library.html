@@ -5,15 +5,17 @@
   SQL Queries / SQL Views workspace (#649): the View Definitions shape over
   Library resources of the route's kind. The SQL pane edits the decoded
   application/sql attachment; the JSON fold edits the rest of the Library.
-  Above the list, a server-rendered "Recently used" group (#754/#755 ticket
-  03) restores the last-picked library on arrival and remembers up to
+  Above the list, a server-rendered "Recently used" group (#754/#755)
+  restores the last-picked library on arrival and remembers up to
   `max_recent` more, with a `{id, name, meta}` snapshot so a recent still
   renders when the search box filters it out — the page key (`rail_page`) and
   heading (`all_heading_key`) come from the route's `LibraryKind`, never
   hardcoded here, so SQL Queries and SQL Views never share or contaminate
   each other's record. Save/Duplicate are one plain form; Run is a plain
-  link; Delete rides conformance-crud.js. Everything works without
-  JavaScript.
+  link; Delete rides conformance-crud.js. The SQL pane's textarea gets a
+  CodeMirror 6 editor with SQL highlighting (#838) when JS and the vendored
+  bundle are available; the JSON pane is a plain textarea (#840). Everything
+  works without JavaScript.
 #}
 
 {% block title %}{{ i18n.t(title_key) }} — {{ i18n.t("app-title") }}{% endblock %}
@@ -164,4 +166,13 @@
 
 <script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/conformance-crud.js" defer></script>
+<!-- The SQL pane editor (#838): the vendored CodeMirror 6 bundle must
+     load before the shared mount helper, which must load before this
+     page's own editor script - each reads globals (window.HfsCodeMirror,
+     window.HfsCodeEditor) at the top of its IIFE. Loaded on both
+     /ui/sql/queries and /ui/sql/views, since this one template serves both
+     routes; no other page mounts this editor. -->
+<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
+<script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/sql-editor.js" defer></script>
 {% endblock %}

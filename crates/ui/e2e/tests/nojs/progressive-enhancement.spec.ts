@@ -382,6 +382,44 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
 });
 
+// #838: sql-editor.js never loads (this project runs with
+// javaScriptEnabled: false), so the SQL pane stays the plain textarea it
+// is today — visible, holding the decoded SQL, editable, and saved by a
+// real form POST.
+test("the SQL Queries pane is a plain textarea and Save persists without JavaScript", async ({
+  page,
+  request,
+}) => {
+  const sql = "SELECT id FROM v";
+  const libId = await createResource(request, "Library", {
+    name: `nojs_sql_query_${Date.now()}`,
+    status: "active",
+    type: {
+      coding: [
+        {
+          system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+          code: "sql-query",
+        },
+      ],
+    },
+    content: [{ contentType: "application/sql", data: Buffer.from(sql).toString("base64") }],
+  });
+  await waitSearchable(request, "Library", libId);
+
+  await page.goto(`/ui/sql/queries?lib=${libId}`);
+  const textarea = page.locator("textarea[name='sql']");
+  await expect(textarea).toBeVisible();
+  await expect(textarea).toHaveValue(sql);
+  // No editor script ran, so no CodeMirror wrapper was inserted.
+  await expect(page.locator(".sql-editor")).toHaveCount(0);
+
+  const updated = "SELECT name FROM v";
+  await textarea.fill(updated);
+  await page.locator("button[name='action'][value='save']").click();
+  await expect(page).toHaveURL(/saved=1/);
+  await expect(page.locator("textarea[name='sql']")).toHaveValue(updated);
+});
+
 test("Bulk Export accepts comma- and newline-separated Patient IDs without JavaScript", async ({
   page,
   bulkExport,

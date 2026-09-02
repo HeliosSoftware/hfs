@@ -54,6 +54,63 @@ test("a stored ViewDefinition lists, edits, and previews rows", async ({ page, r
   await expect(page.locator("textarea[name='json']")).toContainText("new_view");
 });
 
+// #838 closes #820's own test gap: until now no
+// Playwright test exercised the CodeMirror 6 editor vd-editor.js mounts over
+// the JSON textarea. `insertText` (a single DOM input event, not per-key
+// key events) is used for the replacement doc so CodeMirror's own
+// closeBrackets extension never sees a lone "{"/"\"" keystroke to pair —
+// exactly the same document ends up in the textarea either way, but this
+// keeps the assertion below an exact match instead of a bracket-pairing
+// footgun.
+test("the CodeMirror editor syncs typed keystrokes to the hidden textarea, saves them, and never traps Tab", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const vdId = await createResource(request, "ViewDefinition", starter(`zcm_${stamp}_before`));
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+
+  const textarea = page.locator("textarea[name='json']");
+  const editor = page.locator(".vd-editor .cm-content[role='textbox']");
+  await expect(editor).toBeVisible();
+  await expect(textarea).toBeHidden();
+
+  // The editor exposes the textarea's own aria-label on its own
+  // role="textbox" content, so the hidden textarea does not duplicate the
+  // landmark (NF3).
+  const ariaLabel = await textarea.getAttribute("aria-label");
+  expect(ariaLabel).toBeTruthy();
+  await expect(editor).toHaveAttribute("aria-label", ariaLabel!);
+
+  // `resourceType` is what the server's own createResource fixture injects
+  // for us on every other test's writes (pages/api.ts) - typed by hand here
+  // since Save posts exactly what the editor shows.
+  const updatedDoc = JSON.stringify({
+    resourceType: "ViewDefinition",
+    ...starter(`zcm_${stamp}_after`),
+  });
+  await editor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Delete");
+  await page.keyboard.insertText(updatedDoc);
+  await expect(textarea).toHaveValue(updatedDoc);
+
+  // Tab moves focus to the next form control (Save) instead of indenting.
+  await page.keyboard.press("Tab");
+  const save = page.locator("button[name='action'][value='save']");
+  await expect(save).toBeFocused();
+
+  // Save submits exactly what the editor showed; after the redirect, the
+  // freshly rendered page's editor and its hidden textarea both show the
+  // saved JSON.
+  await save.click();
+  await page.waitForURL(/saved=1/);
+  await expect(page.locator("textarea[name='json']")).toContainText(`zcm_${stamp}_after`);
+  await expect(page.locator(".vd-editor .cm-content")).toContainText(`zcm_${stamp}_after`);
+});
+
 // #752 ticket 02: the live preview follows the editor's *current* text, in
 // or out of CodeMirror — RF4 (load), RF5 (debounced edits), RF7 (failure
 // keeps the last good table and marks its meta stale, then a fix clears it).

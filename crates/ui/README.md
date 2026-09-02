@@ -22,8 +22,9 @@ thin.
 npm dependency, and no build step for the browser code, with one narrow,
 documented exception** (see "Assets: vendored & embedded" below). Two
 third-party scripts are vendored: htmx, and — as a prebuilt, never-built-here
-bundle — CodeMirror 6, for the ViewDefinition editor (#753). Everything else
-under `assets/` is hand-written vanilla JS in an IIFE. Do not introduce a
+bundle — CodeMirror 6, mounted over the ViewDefinition JSON editor (#753) and
+the SQL Queries/SQL Views editor panes (#838). Everything else under
+`assets/` is hand-written vanilla JS in an IIFE. Do not introduce a
 framework.
 
 Why, over a SPA + JSON API:
@@ -108,14 +109,15 @@ in the style every other asset in this crate uses. For that narrow case:
 > the resulting bundle is never loaded from a CDN; and the bundle ships with its license
 > banner intact.
 
-CodeMirror 6 is the first, and so far only, case this applies to (#753):
-[`crates/ui/vendor/codemirror/`](vendor/codemirror/README.md) is the vendoring
-ritual (pinned npm dependencies, a committed lockfile, a rollup + terser recipe
-run by hand, never by `cargo build` or CI); its one output,
-[`assets/vendor/codemirror.bundle.js`](assets/vendor/codemirror.bundle.js), is
-the vendored bundle itself — embedded and served exactly like every other
+CodeMirror 6 is the first, and so far only, case this applies to (#753,
+extended by #838): [`crates/ui/vendor/codemirror/`](vendor/codemirror/README.md)
+is the vendoring ritual (pinned npm dependencies, a committed lockfile, a
+rollup + terser recipe run by hand, never by `cargo build` or CI); its one
+output, [`assets/vendor/codemirror.bundle.js`](assets/vendor/codemirror.bundle.js),
+is the vendored bundle itself — embedded and served exactly like every other
 asset in this crate (above), nothing bundler-specific about how it ships. It
-backs the ViewDefinition editor on `/ui/sql/view-definitions`; see
+backs the ViewDefinition JSON editor on `/ui/sql/view-definitions` and the SQL
+pane editors on `/ui/sql/queries` and `/ui/sql/views`; see
 [`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
 for the full evaluation this amendment is drawn from. The editor talks to two
 JSON-in-HTML-fragment-out endpoints on that page: `POST …/lint` (#753 ticket
@@ -147,8 +149,9 @@ Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
 is used across workspaces — `busy.js` ahead of every page script (defer runs in
 document order) because page scripts call into it. `theme.js` loads **without
 `defer`**, before first paint, to avoid a flash of the wrong theme. `busy.js`
-is the crate's one exported global (`window.hfsBusy`): unlike the closed IIFEs
-it exists to be called by the others.
+exports `window.hfsBusy`; the CodeMirror stack (below) exports two more
+globals for the same reason — code that exists to be called by other scripts,
+not just a closed IIFE.
 
 | Asset | Owns |
 |---|---|
@@ -165,6 +168,9 @@ it exists to be called by the others.
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
 | `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
 | `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
+| `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)`, exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of |
+| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838) |
+| `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, no fold or lint yet (#838) |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.

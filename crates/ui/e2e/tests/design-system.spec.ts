@@ -15,16 +15,17 @@ import postcss from "postcss";
 //   - a selector defined twice renders as the cascade-merge of two authors'
 //     blocks, which nobody wrote.
 
-// Classes added at runtime by vendored libraries, not defined in app.css.
-// `^cm-` and `^ͼ` (CodeMirror 6's `ͼN` hash classes, e.g. `.ͼ1`, plus
-// layer/cursor classes like `.cm-layer-above`/`.cm-cursor-primary`): the
-// ViewDefinition editor's CodeMirror bundle (#753) mounts its own stylesheet
-// at runtime via `StyleModule.mount`, unlayered and outside app.css entirely
-// (see app.css's own note on that block) — there is no rule for the guard
-// to find, by design, whenever a page with the editor mounted is in the
-// sweep (e.g. `/ui/sql/view-definitions` with a selection restored by rail
-// state, #822).
-const RUNTIME_CLASSES = /^htmx-|^cm-|^ͼ/;
+// Classes added at runtime by vendored libraries, not defined in app.css:
+// htmx's own state classes, and CodeMirror 6's (#753, extended by #838) —
+// it mounts its own `<style>` via `StyleModule.mount` at runtime (see
+// app.css's "Shared CodeMirror 6 chrome" comment) and injects both internal
+// implementation classes ("cm-layer-above", "cm-cursor-primary", ...) and
+// auto-generated, per-load-unique theme classes ("ͼ1", "ͼ2", ...) that no
+// app.css rule can reasonably target. The "cm-" prefix requires the literal
+// hyphen, so it does not also swallow "cmt-" — this crate's own
+// token-highlighting classes (e.g. `cmt-sql-keyword`, `cmt-json-key`) —
+// which stay held to the same "must have a rule" bar as everything else.
+const RUNTIME_CLASSES = /^(?:htmx-|cm-|ͼ)/;
 
 // The assets are read over HTTP from the server under test, not from the
 // source tree: the CI runner drives a packaged binary with no checkout
