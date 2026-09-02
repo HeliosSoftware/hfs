@@ -1032,6 +1032,7 @@ hts-cs-validate-heading = Code validieren
 hts-cs-validate-mode-legend = Eingabemodus
 hts-cs-validate-mode-code = Einzelcode
 hts-cs-validate-mode-coding = Coding
+hts-cs-validate-code-legend = Einzelcode
 hts-cs-validate-code = Code
 hts-cs-validate-display = Anzeige
 hts-cs-validate-coding-legend = Coding
