@@ -7,7 +7,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxPath, State as AxState};
@@ -103,7 +106,16 @@ struct MockExport {
     kickoff_gate: Arc<Mutex<Option<Arc<RequestGate>>>>,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     patients: Arc<Mutex<Vec<serde_json::Value>>>,
-    search_status: Arc<Mutex<u16>>,
+    identifier_patients: Arc<Mutex<Vec<serde_json::Value>>>,
+    identifier_search_status: Arc<Mutex<u16>>,
+    name_search_status: Arc<Mutex<u16>>,
+    identifier_search_body: Arc<Mutex<Option<String>>>,
+    name_search_body: Arc<Mutex<Option<String>>>,
+    identifier_search_body_error: Arc<Mutex<bool>>,
+    search_barrier: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    search_arrivals: Arc<AtomicUsize>,
+    identifier_search_delay_ms: Arc<Mutex<u64>>,
+    name_search_delay_ms: Arc<Mutex<u64>>,
     patient_read_status: Arc<Mutex<u16>>,
     patient_read_body: Arc<Mutex<Option<String>>>,
 }
@@ -137,7 +149,16 @@ impl Default for MockExport {
             kickoff_gate: Default::default(),
             requests: Default::default(),
             patients: Default::default(),
-            search_status: Arc::new(Mutex::new(200)),
+            identifier_patients: Default::default(),
+            identifier_search_status: Arc::new(Mutex::new(200)),
+            name_search_status: Arc::new(Mutex::new(200)),
+            identifier_search_body: Default::default(),
+            name_search_body: Default::default(),
+            identifier_search_body_error: Default::default(),
+            search_barrier: Default::default(),
+            search_arrivals: Default::default(),
+            identifier_search_delay_ms: Default::default(),
+            name_search_delay_ms: Default::default(),
             patient_read_status: Arc::new(Mutex::new(200)),
             patient_read_body: Default::default(),
         }
@@ -341,18 +362,60 @@ fn mock_fhir_app(state: MockExport) -> Router {
         headers: HeaderMap,
         body: Bytes,
     ) -> axum::response::Response {
+        let form: HashMap<_, _> = form_urlencoded::parse(&body).collect();
+        let identifier = form.contains_key("identifier");
         s.requests
             .lock()
             .unwrap()
             .push(capture(method, uri, headers, body));
-        let status = StatusCode::from_u16(*s.search_status.lock().unwrap()).unwrap();
+        s.search_arrivals.fetch_add(1, Ordering::SeqCst);
+        let barrier = s.search_barrier.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
+        let delay_ms = if identifier {
+            *s.identifier_search_delay_ms.lock().unwrap()
+        } else {
+            *s.name_search_delay_ms.lock().unwrap()
+        };
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        let status = StatusCode::from_u16(if identifier {
+            *s.identifier_search_status.lock().unwrap()
+        } else {
+            *s.name_search_status.lock().unwrap()
+        })
+        .unwrap();
         if !status.is_success() {
             return status.into_response();
         }
+        if identifier && *s.identifier_search_body_error.lock().unwrap() {
+            let stream = async_stream::stream! {
+                yield Err::<Bytes, std::io::Error>(std::io::Error::other("forced search body failure"));
+            };
+            return axum::response::Response::builder()
+                .status(status)
+                .body(Body::from_stream(stream))
+                .unwrap();
+        }
+        let configured_body = if identifier {
+            s.identifier_search_body.lock().unwrap().clone()
+        } else {
+            s.name_search_body.lock().unwrap().clone()
+        };
+        if let Some(body) = configured_body {
+            return (status, body).into_response();
+        }
+        let patients = if identifier {
+            s.identifier_patients.lock().unwrap().clone()
+        } else {
+            s.patients.lock().unwrap().clone()
+        };
         Json(serde_json::json!({
             "resourceType": "Bundle",
             "type": "searchset",
-            "entry": s.patients.lock().unwrap().iter()
+            "entry": patients.iter()
                 .map(|resource| serde_json::json!({"resource": resource}))
                 .collect::<Vec<_>>()
         }))
@@ -1928,6 +1991,11 @@ async fn patient_options_merge_exact_first_deduplicate_and_limit_results() {
             )
         })
         .collect();
+    *mock.identifier_patients.lock().unwrap() = vec![
+        patient("alice-3", "Alice", "Family 3"),
+        patient("identifier-match", "Alice", "Identifier"),
+    ];
+    *mock.identifier_search_delay_ms.lock().unwrap() = 20;
 
     let (status, headers, html) =
         post_patient_query(&base, "/ui/bulk-export/patient-options", "alice-3", None).await;
@@ -1935,25 +2003,66 @@ async fn patient_options_merge_exact_first_deduplicate_and_limit_results() {
     assert_eq!(headers["cache-control"], "private, no-store");
     assert_eq!(html.matches("data-combobox-option").count(), 8, "{html}");
     let exact = html.find("Patient/alice-3").unwrap();
+    let identifier = html.find("Patient/identifier-match").unwrap();
     let first_other = html.find("Patient/alice-0").unwrap();
     assert!(exact < first_other, "exact id must be first: {html}");
+    assert!(
+        exact < identifier && identifier < first_other,
+        "identifier matches must precede name matches even when the identifier response finishes last: {html}"
+    );
     assert_eq!(html.matches("Patient/alice-3").count(), 3, "{html}");
 
     let requests = mock.requests.lock().unwrap().clone();
-    let search = requests
+    let searches: Vec<_> = requests
         .iter()
-        .find(|request| request.path.ends_with("/Patient/_search"))
-        .expect("name search request");
-    let form: HashMap<_, _> = form_urlencoded::parse(search.body.as_bytes()).collect();
-    assert_eq!(
-        form.get("name").map(|value| value.as_ref()),
-        Some("alice-3")
+        .filter(|request| request.path.ends_with("/Patient/_search"))
+        .collect();
+    assert_eq!(searches.len(), 2);
+    assert!(searches.iter().all(|search| search.method == Method::POST));
+    assert!(searches.iter().all(|search| search.query.is_empty()));
+    assert!(searches.iter().all(|search| {
+        search
+            .content_type
+            .starts_with("application/x-www-form-urlencoded")
+    }));
+    let forms: Vec<HashMap<_, _>> = searches
+        .iter()
+        .map(|search| form_urlencoded::parse(search.body.as_bytes()).collect())
+        .collect();
+    assert!(
+        forms
+            .iter()
+            .any(|form| form.get("identifier").map(|value| value.as_ref()) == Some("alice-3"))
     );
-    assert_eq!(form.get("_count").map(|value| value.as_ref()), Some("9"));
-    assert_eq!(
-        form.get("_elements").map(|value| value.as_ref()),
-        Some("id,name")
+    assert!(
+        forms
+            .iter()
+            .any(|form| form.get("name").map(|value| value.as_ref()) == Some("alice-3"))
     );
+    for form in forms {
+        assert_eq!(form.get("_count").map(|value| value.as_ref()), Some("9"));
+        assert_eq!(
+            form.get("_elements").map(|value| value.as_ref()),
+            Some("id,name")
+        );
+    }
+}
+
+#[tokio::test]
+async fn patient_parameter_searches_start_concurrently() {
+    let (base, mock, _) = serve().await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    *mock.search_barrier.lock().unwrap() = Some(barrier.clone());
+
+    let lookup = tokio::spawn(async move {
+        post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait())
+        .await
+        .expect("both searches must reach the backend together");
+    let (status, _, _) = lookup.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(mock.search_arrivals.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -1967,6 +2076,9 @@ async fn patient_options_honor_query_boundaries_and_non_hx_redirect() {
     let (_, _, html) =
         post_patient_query(&base, "/ui/bulk-export/patient-options", "a", None).await;
     assert!(html.contains("Patient/a"));
+    let (_, _, html) =
+        post_patient_query(&base, "/ui/bulk-export/patient-options", "Patient/a", None).await;
+    assert!(html.contains("Patient/a"));
     assert_eq!(
         mock.requests
             .lock()
@@ -1975,7 +2087,7 @@ async fn patient_options_honor_query_boundaries_and_non_hx_redirect() {
             .filter(|request| request.path.ends_with("/_search"))
             .count(),
         0,
-        "one-character queries only attempt exact id"
+        "one-character and Patient/-prefixed queries only attempt exact id"
     );
     let (_, _, html) = post_patient_query(
         &base,
@@ -2039,50 +2151,153 @@ async fn exact_patient_read_treats_gone_as_no_match_and_rejects_invalid_success_
 }
 
 #[tokio::test]
-async fn not_implemented_name_search_downgrades_once_but_other_failures_do_not() {
-    let (base, mock, _) = serve().await;
-    *mock.search_status.lock().unwrap() = 501;
-    for _ in 0..2 {
+async fn not_implemented_patient_search_downgrades_once_and_wins_over_sibling_errors() {
+    for case in 0..4 {
+        let (base, mock, _) = serve().await;
+        *mock.patients.lock().unwrap() = vec![patient("p-1", "Pat", "One")];
+        *mock.identifier_patients.lock().unwrap() = vec![patient("search-only", "Search", "Only")];
+        match case {
+            0 => {
+                *mock.identifier_search_status.lock().unwrap() = 501;
+                *mock.name_search_status.lock().unwrap() = 500;
+            }
+            1 => {
+                *mock.name_search_status.lock().unwrap() = 501;
+                *mock.identifier_search_body.lock().unwrap() = Some("not json".to_string());
+            }
+            2 => {
+                *mock.name_search_status.lock().unwrap() = 501;
+                *mock.identifier_search_body_error.lock().unwrap() = true;
+            }
+            3 => {
+                *mock.name_search_status.lock().unwrap() = 501;
+            }
+            _ => unreachable!(),
+        }
+
+        let (_, _, html) =
+            post_patient_query(&base, "/ui/bulk-export/patient-options", "p-1", None).await;
+        assert!(
+            html.contains("Patient/p-1"),
+            "exact read must survive downgrade: {html}"
+        );
+        assert!(
+            !html.contains("Patient/search-only"),
+            "a 501 must discard successful sibling search results: {html}"
+        );
+        assert!(html.contains("data-combobox-use-alternate"), "{html}");
         let (_, _, html) =
             post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
         assert!(html.contains("data-combobox-use-alternate"), "{html}");
+        assert_eq!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.path.ends_with("/_search"))
+                .count(),
+            2,
+            "the first lookup starts both searches and the cached downgrade suppresses later searches"
+        );
     }
-    assert_eq!(
-        mock.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|request| request.path.ends_with("/_search"))
-            .count(),
-        1,
-        "a 501 capability downgrade is cached"
-    );
 
     for status in [403, 500] {
         let (base, mock, _) = serve().await;
-        *mock.search_status.lock().unwrap() = status;
+        *mock.identifier_patients.lock().unwrap() = vec![patient("partial", "Must Not", "Leak")];
+        *mock.name_search_status.lock().unwrap() = status;
         let (_, _, html) =
             post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
         assert!(html.contains("Suggestions could not be loaded"), "{html}");
+        assert!(!html.contains("Patient/partial"), "{html}");
         assert!(!html.contains("data-combobox-use-alternate"), "{html}");
     }
 }
 
 #[tokio::test]
-async fn id_only_mode_renders_its_hint_and_never_attempts_name_search() {
+async fn malformed_patient_search_responses_fail_without_partial_results_or_downgrade() {
+    for malformed_identifier in [true, false] {
+        let (base, mock, _) = serve().await;
+        *mock.identifier_patients.lock().unwrap() =
+            vec![patient("identifier-partial", "Identifier", "Partial")];
+        *mock.patients.lock().unwrap() = vec![patient("name-partial", "Name", "Partial")];
+        if malformed_identifier {
+            *mock.identifier_search_body.lock().unwrap() = Some("not json".to_string());
+        } else {
+            *mock.name_search_body.lock().unwrap() = Some("not json".to_string());
+        }
+
+        let (_, _, html) =
+            post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+        assert!(html.contains("Suggestions could not be loaded"), "{html}");
+        assert!(!html.contains("Patient/identifier-partial"), "{html}");
+        assert!(!html.contains("Patient/name-partial"), "{html}");
+        assert!(!html.contains("data-combobox-use-alternate"), "{html}");
+    }
+}
+
+#[tokio::test]
+async fn structurally_invalid_search_bundles_fail_before_either_result_set_is_merged() {
+    for malformed in [
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "entry": [{
+                "resource": {"resourceType": "Patient", "id": "not/valid"}
+            }]
+        }),
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "entry": null
+        }),
+    ] {
+        for malformed_identifier in [true, false] {
+            let (base, mock, _) = serve().await;
+            *mock.identifier_patients.lock().unwrap() =
+                vec![patient("identifier-partial", "Identifier", "Partial")];
+            *mock.patients.lock().unwrap() = vec![patient("name-partial", "Name", "Partial")];
+            if malformed_identifier {
+                *mock.identifier_search_body.lock().unwrap() = Some(malformed.to_string());
+            } else {
+                *mock.name_search_body.lock().unwrap() = Some(malformed.to_string());
+            }
+
+            let (_, _, html) =
+                post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+            assert!(html.contains("Suggestions could not be loaded"), "{html}");
+            assert!(!html.contains("Patient/identifier-partial"), "{html}");
+            assert!(!html.contains("Patient/name-partial"), "{html}");
+            assert!(!html.contains("data-combobox-use-alternate"), "{html}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_searchset_without_entry_is_a_valid_empty_result() {
+    let (base, mock, _) = serve().await;
+    *mock.identifier_search_body.lock().unwrap() =
+        Some(serde_json::json!({"resourceType": "Bundle", "type": "searchset"}).to_string());
+    *mock.patients.lock().unwrap() = vec![patient("name-result", "Name", "Result")];
+
+    let (_, _, html) =
+        post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+    assert!(html.contains("Patient/name-result"), "{html}");
+    assert!(!html.contains("Suggestions could not be loaded"), "{html}");
+}
+
+#[tokio::test]
+async fn id_only_mode_renders_its_hint_and_never_attempts_parameter_search() {
     let (base, mock, _) =
         serve_with_runtime(helios_ui::PatientNameSearchSupport::IdOnly, false).await;
     *mock.patients.lock().unwrap() = vec![patient("p-1", "Pat", "One")];
     let (_, page) = get_text(&base, "/ui/bulk-export/new").await;
-    assert!(page.contains("Search by exact logical FHIR ID"), "{page}");
+    assert!(page.contains("Search by exact FHIR ID"), "{page}");
+    assert!(page.contains("placeholder=\"Search patients\""), "{page}");
     assert!(
-        page.contains("placeholder=\"Search exact FHIR ID\""),
+        !page.contains("data-combobox-alternate-placeholder"),
         "{page}"
     );
-    assert!(
-        !page.contains("placeholder=\"Search name, surname"),
-        "{page}"
-    );
+    assert!(page.contains("placeholder=\"Patient FHIR IDs\""), "{page}");
 
     let (_, _, html) =
         post_patient_query(&base, "/ui/bulk-export/patient-options", "p-1", None).await;
@@ -2095,7 +2310,7 @@ async fn id_only_mode_renders_its_hint_and_never_attempts_name_search() {
         "{missing_html}"
     );
     assert!(
-        !missing_html.contains("Search by exact logical FHIR ID"),
+        !missing_html.contains("Search by exact FHIR ID"),
         "the fixed ID-only hint must not be repeated as a search result: {missing_html}"
     );
     assert!(
@@ -2105,6 +2320,60 @@ async fn id_only_mode_renders_its_hint_and_never_attempts_name_search() {
             .iter()
             .all(|request| !request.path.ends_with("/_search"))
     );
+}
+
+#[tokio::test]
+async fn patient_copy_is_localized_and_the_placeholder_stays_generic_after_downgrade() {
+    let (base, mock, _) = serve().await;
+    let (_, page) = get_text(&base, "/ui/bulk-export/new").await;
+    assert!(page.contains("placeholder=\"Search patients\""), "{page}");
+    assert!(
+        page.contains("Search by name, surname or exact identifier."),
+        "{page}"
+    );
+    assert!(!page.contains("such as Patient/"), "{page}");
+
+    *mock.identifier_search_status.lock().unwrap() = 501;
+    post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+    let (_, page) = get_text(&base, "/ui/bulk-export/new").await;
+    assert!(page.contains("placeholder=\"Search patients\""), "{page}");
+    assert!(page.contains("Search by exact FHIR ID."), "{page}");
+    assert!(
+        !page.contains("data-combobox-alternate-placeholder"),
+        "{page}"
+    );
+
+    for (locale, placeholder, hint, fallback) in [
+        (
+            "es",
+            "Buscar pacientes",
+            "Busca por ID FHIR exacto.",
+            "IDs FHIR de pacientes",
+        ),
+        (
+            "de",
+            "Patienten suchen",
+            "Suchen Sie nach einer exakten FHIR-ID.",
+            "FHIR-IDs der Patienten",
+        ),
+    ] {
+        let response = client()
+            .get(format!("{base}/ui/bulk-export/new"))
+            .header("Accept-Language", locale)
+            .send()
+            .await
+            .unwrap();
+        let page = response.text().await.unwrap();
+        assert!(
+            page.contains(&format!("placeholder=\"{placeholder}\"")),
+            "{page}"
+        );
+        assert!(page.contains(hint), "{page}");
+        assert!(
+            page.contains(&format!("placeholder=\"{fallback}\"")),
+            "{page}"
+        );
+    }
 }
 
 #[tokio::test]

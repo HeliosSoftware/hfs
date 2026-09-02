@@ -299,6 +299,10 @@ test("Bulk Export accepts comma- and newline-separated Patient IDs without JavaS
 
   await expect(bulkExport.patientFallback).toBeVisible();
   await expect(bulkExport.patientFallback).toBeEnabled();
+  await expect(bulkExport.patientFallback).toHaveAttribute("placeholder", "Patient FHIR IDs");
+  await expect(page.locator("#bulk-export-patients-fallback-hint")).toContainText(
+    "separated by commas or new lines",
+  );
   const patientRefs = "Patient/p-104, Patient/p-205\nPatient/p-306";
   await bulkExport.patientFallback.fill(patientRefs);
 

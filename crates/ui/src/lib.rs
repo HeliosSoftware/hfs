@@ -117,7 +117,7 @@ pub struct NlSearch {
     pub model: String,
 }
 
-/// Whether the mounted FHIR API can search Patient resources by name.
+/// Whether the mounted FHIR API can search Patient resources by search parameters.
 ///
 /// Exact logical-id reads remain available in both modes. The UI keeps this
 /// capability separate because standalone S3 intentionally has no search
