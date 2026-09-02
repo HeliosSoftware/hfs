@@ -6,9 +6,15 @@
   detail-page surface stays terse. The mode selector is still a real
   radio pair (now chip-shaped) so the nojs path submits a mode.
 
-  V3 layout: the form IS the card. `.card-head` + `.panel` for the bare-code
-  half, a second `.card-head` + `.panel` for the Coding half — the same
-  two-band idiom the workbench result uses.
+  V3 layout: the form IS the card. `.card-head` + `.panel` for the shared
+  heading and mode radios, then one `.validate-mode-panel` per mode so the
+  CSS-only `:has()` reveal (app.css, #804) can show only the active half —
+  mirroring the Bulk Export scope reveal. `mode` (`ValidateInputMode`,
+  context-provided by cs-detail.html's `{% let mode = self.mode() %}`)
+  drives which radio is `checked`, so a no-JS re-render keeps the
+  submitted mode selected and the CSS reveal in sync without a page
+  reload. Browsers without `:has()` show both halves — today's (buggy)
+  fallback behavior, same as Bulk Export.
 -#}
 <form id="hts-workbench-input"
       class="card"
@@ -27,51 +33,59 @@
     <div class="field" role="group" aria-labelledby="validate-mode-label">
       <span class="field__label" id="validate-mode-label">{{ chrome.i18n.t("hts-cs-validate-mode-legend") }}</span>
       <div class="facets facets--bare">
-        <label class="chip"><input type="radio" name="mode" value="code" checked> {{ chrome.i18n.t("hts-cs-validate-mode-code") }}</label>
-        <label class="chip"><input type="radio" name="mode" value="coding"> {{ chrome.i18n.t("hts-cs-validate-mode-coding") }}</label>
+        <label class="chip"><input type="radio" name="mode" value="code"{% if mode == ValidateInputMode::Code %} checked{% endif %}> {{ chrome.i18n.t("hts-cs-validate-mode-code") }}</label>
+        <label class="chip"><input type="radio" name="mode" value="coding"{% if mode == ValidateInputMode::Coding %} checked{% endif %}> {{ chrome.i18n.t("hts-cs-validate-mode-coding") }}</label>
       </div>
-    </div>
-
-    <div class="builder-grid">
-      <div class="field">
-        <label class="field__label" for="validate-code">{{ chrome.i18n.t("hts-cs-validate-code") }}</label>
-        <input class="field__input" id="validate-code" name="code" type="text" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="field">
-        <label class="field__label" for="validate-display">{{ chrome.i18n.t("hts-cs-validate-display") }}</label>
-        <input class="field__input" id="validate-display" name="display" type="text" autocomplete="off" spellcheck="false">
-      </div>
-    </div>
-
-    <div class="field">
-      <label class="field__label" for="validate-display-language">{{ chrome.i18n.t("hts-cs-lookup-display-language") }}</label>
-      <input class="field__input" id="validate-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false"
-             placeholder="{{ chrome.i18n.t("hts-cs-lookup-display-language-placeholder") }}">
     </div>
   </div>
 
-  <div class="card-head">
-    <h3>{{ chrome.i18n.t("hts-cs-validate-coding-legend") }}</h3>
+  <div class="validate-mode-panel validate-mode-panel--code">
+    <div class="panel">
+      <div class="builder-grid">
+        <div class="field">
+          <label class="field__label" for="validate-code">{{ chrome.i18n.t("hts-cs-validate-code") }}</label>
+          <input class="field__input" id="validate-code" name="code" type="text" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label class="field__label" for="validate-display">{{ chrome.i18n.t("hts-cs-validate-display") }}</label>
+          <input class="field__input" id="validate-display" name="display" type="text" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="field__label" for="validate-display-language">{{ chrome.i18n.t("hts-cs-lookup-display-language") }}</label>
+        <input class="field__input" id="validate-display-language" name="displayLanguage" type="text" autocomplete="off" spellcheck="false"
+               placeholder="{{ chrome.i18n.t("hts-cs-lookup-display-language-placeholder") }}">
+      </div>
+    </div>
+  </div>
+
+  <div class="validate-mode-panel validate-mode-panel--coding">
+    <div class="card-head">
+      <h3>{{ chrome.i18n.t("hts-cs-validate-coding-legend") }}</h3>
+    </div>
+
+    <div class="panel">
+      <div class="builder-grid">
+        <div class="field">
+          <label class="field__label" for="validate-coding-system">{{ chrome.i18n.t("hts-cs-validate-coding-system") }}</label>
+          <input class="field__input" id="validate-coding-system" name="coding.system" type="text" autocomplete="off" spellcheck="false"
+                 value="{% if let Some(s) = summary %}{{ s.url }}{% endif %}">
+        </div>
+        <div class="field">
+          <label class="field__label" for="validate-coding-code">{{ chrome.i18n.t("hts-cs-validate-coding-code") }}</label>
+          <input class="field__input" id="validate-coding-code" name="coding.code" type="text" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="field__label" for="validate-coding-display">{{ chrome.i18n.t("hts-cs-validate-coding-display") }}</label>
+        <input class="field__input" id="validate-coding-display" name="coding.display" type="text" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
   </div>
 
   <div class="panel">
-    <div class="builder-grid">
-      <div class="field">
-        <label class="field__label" for="validate-coding-system">{{ chrome.i18n.t("hts-cs-validate-coding-system") }}</label>
-        <input class="field__input" id="validate-coding-system" name="coding.system" type="text" autocomplete="off" spellcheck="false"
-               value="{% if let Some(s) = summary %}{{ s.url }}{% endif %}">
-      </div>
-      <div class="field">
-        <label class="field__label" for="validate-coding-code">{{ chrome.i18n.t("hts-cs-validate-coding-code") }}</label>
-        <input class="field__input" id="validate-coding-code" name="coding.code" type="text" autocomplete="off" spellcheck="false">
-      </div>
-    </div>
-
-    <div class="field">
-      <label class="field__label" for="validate-coding-display">{{ chrome.i18n.t("hts-cs-validate-coding-display") }}</label>
-      <input class="field__input" id="validate-coding-display" name="coding.display" type="text" autocomplete="off" spellcheck="false">
-    </div>
-
     <div class="form-actions">
       <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
     </div>

@@ -2848,6 +2848,18 @@ details.json-fold[open] > summary .icon {
   font-variant-numeric: tabular-nums;
 }
 
+/* A native radio/checkbox carries a UA margin that .chip's
+   align-items: center centers by margin box, not visible box — the
+   control lands a couple of px below the chip's vertical center (#804).
+   Same reset .choice-card already applies to its radios. */
+.chip input[type="radio"],
+.chip input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
 /* Data table */
 
 .table-wrap {
@@ -3319,6 +3331,22 @@ details.json-fold[open] > summary .icon {
 }
 
 .bulk-export-form:has(input[name="scope"][value="group"]:checked) .field--group-id {
+  display: block;
+}
+
+/* HTS CodeSystem $validate-code: show only the fields for the selected
+   input mode (#804), same CSS-only reveal idiom as the Bulk Export scope
+   field above. Browsers without :has() keep both halves visible — today's
+   (buggy) fallback behavior. */
+#hts-workbench-input .validate-mode-panel--coding {
+  display: none;
+}
+
+#hts-workbench-input:has(input[name="mode"][value="coding"]:checked) .validate-mode-panel--code {
+  display: none;
+}
+
+#hts-workbench-input:has(input[name="mode"][value="coding"]:checked) .validate-mode-panel--coding {
   display: block;
 }
 
