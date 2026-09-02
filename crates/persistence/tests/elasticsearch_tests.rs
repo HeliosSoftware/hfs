@@ -2798,6 +2798,64 @@ mod es_integration {
         );
     }
 
+    /// #892: `ne` must be the complement of the day range, not `eq`.
+    #[tokio::test]
+    async fn es_integration_search_last_updated_ne_excludes_today() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "lu-ne-1"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let today = created.last_modified().format("%Y-%m-%d").to_string();
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let last_updated = |prefix: SearchPrefix| {
+            SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "_lastUpdated".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, &today)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        let eq = backend
+            .search(&tenant, &last_updated(SearchPrefix::Eq))
+            .await
+            .unwrap();
+        assert!(
+            eq.resources.items.iter().any(|r| r.id() == "lu-ne-1"),
+            "eq on the creation day must match the resource"
+        );
+
+        let ne = backend
+            .search(&tenant, &last_updated(SearchPrefix::Ne))
+            .await
+            .unwrap();
+        assert!(
+            ne.resources.items.iter().all(|r| r.id() != "lu-ne-1"),
+            "ne on the creation day must exclude the resource"
+        );
+    }
+
     // ========================================================================
     // Full-Text Search Tests
     // ========================================================================
