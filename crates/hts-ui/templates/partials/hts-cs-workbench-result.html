@@ -11,10 +11,12 @@
   V3 layout: every result is a `.card` with a `.card-head` (`<h3>`, not the
   old `<h5>`-shaped hook that rendered below body size) and one or more
   `.panel` bands of `.kv-grid` / `.detail__field` pairs. The raw echo is a
-  bare `<details>` inside its own `.card`, exactly as
-  `crates/ui/templates/pages/capability-statement.html` renders its raw
-  payload — deliberately NOT `.addbox`, which is the Add-tenant dropdown
-  and would float this over the page.
+  `.disclosure` — the shared fold pattern from `crates/ui` (see
+  `templates/pages/bulk-import.html`) — inside its own `.card`. It draws
+  its own chevron `<span>`: a `<summary>` shows the native `::marker` only
+  at `display: list-item`, so a styled summary has no marker to inherit.
+  Deliberately NOT `.addbox`, which is the Add-tenant dropdown and would
+  float this over the page.
 
   Fluent keys: op-specific under `hts-cs-lookup-*` / `hts-cs-validate-*` /
   `hts-cs-subsumes-*`; shared under `hts-workbench-*` (reused by Slice C/D/E).
@@ -191,13 +193,18 @@
   {% endif %}
 
   {#- Raw request + response echo (§7.3 wireframe). Kept last so the
-      readable summary above stays visually primary. A bare
-      <details>/<summary> keeps the native disclosure marker; `.detail__code`
-      is the shared preformatted-payload token. -#}
+      readable summary above stays visually primary. The shared
+      `.disclosure` pattern supplies the chevron and the pointer cursor —
+      the native `::marker` needs `display: list-item` and no styled
+      summary keeps it; `.detail__code` is the shared preformatted-payload
+      token. -#}
   {% if !view.raw_body.is_empty() || !view.request_url.is_empty() %}
   <section class="card panel">
-    <details>
-      <summary class="field__label">{{ chrome.i18n.t("hts-workbench-raw-response") }}</summary>
+    <details class="disclosure">
+      <summary class="disclosure__summary">
+        <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
+        {{ chrome.i18n.t("hts-workbench-raw-response") }}
+      </summary>
       {% if !view.request_url.is_empty() %}
       <div class="kv-grid" style="margin:14px 0">
         <div class="detail__field detail__field--wide">
