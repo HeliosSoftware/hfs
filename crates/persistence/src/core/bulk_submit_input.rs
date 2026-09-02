@@ -93,6 +93,26 @@ pub trait SubmitInputFetcher: Send + Sync {
         oauth_metadata_urls: &[String],
         encryption_key: Option<&Value>,
     ) -> StorageResult<(Box<dyn AsyncBufRead + Send + Unpin>, Option<u64>)>;
+
+    /// Returns the advertised size in bytes of the file at `url` without
+    /// opening its body, or `None` when the source cannot cheaply say (no
+    /// HEAD support, no `Content-Length`, or a JWE file whose decrypted
+    /// length differs from the wire length).
+    ///
+    /// The worker calls this for every manifest file up front so the byte
+    /// progress denominator is complete before ingestion starts — learned
+    /// lazily per file, each newly opened file yanks the percentage
+    /// backwards (#874). Best-effort: any `None` (the default) falls back
+    /// to lazy accumulation.
+    async fn file_size(
+        &self,
+        _url: &str,
+        _request_headers: &[(String, String)],
+        _requires_access_token: bool,
+        _oauth_metadata_urls: &[String],
+    ) -> StorageResult<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// Maps a submission to the stable [`ExportJobId`] used as the output-store key
