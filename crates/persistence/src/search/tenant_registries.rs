@@ -89,15 +89,37 @@ impl TenantSearchRegistries {
     /// caching it, so the next access retries the load instead of being
     /// permanently stuck with an incomplete overlay (#787).
     pub fn for_tenant(&self, tenant_id: &str) -> Arc<RwLock<SearchParameterRegistry>> {
-        if let Some(reg) = self.per_tenant.read().get(tenant_id) {
-            return reg.clone();
+        if let Some(reg) = self.cached(tenant_id) {
+            return reg;
         }
         // Build outside the map lock. A concurrent builder for the same tenant
         // is harmless — the last writer wins and both hold equivalent content.
-        let mut reg = self.base.read().clone();
         let Some(stored) = (self.loader)(tenant_id) else {
-            return Arc::new(RwLock::new(reg));
+            return Arc::new(RwLock::new(self.base.read().clone()));
         };
+        self.build_and_cache(tenant_id, stored)
+    }
+
+    /// Returns `tenant_id`'s registry only if already cached — never consults
+    /// the loader. For a caller that can itself load the tenant's stored
+    /// overlay on a cache miss (e.g. a SQLite transaction reusing its own
+    /// held connection instead of asking the pool for a second one, avoiding
+    /// the two-simultaneous-connections hazard behind #787) and wants to
+    /// check the fast path first via [`build_and_cache`](Self::build_and_cache).
+    pub fn cached(&self, tenant_id: &str) -> Option<Arc<RwLock<SearchParameterRegistry>>> {
+        self.per_tenant.read().get(tenant_id).cloned()
+    }
+
+    /// Builds and caches `tenant_id`'s registry from an already-loaded set of
+    /// stored definitions — the base clone + overlay step `for_tenant` would
+    /// otherwise do itself, exposed for callers that source `stored` some
+    /// other way (see [`cached`](Self::cached)).
+    pub fn build_and_cache(
+        &self,
+        tenant_id: &str,
+        stored: Vec<SearchParameterDefinition>,
+    ) -> Arc<RwLock<SearchParameterRegistry>> {
+        let mut reg = self.base.read().clone();
         for def in stored {
             // A stored param may legitimately shadow a base spec param; ignore
             // duplicate-url rejections (already-registered canonical URLs).

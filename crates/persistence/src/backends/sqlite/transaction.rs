@@ -20,6 +20,7 @@ use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
 use super::SqliteBackend;
+use super::backend::load_tenant_stored_params_with_conn;
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -559,12 +560,39 @@ impl TransactionProvider for SqliteBackend {
         options: TransactionOptions,
     ) -> StorageResult<Self::Transaction> {
         let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let fhir_version = options.fhir_version.unwrap_or(self.config().fhir_version);
+
+        // Build the transaction's search-parameter registry from THIS
+        // connection on a cache miss, rather than asking the pool for a
+        // second, simultaneous one (#787) — see
+        // `load_tenant_stored_params_with_conn`. A cached registry skips the
+        // query entirely, same as the non-transactional path.
+        let registry = match self.tenant_registries().cached(tenant_id) {
+            Some(registry) => registry,
+            None => {
+                let stored = load_tenant_stored_params_with_conn(&conn, fhir_version, tenant_id)
+                    .map_err(|e| {
+                        StorageError::Backend(BackendError::Internal {
+                            backend_name: "sqlite".to_string(),
+                            message: format!(
+                                "Failed to load this tenant's SearchParameter overlay; \
+                                 refusing to start a transaction that would index \
+                                 resources against an incomplete registry: {e}"
+                            ),
+                            source: None,
+                        })
+                    })?;
+                self.tenant_registries().build_and_cache(tenant_id, stored)
+            }
+        };
+
         SqliteTransaction::new(
             conn,
             tenant.clone(),
-            Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
+            Arc::new(SearchParameterExtractor::new(registry)),
             self.is_search_offloaded(),
-            options.fhir_version.unwrap_or(self.config().fhir_version),
+            fhir_version,
         )
     }
 }
