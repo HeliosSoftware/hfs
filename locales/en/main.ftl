@@ -88,6 +88,12 @@ error-not-found = The requested resource was not found.
 error-unauthorized = You are not authorized to perform this action.
 error-generic = Something went wrong. Try again.
 
+## Generic "not found" page (#835): a full-page 404 inside the shell, distinct
+## from error-not-found above (OperationOutcome text for API responses).
+
+not-found-title = Not found
+not-found-text = This page doesn't exist, or isn't available to you.
+
 ## Dashboard shell (Figma "Dashboard V1.1")
 
 nav-section-work = Work
@@ -108,7 +114,6 @@ nav-sql-view-definitions = View Definitions
 nav-sql-queries = SQL Queries
 nav-sql-views = SQL Views
 nav-sql-export = SQL Export
-nav-sql-files = Files
 nav-capability-conformance = Capability & Conformance
 nav-search-parameters = Search Parameters
 nav-subscriptions = Subscriptions
@@ -799,9 +804,6 @@ sql-export-title = SQL Export
 sql-export-lede = Run stored view definitions, SQL queries and SQL views as a long-running $sql-export job and download the output files.
 sql-export-active-title = SQL Exports
 
-sql-files-title = Files
-sql-files-lede = Manifests and output files produced by SQL exports.
-
 ## View Definitions workspace (#649)
 
 vd-new = Create New
@@ -849,10 +851,9 @@ lib-sql-heading = SQL
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
 
-## SQL Export and Files pages (#649, #833)
+## SQL Export pages (#649, #833)
 
 export-start-failed = Could not start the export.
-export-job-id = Job id
 export-format = Output format
 export-start = Start Export
 
@@ -931,14 +932,28 @@ sql-export-files-count = { $count ->
     [one] { $count } file
    *[other] { $count } files
 }
-files-job-heading = Export Job
-files-load = Load Manifest
-files-error = Could not load the manifest.
-files-outputs-heading = Outputs
-files-col-output = Output
-files-col-downloads = Downloads
-files-shard = File { $n }
-files-empty = The job produced no output files.
+
+## Job detail page (#835)
+
+sql-export-detail-finished = Finished
+sql-export-detail-failed = Failed
+sql-export-detail-cancelled = Cancelled
+sql-export-detail-started = Started
+sql-export-detail-after = after
+sql-export-failure-subject = The export stopped on subject
+sql-export-failure-generic = The export failed:
+sql-export-detail-job-heading = Job
+sql-export-detail-field-job-id = Job id
+sql-export-detail-field-format = Format
+sql-export-detail-field-started = Started
+sql-export-detail-field-duration = Duration
+sql-export-detail-field-subjects = Subjects
+sql-export-detail-outputs-heading = Output files
+sql-export-detail-col-output = Output
+sql-export-detail-col-subject = Subject
+sql-export-detail-col-files = Files
+sql-export-detail-outputs-empty = The job produced no output files.
+sql-export-file-fallback = File { $n }
 
 ## HTS administrative UI (crates/hts-ui) — Phase 1 scaffold stubs
 ##

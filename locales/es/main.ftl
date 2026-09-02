@@ -84,6 +84,13 @@ error-not-found = No se encontró el recurso solicitado.
 error-unauthorized = No está autorizado para realizar esta acción.
 error-generic = Algo salió mal. Vuelva a intentarlo.
 
+## Página genérica de "no encontrado" (#835): un 404 de página completa dentro
+## del shell, distinta de error-not-found (texto de OperationOutcome para
+## respuestas de la API).
+
+not-found-title = No encontrado
+not-found-text = Esta página no existe, o no está disponible para usted.
+
 ## Estructura del panel (Figma «Dashboard V1.1»)
 
 nav-section-work = Trabajo
@@ -104,7 +111,6 @@ nav-sql-view-definitions = Definiciones de vistas
 nav-sql-queries = Consultas SQL
 nav-sql-views = Vistas SQL
 nav-sql-export = Exportación SQL
-nav-sql-files = Archivos
 nav-capability-conformance = Capacidad y conformidad
 nav-search-parameters = Parámetros de búsqueda
 nav-subscriptions = Suscripciones
@@ -796,9 +802,6 @@ sql-export-title = Exportación SQL
 sql-export-lede = Ejecuta ViewDefinitions, consultas SQL y vistas SQL almacenadas como un trabajo $sql-export de larga duración y descarga los archivos de salida.
 sql-export-active-title = Exportaciones SQL
 
-sql-files-title = Archivos
-sql-files-lede = Manifiestos y archivos de salida producidos por las exportaciones SQL.
-
 ## Espacio de definiciones de vistas (#649)
 
 vd-new = Crear nueva
@@ -842,10 +845,9 @@ lib-sql-heading = SQL
 lib-delete-confirm = ¿Eliminar «{ $name }»? Esta acción no se puede deshacer.
 lib-delete-failed = No se pudo eliminar la biblioteca.
 
-## Páginas de exportación SQL y archivos (#649, #833)
+## Páginas de exportación SQL (#649, #833)
 
 export-start-failed = No se pudo iniciar la exportación.
-export-job-id = Id del trabajo
 export-format = Formato de salida
 export-start = Iniciar exportación
 
@@ -924,14 +926,28 @@ sql-export-files-count = { $count ->
     [one] { $count } archivo
    *[other] { $count } archivos
 }
-files-job-heading = Trabajo de exportación
-files-load = Cargar manifiesto
-files-error = No se pudo cargar el manifiesto.
-files-outputs-heading = Salidas
-files-col-output = Salida
-files-col-downloads = Descargas
-files-shard = Archivo { $n }
-files-empty = El trabajo no produjo archivos de salida.
+
+## Página de detalle del trabajo (#835)
+
+sql-export-detail-finished = Finalizada
+sql-export-detail-failed = Fallida
+sql-export-detail-cancelled = Cancelada
+sql-export-detail-started = Iniciada
+sql-export-detail-after = luego de
+sql-export-failure-subject = La exportación se detuvo en el elemento
+sql-export-failure-generic = La exportación falló:
+sql-export-detail-job-heading = Trabajo
+sql-export-detail-field-job-id = Id del trabajo
+sql-export-detail-field-format = Formato
+sql-export-detail-field-started = Iniciado
+sql-export-detail-field-duration = Duración
+sql-export-detail-field-subjects = Elementos
+sql-export-detail-outputs-heading = Archivos de salida
+sql-export-detail-col-output = Salida
+sql-export-detail-col-subject = Elemento
+sql-export-detail-col-files = Archivos
+sql-export-detail-outputs-empty = El trabajo no produjo archivos de salida.
+sql-export-file-fallback = Archivo { $n }
 
 ## UI administrativa de HTS (crates/hts-ui) — stubs de Phase 1
 ##

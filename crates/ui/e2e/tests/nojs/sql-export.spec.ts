@@ -1,5 +1,11 @@
 import { test, expect } from "../../pages/fixtures";
-import { createResource, createResources, deleteResources, waitSearchable } from "../../pages/api";
+import {
+  createResource,
+  createResources,
+  createSqlQueryLibrary,
+  deleteResources,
+  waitSearchable,
+} from "../../pages/api";
 
 // This file runs in the `nojs` project (javaScriptEnabled: false): htmx,
 // sql-export.js, and every `data-*` handler are inert here — the Active SQL
@@ -31,10 +37,18 @@ const PADDING_SUBJECTS = 200;
 // the full mechanism).
 let seededViewDefinitionIds: string[] = [];
 
+// Same reasoning as `seededViewDefinitionIds` above, for the `Library`
+// sql-query subject the failed-job detail test below seeds.
+let seededLibraryIds: string[] = [];
+
 test.afterEach(async ({ request }) => {
   const ids = seededViewDefinitionIds;
   seededViewDefinitionIds = [];
   await deleteResources(request, "ViewDefinition", ids);
+
+  const libraryIds = seededLibraryIds;
+  seededLibraryIds = [];
+  await deleteResources(request, "Library", libraryIds);
 
   // The jobs this test starts live in the per-user settings document under
   // `byTenant.<tenant>.sqlExport.jobs` (crates/ui/src/sql_export.rs); the
@@ -162,4 +176,112 @@ test("the subjects table's tools stay hidden, and a subject checked by hand stil
 
   await expect(page).toHaveURL(/\/ui\/sql\/export$/);
   await expect(sqlExport.card(name)).toBeVisible();
+});
+
+// The job detail page (#835) is a plain server-rendered page — no htmx, no
+// script — so it has to work exactly as well without JavaScript as the list
+// it is reached from.
+test("a completed job's detail page lists its outputs and download pills without JavaScript", async ({
+  page,
+  request,
+  sqlExport,
+}) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "NojsSqlExportDetailE2E" }],
+  });
+  const vdName = `nojs_sql_export_detail_${Date.now()}`;
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: vdName,
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await waitSearchable(request, "Patient", patientId);
+
+  await sqlExport.gotoNew();
+  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+  await sqlExport.startButton.click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+
+  // No htmx here: the card only catches up on a fresh reload.
+  let card = sqlExport.card(vdName);
+  await expect
+    .poll(
+      async () => {
+        await page.reload();
+        card = sqlExport.card(vdName);
+        return card.locator(".tag").innerText();
+      },
+      { timeout: 15_000, intervals: [250, 500, 1_000] },
+    )
+    .toBe("Complete");
+
+  // The card title is a plain `<a href>` — no JS needed to reach the
+  // permalink.
+  await card.getByRole("link", { name: vdName }).click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+  const row = page.locator(".data-table tbody tr").filter({ hasText: vdName });
+  await expect(row).toHaveCount(1);
+  await expect(row.locator(".job-card__files a")).toHaveCount(1);
+});
+
+test("Retry on a failed job's detail page works without JavaScript", async ({
+  page,
+  request,
+  sqlExport,
+}) => {
+  test.setTimeout(60_000);
+  const stamp = Date.now();
+  const canonical = `http://example.org/ViewDefinition/nojs-sql-export-failed-${stamp}`;
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: `nojs_sql_export_failed_vd_${stamp}`,
+    url: canonical,
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+
+  // Syntactically valid (kick-off's own SQL-shape check passes) but
+  // references a column "v" never has, so the job fails during its own
+  // background execution — see the chromium spec's own version of this
+  // fixture for the full reasoning.
+  const queryName = `nojs_sql_export_failed_query_${stamp}`;
+  const libId = await createSqlQueryLibrary(
+    request,
+    queryName,
+    canonical,
+    "SELECT no_such_column FROM v",
+  );
+  seededLibraryIds.push(libId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await waitSearchable(request, "Library", libId);
+
+  await sqlExport.gotoNew();
+  await sqlExport.subjectCheckbox(`Library/${libId}`).check();
+  await sqlExport.startButton.click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+
+  let card = sqlExport.card(queryName);
+  await expect
+    .poll(
+      async () => {
+        await page.reload();
+        card = sqlExport.card(queryName);
+        return card.locator(".tag").innerText();
+      },
+      { timeout: 30_000, intervals: [500, 1_000, 2_000] },
+    )
+    .toBe("Failed");
+
+  await card.getByRole("link", { name: queryName }).click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+  await expect(page.locator(".notice--warn")).toContainText(queryName);
+
+  // Retry is a plain form and works without JavaScript.
+  await page.getByRole("button", { name: "Retry" }).click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+  await expect(sqlExport.card(queryName)).toHaveCount(2);
 });

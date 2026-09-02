@@ -83,7 +83,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Query, RawQuery, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -1254,6 +1254,15 @@ pub fn mount_with_conformance_source_and_runtime(
             get(sql_export::list).post(sql_export::start),
         )
         .route("/ui/sql/export/new", get(sql_export::new_page))
+        // The job detail permalink (#835). `new` above is a literal segment,
+        // matched ahead of the `{id}` param at the same depth regardless of
+        // route registration order — axum's router always prefers a static
+        // route over a dynamic one.
+        .route("/ui/sql/export/{id}", get(sql_export::detail_page))
+        .route(
+            "/ui/sql/export/{id}/detail",
+            get(sql_export::detail_fragment),
+        )
         .route("/ui/sql/export/{id}/card", get(sql_export::card))
         .route(
             "/ui/sql/export/{id}/cancel",
@@ -1271,7 +1280,24 @@ pub fn mount_with_conformance_source_and_runtime(
             "/ui/sql/export/{id}/remove",
             axum::routing::post(sql_export::remove),
         )
-        .route("/ui/sql/files", get(sql_files_page))
+        // The job-id lookup form (#649) is retired: a job's own permalink
+        // above is what it always meant to reach. `301` (rather than
+        // axum's `Redirect::permanent`, which answers `308`) so a bookmark
+        // or an external link keeps working exactly as before — a GET
+        // stays a GET either way, and `301` is what every other permanent
+        // move in this codebase (search engines, browser history) expects.
+        // Deliberately drops the legacy `?job=`: the list works with
+        // locally-generated ids, which that query string never carried
+        // (#835).
+        .route(
+            "/ui/sql/files",
+            get(|| async {
+                (
+                    StatusCode::MOVED_PERMANENTLY,
+                    [(axum::http::header::LOCATION, "/ui/sql/export")],
+                )
+            }),
+        )
         .route("/ui/subscriptions", get(subscriptions::page))
         // Schema-driven resource editor (#264). One POST endpoint applies every
         // structural mutation and re-renders: the document rides with it.
@@ -3441,59 +3467,6 @@ async fn sql_views_save(
     sql_library_save(state, locale, rv, rt, form, &SQL_VIEW_KIND).await
 }
 
-/// The Files page (#649): a finished job's completion manifest — one row per
-/// output with its shard download links, served straight off the FHIR API's
-/// result endpoint.
-#[derive(Template)]
-#[template(path = "pages/sql-files.html")]
-struct SqlFilesPage {
-    status: Status,
-    i18n: I18n,
-    active_page: &'static str,
-    job: String,
-    outputs: Option<Vec<sql_export::ManifestOutput>>,
-    format: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct SqlFilesQuery {
-    job: Option<String>,
-}
-
-async fn sql_files_page(
-    State(state): State<WebState>,
-    locale: RequestLocale,
-    rv: RequestVersion,
-    rt: RequestTenant,
-    headers: HeaderMap,
-    Query(query): Query<SqlFilesQuery>,
-) -> Response {
-    let job = query.job.unwrap_or_default();
-    let caller = Caller::from_request(&headers, &rt.id);
-    let (outputs, format, error) = if job.is_empty() {
-        (None, None, None)
-    } else {
-        match state.conformance.sql_export_manifest(&job, &caller).await {
-            Ok(manifest) => (
-                Some(sql_export::manifest_outputs(&manifest)),
-                sql_export::manifest_value(&manifest, "_format"),
-                None,
-            ),
-            Err(error) => (None, None, Some(error)),
-        }
-    };
-    render(SqlFilesPage {
-        status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
-        active_page: "sql-files",
-        job,
-        outputs,
-        format,
-        error,
-    })
-}
-
 /// The shared cards, already HTML.
 ///
 /// Rendered in the handler rather than from the template so the page keeps
@@ -4493,6 +4466,43 @@ pub(crate) fn render<T: Template>(template: T) -> Response {
         )
             .into_response(),
     }
+}
+
+/// The generic "not found" page (#835): a `404` inside the full shell for a
+/// route naming something this request cannot see — an unknown id, or one
+/// belonging to another user/tenant, deliberately indistinguishable from
+/// each other. Reusable by any future route needing the same shape: nothing
+/// here is specific to the one caller that exists today
+/// (`sql_export::detail_page`) beyond its own `back_href`/`back_label`.
+/// Never reveals which of "unknown" or "not yours" applies, nor any other
+/// internal detail.
+#[derive(Template)]
+#[template(path = "pages/not-found.html")]
+struct NotFoundPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    back_href: String,
+    back_label: String,
+}
+
+/// Renders [`NotFoundPage`] with a `404` status — the shared tail for any
+/// route that must answer "not found", full shell included.
+pub(crate) fn render_not_found(
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    back_href: impl Into<String>,
+    back_label: impl Into<String>,
+) -> Response {
+    let page = NotFoundPage {
+        status,
+        i18n,
+        active_page,
+        back_href: back_href.into(),
+        back_label: back_label.into(),
+    };
+    (StatusCode::NOT_FOUND, render(page)).into_response()
 }
 
 fn unix_timestamp_seconds() -> u64 {

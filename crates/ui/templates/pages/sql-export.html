@@ -31,7 +31,16 @@
 {% if let Some(job_id) = store_error %}
 <div class="card notice notice--warn" role="alert">
   {{ i18n.t("sql-export-store-error") }} <code>{{ job_id }}</code>
-  <a class="btn" href="/ui/sql/files?job={{ job_id }}">{{ i18n.t("sql-export-view-files") }}</a>
+  <!-- #835: the job started but this UI's own record of it never got
+       written, so there is no notebook entry to link a detail page to
+       (module docs of sql_export.rs) — Copy job id is all this notice can
+       offer. Server-rendered hidden, like the same button on every card,
+       and revealed only once JavaScript and the Clipboard API are both
+       available (sql-export.js). -->
+  <button type="button" class="btn" hidden
+          data-copy-job-id="{{ job_id }}"
+          data-copy-label="{{ i18n.t("sql-export-copy-job-id") }}"
+          data-copied-label="{{ i18n.t("sql-export-copied") }}">{{ i18n.t("sql-export-copy-job-id") }}</button>
 </div>
 {% endif %}
 

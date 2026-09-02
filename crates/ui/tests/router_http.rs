@@ -2107,9 +2107,12 @@ async fn editor_opens_the_root_picker_on_an_empty_document() {
     assert!(!html.contains(r#"<details class="editor-add" open>"#));
 }
 
-/// #649: SQL on FHIR is a top-level nav section whose five children are real
+/// #649: SQL on FHIR is a top-level nav section whose four children are real
 /// routes — the dead `nav-item--soon` placeholder is gone — and each page
-/// answers 200 and marks its own nav entry current.
+/// answers 200 and marks its own nav entry current. The job-id lookup form
+/// that used to round out the section is retired (#835): it no longer has a
+/// nav entry of its own, and `/ui/sql/files` now just redirects (see
+/// [`sql_files_redirects_permanently_to_the_export_list`]).
 #[tokio::test]
 async fn sql_on_fhir_section_navigates_to_real_pages() {
     let response = app()
@@ -2124,22 +2127,22 @@ async fn sql_on_fhir_section_navigates_to_real_pages() {
         "/ui/sql/queries",
         "/ui/sql/views",
         "/ui/sql/export",
-        "/ui/sql/files",
     ] {
         assert!(
             html.contains(&format!(r#"href="{href}""#)),
             "{href} missing from the nav"
         );
     }
-    // No entry in the menu is a dead placeholder any more.
+    // No entry in the menu is a dead placeholder any more, and the retired
+    // Files page left none behind either.
     assert!(!html.contains("nav-item--soon"));
+    assert!(!html.contains(r#"href="/ui/sql/files""#));
 
     for href in [
         "/ui/sql/view-definitions",
         "/ui/sql/queries",
         "/ui/sql/views",
         "/ui/sql/export",
-        "/ui/sql/files",
     ] {
         let response = app()
             .oneshot(Request::get(href).body(Body::empty()).unwrap())
@@ -2155,23 +2158,11 @@ async fn sql_on_fhir_section_navigates_to_real_pages() {
 }
 
 /// #649/#833: SQL Export's builder (`/ui/sql/export/new`) offers the stored
-/// subjects and validates the submission; Files tables a finished job's
-/// manifest as download links (the job-store/list behavior itself is
-/// covered end-to-end in `sql_export_http.rs`).
+/// subjects and validates the submission (the job-store/list behavior itself
+/// is covered end-to-end in `sql_export_http.rs`).
 #[tokio::test]
-async fn sql_export_new_offers_subjects_and_files_tables_the_manifest() {
+async fn sql_export_new_offers_subjects_and_validates_submission() {
     let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
-    let manifest = serde_json::json!({
-        "resourceType": "Parameters",
-        "parameter": [
-            {"name": "exportId", "valueString": "job-9"},
-            {"name": "_format", "valueCode": "csv"},
-            {"name": "output", "part": [
-                {"name": "name", "valueString": "patients"},
-                {"name": "location", "valueUri": "http://s/export/job-9/patients-0.csv"},
-            ]},
-        ]
-    });
     let source = helios_ui::StaticConformanceSource::empty()
         .with(
             "ViewDefinition",
@@ -2189,8 +2180,7 @@ async fn sql_export_new_offers_subjects_and_files_tables_the_manifest() {
                 "status": "active",
                 "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
             ],
-        )
-        .with_export_manifest(Ok(manifest));
+        );
     let app = helios_ui::mount_with_conformance_source(
         Router::new(),
         "9.9.9",
@@ -2239,28 +2229,27 @@ async fn sql_export_new_offers_subjects_and_files_tables_the_manifest() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(body_text(response).await.contains("at least one subject"));
+}
 
-    // Files tables the manifest with its download links.
-    let response = app
-        .clone()
-        .oneshot(
-            Request::get("/ui/sql/files?job=job-9")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let html = body_text(response).await;
-    assert!(
-        html.contains(
-            r#"<form method="get" action="/ui/sql/files" class="card__body detail-stack">"#
-        )
-    );
-    assert!(html.contains("patients"));
-    // #833 gate-fix FALLA 2: an absolute manifest location renders as a
-    // same-origin path, since the UI and the FHIR API share one server.
-    assert!(html.contains(r#"href="/export/job-9/patients-0.csv""#));
-    assert!(html.contains(">csv<"));
+/// #835: the retired job-id lookup form's own URL keeps working as a
+/// bookmark — it just no longer resolves to a page of its own. A query
+/// string (the legacy `?job=`) is dropped along with everything else the
+/// form used to do with it: the list works off locally-generated ids, which
+/// that parameter never carried.
+#[tokio::test]
+async fn sql_files_redirects_permanently_to_the_export_list() {
+    for target in ["/ui/sql/files", "/ui/sql/files?job=job-9"] {
+        let response = app()
+            .oneshot(Request::get(target).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY, "{target}");
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/ui/sql/export",
+            "{target}"
+        );
+    }
 }
 
 /// #649: the SQL Queries and SQL Views workspaces list Libraries of their own

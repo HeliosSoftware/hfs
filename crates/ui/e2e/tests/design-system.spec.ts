@@ -58,6 +58,18 @@ async function jsHookClasses(request: APIRequestContext, sources: Set<string>): 
   return found;
 }
 
+// A SQL Export job's detail page (`/ui/sql/export/{id}`, #835) is
+// deliberately not added to ROUTES/this sweep (nor to a11y.spec.ts's or
+// no-cdn.spec.ts's own ROUTES-driven loops), unlike `seedBulkImportDetail`.
+// Every class its templates render — `.job-card`, `.tag`, `.progress`,
+// `.kv-grid`, `.detail__tags`, `.job-card__files` — is exercised, name for
+// name, by the Rust template-rendering coverage in `sql_export_http.rs`
+// (fast, seeded fixtures covering every status) and by this same file's own
+// "every exercised detail field" test just above (a real, end-to-end
+// `$sql-export` job). Seeding a second real job per sweep — four more here
+// alone, plus a11y's per-route-per-theme tests and no-cdn's own three loops
+// — would only re-run the same class list those already cover, at the cost
+// of several more live `$sql-export` round trips on every run.
 test("every class used on every page matches a rule in app.css", async ({ page, request }) => {
   const defined = new Set<string>();
   const css = (await stylesheet(request)).replace(/\/\*[\s\S]*?\*\//g, "");
@@ -488,8 +500,9 @@ test("every exercised detail field gets external spacing from its direct parent"
   page,
   request,
 }) => {
+  const vdName = `spacing_guard_${Date.now()}`;
   const viewDefinitionId = await createResource(request, "ViewDefinition", {
-    name: `spacing_guard_${Date.now()}`,
+    name: vdName,
     status: "active",
     resource: "Patient",
     select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
@@ -500,8 +513,29 @@ test("every exercised detail field gets external spacing from its direct parent"
     await page.goto("/ui/capability-statement", { waitUntil: "networkidle" });
     await expectDetailFieldSpacing(page, "Capability Statement summary");
 
-    await page.goto("/ui/sql/files", { waitUntil: "networkidle" });
-    await expectDetailFieldSpacing(page, "SQL Files form");
+    // /ui/sql/export/new (#834) left the `.detail__field` vocabulary this
+    // sweep guards: its builder form now speaks Bulk Export's own `.field`
+    // instead, the same reason /ui/bulk-export/new never joined this sweep.
+    // The retired Files lookup page (#835) used to be what exercised this
+    // vocabulary for the SQL Export workspace; its own job detail page (the
+    // Job card) is what carries it now. A job has no static URL, so it is
+    // kicked off here — the `ViewDefinition` above as its only subject,
+    // trivial enough to finish before this request even returns — and
+    // resolved off the redirect's own rendered list, the same way
+    // `sql-export.spec.ts` locates a card by name.
+    const exportListHtml = await (
+      await request.post("/ui/sql/export", {
+        form: { subject: `ViewDefinition/${viewDefinitionId}`, format: "csv" },
+      })
+    ).text();
+    const detailHref = exportListHtml.match(
+      new RegExp(`href="(/ui/sql/export/[^"]+)"[^>]*>${vdName}<`),
+    )?.[1];
+    if (!detailHref) {
+      throw new Error(`seeded SQL Export job "${vdName}" not found on the list`);
+    }
+    await page.goto(detailHref, { waitUntil: "networkidle" });
+    await expectDetailFieldSpacing(page, "SQL Export job detail");
 
     await page.goto("/ui/search-parameters", { waitUntil: "networkidle" });
     await page.locator("a.row-link").first().click();
@@ -526,6 +560,14 @@ test("every exercised detail field gets external spacing from its direct parent"
     // "every class used" sweep on whatever run happens to follow this one
     // against the same reused local dev server.
     await deleteResources(request, "ViewDefinition", [viewDefinitionId]);
+    // The job just seeded lives in the per-user settings document under
+    // `byTenant.<tenant>.sqlExport.jobs` (crates/ui/src/sql_export.rs); left
+    // behind, it becomes an extra card on `/ui/sql/export` for whatever run
+    // follows this one, same reasoning as the ViewDefinition above.
+    await request.patch("/_user/settings", {
+      headers: { "Content-Type": "application/json" },
+      data: { sqlExport: null },
+    });
   }
 });
 

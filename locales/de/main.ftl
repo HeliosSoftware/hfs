@@ -84,6 +84,13 @@ error-not-found = Die angeforderte Ressource wurde nicht gefunden.
 error-unauthorized = Sie sind nicht berechtigt, diese Aktion auszuführen.
 error-generic = Etwas ist schiefgelaufen. Versuchen Sie es erneut.
 
+## Generische "Nicht gefunden"-Seite (#835): ein vollständiger 404 innerhalb
+## des Shells, getrennt von error-not-found (OperationOutcome-Text für
+## API-Antworten).
+
+not-found-title = Nicht gefunden
+not-found-text = Diese Seite existiert nicht oder ist für Sie nicht verfügbar.
+
 ## Dashboard-Gerüst (Figma "Dashboard V1.1")
 
 nav-section-work = Arbeit
@@ -104,7 +111,6 @@ nav-sql-view-definitions = View-Definitionen
 nav-sql-queries = SQL-Abfragen
 nav-sql-views = SQL-Views
 nav-sql-export = SQL-Export
-nav-sql-files = Dateien
 nav-capability-conformance = Capability & Konformität
 nav-search-parameters = Suchparameter
 nav-subscriptions = Abonnements
@@ -796,9 +802,6 @@ sql-export-title = SQL-Export
 sql-export-lede = Führt gespeicherte ViewDefinitions, SQL-Abfragen und SQL-Views als langlaufenden $sql-export-Auftrag aus und lädt die Ausgabedateien herunter.
 sql-export-active-title = SQL-Exporte
 
-sql-files-title = Dateien
-sql-files-lede = Manifeste und Ausgabedateien der SQL-Exporte.
-
 ## View-Definitionen-Arbeitsbereich (#649)
 
 vd-new = Neu erstellen
@@ -842,10 +845,9 @@ lib-sql-heading = SQL
 lib-delete-confirm = „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
 lib-delete-failed = Die Bibliothek konnte nicht gelöscht werden.
 
-## SQL-Export- und Dateien-Seiten (#649, #833)
+## SQL-Export-Seiten (#649, #833)
 
 export-start-failed = Der Export konnte nicht gestartet werden.
-export-job-id = Auftrags-ID
 export-format = Ausgabeformat
 export-start = Export starten
 
@@ -924,14 +926,28 @@ sql-export-files-count = { $count ->
     [one] { $count } Datei
    *[other] { $count } Dateien
 }
-files-job-heading = Exportauftrag
-files-load = Manifest laden
-files-error = Das Manifest konnte nicht geladen werden.
-files-outputs-heading = Ausgaben
-files-col-output = Ausgabe
-files-col-downloads = Downloads
-files-shard = Datei { $n }
-files-empty = Der Auftrag hat keine Ausgabedateien erzeugt.
+
+## Auftrags-Detailseite (#835)
+
+sql-export-detail-finished = Abgeschlossen
+sql-export-detail-failed = Fehlgeschlagen
+sql-export-detail-cancelled = Abgebrochen
+sql-export-detail-started = Gestartet
+sql-export-detail-after = nach
+sql-export-failure-subject = Der Export stoppte beim Element
+sql-export-failure-generic = Der Export ist fehlgeschlagen:
+sql-export-detail-job-heading = Auftrag
+sql-export-detail-field-job-id = Auftrags-ID
+sql-export-detail-field-format = Format
+sql-export-detail-field-started = Gestartet
+sql-export-detail-field-duration = Dauer
+sql-export-detail-field-subjects = Elemente
+sql-export-detail-outputs-heading = Ausgabedateien
+sql-export-detail-col-output = Ausgabe
+sql-export-detail-col-subject = Element
+sql-export-detail-col-files = Dateien
+sql-export-detail-outputs-empty = Der Auftrag hat keine Ausgabedateien erzeugt.
+sql-export-file-fallback = Datei { $n }
 
 ## Administrative HTS-UI (crates/hts-ui) — Phase-1-Stubs
 ##

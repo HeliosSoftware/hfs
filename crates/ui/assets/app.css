@@ -2041,6 +2041,27 @@ select.field__input {
   align-self: start;
 }
 
+/* #835: the job detail header's status row (status chip, contextual
+   action, overflow) — a peer of .job-card__actions, right-aligned like it. */
+.page-head__action {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* #835: the job detail's own vertical rhythm for the notice/progress/cards
+   region. That content lives inside #job-detail, a descendant of .content
+   rather than a direct child of it, so the site-wide
+   .content > .card ~ .card spacing rule ("Stacked section cards keep the
+   page's vertical rhythm", further down this file) never reaches it. */
+.job-detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
 .page-head__title {
   margin: 0 0 4px;
   font-size: 24px;
@@ -3633,6 +3654,17 @@ details.json-fold[open] > summary .icon {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
+}
+
+/* #835: the job detail's Job card Subjects field — a `.tag--type` pill per
+   subject holding only the kind, its display name running on as plain text
+   right after (not inside the pill, unlike .detail__tags' own single-node
+   pills), so the two flow and wrap together like ordinary inline content. */
+.job-detail__subjects {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
 
 .detail__code {
@@ -6073,6 +6105,16 @@ details.json-fold[open] > summary .icon {
   overflow-wrap: anywhere;
 }
 
+/* #835: the card title links to the job's own detail page. */
+.job-card__name a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.job-card__name a:hover {
+  text-decoration: underline;
+}
+
 .job-card__actions {
   display: flex;
   align-items: center;
@@ -6167,6 +6209,13 @@ details.json-fold[open] > summary .icon {
 .job-card__files a:hover {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+/* #835: the Output files table's Files column reuses .job-card__files for
+   its download pills, but as a table cell's sole content — the top margin
+   above assumes trailing a .job-card__meta paragraph, which isn't there. */
+.data-table .job-card__files {
+  margin-top: 0;
 }
 }
 
