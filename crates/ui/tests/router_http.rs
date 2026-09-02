@@ -2220,9 +2220,9 @@ async fn sql_export_new_offers_subjects_and_files_tables_the_manifest() {
     let html = body_text(response).await;
     assert!(html.contains(r#"value="ViewDefinition/vd1""#));
     assert!(html.contains(r#"value="Library/q1""#));
-    assert!(html.contains(
-        r#"<form method="post" action="/ui/sql/export" class="card__body detail-stack">"#
-    ));
+    assert!(
+        html.contains(r#"<form method="post" action="/ui/sql/export" class="bulk-export-form">"#)
+    );
 
     // No subject selected: the page explains instead of submitting (settings
     // is unavailable here, so a valid submission would 303 without a card to

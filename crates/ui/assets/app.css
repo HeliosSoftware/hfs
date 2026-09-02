@@ -1741,6 +1741,12 @@ select.field__input {
   width: 64px;
 }
 
+/* A leading checkbox column (SQL Export's subjects table, #834): just wide
+   enough for the control, never stretching to carry column weight. */
+.data-table .col-check {
+  width: 32px;
+}
+
 .col-tenant {
   display: flex;
   align-items: center;
@@ -2753,6 +2759,12 @@ select.field__input {
   align-items: center;
   gap: 8px;
   margin-top: 12px;
+}
+
+/* The "nothing to export yet" card's actions (SQL Export, #834): left-aligned
+   like the rest of that card's body copy, not trailing off to the right. */
+.form-actions--start {
+  justify-content: flex-start;
 }
 
 /* Shared labelled-value compositions. The flush modifier sets the value that
@@ -5700,6 +5712,21 @@ details.json-fold[open] > summary .icon {
    Edit raw stays alone at the end. */
 .card-head__tools--start {
   margin-right: auto;
+}
+
+/* The subjects table's toolbar (SQL Export builder, #834): the type switch
+   and filter box beside "Subjects". Rendered `hidden` until the filter/
+   switch/select-all enhancement reveals it — a no-JavaScript client never
+   sees this row at all. `flex-wrap` keeps the switch and the filter box from
+   forcing horizontal overflow once revealed on a narrow viewport. */
+.card-head__tools--subjects {
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.card-head__tools--subjects .field__input {
+  width: 220px;
 }
 
 }

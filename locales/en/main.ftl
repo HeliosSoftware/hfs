@@ -796,7 +796,7 @@ sql-views-title = SQL Views
 sql-views-lede = Reusable SQL views layered over ViewDefinitions.
 
 sql-export-title = SQL Export
-sql-export-lede = Long-running SQL on FHIR export jobs.
+sql-export-lede = Run stored view definitions, SQL queries and SQL views as a long-running $sql-export job and download the output files.
 sql-export-active-title = SQL Exports
 
 sql-files-title = Files
@@ -853,10 +853,31 @@ lib-delete-failed = Could not delete the library.
 
 export-start-failed = Could not start the export.
 export-job-id = Job id
-export-new-heading = New Export
-export-no-subjects = Nothing to export yet — create a ViewDefinition first.
 export-format = Output format
 export-start = Start Export
+
+## SQL Export builder — create form (#834)
+
+sql-export-name-placeholder = Monthly patient flat files
+sql-export-subjects-legend = What are you exporting?
+sql-export-subjects-heading = Subjects
+sql-export-filter-all = All
+sql-export-filter-view-definitions = View Definitions
+sql-export-filter-queries = Queries
+sql-export-filter-views = Views
+sql-export-filter-subjects = Filter subjects
+sql-export-select-all = Select all
+sql-export-col-subject = Subject
+sql-export-col-kind = Kind
+sql-export-col-status = Status
+sql-export-selected-count = { $selected } of { $total } selected
+sql-export-format-ndjson-hint = One JSON object per row. Streams well into pipelines.
+sql-export-format-csv-hint = Header row plus one line per row. Opens in any spreadsheet.
+sql-export-format-json-hint = A single JSON array per output. Easiest to inspect by hand.
+sql-export-format-parquet-hint = Columnar and typed. Best for analytics engines.
+sql-export-empty-heading = Nothing to export yet
+sql-export-empty-body = Every stored view definition, SQL query and SQL view shows up here as an export subject. Create one first.
+sql-export-filter-empty = No subjects match
 
 ## Active SQL Exports list and job cards (#833)
 

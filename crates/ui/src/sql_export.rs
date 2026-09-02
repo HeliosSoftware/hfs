@@ -217,9 +217,10 @@ pub struct ExportJob {
     /// kick-off still leaves a `failed` card, per RF3).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub job_id: String,
-    /// Optional user-supplied name; the form does not collect one yet (#834),
-    /// so this stays empty until then and the card falls back to the
-    /// subjects' names (RF19).
+    /// Optional user-supplied name (#834): trimmed by the builder before
+    /// storage, so an empty submission leaves this empty and the card falls
+    /// back to the subjects' names — see [`card_name`]. Never sent to
+    /// `$sql-export` itself; it is purely this notebook's own label.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -626,17 +627,22 @@ async fn refresh_in_progress_jobs(
 // Subjects (#649): the stored ViewDefinitions/Libraries the form offers
 // ---------------------------------------------------------------------------
 
-/// One checkbox row of the export form: a runnable subject the store holds.
+/// One row of the export form's subjects table: a runnable subject the store
+/// holds.
 pub(crate) struct ExportSubject {
     /// `ViewDefinition/{id}` or `Library/{id}` — the `subjectReference`.
     pub(crate) reference: String,
     pub(crate) name: String,
-    /// Display label for the form's kind chip ("ViewDefinition", "SQL
-    /// Query", "SQL View") — the restyle is #834, unchanged here.
+    /// Display label for the table's kind tag ("ViewDefinition", "SQL
+    /// Query", "SQL View").
     pub(crate) kind_label: &'static str,
-    /// The stable code a job's [`JobSubject::kind`] stores (RF6); translated
-    /// back through i18n when a card's meta line summarizes it (RF20).
+    /// The stable code a job's [`JobSubject::kind`] stores, and the table
+    /// row's `data-kind` (#834); translated back through i18n when a card's
+    /// meta line summarizes it.
     pub(crate) kind_code: &'static str,
+    /// `ViewDefinition.status` / `Library.status` — `draft`, `active`,
+    /// `retired`, `unknown`, or empty when the resource carries none (#834).
+    pub(crate) status: String,
 }
 
 /// The stored subjects `$sql-export` can run: every ViewDefinition, and every
@@ -661,6 +667,7 @@ async fn export_subjects(
                     name: e.name,
                     kind_label: "ViewDefinition",
                     kind_code: "view-definition",
+                    status: e.status,
                 });
             }
         }
@@ -678,6 +685,7 @@ async fn export_subjects(
                         name: e.name,
                         kind_label,
                         kind_code,
+                        status: e.status,
                     });
                 }
             }
@@ -915,16 +923,95 @@ fn urlencode(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-/// The SQL Export builder (#833, formerly the whole `/ui/sql/export` page):
-/// pick stored subjects, choose a format, submit. Its restyle is #834 — this
-/// keeps the existing form markup, just moved off the list route.
+/// One row of the builder's subjects table: a subject plus whether this
+/// render should show it pre-checked — a `?subject=` prefill, or the
+/// selection a rejected submission sent back for the user to correct —
+/// computed once in [`subject_rows`] so the template only ever reads a plain
+/// `bool`.
+struct SubjectRow {
+    reference: String,
+    name: String,
+    kind_label: &'static str,
+    kind_code: &'static str,
+    /// A missing status renders as an em dash, decided here rather than in
+    /// the template so the fallback lives in exactly one place.
+    status: String,
+    checked: bool,
+}
+
+/// `status`, or an em dash when the resource carries none.
+fn status_display(status: &str) -> String {
+    if status.is_empty() {
+        "—".to_string()
+    } else {
+        status.to_string()
+    }
+}
+
+/// Pairs `subjects` with `checked`, and counts how many ended up checked —
+/// the "n of m selected" hint's `n`. A `selected` reference that matches no
+/// current subject (an unknown `?subject=`, or a resubmitted reference the
+/// store no longer has) simply checks nothing rather than erroring — unknown
+/// references are ignored in silence.
+fn subject_rows(subjects: Vec<ExportSubject>, selected: &[String]) -> (Vec<SubjectRow>, usize) {
+    let rows: Vec<SubjectRow> = subjects
+        .into_iter()
+        .map(|s| {
+            let checked = selected.contains(&s.reference);
+            SubjectRow {
+                reference: s.reference,
+                name: s.name,
+                kind_label: s.kind_label,
+                kind_code: s.kind_code,
+                status: status_display(&s.status),
+                checked,
+            }
+        })
+        .collect();
+    let selected_count = rows.iter().filter(|row| row.checked).count();
+    (rows, selected_count)
+}
+
+/// The builder's conserved form state across a re-render: a `?subject=`
+/// prefill on a fresh `GET`, or — after a rejected `POST` — the
+/// `name`/`format`/selection the submission itself carried, so the user
+/// never has to redo the parts that were fine. Defaults to a bare `GET /new`
+/// with no prefill: no name, NDJSON (the default output format), nothing
+/// checked.
+struct NewFormState {
+    name: String,
+    format: String,
+    selected: Vec<String>,
+}
+
+impl Default for NewFormState {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            format: "ndjson".to_string(),
+            selected: Vec::new(),
+        }
+    }
+}
+
+/// The SQL Export builder (#833, #834): pick stored subjects from a single
+/// filterable table, choose an output format, submit — the create-form half
+/// of the workspace's two doors, in Bulk Export's own visual language.
 #[derive(Template)]
 #[template(path = "pages/sql-export-new.html")]
 struct ExportNewPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    subjects: Vec<ExportSubject>,
+    /// Empty renders the "nothing to export yet" card instead of the form —
+    /// unless `degraded` is set too, in which case neither the form nor that
+    /// card renders, only the notice (an empty result here could just be the
+    /// fetch failure, not an actually-empty store).
+    subjects: Vec<SubjectRow>,
+    total: usize,
+    selected_count: usize,
+    name: String,
+    format: String,
     degraded: Option<String>,
     start_error: Option<String>,
 }
@@ -1000,29 +1087,64 @@ pub(crate) async fn list(
     })
 }
 
-/// `GET /ui/sql/export/new` — the export builder (RF2).
+/// `GET /ui/sql/export/new` — the export builder. `subject` may repeat
+/// (`?subject=ViewDefinition/x&subject=Library/y`, prefilling the table's
+/// checkboxes), which `Query<T>` cannot express, so the raw query string is
+/// parsed by hand the same way [`start`] parses its body.
 pub(crate) async fn new_page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
-    render_new_page(&state, locale, rv.0, &rt, None).await
+    let selected = query
+        .as_deref()
+        .map(|raw| {
+            form_urlencoded::parse(raw.as_bytes())
+                .filter(|(key, _)| key == "subject")
+                .map(|(_, value)| value.into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    render_new_page(
+        &state,
+        locale,
+        rv.0,
+        &rt,
+        None,
+        NewFormState {
+            selected,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
+/// Shared render tail of [`new_page`] and every re-render [`start`] falls
+/// back to: fetches the current subjects, pairs them with `form`'s selection,
+/// and renders the builder — or its empty/degraded states, both decided in
+/// the template from `subjects`/`degraded`.
 async fn render_new_page(
     state: &WebState,
     locale: RequestLocale,
     version: helios_fhir::FhirVersion,
     rt: &RequestTenant,
     start_error: Option<String>,
+    form: NewFormState,
 ) -> Response {
     let (subjects, degraded) = export_subjects(state, version, &rt.id).await;
+    let total = subjects.len();
+    let (rows, selected_count) = subject_rows(subjects, &form.selected);
     render(ExportNewPage {
         status: current_status(state, version, rt),
         i18n: I18n::new(locale),
         active_page: "sql-export",
-        subjects,
+        subjects: rows,
+        total,
+        selected_count,
+        name: form.name,
+        format: form.format,
         degraded,
         start_error,
     })
@@ -1030,8 +1152,8 @@ async fn render_new_page(
 
 /// `POST /ui/sql/export` — resolve the checked subjects against the same
 /// list `/new` offered, create the job record, kick it off, and land on the
-/// list (RF3). The form repeats `subject=` per checkbox, which `Form`-into-
-/// a-struct cannot express, so the raw body is parsed by hand.
+/// list. The form repeats `subject=` per checkbox, which `Form`-into-a-struct
+/// cannot express, so the raw body is parsed by hand.
 pub(crate) async fn start(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -1042,15 +1164,21 @@ pub(crate) async fn start(
     axum::extract::RawForm(body): axum::extract::RawForm,
 ) -> Response {
     let i18n = I18n::new(locale);
+    let mut name = String::new();
     let mut format = "ndjson".to_string();
     let mut refs: Vec<String> = Vec::new();
     for (key, value) in form_urlencoded::parse(&body) {
         match key.as_ref() {
+            "name" => name = value.into_owned(),
             "subject" => refs.push(value.into_owned()),
             "format" => format = value.into_owned(),
             _ => {}
         }
     }
+    // Trimmed once, up front — an empty result is never stored (the job's
+    // `name` serialization already skips an empty string), and every
+    // re-render below echoes back the exact same trimmed value.
+    let name = name.trim().to_string();
     if refs.is_empty() {
         return render_new_page(
             &state,
@@ -1058,18 +1186,35 @@ pub(crate) async fn start(
             rv.0,
             &rt,
             Some(i18n.t("sql-export-select-subject")),
+            NewFormState {
+                name: name.clone(),
+                format: format.clone(),
+                selected: refs.clone(),
+            },
         )
         .await;
     }
 
     // Resolve every checked reference against the same subjects `/new`
-    // offers (RF10): an unknown reference (deleted or tampered with since
-    // the form was loaded) re-renders instead of kicking off a half-formed
-    // job. A degraded fetch cannot validate anything, so it fails the same
-    // way rather than trusting the submitted names/kinds blindly.
+    // offers: an unknown reference (deleted or tampered with since the form
+    // was loaded) re-renders instead of kicking off a half-formed job. A
+    // degraded fetch cannot validate anything, so it fails the same way
+    // rather than trusting the submitted names/kinds blindly.
     let (available_subjects, degraded) = export_subjects(&state, rv.0, &rt.id).await;
     if let Some(message) = degraded {
-        return render_new_page(&state, locale, rv.0, &rt, Some(message)).await;
+        return render_new_page(
+            &state,
+            locale,
+            rv.0,
+            &rt,
+            Some(message),
+            NewFormState {
+                name: name.clone(),
+                format: format.clone(),
+                selected: refs.clone(),
+            },
+        )
+        .await;
     }
     let mut subjects = Vec::with_capacity(refs.len());
     for reference in &refs {
@@ -1083,6 +1228,11 @@ pub(crate) async fn start(
                 rv.0,
                 &rt,
                 Some(i18n.t("sql-export-unknown-subject")),
+                NewFormState {
+                    name: name.clone(),
+                    format: format.clone(),
+                    selected: refs.clone(),
+                },
             )
             .await;
         };
@@ -1095,6 +1245,7 @@ pub(crate) async fn start(
 
     let caller = Caller::from_request(&headers, &rt.id);
     let mut job = ExportJob {
+        name,
         subjects,
         format,
         status: "in-progress".to_string(),

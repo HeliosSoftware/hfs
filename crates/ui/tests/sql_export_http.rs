@@ -30,6 +30,23 @@ fn view_definition(id: &str, name: &str) -> serde_json::Value {
     serde_json::json!({"resourceType": "ViewDefinition", "id": id, "name": name, "resource": "Patient"})
 }
 
+fn view_definition_with_status(id: &str, name: &str, status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "ViewDefinition", "id": id, "name": name, "resource": "Patient",
+        "status": status,
+    })
+}
+
+const LIBRARY_TYPES_SYSTEM: &str =
+    "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+
+fn library(id: &str, name: &str, code: &str, status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "Library", "id": id, "name": name, "status": status,
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": code}]},
+    })
+}
+
 /// Reads `X-Test-User` and injects a matching `Principal`, so a request can
 /// exercise a specific authenticated settings key without standing up real
 /// auth — the same pattern `bulk_export_http.rs` uses.
@@ -282,6 +299,167 @@ async fn empty_list_shows_a_notice_and_new_offers_subjects_with_their_kind() {
     assert!(html.contains(">ViewDefinition<"));
 }
 
+/// The full builder structure (#834): the back link to the list, the
+/// optional name field, one table row per subject carrying its kind tag,
+/// `data-kind`, and status, the four format radios with NDJSON checked by
+/// default, a single submit control, the table's filter/switch/select-all
+/// tools rendered `hidden`, and the "n of m selected" hint reflecting that
+/// nothing is checked yet.
+#[tokio::test]
+async fn new_page_renders_the_builder_structure() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![
+                view_definition_with_status("vd1", "patients_flat", "active"),
+                view_definition_with_status("vd2", "encounters_flat", "draft"),
+            ],
+        )
+        .with(
+            "Library",
+            FhirVersion::R4,
+            vec![library("q1", "patient_counts", "sql-query", "active")],
+        );
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    // Back link to the list, sharing the list page's own title.
+    assert!(html.contains(r#"<a class="back-link" href="/ui/sql/export">"#));
+    assert!(html.contains(">SQL Exports<"));
+
+    // The name field: present, optional (no `required`).
+    assert!(html.contains(r#"<input class="field__input" type="text" name="name""#));
+    assert!(!html.contains(r#"name="name" required"#));
+
+    // One row per subject — ViewDefinitions then SQL Queries, each group
+    // name-sorted — each carrying its kind tag, `data-kind`, and status.
+    assert!(html.contains(r#"data-kind="view-definition" data-name="encounters_flat""#));
+    assert!(html.contains(r#"data-kind="view-definition" data-name="patients_flat""#));
+    assert!(html.contains(r#"data-kind="sql-query" data-name="patient_counts""#));
+    assert!(html.contains(">ViewDefinition<"));
+    assert!(html.contains(">SQL Query<"));
+    assert!(html.contains(">active<"));
+    assert!(html.contains(">draft<"));
+
+    // Format radios: four, NDJSON checked, nothing else.
+    assert_eq!(html.matches(r#"name="format""#).count(), 4);
+    assert!(html.contains(r#"value="ndjson" checked"#));
+    assert!(!html.contains(r#"value="csv" checked"#));
+    assert!(!html.contains(r#"value="json" checked"#));
+    assert!(!html.contains(r#"value="parquet" checked"#));
+
+    // Exactly one Start Export control, wired to the builder's own form
+    // (the shared shell's sidebar renders its own unrelated submit buttons,
+    // one per enabled FHIR version, so this checks the specific control
+    // rather than every `type="submit"` on the page).
+    assert!(
+        html.contains(r#"<form method="post" action="/ui/sql/export" class="bulk-export-form">"#)
+    );
+    assert_eq!(html.matches("Start Export").count(), 1);
+
+    // The table's tools and the header select-all render, but stay hidden
+    // and inert until a later enhancement reveals them.
+    assert!(html.contains(r#"class="card-head__tools card-head__tools--subjects" hidden"#));
+    assert!(html.contains(r#"aria-label="Select all" hidden"#));
+    assert_eq!(html.matches(r#"class="seg__btn""#).count(), 4);
+    assert!(html.contains(r#"type="search""#));
+    assert!(html.contains(r#"aria-label="Filter subjects""#));
+
+    // Nothing marked yet: "0 of 3 selected".
+    assert!(html.contains("0 of 3 selected"));
+}
+
+#[tokio::test]
+async fn prefill_checks_matching_subjects_and_silently_ignores_unknown_ones() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![
+                view_definition("vd1", "patients"),
+                view_definition("vd2", "encounters"),
+            ],
+        )
+        .with(
+            "Library",
+            FhirVersion::R4,
+            vec![library("q1", "counts", "sql-query", "active")],
+        );
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get(
+            "/ui/sql/export/new?subject=ViewDefinition%2Fvd1&subject=Library%2Fq1&subject=Library%2Fnope",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="ViewDefinition/vd1" aria-label="patients" checked"#));
+    assert!(html.contains(r#"value="Library/q1" aria-label="counts" checked"#));
+    assert!(html.contains(r#"value="ViewDefinition/vd2" aria-label="encounters">"#));
+    assert!(!html.contains("Library/nope"));
+    assert!(html.contains("2 of 3 selected"));
+
+    // No `?subject=` at all renders exactly like a bare `GET /new`.
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("0 of 3 selected"));
+}
+
+#[tokio::test]
+async fn an_empty_store_offers_the_two_creation_links_but_a_degraded_fetch_does_not() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Nothing to export yet"));
+    assert!(html.contains(r#"href="/ui/sql/view-definitions?vd=new""#));
+    assert!(html.contains(r#"href="/ui/sql/queries?lib=new""#));
+    // No builder form at all — not the name field, not a format, not Start
+    // Export. (The page's shared shell renders its own, unrelated `<form>`
+    // for the sidebar's FHIR-version switcher, so this checks the specific
+    // markup the builder itself would own rather than a blanket "<form".)
+    assert!(!html.contains(r#"action="/ui/sql/export""#));
+    assert!(!html.contains(r#"name="format""#));
+    assert!(!html.contains("Start Export"));
+
+    // A fetch failure with nothing loaded is not the same as an empty store:
+    // the "Nothing to export yet" card would be a false claim, so only the
+    // degraded notice renders.
+    let degraded = StaticConformanceSource::empty().with_fetch_error(
+        "ViewDefinition",
+        FhirVersion::R4,
+        "boom",
+    );
+    let response = app_with_settings(None, degraded)
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("could not be loaded"));
+    assert!(!html.contains("Nothing to export yet"));
+    assert!(!html.contains(r#"action="/ui/sql/export""#));
+}
+
 #[tokio::test]
 async fn starting_without_a_subject_rerenders_the_builder_with_an_error() {
     let backend = backend_with_schema().await;
@@ -294,11 +472,15 @@ async fn starting_without_a_subject_rerenders_the_builder_with_an_error() {
 
     let response = app
         .clone()
-        .oneshot(post_form("/ui/sql/export", "format=csv"))
+        .oneshot(post_form("/ui/sql/export", "name=My+export&format=csv"))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(body_text(response).await.contains("at least one subject"));
+    let html = body_text(response).await;
+    assert!(html.contains("at least one subject"));
+    // The name and format the submission carried are conserved.
+    assert!(html.contains(r#"value="My export""#));
+    assert!(html.contains(r#"value="csv" checked"#));
     assert!(
         source.export_calls().is_empty(),
         "no kick-off without a subject"
@@ -319,13 +501,17 @@ async fn an_unknown_subject_reference_rerenders_the_builder_without_a_kickoff() 
         .clone()
         .oneshot(post_form(
             "/ui/sql/export",
-            "subject=ViewDefinition%2Fgone&format=csv",
+            "name=x&subject=ViewDefinition%2Fvd1&subject=ViewDefinition%2Fgone&format=json",
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("no longer available"));
+    // The name, format, and every still-valid reference are conserved.
+    assert!(html.contains(r#"value="x""#));
+    assert!(html.contains(r#"value="json" checked"#));
+    assert!(html.contains(r#"value="ViewDefinition/vd1" aria-label="patients" checked"#));
     assert!(
         source.export_calls().is_empty(),
         "an unresolved subject must not reach $sql-export"

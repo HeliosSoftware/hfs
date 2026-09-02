@@ -1,5 +1,5 @@
 import { test, expect } from "../../pages/fixtures";
-import { createResources, deleteResources } from "../../pages/api";
+import { createResource, createResources, deleteResources, waitSearchable } from "../../pages/api";
 
 // This file runs in the `nojs` project (javaScriptEnabled: false): htmx,
 // sql-export.js, and every `data-*` handler are inert here — the Active SQL
@@ -128,4 +128,38 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
   await completedCard.getByRole("button", { name: "Remove from list" }).click();
   await expect(page).toHaveURL(/\/ui\/sql\/export$/);
   await expect(sqlExport.card(completedName)).toHaveCount(0);
+});
+
+// #834's filter/switch/select-all/count enhancement (sql-export-form.js)
+// never runs in this project: the builder has to stay exactly as the server
+// renders it — every subject row visible, the table's tools and the header
+// select-all both `hidden` — and a subject checked by hand (a real click,
+// not the `evaluateAll` instrumentation the padded scenario above needs)
+// still starts the job through a plain form post.
+test("the subjects table's tools stay hidden, and a subject checked by hand still starts the job", async ({
+  page,
+  request,
+  sqlExport,
+}) => {
+  const name = `nojs_sql_export_manual_${Date.now()}`;
+  const vdId = await createResource(request, "ViewDefinition", {
+    name,
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await sqlExport.gotoNew();
+  await expect(sqlExport.subjectTypeSwitch).toBeHidden();
+  await expect(sqlExport.subjectFilterInput).toBeHidden();
+  await expect(sqlExport.subjectSelectAll).toBeHidden();
+  await expect(sqlExport.subjectRow(name)).toBeVisible();
+
+  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+  await sqlExport.startButton.click();
+
+  await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+  await expect(sqlExport.card(name)).toBeVisible();
 });

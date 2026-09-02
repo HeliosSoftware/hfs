@@ -6,8 +6,13 @@
 // `afterEach` (below) restores both kinds of state it leaves on that shared
 // server, so a rerun sees the same empty baseline as the very first run.
 import { expect, test } from "../pages/fixtures";
-import { createResource, createResources, deleteResources, waitSearchable } from "../pages/api";
-import { expectDetailFieldSpacing } from "../pages/detail-spacing";
+import {
+  createResource,
+  createResources,
+  createSqlQueryLibrary,
+  deleteResources,
+  waitSearchable,
+} from "../pages/api";
 
 // The card's own htmx fragment polls every 5s; generous headroom for a job to
 // finish without ever sleeping blindly (RNF3).
@@ -22,10 +27,20 @@ const POLL_TIMEOUT = 30_000;
 // happens to follow this one against the same shared server.
 let seededViewDefinitionIds: string[] = [];
 
+// Same reasoning as `seededViewDefinitionIds` above, for the `Library`
+// sql-query/sql-view subjects the builder-enhancement tests below seed: left
+// behind, a `Library` becomes `/ui/sql/queries`' or `/ui/sql/views`' default
+// rail selection on whatever run follows this one.
+let seededLibraryIds: string[] = [];
+
 test.afterEach(async ({ request }) => {
   const ids = seededViewDefinitionIds;
   seededViewDefinitionIds = [];
   await deleteResources(request, "ViewDefinition", ids);
+
+  const libraryIds = seededLibraryIds;
+  seededLibraryIds = [];
+  await deleteResources(request, "Library", libraryIds);
 
   // The jobs these tests start live in the per-user settings document under
   // `byTenant.<tenant>.sqlExport.jobs` (crates/ui/src/sql_export.rs); the
@@ -167,10 +182,9 @@ test.describe.serial("Active SQL Exports", () => {
     await sqlExport.goto();
     await sqlExport.newButton.click();
     await expect(page).toHaveURL(/\/ui\/sql\/export\/new$/);
-    await expectDetailFieldSpacing(page, "SQL Export builder");
 
     await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
-    await sqlExport.formatSelect.selectOption("csv");
+    await sqlExport.formatOption("csv").check();
     await sqlExport.startButton.click();
 
     await expect(page).toHaveURL(/\/ui\/sql\/export$/);
@@ -215,5 +229,170 @@ test.describe.serial("Active SQL Exports", () => {
     await expect
       .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
       .toBe(jobId);
+  });
+});
+
+// #834: the builder's subjects table gains a type switch, a text filter, a
+// header select-all, and a live "n of m selected" count over the plain rows
+// the #833 markup rendered — sql-export-form.js. This file's own top-level
+// `afterEach` (above) cleans up both kinds of resource these tests seed.
+test.describe("SQL Export builder subjects table (#834)", () => {
+  test("marks a ViewDefinition and a SQL Query, starts as CSV, and the card summarizes both kinds", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const vdName = `e2e_sql_export_form_vd_${stamp}`;
+    const canonical = `http://example.org/ViewDefinition/e2e-sql-export-form-${stamp}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: vdName,
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+
+    const queryName = `e2e_sql_export_form_query_${stamp}`;
+    const libId = await createSqlQueryLibrary(request, queryName, canonical);
+    seededLibraryIds.push(libId);
+
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Library", libId);
+
+    await sqlExport.gotoNew();
+    await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+    await sqlExport.subjectCheckbox(`Library/${libId}`).check();
+    await sqlExport.formatOption("csv").check();
+    await sqlExport.startButton.click();
+
+    await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+    const card = sqlExport.card(vdName);
+    await expect(card).toBeVisible();
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+    await expect(card).toContainText("1 ViewDefinition");
+    await expect(card).toContainText("1 SQL Query");
+    await expect(card).toContainText("CSV");
+  });
+
+  test("filtering hides a checked row without unchecking it, and the hidden selection still submits", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const targetName = `e2e_sql_export_filter_target_${stamp}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: targetName,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+    await waitSearchable(request, "ViewDefinition", vdId);
+
+    await sqlExport.gotoNew();
+    const row = sqlExport.subjectRow(targetName);
+    const checkbox = sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`);
+    await checkbox.check();
+    const countBefore = await sqlExport.selectedCount.textContent();
+
+    await sqlExport.subjectFilterInput.fill(`no-such-subject-${stamp}`);
+    await expect(row).toBeHidden();
+    await expect(checkbox).toBeChecked();
+    await expect(sqlExport.selectedCount).toHaveText(countBefore ?? "");
+    await expect(sqlExport.subjectsEmptyRow).toBeVisible();
+
+    // Submit while the row is still hidden by the filter: a hidden checked
+    // box is still part of the form, and its value still reaches the job.
+    await sqlExport.startButton.click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+    await expect(sqlExport.card(targetName)).toBeVisible();
+  });
+
+  test("the type switch shows only the selected kind and updates aria-pressed", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const vdName = `e2e_sql_export_switch_vd_${stamp}`;
+    const canonical = `http://example.org/ViewDefinition/e2e-sql-export-switch-${stamp}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: vdName,
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+
+    const queryName = `e2e_sql_export_switch_query_${stamp}`;
+    const libId = await createSqlQueryLibrary(request, queryName, canonical);
+    seededLibraryIds.push(libId);
+
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Library", libId);
+
+    await sqlExport.gotoNew();
+    const vdRow = sqlExport.subjectRow(vdName);
+    const queryRow = sqlExport.subjectRow(queryName);
+    await expect(vdRow).toBeVisible();
+    await expect(queryRow).toBeVisible();
+
+    await sqlExport.subjectTypeButton("sql-query").click();
+    await expect(sqlExport.subjectTypeButton("sql-query")).toHaveAttribute("aria-pressed", "true");
+    await expect(sqlExport.subjectTypeButton("all")).toHaveAttribute("aria-pressed", "false");
+    await expect(vdRow).toBeHidden();
+    await expect(queryRow).toBeVisible();
+
+    await sqlExport.subjectTypeButton("all").click();
+    await expect(sqlExport.subjectTypeButton("all")).toHaveAttribute("aria-pressed", "true");
+    await expect(vdRow).toBeVisible();
+  });
+
+  test("header select-all marks only the rows a filter currently shows, and the count includes hidden checked rows", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const hiddenName = `e2e_sql_export_selectall_hidden_${stamp}`;
+    const visiblePrefix = `e2e_sql_export_selectall_visible_${stamp}`;
+    const visibleNameA = `${visiblePrefix}_a`;
+    const visibleNameB = `${visiblePrefix}_b`;
+    const ids = await createResources(
+      request,
+      [hiddenName, visibleNameA, visibleNameB].map((name) => ({
+        type: "ViewDefinition",
+        body: {
+          name,
+          status: "active",
+          resource: "Patient",
+          select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+        },
+      })),
+    );
+    seededViewDefinitionIds.push(...ids);
+    await Promise.all(ids.map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+    await sqlExport.gotoNew();
+    await sqlExport.subjectCheckbox(`ViewDefinition/${ids[0]}`).check();
+
+    await sqlExport.subjectFilterInput.fill(visiblePrefix);
+    await expect(sqlExport.subjectRow(hiddenName)).toBeHidden();
+    await expect(sqlExport.subjectRow(visibleNameA)).toBeVisible();
+    await expect(sqlExport.subjectRow(visibleNameB)).toBeVisible();
+
+    await sqlExport.subjectSelectAll.check();
+
+    await expect(sqlExport.subjectCheckbox(`ViewDefinition/${ids[1]}`)).toBeChecked();
+    await expect(sqlExport.subjectCheckbox(`ViewDefinition/${ids[2]}`)).toBeChecked();
+    // The hidden, already-checked row is untouched by select-all — neither
+    // dropped nor double-counted.
+    await expect(sqlExport.subjectCheckbox(`ViewDefinition/${ids[0]}`)).toBeChecked();
+    await expect(sqlExport.selectedCount).toContainText("3 of");
+    await expect(sqlExport.subjectSelectAll).toBeChecked();
   });
 });

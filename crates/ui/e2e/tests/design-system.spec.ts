@@ -500,9 +500,6 @@ test("every exercised detail field gets external spacing from its direct parent"
     await page.goto("/ui/capability-statement", { waitUntil: "networkidle" });
     await expectDetailFieldSpacing(page, "Capability Statement summary");
 
-    await page.goto("/ui/sql/export/new", { waitUntil: "networkidle" });
-    await expectDetailFieldSpacing(page, "SQL Export form");
-
     await page.goto("/ui/sql/files", { waitUntil: "networkidle" });
     await expectDetailFieldSpacing(page, "SQL Files form");
 

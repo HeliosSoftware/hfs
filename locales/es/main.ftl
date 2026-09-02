@@ -793,7 +793,7 @@ sql-views-title = Vistas SQL
 sql-views-lede = Vistas SQL reutilizables construidas sobre ViewDefinitions.
 
 sql-export-title = Exportación SQL
-sql-export-lede = Trabajos de exportación SQL on FHIR de larga duración.
+sql-export-lede = Ejecuta ViewDefinitions, consultas SQL y vistas SQL almacenadas como un trabajo $sql-export de larga duración y descarga los archivos de salida.
 sql-export-active-title = Exportaciones SQL
 
 sql-files-title = Archivos
@@ -846,10 +846,31 @@ lib-delete-failed = No se pudo eliminar la biblioteca.
 
 export-start-failed = No se pudo iniciar la exportación.
 export-job-id = Id del trabajo
-export-new-heading = Nueva exportación
-export-no-subjects = Nada que exportar todavía: crea primero una ViewDefinition.
 export-format = Formato de salida
 export-start = Iniciar exportación
+
+## Formulario de creación del generador de exportaciones SQL (#834)
+
+sql-export-name-placeholder = Archivos planos mensuales de pacientes
+sql-export-subjects-legend = ¿Qué vas a exportar?
+sql-export-subjects-heading = Elementos
+sql-export-filter-all = Todos
+sql-export-filter-view-definitions = ViewDefinitions
+sql-export-filter-queries = Consultas
+sql-export-filter-views = Vistas
+sql-export-filter-subjects = Filtrar elementos
+sql-export-select-all = Seleccionar todo
+sql-export-col-subject = Elemento
+sql-export-col-kind = Tipo
+sql-export-col-status = Estado
+sql-export-selected-count = { $selected } de { $total } seleccionados
+sql-export-format-ndjson-hint = Un objeto JSON por fila. Se transmite bien hacia otras canalizaciones.
+sql-export-format-csv-hint = Fila de encabezado más una línea por fila. Se abre en cualquier hoja de cálculo.
+sql-export-format-json-hint = Un único arreglo JSON por salida. El más fácil de inspeccionar a mano.
+sql-export-format-parquet-hint = Columnar y tipado. El mejor para motores de análisis.
+sql-export-empty-heading = Aún no hay nada que exportar
+sql-export-empty-body = Cada ViewDefinition, consulta SQL y vista SQL almacenada aparece aquí como un elemento exportable. Crea uno primero.
+sql-export-filter-empty = Ningún elemento coincide
 
 ## Lista de exportaciones SQL activas y tarjetas de trabajo (#833)
 

@@ -793,7 +793,7 @@ sql-views-title = SQL-Views
 sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
 
 sql-export-title = SQL-Export
-sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
+sql-export-lede = Führt gespeicherte ViewDefinitions, SQL-Abfragen und SQL-Views als langlaufenden $sql-export-Auftrag aus und lädt die Ausgabedateien herunter.
 sql-export-active-title = SQL-Exporte
 
 sql-files-title = Dateien
@@ -846,10 +846,31 @@ lib-delete-failed = Die Bibliothek konnte nicht gelöscht werden.
 
 export-start-failed = Der Export konnte nicht gestartet werden.
 export-job-id = Auftrags-ID
-export-new-heading = Neuer Export
-export-no-subjects = Noch nichts zu exportieren — lege zuerst eine ViewDefinition an.
 export-format = Ausgabeformat
 export-start = Export starten
+
+## Erstellungsformular des SQL-Export-Generators (#834)
+
+sql-export-name-placeholder = Monatliche Patienten-Flachdateien
+sql-export-subjects-legend = Was möchten Sie exportieren?
+sql-export-subjects-heading = Elemente
+sql-export-filter-all = Alle
+sql-export-filter-view-definitions = ViewDefinitions
+sql-export-filter-queries = Abfragen
+sql-export-filter-views = Views
+sql-export-filter-subjects = Elemente filtern
+sql-export-select-all = Alle auswählen
+sql-export-col-subject = Element
+sql-export-col-kind = Typ
+sql-export-col-status = Status
+sql-export-selected-count = { $selected } von { $total } ausgewählt
+sql-export-format-ndjson-hint = Ein JSON-Objekt pro Zeile. Läuft gut in Pipelines.
+sql-export-format-csv-hint = Kopfzeile plus eine Zeile pro Datensatz. Öffnet sich in jeder Tabellenkalkulation.
+sql-export-format-json-hint = Ein einzelnes JSON-Array pro Ausgabe. Am einfachsten von Hand zu prüfen.
+sql-export-format-parquet-hint = Spaltenorientiert und typisiert. Am besten für Analyse-Engines geeignet.
+sql-export-empty-heading = Noch nichts zu exportieren
+sql-export-empty-body = Jede gespeicherte ViewDefinition, SQL-Abfrage und SQL-View erscheint hier als exportierbares Element. Legen Sie zuerst eines an.
+sql-export-filter-empty = Keine Elemente gefunden
 
 ## Liste der aktiven SQL-Exporte und Auftragskarten (#833)
 
