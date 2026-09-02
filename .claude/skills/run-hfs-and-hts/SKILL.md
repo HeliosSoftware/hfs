@@ -19,7 +19,7 @@ Start `hts` first, seeded from the bundled terminology data, then start
 
 ```bash
 # Terminal 1 — HTS, seeded with the bundled terminology set, admin UI on
-HTS_BOOTSTRAP_DIR=./crates/hts/terminology-data HTS_UI_ENABLED=true cargo run --bin hts
+HTS_BOOTSTRAP_DIR=./crates/hts/terminology-data cargo run --bin hts
 # binds 127.0.0.1:8090, admin UI at /ui/hts
 
 # Terminal 2 — HFS, wired to use HTS for terminology operations
@@ -32,7 +32,6 @@ cargo run --bin hfs
 ```powershell
 # Terminal 1 — HTS
 $env:HTS_BOOTSTRAP_DIR = ".\crates\hts\terminology-data"
-$env:HTS_UI_ENABLED    = "true"
 cargo run --bin hts              # binds 127.0.0.1:8090, admin UI at /ui/hts
 
 # Terminal 2 — HFS
@@ -46,9 +45,10 @@ not at boot, but there's nothing to look up until HTS has finished its
 bootstrap import.
 
 Note there are two distinct `/ui` surfaces once both are running: HFS's own
-UI at `http://127.0.0.1:8080/ui`, and — only with `HTS_UI_ENABLED=true` —
-HTS's administrative UI at `http://127.0.0.1:8090/ui/hts` (off by default;
-see [run-hts-server](../run-hts-server/SKILL.md#admin-ui)).
+UI at `http://127.0.0.1:8080/ui`, and HTS's administrative UI at
+`http://127.0.0.1:8090/ui/hts` (both on by default; set `HTS_UI_ENABLED=false`
+to opt out of the latter — see
+[run-hts-server](../run-hts-server/SKILL.md#admin-ui)).
 
 ## Sanity checks
 
@@ -56,7 +56,7 @@ see [run-hts-server](../run-hts-server/SKILL.md#admin-ui)).
 curl http://localhost:8090/health
 curl "http://localhost:8090/metadata?mode=terminology"   # TerminologyCapabilities once seeded
 curl http://localhost:8080/health
-curl -o /dev/null -w "%{http_code}\n" http://localhost:8090/ui/hts   # 200 only if HTS_UI_ENABLED=true
+curl -o /dev/null -w "%{http_code}\n" http://localhost:8090/ui/hts   # 200 unless HTS_UI_ENABLED=false
 ```
 
 ## What this enables
