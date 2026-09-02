@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "data-types",
   "meta": {
-    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
+    "lastUpdated": "2026-08-29T05:37:46.371+11:00"
   },
   "text": {
     "status": "generated",
@@ -34,7 +34,7 @@
   "title": "All FHIR Types",
   "status": "active",
   "experimental": false,
-  "date": "2026-07-17T03:44:13+00:00",
+  "date": "2026-08-28T18:37:46+00:00",
   "publisher": "HL7 (FHIR Project)",
   "contact": [
     {

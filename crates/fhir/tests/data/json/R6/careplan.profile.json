@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "CarePlan",
   "meta": {
-    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+    "lastUpdated": "2026-08-28T18:37:46.371+00:00"
   },
   "text": {
     "status": "generated",
@@ -31,7 +31,7 @@
   "name": "CarePlan",
   "status": "active",
   "experimental": false,
-  "date": "2026-07-17T03:44:13+00:00",
+  "date": "2026-08-28T18:37:46+00:00",
   "publisher": "HL7 International / Patient Care",
   "contact": [
     {
@@ -145,7 +145,7 @@
               },
               {
                 "url": "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-                "valueMarkdown": "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+                "valueMarkdown": "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
               }
             ],
             "key": "dom-6",

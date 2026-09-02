@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="QuestionnaireResponse"/>
   <meta>
-    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
+    <lastUpdated value="2026-08-28T18:37:46.371+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -306,6 +306,8 @@
             <span style="font-style: italic" title="qrs-1">+ Rule: Item cannot contain both item and answer</span>
             <br/>
             <span style="font-style: italic" title="qrs-2">+ Rule: Repeated answers are combined in the answers array of a single item</span>
+            <br/>
+            <span style="font-style: italic" title="qrs-4">+ Rule: The same answer cannot be specified more than once for the same question</span>
             <br/>This repeating element order: The order of the items is the order in which the questions were presented to the user when completing the Questionnaire.
             <br/>
           </td>
@@ -702,7 +704,7 @@
   <name value="QuestionnaireResponse"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-08-28T18:37:46+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -788,7 +790,7 @@
           <valueBoolean value="true"/>
         </extension>
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-          <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+          <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
         </extension>
         <key value="dom-6"/>
         <severity value="warning"/>
@@ -1523,6 +1525,13 @@
         <expression value="repeat(answer|item).select(item.where(answer.value.exists()).linkId.isDistinct()).allTrue()"/>
         <source value="http://hl7.org/fhir/StructureDefinition/QuestionnaireResponse"/>
       </constraint>
+      <constraint>
+        <key value="qrs-4"/>
+        <severity value="error"/>
+        <human value="The same answer cannot be specified more than once for the same question"/>
+        <expression value="answer.value.isDistinct().allTrue()"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/QuestionnaireResponse"/>
+      </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
@@ -1757,6 +1766,7 @@
       </type>
       <condition value="qrs-1"/>
       <condition value="qrs-2"/>
+      <condition value="qrs-4"/>
       <constraint>
         <key value="ele-1"/>
         <severity value="error"/>
@@ -2345,6 +2355,13 @@
       </type>
       <orderMeaning value="The order of the items is the order in which the questions were presented to the user when completing the Questionnaire."/>
       <constraint>
+        <key value="qrs-4"/>
+        <severity value="error"/>
+        <human value="The same answer cannot be specified more than once for the same question"/>
+        <expression value="answer.value.isDistinct().allTrue()"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/QuestionnaireResponse"/>
+      </constraint>
+      <constraint>
         <key value="qrs-2"/>
         <severity value="error"/>
         <human value="Repeated answers are combined in the answers array of a single item"/>
@@ -2443,6 +2460,7 @@
       </type>
       <condition value="qrs-1"/>
       <condition value="qrs-2"/>
+      <condition value="qrs-4"/>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>

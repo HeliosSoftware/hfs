@@ -870,6 +870,132 @@ async fn the_management_page_reports_unavailable_settings_without_a_new_action()
     assert!(!html.contains("0 exports · 0 running"));
 }
 
+/// An Until instant reaches the kick-off as `_until`, and pairs with Since to
+/// bound the window at both ends.
+#[tokio::test]
+async fn until_is_sent_on_the_kickoff_and_pairs_with_since() {
+    let (base, mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Bounded window"),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-01-01T00:00:00Z"),
+            ("until", "2026-02-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 1);
+    let q = &kickoffs[0].1;
+    assert_eq!(
+        query_values(q, "_since"),
+        vec!["2026-01-01T00:00:00Z"],
+        "{q}"
+    );
+    assert_eq!(
+        query_values(q, "_until"),
+        vec!["2026-02-01T00:00:00Z"],
+        "{q}"
+    );
+}
+
+/// Leaving Until empty keeps today's open-ended behaviour: the parameter is not
+/// sent at all, rather than sent blank.
+#[tokio::test]
+async fn an_empty_until_is_not_sent_at_all() {
+    let (base, mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Open ended"),
+            ("scope", "system"),
+            ("since_preset", "week"),
+            ("until", "   "),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    let q = &kickoffs[0].1;
+    assert_eq!(query_values(q, "_since").len(), 1, "{q}");
+    assert!(query_values(q, "_until").is_empty(), "{q}");
+}
+
+/// On the patient scope the kick-off is a `Parameters` POST, where `_until` is
+/// an instant like `_since` — not a string like `_type` and `_elements`.
+#[tokio::test]
+async fn until_rides_the_patient_scope_parameters_as_an_instant() {
+    let (base, mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Bounded cohort"),
+            ("scope", "patient"),
+            ("patient", "p-1"),
+            ("until", "2026-02-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let requests = mock.requests.lock().unwrap().clone();
+    let kickoff = requests.last().unwrap();
+    assert_eq!(kickoff.method, Method::POST);
+    let parameters: serde_json::Value = serde_json::from_str(&kickoff.body).unwrap();
+    let entries = parameters["parameter"].as_array().unwrap();
+
+    assert!(
+        entries.iter().any(|entry| {
+            entry["name"] == "_until" && entry["valueInstant"] == "2026-02-01T00:00:00Z"
+        }),
+        "_until must be a valueInstant: {:?}",
+        entries
+    );
+    assert!(
+        entries
+            .iter()
+            .filter(|entry| entry["name"] == "_until")
+            .all(|entry| entry.get("valueString").is_none()),
+        "_until must not also be sent as a valueString"
+    );
+}
+
+/// The window is stated on the Active Exports card, so a running job says what
+/// it was started with.
+#[tokio::test]
+async fn the_card_states_the_export_window() {
+    let (base, _mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Windowed"),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-01-01T00:00:00Z"),
+            ("until", "2026-02-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("2026-01-01T00:00:00Z"), "{html}");
+    assert!(html.contains("2026-02-01T00:00:00Z"), "{html}");
+}
+
 #[tokio::test]
 async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     let (base, mock, _) = serve().await;

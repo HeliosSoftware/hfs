@@ -131,6 +131,15 @@
                  placeholder="2026-08-01T00:00:00Z">
           <span class="field__hint">{{ i18n.t("bulk-export-field-since-custom-hint") }}</span>
         </label>
+        <!-- Until has no natural preset list the way Since does, so it is a
+             single instant input. Left empty it is simply not sent, which keeps
+             today's open-ended behaviour. -->
+        <label class="field">
+          <span class="field__label">{{ i18n.t("bulk-export-field-until") }}</span>
+          <input class="field__input" type="text" name="until" autocomplete="off"
+                 placeholder="2026-08-01T00:00:00Z">
+          <span class="field__hint">{{ i18n.t("bulk-export-field-until-hint") }}</span>
+        </label>
       </div>
     </div>
   </section>

@@ -52,6 +52,11 @@
         {
           "system": "http://acme.org/tests",
           "code": "LIPID"
+        },
+        {
+          "system": "http://loinc.org",
+          "code": "100898-6",
+          "display": "Lipid panel - Serum or Plasma"
         }
       ],
       "text": "Lipid Panel"

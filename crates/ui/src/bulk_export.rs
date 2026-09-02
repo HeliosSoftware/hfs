@@ -63,6 +63,10 @@ pub struct ExportJob {
     pub type_filter: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub since: String,
+    /// Upper bound of the export window (`_until`). `default` so jobs persisted
+    /// before this field existed still deserialize.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub until: String,
     /// Canonical `Patient/{logical-id}` references selected for this export.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patient_refs: Vec<String>,
@@ -180,6 +184,7 @@ fn job_merge_value(job: &ExportJob) -> Value {
         "elements": optional_string(&job.elements),
         "typeFilter": optional_string(&job.type_filter),
         "since": optional_string(&job.since),
+        "until": optional_string(&job.until),
         "patientRefs": if job.patient_refs.is_empty() {
             Value::Null
         } else {
@@ -499,6 +504,9 @@ struct JobCard {
     files: Vec<(String, String)>,
     elapsed: String,
     can_delete: bool,
+    /// The `[_since, _until]` window, pre-rendered, empty when unbounded. Shown
+    /// so a running job states the window it was started with.
+    window: String,
 }
 
 fn progress_pct(status: &str, progress: &str) -> String {
@@ -565,6 +573,18 @@ fn job_card(i18n: &I18n, id: &str, job: &ExportJob, state: &WebState, tenant: &s
         elapsed: elapsed(job),
         can_delete: terminal_status(&job.status)
             && remote_job_identity(job, state, tenant) != RemoteJobIdentity::Unknown,
+        window: export_window(i18n, job),
+    }
+}
+
+/// Renders a job's `[_since, _until]` window for the card, or an empty string
+/// when the export is unbounded. Either bound may stand alone.
+fn export_window(i18n: &I18n, job: &ExportJob) -> String {
+    match (job.since.is_empty(), job.until.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("{} {}", i18n.t("bulk-export-window-since"), job.since),
+        (true, false) => format!("{} {}", i18n.t("bulk-export-window-until"), job.until),
+        (false, false) => format!("{} \u{2192} {}", job.since, job.until),
     }
 }
 
@@ -684,6 +704,7 @@ pub struct StartForm {
     pub type_filter: String,
     pub since_preset: String,
     pub since_custom: String,
+    pub until: String,
     pub patients: Vec<String>,
 }
 
@@ -704,6 +725,7 @@ fn parse_start_form(body: &str) -> StartForm {
             "type_filter" => form.type_filter = value,
             "since_preset" => form.since_preset = value,
             "since_custom" => form.since_custom = value,
+            "until" => form.until = value,
             "patient" => form.patients.push(value),
             _ => {}
         }
@@ -1010,6 +1032,7 @@ pub async fn start(
         elements: form.elements.trim().to_string(),
         type_filter: form.type_filter.trim().to_string(),
         since: since_instant(&form.since_preset, &form.since_custom),
+        until: form.until.trim().to_string(),
         patient_refs,
         fhir_version: Some(rv.0),
         status: "in-progress".to_string(),
@@ -1069,6 +1092,9 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, ten
     if !job.since.is_empty() {
         query.push(("_since", &job.since));
     }
+    if !job.until.is_empty() {
+        query.push(("_until", &job.until));
+    }
     let client = match no_redirect_client() {
         Ok(client) => client,
         Err(e) => {
@@ -1080,7 +1106,7 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, ten
     let builder = if job.scope == "patient" && !job.patient_refs.is_empty() {
         let mut parameters = Vec::new();
         for (name, value) in &query {
-            if *name == "_since" {
+            if *name == "_since" || *name == "_until" {
                 parameters.push(json!({ "name": name, "valueInstant": value }));
             } else {
                 parameters.push(json!({ "name": name, "valueString": value }));
@@ -1911,5 +1937,36 @@ mod tests {
         })
         .to_string();
         assert_eq!(response_diagnostics(&body), "Patient/missing was not found");
+    }
+
+    /// A job persisted before `until` existed must still load. `#[serde(default)]`
+    /// is what makes that true; without it every stored job would fail to
+    /// deserialize the moment this field shipped.
+    #[test]
+    fn a_job_stored_before_until_existed_still_deserializes() {
+        let stored = serde_json::json!({
+            "name": "Legacy job",
+            "scope": "system",
+            "since": "2026-01-01T00:00:00Z",
+            "status": "in-progress"
+        })
+        .to_string();
+
+        let job: ExportJob = serde_json::from_str(&stored).expect("stored job must still load");
+        assert_eq!(job.since, "2026-01-01T00:00:00Z");
+        assert_eq!(job.until, "", "an absent until reads as unbounded");
+    }
+
+    /// An unbounded job serialises without an `until` key at all, so the stored
+    /// shape does not grow for exports that do not use the bound.
+    #[test]
+    fn an_unbounded_job_does_not_serialise_an_until_key() {
+        let job = ExportJob {
+            name: "Open ended".to_string(),
+            scope: "system".to_string(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&job).unwrap();
+        assert!(value.get("until").is_none(), "{value}");
     }
 }

@@ -9,6 +9,16 @@
   </meta>
   <status value="active"/>
   <intent value="original-order"/>
+  <code>
+    <concept>
+      <coding>
+        <system value="http://loinc.org"/>
+        <code value="2345-7"/>
+        <display value="Glucose [Mass/volume] in Serum or Plasma"/>
+      </coding>
+      <text value="Glucose test"/>
+    </concept>
+  </code>
   <subject>
     <reference value="Patient/dicom"/>
   </subject>

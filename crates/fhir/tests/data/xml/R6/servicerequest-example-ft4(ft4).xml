@@ -7,6 +7,30 @@
       <display value="test health data"/>
     </security>
   </meta>
+  <contained>
+    <ServiceRequest>
+      <id value="tsh"/>
+      <status value="completed"/>
+      <intent value="original-order"/>
+      <code>
+        <concept>
+          <coding>
+            <system value="http://loinc.org"/>
+            <code value="3016-3"/>
+            <display value="Thyrotropin [Units/volume] in Serum or Plasma"/>
+          </coding>
+          <text value="TSH"/>
+        </concept>
+      </code>
+      <subject>
+        <reference value="Patient/pat2"/>
+      </subject>
+    </ServiceRequest>
+  </contained>
+  <basedOn>
+    <reference value="#tsh"/>
+    <display value="Original request for TSH test"/>
+  </basedOn>
   <status value="active"/>
   <intent value="reflex-order"/>
   <code>

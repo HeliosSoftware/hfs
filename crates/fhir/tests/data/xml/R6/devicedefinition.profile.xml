@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="DeviceDefinition"/>
   <meta>
-    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
+    <lastUpdated value="2026-08-28T18:37:46.371+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -380,7 +380,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Jurisdiction of the authority that maintains the DeviceDefinition (if applicable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.2.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
+            <a href="http://terminology.hl7.org/7.3.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -890,7 +890,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">registered-name | user-friendly-name | patient-reported-name
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.2.0/ValueSet-device-nametype.html">Device Name Type</a> (
+            <a href="http://terminology.hl7.org/7.3.0/ValueSet-device-nametype.html">Device Name Type</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1000,7 +1000,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Describes the common type of the standard, specification, or formal guidance
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.2.0/ValueSet-device-specification-category.html">Device Specification Category</a> (
+            <a href="http://terminology.hl7.org/7.3.0/ValueSet-device-specification-category.html">Device Specification Category</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1719,7 +1719,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The type indicates the relationship of the related device to the device instance
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.2.0/ValueSet-devicedefinition-relationtype.html">Device Definition Relation Type</a> (
+            <a href="http://terminology.hl7.org/7.3.0/ValueSet-devicedefinition-relationtype.html">Device Definition Relation Type</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1953,7 +1953,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">lot-number | manufactured-date | serial-number | expiration-date | biological-source | software-version
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.2.0/ValueSet-device-productidentifierinudi.html">Device Production Identifier In UDI</a> (
+            <a href="http://terminology.hl7.org/7.3.0/ValueSet-device-productidentifierinudi.html">Device Production Identifier In UDI</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -2333,7 +2333,7 @@
   <name value="DeviceDefinition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-08-28T18:37:46+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>

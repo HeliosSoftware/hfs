@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Bundle"/>
   <meta>
-    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
+    <lastUpdated value="2026-08-28T18:37:46.371+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -750,7 +750,7 @@
   <name value="Bundle"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-08-28T18:37:46+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>

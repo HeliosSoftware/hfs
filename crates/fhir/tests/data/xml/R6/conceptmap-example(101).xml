@@ -17,12 +17,12 @@
       <a name="hc101"> </a>
       <p>Mapping from 
         <a href="valueset-address-use.html">AddressUse</a> to 
-        <a href="http://terminology.hl7.org/7.2.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+        <a href="http://terminology.hl7.org/7.3.0/ValueSet-v3-AddressUse.html">AddressUse</a>
       </p>
       <br/>
       <p>Mapping from 
         <a href="codesystem-address-use.html">AddressUse</a> to 
-        <a href="http://terminology.hl7.org/7.2.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+        <a href="http://terminology.hl7.org/7.3.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
       </p>
       <table class="grid">
         <tr>
