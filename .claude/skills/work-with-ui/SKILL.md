@@ -13,7 +13,10 @@ is the operational summary.
 ## Stack: server-rendered htmx, no SPA
 
 There is **no React, Vue, Svelte, Alpine, or jQuery, and no bundler or build
-step.** Do not introduce one.
+step**, with one narrow exception: CodeMirror 6 is vendored as a prebuilt
+bundle via a documented, hand-run ritual under `crates/ui/vendor/codemirror/`
+— never executed by `cargo build` or CI. See `crates/ui/README.md` § "The one
+exception: a vendored, prebuilt bundle". Do not introduce another one.
 
 | Layer | What we use |
 |---|---|
@@ -82,10 +85,14 @@ through to the normal REST surface.
   `{% include %}`d into pages so the first render and the swap emit identical markup.
 - `templates/icons/*.svg` — Figma exports, fills normalized to `currentColor`, inlined.
 - `assets/` — `htmx.min.js` (pinned), `app.css`, `fonts/`, `logo.png`, the
-  shared `busy.js` (#679, the crate's one exported global `window.hfsBusy`),
-  and the per-page scripts: `theme.js`, `editor.js`, `resources.js`,
+  shared `busy.js` (#679, `window.hfsBusy`), the vendored CodeMirror 6 bundle
+  (`vendor/codemirror.bundle.js`, `window.HfsCodeMirror`) with its shared
+  mount helper `code-editor.js` (`window.HfsCodeEditor`, #838), and the
+  per-page scripts: `theme.js`, `editor.js`, `resources.js`,
   `saved-queries.js`, `batch.js`, `history.js`, `nl-search.js`,
-  `resource-filter.js`, `conformance-crud.js`.
+  `resource-filter.js`, `conformance-crud.js`, `vd-editor.js` (ViewDefinition
+  editor, `/ui/sql/view-definitions`), `sql-editor.js` (SQL pane editor,
+  `/ui/sql/queries` and `/ui/sql/views`).
 
 `theme.js` loads **without `defer`**, before first paint, to avoid a FOUC; every
 other script is `defer`. Busy/working states go through `hfsBusy` for
@@ -157,10 +164,17 @@ planned follow-up (`crates/auth/src/outbound.rs`).
 
 ### Per-user preferences
 
-Theme, nav state, FHIR version, tenant, and saved/recent queries roam in the
-`/_user/settings` document (weak `ETag`, JSON merge patch, `If-Match` on write).
-Tenant-derived keys live under a reserved `byTenant` map so a tenant purge can
-reach them — see `/run-hfs-server` for the full semantics.
+Theme, nav state, FHIR version, tenant, saved/recent queries, and — since
+#754/#755 — every sidebar rail's `rails.<page>` record of `last`/`recent`
+(`rail_state`) roam in the `/_user/settings` document (weak `ETag`, JSON
+merge patch, `If-Match` on write). Tenant-derived keys live under a reserved
+`byTenant` map so a tenant purge can reach them — see `/run-hfs-server` for
+the full semantics. The server renders each rail's "Recently used" group
+from `recent`; Compartments is the one exception — it remembers only `last`,
+no group, since its 4-5 definitions would make one noise. With no settings
+store configured there is nothing to render or restore, and every rail opens
+on its page default. `resource-filter.js` now only owns a rail's tooltip and
+scroll-to-selection on arrival — recents are server-rendered, not client-side.
 
 ### i18n
 

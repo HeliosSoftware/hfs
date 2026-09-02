@@ -17,8 +17,9 @@ use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
 use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
-    BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, IncludeProvider, ResourceStorage,
-    RevincludeProvider, SearchProvider, bundle_if_match_gate,
+    BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, ConditionalCreateResult,
+    ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult, IncludeProvider,
+    ResourceStorage, RevincludeProvider, SearchProvider, bundle_if_match_gate,
 };
 use helios_persistence::error::{ResourceError, StorageError, TransactionError};
 use serde_json::Value;
@@ -66,6 +67,7 @@ where
         + IncludeProvider
         + RevincludeProvider
         + BundleProvider
+        + ConditionalStorage
         + Send
         + Sync,
 {
@@ -182,19 +184,36 @@ where
     // load-bearing — but the scan and the write still agree, which is the
     // invariant this is keyed for.
     //
+    // A conditional entry (`PUT/DELETE [type]?[criteria]`, or `POST` with
+    // `ifNoneExist`) is a read-then-write inside the backend, not a
+    // compare-and-swap. Two such entries racing in one bundle can both resolve
+    // their criteria against the same pre-bundle state and both write — two
+    // `ifNoneExist` creates with the same identifier would yield two
+    // resources, which is precisely what the client asked the server to
+    // prevent. Serialize the bundle when any entry is conditional (#511).
+    //
     // NOTE: extend this scan in lockstep with any new cross-entry
     // `state.validation()` mutation added to `process_batch_entry`.
-    let writes_conformance = entries.iter().any(|entry| {
-        entry
-            .get("request")
-            .and_then(|request| {
-                let method = parse_entry_method(request).ok()?;
-                let url = request.get("url").and_then(Value::as_str)?;
-                parse_bundle_request_url(&method, url).ok()
-            })
-            .is_some_and(|(resource_type, _)| resource_type == "StructureDefinition")
+    let needs_serial = entries.iter().any(|entry| {
+        let Some(request) = entry.get("request") else {
+            return false;
+        };
+        if request.get("ifNoneExist").and_then(Value::as_str).is_some() {
+            return true;
+        }
+        let Ok(method) = parse_entry_method(request) else {
+            return false;
+        };
+        let Some(url) = request.get("url").and_then(Value::as_str) else {
+            return false;
+        };
+        let Ok((resource_type, id)) = parse_bundle_request_url(&method, url) else {
+            return false;
+        };
+        resource_type == "StructureDefinition"
+            || (!matches!(method, BundleMethod::Get) && conditional_criteria(url, &id).is_some())
     });
-    if writes_conformance {
+    if needs_serial {
         return 1;
     }
 
@@ -260,7 +279,13 @@ async fn process_batch<S>(
     principal: Option<&Principal>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
+    S: ResourceStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + ConditionalStorage
+        + Send
+        + Sync,
 {
     debug!(
         tenant = %tenant.tenant_id(),
@@ -305,8 +330,17 @@ where
     let results: Vec<(usize, Value)> = stream::iter(0..entries_ref.len())
         .map(|index| async move {
             let entry = &entries_ref[index];
-            let result =
-                process_batch_entry(state, tenant, fhir_version, entry, index, principal).await;
+            let mut audit_target = None;
+            let result = process_batch_entry(
+                state,
+                tenant,
+                fhir_version,
+                entry,
+                index,
+                principal,
+                &mut audit_target,
+            )
+            .await;
 
             // Audit is emitted inside the entry future rather than after
             // collection. `emit_batch_entry_audit` hands off to a detached
@@ -320,6 +354,7 @@ where
                 state,
                 entry,
                 &result,
+                audit_target.as_ref(),
                 principal,
                 None,
                 Some(&correlation_details),
@@ -427,10 +462,12 @@ where
                 // that work lands on an untouched dispatch path instead of
                 // merging against a refusal it is about to replace.
                 //
-                // `ifNoneExist` is left alone too — MongoDB resolves it inside
-                // the session, so refusing it here would remove a working,
-                // atomic feature. Resolving URL criteria within a transaction's
-                // atomic scope is #511.
+                // `ifNoneExist` is left alone: every backend resolves it inside
+                // the open transaction (#511). Resolving URL-borne criteria
+                // (`PUT [type]?[criteria]`) within a transaction's atomic scope
+                // needs a search surface on the `Transaction` trait and the
+                // R4 §3.1.0.11.2 overlapping-identity pre-pass, and remains a
+                // follow-up; the batch arm resolves them.
                 if !matches!(bundle_entry.method, BundleMethod::Get)
                     && bundle_entry.url.contains('?')
                 {
@@ -770,6 +807,11 @@ where
 }
 
 /// Processes a single batch entry, returning a structured BundleEntryResult.
+///
+/// `audit_target` is an out-parameter for the one case where neither the
+/// request URL nor the response body names the entity the entry acted on: a
+/// conditional DELETE answers 204 with no body, and its URL carries criteria
+/// rather than an id. `emit_entry_audit` reads it after everything else.
 async fn process_batch_entry<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -777,9 +819,16 @@ async fn process_batch_entry<S>(
     entry: &Value,
     index: usize,
     principal: Option<&Principal>,
+    audit_target: &mut Option<AuditTarget>,
 ) -> BundleEntryResult
 where
-    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
+    S: ResourceStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + ConditionalStorage
+        + Send
+        + Sync,
 {
     let request = match entry.get("request") {
         Some(r) => r,
@@ -800,6 +849,7 @@ where
     };
     let url = request.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let if_match = request.get("ifMatch").and_then(|v| v.as_str());
+    let if_none_exist = request.get("ifNoneExist").and_then(|v| v.as_str());
 
     // Parse the URL to extract resource type and ID
     let (resource_type, id) = match parse_bundle_request_url(&method, url) {
@@ -828,33 +878,50 @@ where
         }
     }
 
-    // A query on a type-level URL is FHIR conditional criteria, and this path
-    // cannot resolve one — that needs a search, which is #511. Refuse it
-    // explicitly rather than dispatch something else: before #503 the criteria
-    // rode along in `resource_type`, so a conditional PUT reached
-    // `create_or_update` with an empty id and wrote a row no search can address.
-    //
-    // GET is exempt. A query there is a search rather than a condition, and
-    // executing it is #478's deliverable; leaving the arm untouched keeps this
-    // fix off that diff.
-    //
-    // Since #502 the predicate is enum-typed, matching its transaction twin. As
-    // a raw `method != "GET"` this was the third case-sensitive comparison in
-    // the file: a lowercase `get` on a search URL failed it and was refused as a
-    // conditional interaction. Such an entry is now refused at the seam and
-    // never reaches here. `{method}` below renders the canonical spelling rather
-    // than echoing raw client bytes.
-    if !matches!(method, BundleMethod::Get)
-        && let Some(criteria) = conditional_criteria(url, &id)
-    {
+    // A query on a type-level URL is FHIR conditional criteria (#511). It is
+    // percent-decoded here, once, so the backend receives exactly what the
+    // resource endpoints hand it: axum's `Query` decodes for them, and no
+    // backend decodes for itself. Repeated keys survive, which the endpoints'
+    // `HashMap` round-trip loses (FHIR AND semantics). GET is exempt — a query
+    // there is a search, executed below.
+    let criteria = if matches!(method, BundleMethod::Get) {
+        None
+    } else {
+        conditional_criteria(url, &id).map(normalize_criteria)
+    };
+
+    if let Some(criteria) = criteria.as_deref() {
+        // FHIR defines no `POST [type]?[criteria]`; a conditional create is
+        // expressed through `request.ifNoneExist`. Refuse rather than guess.
+        if matches!(method, BundleMethod::Post) {
+            return create_error_result(
+                400,
+                &format!(
+                    "Entry {index}: POST {url} carries criteria, but a conditional \
+                     create is expressed through request.ifNoneExist, not the URL. \
+                     Nothing was written."
+                ),
+            );
+        }
+        if criteria.is_empty() {
+            // `Patient?&` decodes to nothing. Empty criteria would match every
+            // resource of the type on a literal reading; no conditional
+            // interaction means that.
+            return create_error_result(
+                400,
+                &format!("Entry {index}: {method} {url} carries no usable criteria"),
+            );
+        }
+    }
+
+    // `ifMatch` names a version of one instance; a conditional entry names no
+    // instance until the server resolves it. FHIR gives the pairing no meaning.
+    if if_match.is_some() && (criteria.is_some() || if_none_exist.is_some()) {
         return create_error_result(
             400,
             &format!(
-                "Conditional interactions are not supported in Bundle entries \
-                 (entry {index}: {method} {url}). Criteria were not applied and \
-                 nothing was written. Address the instance directly, or perform \
-                 the conditional interaction against the resource endpoint. \
-                 Criteria: {criteria}"
+                "Entry {index}: ifMatch cannot be combined with a conditional \
+                 interaction ({method} {url}); address the instance directly"
             ),
         );
     }
@@ -921,19 +988,56 @@ where
                 return create_error_result(422, &validation_failure_message(&e));
             }
 
+            // Conditional create. The criteria are passed verbatim, as the
+            // resource endpoint passes its `If-None-Exist` header and as the
+            // transaction executors pass the same field: it is a query string
+            // by definition, not a URL component to decode.
+            if let Some(criteria) = if_none_exist {
+                return match state
+                    .storage()
+                    .conditional_create(
+                        tenant.context(),
+                        &resource_type,
+                        resource,
+                        criteria,
+                        fhir_version,
+                    )
+                    .await
+                {
+                    Ok(ConditionalCreateResult::Created(stored)) => {
+                        record_stored_profile(state, tenant, fhir_version, &stored);
+                        BundleEntryResult::created(stored)
+                    }
+                    // The match is answered as the resource endpoint answers
+                    // it (200, no write) — with the match's location, which the
+                    // transaction executors also set through
+                    // `bundle_if_none_exist_gate`.
+                    Ok(ConditionalCreateResult::Exists(stored)) => {
+                        let location = stored.versioned_url();
+                        let mut result = BundleEntryResult::ok(stored);
+                        result.location = Some(location);
+                        result
+                    }
+                    Ok(ConditionalCreateResult::MultipleMatches(count)) => {
+                        entry_failure(RestError::MultipleMatches {
+                            operation: "create".to_string(),
+                            count,
+                        })
+                    }
+                    Err(e) => {
+                        let (status, message) = entry_error(e);
+                        create_error_result(status, &message)
+                    }
+                };
+            }
+
             match state
                 .storage()
                 .create(tenant.context(), &resource_type, resource, fhir_version)
                 .await
             {
                 Ok(stored) => {
-                    if resource_type == "StructureDefinition" {
-                        state.validation().upsert_stored_profile(
-                            tenant.tenant_id(),
-                            fhir_version,
-                            stored.content(),
-                        );
-                    }
+                    record_stored_profile(state, tenant, fhir_version, &stored);
                     BundleEntryResult::created(stored)
                 }
                 Err(e) => {
@@ -955,6 +1059,59 @@ where
                 admit_bundle_mutation(&method, &resource_type, Some(&resource), fhir_version)
             {
                 return entry_failure(error);
+            }
+
+            // Conditional update, mirroring `conditional_update_handler`:
+            // upsert, so no match creates (201) and one match updates (200).
+            if let Some(criteria) = criteria.as_deref() {
+                if let Err(e) = state
+                    .validation()
+                    .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                    .await
+                {
+                    return create_error_result(422, &validation_failure_message(&e));
+                }
+
+                return match state
+                    .storage()
+                    .conditional_update(
+                        tenant.context(),
+                        &resource_type,
+                        resource,
+                        criteria,
+                        true,
+                        fhir_version,
+                    )
+                    .await
+                {
+                    Ok(ConditionalUpdateResult::Updated(stored)) => {
+                        record_stored_profile(state, tenant, fhir_version, &stored);
+                        let location = format!("{}/{}", stored.resource_type(), stored.id());
+                        let mut result = BundleEntryResult::ok(stored);
+                        result.location = Some(location);
+                        result
+                    }
+                    Ok(ConditionalUpdateResult::Created(stored)) => {
+                        record_stored_profile(state, tenant, fhir_version, &stored);
+                        BundleEntryResult::created(stored)
+                    }
+                    // Unreachable with upsert, kept so the match stays
+                    // exhaustive over the trait's contract.
+                    Ok(ConditionalUpdateResult::NoMatch) => entry_failure(RestError::NotFound {
+                        resource_type: resource_type.clone(),
+                        id: "conditional".to_string(),
+                    }),
+                    Ok(ConditionalUpdateResult::MultipleMatches(count)) => {
+                        entry_failure(RestError::MultipleMatches {
+                            operation: "update".to_string(),
+                            count,
+                        })
+                    }
+                    Err(e) => {
+                        let (status, message) = entry_error(e);
+                        create_error_result(status, &message)
+                    }
+                };
             }
 
             // `PUT Patient` names no instance to update. Left to fall through it
@@ -1000,13 +1157,7 @@ where
                 .await
             {
                 Ok((stored, created)) => {
-                    if resource_type == "StructureDefinition" {
-                        state.validation().upsert_stored_profile(
-                            tenant.tenant_id(),
-                            fhir_version,
-                            stored.content(),
-                        );
-                    }
+                    record_stored_profile(state, tenant, fhir_version, &stored);
                     if created {
                         BundleEntryResult::created(stored)
                     } else {
@@ -1025,6 +1176,33 @@ where
         BundleMethod::Delete => {
             if let Err(error) = admit_bundle_mutation(&method, &resource_type, None, fhir_version) {
                 return entry_failure(error);
+            }
+
+            // Conditional delete, mirroring `conditional_delete_handler`: no
+            // match is a success (R4 §3.1.0.7.1), several matches are 412
+            // because `/metadata` elects `conditionalDelete: "single"`.
+            if let Some(criteria) = criteria.as_deref() {
+                return match state
+                    .storage()
+                    .conditional_delete(tenant.context(), &resource_type, criteria)
+                    .await
+                {
+                    Ok(ConditionalDeleteResult::Deleted(deleted)) => {
+                        *audit_target = Some(AuditTarget::from_stored(&deleted));
+                        BundleEntryResult::deleted()
+                    }
+                    Ok(ConditionalDeleteResult::NoMatch) => BundleEntryResult::deleted(),
+                    Ok(ConditionalDeleteResult::MultipleMatches(count)) => {
+                        entry_failure(RestError::MultipleMatches {
+                            operation: "delete".to_string(),
+                            count,
+                        })
+                    }
+                    Err(e) => {
+                        let (status, message) = entry_error(e);
+                        create_error_result(status, &message)
+                    }
+                };
             }
 
             // Mirror of the PUT guard above. FHIR defines no unconditional
@@ -1082,6 +1260,62 @@ where
 /// Applies the type and immutability gates shared by batch and transaction
 /// mutations. The caller decides whether the error belongs to one batch entry
 /// or rejects the whole transaction.
+/// Folds a written StructureDefinition into the tenant profile registry so
+/// later entries' `check_write` resolve against it. Every write arm calls this;
+/// `batch_concurrency` serializes the bundle when one of them will.
+fn record_stored_profile<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
+    stored: &helios_persistence::types::StoredResource,
+) where
+    S: ResourceStorage + Send + Sync,
+{
+    if stored.resource_type() == "StructureDefinition" {
+        state.validation().upsert_stored_profile(
+            tenant.tenant_id(),
+            fhir_version,
+            stored.content(),
+        );
+    }
+}
+
+/// The entity a batch entry acted on, when neither its URL nor its response
+/// body says: a conditional DELETE's 204 has no body and its URL carries
+/// criteria, not an id.
+struct AuditTarget {
+    resource_type: String,
+    id: String,
+    patient_reference: Option<String>,
+}
+
+impl AuditTarget {
+    fn from_stored(stored: &helios_persistence::types::StoredResource) -> Self {
+        Self {
+            resource_type: stored.resource_type().to_string(),
+            id: stored.id().to_string(),
+            patient_reference: extract_patient_from_resource(
+                stored.resource_type(),
+                stored.content(),
+            ),
+        }
+    }
+}
+
+/// Percent-decodes a bundle entry's conditional criteria into the `k=v&k=v`
+/// form `ConditionalStorage` takes, keeping repeated keys and their order.
+///
+/// A decoded value that itself contains `&` or `=` cannot survive the re-join;
+/// the resource endpoints share that limit, since they re-join axum's decoded
+/// pairs the same way (`conditional_update_handler`).
+fn normalize_criteria(raw: &str) -> String {
+    crate::extractors::query_pairs::parse_query_pairs(Some(raw))
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 fn admit_bundle_mutation(
     method: &BundleMethod,
     resource_type: &str,
@@ -1137,6 +1371,7 @@ fn emit_batch_entry_audit<S>(
     state: &AppState<S>,
     entry: &Value,
     result: &BundleEntryResult,
+    audit_target: Option<&AuditTarget>,
     principal: Option<&Principal>,
     rollback_reason: Option<&str>,
     correlation: Option<&EntryAuditCorrelation>,
@@ -1156,6 +1391,7 @@ fn emit_batch_entry_audit<S>(
         url,
         request_resource,
         result,
+        audit_target,
         principal,
         rollback_reason,
         correlation,
@@ -1179,6 +1415,7 @@ fn emit_transaction_entry_audit<S>(
         &entry.url,
         entry.resource.as_ref(),
         result,
+        None,
         principal,
         rollback_reason,
         correlation,
@@ -1193,6 +1430,7 @@ fn emit_entry_audit<S>(
     url: &str,
     request_resource: Option<&Value>,
     result: &BundleEntryResult,
+    audit_target: Option<&AuditTarget>,
     principal: Option<&Principal>,
     rollback_reason: Option<&str>,
     correlation: Option<&EntryAuditCorrelation>,
@@ -1226,6 +1464,13 @@ fn emit_entry_audit<S>(
         if let Some(id) = resource.get("id").and_then(|v| v.as_str()) {
             resource_id = Some(id.to_string());
         }
+    }
+
+    // An explicit target wins: it exists precisely because the URL and the
+    // body name nothing (conditional DELETE).
+    if let Some(target) = audit_target {
+        resource_type = target.resource_type.clone();
+        resource_id = Some(target.id.clone());
     }
 
     let patient_ref = result
@@ -1270,7 +1515,9 @@ fn emit_entry_audit<S>(
             .detail("entry-index", correlation.entry_index.to_string());
     }
 
-    if let Some(patient_ref) = patient_ref {
+    if let Some(patient_ref) =
+        patient_ref.or_else(|| audit_target.and_then(|t| t.patient_reference.clone()))
+    {
         builder = builder.patient(patient_ref);
     }
     if let Some(principal) = principal {
@@ -1327,8 +1574,8 @@ fn extract_outcome_description(outcome: Option<&Value>) -> Option<String> {
 /// `[type]/?[criteria]` form that `http.html` prints for conditional delete both
 /// reduce to the type alone instead of producing an empty id.
 ///
-/// The query itself is deliberately not returned. Callers refuse conditional
-/// entries via [`conditional_criteria`]; resolving them is #511.
+/// The query itself is deliberately not returned. Callers recover conditional
+/// criteria via [`conditional_criteria`] and resolve them separately (#511).
 fn parse_request_url(url: &str) -> Result<(String, String), String> {
     let path = url.split_once('?').map_or(url, |(path, _)| path);
     let mut segments = path.split('/').filter(|segment| !segment.is_empty());
@@ -2469,12 +2716,14 @@ mod tests {
             &result_1,
             None,
             None,
+            None,
             Some(&correlation_0),
         );
         emit_batch_entry_audit(
             &state,
             &entry_2,
             &result_2,
+            None,
             None,
             None,
             Some(&correlation_1),
@@ -2532,6 +2781,26 @@ mod tests {
         reverse_of: Option<usize>,
         in_flight: AtomicUsize,
         peak_in_flight: AtomicUsize,
+        /// What every `ConditionalStorage` call answers with (#511). The
+        /// default panics, so a test that reaches conditional storage without
+        /// scripting it fails loudly rather than exercising a stub.
+        conditional_reply: ConditionalReply,
+        /// Every `ConditionalStorage` call, as `(operation, resource type,
+        /// criteria exactly as received)`.
+        conditional_calls: std::sync::Mutex<Vec<(&'static str, String, String)>>,
+    }
+
+    /// The scripted outcome of a conditional call on [`DelayStorage`].
+    #[derive(Clone, Copy)]
+    enum ConditionalReply {
+        Unscripted,
+        Created,
+        Updated,
+        Exists,
+        NoMatch,
+        Deleted,
+        MultipleMatches(usize),
+        Unsupported,
     }
 
     impl DelayStorage {
@@ -2542,7 +2811,53 @@ mod tests {
                 reverse_of: None,
                 in_flight: AtomicUsize::new(0),
                 peak_in_flight: AtomicUsize::new(0),
+                conditional_reply: ConditionalReply::Unscripted,
+                conditional_calls: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn conditional(reply: ConditionalReply) -> Self {
+            Self {
+                conditional_reply: reply,
+                ..Self::new(8, 0)
+            }
+        }
+
+        fn conditional_calls(&self) -> Vec<(&'static str, String, String)> {
+            self.conditional_calls.lock().unwrap().clone()
+        }
+
+        fn record_conditional(&self, op: &'static str, resource_type: &str, criteria: &str) {
+            self.conditional_calls.lock().unwrap().push((
+                op,
+                resource_type.to_string(),
+                criteria.to_string(),
+            ));
+        }
+
+        /// The resource a scripted reply hands back: the one the criteria
+        /// "matched", under a fixed id so tests can assert locations.
+        fn existing(tenant: &TenantContext, resource_type: &str) -> StoredResource {
+            StoredResource::new(
+                resource_type,
+                "existing",
+                tenant.tenant_id().clone(),
+                serde_json::json!({
+                    "resourceType": resource_type,
+                    "id": "existing",
+                    "name": [{"family": "Existing"}]
+                }),
+                FhirVersion::default(),
+            )
+        }
+
+        fn unsupported(capability: &str) -> helios_persistence::error::StorageError {
+            helios_persistence::error::StorageError::Backend(
+                helios_persistence::error::BackendError::UnsupportedCapability {
+                    backend_name: "delay".to_string(),
+                    capability: capability.to_string(),
+                },
+            )
         }
 
         fn reversing(concurrency: usize, delay_ms: u64, total: usize) -> Self {
@@ -2700,6 +3015,102 @@ mod tests {
         }
     }
 
+    // #511 widened the bound to `ConditionalStorage`. Each call records what
+    // reached storage and answers with the scripted reply, so tests pin both
+    // the criteria the batch arm hands over and the status each outcome maps
+    // to, without a search index.
+    #[async_trait]
+    impl ConditionalStorage for DelayStorage {
+        async fn conditional_create(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            search_params: &str,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<ConditionalCreateResult> {
+            self.record_conditional("create", resource_type, search_params);
+            match self.conditional_reply {
+                ConditionalReply::Created => {
+                    Ok(ConditionalCreateResult::Created(StoredResource::new(
+                        resource_type,
+                        "created",
+                        tenant.tenant_id().clone(),
+                        resource,
+                        fhir_version,
+                    )))
+                }
+                ConditionalReply::Exists => Ok(ConditionalCreateResult::Exists(Self::existing(
+                    tenant,
+                    resource_type,
+                ))),
+                ConditionalReply::MultipleMatches(n) => {
+                    Ok(ConditionalCreateResult::MultipleMatches(n))
+                }
+                ConditionalReply::Unsupported => Err(Self::unsupported("conditional_create")),
+                _ => panic!("conditional_create is not scripted for this test"),
+            }
+        }
+
+        async fn conditional_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            search_params: &str,
+            upsert: bool,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<ConditionalUpdateResult> {
+            assert!(
+                upsert,
+                "the batch arm mirrors the resource endpoint: upsert"
+            );
+            self.record_conditional("update", resource_type, search_params);
+            match self.conditional_reply {
+                ConditionalReply::Updated => Ok(ConditionalUpdateResult::Updated(Self::existing(
+                    tenant,
+                    resource_type,
+                ))),
+                ConditionalReply::Created => {
+                    Ok(ConditionalUpdateResult::Created(StoredResource::new(
+                        resource_type,
+                        "created",
+                        tenant.tenant_id().clone(),
+                        resource,
+                        fhir_version,
+                    )))
+                }
+                ConditionalReply::NoMatch => Ok(ConditionalUpdateResult::NoMatch),
+                ConditionalReply::MultipleMatches(n) => {
+                    Ok(ConditionalUpdateResult::MultipleMatches(n))
+                }
+                ConditionalReply::Unsupported => Err(Self::unsupported("conditional_update")),
+                _ => panic!("conditional_update is not scripted for this test"),
+            }
+        }
+
+        async fn conditional_delete(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            search_params: &str,
+        ) -> StorageResult<ConditionalDeleteResult> {
+            self.record_conditional("delete", resource_type, search_params);
+            match self.conditional_reply {
+                ConditionalReply::Deleted => Ok(ConditionalDeleteResult::Deleted(Self::existing(
+                    tenant,
+                    resource_type,
+                ))),
+                ConditionalReply::NoMatch => Ok(ConditionalDeleteResult::NoMatch),
+                ConditionalReply::MultipleMatches(n) => {
+                    Ok(ConditionalDeleteResult::MultipleMatches(n))
+                }
+                ConditionalReply::Unsupported => Err(Self::unsupported("conditional_delete")),
+                _ => panic!("conditional_delete is not scripted for this test"),
+            }
+        }
+    }
+
     /// A batch Bundle of `count` GET entries, targeting `Patient/p0..p{count}`.
     fn get_bundle(count: usize) -> Value {
         let entries: Vec<Value> = (0..count)
@@ -2722,7 +3133,13 @@ mod tests {
         principal: Option<&Principal>,
     ) -> Value
     where
-        S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
+        S: ResourceStorage
+            + SearchProvider
+            + IncludeProvider
+            + RevincludeProvider
+            + ConditionalStorage
+            + Send
+            + Sync,
     {
         let tenant = TenantExtractor::new("test-tenant", crate::tenant::TenantSource::Default);
         let response = process_batch(
@@ -2878,11 +3295,8 @@ mod tests {
         })];
         assert_eq!(batch_concurrency(&state, &url_only), 1);
 
-        // Since #503 the parse strips the query, so a conditional conformance
-        // URL is caught here where it silently was not before. Such an entry is
-        // refused before it writes, which makes this clamp conservative — but
-        // the scan and the write must not disagree, which is what it is keyed
-        // for.
+        // A conditional conformance write is caught twice over: as a
+        // StructureDefinition write and as a conditional entry (#511).
         let conditional = [serde_json::json!({
             "request": { "method": "PUT", "url": "StructureDefinition?url=http://example.org/sd" },
             "resource": { "resourceType": "StructureDefinition" }
@@ -3152,11 +3566,13 @@ mod tests {
 
     /// A conditional write is refused per-entry and never reaches storage.
     ///
-    /// `DelayStorage::create_or_update` and `::delete` are `unimplemented!()`,
-    /// so this panics rather than merely failing if a refusal is ever moved
-    /// after dispatch.
+    /// What is still refused after #511: criteria on a POST (FHIR expresses a
+    /// conditional create through `ifNoneExist`), and `ifMatch` paired with any
+    /// conditional interaction. `DelayStorage`'s conditional reply is
+    /// unscripted, so this panics rather than merely failing if a refusal is
+    /// ever moved after dispatch.
     #[tokio::test]
-    async fn conditional_write_entries_are_refused_before_they_reach_storage() {
+    async fn conditional_entries_that_fhir_leaves_undefined_are_refused_before_storage() {
         let state = state_with(DelayStorage::new(8, 0));
 
         let bundle = serde_json::json!({
@@ -3164,12 +3580,35 @@ mod tests {
             "type": "batch",
             "entry": [
                 {
-                    "request": { "method": "PUT", "url": "Patient?identifier=http://example.org|1" },
+                    "request": { "method": "POST", "url": "Patient?identifier=x" },
                     "resource": { "resourceType": "Patient" }
                 },
-                { "request": { "method": "DELETE", "url": "Patient?identifier=x" } },
                 {
-                    "request": { "method": "POST", "url": "Patient?identifier=x" },
+                    "request": {
+                        "method": "PUT",
+                        "url": "Patient?identifier=x",
+                        "ifMatch": "W/\"1\""
+                    },
+                    "resource": { "resourceType": "Patient" }
+                },
+                {
+                    "request": {
+                        "method": "DELETE",
+                        "url": "Patient?identifier=x",
+                        "ifMatch": "W/\"1\""
+                    }
+                },
+                {
+                    "request": {
+                        "method": "POST",
+                        "url": "Patient",
+                        "ifNoneExist": "identifier=x",
+                        "ifMatch": "W/\"1\""
+                    },
+                    "resource": { "resourceType": "Patient" }
+                },
+                {
+                    "request": { "method": "PUT", "url": "Patient?&" },
                     "resource": { "resourceType": "Patient" }
                 },
             ]
@@ -3177,7 +3616,7 @@ mod tests {
 
         let response = run_batch(&state, &bundle, None).await;
         let entries = response["entry"].as_array().unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 5);
         for (index, entry) in entries.iter().enumerate() {
             assert_eq!(
                 entry["response"]["status"], "400 Bad Request",
@@ -3185,6 +3624,210 @@ mod tests {
             );
         }
         assert_eq!(state.storage().peak(), 0, "no entry may reach storage");
+        assert!(state.storage().conditional_calls().is_empty());
+    }
+
+    /// A conditional PUT hands the backend percent-decoded criteria with
+    /// repeated keys intact, and maps each `ConditionalUpdateResult` the way
+    /// `conditional_update_handler` maps it (#511).
+    #[tokio::test]
+    async fn conditional_put_decodes_criteria_and_maps_update_results() {
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{
+                "request": {
+                    "method": "PUT",
+                    "url": "Patient?identifier=http%3A%2F%2Fexample.org%7C123&identifier=x"
+                },
+                "resource": { "resourceType": "Patient" }
+            }]
+        });
+
+        let state = state_with(DelayStorage::conditional(ConditionalReply::Updated));
+        let response = run_batch(&state, &bundle, None).await;
+        assert_eq!(
+            state.storage().conditional_calls(),
+            vec![(
+                "update",
+                "Patient".to_string(),
+                "identifier=http://example.org|123&identifier=x".to_string()
+            )]
+        );
+        let entry = &response["entry"][0];
+        assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
+        assert_eq!(entry["response"]["location"], "Patient/existing");
+        assert_eq!(entry["resource"]["id"], "existing");
+
+        let state = state_with(DelayStorage::conditional(ConditionalReply::Created));
+        let response = run_batch(&state, &bundle, None).await;
+        let entry = &response["entry"][0];
+        assert_eq!(entry["response"]["status"], "201 Created", "{entry}");
+        assert_eq!(entry["response"]["location"], "Patient/created/_history/1");
+
+        let state = state_with(DelayStorage::conditional(
+            ConditionalReply::MultipleMatches(2),
+        ));
+        let response = run_batch(&state, &bundle, None).await;
+        let entry = &response["entry"][0];
+        assert_eq!(
+            entry["response"]["status"], "412 Precondition Failed",
+            "{entry}"
+        );
+        assert!(entry["resource"].is_null());
+        assert!(
+            entry["response"]["outcome"]
+                .to_string()
+                .contains("matched 2"),
+            "{entry}"
+        );
+    }
+
+    /// A conditional DELETE answers 204 with no body for both a deletion and
+    /// no match, and 412 for several matches (#511).
+    #[tokio::test]
+    async fn conditional_delete_maps_results() {
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{ "request": { "method": "DELETE", "url": "Patient?identifier=x" } }]
+        });
+
+        for reply in [ConditionalReply::Deleted, ConditionalReply::NoMatch] {
+            let state = state_with(DelayStorage::conditional(reply));
+            let response = run_batch(&state, &bundle, None).await;
+            let entry = &response["entry"][0];
+            assert_eq!(entry["response"]["status"], "204 No Content", "{entry}");
+            assert!(
+                entry.get("resource").is_none(),
+                "a 204 carries no body: {entry}"
+            );
+            assert_eq!(
+                state.storage().conditional_calls(),
+                vec![("delete", "Patient".to_string(), "identifier=x".to_string())]
+            );
+        }
+
+        let state = state_with(DelayStorage::conditional(
+            ConditionalReply::MultipleMatches(3),
+        ));
+        let response = run_batch(&state, &bundle, None).await;
+        assert_eq!(
+            response["entry"][0]["response"]["status"], "412 Precondition Failed",
+            "{}",
+            response["entry"][0]
+        );
+    }
+
+    /// `ifNoneExist` reaches storage verbatim — it is a query string by
+    /// definition, as the resource endpoint's `If-None-Exist` header is — and a
+    /// match answers 200 with the match's location (#511).
+    #[tokio::test]
+    async fn post_with_if_none_exist_is_passed_verbatim_and_maps_create_results() {
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{
+                "request": {
+                    "method": "POST",
+                    "url": "Patient",
+                    "ifNoneExist": "identifier=http%3A%2F%2Fexample.org|1"
+                },
+                "resource": { "resourceType": "Patient" }
+            }]
+        });
+
+        let state = state_with(DelayStorage::conditional(ConditionalReply::Exists));
+        let response = run_batch(&state, &bundle, None).await;
+        assert_eq!(
+            state.storage().conditional_calls(),
+            vec![(
+                "create",
+                "Patient".to_string(),
+                "identifier=http%3A%2F%2Fexample.org|1".to_string()
+            )]
+        );
+        let entry = &response["entry"][0];
+        assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
+        assert_eq!(entry["response"]["location"], "Patient/existing/_history/1");
+
+        let state = state_with(DelayStorage::conditional(ConditionalReply::Created));
+        let response = run_batch(&state, &bundle, None).await;
+        assert_eq!(response["entry"][0]["response"]["status"], "201 Created");
+
+        let state = state_with(DelayStorage::conditional(
+            ConditionalReply::MultipleMatches(2),
+        ));
+        let response = run_batch(&state, &bundle, None).await;
+        assert_eq!(
+            response["entry"][0]["response"]["status"],
+            "412 Precondition Failed"
+        );
+    }
+
+    /// A backend whose `ConditionalStorage` is a stub (S3) answers 501 per
+    /// entry, through the same error funnel every other storage error takes.
+    #[tokio::test]
+    async fn unsupported_conditional_storage_is_reported_as_501_per_entry() {
+        let state = state_with(DelayStorage::conditional(ConditionalReply::Unsupported));
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                {
+                    "request": { "method": "PUT", "url": "Patient?identifier=x" },
+                    "resource": { "resourceType": "Patient" }
+                },
+                { "request": { "method": "DELETE", "url": "Patient?identifier=x" } },
+                {
+                    "request": { "method": "POST", "url": "Patient", "ifNoneExist": "identifier=x" },
+                    "resource": { "resourceType": "Patient" }
+                },
+            ]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        for (index, entry) in response["entry"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(
+                entry["response"]["status"], "501 Not Implemented",
+                "entry {index}: {entry}"
+            );
+        }
+    }
+
+    /// Conditional entries are read-then-write in the backend, so a bundle
+    /// carrying one runs serially (#511).
+    #[test]
+    fn batch_concurrency_is_one_when_an_entry_is_conditional() {
+        let state = state_with(DelayStorage::new(32, 0));
+
+        let conditional_put = [serde_json::json!({
+            "request": { "method": "PUT", "url": "Patient?identifier=x" },
+            "resource": { "resourceType": "Patient" }
+        })];
+        assert_eq!(batch_concurrency(&state, &conditional_put), 1);
+
+        let conditional_delete = [serde_json::json!({
+            "request": { "method": "DELETE", "url": "Patient?identifier=x" }
+        })];
+        assert_eq!(batch_concurrency(&state, &conditional_delete), 1);
+
+        let if_none_exist = [serde_json::json!({
+            "request": { "method": "POST", "url": "Patient", "ifNoneExist": "identifier=x" },
+            "resource": { "resourceType": "Patient" }
+        })];
+        assert_eq!(batch_concurrency(&state, &if_none_exist), 1);
+
+        // A GET with a query is a search, not a condition; an instance URL
+        // with a control parameter is not conditional either.
+        let not_conditional = [
+            serde_json::json!({ "request": { "method": "GET", "url": "Patient?name=x" } }),
+            serde_json::json!({ "request": { "method": "GET", "url": "Patient/p1?_format=json" } }),
+        ];
+        assert_eq!(
+            batch_concurrency(&state, &not_conditional),
+            batch_concurrency(&state, &[])
+        );
     }
 
     /// A type-level URL with no criteria names no instance. Left to fall

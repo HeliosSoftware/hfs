@@ -610,6 +610,7 @@ bulk-import-detail-created = Created
 bulk-import-detail-status = Status
 bulk-import-detail-auth = Authentication
 bulk-import-abort = Abort
+bulk-import-mark-completed = Mark completed
 bulk-import-delete = Delete
 bulk-import-edit = Edit
 bulk-import-edit-title = Edit Submission
@@ -696,16 +697,16 @@ bulk-export-scope-group-hint = Just the members of a cohort you've already defin
 bulk-export-field-group-id = Group ID
 bulk-export-field-group-id-hint = Required for the Group scope: the id of the FHIR Group to export.
 bulk-export-field-patients = Patients
-bulk-export-field-patients-placeholder = Search name, surname, or exact FHIR ID
-bulk-export-field-patients-hint = Search by the beginning of a given name or family name, or enter an exact logical FHIR ID such as Patient/p-104. Leave empty to export every patient.
-bulk-export-field-patients-fallback-placeholder = Patient/p-104, Patient/p-205
+bulk-export-field-patients-placeholder = Search patients
+bulk-export-field-patients-hint = Search by name, surname or exact identifier. Leave empty to export every patient.
+bulk-export-field-patients-fallback-placeholder = Patient FHIR IDs
 bulk-export-field-patients-fallback-hint = Enter exact logical FHIR IDs separated by commas or new lines. Leave empty to export every patient.
-bulk-export-field-patients-id-only-hint = Search by exact logical FHIR ID, such as Patient/p-104. Leave empty to export every patient.
-bulk-export-field-patients-id-only-placeholder = Search exact FHIR ID
+bulk-export-field-patients-id-only-hint = Search by exact FHIR ID. Leave empty to export every patient.
 bulk-export-patient-options-empty = No matching patients found.
 bulk-export-patient-invalid = Enter only valid logical Patient IDs, separated by commas or new lines.
 bulk-export-field-name = Name
 bulk-export-field-name-placeholder = Diabetes registry 2024
+bulk-export-name-required = Enter a name for this export.
 bulk-export-types = Resource types
 bulk-export-all-resources = All Resources
 bulk-export-narrow = Narrow it down
@@ -718,7 +719,7 @@ bulk-export-since-week = Last 7 days
 bulk-export-since-month = Last 4 weeks
 bulk-export-since-custom = Custom
 bulk-export-field-since-custom = Custom instant
-bulk-export-field-since-custom-hint = Used when Since is Custom. RFC 3339, e.g. 2026-08-01T00:00:00Z.
+bulk-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
 bulk-export-field-until = Until
 bulk-export-field-until-hint = Optional upper bound. RFC 3339, e.g. 2026-08-01T00:00:00Z.
 bulk-export-window-since = Since
@@ -800,6 +801,7 @@ sql-views-lede = Reusable SQL views layered over ViewDefinitions.
 
 sql-export-title = SQL Export
 sql-export-lede = Long-running SQL on FHIR export jobs.
+sql-export-active-title = SQL Exports
 
 sql-files-title = Files
 sql-files-lede = Manifests and output files produced by SQL exports.
@@ -810,6 +812,7 @@ vd-new = Create New
 vd-new-title = New View Definition
 vd-rail-label = View definitions
 vd-rail-heading = View Definitions
+vd-rail-all-heading = All View Definitions
 vd-filter = Filter views
 vd-none = No view definitions yet.
 vd-empty-lede = Create your first ViewDefinition with Create New.
@@ -823,8 +826,15 @@ vd-delete = Delete
 vd-delete-confirm = Delete view definition "{ $name }"? This cannot be undone.
 vd-delete-failed = Could not delete the view definition.
 vd-json-heading = Definition (JSON)
+vd-run-hint = Runs as you type — results follow the current definition, saved or not
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
+# #752 ticket 01: the $sql-run preview's row/duration meta, shared by the
+# page's own render and the `/run` fragment endpoint.
+vd-results-meta = { $rows } rows · { $ms } ms
+# #752 ticket 01: the results meta after a failed run — the previous table
+# stays on screen, relabelled.
+vd-results-stale = last successful run
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next
@@ -833,6 +843,8 @@ vd-page-next = Next
 
 sql-queries-new-title = New SQL Query
 sql-views-new-title = New SQL View
+sql-queries-rail-all-heading = All SQL Queries
+sql-views-rail-all-heading = All SQL Views
 lib-filter = Filter libraries
 lib-none = No libraries yet.
 lib-empty-lede = Create your first library with Create New.
@@ -841,24 +853,67 @@ lib-sql-heading = SQL
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
 
-## SQL Export and Files pages (#649)
+## SQL Export and Files pages (#649, #833)
 
 export-start-failed = Could not start the export.
-export-started = Export started.
-export-cancelled = Cancellation requested.
-export-job-heading = Export Job
 export-job-id = Job id
-export-job-state = State
-export-state-running = Running
-export-state-done = Finished
-export-state-unknown = This job is unknown — it may have been cancelled or reclaimed.
-export-refresh = Refresh
-export-cancel = Cancel Job
-export-view-files = View Files
 export-new-heading = New Export
 export-no-subjects = Nothing to export yet — create a ViewDefinition first.
 export-format = Output format
 export-start = Start Export
+
+## Active SQL Exports list and job cards (#833)
+
+sql-export-new = New SQL Export
+sql-export-unavailable = The storage backend does not host the settings store, so SQL export jobs cannot be tracked.
+sql-export-none = No SQL exports yet. Use New SQL Export to start one.
+sql-export-store-error = The export started, but could not be added to this list. Job id:
+sql-export-exports-word = exports
+sql-export-running = running
+sql-export-select-subject = Select at least one subject.
+sql-export-unknown-subject = One or more selected subjects are no longer available. Refresh the page and try again.
+sql-export-cancelled-reason = the server no longer knows this job
+sql-export-status-in-progress = In progress
+sql-export-status-complete = Complete
+sql-export-status-failed = Failed
+sql-export-status-cancelled = Cancelled
+sql-export-view-files = View files
+sql-export-cancel = Cancel
+sql-export-retry = Retry
+sql-export-run-again = Run again
+sql-export-remove = Remove from list
+sql-export-more-actions = More actions
+sql-export-copy-job-id = Copy job id
+sql-export-copied = Copied
+sql-export-progress-waiting = Waiting for the first status report…
+sql-export-started = started
+sql-export-finished-in = finished in
+sql-export-cancelled-at = cancelled at
+sql-export-status-unavailable = status unavailable
+sql-export-format-ndjson = NDJSON
+sql-export-format-csv = CSV
+sql-export-format-json = JSON
+sql-export-format-parquet = Parquet
+sql-export-subjects-count = { $count ->
+    [one] { $count } subject
+   *[other] { $count } subjects
+}
+sql-export-kind-view-definition = { $count ->
+    [one] { $count } ViewDefinition
+   *[other] { $count } ViewDefinitions
+}
+sql-export-kind-sql-query = { $count ->
+    [one] { $count } SQL Query
+   *[other] { $count } SQL Queries
+}
+sql-export-kind-sql-view = { $count ->
+    [one] { $count } SQL View
+   *[other] { $count } SQL Views
+}
+sql-export-files-count = { $count ->
+    [one] { $count } file
+   *[other] { $count } files
+}
 files-job-heading = Export Job
 files-load = Load Manifest
 files-error = Could not load the manifest.
@@ -1034,6 +1089,7 @@ hts-cs-validate-heading = Validate a code
 hts-cs-validate-mode-legend = Input mode
 hts-cs-validate-mode-code = Bare code
 hts-cs-validate-mode-coding = Coding
+hts-cs-validate-code-legend = Bare code
 hts-cs-validate-code = Code
 hts-cs-validate-display = Display
 hts-cs-validate-coding-legend = Coding
@@ -1060,6 +1116,8 @@ hts-cs-subsumes-outcome-not-subsumed = Neither code subsumes the other.
 hts-workbench-run = Run
 hts-workbench-raw-response = Raw request and response
 hts-workbench-copy-url = Request URL
+hts-workbench-request-body = Request body
+hts-workbench-response-body = Response body
 
 ## Additional degraded reason for CS-read 404s (design doc §7.3 states matrix).
 
@@ -1473,8 +1531,6 @@ hts-capability-closure = Closure maintenance
 hts-capability-code-systems-declared = Code systems declared
 hts-capability-flag-true = Yes
 hts-capability-flag-false = No
-hts-capability-raw-truncated = Truncated to the first { $shown } of { $total } bytes — this server's statement grows with the code systems it loads.
-hts-capability-raw-full = View the complete statement
 
 # Home V3 tile sub-lines. The mockup folds Backend, FHIR version,
 # Bundled data and Avg latency into the sub-line of the tile each

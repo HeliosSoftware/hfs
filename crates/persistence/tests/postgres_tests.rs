@@ -4567,6 +4567,186 @@ mod postgres_integration {
         }
     }
 
+    fn if_none_exist_entry(family: &str, full_url: &str) -> helios_persistence::core::BundleEntry {
+        use helios_persistence::core::{BundleEntry, BundleMethod};
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-COND-1"}],
+                "name": [{"family": family}]
+            })),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: Some("identifier=http://example.org/mrn|MRN-TX-COND-1".to_string()),
+            full_url: Some(full_url.to_string()),
+        }
+    }
+
+    /// `ifNoneExist` is resolved inside the transaction (#511): the same bundle
+    /// twice answers 201 then 200, the 200 names the match, and one row exists.
+    /// Two entries with the same criteria in one bundle see each other, since
+    /// buffered creates are flushed before the search.
+    #[tokio::test]
+    async fn postgres_integration_transaction_if_none_exist_is_idempotent() {
+        use helios_persistence::core::BundleProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tx-if-none-exist");
+
+        let first = backend
+            .process_transaction(
+                &tenant,
+                vec![if_none_exist_entry("First", "urn:uuid:first")],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.entries[0].status, 201);
+
+        let second = backend
+            .process_transaction(
+                &tenant,
+                vec![if_none_exist_entry("Second", "urn:uuid:second")],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.entries[0].status, 200,
+            "the match is answered, not duplicated"
+        );
+        assert_eq!(second.entries[0].location, first.entries[0].location);
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+
+        let tenant = create_tenant("tx-if-none-exist-same-bundle");
+        let both = backend
+            .process_transaction(
+                &tenant,
+                vec![
+                    if_none_exist_entry("First", "urn:uuid:first"),
+                    if_none_exist_entry("Second", "urn:uuid:second"),
+                ],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(both.entries[0].status, 201);
+        assert_eq!(both.entries[1].status, 200);
+        assert_eq!(both.entries[1].location, both.entries[0].location);
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    }
+
+    /// A `urn:uuid` reference to a matched `ifNoneExist` entry resolves to the
+    /// match (R4 §3.1.0.11.2); several matches fail the entry with 412 and roll
+    /// the bundle back.
+    #[tokio::test]
+    async fn postgres_integration_transaction_if_none_exist_resolves_references_and_rejects_ambiguity()
+     {
+        use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider};
+        use helios_persistence::error::TransactionError;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tx-if-none-exist-urn");
+
+        let existing = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-COND-1"}],
+                    "name": [{"family": "AlreadyThere"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let result = backend
+            .process_transaction(
+                &tenant,
+                vec![
+                    if_none_exist_entry("Duplicate", "urn:uuid:patient"),
+                    BundleEntry {
+                        method: BundleMethod::Post,
+                        url: "Observation".to_string(),
+                        resource: Some(json!({
+                            "resourceType": "Observation",
+                            "status": "final",
+                            "code": {"text": "test"},
+                            "subject": {"reference": "urn:uuid:patient"}
+                        })),
+                        if_match: None,
+                        if_none_match: None,
+                        if_none_exist: None,
+                        full_url: Some("urn:uuid:observation".to_string()),
+                    },
+                ],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].status, 200);
+        assert_eq!(result.entries[1].status, 201);
+        let observation = result.entries[1].resource.as_ref().expect("created");
+        assert_eq!(
+            observation["subject"]["reference"],
+            json!(format!("Patient/{}", existing.id()))
+        );
+
+        // A second identical patient makes the criteria ambiguous.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-COND-1"}],
+                    "name": [{"family": "Twin"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let before = backend.count(&tenant, Some("Patient")).await.unwrap();
+
+        let err = backend
+            .process_transaction(
+                &tenant,
+                vec![
+                    BundleEntry {
+                        method: BundleMethod::Post,
+                        url: "Patient".to_string(),
+                        resource: Some(
+                            json!({"resourceType": "Patient", "name": [{"family": "Plain"}]}),
+                        ),
+                        if_match: None,
+                        if_none_match: None,
+                        if_none_exist: None,
+                        full_url: None,
+                    },
+                    if_none_exist_entry("Ambiguous", "urn:uuid:ambiguous"),
+                ],
+                FhirVersion::default(),
+            )
+            .await
+            .expect_err("an ambiguous ifNoneExist must fail the bundle");
+        match err {
+            TransactionError::BundleError { index, message } => {
+                assert_eq!(index, 1);
+                assert!(message.contains("412"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            backend.count(&tenant, Some("Patient")).await.unwrap(),
+            before,
+            "the plain create in entry 0 must have been rolled back"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_conditional_delete() {
         use helios_persistence::core::{
@@ -4602,7 +4782,7 @@ mod postgres_integration {
             .unwrap();
 
         assert!(
-            matches!(result, ConditionalDeleteResult::Deleted),
+            matches!(result, ConditionalDeleteResult::Deleted(_)),
             "Conditional delete should find and delete resource"
         );
 
@@ -5703,6 +5883,136 @@ mod postgres_integration {
             stored.content()["gender"],
             json!("female"),
             "merge must retain elements the submission omitted"
+        );
+    }
+
+    /// #872: the batched ingest commits entry writes, rollback records, and
+    /// per-line receipts together, and a failing entry is contained to its
+    /// savepoint — on Postgres a failed statement aborts the transaction, so
+    /// without the savepoint one bad entry would poison the whole batch.
+    #[tokio::test]
+    async fn postgres_bulk_submit_batch_commits_bookkeeping_and_contains_errors() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
+            SubmissionId,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_batch");
+        let sub_id = SubmissionId::generate("pg-batch-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/b.json"), None)
+            .await
+            .unwrap();
+        // Move the manifest out of `pending` right away: the test binary
+        // shares one container database, and a concurrently running test that
+        // calls claim_next_manifest would otherwise claim this one (the claim
+        // queue is cross-tenant by design).
+        backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                Vec::new(),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        // An existing resource for the update path, and a soft-deleted id
+        // whose create fails with AlreadyExists inside the batch.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-upd","name":[{"family":"Old"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-gone"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", "pg-batch-gone")
+            .await
+            .unwrap();
+
+        let entries = vec![
+            NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-new","name":[{"family":"BatchNew"}]}),
+            ),
+            NdjsonEntry::new(
+                2,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-gone"}),
+            ),
+            NdjsonEntry::new(
+                3,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-upd","name":[{"family":"BatchUpd"}]}),
+            ),
+        ];
+        let results = backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                entries,
+                &BulkProcessingOptions::new().with_file_url("https://provider/p.ndjson"),
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].is_success() && results[0].created);
+        assert!(
+            results[1].is_error(),
+            "the soft-deleted id must fail its entry, got {:?}",
+            results[1]
+        );
+        assert!(results[2].is_success() && !results[2].created);
+
+        // The failed entry did not poison the batch: both writes committed,
+        // together with their receipts and rollback records.
+        assert!(
+            backend
+                .read(&tenant, "Patient", "pg-batch-new")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let updated = backend
+            .read(&tenant, "Patient", "pg-batch-upd")
+            .await
+            .unwrap()
+            .expect("updated patient");
+        assert_eq!(updated.content()["name"], json!([{"family":"BatchUpd"}]));
+
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.success, 2);
+        assert_eq!(counts.processing_error, 1);
+
+        let changes = backend.list_changes(&tenant, &sub_id, 10, 0).await.unwrap();
+        assert_eq!(
+            changes.len(),
+            2,
+            "one rollback record per successful write, none for the failed entry"
         );
     }
 

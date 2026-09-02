@@ -7,8 +7,10 @@
   Facts collapse into the page head as a `.facets.facets--bare` chip row
   (version / status / group count / publisher) plus the canonical URL in a
   `.detail__field--wide`; the full fact set — including the source/target
-  URIs — lives in a collapsed bare `<details>` disclosure inside a `.card`
-  so the Translate workbench starts high on the page.
+  URIs — lives in a collapsed fold inside a `.card` so the Translate
+  workbench starts high on the page. The fold uses HFS's shared
+  `.disclosure` / `.disclosure__summary` pattern (chevron icon included),
+  so it reads as clickable instead of as an inert label.
 
   Zero new CSS — see the guard test in tests/concept_maps.rs.
 -#}
@@ -89,8 +91,11 @@
     </header>
 
     <section class="card panel" style="margin-bottom:16px">
-      <details>
-        <summary class="field__label">{{ chrome.i18n.t("hts-cm-detail-facts-summary") }}</summary>
+      <details class="disclosure">
+        <summary class="disclosure__summary">
+          <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
+          {{ chrome.i18n.t("hts-cm-detail-facts-summary") }}
+        </summary>
         <div class="kv-grid" style="margin:14px 0 0">
           <div class="detail__field detail__field--wide">
             <span>{{ chrome.i18n.t("hts-detail-canonical-url") }}</span>

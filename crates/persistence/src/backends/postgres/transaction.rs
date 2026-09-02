@@ -163,10 +163,63 @@ impl PostgresTransaction {
         })
     }
 
-    fn client(&self) -> StorageResult<&Client> {
+    pub(crate) fn client(&self) -> StorageResult<&Client> {
         self.client
             .as_ref()
             .ok_or_else(|| StorageError::Transaction(TransactionError::InvalidTransaction))
+    }
+
+    /// The transaction's client, for sibling modules that batch their own
+    /// bookkeeping statements (rollback records, receipts) into the same
+    /// commit — see the bulk-submit batch ingest (#872).
+    pub(crate) fn raw_client(&self) -> StorageResult<&Client> {
+        self.client()
+    }
+
+    /// Opens a savepoint around one unit of work whose failure must not take
+    /// the transaction down with it — the bulk-submit batch ingest wraps each
+    /// entry in one (#872).
+    ///
+    /// Creates buffered before this point are sent first, so the savepoint
+    /// covers exactly the work that follows it: a later
+    /// [`rollback_to_savepoint`](Self::rollback_to_savepoint) can never
+    /// discard an earlier unit's rows, and a conflict among the earlier rows
+    /// is raised here, against the unit that produced them.
+    pub(crate) async fn savepoint(&mut self, name: &str) -> StorageResult<()> {
+        self.ensure_usable()?;
+        self.flush().await?;
+        self.client()?
+            .batch_execute(&format!("SAVEPOINT {name}"))
+            .await
+            .map_err(|e| internal_error(format!("savepoint: {e}")))
+    }
+
+    /// Releases a savepoint, sending the creates buffered since it was opened
+    /// first — so a conflict among them is raised here, inside the savepoint
+    /// where the caller can roll it back, and not at commit.
+    pub(crate) async fn release_savepoint(&mut self, name: &str) -> StorageResult<()> {
+        self.flush().await?;
+        self.client()?
+            .batch_execute(&format!("RELEASE SAVEPOINT {name}"))
+            .await
+            .map_err(|e| internal_error(format!("release savepoint: {e}")))
+    }
+
+    /// Rolls back to a savepoint, dropping the creates buffered since it was
+    /// opened and clearing the conflict one of them may have raised.
+    ///
+    /// This is the one place a conflict is *not* fatal: `savepoint` flushed
+    /// everything older, so the batch that conflicted held only this unit's
+    /// creates, and the rollback undoes whatever part of it landed. The
+    /// transaction is back exactly where the savepoint was opened, and usable.
+    pub(crate) async fn rollback_to_savepoint(&mut self, name: &str) -> StorageResult<()> {
+        self.pending.clear();
+        self.pending_index_rows = 0;
+        self.conflict = None;
+        self.client()?
+            .batch_execute(&format!("ROLLBACK TO SAVEPOINT {name}"))
+            .await
+            .map_err(|e| internal_error(format!("rollback to savepoint: {e}")))
     }
 
     /// Index a resource for search within the transaction.
@@ -292,17 +345,20 @@ impl PostgresTransaction {
     ///
     /// `create` used to learn on the spot that its row conflicted, because it
     /// sent the insert itself. Buffered, it cannot: the conflict is discovered
-    /// when the batch lands. The two are equivalent for the only caller that
-    /// exists — a transaction bundle is all-or-nothing, so an entry that
-    /// conflicts rolls the whole bundle back either way, and the entry index is
-    /// preserved through [`DeferredConflict::ordinal`].
+    /// when the batch lands. The two are equivalent for a transaction bundle —
+    /// it is all-or-nothing, so an entry that conflicts rolls the whole bundle
+    /// back either way, and the entry index is preserved through
+    /// [`DeferredConflict::ordinal`].
     ///
-    /// They are *not* equivalent for a hypothetical caller that catches the
-    /// error and commits anyway: entries the unbatched path would never have
-    /// attempted are already inserted by the time the conflict is seen. So a
-    /// conflict poisons the transaction — [`Transaction::commit`] refuses and
-    /// rolls back instead. That is a deliberate loss of a capability nothing
-    /// uses, rather than a silent divergence.
+    /// They are *not* equivalent for a caller that catches the error and
+    /// commits anyway: entries the unbatched path would never have attempted
+    /// are already inserted by the time the conflict is seen. So a conflict
+    /// poisons the transaction — [`Transaction::commit`] refuses and rolls
+    /// back instead. The one caller that does contain per-entry failures, the
+    /// bulk-submit batch ingest, scopes each entry in a savepoint whose
+    /// [`rollback_to_savepoint`](Self::rollback_to_savepoint) undoes the
+    /// conflicting batch and lifts the poison — see `savepoint` for why that
+    /// batch can only ever hold the one entry's creates.
     pub(crate) async fn flush(&mut self) -> StorageResult<()> {
         if self.pending.is_empty() {
             return Ok(());

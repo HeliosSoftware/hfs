@@ -23,6 +23,9 @@
     <form method="post" action="/ui/bulk-import/{{ id }}/abort">
       <button type="submit" class="btn">{% include "icons/stop-circle.svg" %}{{ i18n.t("bulk-import-abort") }}</button>
     </form>
+    <form method="post" action="/ui/bulk-import/{{ id }}/complete">
+      <button type="submit" class="btn">{% include "icons/check-circle.svg" %}{{ i18n.t("bulk-import-mark-completed") }}</button>
+    </form>
   </div>
   {% endif %}
 </div>

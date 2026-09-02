@@ -29,10 +29,11 @@ use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
+use crate::raw_fold::RawFold;
 use crate::upstream::{
-    CodeSystemSummary, CsBrowserFilters, CsBrowserPage, LookupParams, LookupResult, OutcomeView,
-    SubsumesParams, SubsumesResult, UpstreamError, ValidateCodeParams, ValidateCodeResult,
-    ValidateInputMode,
+    CodeSystemSummary, CsBrowserFilters, CsBrowserPage, LookupParams, LookupResult, OpFailure,
+    OutcomeView, SubsumesParams, SubsumesResult, UpstreamError, ValidateCodeParams,
+    ValidateCodeResult, ValidateInputMode,
 };
 use crate::{Chrome, HtsUiState};
 
@@ -375,6 +376,13 @@ impl<'a> DetailPageTemplate<'a> {
     fn summary(&self) -> Option<&CodeSystemSummary> {
         self.detail.as_ref().ok()
     }
+
+    /// Validate input-mode echo for the Validate-input partial (#804).
+    /// `None` workbench (first GET of the tab) falls back to the `code`
+    /// default via `ValidateInputMode::default()`.
+    fn mode(&self) -> ValidateInputMode {
+        self.workbench.as_ref().map(|w| w.mode).unwrap_or_default()
+    }
 }
 
 /// Base detail URL — permanent-redirects to the default operation tab
@@ -488,8 +496,12 @@ pub struct WorkbenchResultView {
     /// through a wrapper struct — the doc-comment cost is smaller.
     #[allow(dead_code)]
     pub op: CsTab,
-    pub request_url: String,
-    pub raw_body: String,
+    /// The Validate input-mode the operator submitted. Echoed back so the
+    /// no-JS re-render keeps the same radio checked (#804); irrelevant to
+    /// the other two ops, which just carry the default.
+    pub mode: ValidateInputMode,
+    /// What went over the wire, for the "Raw request and response" fold.
+    pub raw: RawFold,
     pub lookup: Option<LookupResult>,
     pub validate: Option<ValidateCodeResult>,
     pub subsumes: Option<SubsumesResult>,
@@ -501,8 +513,8 @@ impl WorkbenchResultView {
     fn empty(op: CsTab) -> Self {
         Self {
             op,
-            request_url: String::new(),
-            raw_body: String::new(),
+            mode: ValidateInputMode::default(),
+            raw: RawFold::default(),
             lookup: None,
             validate: None,
             subsumes: None,
@@ -511,10 +523,13 @@ impl WorkbenchResultView {
         }
     }
 
-    fn from_error(op: CsTab, request_url: String, err: &UpstreamError) -> Self {
+    /// The view for a failed call. The exchange the proxy kept rides along, so
+    /// the raw fold shows the payload of the failure rather than going blank
+    /// on it (#803).
+    fn from_error(op: CsTab, failure: &OpFailure) -> Self {
         let mut view = Self::empty(op);
-        view.request_url = request_url;
-        match err {
+        view.raw = RawFold::from_exchange(&failure.exchange);
+        match &failure.error {
             UpstreamError::Outcome { outcome, .. } => view.outcome = Some((**outcome).clone()),
             UpstreamError::NotFound { .. } => {
                 view.outcome = Some(OutcomeView {
@@ -538,7 +553,7 @@ impl WorkbenchResultView {
             UpstreamError::Connect { .. }
             | UpstreamError::Timeout { .. }
             | UpstreamError::ClientBuild { .. } => {
-                view.degraded_reason = Some(err.degraded_reason());
+                view.degraded_reason = Some(failure.error.degraded_reason());
             }
             UpstreamError::Decode { message, .. } => {
                 view.outcome = Some(OutcomeView::invalid_input(message.clone()));
@@ -598,22 +613,15 @@ async fn lookup_run(
         match result {
             Ok(result) => WorkbenchResultView {
                 op: CsTab::Lookup,
-                request_url: result.request_url.clone(),
-                raw_body: result.raw_body.clone(),
+                mode: ValidateInputMode::default(),
+                raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
                 lookup: Some(result),
                 validate: None,
                 subsumes: None,
                 outcome: None,
                 degraded_reason: None,
             },
-            Err(err) => {
-                let request_url = if !canonical.is_empty() {
-                    format!("{}/CodeSystem/$lookup", state.upstream.base_url())
-                } else {
-                    format!("{}/CodeSystem/{}/$lookup", state.upstream.base_url(), id)
-                };
-                WorkbenchResultView::from_error(CsTab::Lookup, request_url, &err)
-            }
+            Err(err) => WorkbenchResultView::from_error(CsTab::Lookup, &err),
         }
     };
     respond_workbench(&state, chrome, id, CsTab::Lookup, view, is_htmx).await
@@ -638,6 +646,10 @@ async fn validate_run(
         coding_display: opt(&form, "coding.display"),
         display_language: opt(&form, "displayLanguage"),
     };
+    // `params` moves into `cs_validate_code` below; capture the submitted
+    // mode up front so every branch can echo it back into the re-rendered
+    // form (#804 — the no-JS path must keep the same radio checked).
+    let submitted_mode = params.mode;
     let chrome = Chrome {
         i18n: I18n::new(locale),
         active_page: "code-systems",
@@ -651,6 +663,7 @@ async fn validate_run(
     let canonical = cs.as_ref().map(|s| s.url.clone()).unwrap_or_default();
     let view = if canonical.is_empty() {
         WorkbenchResultView {
+            mode: submitted_mode,
             outcome: Some(OutcomeView::invalid_input(
                 "CodeSystem canonical url unavailable".to_string(),
             )),
@@ -658,6 +671,7 @@ async fn validate_run(
         }
     } else if matches!(params.mode, ValidateInputMode::Code) && params.code.trim().is_empty() {
         WorkbenchResultView {
+            mode: submitted_mode,
             outcome: Some(OutcomeView::invalid_input("code is required".to_string())),
             ..WorkbenchResultView::empty(CsTab::Validate)
         }
@@ -665,6 +679,7 @@ async fn validate_run(
         && (params.coding_code.trim().is_empty() || params.coding_system.trim().is_empty())
     {
         WorkbenchResultView {
+            mode: submitted_mode,
             outcome: Some(OutcomeView::invalid_input(
                 "coding.system and coding.code are required".to_string(),
             )),
@@ -674,8 +689,8 @@ async fn validate_run(
         match state.upstream.cs_validate_code(&canonical, params).await {
             Ok(result) => WorkbenchResultView {
                 op: CsTab::Validate,
-                request_url: result.request_url.clone(),
-                raw_body: result.raw_body.clone(),
+                mode: submitted_mode,
+                raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
                 lookup: None,
                 validate: Some(result),
                 subsumes: None,
@@ -683,9 +698,9 @@ async fn validate_run(
                 degraded_reason: None,
             },
             Err(err) => {
-                let request_url =
-                    format!("{}/CodeSystem/$validate-code", state.upstream.base_url());
-                WorkbenchResultView::from_error(CsTab::Validate, request_url, &err)
+                let mut view = WorkbenchResultView::from_error(CsTab::Validate, &err);
+                view.mode = submitted_mode;
+                view
             }
         }
     };
@@ -731,18 +746,15 @@ async fn subsumes_run(
         match state.upstream.cs_subsumes(&canonical, params).await {
             Ok(result) => WorkbenchResultView {
                 op: CsTab::Subsumes,
-                request_url: result.request_url.clone(),
-                raw_body: result.raw_body.clone(),
+                mode: ValidateInputMode::default(),
+                raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
                 lookup: None,
                 validate: None,
                 subsumes: Some(result),
                 outcome: None,
                 degraded_reason: None,
             },
-            Err(err) => {
-                let request_url = format!("{}/CodeSystem/$subsumes", state.upstream.base_url());
-                WorkbenchResultView::from_error(CsTab::Subsumes, request_url, &err)
-            }
+            Err(err) => WorkbenchResultView::from_error(CsTab::Subsumes, &err),
         }
     };
     respond_workbench(&state, chrome, id, CsTab::Subsumes, view, is_htmx).await
@@ -753,9 +765,12 @@ async fn respond_workbench<'a>(
     chrome: Chrome<'a>,
     id: String,
     tab: CsTab,
-    view: WorkbenchResultView,
+    mut view: WorkbenchResultView,
     is_htmx: bool,
 ) -> Response {
+    // Both response shapes render the same raw fold, so the payloads are
+    // highlighted once, here, where the request locale is in hand.
+    view.raw.highlight(&chrome.i18n);
     if is_htmx {
         return render(WorkbenchResultTemplate { chrome, view }.render());
     }

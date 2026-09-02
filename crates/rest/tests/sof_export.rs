@@ -2667,4 +2667,96 @@ mod sof_export_tests {
         let out: Value = resp.json();
         assert_eq!(out["resourceType"].as_str(), Some("OperationOutcome"));
     }
+
+    /// #833 SQL Export list-first, ticket 02 validation observation 3: the UI
+    /// builder lets a user check a ViewDefinition and a Library SQL Query in
+    /// the same job, sent as two `subject` parts named by `subjectReference`
+    /// (see crates/ui/src/conformance.rs's export_start). The manifest must
+    /// carry one `output` per subject, not collapse the mixture into one.
+    #[tokio::test]
+    async fn test_export_mixes_a_view_and_a_sqlquery_subject_in_one_manifest() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let vd_ref = seed_patient_flat_view(&backend).await;
+
+        let library = sql_library(
+            "SELECT patient_id, family FROM pt WHERE active = 1",
+            &vd_ref,
+            "pt",
+        );
+        backend
+            .create_or_update(
+                &test_tenant(),
+                "Library",
+                "demo-lib",
+                library,
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed library");
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subject", "part": [
+                    {"name": "name", "valueString": "patients_flat"},
+                    {"name": "subjectReference",
+                     "valueReference": {"reference": "ViewDefinition/patient-flat"}}
+                ]},
+                {"name": "subject", "part": [
+                    {"name": "name", "valueString": "active_families"},
+                    {"name": "subjectReference",
+                     "valueReference": {"reference": "Library/demo-lib"}}
+                ]}
+            ]
+        });
+
+        let submit_resp = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(
+            submit_resp.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            submit_resp.text()
+        );
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        let params = manifest["parameter"].as_array().unwrap();
+        let output_names: Vec<&str> = params
+            .iter()
+            .filter(|p| p["name"].as_str() == Some("output"))
+            .filter_map(|p| {
+                p["part"].as_array().and_then(|parts| {
+                    parts
+                        .iter()
+                        .find(|q| q["name"].as_str() == Some("name"))
+                        .and_then(|q| q["valueString"].as_str())
+                })
+            })
+            .collect();
+        assert_eq!(
+            output_names.len(),
+            2,
+            "expected one output per subject (one ViewDefinition, one SQL Query), got {output_names:?}"
+        );
+        assert!(
+            output_names.contains(&"patients_flat"),
+            "manifest missing the ViewDefinition output: {output_names:?}"
+        );
+        assert!(
+            output_names.contains(&"active_families"),
+            "manifest missing the SQL Query output: {output_names:?}"
+        );
+    }
 }

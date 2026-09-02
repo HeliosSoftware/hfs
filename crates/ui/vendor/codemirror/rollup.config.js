@@ -39,6 +39,7 @@ const BUNDLED_PACKAGES = [
   '@codemirror/lint',
   '@codemirror/search',
   '@codemirror/lang-json',
+  '@codemirror/lang-sql',
   '@lezer/common',
   '@lezer/highlight',
   'lezer-fhirpath',

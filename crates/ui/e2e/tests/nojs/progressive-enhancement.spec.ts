@@ -3,6 +3,7 @@ import {
   CANONICAL_BUTTON_GEOMETRY,
   readButtonGeometries,
 } from "../../pages/button-geometry";
+import { createResource, waitSearchable } from "../../pages/api";
 import { langLink, openUserMenu } from "../../pages/user-menu";
 
 // This whole file runs in the `nojs` project (javaScriptEnabled: false), which
@@ -91,6 +92,95 @@ test("the Resources type rail navigates via plain links with no JavaScript", asy
   await expect(page).toHaveURL(/\/ui\/resources\?type=Observation/);
   await expect(item).toHaveAttribute("aria-current", "true");
 });
+
+// "Tests esperados" #15 (RF8): a rail click is a real navigation with no
+// JavaScript at all, so the server itself records the selection (RF3) — and
+// the "Recently used" group, entirely server-rendered (RF6), shows it on the
+// very next load without any client script populating it.
+test("a Resources rail click without JavaScript is remembered in the recently-used group", async ({
+  page,
+}) => {
+  await page.goto("/ui/resources");
+  await page
+    .locator("#type-rail-list a.filter-rail__item[data-type='Observation']")
+    .click();
+  await expect(page).toHaveURL(/\/ui\/resources\?type=Observation/);
+
+  await page.goto("/ui/resources");
+  const recentGroup = page.locator("#type-rail-recent");
+  await expect(recentGroup).toBeVisible();
+  await expect(recentGroup.locator("[data-type='Observation']")).toBeVisible();
+});
+
+// "Tests esperados" #6 (#754/#755 ticket 04): a Compartments rail click is a
+// real navigation with no JavaScript at all — there is no "Recently used"
+// group here (only 4-5 definitions), just `rails.compartments.last` — so the
+// server itself records the selection (RF2), and a later plain arrival with
+// no `?def=` at all restores it (RF1), the same route the nojs sweep above
+// already proved is navigable.
+test("a Compartments rail click without JavaScript is remembered on a later plain arrival", async ({
+  page,
+  compartments,
+}) => {
+  await compartments.goto();
+  await compartments.railItem("Encounter").click();
+  await expect(page).toHaveURL(/def=Encounter/);
+  await expect(compartments.railItem("Encounter")).toHaveAttribute("aria-current", "true");
+
+  await compartments.goto();
+  await expect(compartments.railItem("Encounter")).toHaveAttribute("aria-current", "true");
+});
+
+// "Tests esperados" #12 (#754/#755 ticket 03): the three SQL rails (View
+// Definitions, SQL Queries, SQL Views) render their rail and "Recently used"
+// group entirely server-side, and a rail click is a real navigation the
+// server itself records — no client script required either way.
+const SQL_RAILS = [
+  { path: "/ui/sql/view-definitions", list: "vd-rail-list", recent: "vd-rail-recent", param: "vd" },
+  { path: "/ui/sql/queries", list: "lib-rail-list", recent: "lib-rail-recent", param: "lib" },
+  { path: "/ui/sql/views", list: "lib-rail-list", recent: "lib-rail-recent", param: "lib" },
+];
+for (const { path, list, recent, param } of SQL_RAILS) {
+  test(`${path} renders its rail and group, and a click without JavaScript is remembered`, async ({
+    page,
+    request,
+  }) => {
+    const stamp = Date.now().toString(36);
+    const id =
+      param === "vd"
+        ? await createResource(request, "ViewDefinition", {
+            name: `znojs_${stamp}`,
+            status: "active",
+            resource: "Patient",
+            select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+          })
+        : await createResource(request, "Library", {
+            name: `znojs_${stamp}`,
+            status: "active",
+            type: {
+              coding: [
+                {
+                  system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+                  code: path.endsWith("queries") ? "sql-query" : "sql-view",
+                },
+              ],
+            },
+          });
+    await waitSearchable(request, param === "vd" ? "ViewDefinition" : "Library", id);
+
+    await page.goto(path);
+    const item = page.locator(`#${list} a.filter-rail__item[data-type='${id}']`);
+    await expect(item).toBeVisible();
+    await item.click();
+    await expect(page).toHaveURL(new RegExp(`${param}=${id}`));
+    await expect(item).toHaveAttribute("aria-current", "true");
+
+    await page.goto(path);
+    const recentGroup = page.locator(`#${recent}`);
+    await expect(recentGroup).toBeVisible();
+    await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+  });
+}
 
 test("the CapabilityStatement filter submits a GET form with no JavaScript", async ({
   page,
@@ -181,6 +271,9 @@ test("Bulk Export can narrow through a conflicting native form without JavaScrip
   bulkExport,
 }) => {
   await page.goto("/ui/bulk-export/new");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
+  await bulkExport.nameInput.fill("No-JS All Resources");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
 
   await expect(bulkExport.allResources).toBeChecked();
   await expect(bulkExport.typeCheckboxes).not.toHaveCount(0);
@@ -218,6 +311,7 @@ test("Bulk Export submits an exact custom instant without JavaScript", async ({
   bulkExport,
 }) => {
   await page.goto("/ui/bulk-export/new");
+  await bulkExport.nameInput.fill("No-JS custom instant");
 
   const instant = "2026-08-01T00:00:00Z";
   await bulkExport.sincePreset.selectOption("custom");
@@ -238,6 +332,81 @@ test("Bulk Export submits an exact custom instant without JavaScript", async ({
   const params = new URLSearchParams(request.postData() ?? "");
   expect(params.get("since_preset")).toBe("custom");
   expect(params.get("since_custom")).toBe(instant);
+});
+
+test("Bulk Export shows both invalid fields and Clear starts fresh without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.goto("/ui/bulk-export/new");
+  await expect(bulkExport.form).toHaveAttribute("novalidate", "");
+  await bulkExport.nameInput.fill("   ");
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientFallback.fill("Patient/p-104, Patient/p-205");
+  await bulkExport.allResources.uncheck();
+  await bulkExport.typeCheckbox("Patient").check();
+  await bulkExport.form.locator('input[name="elements"]').fill("id,meta");
+  await bulkExport.form
+    .locator('input[name="type_filter"]')
+    .fill("Patient?active=true");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("not-an-instant");
+
+  const submitted = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/ui/bulk-export") &&
+      response.request().method() === "POST",
+  );
+  await bulkExport.startButton.click();
+  expect((await submitted).status()).toBe(400);
+
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(bulkExport.nameInput).toHaveValue("   ");
+  await expect(bulkExport.nameInput).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.nameInput).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-name-error",
+  );
+  await expect(bulkExport.nameError).toHaveText("Enter a name for this export.");
+  await expect(bulkExport.nameInput).toBeFocused();
+  await expect(bulkExport.scopeRadio("patient")).toBeChecked();
+  await expect(bulkExport.patientFallback).toHaveValue("Patient/p-104, Patient/p-205");
+  await expect(bulkExport.allResources).not.toBeChecked();
+  await expect(bulkExport.typeCheckbox("Patient")).toBeChecked();
+  await expect(bulkExport.form.locator('input[name="elements"]')).toHaveValue("id,meta");
+  await expect(bulkExport.form.locator('input[name="type_filter"]')).toHaveValue(
+    "Patient?active=true",
+  );
+  await expect(bulkExport.sincePreset).toHaveValue("custom");
+  await expect(bulkExport.sinceCustom).toHaveValue("not-an-instant");
+  await expect(bulkExport.sinceCustom).toBeEnabled();
+  await expect(bulkExport.sinceCustom).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.sinceCustom).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-since-custom-error",
+  );
+  await expect(bulkExport.sinceCustomError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+
+  await bulkExport.clearLink.click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export\/new$/);
+  await expect(bulkExport.nameInput).toHaveValue("");
+  await expect(bulkExport.scopeRadio("system")).toBeChecked();
+  await expect(bulkExport.patientFallback).toHaveValue("");
+  await expect(bulkExport.allResources).toBeChecked();
+  expect(
+    await bulkExport.typeCheckboxes.evaluateAll((types) =>
+      types.every(
+        (type) => !(type as HTMLInputElement).checked && !(type as HTMLInputElement).disabled,
+      ),
+    ),
+  ).toBe(true);
+  await expect(bulkExport.sincePreset).toHaveValue("");
+  await expect(bulkExport.sinceCustom).toHaveValue("");
+  await expect(bulkExport.sinceCustom).toBeEnabled();
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
 });
 
 test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
@@ -261,14 +430,17 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await expect(form.locator(".form-actions > a")).toHaveCount(0);
   const startExport = form.getByRole("button", { name: "Start Export" });
   await expect(startExport).toBeVisible();
+  await expect(startExport).toBeEnabled();
+  expect(await startExport.getAttribute("aria-busy")).toBeNull();
 
   const exportName = `no-js-export-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  await form.locator('input[name="name"]').fill(exportName);
+  await form.locator('input[name="name"]').fill(`  ${exportName}  `);
   await form.locator('input[name="scope"][value="system"]').check();
   await startExport.click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
   let card = page.locator(".job-card").filter({ hasText: exportName });
   await expect(card).toBeVisible();
+  await expect(card.locator(".job-card__name")).toHaveText(exportName);
 
   await card.getByRole("button", { name: "Cancel" }).click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
@@ -290,15 +462,58 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
 });
 
+// #838: sql-editor.js never loads (this project runs with
+// javaScriptEnabled: false), so the SQL pane stays the plain textarea it
+// is today — visible, holding the decoded SQL, editable, and saved by a
+// real form POST.
+test("the SQL Queries pane is a plain textarea and Save persists without JavaScript", async ({
+  page,
+  request,
+}) => {
+  const sql = "SELECT id FROM v";
+  const libId = await createResource(request, "Library", {
+    name: `nojs_sql_query_${Date.now()}`,
+    status: "active",
+    type: {
+      coding: [
+        {
+          system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+          code: "sql-query",
+        },
+      ],
+    },
+    content: [{ contentType: "application/sql", data: Buffer.from(sql).toString("base64") }],
+  });
+  await waitSearchable(request, "Library", libId);
+
+  await page.goto(`/ui/sql/queries?lib=${libId}`);
+  const textarea = page.locator("textarea[name='sql']");
+  await expect(textarea).toBeVisible();
+  await expect(textarea).toHaveValue(sql);
+  // No editor script ran, so no CodeMirror wrapper was inserted.
+  await expect(page.locator(".sql-editor")).toHaveCount(0);
+
+  const updated = "SELECT name FROM v";
+  await textarea.fill(updated);
+  await page.locator("button[name='action'][value='save']").click();
+  await expect(page).toHaveURL(/saved=1/);
+  await expect(page.locator("textarea[name='sql']")).toHaveValue(updated);
+});
+
 test("Bulk Export accepts comma- and newline-separated Patient IDs without JavaScript", async ({
   page,
   bulkExport,
 }) => {
   await page.goto("/ui/bulk-export/new");
+  await bulkExport.nameInput.fill("No-JS patient IDs");
   await bulkExport.scopeRadio("patient").check();
 
   await expect(bulkExport.patientFallback).toBeVisible();
   await expect(bulkExport.patientFallback).toBeEnabled();
+  await expect(bulkExport.patientFallback).toHaveAttribute("placeholder", "Patient FHIR IDs");
+  await expect(page.locator("#bulk-export-patients-fallback-hint")).toContainText(
+    "separated by commas or new lines",
+  );
   const patientRefs = "Patient/p-104, Patient/p-205\nPatient/p-306";
   await bulkExport.patientFallback.fill(patientRefs);
 
