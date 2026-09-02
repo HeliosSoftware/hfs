@@ -96,17 +96,11 @@ Options:
 | `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Elasticsearch index `refresh_interval` for ES-backed backends. Controls how quickly indexed documents become searchable when no per-write refresh is requested. `-1` disables periodic refresh entirely. Applied when an index is created; indices that already exist keep their current setting. |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | The `refresh` parameter applied to Elasticsearch index/delete operations. One of `false` (no per-write refresh), `wait_for` (block each write until the affected shards refresh), or `true` (force a refresh per write; expensive, low-volume deployments only). |
 
-In the ES-backed composite modes the search secondary is **eventually
-consistent** by default: a write can return `201`/`200` before the resource is
-findable via search. Two independent delays contribute. First, the composite
-forwards the index write to Elasticsearch on a background worker unless
-`HFS_COMPOSITE_SYNC_MODE=synchronous`. Second, Elasticsearch only makes an
-indexed document searchable at the next index refresh, which happens every
-`HFS_ELASTICSEARCH_REFRESH_INTERVAL` unless the write itself requests a refresh
-via `HFS_ELASTICSEARCH_WRITE_REFRESH`. Read-after-write search therefore
-requires **both** `HFS_COMPOSITE_SYNC_MODE=synchronous` and
-`HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`; either setting alone still leaves a
-window in which an immediate follow-up search misses the write.
+Read-after-write search on an ES-backed composite needs **both**
+`HFS_COMPOSITE_SYNC_MODE=synchronous` and
+`HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`. See
+[Search visibility on Elasticsearch-backed composites](../persistence/README.md#search-visibility-on-elasticsearch-backed-composites)
+in the persistence crate for why either setting alone still leaves a window.
 
 Set `HFS_BASE_URL` to the public address clients can reach. The value may
 contain a path prefix. It must be an absolute `http` or `https` URL without
