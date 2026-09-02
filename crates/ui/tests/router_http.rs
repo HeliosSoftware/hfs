@@ -2386,9 +2386,9 @@ async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
 }
 
 /// #649: the View Definitions workspace lists stored views in the rail
-/// (name-sorted, first selected), edits the selection as JSON, offers the
-/// starter document under Create New, and previews rows through $sql-run in
-/// the view's declared column order.
+/// (name-sorted, first selected), edits the selection as JSON, and offers
+/// the starter document under Create New. #752 ticket 02, RF1: there is no
+/// `?run=1` — it is no longer read by the handler and has no effect.
 #[tokio::test]
 async fn view_definitions_workspace_lists_edits_and_previews() {
     let vds = vec![
@@ -2437,8 +2437,23 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     // Delete goes through the shared conformance CRUD script.
     assert!(html.contains(r#"data-crud-delete"#));
     assert!(html.contains("/ui/assets/conformance-crud.js"));
+    // #752 ticket 02, RF1/RF2: no Run link, no `<details>` fold — the
+    // editor card is always open with the "Runs as you type" legend, and
+    // the results region's own empty notice is always present.
+    assert!(!html.contains("run=1"));
+    assert!(!html.contains("json-fold"));
+    assert!(html.contains("editor-legend__live"));
+    assert!(html.contains(r#"id="vd-run-notice""#));
+    assert!(html.contains(r#"hx-post="/ui/sql/view-definitions/run""#));
+    // RF4: no server-side results yet, so the notice's own empty shell
+    // carries the initial-load trigger.
+    assert!(html.contains(r#"hx-trigger="load""#));
+    // RF3: no results card until something has actually run — only the
+    // empty placeholder the first live fragment's OOB swap anchors onto.
+    assert!(!html.contains("table-card"));
+    assert!(html.contains(r#"<div id="vd-results"></div>"#));
 
-    // ?run=1 previews through $sql-run: declared column order, row rendered.
+    // RF1: `?run=1` is no longer read by the handler — no results card.
     let response = app
         .clone()
         .oneshot(
@@ -2449,11 +2464,7 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
         .await
         .unwrap();
     let html = body_text(response).await;
-    assert!(html.contains("<th>id</th><th>family</th>"));
-    assert!(html.contains("<td>p1</td><td>Doe</td>"));
-    // #752 ticket 01: the page's own render shares the fragment endpoint's
-    // markup (RF7), but in page mode — no OOB swap to carry out.
-    assert!(!html.contains("hx-swap-oob"));
+    assert!(!html.contains("table-card"));
 
     // Create New offers the starter document in the editor.
     let response = app
@@ -2468,6 +2479,76 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     let html = body_text(response).await;
     assert!(html.contains("new_view"));
     assert!(html.contains("getResourceKey()"));
+    // RF4/NF5: `?vd=new` selects the starter document, so the results
+    // region's own load trigger fires for it exactly like a stored view.
+    assert!(html.contains(r#"hx-trigger="load""#));
+}
+
+/// #752 ticket 02, RF6: `?vd=<id>&saved=1` (Save's own redirect) renders the
+/// just-stored definition's `$sql-run` results server-side — the nojs path
+/// to the playground's live preview. The success case's results card comes
+/// with a working meta and no load trigger left behind (RF4: results
+/// already present, so the client must not ask again); the failure case
+/// shows `vd-run-failed` instead, with no results card.
+#[tokio::test]
+async fn view_definitions_saved_redirect_renders_results_server_side() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![vd.clone()],
+        )
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = view_definitions_app(source);
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="vd-results""#));
+    assert!(html.contains("<th>id</th>"));
+    assert!(html.contains("<td>p1</td>"));
+    let meta = text_between(
+        &html,
+        r#"id="vd-results-meta" class="card-head__meta">"#,
+        "</span>",
+    );
+    assert!(meta.starts_with("1 rows"), "{meta}");
+    // RF4: results already arrived server-side, so the notice must not also
+    // carry the client-driven initial-load trigger.
+    assert!(!html.contains(r#"hx-trigger="load""#));
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Err("boom".into()));
+    let app = view_definitions_app(source);
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("notice--warn"));
+    assert!(html.contains("boom"));
+    // RF7: no real results card on a failed run — just the anchor placeholder
+    // a later successful edit's OOB swap needs (see the partial's own
+    // header comment for why).
+    assert!(!html.contains("table-card"));
+    assert!(html.contains(r#"<div id="vd-results"></div>"#));
+    assert!(!html.contains(r#"hx-trigger="load""#));
 }
 
 /// The text between two markers in `html`, panicking (with the marker named)

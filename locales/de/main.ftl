@@ -817,6 +817,7 @@ vd-delete = Löschen
 vd-delete-confirm = View-Definition „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
 vd-delete-failed = Die View-Definition konnte nicht gelöscht werden.
 vd-json-heading = Definition (JSON)
+vd-run-hint = Läuft während der Eingabe – die Ergebnisse folgen der aktuellen Definition, gespeichert oder nicht
 vd-results-heading = Ergebnisse
 vd-results-empty = Die View hat keine Zeilen erzeugt.
 vd-results-meta = { $rows } Zeilen · { $ms } ms

@@ -2350,11 +2350,12 @@ async fn batch_page(
     })
 }
 
-/// The View Definitions workspace (#649, Figma `420-2`): a filter rail of the
-/// tenant's stored ViewDefinitions, the selected one as editable JSON, and a
-/// `$sql-run` preview of its output. Save and Duplicate are plain form posts
-/// (they work without JavaScript); Delete rides `conformance-crud.js` like
-/// the other conformance viewers.
+/// The View Definitions playground (#649, Figma `420-2`; #752): a filter
+/// rail of the tenant's stored ViewDefinitions, the selected one always
+/// editable as JSON, and a `$sql-run` preview that follows the editor's
+/// current text — saved or not, no Run button. Save and Duplicate are plain
+/// form posts (they work without JavaScript); Delete rides
+/// `conformance-crud.js` like the other conformance viewers.
 #[derive(Template)]
 #[template(path = "pages/sql-view-definitions.html")]
 struct SqlViewDefinitionsPage {
@@ -2412,10 +2413,11 @@ enum RunResultsState {
     /// RF5/RF6: a run or parse failure, with the message rendered next to
     /// `vd-run-failed`.
     Failure(String),
-    /// RF7: the page's own render before anything has run — no `?run=1`, or
-    /// the current selection has no preview yet. Never produced by the
-    /// `/run` fragment endpoint, which always ends in `Success` or
-    /// `Failure`.
+    /// RF7: the page's own render before anything has run server-side — no
+    /// `?saved=1`, or the current selection has no preview yet. Renders the
+    /// notice region's own client-driven initial-load request (#752 ticket
+    /// 02, RF4). Never produced by the `/run` fragment endpoint, which
+    /// always ends in `Success` or `Failure`.
     Empty,
 }
 
@@ -2425,9 +2427,9 @@ enum RunResultsState {
 /// for the page's own initial render (`{{ run_results.render()?|safe }}` in
 /// `sql-view-definitions.html`, `fragment: false`), and directly as the
 /// whole response of [`sql_view_definitions_run`] (`fragment: true`,
-/// RF4–RF6). `fragment` only toggles the notice wrapper and the
-/// `hx-swap-oob` attributes; the table markup itself lives solely in the
-/// template's `Success` arm.
+/// RF4–RF6). `fragment` only toggles the `hx-swap-oob` attributes and
+/// whether the `Empty` arm's own load trigger applies (#752 ticket 02); the
+/// table markup itself lives solely in the template's `Success` arm.
 #[derive(Template)]
 #[template(path = "partials/sql_run_results.html")]
 struct RunResultsPartial {
@@ -2440,7 +2442,6 @@ struct RunResultsPartial {
 struct SqlVdQuery {
     vd: Option<String>,
     filter: Option<String>,
-    run: Option<String>,
     saved: Option<String>,
     /// 1-based (#741). Kept as raw text rather than `Option<usize>` so a
     /// non-numeric value fails the `parse` below instead of the whole
@@ -2672,12 +2673,14 @@ async fn sql_view_definitions_page(
     let recent_entries =
         resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));
 
-    // `?run=1` previews the selected view through $sql-run — a plain link, so
-    // it works without JavaScript. RF7: this render's own state is `Empty`
-    // whenever the preview wasn't asked for, the same "nothing to show" the
-    // page has always had with no `?run=1`.
+    // #752 ticket 02, RF6: `?saved=1` (Save's own redirect) runs the just-
+    // stored definition through $sql-run once, server-side, so the nojs path
+    // shows results without a client request. Every other render's own state
+    // is `Empty` (RF7) — the empty notice this produces is what carries
+    // ticket 02's client-driven initial-load request (RF4), covering both an
+    // ordinary `?vd=` navigation and `?vd=new`'s starter document.
     let i18n = I18n::new(locale);
-    let run_state = match (&selected_value, query.run.as_deref() == Some("1")) {
+    let run_state = match (&selected_value, query.saved.as_deref() == Some("1")) {
         (Some(vd), true) => match run_view_preview(&state, vd, rv.0, &rt.id).await {
             Ok((table, ms)) => RunResultsState::Success(table, ms),
             Err(error) => RunResultsState::Failure(error),
@@ -2710,10 +2713,11 @@ async fn sql_view_definitions_page(
 }
 
 /// Runs `$sql-run` for a preview and times the call in whole milliseconds —
-/// shared by the page's own `?run=1` render and the `/run` fragment endpoint
-/// (#752 ticket 01) so the row cap and the `{ $rows } rows · { $ms } ms`
-/// meta can never drift between the two callers. NF2: never logs
-/// `view_definition` itself — a ViewDefinition's `constant[]` can carry PHI.
+/// shared by the page's own `?saved=1` render (#752 ticket 02, RF6) and the
+/// `/run` fragment endpoint (#752 ticket 01) so the row cap and the
+/// `{ $rows } rows · { $ms } ms` meta can never drift between the two
+/// callers. NF2: never logs `view_definition` itself — a ViewDefinition's
+/// `constant[]` can carry PHI.
 async fn run_view_preview(
     state: &WebState,
     view_definition: &serde_json::Value,
@@ -2769,9 +2773,12 @@ async fn sql_view_definitions_save(
                 json,
             }),
             is_new,
-            // A form-validation error re-renders in place: nothing has run,
-            // so this render's own results are `Empty` (RF7), same as any
-            // other render with no `?run=1`.
+            // A form-validation error re-renders in place: nothing has run
+            // server-side, so this render's own results are `Empty` (RF7) —
+            // same as any other render with no `?saved=1`. The submitted
+            // text is still whatever the user typed (kept, not lost), so
+            // the `Empty` arm's own load trigger (#752 ticket 02, RF4) runs
+            // that same text through the live preview once the page opens.
             run_results: RunResultsPartial {
                 i18n: I18n::new(locale),
                 fragment: false,
@@ -2858,10 +2865,13 @@ struct SqlVdRunForm {
 }
 
 /// `POST /ui/sql/view-definitions/run` (#752 ticket 01): the playground's
-/// live preview fragment. Unlike the page's own `?run=1`, this always runs
-/// the editor's *posted* text — saved or not — through the same
+/// live preview fragment. Unlike the page's own `?saved=1` render, this
+/// always runs the editor's *posted* text — saved or not — through the same
 /// [`run_view_preview`] helper, and renders `partials/sql_run_results.html`
-/// in fragment mode (RF4–RF6) instead of a full page.
+/// in fragment mode (RF4–RF6) instead of a full page. Ticket 02 wires it to
+/// the editor's textarea (`input changed delay:500ms`) and, via the results
+/// region's own empty shell, to the page's `load` event — see
+/// `templates/partials/sql_run_results.html`'s header comment.
 ///
 /// Always answers `200` except for a malformed request body — a missing
 /// `json` field, which `axum::Form`'s own rejection turns into a `4xx`

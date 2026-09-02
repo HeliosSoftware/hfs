@@ -817,6 +817,7 @@ vd-delete = Eliminar
 vd-delete-confirm = ¿Eliminar la definición de vista «{ $name }»? Esta acción no se puede deshacer.
 vd-delete-failed = No se pudo eliminar la definición de vista.
 vd-json-heading = Definición (JSON)
+vd-run-hint = Se ejecuta mientras escribes: los resultados siguen la definición actual, esté guardada o no
 vd-results-heading = Resultados
 vd-results-empty = La vista no produjo filas.
 vd-results-meta = { $rows } filas · { $ms } ms

@@ -820,6 +820,7 @@ vd-delete = Delete
 vd-delete-confirm = Delete view definition "{ $name }"? This cannot be undone.
 vd-delete-failed = Could not delete the view definition.
 vd-json-heading = Definition (JSON)
+vd-run-hint = Runs as you type — results follow the current definition, saved or not
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
 # #752 ticket 01: the $sql-run preview's row/duration meta, shared by the
