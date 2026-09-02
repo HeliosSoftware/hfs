@@ -63,6 +63,13 @@ mod meta_params_suite;
 #[path = "search/date_boundary_suite.rs"]
 mod date_boundary_suite;
 
+/// The T2 cluster harness: two independently constructed backends over one
+/// shared store, barrier-synchronized racing, and the definition-of-done
+/// assertion rows. Declared at the top level for the same `#[path]` resolution
+/// reason as `if_match_suite` above.
+#[path = "common/cluster_harness.rs"]
+mod cluster_harness;
+
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
 // ============================================================================
@@ -6406,5 +6413,672 @@ mod postgres_integration {
             &unique_base("fidelity_purge"),
         )
         .await;
+    }
+
+    // ========================================================================
+    // T2 cluster harness — calibration against the bulk-export job store.
+    // ========================================================================
+    //
+    // Two freshly constructed backends over the one shared container play
+    // "instance A" and "instance B" (`create_backend()` builds a new pool each
+    // time; the only thing the two handles share is the database). The
+    // bulk-export job store is already cluster-safe — DB-leased and fenced —
+    // so these rows must pass on an unchanged tree: they prove the harness,
+    // not the product. Every later cluster-capable subsystem points the same
+    // helpers at its own store.
+
+    use crate::cluster_harness as harness;
+    use helios_persistence::core::bulk_export::{ExportJobId, ExportProgress};
+    use helios_persistence::error::BulkExportError;
+    use std::sync::Arc;
+
+    /// Maps `get_export_status` to the harness's `Option` shape: a job that
+    /// doesn't exist *for this tenant* is `None`; any other error is a bug.
+    async fn export_status_across(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+    ) -> Option<ExportProgress> {
+        match backend.get_export_status(tenant, job_id).await {
+            Ok(progress) => Some(progress),
+            Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => None,
+            Err(other) => panic!("unexpected error reading export status: {other:?}"),
+        }
+    }
+
+    /// Claims and finishes every eligible job so an exclusivity race starts
+    /// from an empty queue. Leftover `accepted` jobs from other suites
+    /// sharing the container would otherwise let both racers win on
+    /// different jobs.
+    async fn drain_export_queue(backend: &PostgresBackend) {
+        let reaper = WorkerId::new(format!("cluster-drain-{}", uuid::Uuid::new_v4()));
+        while let Some(lease) = backend
+            .claim_next(&reaper, StdDuration::from_secs(60))
+            .await
+            .unwrap()
+        {
+            backend
+                .finish_export_job(
+                    &lease.tenant,
+                    &lease.job_id,
+                    &lease.worker_id,
+                    lease.fencing_token,
+                )
+                .await
+                .expect("draining a leftover export job");
+        }
+    }
+
+    /// DoD rows: visibility + isolation.
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_visible_and_isolated_across_handles() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-vis");
+
+        let job_id = handles
+            .a
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Visibility: created via instance A, observable via instance B.
+        let progress = harness::assert_visible(
+            export_status_across(&handles.b, &tenant, &job_id).await,
+            "export job created via instance A",
+        );
+        assert_eq!(progress.status, ExportStatus::Accepted);
+
+        // Isolation: another tenant on instance B sees nothing.
+        let other_tenant = create_tenant("cluster-vis-other");
+        harness::assert_wrong_tenant_hidden(
+            export_status_across(&handles.b, &other_tenant, &job_id).await,
+            "export job",
+        );
+    }
+
+    /// DoD row: exclusivity — two instances race `claim_next` on one queued
+    /// job and exactly one wins (`FOR UPDATE SKIP LOCKED`).
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_claim_exclusive_across_handles() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-claim");
+
+        drain_export_queue(&handles.a).await;
+
+        let job_id = handles
+            .a
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker_a = WorkerId::new(format!("cluster-claim-a-{}", uuid::Uuid::new_v4()));
+        let worker_b = WorkerId::new(format!("cluster-claim-b-{}", uuid::Uuid::new_v4()));
+        let (a, b) = (handles.a, handles.b);
+        let (lease_a, lease_b) = harness::race2(
+            async move {
+                a.claim_next(&worker_a, StdDuration::from_secs(60))
+                    .await
+                    .unwrap()
+            },
+            async move {
+                b.claim_next(&worker_b, StdDuration::from_secs(60))
+                    .await
+                    .unwrap()
+            },
+        )
+        .await;
+
+        harness::assert_exactly_one(&lease_a, &lease_b, "the claim on one queued job");
+        let winner = lease_a.or(lease_b).unwrap();
+        assert_eq!(winner.job_id, job_id);
+        assert_eq!(
+            winner.tenant.tenant_id().as_str(),
+            tenant.tenant_id().as_str()
+        );
+    }
+
+    /// DoD row: fencing — after a release/reclaim moves the lease to another
+    /// instance, the stale holder's heartbeat and guarded writes are refused.
+    /// Deterministic: the reclaim uses `release`, not lease expiry, so there
+    /// are no sleeps (coverage-safe).
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_stale_handle_fenced_after_release() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-fence");
+
+        let job_id = handles
+            .a
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Instance A claims, then releases (graceful shutdown).
+        let worker_a = WorkerId::new(format!("cluster-fence-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&handles.a, &worker_a, &job_id, StdDuration::from_secs(60)).await;
+        ExportClaimStrategy::release(&handles.a, lease_a.clone())
+            .await
+            .unwrap();
+
+        // Instance B reclaims; the fencing token moves past A's.
+        let worker_b = WorkerId::new(format!("cluster-fence-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&handles.b, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+
+        // The stale handle is fenced out of heartbeat and guarded writes.
+        assert!(matches!(
+            handles.a.heartbeat(&lease_a).await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+        assert!(matches!(
+            handles
+                .a
+                .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        // The current holder is unaffected.
+        handles
+            .b
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// DoD row: durability — dropping the creating handle (simulated
+    /// redeploy) must not lose the job; a fresh handle still sees it.
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_survives_handle_drop() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let tenant = create_tenant("cluster-durable");
+
+        let first = create_backend().await;
+        let job_id = first
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        drop(first);
+
+        let replacement = create_backend().await;
+        let progress = harness::assert_visible(
+            export_status_across(&replacement, &tenant, &job_id).await,
+            "export job after its creating handle was dropped",
+        );
+        assert_eq!(progress.status, ExportStatus::Accepted);
+    }
+
+    // ========================================================================
+    // T2 cluster suite — F5 resource version-id race.
+    // ========================================================================
+    //
+    // Every version bump is a version-guarded compare-and-swap that lands the
+    // resource row and its history row in one statement, so two instances
+    // racing unconditional writes can never both assign the same version_id
+    // or lose a history row. `create_or_update` retries transient CAS losses,
+    // keeping unconditional PUT last-writer-wins at the API surface — a PUT
+    // must never surface a 404 or 409 that only a concurrent PUT produced.
+
+    /// Asserts a resource's history holds every version exactly once,
+    /// contiguous from 1 — no duplicate version_ids, no lost history rows.
+    async fn assert_history_versions(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_len: u64,
+    ) {
+        let history = backend
+            .history_instance(
+                tenant,
+                resource_type,
+                id,
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap();
+        let mut versions: Vec<u64> = history
+            .items
+            .iter()
+            .map(|e| e.resource.version_id().parse().unwrap())
+            .collect();
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            (1..=expected_len).collect::<Vec<_>>(),
+            "history must hold every version exactly once"
+        );
+    }
+
+    /// DoD rows (F5): exclusivity + isolation — two instances race
+    /// unconditional `update`s from the same version-1 snapshot. The CAS lets
+    /// exactly one through; the loser gets `VersionConflict` instead of
+    /// silently losing an update or 500ing on a duplicate history row, and a
+    /// fresh read-then-retry converges on version 3.
+    #[tokio::test]
+    async fn postgres_integration_cluster_resource_update_race_no_lost_version() {
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-f5-upd");
+
+        let created = handles
+            .a
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "V1"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+
+        let (a, b) = (handles.a, handles.b);
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let (snapshot_a, snapshot_b) = (created.clone(), created);
+        let (res_a, res_b) = harness::race2(
+            async move {
+                a.update(
+                    &tenant_a,
+                    &snapshot_a,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                )
+                .await
+            },
+            async move {
+                b.update(
+                    &tenant_b,
+                    &snapshot_b,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+                )
+                .await
+            },
+        )
+        .await;
+
+        let (ok_a, err_a) = match res_a {
+            Ok(r) => (Some(r), None),
+            Err(e) => (None, Some(e)),
+        };
+        let (ok_b, err_b) = match res_b {
+            Ok(r) => (Some(r), None),
+            Err(e) => (None, Some(e)),
+        };
+        harness::assert_exactly_one(&ok_a, &ok_b, "the version-guarded update");
+        let winner = ok_a.or(ok_b).unwrap();
+        assert_eq!(winner.version_id(), "2");
+        let loser = err_a.or(err_b).unwrap();
+        assert!(
+            matches!(
+                loser,
+                StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+            ),
+            "loser must see VersionConflict, got {loser:?}"
+        );
+
+        // A fresh read-then-retry from a third instance converges.
+        let verifier = create_backend().await;
+        let current = verifier
+            .read(&tenant, "Patient", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version_id(), "2");
+        let retried = verifier
+            .update(
+                &tenant,
+                &current,
+                json!({"resourceType": "Patient", "name": [{"family": "Retry"}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.version_id(), "3");
+
+        assert_history_versions(&verifier, &tenant, "Patient", &id, 3).await;
+
+        // Isolation: the resource does not exist for another tenant.
+        harness::assert_wrong_tenant_hidden(
+            verifier
+                .read(&create_tenant("cluster-f5-other"), "Patient", &id)
+                .await
+                .unwrap(),
+            "patient",
+        );
+    }
+
+    /// DoD row (F5): unconditional PUT stays last-writer-wins — two instances
+    /// race `create_or_update` on one existing resource; the bounded CAS
+    /// retry absorbs the losing race so both callers succeed, with distinct
+    /// version_ids and a complete history.
+    #[tokio::test]
+    async fn postgres_integration_cluster_resource_create_or_update_race_both_succeed() {
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-f5-put");
+
+        let created = handles
+            .a
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "V1"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+
+        let (a, b) = (handles.a, handles.b);
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let (id_a, id_b) = (id.clone(), id.clone());
+        let (res_a, res_b) = harness::race2(
+            async move {
+                a.create_or_update(
+                    &tenant_a,
+                    "Patient",
+                    &id_a,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+            async move {
+                b.create_or_update(
+                    &tenant_b,
+                    "Patient",
+                    &id_b,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+        )
+        .await;
+
+        let (stored_a, created_a) = res_a.expect("create_or_update must absorb CAS races");
+        let (stored_b, created_b) = res_b.expect("create_or_update must absorb CAS races");
+        assert!(
+            !created_a && !created_b,
+            "both racers must take the update arm"
+        );
+        assert_ne!(
+            stored_a.version_id(),
+            stored_b.version_id(),
+            "racing writers must never assign the same version"
+        );
+
+        let verifier = create_backend().await;
+        let current = verifier
+            .read(&tenant, "Patient", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version_id(), "3");
+        assert_history_versions(&verifier, &tenant, "Patient", &id, 3).await;
+    }
+
+    /// DoD row (F5): an unconditional `update` racing an unconditional
+    /// `delete` can interleave either way, but the CAS keeps the invariants:
+    /// the delete always lands, no duplicate version_id, no lost history row,
+    /// and the resource ends deleted.
+    #[tokio::test]
+    async fn postgres_integration_cluster_resource_update_delete_race_keeps_history_coherent() {
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-f5-del");
+
+        let created = handles
+            .a
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "V1"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+
+        let (a, b) = (handles.a, handles.b);
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let id_b = id.clone();
+        let (res_update, res_delete) = harness::race2(
+            async move {
+                a.update(
+                    &tenant_a,
+                    &created,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                )
+                .await
+            },
+            async move { b.delete(&tenant_b, "Patient", &id_b).await },
+        )
+        .await;
+
+        // The delete derives the tombstone's version from the locked row
+        // inside its own statement, so it lands whichever way the race goes.
+        res_delete.expect("racing delete must succeed");
+
+        // The update either beat the delete (then the delete bumped again from
+        // the row it locked) or found the row gone.
+        let expected_versions = match res_update {
+            Ok(stored) => {
+                assert_eq!(stored.version_id(), "2");
+                3
+            }
+            Err(err) => {
+                assert!(
+                    matches!(err, StorageError::Resource(ResourceError::NotFound { .. })),
+                    "update racing a delete must see NotFound, got {err:?}"
+                );
+                2
+            }
+        };
+
+        let verifier = create_backend().await;
+        match verifier.read(&tenant, "Patient", &id).await {
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+            other => panic!("resource must end deleted, got {other:?}"),
+        }
+        assert_history_versions(&verifier, &tenant, "Patient", &id, expected_versions).await;
+    }
+
+    /// A fresh handle whose pool holds exactly one connection, so a warm-up
+    /// and the race that follows provably share one connection and one
+    /// prepared-statement cache — the race then measures the storage
+    /// protocol, not connection setup.
+    async fn create_race_backend() -> PostgresBackend {
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 1,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        PostgresBackend::new(config)
+            .await
+            .expect("Failed to create single-connection PostgresBackend")
+    }
+
+    /// Creates a Patient and soft-deletes it, returning its id: version 1 is
+    /// the create, version 2 the tombstone.
+    async fn seed_tombstone(backend: &PostgresBackend, tenant: &TenantContext) -> String {
+        let created = backend
+            .create(
+                tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "Seed"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        created.id().to_string()
+    }
+
+    /// Runs one throwaway create → delete → restore cycle so every statement
+    /// on the restore path is prepared on the handle's single connection
+    /// before the timed race.
+    async fn warm_restore_path(backend: &PostgresBackend, tenant: &TenantContext) {
+        let id = seed_tombstone(backend, tenant).await;
+        backend
+            .create_or_update(
+                tenant,
+                "Patient",
+                &id,
+                json!({"resourceType": "Patient", "name": [{"family": "Warm"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// DoD rows (F5, restore path): two instances race unconditional PUTs
+    /// onto one soft-deleted id. The restore is a version-guarded CAS that
+    /// lands the row and its history entry in one statement, and
+    /// `create_or_update` retries the loser from a fresh read, so both PUTs
+    /// succeed: the winner restores (v3, "created"), the loser converges
+    /// through the update arm (v4, "updated"), history is contiguous 1..=4,
+    /// and the newest history entry carries the live body. Without the CAS,
+    /// both racers compute v3 — the second history insert violates the
+    /// primary key (a 500) and the live row and history v3 carry different
+    /// bodies. Five rounds on fresh ids give the interleaving room to occur;
+    /// the post-conditions are the same for every interleaving.
+    #[tokio::test]
+    async fn postgres_integration_cluster_restore_deleted_race_keeps_history_coherent() {
+        let tenant = create_tenant("cluster-f5-restore");
+        let a = Arc::new(create_race_backend().await);
+        let b = Arc::new(create_race_backend().await);
+        warm_restore_path(&a, &tenant).await;
+        warm_restore_path(&b, &tenant).await;
+        let verifier = create_backend().await;
+
+        for round in 0..5 {
+            let id = seed_tombstone(&a, &tenant).await;
+
+            let (ra, rb) = (Arc::clone(&a), Arc::clone(&b));
+            let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+            let (id_a, id_b) = (id.clone(), id.clone());
+            let (res_a, res_b) = harness::race2(
+                async move {
+                    ra.create_or_update(
+                        &tenant_a,
+                        "Patient",
+                        &id_a,
+                        json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                },
+                async move {
+                    rb.create_or_update(
+                        &tenant_b,
+                        "Patient",
+                        &id_b,
+                        json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                },
+            )
+            .await;
+
+            let (stored_a, created_a) =
+                res_a.unwrap_or_else(|e| panic!("round {round}: PUT via A must succeed: {e:?}"));
+            let (stored_b, created_b) =
+                res_b.unwrap_or_else(|e| panic!("round {round}: PUT via B must succeed: {e:?}"));
+
+            // Exactly one racer restores the tombstone; the other converges
+            // through the update arm onto the restored row.
+            let restored = |flag: bool| flag.then_some(());
+            harness::assert_exactly_one(
+                &restored(created_a),
+                &restored(created_b),
+                &format!("round {round}: the restore of one tombstone"),
+            );
+            assert_ne!(
+                stored_a.version_id(),
+                stored_b.version_id(),
+                "round {round}: racing writers must never assign the same version"
+            );
+
+            let current = verifier
+                .read(&tenant, "Patient", &id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.version_id(), "4", "round {round}");
+            assert!(!current.is_deleted(), "round {round}");
+            assert_history_versions(&verifier, &tenant, "Patient", &id, 4).await;
+
+            // The newest history entry must be the live body — a lost race
+            // that still "succeeded" leaves history v3 with one racer's body
+            // and the live row with the other's.
+            let history = verifier
+                .history_instance(
+                    &tenant,
+                    "Patient",
+                    &id,
+                    &HistoryParams::new().include_deleted(true),
+                )
+                .await
+                .unwrap();
+            let newest = history
+                .items
+                .iter()
+                .max_by_key(|e| e.resource.version_id().parse::<u64>().unwrap())
+                .unwrap();
+            assert_eq!(
+                newest.resource.content(),
+                current.content(),
+                "round {round}: newest history entry must carry the live body"
+            );
+        }
+    }
+
+    /// DoD row (F5, restore path): isolation — a PUT onto the same id under
+    /// another tenant creates a fresh version-1 resource in that tenant and
+    /// leaves the first tenant's tombstone exactly as it was.
+    #[tokio::test]
+    async fn postgres_integration_cluster_restore_deleted_wrong_tenant_creates_not_restores() {
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-f5-restore-iso");
+        let id = seed_tombstone(&handles.a, &tenant).await;
+
+        let other = create_tenant("cluster-f5-restore-other");
+        let (stored, created) = handles
+            .b
+            .create_or_update(
+                &other,
+                "Patient",
+                &id,
+                json!({"resourceType": "Patient", "name": [{"family": "Other"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert!(created, "the other tenant must get a fresh resource");
+        assert_eq!(stored.version_id(), "1");
+        assert_eq!(stored.tenant_id().as_str(), other.tenant_id().as_str());
+
+        // The first tenant's tombstone is untouched.
+        match handles.a.read(&tenant, "Patient", &id).await {
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+            got => panic!("first tenant's resource must still be deleted, got {got:?}"),
+        }
+        assert_history_versions(&handles.a, &tenant, "Patient", &id, 2).await;
     }
 }

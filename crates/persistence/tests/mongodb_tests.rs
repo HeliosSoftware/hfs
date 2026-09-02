@@ -39,6 +39,12 @@ use mongodb::Client;
 use mongodb::bson::{Document, doc};
 use serde_json::json;
 
+/// The T2 cluster harness (two independently constructed backends over one
+/// shared store); path-included rather than placed in a `mod common`, which no
+/// test target declares.
+#[path = "common/cluster_harness.rs"]
+mod cluster_harness;
+
 const MONGODB_MAX_DATABASE_NAME_LEN: usize = 63;
 const MONGODB_TEST_DB_PREFIX: &str = "hfs_phase2_mongo_";
 
@@ -4514,4 +4520,207 @@ async fn mongodb_integration_export_until_is_inclusive() {
         1,
         "a resource exactly on the bound is included"
     );
+}
+
+// ============================================================================
+// T2 cluster suite — F5 resource version-id race (restore path).
+// ============================================================================
+//
+// Two independently constructed `MongoBackend`s on ONE database play
+// "instance A" and "instance B"; `create_backend` mints a fresh database per
+// call, so the second handle is built from the first's config instead. Mongo's
+// restore was already a version-guarded CAS; what these rows pin is that a
+// lost race is *retried* by `create_or_update` rather than surfacing a 404 on
+// a PUT, and that the loser reports `VersionConflict` with the stored version.
+
+use cluster_harness as harness;
+
+/// Two fresh handles, one database. `None` when Mongo is unavailable (the
+/// suite's usual skip convention).
+async fn two_mongo_handles(test_name: &str) -> Option<(MongoBackend, MongoBackend)> {
+    let connection_string = shared_mongo::connection_string().await?;
+    let a = build_backend(MongoBackendConfig {
+        connection_string: connection_string.clone(),
+        database_name: build_test_database_name(test_name),
+        max_connections: 1,
+        ..Default::default()
+    })
+    .await?;
+    let b = build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: a.config().database_name.clone(),
+        max_connections: 1,
+        ..Default::default()
+    })
+    .await?;
+    Some((a, b))
+}
+
+/// Asserts a resource's history holds every version exactly once,
+/// contiguous from 1 — no duplicate version_ids, no lost history rows.
+async fn assert_mongo_history_versions(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    resource_type: &str,
+    id: &str,
+    expected_len: u64,
+) {
+    let history = backend
+        .history_instance(
+            tenant,
+            resource_type,
+            id,
+            &HistoryParams::new().include_deleted(true),
+        )
+        .await
+        .unwrap();
+    let mut versions: Vec<u64> = history
+        .items
+        .iter()
+        .map(|e| e.resource.version_id().parse().unwrap())
+        .collect();
+    versions.sort_unstable();
+    assert_eq!(
+        versions,
+        (1..=expected_len).collect::<Vec<_>>(),
+        "history must hold every version exactly once"
+    );
+}
+
+/// Creates a Patient and soft-deletes it, returning its id: version 1 is the
+/// create, version 2 the tombstone.
+async fn seed_mongo_tombstone(backend: &MongoBackend, tenant: &TenantContext) -> String {
+    let created = backend
+        .create(
+            tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": "Seed"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .delete(tenant, "Patient", created.id())
+        .await
+        .unwrap();
+    created.id().to_string()
+}
+
+/// DoD rows (F5, restore path): two instances race unconditional PUTs onto
+/// one soft-deleted id; both succeed (winner restores, loser converges through
+/// the update arm), history is contiguous 1..=4 and the newest entry carries
+/// the live body. Without the retry the loser's CAS miss surfaced as a 404.
+#[tokio::test]
+async fn mongodb_integration_cluster_restore_deleted_race_keeps_history_coherent() {
+    let Some((a, b)) = two_mongo_handles("cluster_restore_race").await else {
+        return;
+    };
+    let (a, b) = (Arc::new(a), Arc::new(b));
+    let tenant = create_tenant("cluster-f5-restore");
+
+    for round in 0..5 {
+        let id = seed_mongo_tombstone(&a, &tenant).await;
+
+        let (ra, rb) = (Arc::clone(&a), Arc::clone(&b));
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let (id_a, id_b) = (id.clone(), id.clone());
+        let (res_a, res_b) = harness::race2(
+            async move {
+                ra.create_or_update(
+                    &tenant_a,
+                    "Patient",
+                    &id_a,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+            async move {
+                rb.create_or_update(
+                    &tenant_b,
+                    "Patient",
+                    &id_b,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+        )
+        .await;
+
+        let (stored_a, created_a) =
+            res_a.unwrap_or_else(|e| panic!("round {round}: PUT via A must succeed: {e:?}"));
+        let (stored_b, created_b) =
+            res_b.unwrap_or_else(|e| panic!("round {round}: PUT via B must succeed: {e:?}"));
+
+        let restored = |flag: bool| flag.then_some(());
+        harness::assert_exactly_one(
+            &restored(created_a),
+            &restored(created_b),
+            &format!("round {round}: the restore of one tombstone"),
+        );
+        assert_ne!(
+            stored_a.version_id(),
+            stored_b.version_id(),
+            "round {round}: racing writers must never assign the same version"
+        );
+
+        let current = a.read(&tenant, "Patient", &id).await.unwrap().unwrap();
+        assert_eq!(current.version_id(), "4", "round {round}");
+        assert!(!current.is_deleted(), "round {round}");
+        assert_mongo_history_versions(&b, &tenant, "Patient", &id, 4).await;
+
+        let history = b
+            .history_instance(
+                &tenant,
+                "Patient",
+                &id,
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap();
+        let newest = history
+            .items
+            .iter()
+            .max_by_key(|e| e.resource.version_id().parse::<u64>().unwrap())
+            .unwrap();
+        assert_eq!(
+            newest.resource.content(),
+            current.content(),
+            "round {round}: newest history entry must carry the live body"
+        );
+    }
+}
+
+/// DoD row (F5, restore path): isolation — a PUT onto the same id under
+/// another tenant creates a fresh version-1 resource there and leaves the
+/// first tenant's tombstone untouched.
+#[tokio::test]
+async fn mongodb_integration_cluster_restore_deleted_wrong_tenant_creates_not_restores() {
+    let Some((a, b)) = two_mongo_handles("cluster_restore_iso").await else {
+        return;
+    };
+    let tenant = create_tenant("cluster-f5-restore-iso");
+    let id = seed_mongo_tombstone(&a, &tenant).await;
+
+    let other = create_tenant("cluster-f5-restore-other");
+    let (stored, created) = b
+        .create_or_update(
+            &other,
+            "Patient",
+            &id,
+            json!({"resourceType": "Patient", "name": [{"family": "Other"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert!(created, "the other tenant must get a fresh resource");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(stored.tenant_id().as_str(), other.tenant_id().as_str());
+
+    match a.read(&tenant, "Patient", &id).await {
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+        got => panic!("first tenant's resource must still be deleted, got {got:?}"),
+    }
+    assert_mongo_history_versions(&a, &tenant, "Patient", &id, 2).await;
 }
