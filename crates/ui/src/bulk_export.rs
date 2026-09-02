@@ -578,6 +578,11 @@ struct BulkExportPage {
     available: bool,
     resource_types: Vec<String>,
     error: Option<String>,
+    name_error: Option<String>,
+    since_custom_error: Option<String>,
+    form: StartForm,
+    rejected: bool,
+    patient_value: String,
     patient_hint: String,
 }
 
@@ -632,7 +637,16 @@ pub async fn page(
     rv: RequestVersion,
     rt: RequestTenant,
 ) -> Response {
-    bulk_export_page(&state, locale, rv.0, &rt, None).await
+    bulk_export_page(
+        &state,
+        locale,
+        rv.0,
+        &rt,
+        StartForm::initial(),
+        StartErrors::default(),
+        None,
+    )
+    .await
 }
 
 async fn bulk_export_page(
@@ -640,6 +654,8 @@ async fn bulk_export_page(
     locale: RequestLocale,
     version: FhirVersion,
     rt: &RequestTenant,
+    mut form: StartForm,
+    errors: StartErrors,
     error: Option<String>,
 ) -> Response {
     let i18n = I18n::new(locale);
@@ -648,11 +664,14 @@ async fn bulk_export_page(
         .compartments
         .resource_type_names(&rt.id, version)
         .await;
+    form.normalize_for_view(&resource_types);
+    let patient_value = form.patients.join("\n");
     let patient_hint = if state.patient_name_search.load(Ordering::Relaxed) {
         i18n.t("bulk-export-field-patients-hint")
     } else {
         i18n.t("bulk-export-field-patients-id-only-hint")
     };
+    let rejected = errors.rejected || error.is_some();
     render(BulkExportPage {
         status,
         i18n,
@@ -660,6 +679,11 @@ async fn bulk_export_page(
         available: state.settings.is_some(),
         resource_types,
         error,
+        name_error: errors.name,
+        since_custom_error: errors.since_custom,
+        form,
+        rejected,
+        patient_value,
         patient_hint,
     })
 }
@@ -678,6 +702,43 @@ pub struct StartForm {
     pub since_preset: String,
     pub since_custom: String,
     pub patients: Vec<String>,
+}
+
+impl StartForm {
+    fn initial() -> Self {
+        Self {
+            scope: "system".to_string(),
+            all_types: true,
+            ..Default::default()
+        }
+    }
+
+    fn normalize_for_view(&mut self, resource_types: &[String]) {
+        if !matches!(self.scope.as_str(), "system" | "patient" | "group") {
+            self.scope = "system".to_string();
+        }
+        if !matches!(
+            self.since_preset.as_str(),
+            "" | "day" | "week" | "month" | "custom"
+        ) {
+            self.since_preset.clear();
+        }
+        let mut seen = HashSet::new();
+        self.types.retain(|resource_type| {
+            resource_types.contains(resource_type) && seen.insert(resource_type.clone())
+        });
+    }
+
+    fn has_type(&self, resource_type: &str) -> bool {
+        self.types.iter().any(|selected| selected == resource_type)
+    }
+}
+
+#[derive(Default)]
+struct StartErrors {
+    name: Option<String>,
+    since_custom: Option<String>,
+    rejected: bool,
 }
 
 fn parse_start_form(body: &str) -> StartForm {
@@ -704,15 +765,97 @@ fn parse_start_form(body: &str) -> StartForm {
     form
 }
 
-/// Maps the Since preset (or the custom stamp) onto an `_since` instant.
-fn since_instant(preset: &str, custom: &str) -> String {
+/// Maps the Since preset (or a valid, non-empty custom stamp) onto `_since`.
+fn has_fhir_r4_instant_lexical_form(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+
+    let number = |start: usize, end: usize| {
+        bytes
+            .get(start..end)?
+            .iter()
+            .try_fold(0_u32, |value, byte| {
+                byte.is_ascii_digit()
+                    .then_some(value * 10 + u32::from(*byte - b'0'))
+            })
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0, 4),
+        number(5, 7),
+        number(8, 10),
+        number(11, 13),
+        number(14, 16),
+        number(17, 19),
+    ) else {
+        return false;
+    };
+    if year == 0
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return false;
+    }
+
+    let mut zone_start = 19;
+    if bytes.get(zone_start) == Some(&b'.') {
+        zone_start += 1;
+        let fraction_start = zone_start;
+        while bytes.get(zone_start).is_some_and(u8::is_ascii_digit) {
+            zone_start += 1;
+        }
+        if zone_start == fraction_start {
+            return false;
+        }
+    }
+
+    match bytes.get(zone_start) {
+        Some(b'Z') => zone_start + 1 == bytes.len(),
+        Some(b'+') | Some(b'-') => {
+            if bytes.len() != zone_start + 6 || bytes.get(zone_start + 3) != Some(&b':') {
+                return false;
+            }
+            let (Some(offset_hour), Some(offset_minute)) = (
+                number(zone_start + 1, zone_start + 3),
+                number(zone_start + 4, zone_start + 6),
+            ) else {
+                return false;
+            };
+            offset_minute <= 59 && (offset_hour <= 13 || (offset_hour == 14 && offset_minute == 0))
+        }
+        _ => false,
+    }
+}
+
+fn since_instant(preset: &str, custom: &str) -> Result<String, ()> {
     let ago = |d: Duration| (Utc::now() - d).to_rfc3339_opts(SecondsFormat::Secs, true);
     match preset {
-        "day" => ago(Duration::days(1)),
-        "week" => ago(Duration::days(7)),
-        "month" => ago(Duration::weeks(4)),
-        "custom" => custom.trim().to_string(),
-        _ => String::new(),
+        "day" => Ok(ago(Duration::days(1))),
+        "week" => Ok(ago(Duration::days(7))),
+        "month" => Ok(ago(Duration::weeks(4))),
+        "custom" => {
+            let custom = custom.trim();
+            if custom.is_empty() {
+                Ok(String::new())
+            } else {
+                has_fhir_r4_instant_lexical_form(custom)
+                    .then_some(())
+                    .ok_or(())
+                    .and_then(|_| chrono::DateTime::parse_from_rfc3339(custom).map_err(|_| ()))
+                    .map(|_| custom.to_string())
+            }
+        }
+        _ => Ok(String::new()),
     }
 }
 
@@ -1018,7 +1161,6 @@ pub async fn start(
     axum::extract::RawForm(body): axum::extract::RawForm,
 ) -> Response {
     let form = parse_start_form(&String::from_utf8_lossy(&body));
-    let user_key = settings_user_key(principal.as_deref());
     let scope = match form.scope.as_str() {
         "patient" | "group" => form.scope.clone(),
         _ => "system".to_string(),
@@ -1028,21 +1170,30 @@ pub async fn start(
     } else {
         Ok(Vec::new())
     };
-    let patient_refs = match patient_refs {
-        Ok(patient_refs) => patient_refs,
-        Err(()) => {
-            let mut response = bulk_export_page(
-                &state,
-                locale,
-                rv.0,
-                &rt,
-                Some(I18n::new(locale).t("bulk-export-patient-invalid")),
-            )
-            .await;
-            *response.status_mut() = StatusCode::BAD_REQUEST;
-            return response;
-        }
+    let since = since_instant(&form.since_preset, &form.since_custom);
+    let i18n = I18n::new(locale);
+    let errors = StartErrors {
+        name: form
+            .name
+            .trim()
+            .is_empty()
+            .then(|| i18n.t("bulk-export-name-required")),
+        since_custom: since.is_err().then(|| i18n.t("bulk-export-since-invalid")),
+        rejected: true,
     };
+    let patient_error = patient_refs
+        .is_err()
+        .then(|| i18n.t("bulk-export-patient-invalid"));
+    if errors.name.is_some() || errors.since_custom.is_some() || patient_error.is_some() {
+        let mut response =
+            bulk_export_page(&state, locale, rv.0, &rt, form, errors, patient_error).await;
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        return response;
+    }
+
+    let patient_refs = patient_refs.expect("patient references were validated");
+    let since = since.expect("custom instant was validated");
+    let user_key = settings_user_key(principal.as_deref());
     let snapshot = load_jobs(&state, &user_key, &rt.id).await;
     let mut job = ExportJob {
         name: form.name.trim().to_string(),
@@ -1055,7 +1206,7 @@ pub async fn start(
         },
         elements: form.elements.trim().to_string(),
         type_filter: form.type_filter.trim().to_string(),
-        since: since_instant(&form.since_preset, &form.since_custom),
+        since,
         patient_refs,
         fhir_version: Some(rv.0),
         status: "in-progress".to_string(),

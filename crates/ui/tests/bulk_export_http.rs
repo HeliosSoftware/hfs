@@ -767,6 +767,19 @@ async fn seed_job_for_user(
         .expect("seed export job");
 }
 
+async fn assert_no_default_user_jobs(backend: &SqliteBackend) {
+    let settings = backend.get_settings("l2:").await.unwrap();
+    assert!(
+        settings
+            .as_ref()
+            .and_then(|settings| settings
+                .document
+                .pointer("/byTenant/default/bulkExport/jobs"))
+            .is_none(),
+        "invalid input must not persist any export job"
+    );
+}
+
 #[tokio::test]
 async fn the_root_is_the_management_page_and_new_is_the_builder() {
     let (base, mock, _) = serve().await;
@@ -793,6 +806,9 @@ async fn the_root_is_the_management_page_and_new_is_the_builder() {
     assert!(html.contains(r#"<span class="typegrid__label">Patient</span>"#));
     assert!(html.contains("Narrow it down"));
     assert!(html.contains("Start Export"));
+    assert!(html.contains(
+        r#"<h1 class="page-head__title" data-bulk-export-name-heading>Bulk Export</h1>"#
+    ));
     assert!(html.contains(r#"<script src="/ui/assets/resource-filter.js" defer></script>"#));
     assert!(html.contains(r#"<script src="/ui/assets/bulk-export.js" defer></script>"#));
     assert!(html.contains(r#"<form method="post" action="/ui/bulk-export""#));
@@ -818,6 +834,18 @@ async fn the_export_page_uses_form_panels_with_name_and_all_resources_up_top() {
     let name_pos = html.find(r#"name="name""#).expect("name field present");
     let scope_pos = html.find(r#"name="scope""#).expect("scope radios present");
     assert!(name_pos < scope_pos, "Name should precede the scope radios");
+    assert!(
+        html.contains(r#"name="name" required autocomplete="off""#),
+        "Name stays semantically required"
+    );
+    assert!(
+        html.contains(r#"class="bulk-export-form" novalidate"#),
+        "the app and server own validation feedback instead of the browser"
+    );
+    assert!(!html.contains("data-validation-started"));
+    assert!(html.contains(
+        r#"id="bulk-export-name-error" class="field__hint field__hint--error" role="alert" hidden>Enter a name for this export.</span>"#
+    ));
 
     // All Resources is the explicit default above the checkbox grid. The old
     // implicit "leave everything unchecked" hint is retired.
@@ -860,6 +888,18 @@ async fn the_export_page_uses_form_panels_with_name_and_all_resources_up_top() {
             .expect("custom instant input ends");
     let since_custom = &html[since_custom_start..=since_custom_end];
     assert!(!since_custom.contains("disabled"));
+    assert!(since_custom.contains(r#"data-pattern="([0-9]([0-9]"#));
+    assert!(since_custom.contains(r#"([0-5][0-9]|60)"#));
+    assert!(since_custom.contains(r#"|14:00))"#));
+    assert!(
+        !since_custom.contains(" pattern="),
+        "the native constraint UI must not intercept app-owned validation"
+    );
+    assert!(html.contains(
+        r#"id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert" hidden>Enter a valid FHIR instant"#
+    ));
+    assert!(!html.contains("Used when Since is Custom"));
+    assert!(!html.contains("bulk-export-field-since-custom-hint"));
 }
 
 #[tokio::test]
@@ -902,11 +942,26 @@ async fn the_export_builder_uses_the_localized_shared_back_link() {
     let copy_position = header.find(r#"class="page-head__copy""#).unwrap();
     assert!(back_link_position < copy_position);
     assert!(!header.contains(r#"class="page-head__action""#));
-    for (lang, label) in [("es", "Exportaciones"), ("de", "Exporte")] {
+    for (lang, label, name_error, since_error) in [
+        (
+            "es",
+            "Exportaciones",
+            "Ingresa un nombre para esta exportación.",
+            "Ingresa un instante FHIR válido",
+        ),
+        (
+            "de",
+            "Exporte",
+            "Geben Sie einen Namen für diesen Export ein.",
+            "Geben Sie einen gültigen FHIR-Zeitpunkt ein",
+        ),
+    ] {
         let (status, localized_html) =
             get_text(&base, &format!("/ui/bulk-export/new?lang={lang}")).await;
         assert_eq!(status, 200);
         assert_back_link(&localized_html, label);
+        assert!(localized_html.contains(name_error), "{localized_html}");
+        assert!(localized_html.contains(since_error), "{localized_html}");
     }
 }
 
@@ -941,7 +996,7 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
         &base,
         "/ui/bulk-export",
         &[
-            ("name", "Everything"),
+            ("name", "  Everything <img src=x>  "),
             ("scope", "system"),
             ("types", "Patient"),
             ("types", "Observation"),
@@ -964,7 +1019,10 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
 
     // The Exports page shows it in progress.
     let (_, html) = get_text(&base, "/ui/bulk-export").await;
-    assert!(html.contains("Everything"));
+    assert!(
+        html.contains(r#"<h2 class="job-card__name">Everything &#60;img src=x&#62;</h2>"#),
+        "{html}"
+    );
     assert!(html.contains("In progress"));
     // The card's own poll URL (not the layout's tenant-menu hx-get).
     let card_path = html
@@ -976,16 +1034,235 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
 
     // First card fetch: one poll -> 202 with progress, still polling.
     let (_, html) = get_text(&base, &card_path).await;
+    assert!(
+        html.contains(r#"<h2 class="job-card__name">Everything &#60;img src=x&#62;</h2>"#),
+        "{html}"
+    );
     assert!(html.contains("18% complete"), "{html}");
     assert!(html.contains("every 5s"));
 
     // Second: the mock flips to 200 -> complete with two files, no polling.
     let (_, html) = get_text(&base, &card_path).await;
+    assert!(
+        html.contains(r#"<h2 class="job-card__name">Everything &#60;img src=x&#62;</h2>"#),
+        "{html}"
+    );
     assert!(html.contains("Complete"), "{html}");
     assert!(html.contains("Patient"));
     assert!(html.contains("Observation"));
     assert!(html.contains("Download All Resources"));
     assert!(!html.contains("every 5s"));
+}
+
+#[tokio::test]
+async fn invalid_start_fields_return_one_400_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "   "),
+            ("scope", "patient"),
+            ("patient", "Patient/not/valid"),
+            ("since_preset", "custom"),
+            ("since_custom", "not-a-date"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert!(html.contains("Enter a name for this export."), "{html}");
+    assert!(html.contains("Enter a valid FHIR instant"), "{html}");
+    assert!(html.contains("valid logical Patient IDs"), "{html}");
+    assert!(html.contains(r#"id="bulk-export-name-error""#), "{html}");
+    assert!(
+        html.contains(r#"id="bulk-export-since-custom-error""#),
+        "{html}"
+    );
+    assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 2);
+    assert!(
+        html.contains(r#"novalidate data-validation-started="true""#),
+        "{html}"
+    );
+    assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+    assert!(
+        html.contains(r#"autofocus aria-invalid="true" aria-describedby="bulk-export-name-error""#),
+        "{html}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+#[tokio::test]
+async fn an_invalid_active_custom_instant_repopulates_the_representable_form() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "  Preserved & named  "),
+            ("scope", "patient"),
+            ("group_id", "unused-group"),
+            ("types", "Patient"),
+            ("types", "Patient"),
+            ("types", "NotAResource"),
+            ("elements", "id,<meta>"),
+            ("type_filter", "Patient?name=A&B"),
+            ("patient", "Patient/p-104"),
+            ("patient", "Patient/p-205"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-02-31T00:00:00Z"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert!(html.contains("Enter a valid FHIR instant"), "{html}");
+    assert!(
+        html.contains(r#"novalidate data-validation-started="true""#),
+        "{html}"
+    );
+    assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+    assert!(
+        html.contains(
+            r#"autofocus aria-invalid="true" aria-describedby="bulk-export-since-custom-error""#
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"value="  Preserved &#38; named  ""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"name="scope" value="patient" checked"#),
+        "{html}"
+    );
+    assert!(html.contains(r#"value="unused-group""#), "{html}");
+    assert!(
+        html.contains(r#"name="types" value="Patient" checked"#),
+        "{html}"
+    );
+    assert!(!html.contains(r#"value="NotAResource""#), "{html}");
+    assert!(html.contains(r#"value="id,&#60;meta&#62;""#), "{html}");
+    assert!(html.contains(r#"value="Patient?name=A&#38;B""#), "{html}");
+    assert!(
+        html.contains(r#"<option value="custom" selected>"#),
+        "{html}"
+    );
+    assert!(html.contains(r#"value="2026-02-31T00:00:00Z""#), "{html}");
+    assert!(
+        html.contains("Patient/p-104\nPatient/p-205</textarea>"),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"<a class="btn" href="/ui/bulk-export/new">Clear</a>"#),
+        "{html}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+#[tokio::test]
+async fn blank_custom_is_omitted_and_inactive_stale_custom_is_ignored() {
+    let (base, mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Blank custom"),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "   "),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Inactive custom"),
+            ("scope", "system"),
+            ("since_preset", "week"),
+            ("since_custom", "not-a-date"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 2);
+    assert!(query_values(&kickoffs[0].1, "_since").is_empty());
+    let inactive_since = query_values(&kickoffs[1].1, "_since");
+    assert_eq!(inactive_since.len(), 1);
+    assert_ne!(inactive_since[0], "not-a-date");
+}
+
+#[tokio::test]
+async fn valid_fractional_and_offset_custom_instants_keep_their_wire_value() {
+    let (base, mock, _) = serve().await;
+    let instants = [
+        "2026-08-01T00:00:00.123Z",
+        "2026-08-01T03:30:00+03:30",
+        "2026-12-31T23:59:60Z",
+        "2026-08-01T00:00:00+14:00",
+    ];
+
+    for (index, instant) in instants.iter().enumerate() {
+        let name = format!("Valid custom {index}");
+        let (status, _) = post_form(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", &name),
+                ("scope", "system"),
+                ("since_preset", "custom"),
+                ("since_custom", instant),
+            ],
+        )
+        .await;
+        assert_eq!(status, 303);
+    }
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), instants.len());
+    for (kickoff, expected) in kickoffs.iter().zip(instants) {
+        assert_eq!(query_values(&kickoff.1, "_since"), vec![expected]);
+    }
+}
+
+#[tokio::test]
+async fn fhir_r4_lexically_invalid_instants_fail_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+
+    for (index, instant) in [
+        "0000-08-01T00:00:00Z",
+        "2026-08-01T00:00:00+14:01",
+        "2026-08-01T00:00:00+15:00",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("Invalid FHIR instant {index}");
+        let (status, html) = post_form_body(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", &name),
+                ("scope", "system"),
+                ("since_preset", "custom"),
+                ("since_custom", instant),
+            ],
+        )
+        .await;
+        assert_eq!(status, 400, "{instant}: {html}");
+        assert!(html.contains("Enter a valid FHIR instant"), "{html}");
+    }
+
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
 }
 
 #[tokio::test]
@@ -996,6 +1273,7 @@ async fn all_resources_omits_type_even_when_a_hostile_form_sends_types() {
         &base,
         "/ui/bulk-export",
         &[
+            ("name", "Hostile all resources"),
             ("scope", "system"),
             ("types", "Patient"),
             ("all_types", "not-a-boolean"),
@@ -1032,7 +1310,12 @@ async fn self_calls_ignore_public_host_and_prefix_but_validate_advertised_paths(
         let public_base = "https://public.example/fhir";
         let (base, mock, _) =
             serve_with_separate_public_base(public_base, tenant_path_routing).await;
-        post_form(&base, "/ui/bulk-export", &[("scope", "system")]).await;
+        post_form(
+            &base,
+            "/ui/bulk-export",
+            &[("name", "Self call"), ("scope", "system")],
+        )
+        .await;
         let kickoff = mock.kickoffs.lock().unwrap().clone();
         assert_eq!(kickoff.len(), 1);
         assert_eq!(kickoff[0].0, kickoff_path);
@@ -1150,11 +1433,20 @@ async fn legacy_non_202_failures_are_the_only_empty_url_jobs_deletable_locally()
 async fn patient_and_group_scopes_hit_their_export_paths() {
     let (base, mock, _) = serve().await;
 
-    post_form(&base, "/ui/bulk-export", &[("scope", "patient")]).await;
     post_form(
         &base,
         "/ui/bulk-export",
-        &[("scope", "group"), ("group_id", "cohort-7")],
+        &[("name", "Patient export"), ("scope", "patient")],
+    )
+    .await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Group export"),
+            ("scope", "group"),
+            ("group_id", "cohort-7"),
+        ],
     )
     .await;
 
@@ -1215,7 +1507,12 @@ async fn a_rejected_kickoff_lands_as_failed_and_retry_reruns_it() {
 #[tokio::test]
 async fn cancelling_deletes_the_job_server_side() {
     let (base, mock, _) = serve().await;
-    post_form(&base, "/ui/bulk-export", &[("scope", "system")]).await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Cancelable"), ("scope", "system")],
+    )
+    .await;
 
     let (_, html) = get_text(&base, "/ui/bulk-export").await;
     let cancel_path = html
@@ -1433,7 +1730,12 @@ async fn another_authenticated_user_cannot_delete_the_owners_job() {
 #[tokio::test]
 async fn a_stale_poll_cannot_recreate_a_concurrently_deleted_job() {
     let (base, mock, backend) = serve().await;
-    post_form(&base, "/ui/bulk-export", &[("scope", "system")]).await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Concurrent poll"), ("scope", "system")],
+    )
+    .await;
     let (_, html) = get_text(&base, "/ui/bulk-export").await;
     let card_path = html
         .split("hx-get=\"")
@@ -1936,7 +2238,12 @@ async fn redirect_and_midstream_source_failures_surface_as_body_errors() {
 async fn zero_output_hides_download_and_rejects_a_forged_direct_request() {
     let (base, mock, _) = serve().await;
     *mock.outputs.lock().unwrap() = Vec::new();
-    post_form(&base, "/ui/bulk-export", &[("scope", "system")]).await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Zero output"), ("scope", "system")],
+    )
+    .await;
     let (_, html) = get_text(&base, "/ui/bulk-export").await;
     let card_path = html
         .split("hx-get=\"")
@@ -2493,11 +2800,19 @@ async fn invalid_patient_input_fails_without_export_all_and_other_scopes_ignore_
     let (status, html) = post_form_body(
         &base,
         "/ui/bulk-export",
-        &[("scope", "patient"), ("patient", "Patient/not/valid")],
+        &[
+            ("name", "Invalid patient"),
+            ("scope", "patient"),
+            ("patient", "Patient/not/valid"),
+        ],
     )
     .await;
     assert_eq!(status, 400);
     assert!(html.contains("valid logical Patient IDs"), "{html}");
+    assert!(
+        html.contains(r#"novalidate data-validation-started="true""#),
+        "{html}"
+    );
     assert!(mock.kickoffs.lock().unwrap().is_empty());
     let (_, html) = get_text(&base, "/ui/bulk-export").await;
     assert!(!html.contains("valid logical Patient IDs"), "{html}");
@@ -2505,22 +2820,14 @@ async fn invalid_patient_input_fails_without_export_all_and_other_scopes_ignore_
         !html.contains("Retry"),
         "invalid input must not create a card"
     );
-    let settings = backend.get_settings("l2:").await.unwrap();
-    assert!(
-        settings
-            .as_ref()
-            .and_then(|settings| settings
-                .document
-                .pointer("/byTenant/default/bulkExport/jobs"))
-            .is_none(),
-        "invalid input must not persist any export job"
-    );
+    assert_no_default_user_jobs(&backend).await;
 
     for scope in ["system", "group"] {
         post_form(
             &base,
             "/ui/bulk-export",
             &[
+                ("name", "Ignore invalid patient"),
                 ("scope", scope),
                 ("group_id", "g-1"),
                 ("patient", "Patient/not/valid"),

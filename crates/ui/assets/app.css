@@ -1481,6 +1481,15 @@ textarea.field__input {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+.field__input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.field__input[aria-invalid="true"]:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
 /* The native dropdown arrow hugs the border regardless of padding, so draw
    our own chevron with the same inset the text gets. The muted gray reads on
    both themes. */
@@ -5957,7 +5966,11 @@ details.json-fold[open] > summary .icon {
   color: var(--muted);
 }
 
-/* ---- Exports job cards (#735, #795) ---------------------------------- */
+/* ---- Exports builder and job cards (#735, #795, #832) ---------------- */
+
+[data-bulk-export-name-heading] {
+  overflow-wrap: anywhere;
+}
 
 .job-card {
   padding: 14px;
@@ -5971,10 +5984,12 @@ details.json-fold[open] > summary .icon {
 }
 
 .job-card__name {
+  min-width: 0;
   margin: 0;
   font-size: 15px;
   font-weight: 600;
   color: var(--text-strong);
+  overflow-wrap: anywhere;
 }
 
 .job-card__actions {
