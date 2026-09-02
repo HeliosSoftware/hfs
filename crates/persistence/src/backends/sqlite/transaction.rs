@@ -563,14 +563,13 @@ impl TransactionProvider for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let fhir_version = options.fhir_version.unwrap_or(self.config().fhir_version);
 
-        // Warm the tenant's search-parameter registry cache from THIS
-        // connection on a miss, rather than leaving it to the first
-        // `tenant_extractor(tenant_id)` lookup `index_resource_dynamic` makes
-        // per entry (`storage.rs`) — that lookup falls back to the pool-based
-        // loader on a cache miss, which needs a *second*, simultaneous
-        // connection alongside this transaction's own (#787). Warming it here
-        // with the connection already in hand means every entry in this
-        // transaction hits the warm cache instead.
+        // Warm this tenant's search-parameter registry from THIS connection
+        // on a cache miss, rather than letting the backend's indexing path
+        // ask the pool for a second, simultaneous one (#787) — see
+        // `load_tenant_stored_params_with_conn`. Writes in this transaction
+        // index through `SqliteBackend::index_resource`, whose extractor
+        // reads the registry cache populated here; a cached registry skips
+        // the query entirely, same as the non-transactional path.
         if self.tenant_registries().cached(tenant_id).is_none() {
             let stored = load_tenant_stored_params_with_conn(&conn, fhir_version, tenant_id)
                 .map_err(|e| {

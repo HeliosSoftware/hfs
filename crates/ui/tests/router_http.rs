@@ -8,6 +8,8 @@ use axum::{
     http::{Request, StatusCode, header},
     routing::get,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use helios_persistence::{
     StorageResult,
     core::{SettingsStore, StoredUserSettings},
@@ -352,7 +354,7 @@ async fn embedded_assets_are_served() {
     }
 }
 
-/// #753 ticket 01: the vendored CodeMirror 6 + lezer-fhirpath bundle is
+/// #753: the vendored CodeMirror 6 + lezer-fhirpath bundle is
 /// served like every other embedded asset — same route shape, same
 /// JavaScript content type — with no change to how assets are declared or
 /// served (rust-embed already walks subfolders; `assets/fonts/` is the
@@ -2385,10 +2387,127 @@ async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
     assert!(html.contains("SELECT 3"));
 }
 
+/// `application/x-www-form-urlencoded`-encodes `s`, byte by byte, so tests
+/// can post arbitrary text (newlines, tabs, quotes, non-ASCII) without
+/// pulling in a form-encoding crate just for this.
+fn form_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The inverse of Askama's default HTML auto-escaping, so a value read back
+/// out of a rendered `<textarea>` can be compared against the exact text
+/// that was posted.
+fn html_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The exact text between the SQL pane's `<textarea name="sql" ...>` open
+/// tag and its `</textarea>` close tag, HTML-unescaped.
+fn sql_textarea_value(html: &str) -> String {
+    let open_tag_end = html
+        .find(r#"name="sql""#)
+        .and_then(|from| html[from..].find('>').map(|to| from + to + 1))
+        .expect("a <textarea name=\"sql\"> open tag");
+    let close = html[open_tag_end..]
+        .find("</textarea>")
+        .expect("a matching </textarea>");
+    html_unescape(&html[open_tag_end..open_tag_end + close])
+}
+
+/// #838: arbitrary SQL text — newlines, a tab, single
+/// quotes, a SQLite `:ward`-style bind parameter, a non-ASCII character, and
+/// a `--` line comment — must round-trip byte for byte through both halves
+/// of the SQL pane's plumbing: decoding the stored base64 attachment back
+/// into the textarea (`extract_sql`, exercised via a GET), and posting the
+/// textarea's exact text back through the form (`SqlLibSaveForm`, exercised
+/// via a POST). `StaticConformanceSource::save_resource` is a stub that
+/// echoes an id but does not persist (see `sql_library_workspaces_split_
+/// kinds_and_roundtrip_sql` above, which stops at the redirect for the same
+/// reason), so the POST half is proven the same way that test's own "bad
+/// JSON" case already does: force the error-page branch, which re-renders
+/// the exact `sql` field it was posted, in the same response, with no
+/// storage round trip involved.
+#[tokio::test]
+async fn sql_editor_save_roundtrips_special_characters_byte_for_byte() {
+    let sql = "SELECT *\nFROM patients\t-- niño's row\nWHERE ward = :ward\n";
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "special_chars",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode(sql)}]}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    // Decode half: the stored attachment comes back exactly as-is.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert_eq!(sql_textarea_value(&html), sql);
+
+    // Encode/parse half: an invalid-JSON save re-renders the same response
+    // (no redirect, no storage) with the posted `sql` field preserved as-is.
+    let body = format!("id=&action=save&sql={}&json=%7Bnope", form_encode(sql));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert_eq!(sql_textarea_value(&html), sql);
+}
+
 /// #649: the View Definitions workspace lists stored views in the rail
-/// (name-sorted, first selected), edits the selection as JSON, offers the
-/// starter document under Create New, and previews rows through $sql-run in
-/// the view's declared column order.
+/// (name-sorted, first selected), edits the selection as JSON, and offers
+/// the starter document under Create New. #752 ticket 02, RF1: there is no
+/// `?run=1` — it is no longer read by the handler and has no effect.
 #[tokio::test]
 async fn view_definitions_workspace_lists_edits_and_previews() {
     let vds = vec![
@@ -2437,8 +2556,23 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     // Delete goes through the shared conformance CRUD script.
     assert!(html.contains(r#"data-crud-delete"#));
     assert!(html.contains("/ui/assets/conformance-crud.js"));
+    // #752 ticket 02, RF1/RF2: no Run link, no `<details>` fold — the
+    // editor card is always open with the "Runs as you type" legend, and
+    // the results region's own empty notice is always present.
+    assert!(!html.contains("run=1"));
+    assert!(!html.contains("json-fold"));
+    assert!(html.contains("editor-legend__live"));
+    assert!(html.contains(r#"id="vd-run-notice""#));
+    assert!(html.contains(r#"hx-post="/ui/sql/view-definitions/run""#));
+    // RF4: no server-side results yet, so the notice's own empty shell
+    // carries the initial-load trigger.
+    assert!(html.contains(r#"hx-trigger="load""#));
+    // RF3: no results card until something has actually run — only the
+    // empty placeholder the first live fragment's OOB swap anchors onto.
+    assert!(!html.contains("table-card"));
+    assert!(html.contains(r#"<div id="vd-results"></div>"#));
 
-    // ?run=1 previews through $sql-run: declared column order, row rendered.
+    // RF1: `?run=1` is no longer read by the handler — no results card.
     let response = app
         .clone()
         .oneshot(
@@ -2449,8 +2583,7 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
         .await
         .unwrap();
     let html = body_text(response).await;
-    assert!(html.contains("<th>id</th><th>family</th>"));
-    assert!(html.contains("<td>p1</td><td>Doe</td>"));
+    assert!(!html.contains("table-card"));
 
     // Create New offers the starter document in the editor.
     let response = app
@@ -2465,18 +2598,34 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     let html = body_text(response).await;
     assert!(html.contains("new_view"));
     assert!(html.contains("getResourceKey()"));
+    // RF4/NF5: `?vd=new` selects the starter document, so the results
+    // region's own load trigger fires for it exactly like a stored view.
+    assert!(html.contains(r#"hx-trigger="load""#));
 }
 
-/// #753 ticket 02: the CodeMirror 6 bundle (ticket 01) and vd-editor.js load,
-/// in that order, only on the ViewDefinition page — vd-editor.js reads
-/// `window.HfsCodeMirror` at the top of its IIFE, so the bundle must be
-/// first. No other page (checked here: the dashboard and the Resource
-/// Editor) mentions either script.
+/// #752 ticket 02, RF6: `?vd=<id>&saved=1` (Save's own redirect) renders the
+/// just-stored definition's `$sql-run` results server-side — the nojs path
+/// to the playground's live preview. The success case's results card comes
+/// with a working meta and no load trigger left behind (RF4: results
+/// already present, so the client must not ask again); the failure case
+/// shows `vd-run-failed` instead, with no results card.
 #[tokio::test]
-async fn vd_editor_scripts_load_only_on_the_view_definitions_page() {
-    let response = app()
+async fn view_definitions_saved_redirect_renders_results_server_side() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![vd.clone()],
+        )
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = view_definitions_app(source);
+    let response = app
         .oneshot(
-            Request::get("/ui/sql/view-definitions")
+            Request::get("/ui/sql/view-definitions?vd=vd1&saved=1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2484,14 +2633,296 @@ async fn vd_editor_scripts_load_only_on_the_view_definitions_page() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    assert!(
-        html.contains(r#"<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>"#)
+    assert!(html.contains(r#"id="vd-results""#));
+    assert!(html.contains("<th>id</th>"));
+    assert!(html.contains("<td>p1</td>"));
+    let meta = text_between(
+        &html,
+        r#"id="vd-results-meta" class="card-head__meta">"#,
+        "</span>",
     );
-    assert!(html.contains(r#"<script src="/ui/assets/vd-editor.js" defer></script>"#));
-    assert!(
-        html.find("/ui/assets/vendor/codemirror.bundle.js") < html.find("/ui/assets/vd-editor.js"),
-        "the CodeMirror bundle must load before vd-editor.js"
+    assert!(meta.starts_with("1 rows"), "{meta}");
+    // RF4: results already arrived server-side, so the notice must not also
+    // carry the client-driven initial-load trigger.
+    assert!(!html.contains(r#"hx-trigger="load""#));
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Err("boom".into()));
+    let app = view_definitions_app(source);
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("notice--warn"));
+    assert!(html.contains("boom"));
+    // RF7: no real results card on a failed run — just the anchor placeholder
+    // a later successful edit's OOB swap needs (see the partial's own
+    // header comment for why).
+    assert!(!html.contains("table-card"));
+    assert!(html.contains(r#"<div id="vd-results"></div>"#));
+    assert!(!html.contains(r#"hx-trigger="load""#));
+}
+
+/// The text between two markers in `html`, panicking (with the marker named)
+/// if either is missing — used by the `/run` fragment tests to read the
+/// meta span's own text (`{ $rows } rows · { $ms } ms`) without depending on
+/// the exact millisecond count a test run measures.
+fn text_between<'a>(html: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+    let start = html
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("{start_marker} present in {html}"))
+        + start_marker.len();
+    let end = html[start..]
+        .find(end_marker)
+        .unwrap_or_else(|| panic!("{end_marker} present after {start_marker}"))
+        + start;
+    &html[start..end]
+}
+
+fn urlencoded_json_body(document: &serde_json::Value) -> String {
+    form_urlencoded::Serializer::new(String::new())
+        .append_pair("json", &document.to_string())
+        .finish()
+}
+
+/// #752 ticket 01, RF4: the fragment endpoint runs the *posted* text, not a
+/// stored resource — the playground's whole point. The success fragment
+/// opens with an empty `#vd-run-notice`, then `#vd-results` carries its own
+/// `hx-swap-oob`, with the view's declared column order, the canned row,
+/// and a `{ $rows } rows · { $ms } ms` meta.
+#[tokio::test]
+async fn view_definitions_run_previews_the_posted_document_via_an_oob_fragment() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, Vec::new())
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1", "family": "Doe"})]));
+    let app = view_definitions_app(source);
+
+    // Deliberately never stored (RF2/RF3: "contenido no guardado") — proves
+    // the handler ran the request body, not a resource fetched by id.
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "name": "unsaved_view",
+        "status": "draft",
+        "resource": "Patient",
+        "select": [{"column": [
+            {"name": "id", "path": "getResourceKey()"},
+            {"name": "family", "path": "name.family.first()"}
+        ]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(urlencoded_json_body(&vd)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/html; charset=utf-8"
     );
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<div id="vd-run-notice"></div>"#));
+    assert!(html.contains(r#"id="vd-results""#));
+    assert!(html.contains(r#"hx-swap-oob="outerHTML""#));
+    assert!(html.contains("<th>id</th><th>family</th>"));
+    assert!(html.contains("<td>p1</td><td>Doe</td>"));
+    let meta = text_between(
+        &html,
+        r#"id="vd-results-meta" class="card-head__meta">"#,
+        "</span>",
+    );
+    assert!(meta.starts_with("1 rows"), "{meta}");
+    assert!(meta.ends_with(" ms"), "{meta}");
+}
+
+/// #752 ticket 01, RF5: a failed run answers `200` (NF3 — htmx never swaps
+/// an error status) with the notice carrying the server's message, the meta
+/// relabelled to "last successful run" via its own OOB swap, and no
+/// `#vd-results` at all — the client's previous table is left alone.
+#[tokio::test]
+async fn view_definitions_run_reports_a_failed_run_without_a_results_card() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Err("boom".into()));
+    let app = view_definitions_app(source);
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(urlencoded_json_body(&vd)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("boom"));
+    assert!(html.contains(r#"<div id="vd-run-notice">"#));
+    assert!(html.contains(
+        r#"id="vd-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
+    ));
+    assert!(!html.contains(r#"id="vd-results""#));
+}
+
+/// #752 ticket 01, RF6: invalid JSON never reaches `$sql-run` — the seeded
+/// rows would show up in the response if it had — and reports the parse
+/// error in the same notice-only shape as a failed run, still `200`.
+#[tokio::test]
+async fn view_definitions_run_reports_invalid_json_without_calling_sql_run() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("json=%7B"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(!html.contains(r#"id="vd-results""#));
+    assert!(!html.contains("<table"));
+    assert!(!html.contains("<td>p1</td>"));
+}
+
+/// #752 ticket 01, RF2: a body with no `json` field is the one case this
+/// endpoint answers with a genuine error status — axum's own `Form`
+/// rejection, not a hand-rolled one. `422 Unprocessable Entity`, not `400`:
+/// axum's `Form` extractor reports a `POST` body it cannot deserialize (a
+/// missing field included) as `422`, reserving `400` for a query-string
+/// (`GET`) rejection or a request with the wrong content type — see
+/// `axum::form::tests::deserialize_error_status_codes` (axum 0.8.4). Either
+/// way it is a real 4xx, not the 2xx fragment contract RF4–RF6 describe.
+#[tokio::test]
+async fn view_definitions_run_without_a_json_field_is_unprocessable() {
+    let app = view_definitions_app(helios_ui::StaticConformanceSource::empty());
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("other=1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// #752 ticket 01, RF4: a run with no output rows still renders the results
+/// card — `data-table__empty` plus a `0 rows` meta — not the failure notice.
+#[tokio::test]
+async fn view_definitions_run_with_no_rows_renders_the_empty_state() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+    let app = view_definitions_app(source);
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(urlencoded_json_body(&vd)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"class="data-table__empty""#));
+    let meta = text_between(
+        &html,
+        r#"id="vd-results-meta" class="card-head__meta">"#,
+        "</span>",
+    );
+    assert!(meta.starts_with("0 rows"), "{meta}");
+}
+
+/// #838: the vendored CodeMirror 6 bundle and the
+/// shared `code-editor.js` mount helper load, in that order, on every page
+/// that mounts a CodeMirror editor — `code-editor.js` reads
+/// `window.HfsCodeMirror` at the top of its IIFE, so the bundle must load
+/// first. Each page's own editor script (`vd-editor.js` on the
+/// ViewDefinition page, `sql-editor.js` on the two SQL Library pages) reads
+/// both `window.HfsCodeMirror` and `window.HfsCodeEditor`, so it must load
+/// after the helper. The ViewDefinition page never loads `sql-editor.js`
+/// and the SQL Library pages never load `vd-editor.js` — each page mounts
+/// exactly one editor script. No other page (checked here: the dashboard
+/// and the Resource Editor) mentions any of the three scripts.
+#[tokio::test]
+async fn sql_editor_and_vd_editor_scripts_load_only_on_their_own_pages() {
+    // (route, the page's own editor script, the other page's editor script
+    // that must NOT appear here).
+    let editor_pages = [
+        ("/ui/sql/view-definitions", "vd-editor.js", "sql-editor.js"),
+        ("/ui/sql/queries", "sql-editor.js", "vd-editor.js"),
+        ("/ui/sql/views", "sql-editor.js", "vd-editor.js"),
+    ];
+    for (route, own_editor, other_editor) in editor_pages {
+        let response = app()
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let html = body_text(response).await;
+        let own_script = format!(r#"<script src="/ui/assets/{own_editor}" defer></script>"#);
+        assert!(
+            html.contains(
+                r#"<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>"#
+            )
+        );
+        assert!(html.contains(r#"<script src="/ui/assets/code-editor.js" defer></script>"#));
+        assert!(html.contains(&own_script), "{route} must load {own_editor}");
+        assert!(
+            !html.contains(other_editor),
+            "{route} must not load {other_editor}"
+        );
+
+        // Positions are searched by full asset path, not bare filename: an
+        // explanatory HTML comment earlier in the same template mentions
+        // each script's bare name in prose (e.g. "must load before
+        // sql-editor.js"), which would otherwise be found before the real
+        // `<script src>` tag it is describing.
+        let bundle_pos = html.find("/ui/assets/vendor/codemirror.bundle.js");
+        let helper_pos = html.find("/ui/assets/code-editor.js");
+        let own_editor_pos = html.find(&format!("/ui/assets/{own_editor}"));
+        assert!(
+            bundle_pos < helper_pos,
+            "{route}: the CodeMirror bundle must load before code-editor.js"
+        );
+        assert!(
+            helper_pos < own_editor_pos,
+            "{route}: code-editor.js must load before {own_editor}"
+        );
+    }
 
     for other in ["/ui", "/ui/editor?type=Patient&id=abc"] {
         let response = app()
@@ -2505,13 +2936,21 @@ async fn vd_editor_scripts_load_only_on_the_view_definitions_page() {
             "{other} must not load the CodeMirror bundle"
         );
         assert!(
-            !html.contains("/ui/assets/vd-editor.js"),
+            !html.contains("/ui/assets/code-editor.js"),
+            "{other} must not load code-editor.js"
+        );
+        assert!(
+            !html.contains("vd-editor.js"),
             "{other} must not load vd-editor.js"
+        );
+        assert!(
+            !html.contains("sql-editor.js"),
+            "{other} must not load sql-editor.js"
         );
     }
 }
 
-/// #753 ticket 03: `POST /ui/sql/view-definitions/lint` is the CodeMirror
+/// #753: `POST /ui/sql/view-definitions/lint` is the CodeMirror
 /// linter's server call — plain JSON in, `{"diagnostics": [...]}` out, no
 /// htmx swap (the precedent is `/ui/editor/expand`). The rule logic itself
 /// belongs to `helios_sof::lint`; this only checks the handler's own

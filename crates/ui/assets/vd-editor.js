@@ -1,30 +1,35 @@
 /*
- * ViewDefinition editor mount (#753 evaluation POC; not merged upstream).
+ * ViewDefinition editor mount (#753; generalized for #838).
  *
  * Progressive enhancement over the plain `<textarea class="json-editor"
  * name="json">` in `#vd-editor-form` on `/ui/sql/view-definitions`: if the
- * CodeMirror 6 bundle (ticket 01, `/ui/assets/vendor/codemirror.bundle.js`,
- * global `window.HfsCodeMirror`) loaded and that textarea exists, this
- * mounts a CodeMirror 6 editor on top of it with two language layers -
- * JSON on the outside, FHIRPath (the `lezer-fhirpath` grammar) injected
- * into the string values of the properties that hold FHIRPath expressions.
- * The textarea stays in the DOM (hidden, not removed) and stays the form's
- * source of truth: every doc change is written straight back into
- * `textarea.value`, so Save and Duplicate - plain POSTs of this form - keep
- * submitting exactly what the editor shows, with or without this script.
+ * the vendored CodeMirror 6 bundle (`/ui/assets/vendor/codemirror.bundle.js`,
+ * global `window.HfsCodeMirror`) and the shared mount helper
+ * (`code-editor.js`, global `window.HfsCodeEditor`) both loaded and that
+ * textarea exists, this mounts a CodeMirror 6 editor on top of it with two
+ * language layers - JSON on the outside, FHIRPath (the `lezer-fhirpath`
+ * grammar) injected into the string values of the properties that hold
+ * FHIRPath expressions - plus this editor's own local + server lint.
  *
- * Without the bundle, without JS, or if anything below throws, this file
- * does nothing (or backs out cleanly) and the page is the textarea as it
- * is today. Diagnostics, completion, and i18n are out of scope for this
- * ticket - see the epic doc.
+ * The wrapper/sync/back-out plumbing (textarea as source of truth, Tab not
+ * captured, aria-label, silent degradation without the bundle or on any
+ * construction error) belongs to `code-editor.js` and is not duplicated
+ * here - this file only owns what is specific to the ViewDefinition editor:
+ * the JSON+FHIRPath language, its two HighlightStyles, and its lint.
+ *
+ * Without the bundle, without the helper, without JS, or if anything below
+ * throws, this file does nothing (or backs out cleanly) and the page is the
+ * textarea as it is today. Diagnostics, completion, and i18n are out of
+ * scope here.
  */
 (function () {
   "use strict";
 
+  var CodeEditor = window.HfsCodeEditor;
   var CM = window.HfsCodeMirror;
   var form = document.getElementById("vd-editor-form");
   var textarea = form ? form.querySelector('textarea[name="json"]') : null;
-  if (!CM || !textarea) return;
+  if (!CodeEditor || !CM || !textarea) return;
 
   /* ---- FHIRPath injection: which JSON string values are expressions ----
    *
@@ -77,7 +82,7 @@
     if (to <= from) return null;
 
     // Escaped quotes/backslashes inside the literal are not unescaped
-    // before parsing (RF5 does not require it); the FHIRPath grammar just
+    // before parsing; the FHIRPath grammar just
     // fails to parse cleanly there, which is fine - the string still
     // renders, only without FHIRPath coloring: it degrades to a plain
     // JSON string.
@@ -95,7 +100,7 @@
    * that both the JSON grammar and lezer-fhirpath happen to use can still
    * be colored differently depending on which side of the injection they
    * came from. Classes only - every color lives in app.css as a CSS
-   * variable, never a fixed value from here (RF6). */
+   * variable, never a fixed value from here. */
   var jsonHighlightStyle = CM.HighlightStyle.define(
     [
       { tag: CM.tags.propertyName, class: "cmt-json-key" },
@@ -118,7 +123,7 @@
         class: "cmt-fp-function",
       },
       { tag: CM.tags.keyword, class: "cmt-fp-keyword" },
-      // No dedicated FHIRPath punctuation variable (RF6 lists 7 --fp-*
+      // No dedicated FHIRPath punctuation variable (the palette below has 7 --fp-*
       // tokens, not 8): parens/brackets/commas read naturally as part of
       // "operators" here.
       {
@@ -141,7 +146,7 @@
     { scope: fhirpathLanguage }
   );
 
-  /* ---- Server lint (#753 ticket 03) -----------------------------------
+  /* ---- Server lint (#753) --------------------------------------------
    *
    * The browser only knows syntax; the server knows FHIR. A local
    * jsonParseLinter() pass runs first and, if the JSON itself does not
@@ -205,7 +210,7 @@
   /* Walks the JSON syntax tree from its root value, following `pointer`'s
    * segments (an object key by name, an array index numerically), and
    * returns the node at that position - or null if the pointer does not
-   * resolve against this document's actual shape (RF8: painted on line 1
+   * resolve against this document's actual shape (painted on line 1
    * by the caller in that case). */
   function resolveByPointer(tree, doc, pointer) {
     var node = tree.topNode.getChild("Object") || tree.topNode.firstChild;
@@ -233,7 +238,7 @@
     return { from: line.from, to: line.to };
   }
 
-  /* RF8: for an Object/Array (which may span many lines), just the first
+  /* For an Object/Array (which may span many lines), just the first
    * line - from its opening "{"/"[" to wherever that line ends. A scalar
    * value is already within one line, so its own range is used as-is. */
   function valueRange(doc, node) {
@@ -258,7 +263,7 @@
 
   /* FhirPathSyntax/UndeclaredConstant: the span is a char offset into the
    * *content* of the pointed-at string (excluding its quotes). Escapes are
-   * not unescaped anywhere in this ticket's pipeline (server or client), so
+   * not unescaped anywhere in this pipeline (server or client), so
    * a span computed against unescaped text would misalign the moment the
    * string contains one - degrade to underlining the whole string instead,
    * exactly like the server's own FhirPathSyntax message already does when
@@ -328,7 +333,7 @@
         });
       })
       .catch(function (error) {
-        // RF7: network failures, 5xx, 401 - never a visible or console.error
+        // Network failures, 5xx, 401 - never a visible or console.error
         // failure. Local diagnostics (if any) keep working regardless.
         if (window.console && console.debug) console.debug("vd-editor: server lint unavailable", error);
         return [];
@@ -344,74 +349,14 @@
 
   /* ---- Mount --------------------------------------------------------- */
 
-  function mount() {
-    var ariaLabel = textarea.getAttribute("aria-label") || "";
-
-    // Build the wrapper and the EditorView fully in memory first, and only
-    // touch the live DOM (insert the wrapper, hide the textarea) once both
-    // succeed - so a construction error here never leaves the page with a
-    // hidden textarea and no editor to show for it.
-    var wrapper = document.createElement("div");
-    wrapper.className = "vd-editor";
-    wrapper.id = "vd-editor";
-
-    new CM.EditorView({
-      parent: wrapper,
-      state: CM.EditorState.create({
-        doc: textarea.value,
-        extensions: [
-          jsonWithFhirpath,
-          CM.syntaxHighlighting(jsonHighlightStyle),
-          CM.syntaxHighlighting(fhirpathHighlightStyle),
-          CM.lineNumbers(),
-          CM.highlightActiveLine(),
-          CM.highlightActiveLineGutter(),
-          CM.drawSelection(),
-          CM.foldGutter(),
-          CM.bracketMatching(),
-          CM.closeBrackets(),
-          CM.indentOnInput(),
-          CM.indentUnit.of("  "),
-          CM.history(),
-          CM.highlightSelectionMatches(),
-          // RF7: local JSON syntax first, then the server structural +
-          // FHIRPath lint, ~400ms after the last keystroke.
-          CM.linter(vdLinter, { delay: 400 }),
-          CM.lintGutter(),
-          // The plain textarea it replaces soft-wraps by default; matching
-          // that here avoids a new horizontal scrollbar on long FHIRPath
-          // expressions the user never had before.
-          CM.EditorView.lineWrapping,
-          CM.EditorView.contentAttributes.of({ "aria-label": ariaLabel }),
-          // No indentWithTab (RF8): Tab must keep moving focus to the next
-          // form control, not indent inside the editor.
-          CM.keymap.of(
-            [].concat(
-              CM.closeBracketsKeymap,
-              CM.defaultKeymap,
-              CM.historyKeymap,
-              CM.foldKeymap,
-              CM.searchKeymap
-            )
-          ),
-          CM.EditorView.updateListener.of(function (update) {
-            if (!update.docChanged) return;
-            textarea.value = update.state.doc.toString();
-            // Native-input parity for anything else listening on the form.
-            textarea.dispatchEvent(new Event("input", { bubbles: true }));
-          }),
-        ],
-      }),
-    });
-
-    textarea.parentNode.insertBefore(wrapper, textarea);
-    textarea.classList.add("vd-editor__source--mounted");
-  }
-
-  try {
-    mount();
-  } catch (unavailable) {
-    // Degrade silently to the plain textarea (NF3) - nothing above this
-    // line touches the live DOM until mount() has fully succeeded.
-  }
+  CodeEditor.mount(textarea, {
+    language: jsonWithFhirpath,
+    highlight: [CM.syntaxHighlighting(jsonHighlightStyle), CM.syntaxHighlighting(fhirpathHighlightStyle)],
+    // Local JSON syntax first, then the server structural + FHIRPath
+    // lint, ~400ms after the last keystroke.
+    extensions: [CM.linter(vdLinter, { delay: 400 }), CM.lintGutter()],
+    fold: true,
+    wrapperClass: "vd-editor",
+    id: "vd-editor",
+  });
 })();

@@ -632,6 +632,13 @@ fn cs_detail_templates_only_use_classes_that_exist_in_app_css() {
             "partials/hts-cs-workbench-result.html",
             include_str!("../templates/partials/hts-cs-workbench-result.html"),
         ),
+        // Included by the workbench result and by cs-detail directly. It is
+        // the one template allowed its own hooks (`.hts-outcome*`, #805) —
+        // scanning it here is what keeps the rule and the class together.
+        (
+            "partials/hts-outcome.html",
+            include_str!("../templates/partials/hts-outcome.html"),
+        ),
     ];
 
     let mut checked = 0usize;
