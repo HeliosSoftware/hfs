@@ -145,6 +145,22 @@
   --fp-literal: #0b6e99;
   --fp-constant: #b1460a;
   --fp-comment: #5b6472;
+  /* SQL token palette (#838, sql-editor.js): declared with its own
+     names rather than reusing --json-* / --fp-* directly, so the SQL editor
+     never depends on another editor's palette even where the hex values
+     happen to match today. Each clears 4.5:1 on --input-bg below; keyword
+     (purple) and variable (teal) are deliberately different hues from each
+     other and from --text, so a `:ward`-style bind parameter never reads as
+     "just another keyword". */
+  --sql-keyword: #9a3aa0;
+  --sql-type: #0a5f96;
+  --sql-string: #137333;
+  --sql-number: #b4232d;
+  --sql-operator: #4b5563;
+  --sql-variable: #0f6f66;
+  --sql-comment: #5b6472;
+  --sql-punct: #6a6a6a;
+  --sql-literal: #8a5a00;
   /* Destructive text clears 7:1 on the light card surface; the soft hover
      fill keeps 5.8:1 contrast with the same foreground. */
   --danger: #a61b12;
@@ -201,6 +217,17 @@
   --fp-literal: #79c0ff;
   --fp-constant: #ffa657;
   --fp-comment: #9198a1;
+  /* SQL token palette, dark cast — see the light block for why these are
+     distinct from --json-* / --fp-*. */
+  --sql-keyword: #e2a8ff;
+  --sql-type: #7cc9ff;
+  --sql-string: #7ee787;
+  --sql-number: #ff7b72;
+  --sql-operator: #9aa7b5;
+  --sql-variable: #5eead4;
+  --sql-comment: #9198a1;
+  --sql-punct: #a0a0a0;
+  --sql-literal: #e3b341;
   /* Theme-specific destructive pair: 7.6:1 on the card and 5.6:1 on soft. */
   --danger: #ff9a90;
   --ok: #7fd8a5;
@@ -6339,3 +6366,30 @@ body.app-shell .pane {
 .vd-editor .cmt-fp-literal { color: var(--fp-literal); }
 .vd-editor .cmt-fp-constant { color: var(--fp-constant); font-weight: 600; }
 .vd-editor .cmt-fp-comment { color: var(--fp-comment); font-style: italic; }
+
+/* ---------------------------------------------------------------------------
+   SQL editor (#838, sql-editor.js): mounted over the SQL pane's
+   `<textarea name="sql">` on /ui/sql/queries and /ui/sql/views. Same
+   min-height-grows / max-height-scrolls shape as .vd-editor above, just
+   shorter — the SQL pane is a single query, not a full ViewDefinition
+   document — and one token palette instead of two (no injected language). */
+
+.sql-editor .cm-editor {
+  min-height: 180px;
+  max-height: 60vh;
+}
+
+/* SQL token colors — one class per @codemirror/lang-sql tag group this
+   editor assigns (sql-editor.js has the full tag -> class mapping and why
+   Identifier/Builtin are left uncolored). Keywords and boolean/null
+   literals read as bold, matching the JSON/FHIRPath editor's own weight
+   convention for "reserved word" tokens; comments read as italic. */
+.sql-editor .cmt-sql-keyword { color: var(--sql-keyword); font-weight: 600; }
+.sql-editor .cmt-sql-type { color: var(--sql-type); }
+.sql-editor .cmt-sql-string { color: var(--sql-string); }
+.sql-editor .cmt-sql-number { color: var(--sql-number); }
+.sql-editor .cmt-sql-operator { color: var(--sql-operator); }
+.sql-editor .cmt-sql-variable { color: var(--sql-variable); }
+.sql-editor .cmt-sql-comment { color: var(--sql-comment); font-style: italic; }
+.sql-editor .cmt-sql-punct { color: var(--sql-punct); }
+.sql-editor .cmt-sql-literal { color: var(--sql-literal); font-weight: 600; }

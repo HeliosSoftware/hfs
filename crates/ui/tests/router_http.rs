@@ -8,6 +8,8 @@ use axum::{
     http::{Request, StatusCode, header},
     routing::get,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use helios_persistence::{
     StorageResult,
     core::{SettingsStore, StoredUserSettings},
@@ -352,7 +354,7 @@ async fn embedded_assets_are_served() {
     }
 }
 
-/// #753 ticket 01: the vendored CodeMirror 6 + lezer-fhirpath bundle is
+/// #753: the vendored CodeMirror 6 + lezer-fhirpath bundle is
 /// served like every other embedded asset — same route shape, same
 /// JavaScript content type — with no change to how assets are declared or
 /// served (rust-embed already walks subfolders; `assets/fonts/` is the
@@ -2383,6 +2385,123 @@ async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
     assert!(html.contains("SELECT 3"));
 }
 
+/// `application/x-www-form-urlencoded`-encodes `s`, byte by byte, so tests
+/// can post arbitrary text (newlines, tabs, quotes, non-ASCII) without
+/// pulling in a form-encoding crate just for this.
+fn form_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The inverse of Askama's default HTML auto-escaping, so a value read back
+/// out of a rendered `<textarea>` can be compared against the exact text
+/// that was posted.
+fn html_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The exact text between the SQL pane's `<textarea name="sql" ...>` open
+/// tag and its `</textarea>` close tag, HTML-unescaped.
+fn sql_textarea_value(html: &str) -> String {
+    let open_tag_end = html
+        .find(r#"name="sql""#)
+        .and_then(|from| html[from..].find('>').map(|to| from + to + 1))
+        .expect("a <textarea name=\"sql\"> open tag");
+    let close = html[open_tag_end..]
+        .find("</textarea>")
+        .expect("a matching </textarea>");
+    html_unescape(&html[open_tag_end..open_tag_end + close])
+}
+
+/// #838: arbitrary SQL text — newlines, a tab, single
+/// quotes, a SQLite `:ward`-style bind parameter, a non-ASCII character, and
+/// a `--` line comment — must round-trip byte for byte through both halves
+/// of the SQL pane's plumbing: decoding the stored base64 attachment back
+/// into the textarea (`extract_sql`, exercised via a GET), and posting the
+/// textarea's exact text back through the form (`SqlLibSaveForm`, exercised
+/// via a POST). `StaticConformanceSource::save_resource` is a stub that
+/// echoes an id but does not persist (see `sql_library_workspaces_split_
+/// kinds_and_roundtrip_sql` above, which stops at the redirect for the same
+/// reason), so the POST half is proven the same way that test's own "bad
+/// JSON" case already does: force the error-page branch, which re-renders
+/// the exact `sql` field it was posted, in the same response, with no
+/// storage round trip involved.
+#[tokio::test]
+async fn sql_editor_save_roundtrips_special_characters_byte_for_byte() {
+    let sql = "SELECT *\nFROM patients\t-- niño's row\nWHERE ward = :ward\n";
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "special_chars",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode(sql)}]}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    // Decode half: the stored attachment comes back exactly as-is.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert_eq!(sql_textarea_value(&html), sql);
+
+    // Encode/parse half: an invalid-JSON save re-renders the same response
+    // (no redirect, no storage) with the posted `sql` field preserved as-is.
+    let body = format!("id=&action=save&sql={}&json=%7Bnope", form_encode(sql));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert_eq!(sql_textarea_value(&html), sql);
+}
+
 /// #649: the View Definitions workspace lists stored views in the rail
 /// (name-sorted, first selected), edits the selection as JSON, offers the
 /// starter document under Create New, and previews rows through $sql-run in
@@ -2465,31 +2584,63 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     assert!(html.contains("getResourceKey()"));
 }
 
-/// #753 ticket 02: the CodeMirror 6 bundle (ticket 01) and vd-editor.js load,
-/// in that order, only on the ViewDefinition page — vd-editor.js reads
-/// `window.HfsCodeMirror` at the top of its IIFE, so the bundle must be
-/// first. No other page (checked here: the dashboard and the Resource
-/// Editor) mentions either script.
+/// #838: the vendored CodeMirror 6 bundle and the
+/// shared `code-editor.js` mount helper load, in that order, on every page
+/// that mounts a CodeMirror editor — `code-editor.js` reads
+/// `window.HfsCodeMirror` at the top of its IIFE, so the bundle must load
+/// first. Each page's own editor script (`vd-editor.js` on the
+/// ViewDefinition page, `sql-editor.js` on the two SQL Library pages) reads
+/// both `window.HfsCodeMirror` and `window.HfsCodeEditor`, so it must load
+/// after the helper. The ViewDefinition page never loads `sql-editor.js`
+/// and the SQL Library pages never load `vd-editor.js` — each page mounts
+/// exactly one editor script. No other page (checked here: the dashboard
+/// and the Resource Editor) mentions any of the three scripts.
 #[tokio::test]
-async fn vd_editor_scripts_load_only_on_the_view_definitions_page() {
-    let response = app()
-        .oneshot(
-            Request::get("/ui/sql/view-definitions")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let html = body_text(response).await;
-    assert!(
-        html.contains(r#"<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>"#)
-    );
-    assert!(html.contains(r#"<script src="/ui/assets/vd-editor.js" defer></script>"#));
-    assert!(
-        html.find("/ui/assets/vendor/codemirror.bundle.js") < html.find("/ui/assets/vd-editor.js"),
-        "the CodeMirror bundle must load before vd-editor.js"
-    );
+async fn sql_editor_and_vd_editor_scripts_load_only_on_their_own_pages() {
+    // (route, the page's own editor script, the other page's editor script
+    // that must NOT appear here).
+    let editor_pages = [
+        ("/ui/sql/view-definitions", "vd-editor.js", "sql-editor.js"),
+        ("/ui/sql/queries", "sql-editor.js", "vd-editor.js"),
+        ("/ui/sql/views", "sql-editor.js", "vd-editor.js"),
+    ];
+    for (route, own_editor, other_editor) in editor_pages {
+        let response = app()
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let html = body_text(response).await;
+        let own_script = format!(r#"<script src="/ui/assets/{own_editor}" defer></script>"#);
+        assert!(
+            html.contains(
+                r#"<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>"#
+            )
+        );
+        assert!(html.contains(r#"<script src="/ui/assets/code-editor.js" defer></script>"#));
+        assert!(html.contains(&own_script), "{route} must load {own_editor}");
+        assert!(
+            !html.contains(other_editor),
+            "{route} must not load {other_editor}"
+        );
+
+        // Positions are searched by full asset path, not bare filename: an
+        // explanatory HTML comment earlier in the same template mentions
+        // each script's bare name in prose (e.g. "must load before
+        // sql-editor.js"), which would otherwise be found before the real
+        // `<script src>` tag it is describing.
+        let bundle_pos = html.find("/ui/assets/vendor/codemirror.bundle.js");
+        let helper_pos = html.find("/ui/assets/code-editor.js");
+        let own_editor_pos = html.find(&format!("/ui/assets/{own_editor}"));
+        assert!(
+            bundle_pos < helper_pos,
+            "{route}: the CodeMirror bundle must load before code-editor.js"
+        );
+        assert!(
+            helper_pos < own_editor_pos,
+            "{route}: code-editor.js must load before {own_editor}"
+        );
+    }
 
     for other in ["/ui", "/ui/editor?type=Patient&id=abc"] {
         let response = app()
@@ -2503,13 +2654,21 @@ async fn vd_editor_scripts_load_only_on_the_view_definitions_page() {
             "{other} must not load the CodeMirror bundle"
         );
         assert!(
-            !html.contains("/ui/assets/vd-editor.js"),
+            !html.contains("/ui/assets/code-editor.js"),
+            "{other} must not load code-editor.js"
+        );
+        assert!(
+            !html.contains("vd-editor.js"),
             "{other} must not load vd-editor.js"
+        );
+        assert!(
+            !html.contains("sql-editor.js"),
+            "{other} must not load sql-editor.js"
         );
     }
 }
 
-/// #753 ticket 03: `POST /ui/sql/view-definitions/lint` is the CodeMirror
+/// #753: `POST /ui/sql/view-definitions/lint` is the CodeMirror
 /// linter's server call — plain JSON in, `{"diagnostics": [...]}` out, no
 /// htmx swap (the precedent is `/ui/editor/expand`). The rule logic itself
 /// belongs to `helios_sof::lint`; this only checks the handler's own
