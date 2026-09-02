@@ -78,7 +78,7 @@ async fn get(app: Router, path: &str) {
     );
 }
 
-/// "Tests esperados" #6: a page load reads the settings store exactly once,
+/// A page load reads the settings store exactly once,
 /// the same cost model `main` already had — rail state rides the one read
 /// `resolve_prefs` already performs, adding none.
 #[tokio::test]
@@ -167,7 +167,7 @@ fn recent_group_html<'a>(html: &'a str, group_id: &str) -> &'a str {
     &html[start..end]
 }
 
-/// "Tests esperados" #1: a stored `last` is restored when the request itself
+/// A stored `last` is restored when the request itself
 /// carries no explicit `?type=` — marking the rail current and naming the
 /// type in "Create new".
 #[tokio::test]
@@ -185,7 +185,7 @@ async fn resources_restores_the_stored_last_selection() {
     assert!(html.contains("Create new Observation"));
 }
 
-/// "Tests esperados" #2: an explicit `?type=` always wins over a stored
+/// An explicit `?type=` always wins over a stored
 /// selection, and — because it resolves — is recorded as the new `last` and
 /// `recent[0]`.
 #[tokio::test]
@@ -207,7 +207,7 @@ async fn resources_explicit_type_wins_over_stored_and_is_recorded() {
     assert_eq!(rail["recent"][0]["id"], "Encounter");
 }
 
-/// "Tests esperados" #3: a stored `last` that no longer names a real type
+/// A stored `last` that no longer names a real type
 /// falls back to the page default in silence — no error, and the stale value
 /// is left untouched rather than overwritten by the fallback.
 #[tokio::test]
@@ -231,7 +231,7 @@ async fn resources_a_stale_stored_last_falls_back_silently_and_writes_nothing() 
     );
 }
 
-/// "Tests esperados" #5: repeating the same explicit, already-current
+/// Repeating the same explicit, already-current
 /// selection is a no-op write — `RailState::select` reports no change, so
 /// the stored document is untouched (not merely re-written identically).
 #[tokio::test]
@@ -251,7 +251,7 @@ async fn resources_repeating_the_current_selection_writes_nothing() {
     assert_eq!(before, after);
 }
 
-/// "Tests esperados" #6: the "Recently used" group renders present-but-hidden
+/// The "Recently used" group renders present-but-hidden
 /// with nothing stored, and — once something is — its entries render in MRU
 /// order (a plain rail item per entry, the same shape the scrollable list
 /// uses).
@@ -286,7 +286,7 @@ async fn resources_recent_group_is_hidden_when_empty_and_ordered_when_not() {
     );
 }
 
-/// "Tests esperados" #7: a recent id that no longer names a real type is
+/// A recent id that no longer names a real type is
 /// hidden from the group, not pruned from the stored state — a filtered
 /// render costs nothing, and a stale `last` already falls back on its own
 /// with no help from this filter.
@@ -313,7 +313,7 @@ async fn resources_recent_entry_no_longer_a_real_type_is_hidden_not_pruned() {
     );
 }
 
-/// "Tests esperados" #4: Search Parameters restores a stored `base` the same
+/// Search Parameters restores a stored `base` the same
 /// way a type rail restores `last`.
 #[tokio::test]
 async fn search_parameters_restores_the_stored_base() {
@@ -329,7 +329,7 @@ async fn search_parameters_restores_the_stored_base() {
     assert!(html.contains(r#"name="base" value="Encounter""#));
 }
 
-/// "Tests esperados" #4: `?base=` (explicit, empty) opens "All types" and
+/// `?base=` (explicit, empty) opens "All types" and
 /// persists `last: ""` without touching `recent` — and, once that is the
 /// resolved state, every link the page itself generates keeps carrying the
 /// explicit `base=` marker, so "All types" stays one click away even
@@ -367,8 +367,8 @@ async fn search_parameters_explicit_all_types_persists_and_stays_marked() {
     assert!(html.contains(r#"href="/ui/search-parameters?version=R4&#38;base=""#));
 }
 
-/// "Tests esperados" #9 (Search Parameters variant of #6): the group renders
-/// a resolved base with its live count and marks it `aria-current` when it is
+/// The Search Parameters variant of the recently-used group renders a
+/// resolved base with its live count and marks it `aria-current` when it is
 /// also the page's current selection.
 #[tokio::test]
 async fn search_parameters_recent_group_renders_live_count_and_current() {
@@ -391,7 +391,7 @@ async fn search_parameters_recent_group_renders_live_count_and_current() {
     );
 }
 
-/// "Tests esperados" #9: Search and Saved Queries restore and record through
+/// Search and Saved Queries restore and record through
 /// their own `rails.<page>` keys — never Resources', confirming recents are
 /// per page (#603's shared-across-pages model is gone).
 #[tokio::test]
@@ -492,10 +492,10 @@ fn rail_list_html<'a>(html: &'a str, list_id: &str) -> &'a str {
     &html[start..end]
 }
 
-/// "Tests esperados" #1 (View Definitions): a stored `last` is restored
-/// whether it names an entry on the rail's current page or one that has to
-/// be read directly (#741) — and, when it names nothing real at all, the
-/// page falls back to the rail's first visible entry, silently (no write).
+/// For View Definitions, a stored `last` is restored whether it names an
+/// entry on the rail's current page or one that has to be read directly
+/// (#741) — and, when it names nothing real at all, the page falls back to
+/// the rail's first visible entry, silently (no write).
 #[tokio::test]
 async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_falls_back() {
     let vds: Vec<Value> = (1..=51)
@@ -547,10 +547,10 @@ async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_f
     );
 }
 
-/// "Tests esperados" #2 (View Definitions): an explicit `?vd=` selection
-/// that resolves is recorded with its `{id, name, meta}` snapshot at
-/// `recent[0]`/`last`; `?vd=new` never touches the registry; and repeating
-/// the same explicit selection writes nothing further.
+/// For View Definitions, an explicit `?vd=` selection that resolves is
+/// recorded with its `{id, name, meta}` snapshot at `recent[0]`/`last`;
+/// `?vd=new` never touches the registry; and repeating the same explicit
+/// selection writes nothing further.
 #[tokio::test]
 async fn view_definitions_explicit_selection_is_recorded_with_its_snapshot() {
     let vds = vec![
@@ -596,9 +596,9 @@ async fn view_definitions_explicit_selection_is_recorded_with_its_snapshot() {
     assert_eq!(before, after);
 }
 
-/// "Tests esperados" #3 (View Definitions): an explicit `?vd=` naming a
-/// deleted or mistyped id prunes it from the registry (and `last`, when it
-/// named it); the page keeps its current "no selection" render either way.
+/// For View Definitions, an explicit `?vd=` naming a deleted or mistyped id
+/// prunes it from the registry (and `last`, when it named it); the page
+/// keeps its current "no selection" render either way.
 #[tokio::test]
 async fn view_definitions_explicit_stale_selection_is_pruned() {
     let vds = vec![
@@ -641,10 +641,10 @@ async fn view_definitions_explicit_stale_selection_is_pruned() {
     );
 }
 
-/// "Tests esperados" #4 (View Definitions): the "Recently used" group is
-/// immune to the rail's own `?filter=` — an entry on the current page
-/// renders with its live name/meta, overriding a stale snapshot; one the
-/// filter excludes falls back to that very snapshot, `href` included.
+/// For View Definitions, the "Recently used" group is immune to the rail's
+/// own `?filter=` — an entry on the current page renders with its live
+/// name/meta, overriding a stale snapshot; one the filter excludes falls
+/// back to that very snapshot, `href` included.
 #[tokio::test]
 async fn view_definitions_recent_group_ignores_the_filter_and_falls_back_to_the_snapshot() {
     let vds = vec![
@@ -690,10 +690,11 @@ async fn view_definitions_recent_group_ignores_the_filter_and_falls_back_to_the_
     assert!(group.contains(r#"href="/ui/sql/view-definitions?vd=other""#));
 }
 
-/// "Tests esperados" #5 (Libraries): the same restore/record/prune behaviors
-/// as View Definitions, and — because `rails.sqlQueries`/`rails.sqlViews` are
-/// distinct keys — a selection recorded on one page never surfaces on the
-/// other, even against the same stored document.
+/// Libraries (SQL Queries/SQL Views) show the same restore/record/prune
+/// behaviors as View Definitions, and — because
+/// `rails.sqlQueries`/`rails.sqlViews` are distinct keys — a selection
+/// recorded on one page never surfaces on the other, even against the same
+/// stored document.
 #[tokio::test]
 async fn sql_libraries_restore_record_prune_and_never_cross_contaminate() {
     let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
@@ -804,7 +805,7 @@ async fn sql_libraries_restore_record_prune_and_never_cross_contaminate() {
     );
 }
 
-/// "Tests esperados" #6: all three SQL rails ship `resource-filter.js`, their
+/// All three SQL rails ship `resource-filter.js`, their
 /// own "Recently used" group with the right id, a divider, and a localized
 /// "All …" heading — and, with no settings store configured, the group
 /// renders present-but-`hidden` exactly like the type rails.
@@ -871,7 +872,7 @@ fn anchor_with_href_is_current(html: &str, needle: &str) -> bool {
     html[tag_start..tag_end].contains(r#"aria-current="true""#)
 }
 
-/// "Tests esperados" #1: a stored `last` is restored when the request itself
+/// A stored `last` is restored when the request itself
 /// carries no explicit `?def=` — the rail marks it current and the detail
 /// panel shows its code, exactly as an explicit `?def=Encounter` would.
 #[tokio::test]
@@ -899,7 +900,7 @@ async fn compartments_restores_the_stored_last_definition() {
     );
 }
 
-/// "Tests esperados" #2: an explicit `?def=` that resolves wins and is
+/// An explicit `?def=` that resolves wins and is
 /// recorded; repeating it writes nothing further (RailState::select is a
 /// no-op once already current); and an explicit `?def=` that does not name a
 /// real definition falls back to today's behavior (Patient → first) without
@@ -936,7 +937,7 @@ async fn compartments_explicit_def_wins_is_recorded_once_and_an_unknown_one_writ
     );
 }
 
-/// "Tests esperados" #3: a stored `last` that no longer names a real
+/// A stored `last` that no longer names a real
 /// definition (e.g. read against a version/tenant whose set has moved on)
 /// falls back to the page's own default in silence — no error, and the stale
 /// value is left untouched rather than overwritten by the fallback.

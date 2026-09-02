@@ -38,8 +38,8 @@ export const test = base.extend<Fixtures>({
   // left content edge and intercepting clicks. Park the pointer in the topbar
   // after every navigation; tests that exercise the hover do so explicitly.
   //
-  // Rail state (the 754/755 epic) is server-side and per-user: on the
-  // default (no-auth) projects every test runs as the same `l2:` user, so a
+  // Rail state (#754/#755) is server-side and per-user: on the default
+  // (no-auth) projects every test runs as the same `l2:` user, so a
   // "last selected" or "recently used" recorded by one test would otherwise
   // leak into the next one's rail. Reset the `rails` record before each test
   // with a merge patch that deletes it (`null`), same shape and endpoint

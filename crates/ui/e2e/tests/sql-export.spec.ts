@@ -10,7 +10,7 @@ import { createResource, createResources, deleteResources, waitSearchable } from
 import { expectDetailFieldSpacing } from "../pages/detail-spacing";
 
 // The card's own htmx fragment polls every 5s; generous headroom for a job to
-// finish without ever sleeping blindly (RNF3).
+// finish without ever sleeping blindly.
 const POLL_TIMEOUT = 30_000;
 
 // Every `ViewDefinition` a test below seeds gets its id pushed here, then
@@ -49,7 +49,7 @@ test.afterEach(async ({ request }) => {
  * the job with this many trivial subjects (a single self-search round trip
  * apiece) buys a window measured in hundreds of milliseconds, still far
  * short of the card's first 5s htmx poll, without ever waiting on a fixed
- * clock (RNF3): every assertion below still polls actual DOM state — this
+ * clock: every assertion below still polls actual DOM state — this
  * constant only makes that state observable at all.
  */
 const PADDING_SUBJECTS = 200;
@@ -71,7 +71,7 @@ test.describe.serial("Active SQL Exports", () => {
   }) => {
     test.setTimeout(60_000);
     // At least one real subject row, so the completion manifest carries an
-    // actual download link (RF1e) instead of 200 empty outputs.
+    // actual download link instead of 200 empty outputs.
     const patientId = await createResource(request, "Patient", {
       name: [{ family: "SqlExportPaddingE2E" }],
     });
@@ -105,7 +105,7 @@ test.describe.serial("Active SQL Exports", () => {
     await sqlExport.startButton.click();
 
     // (c) Kick-off redirects straight to the list — no flash, the card is
-    // the feedback (epic decision 7) — with an in-progress card for the job.
+    // the feedback — with an in-progress card for the job.
     await expect(page).toHaveURL(/\/ui\/sql\/export$/);
     const card = sqlExport.card(prefix);
     await expect(card).toBeVisible();
@@ -115,7 +115,7 @@ test.describe.serial("Active SQL Exports", () => {
     // otherwise hold nothing but the JS-only Copy job id button — but with
     // JavaScript and the Clipboard API both available (true on this loopback
     // origin), `sql-export.js` reveals it on load; the `nojs` project (no
-    // script runs at all) is where it has to stay hidden (RNF1 of ticket 03).
+    // script runs at all) is where it has to stay hidden.
     // Revealing the `<details>` only un-hides the summary, same as any other
     // native disclosure — its panel still needs opening to see inside.
     await expect(card.locator("details.menu")).toBeVisible();

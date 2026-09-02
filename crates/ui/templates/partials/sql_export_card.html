@@ -3,13 +3,12 @@
    chip, and the overflow menu up top, the full-width progress track, one
    meta line. In-progress cards poll their own fragment every 5s.
 
-   The overflow (#833 ticket 03, RF7) always lists Copy job id — a
-   progressive enhancement (RF8) hidden by default and revealed only when
-   JavaScript and the Clipboard API are both available (sql-export.js) — plus
-   whichever plain-form actions the status allows. An in-progress card's
-   overflow would otherwise hold nothing but that hidden Copy button, so its
-   whole `<details>` starts hidden too (RNF1: no empty menu behind "…"
-   without JavaScript). #}
+   The overflow (#833) always lists Copy job id — a progressive enhancement
+   hidden by default and revealed only when JavaScript and the Clipboard API
+   are both available (sql-export.js) — plus whichever plain-form actions
+   the status allows. An in-progress card's overflow would otherwise hold
+   nothing but that hidden Copy button, so its whole `<details>` starts
+   hidden too (no empty menu behind "…" without JavaScript). #}
 {% if card.status == "in-progress" %}
 <div id="job-{{ card.id }}" class="card job-card"
      hx-get="/ui/sql/export/{{ card.id }}/card"

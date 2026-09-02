@@ -28,8 +28,8 @@ export class SqlExportPage {
     return this.page.locator(".page-head__lede");
   }
 
-  /** One job card on the list, matched by its name (RF19: the subjects'
-   * names when the job has none of its own — the only kind the form offers
+  /** One job card on the list, matched by its name (the subjects' names
+   * when the job has none of its own — the only kind the form offers
    * today). Several cards can share a name (e.g. after Run again); narrow
    * further with `.first()`/`.nth()`, which the list's most-recent-first
    * order makes deterministic. */

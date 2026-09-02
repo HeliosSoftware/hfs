@@ -63,8 +63,7 @@
       { tag: CM.tags.string, class: "cmt-sql-string" },
       { tag: CM.tags.number, class: "cmt-sql-number" },
       { tag: CM.tags.operator, class: "cmt-sql-operator" },
-      // SpecialVar (`:ward`, SQLite dialect) - the token the epic's dialect
-      // decision exists for.
+      // SpecialVar (`:ward`, SQLite dialect) - a bound parameter token.
       { tag: CM.tags.special(CM.tags.name), class: "cmt-sql-variable" },
       { tag: CM.tags.comment, class: "cmt-sql-comment" },
       {

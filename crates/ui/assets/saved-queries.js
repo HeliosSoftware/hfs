@@ -1486,11 +1486,11 @@
   }
 
   /* Marks the picker rail's active type — in the scrollable list and in the
-   * server-rendered "Recently used" group alike (RF4: "aria-current
-   * coherente entre lista y grupo"), since a clone of the same item can sit
-   * in either. Also keeps the rail's own `data-selected-type` current, so a
+   * server-rendered "Recently used" group alike, keeping `aria-current`
+   * consistent between the two, since a clone of the same item can sit in
+   * either. Also keeps the rail's own `data-selected-type` current, so a
    * later `popstate` with no `?type=` in the URL restores from here rather
-   * than a hardcoded default (RF5; see `locationSearchValue`). */
+   * than a hardcoded default (see `locationSearchValue`). */
   function markRailType(type) {
     var railAside = document.querySelector(".filter-rail[data-selected-type]");
     if (railAside) railAside.dataset.selectedType = type || "";
@@ -1913,16 +1913,16 @@
    * all server-rendered (#541) from the shared `partials/type_rail.html`
    * macro; the "Recently used" group above it is server-rendered too
    * (`partials/rail_recent.html`, #754/#755). Without JavaScript the `<a>`
-   * navigates and the server records the selection (RF3); with it, a click
-   * is intercepted so the action happens in-page, the URL still updates via
-   * `history.pushState`, and this script itself records the selection
-   * (RF4) — a click is recorded exactly once either way, never both. */
+   * navigates and the server records the selection; with it, a click is
+   * intercepted so the action happens in-page, the URL still updates via
+   * `history.pushState`, and this script itself records the selection — a
+   * click is recorded exactly once either way, never both. */
 
   var railList = document.getElementById("type-rail-list");
   var railFilter = document.getElementById("type-rail-filter");
   var railRecentGroup = document.getElementById("type-rail-recent");
   /* The page's `rails.<page>` key and its recent-list cap: read off the
-   * server-rendered group, never redeclared here (RF4). */
+   * server-rendered group, never redeclared here. */
   var railPage = railRecentGroup && railRecentGroup.getAttribute("data-rail-page");
   var railMaxRecent = railRecentGroup
     ? parseInt(railRecentGroup.getAttribute("data-max-recent"), 10) || 5
@@ -1944,9 +1944,9 @@
     runSearch("/" + encodeURIComponent(type), false);
   }
 
-  /* RF4: repaints the "Recently used" group locally — cloning the clicked
-   * item from the live list, the same technique `resource-filter.js` used to
-   * use for its localStorage-backed clones — so the group reflects the click
+  /* Repaints the "Recently used" group locally — cloning the clicked item
+   * from the live list, the same technique `resource-filter.js` used to use
+   * for its localStorage-backed clones — so the group reflects the click
    * immediately, without waiting on `recordRailSelection`'s network
    * round-trip. Moves an existing clone to the front instead of duplicating
    * it, and caps at `railMaxRecent`, mirroring `RailState::select`. */
@@ -1983,8 +1983,8 @@
    * builds `next` from a document that already reflects the prior click. */
   var railWriteChain = Promise.resolve();
 
-  /* RF4: records `type` as this page's rail selection with the same
-   * semantics as `RailState::select` (front, no duplicates, capped,
+  /* Records `type` as this page's rail selection with the same semantics
+   * as `RailState::select` (front, no duplicates, capped,
    * `last` = the id) — the settings document's existing ETag/merge-patch
    * cycle, retried once on 412, exactly as `mutate`/`recordRecent` already do
    * for saved and recent queries. A `501` (no settings store) or a network
@@ -2033,11 +2033,11 @@
   if (railList) railList.addEventListener("click", handleRailClick);
   if (railRecentGroup) railRecentGroup.addEventListener("click", handleRailClick);
 
-  /* RF5: the type the current URL (or, absent an explicit `?type=`, this
-   * rail's own `data-selected-type`) names — never a hardcoded default. The
-   * server always resolves and renders one (RF1: explicit → stored `last` →
-   * the page's own fallback), so this only ever comes up empty when the
-   * rail's `<aside>` itself is absent. */
+  /* The type the current URL (or, absent an explicit `?type=`, this rail's
+   * own `data-selected-type`) names — never a hardcoded default. The server
+   * always resolves and renders one (explicit → stored `last` → the page's
+   * own fallback), so this only ever comes up empty when the rail's
+   * `<aside>` itself is absent. */
   function resolvedSelectedType() {
     var type = new URLSearchParams(window.location.search).get("type");
     if (type) return type;
@@ -2051,8 +2051,8 @@
     return "/" + resolvedSelectedType();
   }
 
-  /* Resources opens on the resolved type (RF1/#605): the same path as a
-   * rail click, so the builder and results already match what the rail
+  /* Resources opens on the resolved type (#605): the same path as a rail
+   * click, so the builder and results already match what the rail
    * shows — without registering a "recently used" entry, since that only
    * fires on an actual rail click. Search and Saved Queries keep their
    * blank-canvas load/back-navigation (unchanged from `main`): the visual
@@ -2067,12 +2067,13 @@
     if (parsed) runSearch(searchPath(parsed.type, parsed.query), false);
   }
 
-  /* RF5's rail-mark half for Search and Saved Queries: `renderBuilder`'s
-   * `syncTypeContext("")` (fired when `urlInput` is blank, its no-JS
-   * baseline on these two pages) would otherwise strip the SSR
-   * `aria-current`/`data-selected-type` these tests and the reveal-on-load
-   * script depend on. Marking after settles it without touching the
-   * builder, results, or the catalog cache `loadCatalog` populates per type. */
+  /* The rail-mark half of type resolution for Search and Saved Queries:
+   * `renderBuilder`'s `syncTypeContext("")` (fired when `urlInput` is
+   * blank, its no-JS baseline on these two pages) would otherwise strip the
+   * SSR `aria-current`/`data-selected-type` these tests and the
+   * reveal-on-load script depend on. Marking after settles it without
+   * touching the builder, results, or the catalog cache `loadCatalog`
+   * populates per type. */
   function restoreRailMarkOnly() {
     if (railList) markRailType(resolvedSelectedType());
   }
@@ -3045,12 +3046,12 @@
       runCurrentBuilderSearch(true);
     });
   } else if (document.getElementById("resources") && urlInput) {
-    // Resources opens on the type the server already resolved (RF1/#605) —
-    // the same path a rail click drives — without registering a "recently
+    // Resources opens on the type the server already resolved (#605) — the
+    // same path a rail click drives — without registering a "recently
     // used" entry, since that only fires on an actual rail click.
     restoreLocationContext();
   } else {
-    // Search and Saved Queries: unchanged blank-canvas load, plus RF5's
+    // Search and Saved Queries: unchanged blank-canvas load, plus the
     // rail-mark fix (see `restoreRailMarkOnly`) so the mark this render
     // resolved survives `renderBuilder`'s empty-`urlInput` sweep.
     renderBuilder();

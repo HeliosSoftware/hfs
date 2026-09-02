@@ -93,7 +93,7 @@ test("the Resources type rail navigates via plain links with no JavaScript", asy
   await expect(item).toHaveAttribute("aria-current", "true");
 });
 
-// "Tests esperados" #15: a rail click is a real navigation with no
+// A rail click is a real navigation with no
 // JavaScript at all, so the server itself records the selection — and the
 // "Recently used" group, entirely server-rendered, shows it on the very
 // next load without any client script populating it.
@@ -112,7 +112,7 @@ test("a Resources rail click without JavaScript is remembered in the recently-us
   await expect(recentGroup.locator("[data-type='Observation']")).toBeVisible();
 });
 
-// "Tests esperados" #6 (#754/#755): a Compartments rail click is a real
+// A Compartments rail click (#754/#755) is a real
 // navigation with no JavaScript at all — there is no "Recently used" group
 // here (only 4-5 definitions), just `rails.compartments.last` — so the
 // server itself records the selection, and a later plain arrival with no
@@ -131,8 +131,8 @@ test("a Compartments rail click without JavaScript is remembered on a later plai
   await expect(compartments.railItem("Encounter")).toHaveAttribute("aria-current", "true");
 });
 
-// "Tests esperados" #12 (#754/#755): the three SQL rails (View Definitions,
-// SQL Queries, SQL Views) render their rail and "Recently used" group
+// The three SQL rails (#754/#755) — View Definitions,
+// SQL Queries, SQL Views — render their rail and "Recently used" group
 // entirely server-side, and a rail click is a real navigation the server
 // itself records — no client script required either way.
 const SQL_RAILS = [

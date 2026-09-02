@@ -2257,8 +2257,8 @@ async fn sql_export_new_offers_subjects_and_files_tables_the_manifest() {
         )
     );
     assert!(html.contains("patients"));
-    // #833 gate-fix FALLA 2: an absolute manifest location renders as a
-    // same-origin path, since the UI and the FHIR API share one server.
+    // #833: an absolute manifest location renders as a same-origin path,
+    // since the UI and the FHIR API share one server.
     assert!(html.contains(r#"href="/export/job-9/patients-0.csv""#));
     assert!(html.contains(">csv<"));
 }
