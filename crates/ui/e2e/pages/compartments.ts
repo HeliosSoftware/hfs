@@ -19,6 +19,15 @@ export class CompartmentsPage {
   get railItems(): Locator {
     return this.page.locator(".filter-rail__item");
   }
+  /**
+   * One rail item by its compartment code. There is no `data-*` attribute on
+   * this rail (unlike the type rails) — the code is the item's own visible
+   * text, and the five spec codes share no prefix, so a text filter is
+   * unambiguous.
+   */
+  railItem(code: string): Locator {
+    return this.railItems.filter({ hasText: code });
+  }
   tab(label: RegExp | string): Locator {
     return this.page.locator("nav.tabs a.tab", { hasText: label });
   }

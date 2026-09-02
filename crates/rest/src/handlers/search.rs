@@ -426,8 +426,15 @@ where
     let public_base = state.public_base_url_for_request(tenant);
     let self_link = build_search_url(&public_base, resource_type, &search_params);
 
-    // Convert result to FHIR Bundle
-    let mut bundle = result.to_bundle(&public_base, &self_link);
+    // Counts for the debug line below, taken before `into_bundle` consumes the
+    // result.
+    let match_count = result.resources.len();
+    let include_count = result.included.len();
+
+    // Convert result to FHIR Bundle. `into_bundle` moves each resource's JSON
+    // into its entry; `to_bundle` would deep-clone every one of them and then
+    // drop the originals.
+    let mut bundle = result.into_bundle(&public_base, &self_link);
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
         state.public_url_for_request(tenant, [resource_type, id])
     });
@@ -442,8 +449,8 @@ where
 
     debug!(
         resource_type = %resource_type,
-        results = result.resources.len(),
-        included = result.included.len(),
+        results = match_count,
+        included = include_count,
         summary = ?summary_mode,
         elements = ?elements,
         "Search completed"
@@ -544,8 +551,12 @@ where
     let public_base = state.public_base_url_for_request(&tenant);
     let self_link = build_system_search_url(&public_base, &search_params);
 
-    // Convert result to FHIR Bundle
-    let mut bundle = result.to_bundle(&public_base, &self_link);
+    // Count for the debug line below, taken before `into_bundle` consumes the
+    // result.
+    let match_count = result.resources.len();
+
+    // Convert result to FHIR Bundle (moving, not cloning, each resource).
+    let mut bundle = result.into_bundle(&public_base, &self_link);
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
         state.public_url_for_request(&tenant, [resource_type, id])
     });
@@ -559,7 +570,7 @@ where
         .map(|e| e.iter().map(|s| s.as_str()).collect());
 
     debug!(
-        results = result.resources.len(),
+        results = match_count,
         summary = ?summary_mode,
         elements = ?elements,
         "System-level search completed"
@@ -619,54 +630,23 @@ fn bundle_to_json_with_subsetting(
         });
     }
 
-    serde_json::json!({
-        "resourceType": "Bundle",
-        "type": bundle.bundle_type,
-        "total": bundle.total,
-        "link": bundle.link.iter().map(|l| {
-            serde_json::json!({
-                "relation": l.relation,
-                "url": l.url
-            })
-        }).collect::<Vec<_>>(),
-        "entry": bundle.entry.iter().map(|e| {
-            let mut entry = serde_json::json!({});
-            if let Some(ref full_url) = e.full_url {
-                entry["fullUrl"] = serde_json::Value::String(full_url.clone());
-            }
-            if let Some(ref resource) = e.resource {
-                // Apply subsetting to the resource
-                let subsetted = apply_subsetting(resource, summary_mode, elements, fhir_version);
-                entry["resource"] = subsetted;
-            }
-            if let Some(ref search) = e.search {
-                let mut search_json = serde_json::json!({
-                    "mode": match search.mode {
-                        helios_persistence::types::SearchEntryMode::Match => "match",
-                        helios_persistence::types::SearchEntryMode::Include => "include",
-                        helios_persistence::types::SearchEntryMode::Outcome => "outcome",
-                    }
-                });
-                // Relevance score (Bundle.entry.search.score), when the backend
-                // computed one.
-                if let Some(score) = search.score {
-                    search_json["score"] = serde_json::json!(score);
-                }
-                entry["search"] = search_json;
-            }
-            entry
-        }).collect::<Vec<_>>()
+    crate::responses::bundle::searchset_to_json(bundle, |resource| {
+        apply_subsetting(resource, summary_mode, elements, fhir_version)
     })
 }
 
 /// Applies subsetting to a resource based on _summary and _elements parameters.
 fn apply_subsetting(
-    resource: &serde_json::Value,
+    resource: serde_json::Value,
     summary_mode: Option<SummaryMode>,
     elements: Option<&[&str]>,
     fhir_version: FhirVersion,
 ) -> serde_json::Value {
-    let mut result = resource.clone();
+    // Takes the resource by value: with neither `_summary` nor `_elements` in
+    // play — the overwhelmingly common case, and every request the benchmark
+    // search suite makes — this function now does nothing at all instead of
+    // deep-cloning the resource and returning the copy unchanged.
+    let mut result = resource;
     let mut subsetted = false;
 
     // Apply _summary if specified

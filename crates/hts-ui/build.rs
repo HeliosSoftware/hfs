@@ -6,10 +6,15 @@
 //! rlib gets reused and the binary serves whatever assets were on disk the
 //! last time this crate actually compiled.
 //!
-//! During Phase 1 (pre-#543) the `Assets` embed points at `../ui/assets`, so
-//! we also watch the sibling ui crate's asset directory for changes. Phase 8
-//! (post-#543) unifies these under `helios-ui-chrome` and this extra watch
-//! line can be dropped.
+//! The `Assets` embed points at `../ui/assets`, so we also watch the sibling
+//! ui crate's asset directory. That line **stays**: `helios-ui-chrome` now
+//! exists (#799), but it owns shared *markup* only — the asset embed is
+//! unchanged, and moving those bytes is still gated on #543.
+//!
+//! No watch for `../ui-chrome` is needed, and adding one would be noise:
+//! askama expands to an `include_bytes!` per template inside that crate, so
+//! rustc records each one as a dependency file and cargo rebuilds this crate's
+//! dependents on its own when a shared partial changes.
 
 fn main() {
     println!("cargo:rerun-if-changed=assets");

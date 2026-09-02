@@ -134,6 +134,17 @@
   --json-string: #137333;
   --json-number: #b4232d;
   --json-literal: #6f42c1;
+  /* FHIRPath token palette (#753 evaluation POC, vd-editor.js): the
+     injected grammar's tags mapped to distinct hues, each clearing 4.5:1 on
+     --input-bg below. Kept apart from --json-* above so a FHIRPath path
+     inside a JSON string never reads as "just another JSON string". */
+  --fp-path: #0f6f66;
+  --fp-function: #8a5a00;
+  --fp-keyword: #9a3aa0;
+  --fp-operator: #4b5563;
+  --fp-literal: #0b6e99;
+  --fp-constant: #b1460a;
+  --fp-comment: #5b6472;
   /* Destructive text clears 7:1 on the light card surface; the soft hover
      fill keeps 5.8:1 contrast with the same foreground. */
   --danger: #a61b12;
@@ -181,6 +192,15 @@
   --json-string: #7ee787;
   --json-number: #ff7b72;
   --json-literal: #d2a8ff;
+  /* FHIRPath token palette, dark cast — see the light block for why these
+     are distinct from --json-*. */
+  --fp-path: #5eead4;
+  --fp-function: #e3b341;
+  --fp-keyword: #e2a8ff;
+  --fp-operator: #9aa7b5;
+  --fp-literal: #79c0ff;
+  --fp-constant: #ffa657;
+  --fp-comment: #9198a1;
   /* Theme-specific destructive pair: 7.6:1 on the card and 5.6:1 on soft. */
   --danger: #ff9a90;
   --ok: #7fd8a5;
@@ -1473,6 +1493,10 @@ select.field__input {
 
 .spinner,
 .btn[aria-busy="true"]::after {
+  /* Explicit border-box (#786): the `*` reset does not match pseudo-elements,
+     and content-box would render the ::after ring at 18px — off center against
+     the -7px offsets below. */
+  box-sizing: border-box;
   width: 14px;
   height: 14px;
   border-radius: 50%;
@@ -1523,6 +1547,76 @@ select.field__input {
   margin: 0;
   font-size: 13px;
   color: var(--muted);
+}
+
+/* The CapabilityStatement raw view is a real link without JavaScript. Keep its
+   htmx-only progress message out of that fallback, then reveal it only while
+   htmx marks this explicit indicator as the active request indicator. */
+#capability-json-loading {
+  display: none;
+}
+
+#capability-json-loading.htmx-request {
+  display: inline-flex;
+}
+
+/* Large CapabilityStatements use a page-specific incremental tree. Only the
+   currently expanded, bounded fragments exist in the DOM. */
+#capability-json-body {
+  max-height: 70vh;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.capability-json-outline {
+  padding: 10px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+#capability-json-body .capability-json-outline {
+  max-height: none;
+  overflow: visible;
+}
+
+.capability-json-bracket,
+.capability-json-row {
+  min-height: 24px;
+  padding-right: 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.capability-json-bracket { padding-left: 12px; }
+.capability-json-rows { padding-left: 18px; }
+.capability-json-row { display: flex; align-items: baseline; gap: 6px; }
+.capability-json-row:hover { background: var(--input-bg); }
+.capability-json-row code { font: inherit; min-width: 0; }
+
+.capability-json-node > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.capability-json-node > summary::-webkit-details-marker { display: none; }
+.capability-json-row__fold { flex: 0 0 18px; color: var(--muted); }
+.capability-json-node[open] > summary .capability-json-row__fold { transform: rotate(90deg); }
+.capability-json-node__body { padding-left: 18px; }
+
+.capability-json-truncated {
+  color: var(--muted);
+  font-family: var(--font-sans);
+  font-size: 11px;
+}
+
+.capability-json-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 10px;
+  font-family: var(--font-sans);
 }
 
 /* Centered-popup variant of the addbox (the Bulk Import dialogs, #527): the
@@ -2459,6 +2553,13 @@ select.field__input {
   font-weight: 700;
 }
 
+/* The Recently used heading sits inside its group, so the group's 2px item
+   gap is all that separates it from the first entry; the All Types heading
+   is a rail child and gets the rail's 10px. Top up to the same 10px (#785). */
+.filter-rail__group > .filter-rail__heading--group {
+  margin-bottom: 8px;
+}
+
 /* Between the Recently used group and the general list. Hidden by default —
    shown only when it directly follows a *populated* (non-`hidden`) recent
    group, so there is nothing to divide from before resource-filter.js has
@@ -2631,9 +2732,9 @@ details.json-fold[open] > summary .icon {
   font-variant-numeric: tabular-nums;
 }
 
-/* Appended to <body> and positioned from the focused/hovered rail item so the
-   full label is not clipped by the rail's scrolling overflow. One shared
-   tooltip serves both the main list and cloneNode()-based Recent items. */
+/* Appended to <body> and positioned from the focused/hovered truncated-name
+   item so the full label is not clipped by rail or grid overflow. One shared
+   tooltip serves rails, cloneNode()-based Recent items, and Bulk Export. */
 .filter-rail__tooltip {
   position: fixed;
   z-index: 1000;
@@ -2960,6 +3061,41 @@ details.json-fold[open] > summary .icon {
 /* A failing row carries the frame's red left edge. */
 .data-table tr.row--alert > td:first-child {
   box-shadow: inset 3px 0 0 var(--danger);
+}
+
+/* The Last 24 hrs sparkline (#782): the engine's half-hour delivery series,
+   scaled server-side; color follows the row's state — the frame's dotted
+   amber marks a listener-less websocket. */
+.spark {
+  display: block;
+  width: 120px;
+  height: 24px;
+}
+
+.spark__line {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.spark--active .spark__line {
+  stroke: var(--ok);
+}
+
+.spark--error .spark__line {
+  stroke: var(--danger);
+}
+
+.spark--idle .spark__line {
+  stroke: var(--warn);
+  stroke-dasharray: 2 3;
+}
+
+.spark--requested .spark__line,
+.spark--off .spark__line {
+  stroke: var(--muted);
 }
 
 /* Bulk Export job states (#537) — the same status-pill vocabulary. */
@@ -4143,6 +4279,13 @@ details.json-fold[open] > summary .icon {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* The CapabilityStatement owns the only scroll container for its incremental
+   tree. Keep bounded scalar fragments from creating nested 70vh scrollers. */
+#capability-json-body .json-view {
+  max-height: none;
+  overflow: visible;
 }
 
 /* Form ↔ JSON cross-highlight (editor-sync.js): hovering or focusing a form
@@ -5432,6 +5575,129 @@ details.json-fold[open] > summary .icon {
 
 }
 @layer components {
+/* Shared HTMX-backed multi-select combobox (#655). Domain-specific search and
+   result rendering stay in each caller; this block owns the reusable control. */
+.combobox {
+  position: relative;
+  min-inline-size: 0;
+  padding: 0;
+  border: 0;
+}
+
+.combobox__enhancement {
+  position: relative;
+}
+
+.combobox__selections {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.combobox__control {
+  position: relative;
+}
+
+.combobox__search-icon {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 12px;
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.combobox__search-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.combobox__input {
+  padding-left: 38px;
+}
+
+.combobox__listbox {
+  position: absolute;
+  z-index: 10;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  max-height: 280px;
+  padding: 5px;
+  overflow-y: auto;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 12%);
+}
+
+.combobox__message:not([hidden]) {
+  display: block;
+}
+
+.combobox__option {
+  display: block;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.combobox__option:hover,
+.combobox__option--active {
+  background: var(--accent-soft);
+  color: var(--text-strong);
+}
+
+.combobox__option[aria-selected="true"] {
+  color: var(--muted);
+}
+
+.combobox__chip {
+  gap: 4px;
+  max-width: 100%;
+  padding-right: 2px;
+}
+
+.combobox__chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.combobox__remove {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.combobox__remove:hover,
+.combobox__remove:focus-visible {
+  background: var(--accent-soft);
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 /* Addbox close affordances (#545). */
 .addbox__head {
   display: flex;
@@ -5509,10 +5775,19 @@ details.json-fold[open] > summary .icon {
 @layer pages {
 /* Bulk Export (#537): the resource-type checkbox grid. Its job-status chips
    are .tag variants — one status-pill vocabulary, not a second chip family. */
+.bulk-export-form .combobox--scope-patient {
+  display: none;
+}
+
+.bulk-export-form:has(input[name="scope"][value="patient"]:checked) .combobox--scope-patient {
+  display: block;
+}
+
 .typegrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 6px 18px;
+  margin-top: 8px;
   padding: 6px 0;
 }
 
@@ -5521,6 +5796,22 @@ details.json-fold[open] > summary .icon {
   display: flex;
   gap: 8px;
   align-items: center;
+  min-width: 0;
+}
+
+.typegrid__item > input {
+  flex: none;
+}
+
+/* Resource names share the rail's clipped-name tooltip. Keep their text
+   inside its grid track instead of allowing a long flex item to overlap the
+   next column (#793). */
+.typegrid__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---- Bulk Export against the Figma frame (#735) ---------------------- */
@@ -5600,7 +5891,7 @@ details.json-fold[open] > summary .icon {
   color: var(--muted);
 }
 
-/* ---- Active Exports job cards (#735) --------------------------------- */
+/* ---- Exports job cards (#735, #795) ---------------------------------- */
 
 .job-card {
   padding: 14px;
@@ -5623,7 +5914,41 @@ details.json-fold[open] > summary .icon {
 .job-card__actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 10px;
+}
+
+.job-card__delete {
+  position: relative;
+}
+
+.job-card__delete > summary {
+  list-style: none;
+}
+
+.job-card__delete > summary::-webkit-details-marker {
+  display: none;
+}
+
+.job-card__delete-confirm {
+  position: absolute;
+  z-index: var(--z-dialog-panel);
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(320px, calc(100vw - 32px));
+  padding: 12px;
+  color: var(--text);
+}
+
+.job-card__delete-confirm p {
+  margin: 0 0 10px;
+}
+
+.job-card__delete-confirm form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .progress {
@@ -5763,4 +6088,237 @@ body.app-shell .pane {
     overflow: visible;
   }
 }
+}
+
+/* ---------------------------------------------------------------------------
+   ViewDefinition editor mount (#753 evaluation POC, tickets 02 + 03):
+   CodeMirror 6 chrome — sizing, focus, tokens, and (ticket 03) the async
+   server lint's underline/gutter/tooltip colors — for the `.vd-editor`
+   wrapper vd-editor.js inserts before the JSON fold's textarea. Deliberately
+   OUTSIDE the `tokens, base, components,
+   pages` layer system above: CodeMirror mounts its own `<style>` via
+   `StyleModule.mount` at runtime, and that stylesheet is unlayered. Per the
+   CSS Cascade Layers spec, *any* unlayered declaration always beats *every*
+   layered one, regardless of selector specificity — so a `.cm-editor`
+   override written inside `@layer components` would silently lose to
+   CodeMirror's own defaults no matter how many classes it stacked. Living
+   here, unlayered, is what lets these rules actually override the library's
+   baseTheme (the focus outline in particular) without `!important`, which
+   the rest of this file deliberately avoids (see the `.kv-grid--flush`
+   comment above). Only the CodeMirror-facing rules need this; everything
+   about `.vd-editor__source--mounted` (the hidden textarea) is ordinary
+   layout, but it lives in this same unlayered block for one clear read.
+
+   Sizing is on `.cm-editor` itself, not the `.vd-editor` wrapper: CodeMirror
+   already makes it a flex column with no explicit height, so a plain
+   min-height/max-height there is enough for `.cm-scroller`'s `height: 100%`
+   to resolve once content forces the max-height clamp, giving RF7's "min
+   320px, max ~70vh, scrolls internally" without measuring anything in JS.
+   --------------------------------------------------------------------------- */
+
+.vd-editor {
+  width: 100%;
+}
+
+.vd-editor .cm-editor {
+  min-height: 320px;
+  max-height: 70vh;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--input-bg, var(--surface));
+}
+
+.vd-editor .cm-editor.cm-focused {
+  /* Same focus treatment as .json-editor:focus, the textarea this replaces. */
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.vd-editor .cm-scroller {
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.vd-editor .cm-content {
+  color: var(--text);
+  padding: 12px 0;
+}
+
+.vd-editor .cm-gutters {
+  background: transparent;
+  color: var(--muted);
+  border-right: 1px solid var(--surface-border);
+}
+
+.vd-editor .cm-activeLine,
+.vd-editor .cm-activeLineGutter {
+  background: var(--accent-soft);
+}
+
+.vd-editor .cm-selectionBackground {
+  background: var(--accent-soft);
+}
+
+/* drawSelection()'s caret defaults to a fixed black border-left (CM6's
+   unthemed base — its `&dark` variant never applies here, see the tooltip
+   comment below), invisible over a dark `--input-bg`. Tying it to the
+   theme's own text color keeps it visible, and exactly matching, in both
+   themes without depending on CodeMirror's internal light/dark state. */
+.vd-editor .cm-cursor {
+  border-left-color: var(--text);
+}
+
+.vd-editor .cm-matchingBracket {
+  background: var(--accent-soft);
+  outline: 1px solid var(--accent);
+  border-radius: 2px;
+}
+
+/* bracketMatching()'s unmatched-bracket indicator (gate feedback: the
+   muddy, hardcoded box sitting right on top of an unclosed `(` in a
+   FHIRPath expression, exactly where the async lint's own squiggly
+   underline already marks the same error). CM6's only rule for it is
+   `&.cm-focused .cm-nonmatchingBracket{backgroundColor:"#bb555544"}` —
+   unthemed (fires regardless of light/dark), ignoring this app's palette
+   entirely, and redundant once a lint diagnostic already covers the same
+   span with its own (themed) underline. Cleared rather than recolored: the
+   squiggle alone (pure text-decoration, RF9) already reads as the single,
+   clean "VSCode-like" error indicator. Selector matches CM6's own
+   `.cm-editor.cm-focused .cm-nonmatchingBracket` compound one extra class
+   over - a plain `.vd-editor .cm-nonmatchingBracket` ties CM6's specificity
+   and loses, since its <style> mounts (and so cascades) after this sheet. */
+.vd-editor .cm-editor.cm-focused .cm-nonmatchingBracket {
+  background-color: transparent;
+}
+
+/* JSON token colors — the same variables the Resource Editor's raw JSON
+   view (.jt--key et al.) already uses, so a ViewDefinition's outer shape
+   reads identically wherever it appears in the UI. */
+.vd-editor .cmt-json-key { color: var(--json-key); }
+.vd-editor .cmt-json-string { color: var(--json-string); }
+.vd-editor .cmt-json-number { color: var(--json-number); }
+.vd-editor .cmt-json-literal { color: var(--json-literal); font-weight: 600; }
+.vd-editor .cmt-json-punct { color: var(--muted); }
+
+/* FHIRPath token colors — the injected grammar, scoped separately in
+   vd-editor.js so these never bleed onto the outer JSON's own tokens even
+   though several tags (string, number, ...) are literally the same Tag
+   objects on both sides of the injection. */
+.vd-editor .cmt-fp-path { color: var(--fp-path); }
+.vd-editor .cmt-fp-function { color: var(--fp-function); }
+.vd-editor .cmt-fp-keyword { color: var(--fp-keyword); font-weight: 600; }
+.vd-editor .cmt-fp-operator { color: var(--fp-operator); }
+.vd-editor .cmt-fp-literal { color: var(--fp-literal); }
+.vd-editor .cmt-fp-constant { color: var(--fp-constant); font-weight: 600; }
+.vd-editor .cmt-fp-comment { color: var(--fp-comment); font-style: italic; }
+
+/* Lint hover tooltip chrome (#753 gate-fixes): @codemirror/lint's own
+   `.cm-tooltip` styling only exists under an internal `&light`/`&dark`
+   state — set once, globally, from whether any loaded theme extension
+   opted into `EditorView.darkTheme`, which this mount never does (§4 of the
+   evaluation doc: the browser only knows syntax, not which app theme is
+   active). CodeMirror therefore always renders its `&light` variant, a
+   hardcoded `#f5f5f5`/`#bbb` box, while the tooltip's *text* still inherits
+   this page's real `--text` — white-on-`#f5f5f5` in dark, and a box that
+   matches neither surface in light. Recolored here as an ordinary app
+   popover instead: the same surface/border/radius/shadow recipe
+   `.menu__panel` already uses, so it reads as this UI's own chrome, not a
+   library default. (The bottom `cm-panel-lint` diagnostics panel is left
+   alone: nothing in this POC's keymap can open it — no `lintKeymap` is
+   wired in `vd-editor.js` — so it is unreachable, not just unstyled.) */
+.vd-editor .cm-tooltip {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  box-shadow: var(--surface-shadow);
+  overflow: hidden;
+}
+
+.vd-editor .cm-tooltip-lint {
+  max-width: 360px;
+  /* Vertical breathing room so a single-row diagnostic (the common case)
+     does not span the tooltip's full height and collide with its rounded
+     top/bottom-left corners - see the .cm-diagnostic-error comment below
+     for what that collision looked like. */
+  padding: 4px 0;
+}
+
+/* CM6's own `.cm-diagnostic` base sets `marginLeft: -1px` so a diagnostic's
+   severity bar sits flush against the tooltip's 1px border - fine against
+   CM6's original square-cornered box, but combined with the rounded,
+   clipped popover above it pushed the bar's square corners past the curve,
+   rendering as an oddly clipped (and, at the anti-aliased edge, washed-out)
+   pill instead of a clean accent bar (gate feedback). Zeroing the margin
+   keeps the bar fully inside the rounded box instead of flush with its edge. */
+.vd-editor .cm-diagnostic {
+  margin-left: 0;
+}
+
+/* Server lint presentation (#753 ticket 03, RF9): the underline, gutter
+   marker, and tooltip/panel border CM6's own @codemirror/lint baseTheme
+   bakes fixed reds/oranges into (an inline SVG data URI for the underline
+   and the gutter dot, which cannot reference a CSS variable) are redrawn
+   here with --danger/--warn so both severities theme correctly in light and
+   dark. Nothing here blocks Save — diagnostics stay purely informational. */
+.vd-editor .cm-lintRange-error {
+  background-image: none;
+  text-decoration: underline wavy var(--danger);
+}
+
+.vd-editor .cm-lintRange-warning {
+  background-image: none;
+  text-decoration: underline wavy var(--warn);
+}
+
+.vd-editor .cm-gutter-lint .cm-lint-marker {
+  width: 8px;
+  height: 8px;
+  margin: 0.5em auto 0;
+  border-radius: 50%;
+}
+
+.vd-editor .cm-lint-marker-error {
+  background: var(--danger);
+}
+
+.vd-editor .cm-lint-marker-warning {
+  background: var(--warn);
+}
+
+.vd-editor .cm-diagnostic-error,
+.vd-editor .cm-diagnostic-warning {
+  /* CM6's own base is a 5px bar - thinned to a subtle accent stripe
+     (VSCode's own hover card uses a similarly thin severity rule), not a
+     block. */
+  border-left-width: 3px;
+}
+
+.vd-editor .cm-diagnostic-error {
+  border-left-color: var(--danger);
+}
+
+.vd-editor .cm-diagnostic-warning {
+  border-left-color: var(--warn);
+}
+
+/* jsonParseLinter() (RF7's local pass) reports a single point, not a range,
+   so CM6 renders it as a small triangle (.cm-lintPoint) rather than an
+   underline — same --danger/--warn recoloring, different selector. */
+.vd-editor .cm-lintPoint::after {
+  border-bottom-color: var(--danger);
+}
+
+.vd-editor .cm-lintPoint-warning::after {
+  border-bottom-color: var(--warn);
+}
+
+/* The textarea vd-editor.js mounts over: present for the form (name="json"
+   still submits), hidden from sight and the accessibility tree so it does
+   not shadow the editor's own role="textbox" (CM6's default) landmark. */
+.vd-editor__source--mounted {
+  display: none;
 }

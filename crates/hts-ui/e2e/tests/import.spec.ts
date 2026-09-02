@@ -142,11 +142,16 @@ test.describe("HTS Import page shell (§7.7)", () => {
     // a regression here would show up everywhere. The "dialect: en"
     // disclosure this test used to assert was removed on 2026-08-28 — it
     // shipped non-functional and HFS has no counterpart.
+    //
+    // #799 collapsed the rest to HFS's two controls: the standalone
+    // `.lang-switcher` is gone (its links moved inside the account menu) and
+    // the hardcoded "K" avatar became that menu's `<summary>`. The menu's
+    // full shape is asserted, on this page too, in `user-menu.spec.ts`.
     const tools = page.locator(".topbar__tools");
-    await expect(tools.locator(".lang-switcher")).toHaveCount(1);
     await expect(tools.locator(".theme-toggle")).toHaveCount(1);
-    await expect(tools.locator(".topbar__avatar")).toHaveText("K");
-    await expect(tools.locator("details")).toHaveCount(0);
+    await expect(tools.locator(".lang-switcher")).toHaveCount(0);
+    await expect(tools.locator("details.menu--user")).toHaveCount(1);
+    await expect(tools.locator("details")).toHaveCount(1);
   });
 });
 

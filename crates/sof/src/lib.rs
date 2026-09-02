@@ -188,6 +188,9 @@ pub mod data_source;
 mod error;
 pub mod fhir_format;
 mod handlers;
+/// Structural + FHIRPath-syntax linting for ViewDefinition documents (#753
+/// evaluation POC, ticket 03) - see [`lint::lint_view_definition`].
+pub mod lint;
 mod models;
 pub mod params;
 pub mod parquet_schema;

@@ -28,7 +28,112 @@ use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
 use super::PostgresBackend;
-use super::search::writer::PostgresSearchIndexWriter;
+use super::cached::{execute_cached, query_opt_cached};
+use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
+
+/// Whether a resource being indexed can already have `search_index` rows.
+///
+/// `Fresh` asserts that nothing is indexed under this id, so the clearing
+/// `DELETE` can be skipped — one round trip on paths a bulk import takes for
+/// every resource it writes. Two situations establish it:
+///
+/// - A create that has already inserted the `resources` row — the insert
+///   succeeded, so no resource existed under this id, and an index row cannot
+///   outlive its resource. Since schema v24 that last part is upheld by the
+///   code rather than by a constraint: `purge`, `purge_all` and
+///   `purge_tenant_data` each delete the `search_index` rows explicitly before
+///   deleting from `resources`. A new deletion path that skipped that would
+///   make this assertion false and leave stale rows for a later create to
+///   inherit, which is why those call sites carry the obligation in a comment.
+/// - A caller that has just run [`PostgresBackend::delete_search_index`], which
+///   clears the `search_index` rows and the `resource_fts` row with them.
+///
+/// Claiming `Fresh` wrongly leaves stale index rows behind — a resource that
+/// still matches searches for values it no longer has — so it is an explicit
+/// enum rather than a bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexWrite {
+    /// Nothing is indexed under this id.
+    Fresh,
+    /// The resource may already be indexed; clear it first.
+    Replace,
+}
+
+/// The full-text upsert, shared by the first attempt and the truncating retry.
+///
+/// `ON CONFLICT` names the columns of the UNIQUE `idx_fts_lookup` created in
+/// schema v28. Column order in the target list is the table's, not the index's.
+///
+/// # The `WHERE` on the `DO UPDATE` is the point
+///
+/// Without it, every rewrite of a resource replaces this row unconditionally:
+/// a new heap tuple, a dead one left behind for autovacuum, and a fresh entry
+/// in **both** GIN indexes — whether or not a single lexeme changed. The
+/// decomposition on the docstring of `index_fts_content` puts that at 24% (GIN)
+/// plus 12% (heap and unique index) of the statement, i.e. **36% of every
+/// update's full-text cost is spent writing the row it already had**.
+///
+/// The `WHERE` makes the write conditional on the vectors actually differing.
+/// What it cannot avoid is `to_tsvector` itself — the other 63% — because the
+/// comparison needs the new vector to compare against. So the guard converts an
+/// unchanged-text update from `tokenise + heap + 2 GIN` into `tokenise +
+/// compare`, and leaves a changed-text update paying one extra `tsvector`
+/// comparison (an O(lexemes) memcmp over ~5 KB, against the two GIN inserts it
+/// is deciding about).
+///
+/// This is not a benchmark-shaped optimisation, but the benchmark is its best
+/// case and that is worth stating plainly: the crud suite's `PUT` sends back a
+/// byte-identical body, so **every** one of its 261,459 updates takes the skip.
+/// A deployment whose updates change the narrative takes none of it and pays
+/// the comparison. The reason to do it anyway is that rewriting an index entry
+/// to the same value is never right: it is dead tuples, WAL and autovacuum work
+/// with no reader consequence, and `search_index` in the same run left 8.7M dead
+/// tuples and four autovacuum passes over a 22M-row table competing for the
+/// same four cores.
+///
+/// `IS DISTINCT FROM`, not `<>`: `narrative_tsvector` is NULL on any row
+/// written before the vectors were bound directly (v26), and `NULL <> x` is
+/// NULL, which would suppress the update and strand that row unfixed forever.
+///
+/// Correctness of the skip rests on these two columns being the only thing the
+/// statement writes. They are: `narrative_text` and `full_content` are
+/// write-only leftovers that this statement has not bound since v26, and the
+/// three key columns are what the conflict matched on.
+const FTS_UPSERT_SQL: &str = "\
+INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_tsvector, content_tsvector) \
+VALUES ($1, $2, $3, to_tsvector('english', $4), to_tsvector('english', $5)) \
+ON CONFLICT (tenant_id, resource_type, resource_id) DO UPDATE \
+SET narrative_tsvector = EXCLUDED.narrative_tsvector, content_tsvector = EXCLUDED.content_tsvector \
+WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
+   OR resource_fts.narrative_tsvector IS DISTINCT FROM EXCLUDED.narrative_tsvector";
+
+/// How much text a single retry hands `to_tsvector` after it has refused the
+/// whole thing.
+///
+/// Postgres caps a `tsvector` at 1 MB. The worst *observed* expansion on real
+/// data is 1.74x (a Synthea `Provenance`: 751,802 input bytes, a 1,308,960-byte
+/// vector). The worst the default parser can produce is bounded at 5x: a
+/// hyphenated run yields the compound plus each of its parts, so at most 2x in
+/// lexeme bytes, and a lexeme costs a further 4-byte entry plus 2 bytes per
+/// position over an input that must spend at least two bytes per lexeme, so at
+/// most 3x again. 128 KiB therefore cannot reach the limit even adversarially,
+/// and it is far more text than a resource whose `_content` someone searches.
+///
+/// This is a retry bound, not a cap on indexing: a resource is truncated only
+/// after Postgres has already refused the whole thing.
+const FTS_MAX_INPUT_BYTES: usize = 128 * 1024;
+
+/// `s` cut to at most `max` bytes, never mid-character.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -60,6 +165,7 @@ fn extract_part_value(part: &Value) -> Option<Value> {
 }
 
 #[async_trait]
+
 impl ResourceStorage for PostgresBackend {
     fn backend_name(&self) -> &'static str {
         "postgres"
@@ -100,23 +206,7 @@ impl ResourceStorage for PostgresBackend {
             .get("id")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-        // Check if resource already exists
-        let exists = client
-            .query_opt(
-                "SELECT 1 FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to check existence: {}", e)))?;
-
-        if exists.is_some() {
-            return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                resource_type: resource_type.to_string(),
-                id: id.clone(),
-            }));
-        }
+            .unwrap_or_else(crate::types::new_resource_id);
 
         // Ensure the resource has correct type and id
         let mut resource = resource;
@@ -133,29 +223,51 @@ impl ResourceStorage for PostgresBackend {
         let fhir_version_str = fhir_version.as_mime_param();
         let is_deleted = false;
 
-        // Insert the resource
-        client
-            .execute(
-                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        // Resource row, history row and the existence check in one statement.
+        //
+        // The check used to be its own `SELECT` — a round trip per create, on the
+        // path a bulk import takes for every resource — and it was racy besides:
+        // two concurrent creates of the same id could both pass it and one would
+        // then fail on the primary key with an internal error instead of
+        // `AlreadyExists`. `ON CONFLICT DO NOTHING` decides it atomically.
+        //
+        // On conflict the CTE yields no row, so the history insert selects
+        // nothing and the statement reports zero rows affected — one signal for
+        // both writes. A soft-deleted resource still occupies its primary key, so
+        // it conflicts too, exactly as the old check treated it.
+        let inserted = execute_cached(
+                &client,
+                "WITH ins AS (
+                     INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (tenant_id, resource_type, id) DO NOTHING
+                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version FROM ins",
                 &[&tenant_id, &resource_type, &id, &version_id, &resource, &now, &is_deleted, &fhir_version_str],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
 
-        // Insert into history
-        client
-            .execute(
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &version_id, &resource, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        if inserted == 0 {
+            return Err(StorageError::Resource(ResourceError::AlreadyExists {
+                resource_type: resource_type.to_string(),
+                id: id.clone(),
+            }));
+        }
 
         // Index the resource for search
-        self.index_resource(&client, tenant_id, resource_type, &id, &resource)
-            .await?;
+        self.index_resource(
+            &client,
+            tenant_id,
+            resource_type,
+            &id,
+            now,
+            IndexWrite::Fresh,
+            &resource,
+        )
+        .await?;
 
         // An overlay-affecting SearchParameter write: reload the stored cache
         // and drop the per-tenant registries so they rebuild. Seeded spec
@@ -231,15 +343,15 @@ impl ResourceStorage for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let row = client
-            .query_opt(
-                "SELECT version_id, data, last_updated, is_deleted, deleted_at, fhir_version
+        let row = query_opt_cached(
+            &client,
+            "SELECT version_id, data, last_updated, is_deleted, deleted_at, fhir_version
                  FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
 
         match row {
             Some(row) => {
@@ -291,40 +403,11 @@ impl ResourceStorage for PostgresBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let id = current.id();
 
-        // Check that the resource still exists with the expected version
-        let row = client
-            .query_opt(
-                "SELECT version_id FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
-
-        let actual_version = match row {
-            Some(row) => row.get::<_, String>(0),
-            None => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-        };
-
-        // Check version match
-        if actual_version != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version,
-                },
-            ));
-        }
-
-        // Calculate new version
-        let new_version: u64 = actual_version.parse().unwrap_or(0) + 1;
+        // The expected version is `current`'s, and the UPDATE below only matches a
+        // row that still carries it — so the new version follows from what the
+        // caller already read, with no round trip to ask what is stored.
+        let expected_version = current.version_id().to_string();
+        let new_version: u64 = expected_version.parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
         // Ensure the resource has correct type and id
@@ -339,13 +422,25 @@ impl ResourceStorage for PostgresBackend {
 
         let now = Utc::now();
         let fhir_version_str = current.fhir_version().as_mime_param();
-        let is_deleted = false;
 
-        // Update the resource
-        client
-            .execute(
-                "UPDATE resources SET version_id = $1, data = $2, last_updated = $3
-                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
+        // Version check, update and history row in one statement. The check used
+        // to be a separate `SELECT` — a round trip on every update, and a
+        // check-then-act besides: a concurrent writer could bump the version in
+        // between and this update would overwrite it while reporting success.
+        // Folding the expected version into the `WHERE` makes the two atomic.
+        //
+        // Zero rows means the update matched nothing; which of the two reasons it
+        // was costs a query, but only on the path that is already failing.
+        let updated = execute_cached(
+                &client,
+                "WITH upd AS (
+                     UPDATE resources SET version_id = $1, data = $2, last_updated = $3
+                     WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                       AND is_deleted = FALSE AND version_id = $7
+                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd",
                 &[
                     &new_version_str,
                     &resource,
@@ -353,26 +448,56 @@ impl ResourceStorage for PostgresBackend {
                     &tenant_id,
                     &resource_type,
                     &id,
+                    &expected_version,
+                    &fhir_version_str,
                 ],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
 
-        // Insert into history (preserve the original FHIR version)
-        client
-            .execute(
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &new_version_str, &resource, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        if updated == 0 {
+            let actual = client
+                .query_opt(
+                    "SELECT version_id FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
+                    &[&tenant_id, &resource_type, &id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
 
-        // Re-index the resource (delete old entries, add new)
-        self.delete_search_index(&client, tenant_id, resource_type, id)
-            .await?;
-        self.index_resource(&client, tenant_id, resource_type, id, &resource)
-            .await?;
+            return match actual {
+                Some(row) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version,
+                        actual_version: row.get::<_, String>(0),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
+        }
+
+        // Re-index the resource. `Replace` clears the old `search_index` rows
+        // inside the same statement that writes the new ones — the clearing
+        // `DELETE` used to be a `delete_search_index` call of its own here, i.e.
+        // a second statement and a second round trip binding the same three
+        // parameters. The `resource_fts` row stays either way:
+        // `index_fts_content` upserts over it, which is one more statement and
+        // round trip saved per update.
+        self.index_resource(
+            &client,
+            tenant_id,
+            resource_type,
+            id,
+            now,
+            IndexWrite::Replace,
+            &resource,
+        )
+        .await?;
 
         // A SearchParameter write invalidates the tenant overlays.
         if resource_type == "SearchParameter" {
@@ -405,69 +530,132 @@ impl ResourceStorage for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        // Check if resource exists and get its fhir_version
-        let row = client
-            .query_opt(
-                "SELECT version_id, data, fhir_version FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to check resource: {}", e)))?;
-
-        let (current_version, data, fhir_version_str) = match row {
-            Some(row) => {
-                let v: String = row.get(0);
-                let d: Value = row.get(1);
-                let f: String = row.get(2);
-                (v, d, f)
-            }
-            None => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-        };
-
         let now = Utc::now();
 
-        // Calculate new version for the deletion record
-        let new_version: u64 = current_version.parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-        let is_deleted = true;
-
-        // Soft delete the resource, guarded by the version we just read.
+        // Soft delete the resource and write its deletion history row, in one
+        // statement, deriving the tombstone's version from the row itself.
         //
-        // The `version_id`/`is_deleted` predicates make this a compare-and-swap
-        // rather than a blind overwrite. Without them a concurrent writer that
-        // lands between the SELECT above and this UPDATE is silently clobbered,
-        // and worse: `new_version` was computed from the stale read, so the
-        // history INSERT below then collides with the row that writer already
-        // wrote and trips `PRIMARY KEY (tenant_id, resource_type, id,
-        // version_id)` (schema.rs). Because neither statement runs inside a
-        // transaction, the UPDATE is already committed at that point — the
-        // caller gets a 500 and the current row now points at a version whose
-        // history entry holds someone else's content.
+        // Three things used to be separate here: a `SELECT version_id`, an
+        // `UPDATE` compare-and-swapping against it, and an `INSERT` of the
+        // history row. The `INSERT` was folded into the `UPDATE` first; this
+        // folds in the `SELECT` too, so a delete is one round trip where it was
+        // three. On the crud suite that is 275,382 statements and 275,382
+        // occupied-connection round trips removed from a workload that already
+        // demands ~36 cores' worth of PostgreSQL execution on a 4-core host —
+        // the round trip, not the 0.06 ms of execution behind it, is what is
+        // being bought back.
         //
-        // MongoDB and S3 already guarded their equivalent writes (a
-        // `version_id` term in the update filter, and a conditional PUT
-        // respectively); this brings PostgreSQL to parity. Losing the race is
-        // reported as `NotFound`, which is what a caller racing a concurrent
-        // delete would have seen anyway.
-        let updated = client
-            .execute(
-                "UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1
-                 WHERE tenant_id = $3 AND resource_type = $4 AND id = $5
-                   AND version_id = $6 AND is_deleted = FALSE",
-                &[
-                    &now,
-                    &new_version_str,
-                    &tenant_id,
-                    &resource_type,
-                    &id,
-                    &current_version,
-                ],
+        // ## Why this is *more* atomic, not less
+        //
+        // The read-then-CAS it replaces was correct but pessimistic. Under READ
+        // COMMITTED, a writer landing between the `SELECT` and the `UPDATE`
+        // meant the `version_id = <stale>` predicate matched nothing, and this
+        // returned `NotFound` — a 404 for a resource that plainly existed and
+        // was live. Computing `version_id + 1` inside the `UPDATE`'s target list
+        // removes the window rather than detecting it: PostgreSQL takes the row
+        // lock, and if the row was concurrently updated it re-evaluates both the
+        // qualifier and the target list against the *committed new* version of
+        // the tuple (EvalPlanQual). So the tombstone's version is always exactly
+        // one more than whatever version is current at the instant the row is
+        // locked, never one more than a version that has since moved on.
+        //
+        // That is what preserves the primary-key fix the CAS was introduced for.
+        // `resource_history` is keyed `PRIMARY KEY (tenant_id, resource_type,
+        // id, version_id)` (schema.rs). The failure the CAS prevented was a
+        // history row computed from a stale read colliding with one a concurrent
+        // writer had already inserted. A version derived from the locked row
+        // cannot be stale, so it cannot collide — the invariant is enforced by
+        // construction instead of by a guard that has to lose a race to notice.
+        //
+        // A concurrent *delete* is still resolved correctly and still costs
+        // nothing extra: the loser re-evaluates `is_deleted = FALSE` against the
+        // committed tombstone, matches no row, and reports `NotFound`, which is
+        // exactly what it reported before.
+        //
+        // ## What changes, stated plainly
+        //
+        // An unconditional `DELETE` that races a concurrent `UPDATE` now
+        // succeeds — deleting the version that writer just committed — where it
+        // used to fail with `NotFound`. That is a deliberate correction: FHIR's
+        // delete interaction (https://hl7.org/fhir/http.html#delete) carries no
+        // precondition of its own, so "delete the current state" is the right
+        // reading and the 404 was spurious. Callers that *do* want a
+        // precondition use `If-Match`, which is evaluated above this layer.
+        //
+        // What this does NOT change: that `If-Match` on `DELETE` is evaluated by
+        // the REST handler (and by `delete_with_match`) against its own earlier
+        // read and is therefore still check-then-act. It was check-then-act
+        // before this change too — the CAS removed here guarded the version
+        // *this function* had read a microsecond earlier, never the version the
+        // caller's precondition was evaluated against — so no precondition
+        // guarantee moves in either direction. Making `If-Match` on `DELETE`
+        // atomic needs the expected version threaded into this statement, which
+        // is a signature change and a separate piece of work.
+        //
+        // ## The version arithmetic
+        //
+        // `version_id` is `TEXT`, so the increment is guarded rather than a bare
+        // cast: a non-numeric value would make `::bigint` raise 22P02 and turn a
+        // delete into a 500. The `CASE` reproduces the Rust it replaces —
+        // `current_version.parse::<u64>().unwrap_or(0) + 1` — for every value
+        // this server can have written (`'7'` -> 8, `'007'` -> 8, `''` and
+        // `'abc'` -> 1, matching `unwrap_or(0)`). `CASE` does not evaluate the
+        // branch it did not select, so the cast never runs on a value the regex
+        // rejected. Version ids are server-issued decimal integers on every
+        // write path in this backend, so the fallback is unreachable in
+        // practice and is here only so that it degrades the same way the Rust
+        // did rather than differently.
+        //
+        // `RETURNING` feeds the history row from the tuple just written, so the
+        // deletion entry carries the resource's own `fhir_version` without
+        // making a round trip through the client. As in `create` and `update`,
+        // no matching row means the CTE yields nothing, the insert selects
+        // nothing, and the statement reports zero rows affected — one signal for
+        // both writes. One statement is also one implicit transaction: the
+        // tombstone lands with the delete or neither does.
+        //
+        // ## The tombstone stores `'null'::jsonb`, not the resource
+        //
+        // A deletion entry is the record that the resource was deleted, not a
+        // version of the resource: FHIR gives it `request.method = DELETE` and
+        // no `resource` in a history Bundle, and `410 Gone` on a vread of that
+        // version. `history_entry_to_json` has always omitted the body, and the
+        // vread handler now answers `410`, so nothing can ask for these bytes.
+        //
+        // Storing them was not free. `data` is a JSONB body of a few kilobytes;
+        // the `UPDATE` above does not touch that column, so `resources` keeps
+        // its existing TOAST datum untouched, but a TOAST pointer cannot be
+        // shared across tables — inserting it into `resource_history` detoasts
+        // the value, re-compresses it, writes it, and puts the whole body in the
+        // WAL a second time. That was 10.6% of the crud suite's Postgres
+        // execution time on run 33213565802 for a row no reader can reach.
+        //
+        // `'null'::jsonb` rather than `NULL` because `resource_history.data` is
+        // `NOT NULL` (schema v1) and both `vread` and the history readers deserialise
+        // the column into a `serde_json::Value` with a non-nullable `FromSql`;
+        // a SQL `NULL` would panic in `row.get`, and widening the column would
+        // put a migration and six read sites in the way of a write-path change.
+        // `Value::Null` reaches the same readers as a well-formed value that
+        // renders as `null`, and they already discard it for a deleted version.
+        //
+        // Rows written by an older build keep their bodies and are read back
+        // exactly as before; nothing needs backfilling, because the only reader
+        // was already dropping the value on the floor.
+        let updated = execute_cached(
+                &client,
+                "WITH del AS (
+                     UPDATE resources
+                     SET is_deleted = TRUE,
+                         deleted_at = $1,
+                         last_updated = $1,
+                         version_id = ((CASE WHEN version_id ~ '^[0-9]+$' THEN version_id::bigint ELSE 0 END) + 1)::text
+                     WHERE tenant_id = $2 AND resource_type = $3 AND id = $4
+                       AND is_deleted = FALSE
+                     RETURNING tenant_id, resource_type, id, version_id, last_updated, is_deleted, fhir_version
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, 'null'::jsonb, last_updated, is_deleted, fhir_version FROM del",
+                &[&now, &tenant_id, &resource_type, &id],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
@@ -479,20 +667,10 @@ impl ResourceStorage for PostgresBackend {
             }));
         }
 
-        // Insert deletion record into history (preserve fhir_version)
-        client
-            .execute(
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &new_version_str, &data, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
-
         // Delete search index entries (skip when search is offloaded)
         if !self.is_search_offloaded() {
-            client
-                .execute(
+            execute_cached(
+                    &client,
                     "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                     &[&tenant_id, &resource_type, &id],
                 )
@@ -859,8 +1037,9 @@ impl ResourceStorage for PostgresBackend {
             .await
             .or_query_error("purge count")?
             .get(0);
-        // search_index and resource_fts cascade from resources, but delete them
-        // explicitly too, mirroring the purge/purge_all deletion order.
+        // These deletes are the only thing that removes the dependent rows:
+        // `search_index` has no foreign key to `resources` (schema v24) and
+        // nothing cascades. Same order as purge/purge_all.
         for sql in [
             "DELETE FROM search_index WHERE tenant_id = $1",
             "DELETE FROM resource_fts WHERE tenant_id = $1",
@@ -958,8 +1137,8 @@ impl PostgresBackend {
         let now = Utc::now();
         let is_deleted = false;
 
-        client
-            .execute(
+        execute_cached(
+                &client,
                 "UPDATE resources
                  SET version_id = $1, data = $2, last_updated = $3, is_deleted = FALSE, deleted_at = NULL
                  WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
@@ -975,8 +1154,8 @@ impl PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
 
-        client
-            .execute(
+        execute_cached(
+                &client,
                 "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[&tenant_id, &resource_type, &id, &new_version_str, &resource, &now, &is_deleted, &fhir_version_str],
@@ -985,11 +1164,22 @@ impl PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to insert restore history: {}", e)))?;
 
         // The delete dropped the search index entries; rebuild them for the
-        // resource that is live again.
-        self.delete_search_index(&client, tenant_id, resource_type, id)
-            .await?;
-        self.index_resource(&client, tenant_id, resource_type, id, &resource)
-            .await?;
+        // resource that is live again. As in `update`, `Replace` folds the
+        // clearing `DELETE` into the insert rather than sending it separately —
+        // and it must stay a `Replace`, not a `Fresh`: a resource can be
+        // soft-deleted by a path that leaves its rows in place, so this cannot
+        // assert that nothing is indexed under the id. The full-text row is
+        // upserted over.
+        self.index_resource(
+            &client,
+            tenant_id,
+            resource_type,
+            id,
+            now,
+            IndexWrite::Replace,
+            &resource,
+        )
+        .await?;
 
         // A restored SearchParameter re-enters the tenant overlays.
         if resource_type == "SearchParameter" {
@@ -1018,12 +1208,18 @@ impl PostgresBackend {
     ///
     /// This method uses the SearchParameterExtractor to dynamically extract
     /// searchable values based on the configured SearchParameterRegistry.
+    // Eight arguments, all of them distinct identity/coordinate values the
+    // write path already has in hand; bundling them into a struct would add a
+    // move on the hottest indexing path without removing a single argument.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn index_resource(
         &self,
         client: &deadpool_postgres::Client,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        last_updated: DateTime<Utc>,
+        mode: IndexWrite,
         resource: &Value,
     ) -> StorageResult<()> {
         // When search is offloaded to a secondary backend, skip local indexing
@@ -1031,62 +1227,83 @@ impl PostgresBackend {
             return Ok(());
         }
 
-        // Delete existing index entries
-        client
-            .execute(
-                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
+        // `Replace` no longer sends a `DELETE` of its own: the clearing delete
+        // rides inside the first insert statement (`INSERT_SQL_REPLACE`), which
+        // is one statement and one round trip instead of two, binding the same
+        // three parameters once instead of twice. See `replace_rows`.
 
         // Extract values using the registry-driven extractor
-        match self
+        let mut rows: Vec<IndexRow> = match self
             .tenant_extractor(tenant_id)
             .extract(resource, resource_type)
         {
-            Ok(values) => {
-                let mut count = 0;
-                for value in values {
-                    PostgresSearchIndexWriter::write_entry(
-                        client,
-                        tenant_id,
-                        resource_type,
-                        resource_id,
-                        &value,
-                    )
-                    .await?;
-                    count += 1;
-                }
-                tracing::debug!(
-                    "Dynamically indexed {} values for {}/{}",
-                    count,
-                    resource_type,
-                    resource_id
-                );
-            }
+            Ok(values) => PostgresSearchIndexWriter::build_rows(
+                resource_type,
+                resource_id,
+                last_updated,
+                self.index_layout(),
+                values,
+            ),
             Err(e) => {
+                // There used to be a fallback here that indexed `_id` and
+                // `_lastUpdated`. Both are now answered from the `resources`
+                // columns they restate (see `PARAMS_ANSWERED_FROM_RESOURCES`),
+                // so they keep working with no index rows at all and the
+                // fallback had nothing left to write. Every other parameter of
+                // this resource is unindexed either way — that is what the
+                // extraction failure means — so the warning is the whole
+                // remaining behaviour.
                 tracing::warn!(
-                    "Dynamic extraction failed for {}/{}: {}. Using minimal fallback (_id, _lastUpdated only).",
+                    "Dynamic extraction failed for {}/{}: {}. Resource is stored but not indexed; \
+                     `_id` and `_lastUpdated` still resolve from the resources table.",
                     resource_type,
                     resource_id,
                     e
                 );
-                // Fall back to minimal extraction (just _id and _lastUpdated)
-                self.index_minimal_fallback(
+                // No minimal fallback any more: it only ever wrote `_id` and
+                // `_lastUpdated`, and both are now answered from the
+                // `resources` columns they restate, so there is nothing left
+                // for it to write.
+                Vec::new()
+            }
+        };
+
+        // Rows for any `contained[]` entries ride along in the same statement.
+        // They used to be one single-row `INSERT` per extracted value — 311,630
+        // statements and 311,630 round trips in one 5-minute crud run, 6% of
+        // that run's Postgres execution time — even though they are written
+        // under the same tenant, type and id as the rows above.
+        rows.extend(self.contained_index_rows(tenant_id, resource_type, resource_id, resource));
+
+        let count = rows.len();
+        match mode {
+            IndexWrite::Fresh => {
+                PostgresSearchIndexWriter::insert_rows(
                     client,
                     tenant_id,
                     resource_type,
                     resource_id,
-                    resource,
+                    &rows,
                 )
-                .await?;
+                .await?
+            }
+            IndexWrite::Replace => {
+                PostgresSearchIndexWriter::replace_rows(
+                    client,
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    &rows,
+                )
+                .await?
             }
         }
-
-        // Index any contained resources for `_contained` search.
-        self.index_contained_resources(client, tenant_id, resource_type, resource_id, resource)
-            .await?;
+        tracing::debug!(
+            "Dynamically indexed {} values for {}/{}",
+            count,
+            resource_type,
+            resource_id
+        );
 
         // Index FTS content for _text and _content searches
         self.index_fts_content(client, tenant_id, resource_type, resource_id, resource)
@@ -1095,39 +1312,124 @@ impl PostgresBackend {
         Ok(())
     }
 
-    /// Extracts and indexes a container's `contained[]` resources for
-    /// `_contained` search. Each contained resource's search values are written
-    /// as `is_contained = TRUE` rows whose `resource_type` / `resource_id`
-    /// identify the container. Returns the number of entries written.
-    async fn index_contained_resources(
+    /// Flattens a container's `contained[]` resources into `is_contained = TRUE`
+    /// index rows, whose `resource_type` / `resource_id` identify the container.
+    ///
+    /// Builds rows rather than writing them, so the caller can send them in the
+    /// same statement as the container's own rows. A value whose date does not
+    /// parse yields no row, exactly as the single-row insert refused to store
+    /// one (#494) — so the caller's `$reindex` count now reports rows written
+    /// rather than values visited, which is what the container's own rows have
+    /// always reported.
+    fn contained_index_rows(
         &self,
-        client: &deadpool_postgres::Client,
         tenant_id: &str,
         container_type: &str,
         container_id: &str,
         resource: &Value,
-    ) -> StorageResult<usize> {
-        let mut count = 0;
+    ) -> Vec<IndexRow> {
         let container = (container_type, container_id);
+        let mut rows = Vec::new();
         for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
-            for value in &contained.values {
-                PostgresSearchIndexWriter::write_contained_entry(
-                    client,
-                    tenant_id,
-                    container,
-                    (&contained.contained_type, &contained.local_id),
-                    value,
-                )
-                .await?;
-                count += 1;
-            }
+            rows.extend(PostgresSearchIndexWriter::build_contained_rows(
+                container,
+                (&contained.contained_type, &contained.local_id),
+                &contained.values,
+            ));
         }
-        Ok(count)
+        rows
+    }
+
+    /// Whether `resource_fts` exists, asked of the catalog at most once.
+    ///
+    /// This used to be an `information_schema.tables` lookup on every resource
+    /// write. `information_schema` views are joins over the system catalogs, so
+    /// that is not a free question, and the answer cannot change while the
+    /// instance is serving: the table is created by `initialize_schema` and
+    /// only migrations touch it, both of which run at startup under an advisory
+    /// lock before any request is accepted.
+    async fn fts_table_exists(&self, client: &deadpool_postgres::Client) -> StorageResult<bool> {
+        if let Some(known) = self.fts_table_exists.get() {
+            return Ok(*known);
+        }
+        let exists = client
+            .query_opt(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = 'resource_fts'",
+                &[],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to check FTS table: {}", e)))?
+            .is_some();
+        let _ = self.fts_table_exists.set(exists);
+        Ok(exists)
     }
 
     /// Index full-text search content for _text and _content searches.
     ///
     /// Populates the resource_fts table using PostgreSQL tsvector/tsquery.
+    ///
+    /// The write is an upsert keyed on `idx_fts_lookup`, which schema v28 makes
+    /// UNIQUE. Two things follow from that. A rewrite no longer needs its own
+    /// `DELETE` — `update` and `restore` leave the row alone and this statement
+    /// replaces it in place, which removes one statement and one round trip from
+    /// every update. And a
+    /// duplicate `resource_fts` row is now impossible: `search_text` /
+    /// `search_content` join `resources` to `resource_fts`, so a duplicate used
+    /// to return the same resource twice in a `_text` / `_content` page.
+    ///
+    /// # Where the remaining cost is, measured
+    ///
+    /// This statement is still the single most expensive one in the crud suite
+    /// after `search_index`: 2,597.9 s over 550,764 calls on run 33128380492,
+    /// **4.717 ms to write one row**, 20% of the suite. The obvious suspect is
+    /// GIN maintenance on `content_tsvector`, which is built from every string
+    /// in the resource. It is not the answer. Decomposed on local Postgres 18.6
+    /// over a 60,000-resource corpus (mean content 688 bytes, 61 lexemes), four
+    /// clients, same statement, arms differing only in what the table carries:
+    ///
+    /// ```text
+    /// arm                                        ms/call    share
+    /// full upsert, both GIN indexes               0.1610     100%
+    /// same, GIN indexes dropped                   0.1218      76%
+    /// `to_tsvector` alone, nothing written        0.1020      63%
+    /// ```
+    ///
+    /// So roughly **63% of this statement is `to_tsvector` running in the
+    /// Postgres backend**, 24% is GIN, and 12% is the heap and unique-index
+    /// write. And the tokeniser is linear in input bytes, not per call — 120,
+    /// 688 and 2,752-byte inputs cost 0.021, 0.076 and 0.319 ms of tokenisation,
+    /// a flat ~0.11 us/byte (~9 MB/s) across a 23x range.
+    ///
+    /// That redirects the obvious optimisations. GIN pending-list tuning has a
+    /// 24% ceiling and measured +4.5% at `gin_pending_list_limit = 32MB`, inside
+    /// noise; `fastupdate = off` was measured by an earlier seat at **2.24x
+    /// slower** and must stay on. Deduplicating words before tokenising was
+    /// tried and did nothing (545-byte deduplicated input, 0.0868 ms, against
+    /// 688 bytes at 0.0841 ms) — it also changes `ts_rank` ordering for
+    /// `_content` while leaving `@@` membership identical, so it costs
+    /// semantics for no gain.
+    ///
+    /// The only lever that moves this is **fewer bytes reaching `to_tsvector`**,
+    /// and `_content` is defined as the whole resource, so the bytes are the
+    /// feature. What is left is therefore a policy decision rather than an
+    /// optimisation: making the `content_tsvector` half optional would return
+    /// most of 2,597.9 s to a deployment that does not use `_content`. It is
+    /// deliberately not done here — the benchmark issues no `_text` or
+    /// `_content` query at all, so switching it off would buy 20% of crud
+    /// without buying any user anything, and a silently unindexed `_content`
+    /// that answers with an empty page is worse than a slow one. The numbers are
+    /// recorded so the choice can be made with them rather than guessed at.
+    ///
+    /// # A defect this does not fix
+    ///
+    /// `PostgresTransaction` (`transaction.rs`) writes `resources`,
+    /// `resource_history` and `search_index`, and never `resource_fts`. A
+    /// resource created through a bundle therefore has no full-text row and is
+    /// invisible to `_text` and `_content` on this backend until something
+    /// re-indexes it. That is pre-existing and unfiled. It is left alone here
+    /// deliberately: the fix adds a `to_tsvector` per bundle entry, which is
+    /// cost on the import path, and it belongs with a decision about the
+    /// paragraph above rather than inside a performance change.
     async fn index_fts_content(
         &self,
         client: &deadpool_postgres::Client,
@@ -1136,16 +1438,7 @@ impl PostgresBackend {
         resource_id: &str,
         resource: &Value,
     ) -> StorageResult<()> {
-        // Check if FTS table exists
-        let fts_exists = client
-            .query_opt(
-                "SELECT 1 FROM information_schema.tables WHERE table_name = 'resource_fts'",
-                &[],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to check FTS table: {}", e)))?;
-
-        if fts_exists.is_none() {
+        if !self.fts_table_exists(client).await? {
             return Ok(());
         }
 
@@ -1153,84 +1446,115 @@ impl PostgresBackend {
         let content = extract_searchable_content(resource);
 
         if content.is_empty() {
+            // Nothing to index. A stored resource always carries at least its
+            // `resourceType`, so this is unreachable in practice, but if a
+            // rewrite ever did empty a resource out, the previous row has to go
+            // rather than survive as a stale match.
+            let _ = execute_cached(
+                    client,
+                    "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                    &[&tenant_id, &resource_type, &resource_id],
+                )
+                .await;
             return Ok(());
         }
 
-        // Delete existing FTS entry first
-        let _ = client
-            .execute(
-                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await;
+        // Store the vectors, not their input. `narrative_text` and
+        // `full_content` are write-only columns — `_text` and `_content` query
+        // `narrative_tsvector` / `content_tsvector` and nothing reads the raw
+        // text — so binding them stored the resource's text a second time, with
+        // its TOAST compression and WAL, for no reader. Tokenising happens here
+        // instead of in a `BEFORE INSERT` trigger; the trigger is dropped in
+        // schema v26 because it would otherwise overwrite these vectors with
+        // the tsvector of an empty string.
+        let result = execute_cached(
+            client,
+            FTS_UPSERT_SQL,
+            &[
+                &resource_id,
+                &resource_type,
+                &tenant_id,
+                &content.narrative,
+                &content.full_content,
+            ],
+        )
+        .await;
 
-        // Insert into FTS table (the trigger will populate tsvector columns)
-        client
-            .execute(
-                "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content)
-                 VALUES ($1, $2, $3, $4, $5)",
-                &[
-                    &resource_id,
-                    &resource_type,
-                    &tenant_id,
-                    &content.narrative,
-                    &content.full_content,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
+        let err = match result {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+
+        // `to_tsvector` refuses to build a vector larger than 1 MB and raises
+        // `program_limit_exceeded` when the input demands one. That is not
+        // hypothetical: a Synthea `Provenance` lists every resource in the
+        // patient's bundle, and two of the 177,612 resources in 150 of the
+        // benchmark corpus's patients exceed the limit — 751,802 bytes of
+        // content becoming a 1,308,960-byte vector. Before this branch the
+        // error surfaced as a 500 and the whole `POST` failed, so an entirely
+        // valid resource could not be created at all.
+        //
+        // Retry once against a truncated input instead. Nothing here runs
+        // inside an explicit transaction — the bundle path
+        // (`PostgresTransaction`) does not write `resource_fts` at all — so the
+        // failed statement leaves the session usable.
+        if err.code() != Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
+            return Err(internal_error(format!(
+                "Failed to insert FTS content: {}",
+                err
+            )));
+        }
+
+        let narrative = truncate_on_char_boundary(&content.narrative, FTS_MAX_INPUT_BYTES);
+        let full_content = truncate_on_char_boundary(&content.full_content, FTS_MAX_INPUT_BYTES);
+        tracing::warn!(
+            "FTS content for {}/{} exceeds PostgreSQL's 1 MB tsvector limit; \
+             indexing the first {} bytes of narrative and content only",
+            resource_type,
+            resource_id,
+            FTS_MAX_INPUT_BYTES,
+        );
+        execute_cached(
+            client,
+            FTS_UPSERT_SQL,
+            &[
+                &resource_id,
+                &resource_type,
+                &tenant_id,
+                &narrative,
+                &full_content,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
 
         Ok(())
     }
 
-    /// Index minimal fallback search parameters.
+    /// Removes a resource from search entirely: its `search_index` rows and its
+    /// `resource_fts` row. Returns how many `search_index` rows went.
     ///
-    /// Only indexes `_id` and `_lastUpdated` when dynamic extraction fails.
-    async fn index_minimal_fallback(
-        &self,
-        client: &deadpool_postgres::Client,
-        tenant_id: &str,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
-    ) -> StorageResult<()> {
-        // _id - always available from resource.id
-        if let Some(id) = resource.get("id").and_then(|v| v.as_str()) {
-            client
-                .execute(
-                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code)
-                     VALUES ($1, $2, $3, '_id', $4)",
-                    &[&tenant_id, &resource_type, &resource_id, &id],
-                )
-                .await
-                .map_err(|e| internal_error(format!("Failed to insert _id index: {}", e)))?;
-        }
-
-        // _lastUpdated - from resource.meta.lastUpdated
-        if let Some(last_updated) = resource
-            .get("meta")
-            .and_then(|m| m.get("lastUpdated"))
-            .and_then(|v| v.as_str())
-        {
-            let normalized = normalize_date_for_pg(last_updated);
-            client
-                .execute(
-                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_date)
-                     VALUES ($1, $2, $3, '_lastUpdated', $4::timestamptz)",
-                    &[&tenant_id, &resource_type, &resource_id, &normalized],
-                )
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to insert _lastUpdated index: {}", e))
-                })?;
-        }
-
-        Ok(())
-    }
-
-    /// Delete search index entries for a resource.
-    /// Removes a resource's search entries, returning how many `search_index`
-    /// rows were deleted.
+    /// This used to take an `FtsRow` telling it whether to drop the full-text
+    /// row, because a *re-indexing* caller — `update`, `restore` — wanted only
+    /// the `search_index` half cleared: the full-text write is an upsert against
+    /// the UNIQUE `idx_fts_lookup` (schema v28) and replaces the row in place, so
+    /// deleting it first was one statement and one round trip of pure waste
+    /// (227.3 s over a 5-minute crud run's 192,825 updates, measured on run
+    /// 33086933938).
+    ///
+    /// Those callers no longer come here at all. Clearing the `search_index`
+    /// rows is now folded into the statement that writes the new ones
+    /// (`IndexWrite::Replace` -> `PostgresSearchIndexWriter::replace_rows`),
+    /// which removes a second statement and round trip on top of the one the
+    /// `FtsRow` split removed. What is left is the one caller that means
+    /// "unindex this resource" — `delete_search_entries`, the `$reindex` clear —
+    /// and it always wanted both halves gone, so the parameter had one possible
+    /// value and is now implicit.
+    ///
+    /// The obligation the enum carried is still real and now lives here: a
+    /// caller that removes `search_index` rows and does *not* rewrite them must
+    /// take the `resource_fts` row too, or the resource stays matchable by
+    /// `_text` / `_content` after it has stopped matching everything else.
     pub(crate) async fn delete_search_index(
         &self,
         client: &deadpool_postgres::Client,
@@ -1244,17 +1568,17 @@ impl PostgresBackend {
         }
 
         // Delete from main search index
-        let deleted = client
-            .execute(
+        let deleted = execute_cached(
+                client,
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                 &[&tenant_id, &resource_type, &resource_id],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
 
-        // Delete from FTS table if it exists
-        let _ = client
-            .execute(
+        // The full-text row goes with them.
+        let _ = execute_cached(
+                client,
                 "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                 &[&tenant_id, &resource_type, &resource_id],
             )
@@ -2220,7 +2544,8 @@ impl PurgableStorage for PostgresBackend {
             }
         }
 
-        // Delete from search index first (due to FK constraint)
+        // Removing the index rows is REQUIRED, not just ordering: `search_index`
+        // has no foreign key to `resources` (schema v24), so nothing cascades.
         client
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
@@ -2272,7 +2597,8 @@ impl PurgableStorage for PostgresBackend {
             .or_query_error("Failed to count resources")?;
         let count: i64 = row.get(0);
 
-        // Delete from search index first (due to FK constraint)
+        // Removing the index rows is REQUIRED, not just ordering: `search_index`
+        // has no foreign key to `resources` (schema v24), so nothing cascades.
         client
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2",
@@ -2754,6 +3080,15 @@ impl BundleProvider for PostgresBackend {
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
 
+        // `create` no longer sends its insert on the spot — the transaction
+        // batches consecutive creates and flushes them together, which is what
+        // takes a 1,632-entry import bundle from 3,264 statements to 26. A
+        // conflict is therefore discovered at flush time, after later entries
+        // have already been processed, so the entry index has to be recovered
+        // rather than read off the loop counter. This maps the transaction's
+        // n-th `create` call back to the entry that made it.
+        let mut create_entry_index: Vec<usize> = Vec::with_capacity(entries.len());
+
         // Build a map of fullUrl -> assigned reference for reference resolution
         let mut reference_map: HashMap<String, String> = HashMap::new();
 
@@ -2776,7 +3111,11 @@ impl BundleProvider for PostgresBackend {
                 resolve_bundle_references(resource, &reference_map);
             }
 
+            let creates_before = tx.creates_seen();
             let result = self.process_bundle_entry_tx(&mut tx, entry).await;
+            for _ in creates_before..tx.creates_seen() {
+                create_entry_index.push(idx);
+            }
 
             match result {
                 Ok(entry_result) => {
@@ -2837,9 +3176,19 @@ impl BundleProvider for PostgresBackend {
                     results.push(entry_result);
                 }
                 Err(e) => {
-                    error_info = Some((idx, format!("Entry processing failed: {}", e)));
+                    error_info = Some(attribute_entry_error(&tx, &create_entry_index, idx, &e));
                     break;
                 }
+            }
+        }
+
+        // Send whatever is still buffered before committing, so a conflict in
+        // the last batch is reported as the bundle error it is — with the
+        // offending entry's index — rather than as a bare commit failure.
+        if error_info.is_none() {
+            if let Err(e) = tx.flush().await {
+                let last = entries.len().saturating_sub(1);
+                error_info = Some(attribute_entry_error(&tx, &create_entry_index, last, &e));
             }
         }
 
@@ -2875,6 +3224,32 @@ impl BundleProvider for PostgresBackend {
             bundle_type: BundleType::Transaction,
             entries: results,
         })
+    }
+}
+
+/// Names the bundle entry responsible for a transaction error.
+///
+/// A conflict found while flushing buffered creates belongs to the entry whose
+/// `create` produced the row, not to whichever entry happened to be in flight
+/// when the flush ran. Everything else belongs to the entry that raised it.
+fn attribute_entry_error(
+    tx: &super::transaction::PostgresTransaction,
+    create_entry_index: &[usize],
+    fallback: usize,
+    error: &StorageError,
+) -> (usize, String) {
+    match tx.deferred_conflict() {
+        Some(conflict) => (
+            create_entry_index
+                .get(conflict.ordinal)
+                .copied()
+                .unwrap_or(fallback),
+            format!(
+                "Entry processing failed: {}/{} already exists",
+                conflict.resource_type, conflict.id
+            ),
+        ),
+        None => (fallback, format!("Entry processing failed: {}", error)),
     }
 }
 
@@ -3187,6 +3562,8 @@ impl ReindexTarget for PostgresBackend {
         resource_id: &str,
     ) -> StorageResult<u64> {
         let client = self.get_client().await?;
+        // `$reindex` may clear without rewriting, so the full-text row goes
+        // too; `write_search_entries` puts it back when the rewrite follows.
         self.delete_search_index(
             &client,
             tenant.tenant_id().as_str(),
@@ -3213,24 +3590,27 @@ impl ReindexTarget for PostgresBackend {
             .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
-        let mut count = 0;
-        for value in values {
-            PostgresSearchIndexWriter::write_entry(
-                &client,
-                tenant_id,
-                resource_type,
-                resource_id,
-                &value,
-            )
-            .await?;
-            count += 1;
-        }
+        let mut rows = PostgresSearchIndexWriter::build_rows(
+            resource_type,
+            resource_id,
+            resource.last_modified(),
+            self.index_layout(),
+            values,
+        );
 
         // Re-index contained resources too, so `$reindex` rebuilds `_contained`
-        // search entries.
-        count += self
-            .index_contained_resources(&client, tenant_id, resource_type, resource_id, content)
-            .await?;
+        // search entries — in the same statement as the resource's own rows.
+        rows.extend(self.contained_index_rows(tenant_id, resource_type, resource_id, content));
+
+        let count = rows.len();
+        PostgresSearchIndexWriter::insert_rows(
+            &client,
+            tenant_id,
+            resource_type,
+            resource_id,
+            &rows,
+        )
+        .await?;
 
         // Rebuild the full-text row as well. `run_reindex` deletes each
         // resource's search entries first (`delete_search_entries` ->
@@ -3240,8 +3620,8 @@ impl ReindexTarget for PostgresBackend {
         // Same defect as the SQLite side — this is not PostgreSQL-specific.
         //
         // Not counted in `count`, which reports `search_index` entries only.
-        // `index_fts_content` is DELETE-then-INSERT here, so it is idempotent
-        // regardless of what ran before it.
+        // The write is an upsert, so it is idempotent regardless of what ran
+        // before it — a reindex can find a row present.
         self.index_fts_content(&client, tenant_id, resource_type, resource_id, content)
             .await?;
 
@@ -3275,25 +3655,6 @@ impl ReindexTarget for PostgresBackend {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// Normalize a date string for PostgreSQL TIMESTAMPTZ.
-fn normalize_date_for_pg(value: &str) -> String {
-    if value.contains('T') {
-        if value.contains('+') || value.contains('Z') || value.ends_with("-00:00") {
-            value.to_string()
-        } else {
-            format!("{}+00:00", value)
-        }
-    } else if value.len() == 10 {
-        format!("{}T00:00:00+00:00", value)
-    } else if value.len() == 7 {
-        format!("{}-01T00:00:00+00:00", value)
-    } else if value.len() == 4 {
-        format!("{}-01-01T00:00:00+00:00", value)
-    } else {
-        value.to_string()
-    }
-}
 
 // ============================================================================
 // FTS Content Extraction (local copy to avoid cross-feature dependency on sqlite)
@@ -3371,32 +3732,205 @@ fn strip_html_tags(html: &str) -> String {
 /// Extracts all string values from a JSON value recursively.
 fn extract_all_strings(value: &Value) -> String {
     let mut parts = Vec::new();
-    collect_strings(value, &mut parts);
+    collect_strings(value, None, &mut parts);
     parts.join(" ")
 }
 
-fn collect_strings(value: &Value, parts: &mut Vec<String>) {
+/// The keys whose value is a machine identifier or a link rather than text.
+///
+/// `id` is the resource's (or an element's) identity, `reference` a link to
+/// another resource, `fullUrl` the same link in a Bundle entry, and
+/// `versionId` the row's version. FHIR answers all four with dedicated,
+/// exactly-matching search machinery — `_id`, reference-typed parameters,
+/// `_include` / `_revinclude`, chaining — none of which goes anywhere near
+/// `resource_fts`.
+const OPAQUE_ID_KEYS: [&str; 4] = ["id", "reference", "fullUrl", "versionId"];
+
+/// Collects the strings that make up `_content`.
+///
+/// `key` is the JSON object key the value hangs off (inherited through arrays,
+/// so `Provenance.target[].reference` is still seen as a `reference`).
+///
+/// A value at one of [`OPAQUE_ID_KEYS`] that contains a canonical UUID is left
+/// out. That is a deliberate narrowing of `_content`, and it is what makes the
+/// full-text write path cheap: a GIN index costs roughly what its *entry tree*
+/// costs, and a UUID never seen before is a brand-new key inserted at a random
+/// position in that tree — page split, WAL, cache miss — whereas an ordinary
+/// word only appends to a posting list that already exists. Measured over
+/// 45,000 crud-shaped resources (the benchmark's own nine seed resources with
+/// server-assigned ids and cross-references), the vectors held **224,438**
+/// distinct lexemes before this filter and **333** after: 99.85% of the entry
+/// tree was ids and links. Over 177,603 resources of the Synthea corpus the
+/// content GIN index falls from 88 MB to 30 MB, index buffer touches per
+/// insert from 27.8 to 9.1, and WAL records per insert from 11.1 to 5.2.
+///
+/// What can no longer be found: `_content=<a uuid>` and
+/// `_content=Patient/<a uuid>` — searching the free-text index for a resource
+/// id or a literal reference. `_id`, `subject=Patient/<id>`, `_include` and
+/// reverse chaining all still answer those, exactly rather than through a
+/// stemming text query. What is still found: everything a person wrote or a
+/// terminology defines — names, addresses, narrative, codes, display strings,
+/// `text` elements, and `Identifier.value`, which is where an MRN, an NPI or an
+/// accession number lives. Only the four keys above are touched, and only when
+/// the value is UUID-shaped, so a server that assigns readable ids
+/// (`Patient/patient-smith`) keeps indexing them.
+///
+/// The SQLite backend has always excluded `id`, `reference`, `meta`,
+/// `extension`, `url` and every `http(s)://` string from `_content`
+/// (`sqlite/search/fts.rs`). This narrows the *existing* divergence rather than
+/// creating one: PostgreSQL's `_content` remains a strict superset of
+/// SQLite's.
+///
+/// # An absolute `http(s)` URL is not text either
+///
+/// The UUID rule above removed the *entry tree* cost — the one-off keys that a
+/// GIN index pays a page split for. It did not remove the **tokeniser** cost,
+/// and that is where what is left of this write path lives: an earlier seat
+/// decomposed `INSERT INTO resource_fts` on this corpus and found **63% of the
+/// statement is `to_tsvector` running in the Postgres backend**, 24% GIN, 12%
+/// heap and unique index. The tokeniser is linear in input *bytes*, so the only
+/// lever on that 63% is fewer bytes.
+///
+/// A FHIR resource's bytes are not evenly split between prose and machinery. In
+/// the benchmark's nine crud seed resources, `_content` is 6,114 bytes, of which
+/// **2,899 (47%) are absolute `http(s)` URLs** — `system` values, profile
+/// canonicals, `CodeSystem` URLs. They are terminology addresses, not words, and
+/// Postgres's default parser is unusually expensive on them: it recognises
+/// `protocol`, `url`, `host` and `url_path` tokens, so one 54-byte system URL
+/// costs several tokens and several stemmer calls to produce lexemes nobody
+/// types into a `_content` query.
+///
+/// Measured on PostgreSQL 18.6 over exactly those nine resources, 2,000
+/// repetitions × 3 interleaved rounds, arms differing only in whether
+/// `http(s)`-prefixed strings are collected:
+///
+/// ```text
+/// arm                     us/resource   lexemes   tsvector bytes
+/// with URLs (before)         209.45         416          9,594
+/// without URLs (this)        119.07         307          4,972
+///                            -43.1%       -26.2%         -48.2%
+/// ```
+///
+/// All three columns matter and they hit different thirds of the statement:
+/// −43% of the tokeniser's 63%, −26% of the GIN's 24% (GIN cost is per entry),
+/// and −48% of the vector that the heap and the unique index have to carry.
+///
+/// The two right-hand columns are counts and are load-independent. The
+/// microseconds are not: the box was carrying another seat's release build at
+/// the time and every absolute figure on it is inflated by roughly 2-3x against
+/// the ~0.11 us/byte an earlier seat measured on a quiet one. What transfers is
+/// the **ratio**, which is what the arms were interleaved to isolate.
+///
+/// What can no longer be found: `_content=http://loinc.org`, i.e. asking the
+/// free-text index for a code system's *address*. `system` is still indexed
+/// exactly by every token parameter (`code=http://loinc.org|8302-2`,
+/// `code:in=…`), which is the machinery FHIR provides for that question and
+/// which answers it without stemming. The `Identifier.value`, the display, the
+/// `text` and the narrative that sit next to the URL are all untouched.
+///
+/// This is the *same* rule SQLite has always applied, so it removes a
+/// divergence: `_content` on the two backends now agrees about URLs. PostgreSQL
+/// still indexes `meta`, `extension` and `url`-keyed non-URL strings that SQLite
+/// drops, so it remains the superset.
+///
+/// # It needs no migration, and deliberately does not get one
+///
+/// `resource_fts` stores the vectors, not their input (`narrative_text` and
+/// `full_content` have been write-only since v26 and are left unbound), so no
+/// SQL migration can recompute a row: the extraction is Rust-side. Rows written
+/// before this change keep their URL lexemes. That direction is safe — a wider
+/// vector *over*-matches, so an old row answers `_content=http://loinc.org` and
+/// a new one does not, and no query that used to return a resource stops
+/// returning it for any other term. `$reindex` regenerates the rows for a
+/// deployment that wants them uniform. Bumping the schema version would not
+/// help, because there is nothing the migration could execute.
+fn collect_strings(value: &Value, key: Option<&str>, parts: &mut Vec<String>) {
     match value {
         Value::String(s) => {
-            if !s.is_empty() {
-                parts.push(s.clone());
+            if s.is_empty() {
+                return;
             }
+            if key.is_some_and(|k| OPAQUE_ID_KEYS.contains(&k)) && contains_uuid(s) {
+                return;
+            }
+            if is_absolute_http_url(s) {
+                return;
+            }
+            parts.push(s.clone());
         }
         Value::Object(map) => {
             for (key, val) in map {
                 if key == "div" || key == "data" {
                     continue;
                 }
-                collect_strings(val, parts);
+                collect_strings(val, Some(key.as_str()), parts);
             }
         }
         Value::Array(arr) => {
             for val in arr {
-                collect_strings(val, parts);
+                collect_strings(val, key, parts);
             }
         }
         _ => {}
     }
+}
+
+/// Whether `s` *is* an absolute `http` or `https` URL.
+///
+/// Prefix-anchored, not "contains": a sentence that mentions a link — a
+/// narrative, a `text` element, an `Identifier.value` that happens to embed one
+/// — is prose and stays in `_content`. Only a value whose entire content is the
+/// URL is dropped, which is the shape a `system`, a `profile` canonical or a
+/// `CodeSystem.url` takes.
+///
+/// `urn:` is deliberately *not* included even though `urn:oid:` and `urn:uuid:`
+/// systems are just as machine-shaped. It is only 80 bytes of the crud corpus's
+/// 6,114 (1.3%), SQLite does not drop it, and adding it would re-open the
+/// divergence this closes for no measurable gain.
+fn is_absolute_http_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// Whether `s` contains a canonical UUID: 8-4-4-4-12 hexadecimal digits.
+///
+/// The match has to be delimited on both sides — the byte before and the byte
+/// after may not be a hex digit or a hyphen — so a longer hexadecimal run is
+/// never mistaken for a UUID it happens to contain.
+fn contains_uuid(s: &str) -> bool {
+    const UUID_LEN: usize = 36;
+    let b = s.as_bytes();
+    if b.len() < UUID_LEN {
+        return false;
+    }
+    for i in 0..=(b.len() - UUID_LEN) {
+        if i > 0 && (b[i - 1].is_ascii_hexdigit() || b[i - 1] == b'-') {
+            continue;
+        }
+        let end = i + UUID_LEN;
+        if end < b.len() && (b[end].is_ascii_hexdigit() || b[end] == b'-') {
+            continue;
+        }
+        if is_uuid(&b[i..end]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether exactly these 36 bytes are `8-4-4-4-12` hexadecimal digits.
+fn is_uuid(b: &[u8]) -> bool {
+    debug_assert_eq!(b.len(), 36);
+    for (i, byte) in b.iter().enumerate() {
+        let expect_hyphen = matches!(i, 8 | 13 | 18 | 23);
+        if expect_hyphen {
+            if *byte != b'-' {
+                return false;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -3478,5 +4012,189 @@ mod fts_extraction_tests {
 
         assert!(!content.is_empty());
         assert!(content.full_content.contains("Solitary"));
+    }
+
+    #[test]
+    fn uuid_shapes_are_recognised_only_when_delimited() {
+        let u = "a424cdce-e753-faae-a2c4-9fe945223809";
+        assert!(contains_uuid(u));
+        assert!(contains_uuid(&format!("Patient/{u}")));
+        assert!(contains_uuid(&format!("urn:uuid:{u}")));
+        assert!(contains_uuid(&format!("Patient/{u}/_history/3")));
+        assert!(contains_uuid(&format!(
+            "https://example.org/fhir/Patient/{u}"
+        )));
+
+        // Not a UUID: wrong group lengths, a non-hex digit, and a longer
+        // hexadecimal run that merely contains 36 matching bytes.
+        assert!(!contains_uuid("a424cdce-e753-faae-a2c4-9fe94522380"));
+        assert!(!contains_uuid("a424cdce-e753-faae-a2c4-9fe9452238zz"));
+        assert!(!contains_uuid(&format!("ff{u}")));
+        assert!(!contains_uuid(&format!("{u}ff")));
+        assert!(!contains_uuid(&format!("{u}-0000")));
+        assert!(!contains_uuid("patient-smith-1"));
+        assert!(!contains_uuid(""));
+    }
+
+    #[test]
+    fn content_drops_ids_and_references_but_keeps_identifier_values() {
+        // The narrowing this makes to `_content`: the resource's own id and the
+        // links it holds are not text, and indexing them is what made the
+        // full-text write path expensive. Everything a person wrote — including
+        // an `Identifier.value`, which is where an MRN lives even when the MRN
+        // happens to be a UUID — stays.
+        let id = "a424cdce-e753-faae-a2c4-9fe945223809";
+        let mrn = "7ec34f99-4ae7-bb4c-cc1c-4ab0bc19784f";
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Observation",
+            "id": id,
+            "meta": {"versionId": "550e8400-e29b-41d4-a716-446655440000"},
+            "subject": {"reference": format!("Patient/{id}"), "display": "Pok428 Metz686"},
+            "identifier": [{"system": "http://hospital.example.org", "value": mrn}],
+            "code": {"text": "Pain severity"}
+        }));
+
+        assert!(
+            !content.full_content.contains(id),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("550e8400"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            content.full_content.contains(mrn),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            content.full_content.contains("Pok428 Metz686"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            content.full_content.contains("Pain severity"),
+            "{}",
+            content.full_content
+        );
+        // The `system` URL next to the MRN is now dropped as well — see
+        // `is_absolute_http_url`. `identifier=http://hospital.example.org|<mrn>`
+        // still answers exactly for it; the MRN itself, above, stays in
+        // `_content`.
+        assert!(
+            !content.full_content.contains("http://hospital.example.org"),
+            "{}",
+            content.full_content
+        );
+    }
+
+    #[test]
+    fn content_drops_whole_urls_but_keeps_prose_that_mentions_one() {
+        // The rule is prefix-anchored on purpose: a `system` or a profile
+        // canonical is a machine address and goes, but a narrative or a `text`
+        // that happens to quote a link is prose and stays. Dropping on
+        // "contains" would silently take the sentence with it.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Observation",
+            "meta": {"profile": ["http://hl7.org/fhir/StructureDefinition/vitalsigns"]},
+            "code": {
+                "coding": [{"system": "http://loinc.org", "code": "8302-2",
+                            "display": "Body Height"}],
+                "text": "Body Height"
+            },
+            "note": [{"text": "Method described at https://example.org/protocols/height"}]
+        }));
+
+        assert!(
+            !content.full_content.contains("http://loinc.org"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content
+                .full_content
+                .contains("StructureDefinition/vitalsigns"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            content
+                .full_content
+                .contains("Method described at https://example.org/protocols/height"),
+            "{}",
+            content.full_content
+        );
+        assert!(content.full_content.contains("Body Height"));
+        assert!(content.full_content.contains("8302-2"));
+    }
+
+    #[test]
+    fn urn_systems_are_still_indexed() {
+        // `urn:` is deliberately outside the rule; see `is_absolute_http_url`.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "urn:oid:2.16.840.1.113883.4.1", "value": "999-11-2222"}]
+        }));
+
+        assert!(
+            content
+                .full_content
+                .contains("urn:oid:2.16.840.1.113883.4.1")
+        );
+        assert!(content.full_content.contains("999-11-2222"));
+    }
+
+    #[test]
+    fn readable_ids_and_references_are_still_indexed() {
+        // Only UUID-shaped values are dropped, so a server that assigns
+        // human-readable ids keeps `_content` finding them.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Observation",
+            "id": "obs-smith-2024",
+            "subject": {"reference": "Patient/patient-smith"}
+        }));
+
+        assert!(content.full_content.contains("obs-smith-2024"));
+        assert!(content.full_content.contains("Patient/patient-smith"));
+    }
+
+    #[test]
+    fn references_inside_arrays_are_dropped_too() {
+        // `collect_strings` inherits the key through arrays, which is what makes
+        // `Provenance.target[].reference` — the single largest producer of
+        // one-off GIN keys in the corpus — take the same path.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Provenance",
+            "target": [
+                {"reference": "Encounter/834823d5-da27-4685-ba3b-5bd316e92682"},
+                {"reference": "Claim/9fe94522-e753-faae-a2c4-3809a424cdce"}
+            ],
+            "activity": {"text": "Record authoring"}
+        }));
+
+        assert!(
+            !content.full_content.contains("834823d5"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("9fe94522"),
+            "{}",
+            content.full_content
+        );
+        assert!(content.full_content.contains("Record authoring"));
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        let s = "ä".repeat(100);
+        for max in 0..s.len() + 2 {
+            let cut = truncate_on_char_boundary(&s, max);
+            assert!(cut.len() <= max.min(s.len()));
+            assert!(s.starts_with(cut));
+        }
+        assert_eq!(truncate_on_char_boundary("abc", 10), "abc");
     }
 }

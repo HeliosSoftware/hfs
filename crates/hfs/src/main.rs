@@ -676,6 +676,11 @@ async fn serve(
         // configured from HFS_UI_* client credentials.
         let self_base_url = format!("http://127.0.0.1:{}", config.port);
         let outbound_auth = AuthConfig::from_env().outbound_provider();
+        let patient_name_search = patient_name_search_support(
+            config
+                .storage_backend_mode()
+                .expect("storage backend was validated before server startup"),
+        );
         helios_ui::mount_with_body_limit_and_tenant_routing(
             app,
             env!("CARGO_PKG_VERSION"),
@@ -696,6 +701,7 @@ async fn serve(
             config.max_body_size,
             config.multitenancy.routing_mode.supports_url_path(),
             ui_bulk_provider.clone(),
+            patient_name_search,
         )
     };
     #[cfg(not(all(feature = "ui", not(feature = "headless"))))]
@@ -733,6 +739,20 @@ async fn serve(
     })
     .await?;
     Ok(())
+}
+
+#[cfg(all(feature = "ui", not(feature = "headless")))]
+fn patient_name_search_support(mode: StorageBackendMode) -> helios_ui::PatientNameSearchSupport {
+    match mode {
+        StorageBackendMode::S3 => helios_ui::PatientNameSearchSupport::IdOnly,
+        StorageBackendMode::Sqlite
+        | StorageBackendMode::SqliteElasticsearch
+        | StorageBackendMode::Postgres
+        | StorageBackendMode::PostgresElasticsearch
+        | StorageBackendMode::MongoDB
+        | StorageBackendMode::MongoDBElasticsearch
+        | StorageBackendMode::S3Elasticsearch => helios_ui::PatientNameSearchSupport::Enabled,
+    }
 }
 
 /// Initializes the authentication subsystem from environment configuration.
@@ -3006,6 +3026,47 @@ mod tests {
             StorageBackendMode::S3Elasticsearch.primary_backend_kind(),
             BackendKind::S3
         );
+    }
+
+    #[cfg(all(feature = "ui", not(feature = "headless")))]
+    #[test]
+    fn test_patient_name_search_support_matches_storage_capability() {
+        for (mode, expected) in [
+            (
+                StorageBackendMode::Sqlite,
+                helios_ui::PatientNameSearchSupport::Enabled,
+            ),
+            (
+                StorageBackendMode::SqliteElasticsearch,
+                helios_ui::PatientNameSearchSupport::Enabled,
+            ),
+            (
+                StorageBackendMode::Postgres,
+                helios_ui::PatientNameSearchSupport::Enabled,
+            ),
+            (
+                StorageBackendMode::PostgresElasticsearch,
+                helios_ui::PatientNameSearchSupport::Enabled,
+            ),
+            (
+                StorageBackendMode::MongoDB,
+                helios_ui::PatientNameSearchSupport::Enabled,
+            ),
+            (
+                StorageBackendMode::MongoDBElasticsearch,
+                helios_ui::PatientNameSearchSupport::Enabled,
+            ),
+            (
+                StorageBackendMode::S3,
+                helios_ui::PatientNameSearchSupport::IdOnly,
+            ),
+            (
+                StorageBackendMode::S3Elasticsearch,
+                helios_ui::PatientNameSearchSupport::Enabled,
+            ),
+        ] {
+            assert_eq!(patient_name_search_support(mode), expected, "{mode:?}");
+        }
     }
 
     #[test]

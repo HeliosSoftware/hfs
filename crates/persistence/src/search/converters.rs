@@ -370,6 +370,7 @@ impl ValueConverter {
 
                 // CodeableConcept (has coding array and optionally text)
                 if let Some(coding) = obj.get("coding").and_then(|v| v.as_array()) {
+                    let first_coding_row = results.len();
                     for c in coding {
                         if let Some(code) = c.get("code").and_then(|v| v.as_str()) {
                             let system = c.get("system").and_then(|v| v.as_str()).map(String::from);
@@ -378,11 +379,14 @@ impl ValueConverter {
                             results.push(IndexValue::token_with_display(system, code, display));
                         }
                     }
-                    // Also index CodeableConcept.text for :text modifier searches
-                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                        if !text.is_empty() {
-                            results.push(IndexValue::token_display_only(text));
-                        }
+                    // Also index CodeableConcept.text for :text modifier searches —
+                    // but only when no coding row of this same concept can already
+                    // carry it. See [`absorb_codeable_concept_text`].
+                    if let Some(text) = obj.get("text").and_then(|v| v.as_str())
+                        && !text.is_empty()
+                        && !absorb_codeable_concept_text(&mut results[first_coding_row..], text)
+                    {
+                        results.push(IndexValue::token_display_only(text));
                     }
                 }
 
@@ -598,6 +602,71 @@ impl ValueConverter {
     }
 }
 
+/// Places a `CodeableConcept.text` onto one of the concept's own coding rows,
+/// returning `true` when it found a home and needs no `search_index` row of its
+/// own.
+///
+/// `text` is indexed so that `:text` (and its `:code-text` / `:text-advanced`
+/// relatives) can match the human-readable label. Every backend answers those
+/// modifiers by matching the **display column of any row** for the parameter and
+/// returning that row's `resource_id` — Postgres `value_token_display ILIKE`,
+/// SQLite `value_token_display COLLATE NOCASE LIKE`, MongoDB `$regex` with `i`,
+/// Elasticsearch `match` / `query_string` / `match_phrase_prefix` over the
+/// analyzed `search_params.token.display`. None of them is sensitive to *which*
+/// row of a resource carries the text, and none of them reads the code-less
+/// row's other columns: its `value_token_code` is `""`, which no well-formed
+/// token search names. So the text only has to appear in some row's display for
+/// the same `(resource, param_name)`; a row of its own is pure duplication.
+///
+/// That duplication is the largest single multiplier in the Postgres index. In
+/// the row census for run 33029355759, `Observation | code` holds 1,380,384 rows
+/// for 689,080 resources — exactly 2.00 per resource, one LOINC coding plus one
+/// code-less `text` row, because Synthea writes `code.text` as a verbatim copy of
+/// `coding[0].display`. `Observation | category` and `| status`, which carry no
+/// `text`, sit at exactly 1.00. The same doubling runs through `combo-code`
+/// (1,996,340), `component-code` (615,956), `value-concept`, `combo-value-concept`
+/// and every other CodeableConcept parameter — and it is *squared* inside the
+/// composites, which cross the token axis with the value axis: `code-value-concept`
+/// is 4.00 rows per complete instance where 1.00 would do.
+///
+/// Two dispositions, in order:
+///
+/// 1. A coding whose `display` already equals the text (ASCII-case-insensitively,
+///    which every matcher above is) makes the row redundant outright. This is the
+///    Synthea shape and the one that pays.
+/// 2. Otherwise the text is parked on the first coding that has no `display` of
+///    its own — the column is documented as "Coding.display or
+///    CodeableConcept.text", so this is the value it was meant to hold, and no
+///    display is overwritten.
+///
+/// Anything else (every coding has a *different* display) keeps its own row: the
+/// text is not reachable through any existing row and dropping it would lose a
+/// `:text` match. Non-ASCII case differences also keep the row, which errs toward
+/// writing one row too many rather than losing a result.
+fn absorb_codeable_concept_text(codings: &mut [IndexValue], text: &str) -> bool {
+    let already_carried = codings.iter().any(|value| match value {
+        IndexValue::Token {
+            display: Some(display),
+            ..
+        } => display.eq_ignore_ascii_case(text),
+        _ => false,
+    });
+    if already_carried {
+        return true;
+    }
+
+    for value in codings.iter_mut() {
+        if let IndexValue::Token { display, .. } = value
+            && display.is_none()
+        {
+            *display = Some(text.to_string());
+            return true;
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,6 +778,17 @@ mod tests {
         }
     }
 
+    /// Returns the `display` of every token value, in order.
+    fn displays(values: &[IndexValue]) -> Vec<Option<&str>> {
+        values
+            .iter()
+            .map(|v| match v {
+                IndexValue::Token { display, .. } => display.as_deref(),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn test_convert_codeable_concept() {
         let value = json!({
@@ -719,8 +799,101 @@ mod tests {
             "text": "Some condition"
         });
         let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
-        // Now includes: 2 coding values + 1 text value for :text modifier
+        // Two codings, neither with a display of its own, so the concept's text
+        // rides on the first of them instead of claiming a third row.
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            displays(&results),
+            vec![Some("Some condition"), None],
+            "`:text` still reaches the resource through the first coding"
+        );
+    }
+
+    #[test]
+    fn codeable_concept_text_equal_to_a_display_writes_no_extra_row() {
+        // The Synthea shape, and the one that dominates the benchmark corpus:
+        // `text` is a verbatim copy of `coding[0].display`.
+        let value = json!({
+            "coding": [{
+                "system": "http://loinc.org",
+                "code": "8302-2",
+                "display": "Body Height"
+            }],
+            "text": "Body Height"
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
+        assert_eq!(results.len(), 1, "the text row would be a duplicate");
+        assert_eq!(displays(&results), vec![Some("Body Height")]);
+    }
+
+    #[test]
+    fn codeable_concept_text_matches_a_display_case_insensitively() {
+        // Every `:text` matcher in the workspace is case-insensitive (ILIKE,
+        // COLLATE NOCASE LIKE, $regex /i, a lowercasing analyzer), so a row that
+        // differs only in case cannot change any result.
+        let value = json!({
+            "coding": [{"code": "123", "display": "BODY HEIGHT"}],
+            "text": "Body Height"
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(displays(&results), vec![Some("BODY HEIGHT")]);
+    }
+
+    #[test]
+    fn codeable_concept_text_unlike_every_display_keeps_its_own_row() {
+        // Dropping this one would lose a `:text` match: no existing row's
+        // display contains "Raised blood pressure".
+        let value = json!({
+            "coding": [
+                {"code": "123", "display": "Systolic BP"},
+                {"code": "456", "display": "Diastolic BP"}
+            ],
+            "text": "Raised blood pressure"
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
         assert_eq!(results.len(), 3);
+        assert_eq!(
+            displays(&results),
+            vec![
+                Some("Systolic BP"),
+                Some("Diastolic BP"),
+                Some("Raised blood pressure")
+            ]
+        );
+        assert!(
+            matches!(&results[2], IndexValue::Token { code, .. } if code.is_empty()),
+            "the surviving text row is still the code-less display carrier"
+        );
+    }
+
+    #[test]
+    fn codeable_concept_text_without_any_coding_keeps_its_row() {
+        // Nothing else carries it, and `code:missing=false` must stay true.
+        let value = json!({ "coding": [], "text": "Free text only" });
+        let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(displays(&results), vec![Some("Free text only")]);
+    }
+
+    #[test]
+    fn codeable_concept_text_never_overwrites_a_display() {
+        // Parking the text on a coding that already has a display would delete
+        // that display from the index — a `:text` search for it would stop
+        // matching. The first *display-less* coding takes it instead.
+        let value = json!({
+            "coding": [
+                {"code": "123", "display": "Systolic BP"},
+                {"code": "456"}
+            ],
+            "text": "Raised blood pressure"
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            displays(&results),
+            vec![Some("Systolic BP"), Some("Raised blood pressure")]
+        );
     }
 
     #[test]

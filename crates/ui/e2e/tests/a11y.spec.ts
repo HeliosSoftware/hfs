@@ -77,3 +77,35 @@ for (const theme of THEMES) {
     expect(violations).toEqual([]);
   });
 }
+
+test("terminal export delete disclosure is accessible and viewport-bound", async ({ page }) => {
+  await page.goto("/ui/bulk-export/new");
+  const exportName = `a11y-terminal-${Date.now()}`;
+  const form = page.locator('form[action="/ui/bulk-export"]');
+  await form.locator('input[name="name"]').fill(exportName);
+  await form.locator('input[name="scope"][value="system"]').check();
+  await form.getByRole("button", { name: "Start Export" }).click();
+  let card = page.locator(".job-card").filter({ hasText: exportName });
+  await card.getByRole("button", { name: "Cancel" }).click();
+
+  for (const viewport of [
+    { width: 1280, height: 800 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.goto("/ui/bulk-export", { waitUntil: "networkidle" });
+    card = page.locator(".job-card").filter({ hasText: exportName });
+    const disclosure = card.locator("details.job-card__delete");
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+
+    await disclosure.locator("summary").click();
+    await expect(disclosure).toHaveAttribute("open", "");
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+    const panel = await disclosure.locator(".job-card__delete-confirm").boundingBox();
+    expect(panel).not.toBeNull();
+    expect(panel!.x).toBeGreaterThanOrEqual(0);
+    expect(panel!.y).toBeGreaterThanOrEqual(0);
+    expect(panel!.x + panel!.width).toBeLessThanOrEqual(viewport.width);
+    expect(panel!.y + panel!.height).toBeLessThanOrEqual(viewport.height);
+  }
+});
