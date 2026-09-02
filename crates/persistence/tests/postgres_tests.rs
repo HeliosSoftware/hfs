@@ -4567,6 +4567,186 @@ mod postgres_integration {
         }
     }
 
+    fn if_none_exist_entry(family: &str, full_url: &str) -> helios_persistence::core::BundleEntry {
+        use helios_persistence::core::{BundleEntry, BundleMethod};
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-COND-1"}],
+                "name": [{"family": family}]
+            })),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: Some("identifier=http://example.org/mrn|MRN-TX-COND-1".to_string()),
+            full_url: Some(full_url.to_string()),
+        }
+    }
+
+    /// `ifNoneExist` is resolved inside the transaction (#511): the same bundle
+    /// twice answers 201 then 200, the 200 names the match, and one row exists.
+    /// Two entries with the same criteria in one bundle see each other, since
+    /// buffered creates are flushed before the search.
+    #[tokio::test]
+    async fn postgres_integration_transaction_if_none_exist_is_idempotent() {
+        use helios_persistence::core::BundleProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tx-if-none-exist");
+
+        let first = backend
+            .process_transaction(
+                &tenant,
+                vec![if_none_exist_entry("First", "urn:uuid:first")],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.entries[0].status, 201);
+
+        let second = backend
+            .process_transaction(
+                &tenant,
+                vec![if_none_exist_entry("Second", "urn:uuid:second")],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.entries[0].status, 200,
+            "the match is answered, not duplicated"
+        );
+        assert_eq!(second.entries[0].location, first.entries[0].location);
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+
+        let tenant = create_tenant("tx-if-none-exist-same-bundle");
+        let both = backend
+            .process_transaction(
+                &tenant,
+                vec![
+                    if_none_exist_entry("First", "urn:uuid:first"),
+                    if_none_exist_entry("Second", "urn:uuid:second"),
+                ],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(both.entries[0].status, 201);
+        assert_eq!(both.entries[1].status, 200);
+        assert_eq!(both.entries[1].location, both.entries[0].location);
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    }
+
+    /// A `urn:uuid` reference to a matched `ifNoneExist` entry resolves to the
+    /// match (R4 §3.1.0.11.2); several matches fail the entry with 412 and roll
+    /// the bundle back.
+    #[tokio::test]
+    async fn postgres_integration_transaction_if_none_exist_resolves_references_and_rejects_ambiguity()
+     {
+        use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider};
+        use helios_persistence::error::TransactionError;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tx-if-none-exist-urn");
+
+        let existing = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-COND-1"}],
+                    "name": [{"family": "AlreadyThere"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let result = backend
+            .process_transaction(
+                &tenant,
+                vec![
+                    if_none_exist_entry("Duplicate", "urn:uuid:patient"),
+                    BundleEntry {
+                        method: BundleMethod::Post,
+                        url: "Observation".to_string(),
+                        resource: Some(json!({
+                            "resourceType": "Observation",
+                            "status": "final",
+                            "code": {"text": "test"},
+                            "subject": {"reference": "urn:uuid:patient"}
+                        })),
+                        if_match: None,
+                        if_none_match: None,
+                        if_none_exist: None,
+                        full_url: Some("urn:uuid:observation".to_string()),
+                    },
+                ],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].status, 200);
+        assert_eq!(result.entries[1].status, 201);
+        let observation = result.entries[1].resource.as_ref().expect("created");
+        assert_eq!(
+            observation["subject"]["reference"],
+            json!(format!("Patient/{}", existing.id()))
+        );
+
+        // A second identical patient makes the criteria ambiguous.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-COND-1"}],
+                    "name": [{"family": "Twin"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let before = backend.count(&tenant, Some("Patient")).await.unwrap();
+
+        let err = backend
+            .process_transaction(
+                &tenant,
+                vec![
+                    BundleEntry {
+                        method: BundleMethod::Post,
+                        url: "Patient".to_string(),
+                        resource: Some(
+                            json!({"resourceType": "Patient", "name": [{"family": "Plain"}]}),
+                        ),
+                        if_match: None,
+                        if_none_match: None,
+                        if_none_exist: None,
+                        full_url: None,
+                    },
+                    if_none_exist_entry("Ambiguous", "urn:uuid:ambiguous"),
+                ],
+                FhirVersion::default(),
+            )
+            .await
+            .expect_err("an ambiguous ifNoneExist must fail the bundle");
+        match err {
+            TransactionError::BundleError { index, message } => {
+                assert_eq!(index, 1);
+                assert!(message.contains("412"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            backend.count(&tenant, Some("Patient")).await.unwrap(),
+            before,
+            "the plain create in entry 0 must have been rolled back"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_conditional_delete() {
         use helios_persistence::core::{
