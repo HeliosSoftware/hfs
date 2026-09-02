@@ -2,20 +2,21 @@
 //! mounted router can prove, using the shared [`support::InMemorySettingsStore`]
 //! double:
 //!
-//! - (ticket 01) that `resolve_prefs` reads the settings store **exactly
-//!   once** per request;
-//! - (ticket 02) that Resources, Search, Saved Queries, and Search Parameters
-//!   actually resolve and persist through `rail_state` per RF1/RF2/RF3/RF6 —
-//!   the "Tests esperados" behaviors from the ticket 02 spec that a page
-//!   struct's fields alone (covered in `router_http.rs`) cannot exercise,
-//!   since they need a real store round trip;
-//! - (ticket 03) the same, for the three SQL rails (View Definitions, SQL
-//!   Queries, SQL Views) — including their `{id, name, meta}` snapshot
-//!   (RF1/RF2), pruning a stale explicit selection (RF3), and the "Recently
-//!   used" group staying immune to the rail's own `?filter=`/pagination
-//!   (RF4/RF6).
-//! - (ticket 04) Compartments' `def` restore (RF1/RF2) — no "Recently used"
-//!   group here (only 4-5 definitions), so there is nothing to render, only
+//! - that `resolve_prefs` reads the settings store **exactly once** per
+//!   request;
+//! - that Resources, Search, Saved Queries, and Search Parameters actually
+//!   resolve and persist through `rail_state` — an explicit selection that
+//!   wins and is recorded, a stored `last` that restores and falls back
+//!   silently when stale, and the "Recently used" group staying resolved
+//!   against the live rail — the behaviors a page struct's fields alone
+//!   (covered in `router_http.rs`) cannot exercise, since they need a real
+//!   store round trip;
+//! - the same, for the three SQL rails (View Definitions, SQL Queries, SQL
+//!   Views) — including their `{id, name, meta}` snapshot, pruning a stale
+//!   explicit selection, and the "Recently used" group staying immune to
+//!   the rail's own `?filter=`/pagination.
+//! - Compartments' `def` restore — no "Recently used" group here (only 4-5
+//!   definitions), so there is nothing to render, only
 //!   `rails.compartments` to resolve and record. The "no settings store"
 //!   case is already covered by `router_http.rs`'s
 //!   `compartments_page_defaults_to_patient`, which needs no real store.
@@ -77,9 +78,9 @@ async fn get(app: Router, path: &str) {
     );
 }
 
-/// RNF1 / "Tests esperados" #6: a page load reads the settings store exactly
-/// once, the same cost model `main` already had before this ticket — rail
-/// state rides the one read `resolve_prefs` already performs, adding none.
+/// "Tests esperados" #6: a page load reads the settings store exactly once,
+/// the same cost model `main` already had — rail state rides the one read
+/// `resolve_prefs` already performs, adding none.
 #[tokio::test]
 async fn a_page_load_reads_settings_exactly_once() {
     let store = Arc::new(InMemorySettingsStore::new());
@@ -287,8 +288,8 @@ async fn resources_recent_group_is_hidden_when_empty_and_ordered_when_not() {
 
 /// "Tests esperados" #7: a recent id that no longer names a real type is
 /// hidden from the group, not pruned from the stored state — a filtered
-/// render costs nothing, and RF1 already lets a stale `last` fall back on
-/// its own.
+/// render costs nothing, and a stale `last` already falls back on its own
+/// with no help from this filter.
 #[tokio::test]
 async fn resources_recent_entry_no_longer_a_real_type_is_hidden_not_pruned() {
     let store = Arc::new(InMemorySettingsStore::new());
@@ -331,7 +332,7 @@ async fn search_parameters_restores_the_stored_base() {
 /// "Tests esperados" #4: `?base=` (explicit, empty) opens "All types" and
 /// persists `last: ""` without touching `recent` — and, once that is the
 /// resolved state, every link the page itself generates keeps carrying the
-/// explicit `base=` marker (RF2), so "All types" stays one click away even
+/// explicit `base=` marker, so "All types" stays one click away even
 /// though a real type is still remembered in `recent`.
 #[tokio::test]
 async fn search_parameters_explicit_all_types_persists_and_stays_marked() {
@@ -516,7 +517,7 @@ async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_f
     assert!(html.contains(r#"<h2 class="page-head__title">vd_010</h2>"#));
 
     // Off the current page: a direct read by id opens it exactly like an
-    // explicit `?vd=` would (RF1.2, RNF1: still one read, not a search).
+    // explicit `?vd=` would — still one read, not a search.
     let store = Arc::new(InMemorySettingsStore::new());
     seed_rail(
         &store,
@@ -641,7 +642,7 @@ async fn view_definitions_explicit_stale_selection_is_pruned() {
 }
 
 /// "Tests esperados" #4 (View Definitions): the "Recently used" group is
-/// immune to the rail's own `?filter=` (RF4) — an entry on the current page
+/// immune to the rail's own `?filter=` — an entry on the current page
 /// renders with its live name/meta, overriding a stale snapshot; one the
 /// filter excludes falls back to that very snapshot, `href` included.
 #[tokio::test]
@@ -689,8 +690,8 @@ async fn view_definitions_recent_group_ignores_the_filter_and_falls_back_to_the_
     assert!(group.contains(r#"href="/ui/sql/view-definitions?vd=other""#));
 }
 
-/// "Tests esperados" #5 (Libraries): the same RF1/RF2/RF3 behaviors as View
-/// Definitions, and — because `rails.sqlQueries`/`rails.sqlViews` are
+/// "Tests esperados" #5 (Libraries): the same restore/record/prune behaviors
+/// as View Definitions, and — because `rails.sqlQueries`/`rails.sqlViews` are
 /// distinct keys — a selection recorded on one page never surfaces on the
 /// other, even against the same stored document.
 #[tokio::test]
@@ -705,7 +706,7 @@ async fn sql_libraries_restore_record_prune_and_never_cross_contaminate() {
             "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
     ];
 
-    // RF1.2/RF1.3: a stored `last` restores; a stale one falls back silently.
+    // A stored `last` restores; a stale one falls back silently.
     let store = Arc::new(InMemorySettingsStore::new());
     seed_rail(
         &store,
@@ -714,10 +715,20 @@ async fn sql_libraries_restore_record_prune_and_never_cross_contaminate() {
     )
     .await;
     let html = get_ok_html(lib_app_with(store, libs.clone()), "/ui/sql/queries").await;
-    assert!(html.contains(r#"<h2 class="page-head__title">encounter_counts</h2>"#));
+    // #839: the title row's h2 also carries the type icon and the type/
+    // status chips, so this checks the selected name inside that element
+    // rather than an exact `<h2>...</h2>` match.
+    assert!(html.contains(r#"<h2 class="page-head__title page-head__title--kind">"#));
+    let title_row = html
+        .split(r#"<h2 class="page-head__title page-head__title--kind">"#)
+        .nth(1)
+        .and_then(|s| s.split("</h2>").next())
+        .expect("a title row h2");
+    assert!(title_row.contains("encounter_counts"));
+    assert!(title_row.contains("tag--draft"));
 
-    // RF2/RF3: an explicit selection writes its snapshot; a stale explicit
-    // id prunes; `?lib=new` never writes.
+    // An explicit selection writes its snapshot; a stale explicit id
+    // prunes; `?lib=new` never writes.
     let store = Arc::new(InMemorySettingsStore::new());
     get_ok_html(
         lib_app_with(store.clone(), libs.clone()),
@@ -775,11 +786,16 @@ async fn sql_libraries_restore_record_prune_and_never_cross_contaminate() {
         json!([{"id": "q1", "name": "patient_counts", "meta": "active"}])
     );
 
-    // RF1 "no cross-contamination": SQL Views, under the very same stored
+    // No cross-contamination: SQL Views, under the very same stored
     // document, has never recorded anything of its own and does not see SQL
     // Queries' selections — it opens on its own fallback (its first entry).
     let html = get_ok_html(lib_app_with(store.clone(), libs), "/ui/sql/views").await;
-    assert!(html.contains(r#"<h2 class="page-head__title">flat_patients</h2>"#));
+    assert!(
+        html.split(r#"<h2 class="page-head__title page-head__title--kind">"#)
+            .nth(1)
+            .and_then(|s| s.split("</h2>").next())
+            .is_some_and(|title_row| title_row.contains("flat_patients"))
+    );
     assert!(
         store.peek("l2:").unwrap()["byTenant"]["default"]["rails"]
             .get("sqlViews")
@@ -791,7 +807,7 @@ async fn sql_libraries_restore_record_prune_and_never_cross_contaminate() {
 /// "Tests esperados" #6: all three SQL rails ship `resource-filter.js`, their
 /// own "Recently used" group with the right id, a divider, and a localized
 /// "All …" heading — and, with no settings store configured, the group
-/// renders present-but-`hidden` exactly like the type rails (RF9).
+/// renders present-but-`hidden` exactly like the type rails.
 #[tokio::test]
 async fn sql_rails_ship_the_recent_group_script_and_localized_all_heading() {
     for (path, group_id, all_heading) in [

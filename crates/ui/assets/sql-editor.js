@@ -15,11 +15,11 @@
  * construction error) belongs to `code-editor.js` and is not duplicated
  * here - this file only owns what is specific to the SQL editor: the
  * language (SQLite dialect, the engine `$sqlquery-run` actually executes
- * on) and its HighlightStyle. No fold, no lint, no
- * autocomplete yet (#839/#842).
+ * on), its HighlightStyle, and the failed-line tint below. No fold, no
+ * lint, no autocomplete yet (#842).
  *
- * The Library JSON pane on the same page (`textarea[name="json"]`, behind
- * the fold) is untouched - that is #840.
+ * The Library JSON pane on the same page (`input[type="hidden"][name="json"]`,
+ * no fold since #839) is untouched - #840 replaces it with a Details view.
  *
  * Without the bundle, without the helper, without a `#lib-editor-form`
  * (the page's empty state has none), without JS, or if anything below
@@ -76,11 +76,67 @@
     { scope: sqlLanguage.language }
   );
 
-  CodeEditor.mount(textarea, {
+  /* ---- Failed-line tint (#839): `partials/sql_run_results.html` marks a
+   * `$sql-run` parse failure's notice with `data-error-line="N"`
+   * (`sql_views::extract_error_line` - only sqlparser errors carry a line;
+   * SQLite execution errors don't) each time htmx swaps `#run-notice`, both
+   * from the live-run debounce on the textarea below and from the page's
+   * own initial load. This is purely a decoration on top of the document
+   * CodeMirror already has - it never edits `doc`, moves the cursor, or
+   * touches the textarea/dispatches `input`, so it cannot feed back into
+   * the 500ms live-run loop.
+   *
+   * `errorLineEffect.of(n)` (1-based line number) replaces any previous
+   * tint with one on line `n`; `.of(null)` clears it. A `StateField` is the
+   * idiomatic CodeMirror 6 way to hold "at most one decoration, changed
+   * only by an explicit effect" - see the state.md line-highlight recipe
+   * this mirrors. */
+  var errorLineEffect = CM.StateEffect.define();
+  var errorLineMark = CM.Decoration.line({ attributes: { class: "sql-editor__error-line" } });
+  var errorLineField = CM.StateField.define({
+    create: function () {
+      return CM.Decoration.none;
+    },
+    update: function (decorations, tr) {
+      decorations = decorations.map(tr.changes);
+      for (var i = 0; i < tr.effects.length; i++) {
+        var effect = tr.effects[i];
+        if (!effect.is(errorLineEffect)) continue;
+        decorations =
+          effect.value == null
+            ? CM.Decoration.none
+            : CM.Decoration.set([errorLineMark.range(tr.state.doc.line(effect.value).from)]);
+      }
+      return decorations;
+    },
+    provide: function (field) {
+      return CM.EditorView.decorations.from(field);
+    },
+  });
+
+  var view = CodeEditor.mount(textarea, {
     language: sqlLanguage,
     highlight: CM.syntaxHighlighting(sqlHighlightStyle),
+    extensions: [errorLineField],
     fold: false,
     wrapperClass: "sql-editor",
     id: "sql-editor",
+  });
+  if (!view) return;
+
+  /* `#run-notice` is always swapped wholesale (`hx-swap="outerHTML"`, both
+   * the live-run trigger and the page's own initial load in
+   * `sql-library.html`), so htmx dispatches this `htmx:afterSwap` on the
+   * new `#run-notice` element itself - `event.target` is already the
+   * settled replacement, no need to re-query the DOM by id. Registered
+   * once, for the page's whole lifetime: it does not re-subscribe on every
+   * swap and holds no reference beyond `view`. */
+  document.addEventListener("htmx:afterSwap", function (event) {
+    var target = event.target;
+    if (!target || target.id !== "run-notice") return;
+    var notice = target.querySelector("[data-error-line]");
+    var line = notice ? parseInt(notice.getAttribute("data-error-line"), 10) : NaN;
+    var inRange = Number.isInteger(line) && line >= 1 && line <= view.state.doc.lines;
+    view.dispatch({ effects: errorLineEffect.of(inRange ? line : null) });
   });
 })();

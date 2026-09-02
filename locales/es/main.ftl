@@ -787,10 +787,10 @@ sql-vd-title = Definiciones de vistas
 sql-vd-lede = Crea y gestiona las ViewDefinitions con las que SQL on FHIR aplana recursos.
 
 sql-queries-title = Consultas SQL
-sql-queries-lede = Ejecuta consultas SQL on FHIR contra este servidor.
+sql-queries-lede = SQL ad hoc sobre las tablas planas que producen tus view definitions. Los resultados se actualizan mientras escribes.
 
 sql-views-title = Vistas SQL
-sql-views-lede = Vistas SQL reutilizables construidas sobre ViewDefinitions.
+sql-views-lede = Vistas con nombre que otras consultas y exportaciones pueden seleccionar. Define el SQL una vez; las columnas que produce se convierten en una tabla que cualquiera puede usar.
 
 sql-export-title = Exportación SQL
 sql-export-lede = Trabajos de exportación SQL on FHIR de larga duración.
@@ -811,7 +811,6 @@ vd-none = Aún no hay definiciones de vistas.
 vd-empty-lede = Crea tu primera ViewDefinition con «Crear nueva».
 vd-degraded = No se pudo cargar la lista de definiciones de vistas.
 vd-saved = Guardado.
-vd-run = Ejecutar
 vd-run-failed = No se pudo ejecutar la vista.
 vd-save = Guardar
 vd-duplicate = Duplicar
@@ -828,17 +827,36 @@ vd-pagination-label = Páginas de definiciones de vistas
 vd-page-prev = Anterior
 vd-page-next = Siguiente
 
-## Espacios de consultas y vistas SQL (#649)
+## Partial de resultados de $sql-run (#752): compartido por los playgrounds
+## de View Definitions, SQL Queries y SQL Views (#839).
+
+sql-run-export = Exportar como archivos
+
+## Espacios de consultas y vistas SQL (#649, layout editor-first #839)
 
 sql-queries-new-title = Nueva consulta SQL
 sql-views-new-title = Nueva vista SQL
 sql-queries-rail-all-heading = Todas las consultas SQL
 sql-views-rail-all-heading = Todas las vistas SQL
-lib-filter = Filtrar bibliotecas
-lib-none = Aún no hay bibliotecas.
-lib-empty-lede = Crea tu primera biblioteca con «Crear nueva».
+sql-queries-chip = Consulta SQL
+sql-views-chip = Vista SQL
+sql-queries-filter = Filtrar consultas
+sql-views-filter = Filtrar vistas
+sql-queries-rail-empty = Aún no hay consultas.
+sql-views-rail-empty = Aún no hay vistas.
+sql-queries-empty-title = Aún no hay consultas SQL
+sql-views-empty-title = Aún no hay vistas SQL
+sql-queries-empty-lede = Escribe tu primera consulta con «Crear nueva». Se ejecuta contra las tablas planas de cada view definition activa.
+sql-views-empty-lede = Define tu primera vista con «Crear nueva». Sus columnas se convierten en una tabla que otras consultas y exportaciones pueden seleccionar.
+sql-queries-editor-heading = SQL
+sql-views-editor-heading = Definición de vista (SQL)
+sql-queries-results-heading = Resultados
+sql-views-results-heading = Vista previa
+sql-queries-run-failed = No se pudo ejecutar la consulta.
+sql-views-run-failed = No se pudo ejecutar la vista.
 lib-degraded = No se pudo cargar la lista de bibliotecas.
-lib-sql-heading = SQL
+lib-run-hint = Se ejecuta mientras escribes: los resultados siguen el SQL actual, esté guardado o no
+lib-edit-json = Editar como JSON
 lib-delete-confirm = ¿Eliminar «{ $name }»? Esta acción no se puede deshacer.
 lib-delete-failed = No se pudo eliminar la biblioteca.
 
