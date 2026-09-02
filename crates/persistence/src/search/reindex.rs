@@ -884,6 +884,45 @@ async fn run_reindex(
     }
 }
 
+/// [`crate::core::DeferredReindexHook`] adapter over [`ReindexOperation`],
+/// for the bulk fast-load path (#903): the submit worker fires it after a
+/// manifest that ingested with deferred indexing, and it starts the same
+/// background reindex `POST /$reindex` would, restricted to the manifest's
+/// types.
+pub struct ReindexOnFinish {
+    op: std::sync::Arc<ReindexOperation>,
+}
+
+impl ReindexOnFinish {
+    /// Wraps a reindex manager for use as the worker's post-manifest hook.
+    pub fn new(op: std::sync::Arc<ReindexOperation>) -> Self {
+        Self { op }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::core::DeferredReindexHook for ReindexOnFinish {
+    async fn reindex_types(
+        &self,
+        tenant: &crate::tenant::TenantContext,
+        resource_types: Vec<String>,
+    ) {
+        let request = ReindexRequest::for_types(resource_types.clone());
+        match self.op.start(tenant.clone(), request, None).await {
+            Ok(job_id) => {
+                tracing::info!(job_id, types = ?resource_types, "deferred-index rebuild started");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    types = ?resource_types,
+                    "deferred-index rebuild failed to start — run $reindex manually"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

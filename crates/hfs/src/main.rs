@@ -612,16 +612,19 @@ async fn start_mongodb(
             None
         }
     };
-    // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
-    // lease, and artifact state itself, in the same store the ingestion engine
-    // writes resources to.
-    let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
-
     let ops = standalone_ops(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
+    // lease, and artifact state itself, in the same store the ingestion engine
+    // writes resources to.
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    let submit_bundle = build_bulk_submit(&config, backend.clone(), reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
         config.clone(),
@@ -1220,12 +1223,16 @@ async fn start_sqlite(
     let ui_settings = settings_store.clone();
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(backend.clone());
     let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
-    let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let ops = standalone_ops(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    let submit_bundle = build_bulk_submit(&config, backend.clone(), reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend,
         config.clone(),
@@ -1564,6 +1571,7 @@ fn spawn_export_workers<Dp>(
 async fn build_bulk_submit(
     config: &ServerConfig,
     jobs: Arc<dyn BulkSubmitJobStore>,
+    reindex_hook: Option<Arc<dyn helios_persistence::core::DeferredReindexHook>>,
 ) -> anyhow::Result<Option<helios_rest::BulkSubmitBundle>> {
     let cfg = config.bulk_submit.clone();
     info!(
@@ -1668,7 +1676,13 @@ async fn build_bulk_submit(
         .with_decryption_keys(decryption_keys),
     );
 
-    spawn_submit_workers(jobs.clone(), fetcher.clone(), output.clone(), &cfg);
+    spawn_submit_workers(
+        jobs.clone(),
+        fetcher.clone(),
+        output.clone(),
+        &cfg,
+        reindex_hook,
+    );
 
     Ok(Some(helios_rest::BulkSubmitBundle {
         jobs,
@@ -1690,19 +1704,26 @@ fn spawn_submit_workers(
     fetcher: Arc<dyn SubmitInputFetcher>,
     output: Arc<dyn ExportOutputStore>,
     cfg: &helios_rest::config::BulkSubmitConfig,
+    reindex_hook: Option<Arc<dyn helios_persistence::core::DeferredReindexHook>>,
 ) {
     if cfg.disable_local_worker {
         info!("Bulk submit in-process worker pool is disabled");
         return;
     }
     let lease = std::time::Duration::from_secs(cfg.lease_duration_secs);
+    let defer_indexing = cfg.defer_indexing;
+    if defer_indexing {
+        info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
+    }
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let fetcher = fetcher.clone();
         let output = output.clone();
+        let reindex_hook = reindex_hook.clone();
         let worker_id = WorkerId::new(format!("hfs-submit-worker-{i}"));
         tokio::spawn(async move {
-            let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone());
+            let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
+                .with_deferred_indexing(defer_indexing, reindex_hook.clone());
             loop {
                 match jobs.claim_next_manifest(&worker_id, lease).await {
                     Ok(Some(claimed)) => {
@@ -1901,7 +1922,6 @@ async fn start_sqlite_elasticsearch(
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(sqlite.clone());
 
     let export_bundle = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await?;
-    let submit_bundle = build_bulk_submit(&config, sqlite.clone()).await?;
     // Reindex reads from the SQLite primary and rebuilds BOTH indexes: SQLite's
     // own search_index table and the Elasticsearch index that actually serves
     // search here.
@@ -1912,6 +1932,11 @@ async fn start_sqlite_elasticsearch(
         sqlite.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    let submit_bundle = build_bulk_submit(&config, sqlite.clone(), reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -1972,12 +1997,16 @@ async fn start_postgres(
     let ui_settings = settings_store.clone();
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(backend.clone());
     let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
-    let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let ops = standalone_ops(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    let submit_bundle = build_bulk_submit(&config, backend.clone(), reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
         config.clone(),
@@ -2152,7 +2181,6 @@ async fn start_postgres_elasticsearch(
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(pg.clone());
 
     let export_bundle = build_bulk_export(&config, pg.clone(), pg.clone()).await?;
-    let submit_bundle = build_bulk_submit(&config, pg.clone()).await?;
     let ops = composite_ops(
         composite.clone(),
         pg.clone(),
@@ -2160,6 +2188,11 @@ async fn start_postgres_elasticsearch(
         pg.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    let submit_bundle = build_bulk_submit(&config, pg.clone(), reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -2349,11 +2382,6 @@ async fn start_mongodb_elasticsearch(
             None
         }
     };
-    // Bulk submit runs against the MongoDB primary, which hosts its own job
-    // state. Ingestion deliberately goes to `mongo` rather than the composite:
-    // the composite's search half is fed by the primary's own indexing hooks.
-    let submit_bundle = build_bulk_submit(&config, mongo.clone()).await?;
-
     let ops = composite_ops(
         composite.clone(),
         mongo.clone(),
@@ -2361,6 +2389,14 @@ async fn start_mongodb_elasticsearch(
         mongo.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    // Bulk submit runs against the MongoDB primary, which hosts its own job
+    // state. Ingestion deliberately goes to `mongo` rather than the composite:
+    // the composite's search half is fed by the primary's own indexing hooks.
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    let submit_bundle = build_bulk_submit(&config, mongo.clone(), reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -2498,7 +2534,15 @@ async fn start_s3(
     // there the backend does not declare `BulkSubmitRestWorker` and the worker
     // simply never claims anything.
     let submit_bundle = if backend.supports_bulk_submit_worker() {
-        build_bulk_submit(&config, backend.clone()).await?
+        build_bulk_submit(
+            &config,
+            backend.clone(),
+            ops.reindex.clone().map(|op| {
+                Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+                    as Arc<dyn helios_persistence::core::DeferredReindexHook>
+            }),
+        )
+        .await?
     } else {
         tracing::warn!(
             "S3 is configured bucket-per-tenant with no default system bucket; \
@@ -2772,7 +2816,15 @@ async fn start_s3_elasticsearch(
     // job state. Ingestion goes to `s3` rather than the composite because the
     // composite's Elasticsearch half is fed by the primary's indexing hooks.
     let bulk_submit = if s3.supports_bulk_submit_worker() {
-        build_bulk_submit(&config, s3.clone()).await?
+        build_bulk_submit(
+            &config,
+            s3.clone(),
+            ops.reindex.clone().map(|op| {
+                Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+                    as Arc<dyn helios_persistence::core::DeferredReindexHook>
+            }),
+        )
+        .await?
     } else {
         tracing::warn!(
             "S3 is configured bucket-per-tenant with no default system bucket; \

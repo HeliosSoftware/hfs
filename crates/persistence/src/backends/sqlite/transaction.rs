@@ -49,6 +49,9 @@ pub struct SqliteTransaction {
     invalidate_registry: bool,
     /// The FHIR version writes in this transaction are stamped with.
     fhir_version: FhirVersion,
+    /// Bulk fast-load (#903): skip search-index and FTS writes; stale rows of
+    /// updated resources are still deleted so a deferred index never lies.
+    defer_search_indexing: bool,
 }
 
 impl std::fmt::Debug for SqliteTransaction {
@@ -67,6 +70,7 @@ impl SqliteTransaction {
         tenant: TenantContext,
         backend: SqliteBackend,
         fhir_version: FhirVersion,
+        defer_search_indexing: bool,
     ) -> StorageResult<Self> {
         // Start the transaction
         conn.execute("BEGIN IMMEDIATE", []).map_err(|e| {
@@ -82,6 +86,7 @@ impl SqliteTransaction {
             backend,
             invalidate_registry: false,
             fhir_version,
+            defer_search_indexing,
         })
     }
 
@@ -120,6 +125,13 @@ impl SqliteTransaction {
     ) -> StorageResult<()> {
         self.backend
             .delete_search_index(conn, tenant_id, resource_type, resource_id)?;
+        // Fast-load (#903): the delete above still runs so an updated
+        // resource's stale rows are gone, but the rebuild is deferred to the
+        // post-ingest reindex — extraction plus FTS is the dominant per-byte
+        // cost of bulk ingestion.
+        if self.defer_search_indexing {
+            return Ok(());
+        }
         self.backend
             .index_resource(conn, tenant_id, resource_type, resource_id, resource)
     }
@@ -564,6 +576,7 @@ impl TransactionProvider for SqliteBackend {
             tenant.clone(),
             self.clone(),
             options.fhir_version.unwrap_or(self.config().fhir_version),
+            options.defer_search_indexing,
         )
     }
 }
