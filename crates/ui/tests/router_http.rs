@@ -2451,6 +2451,9 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     let html = body_text(response).await;
     assert!(html.contains("<th>id</th><th>family</th>"));
     assert!(html.contains("<td>p1</td><td>Doe</td>"));
+    // #752 ticket 01: the page's own render shares the fragment endpoint's
+    // markup (RF7), but in page mode — no OOB swap to carry out.
+    assert!(!html.contains("hx-swap-oob"));
 
     // Create New offers the starter document in the editor.
     let response = app
@@ -2465,6 +2468,202 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     let html = body_text(response).await;
     assert!(html.contains("new_view"));
     assert!(html.contains("getResourceKey()"));
+}
+
+/// The text between two markers in `html`, panicking (with the marker named)
+/// if either is missing — used by the `/run` fragment tests to read the
+/// meta span's own text (`{ $rows } rows · { $ms } ms`) without depending on
+/// the exact millisecond count a test run measures.
+fn text_between<'a>(html: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+    let start = html
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("{start_marker} present in {html}"))
+        + start_marker.len();
+    let end = html[start..]
+        .find(end_marker)
+        .unwrap_or_else(|| panic!("{end_marker} present after {start_marker}"))
+        + start;
+    &html[start..end]
+}
+
+fn urlencoded_json_body(document: &serde_json::Value) -> String {
+    form_urlencoded::Serializer::new(String::new())
+        .append_pair("json", &document.to_string())
+        .finish()
+}
+
+/// #752 ticket 01, RF4: the fragment endpoint runs the *posted* text, not a
+/// stored resource — the playground's whole point. The success fragment
+/// opens with an empty `#vd-run-notice`, then `#vd-results` carries its own
+/// `hx-swap-oob`, with the view's declared column order, the canned row,
+/// and a `{ $rows } rows · { $ms } ms` meta.
+#[tokio::test]
+async fn view_definitions_run_previews_the_posted_document_via_an_oob_fragment() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, Vec::new())
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1", "family": "Doe"})]));
+    let app = view_definitions_app(source);
+
+    // Deliberately never stored (RF2/RF3: "contenido no guardado") — proves
+    // the handler ran the request body, not a resource fetched by id.
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "name": "unsaved_view",
+        "status": "draft",
+        "resource": "Patient",
+        "select": [{"column": [
+            {"name": "id", "path": "getResourceKey()"},
+            {"name": "family", "path": "name.family.first()"}
+        ]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(urlencoded_json_body(&vd)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/html; charset=utf-8"
+    );
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<div id="vd-run-notice"></div>"#));
+    assert!(html.contains(r#"id="vd-results""#));
+    assert!(html.contains(r#"hx-swap-oob="outerHTML""#));
+    assert!(html.contains("<th>id</th><th>family</th>"));
+    assert!(html.contains("<td>p1</td><td>Doe</td>"));
+    let meta = text_between(
+        &html,
+        r#"id="vd-results-meta" class="card-head__meta">"#,
+        "</span>",
+    );
+    assert!(meta.starts_with("1 rows"), "{meta}");
+    assert!(meta.ends_with(" ms"), "{meta}");
+}
+
+/// #752 ticket 01, RF5: a failed run answers `200` (NF3 — htmx never swaps
+/// an error status) with the notice carrying the server's message, the meta
+/// relabelled to "last successful run" via its own OOB swap, and no
+/// `#vd-results` at all — the client's previous table is left alone.
+#[tokio::test]
+async fn view_definitions_run_reports_a_failed_run_without_a_results_card() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Err("boom".into()));
+    let app = view_definitions_app(source);
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(urlencoded_json_body(&vd)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("boom"));
+    assert!(html.contains(r#"<div id="vd-run-notice">"#));
+    assert!(html.contains(
+        r#"id="vd-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
+    ));
+    assert!(!html.contains(r#"id="vd-results""#));
+}
+
+/// #752 ticket 01, RF6: invalid JSON never reaches `$sql-run` — the seeded
+/// rows would show up in the response if it had — and reports the parse
+/// error in the same notice-only shape as a failed run, still `200`.
+#[tokio::test]
+async fn view_definitions_run_reports_invalid_json_without_calling_sql_run() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("json=%7B"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(!html.contains(r#"id="vd-results""#));
+    assert!(!html.contains("<table"));
+    assert!(!html.contains("<td>p1</td>"));
+}
+
+/// #752 ticket 01, RF2: a body with no `json` field is the one case this
+/// endpoint answers with a genuine error status — axum's own `Form`
+/// rejection, not a hand-rolled one. `422 Unprocessable Entity`, not `400`:
+/// axum's `Form` extractor reports a `POST` body it cannot deserialize (a
+/// missing field included) as `422`, reserving `400` for a query-string
+/// (`GET`) rejection or a request with the wrong content type — see
+/// `axum::form::tests::deserialize_error_status_codes` (axum 0.8.4). Either
+/// way it is a real 4xx, not the 2xx fragment contract RF4–RF6 describe.
+#[tokio::test]
+async fn view_definitions_run_without_a_json_field_is_unprocessable() {
+    let app = view_definitions_app(helios_ui::StaticConformanceSource::empty());
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("other=1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// #752 ticket 01, RF4: a run with no output rows still renders the results
+/// card — `data-table__empty` plus a `0 rows` meta — not the failure notice.
+#[tokio::test]
+async fn view_definitions_run_with_no_rows_renders_the_empty_state() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+    let app = view_definitions_app(source);
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(urlencoded_json_body(&vd)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"class="data-table__empty""#));
+    let meta = text_between(
+        &html,
+        r#"id="vd-results-meta" class="card-head__meta">"#,
+        "</span>",
+    );
+    assert!(meta.starts_with("0 rows"), "{meta}");
 }
 
 /// #753 ticket 02: the CodeMirror 6 bundle (ticket 01) and vd-editor.js load,

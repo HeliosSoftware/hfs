@@ -1248,6 +1248,11 @@ pub fn mount_with_conformance_source_and_runtime(
             "/ui/sql/view-definitions/lint",
             axum::routing::post(sql_view_definitions_lint),
         )
+        // #752 ticket 01: the playground's live preview fragment.
+        .route(
+            "/ui/sql/view-definitions/run",
+            axum::routing::post(sql_view_definitions_run),
+        )
         .route(
             "/ui/sql/queries",
             get(sql_queries_page).post(sql_queries_save),
@@ -2370,8 +2375,12 @@ struct SqlViewDefinitionsPage {
     selected: Option<SelectedVd>,
     /// `?vd=new`: the JSON below is the starter document, not a stored view.
     is_new: bool,
-    results: Option<sql_views::RunTable>,
-    run_error: Option<String>,
+    /// The `$sql-run` preview card and its failure notice, nested as its own
+    /// template (#752 ticket 01, RF7) so `partials/sql_run_results.html`'s
+    /// markup exists in exactly one place, shared with the `/run` fragment
+    /// endpoint (`sql_view_definitions_run`). `fragment: false` here — the
+    /// page's own render has nothing to swap into.
+    run_results: RunResultsPartial,
     save_error: Option<String>,
     saved: bool,
     /// RF4/RF6: the "Recently used" group's own rows.
@@ -2389,6 +2398,42 @@ struct SelectedVd {
     id: String,
     name: String,
     json: String,
+}
+
+/// The `$sql-run` preview's three renderable shapes (#752 ticket 01, RF4/
+/// RF5–RF6/RF7). A tuple enum rather than parallel `Option`s so a table can
+/// never appear alongside a failure message, and the page's own "nothing has
+/// run yet" state is distinct from both — the invalid combinations RF4–RF7
+/// describe simply have no constructor.
+enum RunResultsState {
+    /// RF4: a successful run — its table, plus how long the `$sql-run` call
+    /// took in whole milliseconds.
+    Success(sql_views::RunTable, u64),
+    /// RF5/RF6: a run or parse failure, with the message rendered next to
+    /// `vd-run-failed`.
+    Failure(String),
+    /// RF7: the page's own render before anything has run — no `?run=1`, or
+    /// the current selection has no preview yet. Never produced by the
+    /// `/run` fragment endpoint, which always ends in `Success` or
+    /// `Failure`.
+    Empty,
+}
+
+/// The `$sql-run` preview card and its failure notice (#752 ticket 01, RF7):
+/// `partials/sql_run_results.html`'s markup is written once and rendered by
+/// two callers — nested as a template field of [`SqlViewDefinitionsPage`]
+/// for the page's own initial render (`{{ run_results.render()?|safe }}` in
+/// `sql-view-definitions.html`, `fragment: false`), and directly as the
+/// whole response of [`sql_view_definitions_run`] (`fragment: true`,
+/// RF4–RF6). `fragment` only toggles the notice wrapper and the
+/// `hx-swap-oob` attributes; the table markup itself lives solely in the
+/// template's `Success` arm.
+#[derive(Template)]
+#[template(path = "partials/sql_run_results.html")]
+struct RunResultsPartial {
+    i18n: I18n,
+    fragment: bool,
+    state: RunResultsState,
 }
 
 #[derive(Deserialize, Default)]
@@ -2628,18 +2673,21 @@ async fn sql_view_definitions_page(
         resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));
 
     // `?run=1` previews the selected view through $sql-run — a plain link, so
-    // it works without JavaScript. Capped: this is a preview, not an export.
-    let (results, run_error) = match (&selected_value, query.run.as_deref() == Some("1")) {
-        (Some(vd), true) => match state.conformance.sql_run(vd, 50, rv.0, &rt.id).await {
-            Ok(rows) => (Some(sql_views::build_table(vd, &rows)), None),
-            Err(error) => (None, Some(error)),
+    // it works without JavaScript. RF7: this render's own state is `Empty`
+    // whenever the preview wasn't asked for, the same "nothing to show" the
+    // page has always had with no `?run=1`.
+    let i18n = I18n::new(locale);
+    let run_state = match (&selected_value, query.run.as_deref() == Some("1")) {
+        (Some(vd), true) => match run_view_preview(&state, vd, rv.0, &rt.id).await {
+            Ok((table, ms)) => RunResultsState::Success(table, ms),
+            Err(error) => RunResultsState::Failure(error),
         },
-        _ => (None, None),
+        _ => RunResultsState::Empty,
     };
 
     render(SqlViewDefinitionsPage {
         status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: "sql-view-definitions",
         rail: summaries,
         filter,
@@ -2648,14 +2696,39 @@ async fn sql_view_definitions_page(
         degraded,
         selected,
         is_new,
-        results,
-        run_error,
+        run_results: RunResultsPartial {
+            i18n,
+            fragment: false,
+            state: run_state,
+        },
         save_error: None,
         saved: query.saved.as_deref() == Some("1"),
         recent_entries,
         rail_page: rail_state::RailPage::ViewDefinitions.key(),
         max_recent: rail_state::MAX_RECENT,
     })
+}
+
+/// Runs `$sql-run` for a preview and times the call in whole milliseconds —
+/// shared by the page's own `?run=1` render and the `/run` fragment endpoint
+/// (#752 ticket 01) so the row cap and the `{ $rows } rows · { $ms } ms`
+/// meta can never drift between the two callers. NF2: never logs
+/// `view_definition` itself — a ViewDefinition's `constant[]` can carry PHI.
+async fn run_view_preview(
+    state: &WebState,
+    view_definition: &serde_json::Value,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+) -> Result<(sql_views::RunTable, u64), String> {
+    let start = std::time::Instant::now();
+    let rows = state
+        .conformance
+        .sql_run(view_definition, sql_views::RUN_LIMIT, version, tenant)
+        .await?;
+    // `Instant::elapsed` millis fits `u64` for anything short of 584 million
+    // years; `unwrap_or(u64::MAX)` is just a total function, never reachable.
+    let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok((sql_views::build_table(view_definition, &rows), ms))
 }
 
 #[derive(Deserialize)]
@@ -2696,8 +2769,14 @@ async fn sql_view_definitions_save(
                 json,
             }),
             is_new,
-            results: None,
-            run_error: None,
+            // A form-validation error re-renders in place: nothing has run,
+            // so this render's own results are `Empty` (RF7), same as any
+            // other render with no `?run=1`.
+            run_results: RunResultsPartial {
+                i18n: I18n::new(locale),
+                fragment: false,
+                state: RunResultsState::Empty,
+            },
             save_error: Some(save_error),
             saved: false,
             // A form-validation error re-renders in place, not a navigation —
@@ -2768,6 +2847,64 @@ async fn sql_view_definitions_save(
         }
         Err(error) => render(error_page(error, form.json, id.is_none(), form.id)),
     }
+}
+
+#[derive(Deserialize)]
+struct SqlVdRunForm {
+    /// The editor's full text, exactly as posted — never reformatted or
+    /// re-serialized before either parsing it (RF6) or handing it to
+    /// `$sql-run` (RF3/NF5): the editor is the source of truth.
+    json: String,
+}
+
+/// `POST /ui/sql/view-definitions/run` (#752 ticket 01): the playground's
+/// live preview fragment. Unlike the page's own `?run=1`, this always runs
+/// the editor's *posted* text — saved or not — through the same
+/// [`run_view_preview`] helper, and renders `partials/sql_run_results.html`
+/// in fragment mode (RF4–RF6) instead of a full page.
+///
+/// Always answers `200` except for a malformed request body — a missing
+/// `json` field, which `axum::Form`'s own rejection turns into a `4xx`
+/// before this handler runs (RF2 — `422 Unprocessable Entity` in practice
+/// for a `POST` body deserialize failure, not `400`; either way a real
+/// error status, not this endpoint's `2xx` fragment contract). NF3: htmx
+/// does not swap `4xx`/`5xx` responses by default, so a run failure or
+/// invalid JSON must not surface as an HTTP error — both render RF5/RF6's
+/// notice-only fragment instead, leaving the client's previous results
+/// table untouched.
+async fn sql_view_definitions_run(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlVdRunForm>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    // RF6: a JSON parse failure never reaches $sql-run. NF2: never log
+    // `form.json` itself — a ViewDefinition's `constant[]` can carry PHI.
+    let view_definition: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return render(RunResultsPartial {
+                i18n,
+                fragment: true,
+                state: RunResultsState::Failure(format!("invalid JSON: {error}")),
+            });
+        }
+    };
+
+    let run_state = match run_view_preview(&state, &view_definition, rv.0, &rt.id).await {
+        Ok((table, ms)) => {
+            tracing::debug!(rows = table.rows.len(), ms, "ran a ViewDefinition preview");
+            RunResultsState::Success(table, ms)
+        }
+        Err(error) => RunResultsState::Failure(error),
+    };
+    render(RunResultsPartial {
+        i18n,
+        fragment: true,
+        state: run_state,
+    })
 }
 
 /// #753 ticket 03 (evaluation POC, not merged upstream): structural +

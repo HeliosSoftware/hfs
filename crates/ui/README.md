@@ -117,7 +117,14 @@ the vendored bundle itself — embedded and served exactly like every other
 asset in this crate (above), nothing bundler-specific about how it ships. It
 backs the ViewDefinition editor on `/ui/sql/view-definitions`; see
 [`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
-for the full evaluation this amendment is drawn from.
+for the full evaluation this amendment is drawn from. The editor talks to two
+JSON-in-HTML-fragment-out endpoints on that page: `POST …/lint` (#753 ticket
+03), the CodeMirror linter's structural + FHIRPath-syntax check, and `POST
+…/run` (#752 ticket 01), which runs the editor's own posted text — saved or
+not — through `$sql-run` and answers with `partials/sql_run_results.html`,
+the same results-card partial the page's own initial render nests as a
+template field. `/run` always answers `200` (htmx does not swap `4xx`/`5xx`
+by default) except for a malformed request body.
 
 ### Client-side scripts
 

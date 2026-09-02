@@ -822,6 +822,12 @@ vd-delete-failed = Could not delete the view definition.
 vd-json-heading = Definition (JSON)
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
+# #752 ticket 01: the $sql-run preview's row/duration meta, shared by the
+# page's own render and the `/run` fragment endpoint.
+vd-results-meta = { $rows } rows · { $ms } ms
+# #752 ticket 01: the results meta after a failed run — the previous table
+# stays on screen, relabelled.
+vd-results-stale = last successful run
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next

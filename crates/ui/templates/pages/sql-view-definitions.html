@@ -130,31 +130,10 @@
       </form>
     </details>
 
-    {% if let Some(error) = run_error %}
-    <p class="notice notice--warn">{{ i18n.t("vd-run-failed") }} {{ error }}</p>
-    {% endif %}
-    {% if let Some(table) = results %}
-    <section class="card table-card">
-      <div class="card-head">
-        <h3>{{ i18n.t("vd-results-heading") }}</h3>
-      </div>
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr>{% for c in table.columns %}<th>{{ c }}</th>{% endfor %}</tr>
-          </thead>
-          <tbody>
-            {% for row in table.rows %}
-            <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
-            {% endfor %}
-            {% if table.rows.is_empty() %}
-            <tr class="data-table__empty"><td colspan="{{ table.columns.len() }}">{{ i18n.t("vd-results-empty") }}</td></tr>
-            {% endif %}
-          </tbody>
-        </table>
-      </div>
-    </section>
-    {% endif %}
+    {#- #752 ticket 01: the $sql-run preview, rendered once in
+        partials/sql_run_results.html and shared with the /run fragment
+        endpoint (RF7). -#}
+    {{ run_results.render()?|safe }}
     {% else %}
     <section class="card">
       <div class="card-head">
