@@ -79,6 +79,38 @@ on:
         description: "HFS_LOG_LEVEL (use 'debug' to log search query params when diagnosing 500s)"
         required: false
         default: "info"
+      pg_shared_buffers:
+        description: "Postgres shared_buffers ('auto' = 25% of Docker host RAM capped at 10GB, or e.g. 4GB)"
+        required: false
+        default: "2GB"
+      pg_effective_cache_size:
+        description: "Postgres effective_cache_size ('auto' = 75% of Docker host RAM capped at 25GB, or e.g. 8GB)"
+        required: false
+        default: "6GB"
+      pg_work_mem:
+        description: "Postgres work_mem (e.g. 10MB, 64MB)"
+        required: false
+        default: "10MB"
+      pg_max_wal_size:
+        description: "Postgres max_wal_size (upstream postgres.conf value)"
+        required: false
+        default: "8GB"
+      pg_min_wal_size:
+        description: "Postgres min_wal_size (upstream postgres.conf value)"
+        required: false
+        default: "2GB"
+      pg_wal_buffers:
+        description: "Postgres wal_buffers (upstream postgres.conf value)"
+        required: false
+        default: "256MB"
+      pg_checkpoint_timeout:
+        description: "Postgres checkpoint_timeout (upstream postgres.conf uses 15min; PG's default is 5min)"
+        required: false
+        default: "15min"
+      hfs_pg_max_connections:
+        description: "HFS Postgres pool size (crud drives 300 VUs; 32 leaves most of each request queued)"
+        required: false
+        default: "32"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -183,6 +215,22 @@ jobs:
   benchmark:
     name: Benchmark (${{ matrix.backend }})
     needs: [setup, build]
+    # UNPINNED, deliberately. This job used to carry a third `runs-on` entry
+    # naming one agent, to keep HFS and k6 — which run natively on the runner,
+    # unlike Postgres — on identical hardware across runs. That pin cost more
+    # than it bought: no runner advertises that label, and `runs-on` matches
+    # LABELS rather than runner names, so the job queued forever instead of
+    # failing. Run 32885795253 sat 5 hours unclaimed and 32972099076 was still
+    # queued with the whole pool provably idle. The label could not be added by
+    # dispatch either — `runs-on` referenced an `inputs.runner` that was never
+    # declared under workflow_dispatch, so it always resolved to the literal.
+    #
+    # The comparability that pin protected is now recovered by reading rather
+    # than by scheduling: `runner-info.txt` records the agent and its CPU/RAM in
+    # every artifact, benchcmp.py reads runner_name from the jobs API and shouts
+    # on a mismatch, and each run carries its own ambient controls (search
+    # shapes untouched by the change under test) so a code delta can be read
+    # within one run instead of across two.
     runs-on: [self-hosted, Linux]
     strategy:
       fail-fast: false
@@ -331,6 +379,15 @@ jobs:
           fi
           echo "Canary OK — host has writable space."
 
+          # How MUCH writable space, recorded so a future run can size
+          # max_wal_size against a number instead of a guess. The canary above
+          # only proves 256 MB is writable; `max_wal_size` reserves several GB
+          # of WAL segments on top of the Synthea corpus, and this host is
+          # shared with every other testcontainers job in the repo.
+          echo "── Docker host storage ──"
+          docker run --rm --name "hfs-bench-df-$RUN_ID" -v /:/hostroot:ro alpine:3 \
+            df -h /hostroot 2>/dev/null || docker system df 2>/dev/null || true
+
       # ── tgz bundle server ────────────────────────────────────────────────
       # The import suite pulls the Synthea `bulk_1k` corpus from this service
       # (`GET /reset`, `GET /<bundle>.json`). Built from the benchmark repo's
@@ -376,7 +433,18 @@ jobs:
           echo "HFS_STORAGE_BACKEND=${{ matrix.backend }}" >> "$GITHUB_ENV"
           if [ "${{ matrix.backend }}" = "sqlite" ]; then
             DB_PATH="$GITHUB_WORKSPACE/fhir-bench.db"
-            rm -f "$DB_PATH"
+            # Remove the WAL sidecars too, not just the database file. The
+            # runner workspace is reused across runs, and a benchmark killed
+            # mid-import (as in run 30550776427) leaves `-wal`/`-shm` behind.
+            # Deleting only the database and then opening a fresh empty one
+            # next to a stale WAL makes SQLite replay that WAL into it, which
+            # both resurrects the previous run's data and stalls startup long
+            # enough to blow the 120s readiness gate.
+            if ls "$DB_PATH"* >/dev/null 2>&1; then
+              echo "Leftover SQLite state from a previous run:"
+              ls -la "$DB_PATH"*
+            fi
+            rm -f "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" "$DB_PATH-journal"
             echo "HFS_DATABASE_URL=$DB_PATH" >> "$GITHUB_ENV"
             echo "SQLite DB: $DB_PATH"
           else
@@ -397,12 +465,105 @@ jobs:
           docker volume create --label hfs-bench=1 \
             --label "hfs-bench-run=${{ github.run_id }}" "$PG_VOLUME" >/dev/null
 
-          # Tuning approximates the benchmark's infra/postgres/postgres.conf.
-          # shared_buffers/effective_cache_size are scaled DOWN from the
-          # published values (10G/25G) to fit a typical self-hosted runner;
-          # bump them (and the runner) to match the benchmark host for numbers
-          # that are directly comparable to the public report. `--shm-size`
-          # must exceed shared_buffers.
+          # ── Memory sizing ────────────────────────────────────────────────
+          # Postgres runs on the REMOTE Docker host, not the runner, so it is
+          # that host's RAM that bounds shared_buffers — read it from the daemon
+          # rather than guessing. The published benchmark uses 10G/25G against a
+          # 30G database container (infra/postgres in the upstream repo); a
+          # hardcoded 2GB here was the single largest known confound in the
+          # 2026-08-24 comparison, on a workload we have already shown is random
+          # heap I/O over a 29 GB search_index.
+          #
+          # 'auto' applies the standard 25% / 75% split of host RAM, so the
+          # config scales with whatever host the run lands on instead of being
+          # silently wrong. Override either value to sweep them.
+          DOCKER_HOST_MEM_BYTES=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
+          DOCKER_HOST_MEM_GB=$(( DOCKER_HOST_MEM_BYTES / 1024 / 1024 / 1024 ))
+          echo "Docker host RAM: ${DOCKER_HOST_MEM_GB}G (${DOCKER_HOST_MEM_BYTES} bytes)"
+          echo "Docker host CPUs: $(docker info --format '{{.NCPU}}' 2>/dev/null || echo '?')"
+          echo "Runner CPUs: $(nproc 2>/dev/null || echo '?'), runner RAM: $(free -g 2>/dev/null | awk '/^Mem:/{print $2"G"}' || echo '?')"
+
+          # Defaults are the CONCRETE values every prior run measured under, not
+          # 'auto' — a default that silently changes with the host would make two
+          # runs incomparable without either of them saying so. 'auto' is opt-in,
+          # for when we deliberately want the config to track the host.
+          PG_SHARED_BUFFERS="${{ inputs.pg_shared_buffers || '2GB' }}"
+          PG_EFFECTIVE_CACHE="${{ inputs.pg_effective_cache_size || '6GB' }}"
+          PG_WORK_MEM="${{ inputs.pg_work_mem || '10MB' }}"
+          # ── WAL / checkpoint sizing ────────────────────────────────────────
+          # These are NOT a tuning experiment: they close a fidelity gap. The
+          # published field's numbers were produced under the benchmark's own
+          # `infra/postgres/postgres.conf`, which ends with
+          #   max_wal_size = '8GB'  min_wal_size = '2GB'
+          #   wal_buffers  = '256MB' checkpoint_timeout = '15min'
+          # (the `max_wal_size = '1GB'` earlier in that file is overridden by
+          # the later line — last assignment wins). This workflow passed only
+          # `-c max_wal_size=1GB` and left checkpoint_timeout at PG's 5min
+          # default, so every run so far checkpointed roughly 8x more often
+          # than aidbox's did and paid a full-page write on the first touch of
+          # every page after each one — a self-inflicted handicap on the two
+          # write suites, not a property of HFS.
+          # These are upstream's exact values. They were capped at 4GB/1GB/64MB
+          # on the first run of this change, out of the concern that the shared
+          # Docker host might fill (run 30550776427). The `df` added beside the
+          # write canary settles it: the host root is **200 G with 170 G free**
+          # (run 33409768172), so 8 GB of WAL segments is not a risk worth
+          # trading fidelity for.
+          PG_MAX_WAL_SIZE="${{ inputs.pg_max_wal_size || '8GB' }}"
+          PG_MIN_WAL_SIZE="${{ inputs.pg_min_wal_size || '2GB' }}"
+          PG_WAL_BUFFERS="${{ inputs.pg_wal_buffers || '256MB' }}"
+          PG_CHECKPOINT_TIMEOUT="${{ inputs.pg_checkpoint_timeout || '15min' }}"
+
+          if [ "$PG_SHARED_BUFFERS" = "auto" ]; then
+            if [ "$DOCKER_HOST_MEM_GB" -ge 8 ]; then
+              AUTO_SB=$(( DOCKER_HOST_MEM_GB / 4 ))
+              # Cap at the published benchmark's 10G. The Docker host is SHARED
+              # with every other testcontainers job in the repo, and this
+              # workflow has taken it down before (run 30550776427). There is no
+              # reason to grab more than the configuration we are trying to
+              # match, however large the host happens to be.
+              [ "$AUTO_SB" -gt 10 ] && AUTO_SB=10
+              PG_SHARED_BUFFERS="${AUTO_SB}GB"
+            else
+              # Too small to carve up meaningfully — keep the old conservative value.
+              PG_SHARED_BUFFERS="2GB"
+            fi
+          fi
+          if [ "$PG_EFFECTIVE_CACHE" = "auto" ]; then
+            if [ "$DOCKER_HOST_MEM_GB" -ge 8 ]; then
+              # effective_cache_size is a planner HINT — it allocates nothing —
+              # so it can track the host without the shared-host concern above,
+              # but capping at the published 25G keeps us comparable.
+              AUTO_EC=$(( DOCKER_HOST_MEM_GB * 3 / 4 ))
+              [ "$AUTO_EC" -gt 25 ] && AUTO_EC=25
+              PG_EFFECTIVE_CACHE="${AUTO_EC}GB"
+            else
+              PG_EFFECTIVE_CACHE="6GB"
+            fi
+          fi
+          # --shm-size must exceed shared_buffers. Only GB-suffixed values can be
+          # turned into a number here; anything else (e.g. "512MB") falls back to
+          # a safe 4g rather than failing the arithmetic and killing the run.
+          case "$PG_SHARED_BUFFERS" in
+            *GB) SHM_GB=$(( ${PG_SHARED_BUFFERS%GB} + 2 )) ;;
+            *)   SHM_GB=4 ;;
+          esac
+          echo "Postgres tuning: shared_buffers=$PG_SHARED_BUFFERS effective_cache_size=$PG_EFFECTIVE_CACHE work_mem=$PG_WORK_MEM shm=${SHM_GB}g"
+          echo "Postgres WAL: max_wal_size=$PG_MAX_WAL_SIZE min_wal_size=$PG_MIN_WAL_SIZE wal_buffers=$PG_WAL_BUFFERS checkpoint_timeout=$PG_CHECKPOINT_TIMEOUT"
+          {
+            echo "### Postgres tuning (${{ matrix.backend }})"
+            echo ""
+            echo "| setting | value |"
+            echo "|---|---|"
+            echo "| Docker host RAM | ${DOCKER_HOST_MEM_GB}G |"
+            echo "| shared_buffers | \`$PG_SHARED_BUFFERS\` |"
+            echo "| effective_cache_size | \`$PG_EFFECTIVE_CACHE\` |"
+            echo "| work_mem | \`$PG_WORK_MEM\` |"
+            echo "| max_wal_size | \`$PG_MAX_WAL_SIZE\` |"
+            echo "| min_wal_size | \`$PG_MIN_WAL_SIZE\` |"
+            echo "| wal_buffers | \`$PG_WAL_BUFFERS\` |"
+            echo "| checkpoint_timeout | \`$PG_CHECKPOINT_TIMEOUT\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
           #
           # The data directory is a **named volume**, not the container's
           # writable layer. Importing the Synthea corpus writes several GB, and
@@ -419,7 +580,7 @@ jobs:
             --name "$PG_CONTAINER" \
             --label hfs-bench=1 \
             --label "hfs-bench-run=${{ github.run_id }}" \
-            --shm-size=4g \
+            --shm-size=${SHM_GB}g \
             -v "$PG_VOLUME:/var/lib/postgresql" \
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_USER=postgres \
@@ -427,16 +588,22 @@ jobs:
             -p 0:5432 \
             postgres:18 \
             -c max_connections=1000 \
-            -c shared_buffers=2GB \
-            -c effective_cache_size=6GB \
-            -c work_mem=10MB \
+            -c shared_buffers=$PG_SHARED_BUFFERS \
+            -c effective_cache_size=$PG_EFFECTIVE_CACHE \
+            -c work_mem=$PG_WORK_MEM \
             -c maintenance_work_mem=256MB \
-            -c max_wal_size=1GB \
+            -c max_wal_size=$PG_MAX_WAL_SIZE \
+            -c min_wal_size=$PG_MIN_WAL_SIZE \
+            -c wal_buffers=$PG_WAL_BUFFERS \
+            -c checkpoint_timeout=$PG_CHECKPOINT_TIMEOUT \
             -c random_page_cost=1.1 \
             -c effective_io_concurrency=200 \
             -c max_worker_processes=8 \
             -c max_parallel_workers=6 \
-            -c max_parallel_workers_per_gather=4 >/dev/null
+            -c max_parallel_workers_per_gather=4 \
+            -c shared_preload_libraries=pg_stat_statements \
+            -c pg_stat_statements.max=10000 \
+            -c pg_stat_statements.track=all >/dev/null
 
           echo "Waiting for Postgres to accept connections..."
           PG_PORT=""
@@ -491,7 +658,13 @@ jobs:
           # comparators (Aidbox/HAPI/Medplum) impose no such cap and import.js
           # allows 900s client-side, so match that here for a fair comparison.
           # HFS_PG_MAX_CONNECTIONS: set explicitly so the pool size is a recorded
-          # input rather than an inferred default. The search suite runs 30 VUs; a
+          # input rather than an inferred default, and now a sweepable one — 32
+          # was chosen for the SEARCH suite's 30 VUs, but crud drives 300. In run
+          # 32767978962 crud managed 261 RPS at p50 996ms; 261 RPS across 32
+          # connections is ~122ms of service time per request, so ~870ms of each
+          # request was spent waiting for a connection rather than doing work.
+          # Postgres itself is started with max_connections=1000, so the pool is
+          # the binding constraint, not the server. The search suite runs 30 VUs; a
           # pool smaller than that puts every request behind a connection queue and
           # the measurement stops being about query cost at all (issue #224 — the
           # pool was pinned at 10 and, on the HFS_DATABASE_URL path, no environment
@@ -502,25 +675,63 @@ jobs:
           HFS_LOG_LEVEL="${{ inputs.log_level || 'info' }}" \
           HFS_MAX_BODY_SIZE="209715200" \
           HFS_REQUEST_TIMEOUT="900" \
-          HFS_PG_MAX_CONNECTIONS="32" \
+          HFS_PG_MAX_CONNECTIONS="${{ inputs.hfs_pg_max_connections || '32' }}" \
           HFS_DATA_DIR="$GITHUB_WORKSPACE/data" \
             ./hfs > "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>&1 &
 
-          echo "HFS_PID=$!" >> "$GITHUB_ENV"
+          # Keep the pid in a LOCAL variable as well as $GITHUB_ENV: values
+          # written to $GITHUB_ENV only become visible to *subsequent* steps, so
+          # the readiness loop below — which runs in this same step — would
+          # otherwise see an empty $HFS_PID and `kill -0 ""` would fail on the
+          # first iteration.
+          HFS_PID=$!
+          echo "HFS_PID=$HFS_PID" >> "$GITHUB_ENV"
 
+          # Cold start is dominated by conformance seeding — 1,377 SearchParameters
+          # written one at a time, measured at 27s (postgres) / 38s (sqlite) on an
+          # empty database. The old 120s gate left barely 3x headroom on a shared
+          # runner, and when the sqlite leg of run 32740257894 blew through it the
+          # step reported 120s of silence and nothing else. 300s plus a progress
+          # line every 10s so a slow start is distinguishable from a hung one.
           echo "Waiting for HFS to become ready..."
-          for i in $(seq 1 60); do
+          READY_TIMEOUT=300
+          START_TS=$SECONDS
+          READY=0
+          while [ $((SECONDS - START_TS)) -lt "$READY_TIMEOUT" ]; do
             if curl -sf "http://localhost:${{ matrix.port }}/metadata" -o /dev/null 2>/dev/null; then
-              echo "HFS ready after $((i * 2))s"
+              echo "HFS ready after $((SECONDS - START_TS))s"
+              READY=1
               break
             fi
-            if [ "$i" -eq 60 ]; then
-              echo "ERROR: HFS did not start within 120s"
-              cat "/tmp/hfs-bench-${{ matrix.backend }}.log"
-              exit 1
+            if ! kill -0 "$HFS_PID" 2>/dev/null; then
+              echo "ERROR: HFS process $HFS_PID exited after $((SECONDS - START_TS))s"
+              break
+            fi
+            ELAPSED=$((SECONDS - START_TS))
+            if [ $((ELAPSED % 10)) -lt 2 ] && [ "$ELAPSED" -gt 0 ]; then
+              echo "  ... still waiting (${ELAPSED}s) — last log line: $(tail -n 1 "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>/dev/null || echo '(no log yet)')"
             fi
             sleep 2
           done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "ERROR: HFS did not become ready within ${READY_TIMEOUT}s"
+            echo "── server log ──"
+            cat "/tmp/hfs-bench-${{ matrix.backend }}.log" || true
+            echo "── process state ──"
+            ps -o pid,stat,etime,rss,args -p "$HFS_PID" 2>/dev/null || echo "process $HFS_PID is gone"
+            echo "── open files / sockets (may need lsof) ──"
+            ls -l "/proc/$HFS_PID/fd" 2>/dev/null | tail -n 20 || true
+            echo "── kernel stack ──"
+            cat "/proc/$HFS_PID/stack" 2>/dev/null || echo "(stack unavailable)"
+            echo "── wait channel ──"
+            cat "/proc/$HFS_PID/wchan" 2>/dev/null && echo || true
+            if [ "${{ matrix.backend }}" = "sqlite" ]; then
+              echo "── sqlite database state ──"
+              ls -la "$HFS_DATABASE_URL"* 2>/dev/null || echo "(no database files)"
+            fi
+            exit 1
+          fi
 
       # Guard against the silent search-parameter degrade (see HFS_DATA_DIR note):
       # if the spec bundle didn't load, HFS logs a "minimal fallback" warning and
@@ -550,6 +761,29 @@ jobs:
           RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}"
           mkdir -p "$RESULTS_DIR"
 
+          # Which machine measured this run, recorded INSIDE the artifact.
+          # This job is unpinned (see the `runs-on` note), so consecutive runs
+          # can land on different agents — and HFS and k6 run natively on the
+          # runner, so that is a hardware change riding along with the code
+          # change. benchcmp.py reads runner_name from the jobs API, but the API
+          # is queryable only while the run is retained and says nothing about
+          # the agent's size; the artifact outlives it and travels with the
+          # numbers. Anyone reading these results later can tell a 2x from a
+          # bigger box apart from a 2x from the code.
+          {
+            echo "runner_name:  ${RUNNER_NAME:-unknown}"
+            echo "runner_cpus:  $(nproc 2>/dev/null || echo '?')"
+            echo "runner_ram:   $(free -g 2>/dev/null | awk '/^Mem:/{print $2"G"}' || echo '?')"
+            echo "runner_ip:    ${RUNNER_IP:-unknown}"
+            echo "docker_host:  ${DOCKER_HOST_IP:-unknown}"
+            echo "github_run:   ${{ github.run_id }}"
+            echo "git_sha:      ${{ github.sha }}"
+            echo "git_ref:      ${{ github.ref_name }}"
+            echo "backend:      ${{ matrix.backend }}"
+            echo "pg_pool_max:  ${{ inputs.hfs_pg_max_connections || '32' }}"
+          } > "$RESULTS_DIR/runner-info.txt"
+          cat "$RESULTS_DIR/runner-info.txt"
+
           # Resolve suite list. 'search' needs data, so 'import' must precede it;
           # canonical order keeps that invariant for the 'all' case.
           CANONICAL="prewarm import crud search"
@@ -565,10 +799,54 @@ jobs:
           [ -n "${{ inputs.vus }}" ]      && EXTRA_ARGS="$EXTRA_ARGS --vus ${{ inputs.vus }}"
           [ -n "${{ inputs.duration }}" ] && EXTRA_ARGS="$EXTRA_ARGS --duration ${{ inputs.duration }}"
 
+          # Where does a suite's time actually go?
+          #
+          # Two storage reductions — the v22 surrogate key plus partial composite
+          # index (~4.7 GB), and dropping the never-read param_url (~3 GB of
+          # heap) — moved import by 1.02x on the same runner. That is a flat
+          # result against a large reduction, which falsifies the assumption
+          # that import is bound by index maintenance and means further index
+          # work is aimed at the wrong thing.
+          #
+          # pg_stat_statements settles it. Reset before each suite, dump after,
+          # and compare Postgres' summed exec time against the suite's wall
+          # clock: if PG's total is a small fraction of the wall time, the
+          # bottleneck is on the HFS/k6 side (extraction CPU, serialization,
+          # round trips) and not in the database at all.
+          if [ "${{ matrix.backend }}" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
+            docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
+              -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements" >/dev/null 2>&1 \
+              || echo "::warning::pg_stat_statements unavailable"
+          fi
+
+          # ── Contention probe ────────────────────────────────────────────
+          # Every benchmark run shares ONE Postgres Docker host with every other
+          # testcontainers job in the repo (HFS CI, UI Tests). Neighbour load
+          # swings throughput by ~2x, and on 2026-08-27 it multiplied EVERY crud
+          # statement by 4-17x — including statements the tested commit never
+          # touched, which is how it was identified as environmental rather than
+          # a regression. Reconstructing that after the fact needed an external
+          # poller and guesswork.
+          #
+          # So each suite now records what the host looked like while it ran:
+          # load average and the container count on the DOCKER HOST (not the
+          # runner — the runner is ours alone, the host is not). A run that
+          # cannot be trusted for throughput now says so in its own artifact.
+          probe_host() {
+            local phase="$1" suite="$2"
+            local la cn
+            la=$(docker run --rm alpine:3 cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3)
+            cn=$(docker ps -q 2>/dev/null | wc -l)
+            echo "$(date -u +%H:%M:%SZ) suite=$suite phase=$phase host_loadavg=${la:-unknown} host_containers=${cn:-unknown}" \
+              >> "$RESULTS_DIR/host-contention.txt"
+          }
+
           for SUITE in $SUITES; do
             SUITE="${SUITE// /}"
             [ -z "$SUITE" ] && continue
             SCRIPT="k6/${SUITE}.js"
+            SUITE_START=$(date +%s)
+            probe_host start "$SUITE"
             if [ ! -f "$SCRIPT" ]; then
               echo "Skip '$SUITE' — $SCRIPT not found"
               continue
@@ -634,7 +912,92 @@ jobs:
               $POINTS_ARG \
               $EXTRA_ARGS \
               "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
+            SUITE_WALL=$(( $(date +%s) - SUITE_START ))
+            probe_host end "$SUITE"
+
+            # Attribute this suite's time. `wall` is the suite's own elapsed
+            # seconds; `pg_exec_total_s` is everything Postgres executed during
+            # it. The ratio is the point: a small ratio means the database was
+            # idle waiting on us, and no amount of index tuning will move the
+            # number.
+            #
+            # The per-statement table shows a HEAD and a WINDOW rather than
+            # `left(query, 110)`. Every search statement is the #279 fast path,
+            # whose first 209 characters are byte-identical
+            # ("SELECT r.id, … FROM ( SELECT DISTINCT resource_id, last_updated
+            # FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND
+            # "), so a 110-character prefix printed the same string for all of
+            # them and the top-15 table could not be attributed to a shape at
+            # all — run 33029355759's had to be reconstructed from call counts.
+            # The window starts at 209 because that is where the predicate — the
+            # only part that differs — begins. Note also that pg_stat_statements
+            # normalises the inlined `param_name` literal, so shapes that share a
+            # predicate shape share one row regardless of parameter.
+            #
+            # The last query is table-level and CUMULATIVE — `pg_stat_statements`
+            # is reset per suite, `pg_stat_user_tables` is not — so read it by
+            # differencing consecutive suites. It exists because nothing above can
+            # see autovacuum or autoanalyze: neither is a statement, so neither
+            # appears in `pg_stat_statements`, yet both compete for the same 4
+            # CPUs as the inserts. `search_index` carries a statistics target of
+            # 4000 on `value_token_code` (v15/v16, issue #281), which makes one
+            # ANALYZE of it a full read of the table; `autoanalyze_count` is how
+            # you tell whether v26's `autovacuum_analyze_scale_factor = 0.4`
+            # actually cut the number of those, and `n_tup_ins` is the row count
+            # every index-insertion estimate is scaled from.
+            if [ "${{ matrix.backend }}" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
+              {
+                echo "suite=$SUITE wall_seconds=$SUITE_WALL"
+                docker exec "$PG_CONTAINER" psql -U postgres -d postgres \
+                  -c "SELECT round((sum(total_exec_time)/1000.0)::numeric, 1) AS pg_exec_total_s,
+                             round((sum(total_plan_time)/1000.0)::numeric, 1) AS pg_plan_total_s,
+                             sum(calls) AS calls
+                      FROM pg_stat_statements" \
+                  -c "SELECT round((total_exec_time/1000.0)::numeric, 1) AS exec_s, calls,
+                             round(mean_exec_time::numeric, 3) AS mean_ms, rows,
+                             left(regexp_replace(query, '\s+', ' ', 'g'), 55)
+                               || ' … ' ||
+                             substr(regexp_replace(query, '\s+', ' ', 'g'), 210, 200) AS query
+                      FROM pg_stat_statements
+                      ORDER BY total_exec_time DESC LIMIT 15" \
+                  -c "SELECT round(100.0 * sum(blks_hit) / NULLIF(sum(blks_hit) + sum(blks_read), 0), 2)
+                             AS cache_hit_pct,
+                             sum(blks_read) AS blks_read, sum(xact_commit) AS commits
+                      FROM pg_stat_database WHERE datname = 'postgres'" \
+                  -c "SELECT relname, n_live_tup, n_tup_ins, n_tup_del, n_dead_tup,
+                             autovacuum_count, autoanalyze_count
+                      FROM pg_stat_user_tables
+                      WHERE relname IN ('search_index', 'resources', 'resource_fts',
+                                        'resource_history')
+                      ORDER BY relname"
+              } > "$RESULTS_DIR/${SUITE}-pgstat.txt" 2>&1 || \
+                echo "::warning::pgstat capture failed for $SUITE"
+              docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
+                -c "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
+            fi
           done
+
+          # Which search_index indexes the suites actually read.
+          #
+          # The plan capture above runs before the load, so its idx_scan counters
+          # only reflect import. This one runs after every suite, so a zero here
+          # means no shape in the whole run touched that index — while every
+          # write still maintained it and it still occupied cache on an 11G host.
+          # Evidence for the next round of index pruning; nothing reads it in
+          # this run.
+          if [ "${{ matrix.backend }}" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
+            docker exec "$PG_CONTAINER" psql -U postgres -d postgres \
+              -c "SELECT s.indexrelname AS index_name, s.idx_scan AS scans,
+                         s.idx_tup_read AS tuples_read,
+                         pg_size_pretty(pg_relation_size(s.indexrelid)) AS size
+                  FROM pg_stat_user_indexes s WHERE s.relname = 'search_index'
+                  ORDER BY s.idx_scan ASC, pg_relation_size(s.indexrelid) DESC;" \
+              -c "SELECT pg_size_pretty(sum(pg_relation_size(s.indexrelid))) AS all_indexes,
+                         pg_size_pretty(pg_relation_size('search_index'))    AS heap_only
+                  FROM pg_stat_user_indexes s WHERE s.relname = 'search_index';" \
+              > "$RESULTS_DIR/index-usage.txt" 2>&1 || \
+              echo "::warning::index usage capture failed"
+          fi
 
       # ── Artifacts ────────────────────────────────────────────────────────
       # Deliberately placed immediately after the suites and BEFORE the
@@ -765,6 +1128,39 @@ jobs:
               if chk.get('fails', 0) > 0:
                   chk_fmt = f"**{chk_fmt}**"
               print(f"| {suite} | {rps:,.0f} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
+
+          # ── How loaded the shared Docker host was ──────────────────────────
+          #
+          # The Postgres container runs on a Docker host shared with every other
+          # testcontainers job in the repo, and the crud suite is bound by that
+          # container. Across six runs of one unchanged branch on 2026-08-31 the
+          # same statements cost 1.90 to 6.70 ms of Postgres execution per call,
+          # and crud moved 6,391 -> 4,418 RPS with it — a 3.5x environmental
+          # spread that dwarfs every code change measured in this workflow's
+          # history. A run that does not say how loaded the host was cannot be
+          # compared to another one.
+          #
+          # `pg ms/call` is `pg_exec_total_s / calls` over the crud window: every
+          # statement Postgres ran, including ones no change here touches, so it
+          # moves with the host and not with the code. Lower is a quieter host.
+          import re
+          pgstat = f"{results_dir}/crud-pgstat.txt"
+          contention = f"{results_dir}/host-contention.txt"
+          if os.path.exists(pgstat):
+              t = open(pgstat).read()
+              m = re.search(r"^\s*([\d.]+)\s*\|\s*[\d.]+\s*\|\s*(\d+)\s*$", t, re.M)
+              if m:
+                  exec_s, calls = float(m.group(1)), int(m.group(2))
+                  per_call = exec_s * 1000.0 / calls if calls else 0.0
+                  load = ""
+                  if os.path.exists(contention):
+                      c = re.search(r"suite=crud phase=start host_loadavg=(\S+).*host_containers=(\d+)",
+                                    open(contention).read())
+                      if c:
+                          load = f", host loadavg {c.group(1)} over {c.group(2)} containers at crud start"
+                  flag = " ⚠ **contended — do not compare this run's crud to a quiet one**" if per_call > 3.0 else ""
+                  print(f"\n**Environment:** crud Postgres cost **{per_call:.2f} ms/call** "
+                        f"({exec_s:,.0f} s over {calls:,} statements{load}).{flag}")
           PYEOF
           } >> "$GITHUB_STEP_SUMMARY"
 

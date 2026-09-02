@@ -402,7 +402,7 @@ async fn browser_renders_full_page_with_translated_heading() {
     );
     for key in [
         "hts-vs-browser-title",
-        "hts-vs-browser-filter-search",
+        "hts-vs-browser-filter-reset",
         "hts-vs-browser-column-url",
         "hts-vs-browser-load-more",
         "hts-vs-expand-heading",
@@ -1154,14 +1154,19 @@ fn vs_detail_templates_only_use_classes_that_exist_in_app_css() {
     );
 }
 
-/// The V3 compact header on the ValueSet detail page.
+/// The V3 compact header on the ValueSet detail page. Since #801 it also
+/// takes the HFS back-link idiom: a `.page-head--back-link` modifier, a
+/// leading `.back-link`, and the rest of the head wrapped in
+/// `.page-head__copy`.
 #[test]
 fn vs_detail_page_uses_the_v3_compact_header_shape() {
     const PAGE: &str = include_str!("../templates/pages/vs-detail.html");
     let body = strip_template_comments(PAGE);
 
     for hook in [
-        r#"<header class="page-head">"#,
+        r#"<header class="page-head page-head--back-link">"#,
+        r#"class="back-link""#,
+        r#"class="page-head__copy""#,
         r#"class="page-head__title""#,
         r#"class="facets facets--bare""#,
         r#"class="detail__field detail__field--wide""#,
@@ -1177,6 +1182,7 @@ fn vs_detail_page_uses_the_v3_compact_header_shape() {
         "addbox",
         "hts-vs-detail__",
         "backlink",
+        "row-link",
         "<dl",
     ] {
         assert!(
@@ -1212,7 +1218,7 @@ async fn vs_detail_renders_the_compact_header_from_a_live_summary() {
     let html = body_text(response).await;
 
     for hook in [
-        r#"<header class="page-head">"#,
+        r#"<header class="page-head page-head--back-link">"#,
         r#"class="facets facets--bare""#,
         ">Facts<",
         "http://example.org/vs/example",
@@ -1233,7 +1239,7 @@ async fn vs_detail_renders_the_compact_header_from_a_live_summary() {
     // ever expanded — i.e. it is high on the page, not buried under a
     // full-width facts card.
     let head = html
-        .find(r#"<header class="page-head">"#)
+        .find(r#"<header class="page-head page-head--back-link">"#)
         .expect("page head present");
     let workbench = html
         .find(r#"id="hts-workbench-input""#)

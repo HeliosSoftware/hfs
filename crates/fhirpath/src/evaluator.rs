@@ -931,6 +931,36 @@ pub fn evaluate(
                     );
                 }
             }
+            // `Type.member`, where `Type` is the context resource's own type, is
+            // the shape every FHIR search-parameter expression starts with —
+            // and it used to materialise a full copy of the resource just to
+            // read one field out of it. `evaluate` resolves a bare type name by
+            // cloning `context.this` and returning it (see the block at the top
+            // of this function), and the default path below then reads a single
+            // member from that copy and drops the rest.
+            //
+            // Cloning an `EvaluationResult` deep-copies every `HashMap` and
+            // every key `String` beneath it, and the search-index extractor
+            // evaluates ~40 parameters against each resource, so it paid that
+            // copy ~40 times per resource. On a local replay of the benchmark's
+            // `k6/import.js` it was the largest cost after FHIRPath evaluation
+            // itself.
+            //
+            // Borrowing is the same value by construction: this branch is taken
+            // only under exactly the conditions in which `evaluate(left_expr)`
+            // would have returned a clone of `context.this` and nothing else,
+            // and `evaluate_invocation` takes its base by reference.
+            if current_item.is_none()
+                && let Expression::Term(Term::Invocation(Invocation::Member(initial_name))) =
+                    left_expr.as_ref()
+                && let Some(this_item) = context.this.as_ref()
+                && let EvaluationResult::Object { map: this_map, .. } = this_item
+                && let Some(EvaluationResult::String(ctx_type, _, _)) = this_map.get("resourceType")
+                && initial_name.eq_ignore_ascii_case(ctx_type)
+            {
+                return evaluate_invocation(this_item, invocation, context, current_item);
+            }
+
             // Default: evaluate left, then invoke on result
             let left_result = evaluate(left_expr, context, current_item)?;
             // Pass current_item to evaluate_invocation for argument evaluation context
@@ -1640,11 +1670,15 @@ fn evaluate_term(
             // If not $this or a variable, it must be a member/function invocation.
             // Determine the base context for this invocation ($this for the current term).
             // Priority: current_item > context.this > context.resources
-            let base_context = match current_item {
-                Some(item) => item.clone(),
+            // Borrowed where the base already exists somewhere referenceable —
+            // `current_item` and `context.this` are both the common case on the
+            // indexing path, and both used to be deep-copied here only for
+            // `evaluate_invocation` to take a reference to the copy.
+            let base_context: std::borrow::Cow<'_, EvaluationResult> = match current_item {
+                Some(item) => std::borrow::Cow::Borrowed(item),
                 None => match &context.this {
-                    Some(this_item) => this_item.clone(),
-                    None => {
+                    Some(this_item) => std::borrow::Cow::Borrowed(this_item),
+                    None => std::borrow::Cow::Owned({
                         // Fallback to resources if context.this is also None
                         if context.resources.is_empty() {
                             EvaluationResult::Empty
@@ -1661,7 +1695,7 @@ fn evaluate_term(
                                 type_info: None,
                             }
                         }
-                    }
+                    }),
                 },
             };
 
@@ -1677,14 +1711,14 @@ fn evaluate_term(
                     if let EvaluationResult::Object {
                         map: obj_map,
                         type_info: None,
-                    } = &base_context
+                    } = base_context.as_ref()
                     {
                         if let Some(EvaluationResult::String(ctx_type, _, _)) =
                             obj_map.get("resourceType")
                         {
                             // The parser ensures 'name' is cleaned of backticks if it was a delimited identifier.
                             if name.eq_ignore_ascii_case(ctx_type) {
-                                return Ok(base_context.clone());
+                                return Ok(base_context.into_owned());
                             }
                         }
                     }
@@ -1695,7 +1729,7 @@ fn evaluate_term(
             // evaluate the invocation on the base_context.
             // Pass current_item (from evaluate_term's scope) as current_item_for_args
             // to evaluate_invocation, which is used for $this in function arguments (e.g., for lambdas).
-            evaluate_invocation(&base_context, invocation, context, current_item)
+            evaluate_invocation(base_context.as_ref(), invocation, context, current_item)
         }
         Term::Literal(literal) => Ok(evaluate_literal(literal)), // Wrap in Ok
         Term::ExternalConstant(name) => {
