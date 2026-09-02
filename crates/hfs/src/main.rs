@@ -18,6 +18,8 @@
 //! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`,
 //! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
+mod cluster;
+
 use std::sync::Arc;
 
 use helios_audit::{
@@ -949,6 +951,36 @@ async fn main() -> anyhow::Result<()> {
     let backend_mode = config
         .storage_backend_mode()
         .map_err(|e| anyhow::anyhow!("Invalid storage backend configuration: {}", e))?;
+
+    // Cluster-mode fail-fast: refuse configurations that cannot run as one of
+    // N instances before any subsystem starts. The audit config is re-parsed
+    // by `init_audit` below; parsing it here too is cheap and keeps the check
+    // a pure function of the assembled view.
+    {
+        let audit_config = AuditConfig::from_env();
+        let view = cluster::ClusterConfigView {
+            cluster: config.cluster,
+            primary_backend: backend_mode.primary_backend_kind(),
+            job_store_backend: &config.job_store_backend,
+            bulk_export_enabled: config.bulk_export.enabled,
+            bulk_export_output_backend: &config.bulk_export.output_backend,
+            bulk_submit_enabled: config.bulk_submit.enabled,
+            bulk_submit_output_backend: &config.bulk_submit.output_backend,
+            audit_backend: audit_config.backend,
+            sof_enabled: config.sof_enabled,
+            export_sink: &config.export_sink,
+        };
+        let verdict = cluster::validate_cluster_config(&view);
+        for warning in &verdict.warnings {
+            warn!("Cluster configuration: {}", warning);
+        }
+        if !verdict.errors.is_empty() {
+            for error in &verdict.errors {
+                eprintln!("Configuration error: {}", error);
+            }
+            std::process::exit(1);
+        }
+    }
 
     // Propagate HFS_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
     // FHIRPath evaluation (CDS Hooks, _filter, etc.) delegates terminology

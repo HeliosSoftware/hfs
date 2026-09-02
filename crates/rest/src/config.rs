@@ -131,6 +131,21 @@ impl fmt::Display for StorageBackendMode {
     }
 }
 
+/// Unified async-job store backend.
+///
+/// Selects where cluster-affected async job state (SQL-on-FHIR `$sql-export`,
+/// `$reindex`) lives once those subsystems can use a shared store. Resolved by
+/// [`ServerConfig::job_store_backend_mode`]; parsed and validated ahead of the
+/// subsystems that consume it, so an operator's cluster configuration is
+/// checked at boot from the first release that knows the variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStoreBackend {
+    /// In-process job state — visible only to this instance; lost on restart.
+    Memory,
+    /// Job state in the shared primary database — cluster-capable.
+    Database,
+}
+
 impl FromStr for StorageBackendMode {
     type Err = String;
 
@@ -984,6 +999,22 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_STORAGE_BACKEND", default_value = "sqlite")]
     pub storage_backend: String,
 
+    /// Declares this process one of N instances behind a load balancer.
+    ///
+    /// Flips cluster-safe defaults (e.g. the unified job store backend) and
+    /// makes the server fail fast at boot on configurations that cannot be
+    /// clustered instead of silently degrading.
+    #[arg(long, env = "HFS_CLUSTER", default_value = "false")]
+    pub cluster: bool,
+
+    /// Unified async-job store backend: "memory" (in-process, single
+    /// instance) or "database" (shared primary database, cluster-capable).
+    ///
+    /// Unset resolves to "memory", or to "database" when `HFS_CLUSTER=true`.
+    /// Parsed and validated ahead of the subsystems that consume it.
+    #[arg(long, env = "HFS_JOB_STORE_BACKEND", default_value = "")]
+    pub job_store_backend: String,
+
     /// Elasticsearch node URLs (comma-separated).
     /// Used when storage_backend is sqlite-elasticsearch, postgres-elasticsearch,
     /// or mongodb-elasticsearch.
@@ -1205,6 +1236,27 @@ impl ServerConfig {
     pub fn storage_backend_mode(&self) -> Result<StorageBackendMode, String> {
         self.storage_backend.parse()
     }
+
+    /// Resolves the unified async-job store backend.
+    ///
+    /// An unset value defaults to [`JobStoreBackend::Database`] when
+    /// `cluster` is set and [`JobStoreBackend::Memory`] otherwise; explicit
+    /// values win regardless of the cluster switch.
+    pub fn job_store_backend_mode(&self) -> Result<JobStoreBackend, String> {
+        match self.job_store_backend.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(if self.cluster {
+                JobStoreBackend::Database
+            } else {
+                JobStoreBackend::Memory
+            }),
+            "memory" => Ok(JobStoreBackend::Memory),
+            "database" | "db" => Ok(JobStoreBackend::Database),
+            other => Err(format!(
+                "Invalid job store backend '{}' (HFS_JOB_STORE_BACKEND). Valid values: memory, database",
+                other
+            )),
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -1233,6 +1285,8 @@ impl Default for ServerConfig {
             default_page_size: 20,
             max_page_size: 1000,
             storage_backend: "sqlite".to_string(),
+            cluster: false,
+            job_store_backend: String::new(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
@@ -1361,6 +1415,10 @@ impl ServerConfig {
             errors.push("Port cannot be 0".to_string());
         }
 
+        if let Err(job_store_error) = self.job_store_backend_mode() {
+            errors.push(job_store_error);
+        }
+
         if self.max_body_size == 0 {
             errors.push("Max body size cannot be 0".to_string());
         }
@@ -1455,6 +1513,8 @@ impl ServerConfig {
             default_page_size: 10,
             max_page_size: 100,
             storage_backend: "sqlite".to_string(),
+            cluster: false,
+            job_store_backend: String::new(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
@@ -2384,5 +2444,42 @@ mod tests {
             assert_eq!(variant.to_string(), expected);
             assert_eq!(expected.parse::<StorageBackendMode>().unwrap(), variant);
         }
+    }
+
+    #[test]
+    fn test_job_store_backend_default_flips_with_cluster() {
+        // Unset → memory single-instance, database when clustered.
+        let mut config = ServerConfig::default();
+        assert_eq!(config.job_store_backend_mode(), Ok(JobStoreBackend::Memory));
+        config.cluster = true;
+        assert_eq!(
+            config.job_store_backend_mode(),
+            Ok(JobStoreBackend::Database)
+        );
+
+        // Explicit values win regardless of the cluster switch.
+        config.job_store_backend = "memory".to_string();
+        assert_eq!(config.job_store_backend_mode(), Ok(JobStoreBackend::Memory));
+        config.cluster = false;
+        config.job_store_backend = " Database ".to_string();
+        assert_eq!(
+            config.job_store_backend_mode(),
+            Ok(JobStoreBackend::Database)
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_job_store_backend() {
+        let config = ServerConfig {
+            job_store_backend: "kafka".to_string(),
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Invalid job store backend 'kafka'")),
+            "expected a job-store error, got: {errors:?}"
+        );
     }
 }
