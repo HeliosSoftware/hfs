@@ -4,11 +4,14 @@
 //! `/__mock_ready` before firing so the mock's TCP listener has finished
 //! accepting on Windows.
 //!
-//! **Shape of record (2026-08-27).** The page mirrors HFS's
-//! `crates/ui/templates/pages/capability-statement.html`: same sidebar
-//! label and icon, same route shape, and the same stacked
-//! `<section class="card">` blocks. It was previously "Diagnostics" at
-//! `/ui/hts/diagnostics`; that path now 308s here.
+//! **Shape of record (2026-09-01, #808).** Four of the six cards are no
+//! longer this crate's markup at all: they are rendered by
+//! `helios_ui_chrome::capability::CapabilityCards`, the same code HFS's
+//! `/ui/capability-statement` renders. These tests therefore assert the
+//! *page* — which cards appear, in what order, fed by which fetch, degrading
+//! how — and leave the cards' internals to the shared crate's own unit tests.
+//! The page was previously "Diagnostics" at `/ui/hts/diagnostics`; that path
+//! now 308s here.
 //!
 //! The tests exercise:
 //!
@@ -24,8 +27,11 @@
 //!    moved to Home, and the round-trips went with them.
 //! 7. The old `/ui/hts/diagnostics` path still resolves, as a 308.
 //! 8. A 5xx on one source degrades only its own card.
-//! 9. (sync) Every CSS class the template names has a real rule in the
-//!    shared `crates/ui/assets/app.css` — the page adds no CSS.
+//! 9. The shared cards arrive with HFS's spec links and colour-coded
+//!    interaction chips — the two improvements this page did not have while
+//!    it kept its own copy of the markup.
+//! 10. (sync) Every CSS class the page names — its own *and* the shared
+//!    cards' — has a real rule in the shared `crates/ui/assets/app.css`.
 
 use axum::{
     Router,
@@ -366,6 +372,27 @@ async fn capability_page_mirrors_hfs_and_declares_terminology_capabilities() {
         "CodeSystem advertises 5 search params and the count column should say so",
     );
 
+    // ── #808: the shared cards bring HFS's links and colour coding ──────
+    // This page rendered plain text here while it kept its own copy of the
+    // markup. The links follow the release the binary was built for, so an
+    // R4 build never sends the operator at the current-release page (#797).
+    assert!(
+        html.contains(
+            r#"<a href="https://hl7.org/fhir/R4/codesystem.html" target="_blank" rel="noopener">CodeSystem</a>"#
+        ),
+        "resource types should link into the release's own specification",
+    );
+    assert!(
+        html.contains(r#"<span class="tag tag--member">read</span>"#),
+        "per-resource interaction verbs should carry HFS's semantic classes",
+    );
+    assert!(
+        html.contains(
+            r#"<a class="url" href="http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup""#
+        ),
+        "operation definitions should link when the canonical is safe",
+    );
+
     // ── System Interactions is absent, not blank ────────────────────────
     // HTS serves `POST /` but declares no `rest[].interaction[]`. The card
     // must not appear at all rather than render an empty chip row.
@@ -408,26 +435,41 @@ async fn capability_page_mirrors_hfs_and_declares_terminology_capabilities() {
         &closure_row[..closure_row.len().min(60)],
     );
 
-    // ── Raw CapabilityStatement, HFS's foldable block ───────────────────
+    // ── Raw CapabilityStatement, the same htmx-lazy fold HFS renders ────
+    // (#808 follow-up to #798). The default view never inlines the
+    // statement — it holds a "Load JSON" link against this server's own
+    // fragment endpoint, not HFS's.
     assert!(
-        html.contains("<details>") && html.contains(r#"<pre class="detail__code">"#),
-        "the raw statement should fold into HFS's `<details>` + `<pre>`",
-    );
-    // Askama emits numeric entities (`&#34;`), so assert on the payload
-    // rather than on a particular quoting of it.
-    let folded = html
-        .split(r#"<pre class="detail__code">"#)
-        .nth(1)
-        .and_then(|s| s.split("</pre>").next())
-        .expect("the raw block renders");
-    assert!(
-        folded.contains("resourceType") && folded.contains("CapabilityStatement"),
-        "the folded block should hold the statement; got: {}",
-        &folded[..folded.len().min(80)],
+        html.contains(r#"id="capability-json-fold""#),
+        "the raw fold should use HFS's shared shell",
     );
     assert!(
-        folded.contains("\n"),
-        "the folded statement should be pretty-printed, not one compact line",
+        html.contains(r#"data-fragment-url="/ui/hts/capability-statement/json-fragment"#),
+        "the fold should lazy-load from HTS's own fragment endpoint, not HFS's",
+    );
+    assert!(
+        !html.contains(r#"<pre class="detail__code">"#),
+        "the default view must not inline the statement any more",
+    );
+
+    // The fragment endpoint itself serves the statement, highlighted.
+    let fragment = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get(
+                "/ui/hts/capability-statement/json-fragment?path=&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fragment.status(), StatusCode::OK);
+    let fragment_html = body_text(fragment).await;
+    assert!(
+        fragment_html.contains("resourceType") && fragment_html.contains("CapabilityStatement"),
+        "the fragment should hold the statement; got: {}",
+        &fragment_html[..fragment_html.len().min(120)],
     );
 
     // ── The page fetches exactly two sources ────────────────────────────
@@ -489,9 +531,21 @@ async fn interactions_appear_when_declared_and_one_failure_degrades_only_its_car
         html.contains("System Interactions"),
         "the card should appear once the server declares interactions",
     );
+    // #808: the chips arrive from the shared card, so they carry HFS's
+    // semantic colour classes and HFS's link into the release's HTTP
+    // specification. Before the unification this page emitted a bare
+    // `<span class="tag">`.
     assert!(
-        html.contains(r#"<span class="tag">batch</span>"#),
-        "declared interactions should render as `.tag` chips",
+        html.contains(
+            r#"<a class="tag tag--config" href="https://hl7.org/fhir/R4/http.html#batch""#
+        ),
+        "declared interactions should be colour-coded chips linked into the spec",
+    );
+    assert!(
+        html.contains(
+            r#"<a class="tag tag--config" href="https://hl7.org/fhir/R4/http.html#transaction""#
+        ),
+        "every declared verb should be linked, not just the first",
     );
 
     // A 500 on the terminology probe degrades only the terminology card;
@@ -516,12 +570,11 @@ async fn interactions_appear_when_declared_and_one_failure_degrades_only_its_car
     // A statement that grows with the data must not ship whole. HTS carries
     // one `capabilitystatement-supported-system` extension per loaded code
     // system; against the bundled seed set that is ~1,975 of them and a
-    // 422 KB raw block — 95% of the page — on every load, `<details>` or
-    // not. Only the seeded deployment exposes this; the small fixtures
-    // above never would.
-    // 400 is already ~10× the 16 KB cap; the real seed set carries ~1,975.
-    // Kept deliberately modest — this fixture is serialized and
-    // pretty-printed on every render, and a needlessly huge one only adds
+    // 422 KB raw block — 95% of the page — if it were ever inlined. Only the
+    // seeded deployment exposes this; the small fixtures above never would.
+    // 400 is already large enough to blow the fragment engine's 1,000-line
+    // render budget and force outline mode; the real seed set carries
+    // ~1,975. Kept deliberately modest — a needlessly huge fixture only adds
     // CPU to a suite that already runs eleven binaries in parallel.
     let bulky: Vec<Value> = (0..400)
         .map(|i| {
@@ -541,65 +594,159 @@ async fn interactions_appear_when_declared_and_one_failure_degrades_only_its_car
             })),
         )
         .await;
+    // The page itself never inlines the statement — #808's whole point — so
+    // it stays small however large the statement grows.
     let html = get_page(&app).await;
-    let folded = html
-        .split(r#"<pre class="detail__code">"#)
-        .nth(1)
-        .and_then(|s| s.split("</pre>").next())
-        .expect("the raw block renders");
     assert!(
-        folded.len() < 20 * 1024,
-        "the raw block must stay capped; got {} bytes",
-        folded.len(),
-    );
-    // Never a silent truncation: the note states both sizes and points at
-    // the endpoint that serves the complete document.
-    assert!(
-        html.contains("Truncated to the first"),
-        "a truncated statement must say so",
-    );
-    assert!(
-        html.contains(r#"<a href="/metadata">"#),
-        "the truncation note must link to the full statement",
+        !html.contains(r#"<pre class="detail__code">"#),
+        "the page must never inline the raw statement",
     );
     assert!(
         html.len() < 60 * 1024,
         "the whole page should stay small even against a bulky statement; got {} bytes",
         html.len(),
     );
+
+    // The root fragment cannot fully render 400 extensions inside its
+    // 1,000-line budget, so it degrades to a paginated outline rather than
+    // one gigantic swap.
+    let root_fragment = body_text(
+        app.clone()
+            .oneshot(
+                axum::http::Request::get(
+                    "/ui/hts/capability-statement/json-fragment?path=&offset=0&limit=100",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        root_fragment.contains(r#"data-capability-json-page"#),
+        "400 extensions should force the root into outline mode",
+    );
+    assert!(
+        root_fragment.contains("[ 400 ]"),
+        "the extension array should summarize its length rather than inline it",
+    );
+
+    // Following that row's own link pages through the 400 items themselves.
+    let extension_page = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get(
+                "/ui/hts/capability-statement/json-fragment?path=%2Fextension&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(extension_page.status(), StatusCode::OK);
+    let extension_html = body_text(extension_page).await;
+    assert!(extension_html.contains("1–100 / 400"));
+    // Each extension is itself an object, so this level summarizes rather
+    // than inlines it too — the same "expand one bounded level at a time"
+    // rule the root page just proved.
+    assert_eq!(extension_html.matches("{ 2 }").count(), 100);
+
+    // Drilling one level further reaches the actual padding value.
+    let item_html = body_text(
+        app.clone()
+            .oneshot(
+                axum::http::Request::get(
+                    "/ui/hts/capability-statement/json-fragment?path=%2Fextension%2F0&offset=0&limit=100",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(item_html.contains("padding-0"));
 }
 
 /// Guard: the page adds **no** CSS. Every class it names must already have
 /// a rule in the shared stylesheet, so a future edit cannot smuggle in a
 /// reintroduced HTS-only style hook.
 ///
+/// The scan covers the shared cards too (#808). They are the bulk of the
+/// page now, and they are edited from `crates/ui-chrome` — where nothing
+/// otherwise checks that a class reaches an HTS page with a rule behind it,
+/// because that crate carries no stylesheet of its own.
+///
 /// A plain `#[test]`: it reads files and never touches the runtime, so it
 /// stays outside the `#[tokio::test]` budget this file works to.
 #[test]
-fn capability_template_only_uses_classes_that_exist_in_app_css() {
-    const PAGE: &str = include_str!("../templates/pages/capability-statement.html");
+fn capability_markup_only_uses_classes_that_exist_in_app_css() {
     const APP_CSS: &str = include_str!("../../ui/assets/app.css");
-
-    // Skip only the `{#- … -#}` *header* comment, which quotes CSS
-    // selectors and `class="…"` fragments in prose. `split_once` (first
-    // match), not `rsplit_once`: the template carries a short comment above
-    // each card, and splitting on the last one would skip nearly the whole
-    // file — silently reducing this guard to a couple of classes.
-    let body = PAGE.split_once("-#}").map(|(_, rest)| rest).unwrap_or(PAGE);
+    const SOURCES: [(&str, &str); 5] = [
+        (
+            "the HTS page",
+            include_str!("../templates/pages/capability-statement.html"),
+        ),
+        (
+            "the shared summary card",
+            include_str!("../../ui-chrome/templates/partials/capability-summary-card.html"),
+        ),
+        (
+            "the shared interactions card",
+            include_str!("../../ui-chrome/templates/partials/capability-interactions-card.html"),
+        ),
+        (
+            "the shared operations card",
+            include_str!("../../ui-chrome/templates/partials/capability-operations-card.html"),
+        ),
+        (
+            "the shared resources card",
+            include_str!("../../ui-chrome/templates/partials/capability-resources-card.html"),
+        ),
+    ];
 
     let mut checked = 0usize;
-    for chunk in body.split(r#"class=""#).skip(1) {
-        let value = chunk.split('"').next().unwrap_or_default();
-        for class in value.split_whitespace() {
-            assert!(
-                APP_CSS.contains(&format!(".{class}")),
-                "class `{class}` used by the Capability template has no rule in crates/ui/assets/app.css",
-            );
-            checked += 1;
+    for (label, source) in SOURCES {
+        // Skip only the leading `{#- … -#}` / `{# … #}` header comment, which
+        // quotes CSS selectors and `class="…"` fragments in prose. First
+        // match, not last: these files carry a short comment above each card,
+        // and splitting on the last one would skip nearly the whole file —
+        // silently reducing this guard to a couple of classes.
+        let body = source
+            .split_once("-#}")
+            .or_else(|| source.split_once("#}"))
+            .map(|(_, rest)| rest)
+            .unwrap_or(source);
+        for chunk in body.split(r#"class=""#).skip(1) {
+            let value = chunk.split('"').next().unwrap_or_default();
+            // A `class` attribute may interpolate: `class="tag {{ i.tag_class }}"`.
+            // Strip the expression and check the literal classes around it —
+            // the interpolated values are `&'static str`s chosen in Rust, and
+            // the shared crate's unit tests pin them.
+            let literals = value
+                .split("{{")
+                .enumerate()
+                .map(|(i, part)| {
+                    if i == 0 {
+                        part
+                    } else {
+                        part.split_once("}}").map(|(_, rest)| rest).unwrap_or("")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            for class in literals.split_whitespace() {
+                assert!(
+                    APP_CSS.contains(&format!(".{class}")),
+                    "class `{class}` used by {label} has no rule in crates/ui/assets/app.css",
+                );
+                checked += 1;
+            }
         }
     }
     assert!(
-        checked >= 10,
-        "expected the scan to reach the template's class attributes, only saw {checked}",
+        checked >= 20,
+        "expected the scan to reach the markup's class attributes, only saw {checked}",
     );
 }

@@ -41,16 +41,22 @@
 mod bulk_export;
 mod bulk_import;
 mod capability;
-mod capability_json;
 mod compartments;
 mod conformance;
 mod editor;
 mod history;
 mod i18n;
-mod json_view;
 mod rail_state;
 mod search_params;
 mod sql_export;
+
+/// The bounded JSON-fragment engine behind the Raw CapabilityStatement fold
+/// moved to `helios-ui-chrome` (#808) so HTS renders the same paginated tree
+/// instead of a byte-capped `<pre>`. Re-exported under their old in-crate
+/// names so every existing `capability_json::`/`json_view::` reference below
+/// — `editor.rs` included — keeps compiling unchanged.
+pub(crate) use helios_ui_chrome::capability_json;
+pub(crate) use helios_ui_chrome::json_view;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
@@ -118,7 +124,7 @@ pub struct NlSearch {
     pub model: String,
 }
 
-/// Whether the mounted FHIR API can search Patient resources by name.
+/// Whether the mounted FHIR API can search Patient resources by search parameters.
 ///
 /// Exact logical-id reads remain available in both modes. The UI keeps this
 /// capability separate because standalone S3 intentionally has no search
@@ -831,25 +837,6 @@ struct JsonViewFragment {
     json_view_paths: bool,
 }
 
-/// A small CapabilityStatement (or subtree) rendered by the unchanged shared
-/// JSON highlighter.
-#[derive(Template)]
-#[template(path = "partials/capability-json-full.html")]
-struct CapabilityJsonFullFragment {
-    i18n: I18n,
-    json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
-}
-
-/// One bounded level of a large CapabilityStatement.
-#[derive(Template)]
-#[template(path = "partials/capability-json-outline.html")]
-struct CapabilityJsonOutlineFragment {
-    i18n: I18n,
-    outline: capability_json::Outline,
-}
-
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
 /// are codegen'd into the binary; a tenant-scoped override layer is open
 /// question 1 on the issue.
@@ -1243,10 +1230,15 @@ pub fn mount_with_conformance_source_and_runtime(
             "/ui/sql/view-definitions",
             get(sql_view_definitions_page).post(sql_view_definitions_save),
         )
-        // #753 ticket 03 (evaluation POC): the editor's async server lint.
+        // #753 (evaluation POC): the editor's async server lint.
         .route(
             "/ui/sql/view-definitions/lint",
             axum::routing::post(sql_view_definitions_lint),
+        )
+        // #752 ticket 01: the playground's live preview fragment.
+        .route(
+            "/ui/sql/view-definitions/run",
+            axum::routing::post(sql_view_definitions_run),
         )
         .route(
             "/ui/sql/queries",
@@ -1337,6 +1329,10 @@ pub fn mount_with_conformance_source_and_runtime(
         .route(
             "/ui/bulk-import/{id}/abort",
             axum::routing::post(bulk_import::abort),
+        )
+        .route(
+            "/ui/bulk-import/{id}/complete",
+            axum::routing::post(bulk_import::complete),
         )
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
@@ -2345,11 +2341,12 @@ async fn batch_page(
     })
 }
 
-/// The View Definitions workspace (#649, Figma `420-2`): a filter rail of the
-/// tenant's stored ViewDefinitions, the selected one as editable JSON, and a
-/// `$sql-run` preview of its output. Save and Duplicate are plain form posts
-/// (they work without JavaScript); Delete rides `conformance-crud.js` like
-/// the other conformance viewers.
+/// The View Definitions playground (#649, Figma `420-2`; #752): a filter
+/// rail of the tenant's stored ViewDefinitions, the selected one always
+/// editable as JSON, and a `$sql-run` preview that follows the editor's
+/// current text — saved or not, no Run button. Save and Duplicate are plain
+/// form posts (they work without JavaScript); Delete rides
+/// `conformance-crud.js` like the other conformance viewers.
 #[derive(Template)]
 #[template(path = "pages/sql-view-definitions.html")]
 struct SqlViewDefinitionsPage {
@@ -2370,8 +2367,12 @@ struct SqlViewDefinitionsPage {
     selected: Option<SelectedVd>,
     /// `?vd=new`: the JSON below is the starter document, not a stored view.
     is_new: bool,
-    results: Option<sql_views::RunTable>,
-    run_error: Option<String>,
+    /// The `$sql-run` preview card and its failure notice, nested as its own
+    /// template (#752 ticket 01, RF7) so `partials/sql_run_results.html`'s
+    /// markup exists in exactly one place, shared with the `/run` fragment
+    /// endpoint (`sql_view_definitions_run`). `fragment: false` here — the
+    /// page's own render has nothing to swap into.
+    run_results: RunResultsPartial,
     save_error: Option<String>,
     saved: bool,
     /// RF4/RF6: the "Recently used" group's own rows.
@@ -2391,11 +2392,47 @@ struct SelectedVd {
     json: String,
 }
 
+/// The `$sql-run` preview's three renderable shapes (#752 ticket 01, RF4/
+/// RF5–RF6/RF7). A tuple enum rather than parallel `Option`s so a table can
+/// never appear alongside a failure message, and the page's own "nothing has
+/// run yet" state is distinct from both — the invalid combinations RF4–RF7
+/// describe simply have no constructor.
+enum RunResultsState {
+    /// RF4: a successful run — its table, plus how long the `$sql-run` call
+    /// took in whole milliseconds.
+    Success(sql_views::RunTable, u64),
+    /// RF5/RF6: a run or parse failure, with the message rendered next to
+    /// `vd-run-failed`.
+    Failure(String),
+    /// RF7: the page's own render before anything has run server-side — no
+    /// `?saved=1`, or the current selection has no preview yet. Renders the
+    /// notice region's own client-driven initial-load request (#752 ticket
+    /// 02, RF4). Never produced by the `/run` fragment endpoint, which
+    /// always ends in `Success` or `Failure`.
+    Empty,
+}
+
+/// The `$sql-run` preview card and its failure notice (#752 ticket 01, RF7):
+/// `partials/sql_run_results.html`'s markup is written once and rendered by
+/// two callers — nested as a template field of [`SqlViewDefinitionsPage`]
+/// for the page's own initial render (`{{ run_results.render()?|safe }}` in
+/// `sql-view-definitions.html`, `fragment: false`), and directly as the
+/// whole response of [`sql_view_definitions_run`] (`fragment: true`,
+/// RF4–RF6). `fragment` only toggles the `hx-swap-oob` attributes and
+/// whether the `Empty` arm's own load trigger applies (#752 ticket 02); the
+/// table markup itself lives solely in the template's `Success` arm.
+#[derive(Template)]
+#[template(path = "partials/sql_run_results.html")]
+struct RunResultsPartial {
+    i18n: I18n,
+    fragment: bool,
+    state: RunResultsState,
+}
+
 #[derive(Deserialize, Default)]
 struct SqlVdQuery {
     vd: Option<String>,
     filter: Option<String>,
-    run: Option<String>,
     saved: Option<String>,
     /// 1-based (#741). Kept as raw text rather than `Option<usize>` so a
     /// non-numeric value fails the `parse` below instead of the whole
@@ -2627,19 +2664,24 @@ async fn sql_view_definitions_page(
     let recent_entries =
         resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));
 
-    // `?run=1` previews the selected view through $sql-run — a plain link, so
-    // it works without JavaScript. Capped: this is a preview, not an export.
-    let (results, run_error) = match (&selected_value, query.run.as_deref() == Some("1")) {
-        (Some(vd), true) => match state.conformance.sql_run(vd, 50, rv.0, &rt.id).await {
-            Ok(rows) => (Some(sql_views::build_table(vd, &rows)), None),
-            Err(error) => (None, Some(error)),
+    // #752 ticket 02, RF6: `?saved=1` (Save's own redirect) runs the just-
+    // stored definition through $sql-run once, server-side, so the nojs path
+    // shows results without a client request. Every other render's own state
+    // is `Empty` (RF7) — the empty notice this produces is what carries
+    // ticket 02's client-driven initial-load request (RF4), covering both an
+    // ordinary `?vd=` navigation and `?vd=new`'s starter document.
+    let i18n = I18n::new(locale);
+    let run_state = match (&selected_value, query.saved.as_deref() == Some("1")) {
+        (Some(vd), true) => match run_view_preview(&state, vd, rv.0, &rt.id).await {
+            Ok((table, ms)) => RunResultsState::Success(table, ms),
+            Err(error) => RunResultsState::Failure(error),
         },
-        _ => (None, None),
+        _ => RunResultsState::Empty,
     };
 
     render(SqlViewDefinitionsPage {
         status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: "sql-view-definitions",
         rail: summaries,
         filter,
@@ -2648,14 +2690,40 @@ async fn sql_view_definitions_page(
         degraded,
         selected,
         is_new,
-        results,
-        run_error,
+        run_results: RunResultsPartial {
+            i18n,
+            fragment: false,
+            state: run_state,
+        },
         save_error: None,
         saved: query.saved.as_deref() == Some("1"),
         recent_entries,
         rail_page: rail_state::RailPage::ViewDefinitions.key(),
         max_recent: rail_state::MAX_RECENT,
     })
+}
+
+/// Runs `$sql-run` for a preview and times the call in whole milliseconds —
+/// shared by the page's own `?saved=1` render (#752 ticket 02, RF6) and the
+/// `/run` fragment endpoint (#752 ticket 01) so the row cap and the
+/// `{ $rows } rows · { $ms } ms` meta can never drift between the two
+/// callers. NF2: never logs `view_definition` itself — a ViewDefinition's
+/// `constant[]` can carry PHI.
+async fn run_view_preview(
+    state: &WebState,
+    view_definition: &serde_json::Value,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+) -> Result<(sql_views::RunTable, u64), String> {
+    let start = std::time::Instant::now();
+    let rows = state
+        .conformance
+        .sql_run(view_definition, sql_views::RUN_LIMIT, version, tenant)
+        .await?;
+    // `Instant::elapsed` millis fits `u64` for anything short of 584 million
+    // years; `unwrap_or(u64::MAX)` is just a total function, never reachable.
+    let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok((sql_views::build_table(view_definition, &rows), ms))
 }
 
 #[derive(Deserialize)]
@@ -2696,8 +2764,17 @@ async fn sql_view_definitions_save(
                 json,
             }),
             is_new,
-            results: None,
-            run_error: None,
+            // A form-validation error re-renders in place: nothing has run
+            // server-side, so this render's own results are `Empty` (RF7) —
+            // same as any other render with no `?saved=1`. The submitted
+            // text is still whatever the user typed (kept, not lost), so
+            // the `Empty` arm's own load trigger (#752 ticket 02, RF4) runs
+            // that same text through the live preview once the page opens.
+            run_results: RunResultsPartial {
+                i18n: I18n::new(locale),
+                fragment: false,
+                state: RunResultsState::Empty,
+            },
             save_error: Some(save_error),
             saved: false,
             // A form-validation error re-renders in place, not a navigation —
@@ -2770,19 +2847,80 @@ async fn sql_view_definitions_save(
     }
 }
 
-/// #753 ticket 03 (evaluation POC, not merged upstream): structural +
+#[derive(Deserialize)]
+struct SqlVdRunForm {
+    /// The editor's full text, exactly as posted — never reformatted or
+    /// re-serialized before either parsing it (RF6) or handing it to
+    /// `$sql-run` (RF3/NF5): the editor is the source of truth.
+    json: String,
+}
+
+/// `POST /ui/sql/view-definitions/run` (#752 ticket 01): the playground's
+/// live preview fragment. Unlike the page's own `?saved=1` render, this
+/// always runs the editor's *posted* text — saved or not — through the same
+/// [`run_view_preview`] helper, and renders `partials/sql_run_results.html`
+/// in fragment mode (RF4–RF6) instead of a full page. Ticket 02 wires it to
+/// the editor's textarea (`input changed delay:500ms`) and, via the results
+/// region's own empty shell, to the page's `load` event — see
+/// `templates/partials/sql_run_results.html`'s header comment.
+///
+/// Always answers `200` except for a malformed request body — a missing
+/// `json` field, which `axum::Form`'s own rejection turns into a `4xx`
+/// before this handler runs (RF2 — `422 Unprocessable Entity` in practice
+/// for a `POST` body deserialize failure, not `400`; either way a real
+/// error status, not this endpoint's `2xx` fragment contract). NF3: htmx
+/// does not swap `4xx`/`5xx` responses by default, so a run failure or
+/// invalid JSON must not surface as an HTTP error — both render RF5/RF6's
+/// notice-only fragment instead, leaving the client's previous results
+/// table untouched.
+async fn sql_view_definitions_run(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlVdRunForm>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    // RF6: a JSON parse failure never reaches $sql-run. NF2: never log
+    // `form.json` itself — a ViewDefinition's `constant[]` can carry PHI.
+    let view_definition: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return render(RunResultsPartial {
+                i18n,
+                fragment: true,
+                state: RunResultsState::Failure(format!("invalid JSON: {error}")),
+            });
+        }
+    };
+
+    let run_state = match run_view_preview(&state, &view_definition, rv.0, &rt.id).await {
+        Ok((table, ms)) => {
+            tracing::debug!(rows = table.rows.len(), ms, "ran a ViewDefinition preview");
+            RunResultsState::Success(table, ms)
+        }
+        Err(error) => RunResultsState::Failure(error),
+    };
+    render(RunResultsPartial {
+        i18n,
+        fragment: true,
+        state: run_state,
+    })
+}
+
+/// #753 (evaluation POC, not merged upstream): structural +
 /// FHIRPath-syntax lint for the ViewDefinition editor's async CodeMirror 6
-/// linter (ticket 02's `vd-editor.js`, RF7). Delegates entirely to
+/// linter (`vd-editor.js`). Delegates entirely to
 /// [`helios_sof::lint::lint_view_definition`] — this handler only decodes
 /// the request body and shapes the response; it never touches storage, the
 /// tenant, or the configured FHIR version, because the lint itself is
-/// purely structural (RF5) and version-agnostic.
+/// purely structural and version-agnostic.
 ///
 /// Plain JSON in, JSON out — no htmx swap involved, matching the precedent
 /// `/ui/editor/expand` already sets for a browser-facing JSON endpoint that
 /// exists to support an editor rather than to mirror the FHIR REST surface.
 /// The body is read as raw bytes (not the `Json` extractor) so a malformed
-/// body reports RF5's exact `{"error": "..."}` shape instead of axum's
+/// body reports the lint's exact `{"error": "..."}` shape instead of axum's
 /// generic rejection body.
 async fn sql_view_definitions_lint(body: Bytes) -> Response {
     let doc: serde_json::Value = match serde_json::from_slice(&body) {
@@ -3514,6 +3652,59 @@ async fn sql_files_page(
     })
 }
 
+/// The shared cards, already HTML.
+///
+/// Rendered in the handler rather than from the template so the page keeps
+/// one error path: `CapabilityCards` returns `Result`, and a template that
+/// called it would have to decide what a half-rendered page looks like.
+struct RenderedCapabilityCards {
+    summary: String,
+    interactions: String,
+    operations: String,
+    resources: String,
+    /// The Raw CapabilityStatement fold (#808 follow-up to #798) — the same
+    /// htmx-lazy, paginated JSON tree HTS now renders too, in place of a
+    /// second bespoke raw-payload mechanism.
+    raw: String,
+}
+
+impl RenderedCapabilityCards {
+    /// HFS's dialect of the shared cards: the backend-role footnote, the
+    /// include/revinclude columns its search layer actually populates, and
+    /// the progressively enhanced type filter its ~150-row table needs.
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        i18n: &I18n,
+        view: &helios_ui_chrome::capability::CapabilityView,
+        version: helios_fhir::FhirVersion,
+        filter: &str,
+        raw_requested: bool,
+        raw_text: &str,
+        raw_url: &str,
+        fragment_url: &str,
+    ) -> Result<Self, askama::Error> {
+        let cards = helios_ui_chrome::capability::CapabilityCards::new(i18n, view)
+            .transaction_note_href(Some(ROLE_MATRIX_URL))
+            .show_include_columns(true)
+            .filter(Some(helios_ui_chrome::capability::ResourceFilter {
+                action: "/ui/capability-statement",
+                version: version.as_str(),
+                value: filter,
+            }));
+        Ok(Self {
+            summary: cards.summary()?,
+            interactions: cards.interactions()?,
+            operations: cards.operations()?,
+            resources: cards.resources()?,
+            raw: cards.raw(raw_requested, raw_text, raw_url, fragment_url)?,
+        })
+    }
+}
+
+/// Where the `transaction` footnote sends an operator asking why the verb is
+/// advertised here and not on another deployment.
+const ROLE_MATRIX_URL: &str = "https://github.com/HeliosSoftware/hfs/blob/main/crates/persistence/README.md#primarysecondary-role-matrix";
+
 /// The read-only CapabilityStatement page (#653): the live `/metadata`
 /// answer for the sidebar's tenant and FHIR version, summarized and filterable,
 /// with the raw statement one fold away.
@@ -3523,21 +3714,11 @@ struct CapabilityPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    /// `None` when the self-fetch failed — the page degrades to a warning.
-    view: Option<capability::CapabilityView>,
-    /// Pretty-printed JSON for the explicit no-JavaScript fallback. This never
-    /// passes through the highlighted renderer.
-    raw: String,
-    /// Whether this request explicitly asked for the plain JSON fallback.
-    raw_requested: bool,
-    /// Version- and filter-preserving URL used by the ordinary no-JS link.
-    raw_url: String,
-    /// Bounded, server-driven JSON root loaded by htmx.
-    fragment_url: String,
-    /// Effective version carried by the resource filter's ordinary GET form.
-    effective_version: &'static str,
-    /// The server-side resource-type filter, echoed back into the form.
-    filter: String,
+    /// The five cards shared with HTS, pre-rendered (#808) — the four summary
+    /// cards plus the Raw CapabilityStatement fold. `None` when the self-fetch
+    /// failed — HFS degrades the whole page to one warning, where HTS
+    /// degrades card by card, because HFS has a single source to fail.
+    cards: Option<RenderedCapabilityCards>,
 }
 
 #[derive(Deserialize, Default)]
@@ -3567,8 +3748,8 @@ struct CapabilityJsonQuery {
     limit: Option<usize>,
 }
 
-fn bounded_capability_fragment<T: Template>(template: T) -> Response {
-    match template.render() {
+fn bounded_capability_fragment(rendered: Result<String, askama::Error>) -> Response {
+    match rendered {
         Ok(html) if html.len() <= capability_json::MAX_FRAGMENT_HTML_BYTES => {
             Html(html).into_response()
         }
@@ -3582,6 +3763,15 @@ fn bounded_capability_fragment<T: Template>(template: T) -> Response {
             format!("template render error: {error}"),
         )
             .into_response(),
+    }
+}
+
+fn capability_json_fragment_endpoint(
+    version: helios_fhir::FhirVersion,
+) -> capability_json::FragmentEndpoint<'static> {
+    capability_json::FragmentEndpoint {
+        base_path: "/ui/capability-statement/json-fragment",
+        version: version.as_str(),
     }
 }
 
@@ -3611,24 +3801,14 @@ async fn capability_json_fragment(
         }
     };
     let limit = query.limit.unwrap_or(capability_json::DEFAULT_PAGE_SIZE);
-    match capability_json::plan(&statement, &query.path, query.offset, limit, version) {
-        Ok(capability_json::View::Full(json_lines)) => {
-            bounded_capability_fragment(CapabilityJsonFullFragment {
-                i18n: I18n::new(locale),
-                json_lines,
-                json_view_id: if query.path.is_empty() {
-                    "capability-json".to_string()
-                } else {
-                    String::new()
-                },
-                json_view_paths: false,
-            })
-        }
+    let i18n = I18n::new(locale);
+    let endpoint = capability_json_fragment_endpoint(version);
+    match capability_json::plan(&statement, &query.path, query.offset, limit, endpoint) {
+        Ok(capability_json::View::Full(json_lines)) => bounded_capability_fragment(
+            capability_json::render_full(&i18n, json_lines, query.path.is_empty()),
+        ),
         Ok(capability_json::View::Outline(outline)) => {
-            bounded_capability_fragment(CapabilityJsonOutlineFragment {
-                i18n: I18n::new(locale),
-                outline,
-            })
+            bounded_capability_fragment(capability_json::render_outline(&i18n, &outline))
         }
         Err(capability_json::Error::NotFound) => {
             (StatusCode::NOT_FOUND, "JSON path not found").into_response()
@@ -3654,8 +3834,11 @@ async fn capability_page(
         .unwrap_or(rv.0);
     let raw_requested = query.raw.as_deref() == Some("1");
     let raw_url = capability_raw_url(&filter, version);
+    let fragment_url =
+        capability_json::root_fragment_url(capability_json_fragment_endpoint(version));
+    let i18n = I18n::new(locale);
     let fetched = state.conformance.metadata(version, &rt.id).await;
-    let (view, raw) = match fetched {
+    let cards = match fetched {
         Ok(statement) => {
             let mut view = capability::build_view(&statement, version);
             if !filter.is_empty() {
@@ -3663,29 +3846,41 @@ async fn capability_page(
                 view.resources
                     .retain(|r| r.resource_type.to_lowercase().contains(&needle));
             }
-            let raw = if raw_requested {
+            let raw_text = if raw_requested {
                 serde_json::to_string_pretty(&statement).unwrap_or_default()
             } else {
                 String::new()
             };
-            (Some(view), raw)
+            match RenderedCapabilityCards::render(
+                &i18n,
+                &view,
+                version,
+                &filter,
+                raw_requested,
+                &raw_text,
+                &raw_url,
+                &fragment_url,
+            ) {
+                Ok(cards) => Some(cards),
+                Err(error) => {
+                    // The shared partials have no fallible construct, so this
+                    // is unreachable in practice — but a blank page is not an
+                    // acceptable way to find that out.
+                    tracing::error!("CapabilityStatement card render failed: {error}");
+                    None
+                }
+            }
         }
         Err(error) => {
             tracing::warn!("CapabilityStatement self-fetch failed: {error}");
-            (None, String::new())
+            None
         }
     };
     render(CapabilityPage {
         status: current_status(&state, version, &rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: "capability-statement",
-        view,
-        raw,
-        raw_requested,
-        raw_url,
-        fragment_url: capability_json::root_fragment_url(version),
-        effective_version: version.as_str(),
-        filter,
+        cards,
     })
 }
 
@@ -4496,16 +4691,18 @@ mod tests {
     #[test]
     fn capability_fragments_enforce_the_rendering_budget() {
         let oversized = "x".repeat(capability_json::MAX_FRAGMENT_HTML_BYTES + 1);
-        let response =
-            bounded_capability_fragment(BoundedFragmentTestTemplate { value: &oversized });
+        let rendered = BoundedFragmentTestTemplate { value: &oversized }.render();
+        let response = bounded_capability_fragment(rendered);
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
     fn capability_fragments_report_template_errors() {
-        let response = bounded_capability_fragment(FailingFragmentTestTemplate {
+        let rendered = FailingFragmentTestTemplate {
             value: FailingDisplay,
-        });
+        }
+        .render();
+        let response = bounded_capability_fragment(rendered);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -4729,12 +4926,17 @@ mod tests {
         assert!(Assets::get("logo.png").is_some());
     }
 
-    /// #753 ticket 01: the CodeMirror 6 + lezer-fhirpath vendoring ritual's
+    /// #753: the CodeMirror 6 + lezer-fhirpath vendoring ritual's
     /// one committed output (`crates/ui/vendor/codemirror/README.md`) is
     /// embedded exactly like any other subfolder asset — `assets/fonts/` is
     /// the existing precedent for rust-embed walking into `assets/vendor/` —
     /// and opens with the license banner rollup.config.js generates, wrapping
-    /// the `window.HfsCodeMirror` global tickets 02 and 03 build against.
+    /// the `window.HfsCodeMirror` global `vd-editor.js` and `sql-editor.js`
+    /// build against.
+    ///
+    /// #838 adds `@codemirror/lang-sql` to the same ritual: this asserts
+    /// the banner lists it, so a bundle regenerated without SQL support
+    /// does not pass silently.
     #[test]
     fn codemirror_vendor_bundle_is_embedded() {
         let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
@@ -4747,14 +4949,26 @@ mod tests {
             source.contains("HfsCodeMirror"),
             "bundle must define the window.HfsCodeMirror global"
         );
+        assert!(
+            source.contains("@codemirror/lang-sql"),
+            "bundle banner must list @codemirror/lang-sql (#838)"
+        );
     }
 
-    /// #753 ticket 02: vd-editor.js — the hand-written mount script that
-    /// progressively enhances the ViewDefinition textarea with the ticket 01
+    /// #753: vd-editor.js — the hand-written mount script that
+    /// progressively enhances the ViewDefinition textarea with the vendored
     /// bundle — is embedded like every other page script.
     #[test]
     fn vd_editor_script_is_embedded() {
         assert!(Assets::get("vd-editor.js").is_some());
+    }
+
+    /// #838: `code-editor.js`, the mount helper `vd-editor.js` was
+    /// generalized out of (and every future CodeMirror editor in this crate
+    /// builds on), is embedded like every other page script.
+    #[test]
+    fn code_editor_helper_script_is_embedded() {
+        assert!(Assets::get("code-editor.js").is_some());
     }
 
     /// The theme script persists the choice to the per-user settings document

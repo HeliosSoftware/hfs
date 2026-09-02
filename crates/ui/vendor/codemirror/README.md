@@ -28,7 +28,7 @@ script and that there is no bundler in this crate. CodeMirror 6 cannot be
 vendored as a single hand-copied file the way `htmx.min.js` is — its packages
 are ESM modules with a dependency graph, and there is no published UMD/IIFE
 build that includes a custom language mix (JSON host + injected FHIRPath).
-Bundling is unavoidable to get from "eleven npm packages" to "one script tag".
+Bundling is unavoidable to get from "a dozen npm packages" to "one script tag".
 
 The ritual is deliberately narrow: it runs only when someone chooses to
 update the bundle, its inputs (`package.json` + `package-lock.json`) are
@@ -86,13 +86,19 @@ assuming the change is intentional.
 | `@codemirror/lint` | 6.9.7 | MIT |
 | `@codemirror/search` | 6.7.1 | MIT |
 | `@codemirror/lang-json` | 6.0.2 | MIT |
+| `@codemirror/lang-sql` | 6.10.0 | MIT |
 | `@lezer/common` | 1.5.2 | MIT |
 | `@lezer/highlight` | 1.2.3 | MIT |
 | `lezer-fhirpath` | 1.2.0 | **not declared in package metadata — to be confirmed before adoption** |
 
-The first eleven are all published by the CodeMirror/Lezer project (Marijn
+The first thirteen are all published by the CodeMirror/Lezer project (Marijn
 Haverbeke and others) under the MIT license; the bundle's banner comment
 carries the required copyright notice.
+
+`@lezer/lr` — a transitive dependency of `@codemirror/lang-sql` — is
+deliberately not added to `dependencies` or to `BUNDLED_PACKAGES`: `src/entry.js`
+never imports from it directly, exactly as with `@lezer/lr` under
+`@codemirror/lang-json` today.
 
 `lezer-fhirpath` (the FHIRPath grammar for CM6, published by HealthSamurai)
 declares no `license` field in its `package.json` and ships no `LICENSE` file
@@ -101,9 +107,9 @@ it "Proprietary", which is npm's own placeholder for "unspecified", not a
 license anyone has actually granted. This is a known, accepted risk for this
 evaluation proof-of-concept: it is used here anyway because writing a
 replacement grammar now would mean implementing before the evaluation has
-concluded. **The bundle is not merged as-is** — the follow-up implementation
-work inherits "confirm the license or replace the grammar" as an explicit
-next step.
+concluded. The bundle has been merged since #820 (issue #753); "confirm the
+license or replace the grammar" remains an open follow-up, tracked
+separately — not a condition of any further merge into this bundle.
 
 `rollup`, `@rollup/plugin-node-resolve`, and `@rollup/plugin-terser` are
 `devDependencies` (build-time only; nothing about them ships in the output).
@@ -126,6 +132,16 @@ nested because they are not part of CodeMirror's own export surface:
 - `HfsCodeMirror.version` — `{ "<package>": "<version>" }` for every package
   in the table above, generated from each package's `package.json`.
 
+`@codemirror/lang-sql` contributes `HfsCodeMirror.sql`, `.SQLDialect`,
+`.StandardSQL`, `.SQLite`, `.keywordCompletionSource`, and
+`.schemaCompletionSource` — the language factory, the dialect it takes a
+`dialect:` config of, the generic and SQLite-flavored built-in dialects, and
+the two completion sources autocomplete wires up. The package's other
+built-in dialects (MySQL, PostgreSQL, ...) are not exposed: `$sqlquery-run`
+executes on SQLite (rusqlite), so only that dialect (plus `StandardSQL` and
+the `SQLDialect` class, kept in case a future dialect swap needs them) is
+re-exported.
+
 See `src/entry.js` for the full, explicit list of re-exported names — it is
 the single source of truth tickets 02 and 03 build against.
 
@@ -134,14 +150,17 @@ the single source of truth tickets 02 and 03 build against.
 Measured against the bundle committed with this ticket (`node -e` using
 `zlib.gzipSync`/`brotliCompressSync` at max quality):
 
-| Encoding | Bytes |
-|---|---|
-| raw (uncompressed) | 426 625 |
-| gzip | 137 351 |
-| brotli | 116 658 |
+| Encoding | Bytes | Delta vs. pre-`lang-sql` |
+|---|---|---|
+| raw (uncompressed) | 441 447 | +14 822 |
+| gzip | 143 157 | +5 806 |
+| brotli | 121 482 | +4 824 |
+
+"Pre-`lang-sql`" is the bundle committed by #753 (426 625 / 137 351 /
+116 658), before #838 added `@codemirror/lang-sql`.
 
 Budget (ticket 01, RF6): raw bundle must stay **≤ 500 000 bytes**. Current
-margin: ≈ 73 KB.
+margin: ≈ 57 KB.
 
 The gzip/brotli figures are informational — what compressing this exact
 artifact yields — not what today's server response carries. See

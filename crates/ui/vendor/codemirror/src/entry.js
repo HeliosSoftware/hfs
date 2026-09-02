@@ -63,6 +63,14 @@ import {
 import { forceLinting, linter, lintGutter, lintKeymap, setDiagnostics } from '@codemirror/lint';
 import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 import { json, jsonLanguage, jsonParseLinter } from '@codemirror/lang-json';
+import {
+  SQLDialect,
+  SQLite,
+  StandardSQL,
+  keywordCompletionSource,
+  schemaCompletionSource,
+  sql,
+} from '@codemirror/lang-sql';
 import { parseMixed } from '@lezer/common';
 import { classHighlighter, styleTags, tags } from '@lezer/highlight';
 import { parser as fhirpathParser, props as fhirpathProps, terminals as fhirpathTerminals } from 'lezer-fhirpath';
@@ -140,6 +148,18 @@ const HfsCodeMirror = {
   json,
   jsonLanguage,
   jsonParseLinter,
+
+  // @codemirror/lang-sql — only the SQLite dialect (the engine
+  // `$sqlquery-run` executes on) the SQL pane editor mounts, plus what a
+  // future dialect swap or schema-aware autocomplete (#839/#842) needs; the
+  // package's other built-in dialects (MySQL, PostgreSQL, ...) are not
+  // exposed (#838).
+  SQLDialect,
+  SQLite,
+  StandardSQL,
+  keywordCompletionSource,
+  schemaCompletionSource,
+  sql,
 
   // @lezer/common
   parseMixed,

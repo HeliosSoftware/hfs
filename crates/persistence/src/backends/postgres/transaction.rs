@@ -163,7 +163,7 @@ impl PostgresTransaction {
         })
     }
 
-    fn client(&self) -> StorageResult<&Client> {
+    pub(crate) fn client(&self) -> StorageResult<&Client> {
         self.client
             .as_ref()
             .ok_or_else(|| StorageError::Transaction(TransactionError::InvalidTransaction))
