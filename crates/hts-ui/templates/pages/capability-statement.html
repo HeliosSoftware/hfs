@@ -1,13 +1,15 @@
 {#-
   Capability & Conformance.
 
-  Four of the six cards below are not written here at all: they are rendered
+  Five of the six cards below are not written here at all: they are rendered
   by `helios_ui_chrome::capability::CapabilityCards` and are the very same
-  markup HFS serves at `/ui/capability-statement` (#808). Do NOT inline that
-  markup back into this file — one document rendered by two templates is
-  exactly what #808 removed, after the copies had already drifted (HFS had
-  version-correct spec links and colour-coded interaction chips; this page
-  had neither).
+  markup HFS serves at `/ui/capability-statement` (#808), Raw
+  CapabilityStatement fold included as of this page's #808 follow-up. Do NOT
+  inline that markup back into this file — one document rendered by two
+  templates is exactly what #808 removed, after the copies had already
+  drifted (HFS had version-correct spec links and colour-coded interaction
+  chips; this page had neither, and byte-capped its raw fold where HFS
+  paginated it).
 
   Card content changes therefore belong in
   `crates/ui-chrome/templates/partials/capability-*.html`, where they land on
@@ -23,11 +25,13 @@
     3. Operations                (shared)
     4. Per-Resource Capabilities (shared)
     5. Terminology capabilities  (HTS-only, below)
-    6. Raw CapabilityStatement   (HTS-only shape, below)
+    6. Raw CapabilityStatement   (shared)
 
   Degraded state is per-card, not per-page: a failed `/metadata` fetch is
   passed to the shared cards as a notice, so each renders its own heading
-  over a `notice--warn` and the terminology card is untouched.
+  over a `notice--warn` and the terminology card is untouched. The raw fold
+  is the one exception — a failed fetch has no document to fold, so
+  `view.raw_card` is `None` and the section is absent rather than degraded.
 
   Every class used here has a rule in `crates/ui/assets/app.css` (shared
   verbatim with HFS): page-head, page-head__title, page-head__lede, card,
@@ -72,48 +76,50 @@
   {% if let Some(reason) = view.terminology_reason %}
   <p class="notice notice--warn">{{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}</p>
   {% else if let Some(tc) = view.terminology %}
-  <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-expansion-hierarchical") }}</span><div>{%- match tc.expansion_hierarchical -%}{%- when Some(b) -%}{% if b %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}{%- when None -%}&mdash;{%- endmatch -%}</div></div>
-  <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-expansion-paging") }}</span><div>{%- match tc.expansion_paging -%}{%- when Some(b) -%}{% if b %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}{%- when None -%}&mdash;{%- endmatch -%}</div></div>
-  <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-expansion-incomplete") }}</span><div>{%- match tc.expansion_incomplete -%}{%- when Some(b) -%}{% if b %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}{%- when None -%}&mdash;{%- endmatch -%}</div></div>
-  <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-validate-code-translations") }}</span><div>{%- match tc.validate_code_translations -%}{%- when Some(b) -%}{% if b %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}{%- when None -%}&mdash;{%- endmatch -%}</div></div>
-  <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-translation-needs-map") }}</span><div>{%- match tc.translation_needs_map -%}{%- when Some(b) -%}{% if b %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}{%- when None -%}&mdash;{%- endmatch -%}</div></div>
-  <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-closure") }}</span><div>{% if tc.supports_closure %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}</div></div>
-  <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-code-systems-declared") }}</span><div><a href="/ui/hts/code-systems">{{ tc.code_systems_declared }}</a></div></div>
-  {% if !tc.expansion_parameters.is_empty() %}
-  <div class="detail__field">
-    <span>{{ chrome.i18n.t("hts-capability-expansion-parameters") }}</span>
-    <div>{% for p in tc.expansion_parameters %}<span class="tag">{{ p }}</span> {% endfor %}</div>
+  <div class="card__body">
+    <div class="kv-grid kv-grid--flush">
+      <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-expansion-hierarchical") }}</span><div>{%- match tc.expansion_hierarchical -%}{%- when Some(b) -%}{% if b %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}{%- when None -%}&mdash;{%- endmatch -%}</div></div>
+      <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-expansion-paging") }}</span><div>{%- match tc.expansion_paging -%}{%- when Some(b) -%}{% if b %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}{%- when None -%}&mdash;{%- endmatch -%}</div></div>
+      <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-expansion-incomplete") }}</span><div>{%- match tc.expansion_incomplete -%}{%- when Some(b) -%}{% if b %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}{%- when None -%}&mdash;{%- endmatch -%}</div></div>
+      <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-validate-code-translations") }}</span><div>{%- match tc.validate_code_translations -%}{%- when Some(b) -%}{% if b %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}{%- when None -%}&mdash;{%- endmatch -%}</div></div>
+      <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-translation-needs-map") }}</span><div>{%- match tc.translation_needs_map -%}{%- when Some(b) -%}{% if b %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}{%- when None -%}&mdash;{%- endmatch -%}</div></div>
+      <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-closure") }}</span><div>{% if tc.supports_closure %}{{ chrome.i18n.t("hts-capability-flag-true") }}{% else %}{{ chrome.i18n.t("hts-capability-flag-false") }}{% endif %}</div></div>
+      <div class="detail__field"><span>{{ chrome.i18n.t("hts-capability-code-systems-declared") }}</span><div><a href="/ui/hts/code-systems">{{ tc.code_systems_declared }}</a></div></div>
+      {% if !tc.expansion_parameters.is_empty() %}
+      <div class="detail__field detail__field--wide">
+        <span>{{ chrome.i18n.t("hts-capability-expansion-parameters") }}</span>
+        <div>{% for p in tc.expansion_parameters %}<span class="tag">{{ p }}</span> {% endfor %}</div>
+      </div>
+      {% endif %}
+    </div>
   </div>
-  {% endif %}
   {% endif %}
 </section>
 
 {#-
-  6. Raw CapabilityStatement — HFS's foldable block, a different mechanism.
-
-  HFS loads its raw statement through a bounded, paginated JSON-fragment
-  endpoint (#798). HTS inlines a byte-capped `<pre>` instead, because its
-  statement carries one `capabilitystatement-supported-system` extension per
-  loaded code system: against the bundled seeds it is ~422 KB, 95% of the
-  page, shipped on every load whether or not the `<details>` is ever opened.
-  Both approaches keep a 400 KB+ statement off the page; neither is the
-  other's markup, so this block stays HTS's own.
-
-  The cap is never silent: when it engages, the note states both sizes and
-  links to `/metadata` for the complete document.
+  6. Raw CapabilityStatement — the same htmx-lazy, paginated fold HFS renders
+  (#798, shared in #808's follow-up). Its own fragment endpoint
+  (`/ui/hts/capability-statement/json-fragment`) re-fetches `/metadata`
+  against this server's own upstream, so a statement that grows with the
+  loaded code systems — one `capabilitystatement-supported-system` extension
+  per system, ~422 KB against the bundled seeds — pages through the same
+  bounded engine rather than needing its own byte cap.
 -#}
-{% if let Some(raw) = view.raw %}
-<section class="card">
-  <details>
-    <summary>{{ chrome.i18n.t("cap-raw-toggle") }}</summary>
-    <pre class="detail__code">{{ raw.text }}</pre>
-    {% if raw.truncated %}
-    <p class="field__hint">
-      {{ chrome.i18n.t_arg2("hts-capability-raw-truncated", "shown", raw.text.len().to_string(), "total", raw.full_bytes.to_string()) }}
-      <a href="/metadata">{{ chrome.i18n.t("hts-capability-raw-full") }}</a>
-    </p>
-    {% endif %}
-  </details>
-</section>
+{% if let Some(raw_card) = view.raw_card %}
+{{ raw_card|safe }}
 {% endif %}
+{#-
+  The fold's auto-loader, exactly as HFS wires it on its own copy of this
+  page (`crates/ui/templates/pages/capability-statement.html`): it listens
+  for the native `toggle` event on `details[data-capability-json-node]` and
+  fires the htmx GET against `data-fragment-url`, so opening the fold shows
+  the tree instead of the server-rendered "Load JSON" fallback. Without this
+  include the shared card still renders — it just degrades silently, with no
+  compile-time signal; see the regression tests in `tests/chrome_parity.rs`.
+
+  Kept outside the `{% if %}` above to mirror HFS, whose tag likewise sits
+  after its own conditional. The per-node arrow toggles come from
+  `json-view.js`, loaded globally by `layouts/base.html`.
+-#}
+<script src="/ui/hts/assets/capability-json.js" defer></script>
 {% endblock %}

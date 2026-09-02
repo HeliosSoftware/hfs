@@ -1451,8 +1451,6 @@ hts-capability-closure = Closure-Pflege
 hts-capability-code-systems-declared = Deklarierte Codesysteme
 hts-capability-flag-true = Ja
 hts-capability-flag-false = Nein
-hts-capability-raw-truncated = Auf die ersten { $shown } von { $total } Bytes gekürzt — die Deklaration dieses Servers wächst mit den geladenen Codesystemen.
-hts-capability-raw-full = Vollständige Deklaration ansehen
 
 # Home V3 tile sub-lines. The mockup folds Backend, FHIR version,
 # Bundled data and Avg latency into the sub-line of the tile each

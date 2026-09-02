@@ -27,12 +27,12 @@
 //!
 //! * **No fetching.** HFS reads its statement through a loopback self-call;
 //!   HTS proxies an upstream and needs per-card isolation semantics. Those
-//!   strategies are legitimately different, so both handlers keep their own.
-//! * **No raw-payload rendering.** HFS streams the raw statement through a
-//!   bounded, paginated JSON fragment endpoint; HTS inlines a byte-capped
-//!   `<pre>` because its statement grows with the loaded code systems. Both
-//!   already keep a 400 KB+ statement off the critical path, by different
-//!   means. Unifying *that* is `json_view`'s problem, not this one.
+//!   strategies are legitimately different, so both handlers keep their own —
+//!   this shows up as [`CapabilityCards::raw`] taking already-fetched text
+//!   and a fragment URL rather than a document to fetch itself. The fragment
+//!   endpoint each product mounts *behind* that URL lives in
+//!   [`crate::capability_json`], which HFS's #798 render budget and HTS's
+//!   400 KB+ statement (one extension per loaded code system) both now share.
 //! * **No FHIR schema dependency.** Deciding whether a resource type has an
 //!   official core page in a given release needs a version-accurate resource
 //!   catalog, which HFS has (the validator's core packs) and HTS does not
@@ -582,6 +582,43 @@ impl<'a> CapabilityCards<'a> {
         }
         .render()
     }
+
+    /// Raw CapabilityStatement — the foldable, htmx-lazy JSON block shared by
+    /// both products (#808 follow-up to #798). Neither the fetch nor the
+    /// fragment endpoint lives here — see [`crate::capability_json`] — this
+    /// card is only the shell: a "Load JSON" link against `fragment_url` by
+    /// default, or the fully resolved `raw` text when `raw_requested` (the
+    /// no-JS fallback, driven by `raw_url`).
+    ///
+    /// Unlike the other four cards this one ignores `self.notice`: a failed
+    /// fetch means the caller has no statement to fold at all, and skips
+    /// calling this method entirely rather than rendering it degraded.
+    pub fn raw(
+        &self,
+        raw_requested: bool,
+        raw: &str,
+        raw_url: &str,
+        fragment_url: &str,
+    ) -> Result<String, askama::Error> {
+        RawCardTemplate {
+            i18n: self.i18n,
+            raw_requested,
+            raw,
+            raw_url,
+            fragment_url,
+        }
+        .render()
+    }
+}
+
+#[derive(Template)]
+#[template(path = "partials/capability-raw-card.html")]
+struct RawCardTemplate<'a> {
+    i18n: &'a dyn ChromeLabels,
+    raw_requested: bool,
+    raw: &'a str,
+    raw_url: &'a str,
+    fragment_url: &'a str,
 }
 
 #[derive(Template)]

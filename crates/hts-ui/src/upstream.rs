@@ -4053,39 +4053,27 @@ fn parse_closure_edges(resource: &Value) -> Vec<ClosureEdge> {
 /// The projection itself is [`helios_ui_chrome::capability::CapabilityView`]
 /// (#808) — the same one HFS renders, produced by the same parser, so the two
 /// pages cannot disagree about what a statement says and a fix to either
-/// lands on both. HTS adds only what is genuinely its own: a byte-capped copy
-/// of the raw document.
+/// lands on both.
+///
+/// [`Self::document`] keeps the fetched body around rather than a
+/// pre-rendered string: the Raw CapabilityStatement fold is now the same
+/// bounded, paginated JSON-fragment engine HFS built for #798
+/// ([`helios_ui_chrome::capability_json`]), which pages through a statement
+/// of any size — HTS's grows with the data, one
+/// `capabilitystatement-supported-system` extension per loaded code system,
+/// ~1,975 of them and 422 KB against the bundled seed set — rather than
+/// requiring a byte cap up front.
 #[derive(Clone, Debug, Default)]
 pub struct CapabilityView {
     /// The shared projection, fed straight to
     /// [`helios_ui_chrome::capability::CapabilityCards`].
     pub cards: helios_ui_chrome::capability::CapabilityView,
-    /// Pretty-printed statement for the foldable raw block.  Retained from
-    /// the response already in hand — no second fetch.
-    ///
-    /// **Capped at [`RAW_STATEMENT_BYTE_CAP`].** HFS can afford to serve its
-    /// whole statement (and does, through a paginated fragment endpoint)
-    /// because that document is a fixed size; HTS's grows with the data,
-    /// because it carries one `capabilitystatement-supported-system`
-    /// extension per loaded code system. Against the bundled seed set that is
-    /// ~1,975 extensions and a 422 KB block — 95% of the page — on every
-    /// load, `<details>` or not. The cap is never silent:
-    /// [`Self::raw_truncated`] drives a note that states both sizes and links
-    /// to `/metadata` for the complete document.
-    pub raw: String,
-    /// Whether [`Self::raw`] was cut short by the cap.
-    pub raw_truncated: bool,
-    /// Full pretty-printed length in bytes, so the note can state what was
-    /// withheld rather than just admitting that something was.
-    pub raw_full_bytes: usize,
+    /// The fetched body, unmodified. Feeds the JSON-fragment endpoint's
+    /// `capability_json::plan` and the `?raw=1` no-JS fallback's full
+    /// pretty-print — both read it fresh from a re-fetch, same as HFS's own
+    /// loopback self-call per request.
+    pub document: Value,
 }
-
-/// Byte budget for the inlined raw statement (see [`CapabilityView::raw`]).
-///
-/// Sized to hold a whole statement from a server whose `/metadata` does not
-/// scale with its content, so the cap only ever engages on a seed-heavy
-/// terminology server — exactly the case where inlining it would be wrong.
-pub const RAW_STATEMENT_BYTE_CAP: usize = 16 * 1024;
 
 /// The resource types a Helios terminology server can advertise.
 ///
@@ -4170,12 +4158,13 @@ impl UpstreamClient {
                 status: status.as_u16(),
             });
         }
-        let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
+        let document: Value = response.json().await.map_err(|e| UpstreamError::Decode {
             op: "metadata",
             url: url.clone(),
             message: e.to_string(),
         })?;
-        Ok(parse_capability_statement(&body, version))
+        let cards = build_capability_view(&document, version, &TerminologyResources);
+        Ok(CapabilityView { cards, document })
     }
 
     /// `GET /metadata?mode=terminology` — the FHIR
@@ -4236,32 +4225,6 @@ impl UpstreamClient {
             url,
             message: e.to_string(),
         })
-    }
-}
-
-/// Project the statement through the shared parser, then keep a capped copy
-/// of the document itself for the raw fold.
-fn parse_capability_statement(body: &Value, version: DocsVersion) -> CapabilityView {
-    // Pretty-printed so the foldable block is readable, then capped — see
-    // `CapabilityView::raw`. Cut on a char boundary; `floor_char_boundary`
-    // is still unstable, so walk back to one.
-    let raw_full = serde_json::to_string_pretty(body).unwrap_or_default();
-    let raw_full_bytes = raw_full.len();
-    let raw = if raw_full_bytes <= RAW_STATEMENT_BYTE_CAP {
-        raw_full
-    } else {
-        let mut end = RAW_STATEMENT_BYTE_CAP;
-        while end > 0 && !raw_full.is_char_boundary(end) {
-            end -= 1;
-        }
-        raw_full[..end].to_owned()
-    };
-
-    CapabilityView {
-        cards: build_capability_view(body, version, &TerminologyResources),
-        raw,
-        raw_truncated: raw_full_bytes > RAW_STATEMENT_BYTE_CAP,
-        raw_full_bytes,
     }
 }
 

@@ -1,17 +1,19 @@
 {#-
   Capability Statement (/ui/capability-statement, #653).
 
-  The four cards above the raw fold are rendered by
-  `helios_ui_chrome::capability::CapabilityCards` and are byte-identical to
-  the ones HTS renders at /ui/hts/capability-statement (#808). Do NOT inline
-  that markup back here: two copies of this page is exactly what #808 removed.
-  Card *content* changes belong in
+  All five cards — the four summaries and the Raw CapabilityStatement fold —
+  are rendered by `helios_ui_chrome::capability::CapabilityCards` and are
+  byte-identical to the ones HTS renders at /ui/hts/capability-statement
+  (#808). Do NOT inline that markup back here: two copies of this page is
+  exactly what #808 removed. Card *content* changes belong in
   `crates/ui-chrome/templates/partials/capability-*.html`.
 
-  The raw fold below stays HFS's own. It is not a `<pre>` of the whole
-  document but a bounded, paginated JSON-fragment tree loaded on demand
-  (#798), which HTS has no equivalent of — HTS byte-caps an inline block
-  instead, because its statement grows with the code systems it loads.
+  The raw fold is not a `<pre>` of the whole document but a bounded,
+  paginated JSON-fragment tree loaded on demand (#798, generalized in #808).
+  Its endpoint (`/ui/capability-statement/json-fragment`) stays HFS's own —
+  HTS mounts an equivalent at `/ui/hts/capability-statement/json-fragment`
+  against its own upstream fetch — but the card shell, the fragment
+  templates and the JSON-rendering engine behind both are the same code.
 -#}
 {% extends "layouts/base.html" %}
 
@@ -32,29 +34,7 @@
 
 {{ cards.resources|safe }}
 
-<details class="card json-fold" id="capability-json-fold"{% if raw_requested %} open{% else %} data-capability-json-node{% endif %}>
-  <summary class="card-head">
-    <h3>{{ i18n.t("cap-raw-toggle") }}</h3>
-    <span class="icon">{% include "icons/chevron-down.svg" %}</span>
-  </summary>
-  <div class="card__body" id="capability-json-body"{% if !raw_requested %}
-       data-capability-json-body
-       data-loading-text="{{ i18n.t("cap-raw-loading") }}"
-       data-error-text="{{ i18n.t("cap-json-load-error") }}"
-       data-fragment-url="{{ fragment_url }}"
-       hx-indicator="#capability-json-loading"{% endif %}>
-    {% if raw_requested %}
-    <p class="notice">{{ i18n.t("cap-raw-plain") }}</p>
-    <pre class="detail__code">{{ raw }}</pre>
-    {% else %}
-    <a class="btn" href="{{ raw_url }}#capability-json-fold">{{ i18n.t("cap-raw-load") }}</a>
-    <p class="busy-status htmx-indicator" id="capability-json-loading" role="status">
-      <span class="spinner" aria-hidden="true"></span>
-      {{ i18n.t("cap-raw-loading") }}
-    </p>
-    {% endif %}
-  </div>
-</details>
+{{ cards.raw|safe }}
 {% else %}
 <p class="notice notice--warn">{{ i18n.t("cap-unavailable") }}</p>
 {% endif %}

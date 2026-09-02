@@ -78,6 +78,19 @@ use askama::Template;
 /// topbars disagreeing about a button.
 pub mod capability;
 
+/// The bounded, incremental JSON-fragment engine behind the Raw
+/// CapabilityStatement card (#808, generalized from HFS's #798). Both
+/// products lazy-load the same paginated, highlighted tree via htmx instead
+/// of each choosing its own compromise (HFS's render budget vs. HTS's
+/// byte-capped `<pre>`).
+pub mod capability_json;
+
+/// A foldable, line-numbered, syntax-highlighted JSON view (#264, #808).
+/// [`capability_json`] builds on this; HFS's Resource Editor, Batch, and
+/// Resources pages also render a [`json_view::JsonLine`] vector through
+/// their own copy of the partial this engine feeds.
+pub mod json_view;
+
 /// The localisation surface the shared chrome needs from its host.
 ///
 /// Both products already own a fluent-backed i18n type; this trait is the

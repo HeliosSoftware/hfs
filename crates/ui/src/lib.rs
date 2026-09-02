@@ -41,15 +41,21 @@
 mod bulk_export;
 mod bulk_import;
 mod capability;
-mod capability_json;
 mod compartments;
 mod conformance;
 mod editor;
 mod history;
 mod i18n;
-mod json_view;
 mod search_params;
 mod sql_export;
+
+/// The bounded JSON-fragment engine behind the Raw CapabilityStatement fold
+/// moved to `helios-ui-chrome` (#808) so HTS renders the same paginated tree
+/// instead of a byte-capped `<pre>`. Re-exported under their old in-crate
+/// names so every existing `capability_json::`/`json_view::` reference below
+/// — `editor.rs` included — keeps compiling unchanged.
+pub(crate) use helios_ui_chrome::capability_json;
+pub(crate) use helios_ui_chrome::json_view;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
@@ -788,25 +794,6 @@ struct JsonViewFragment {
     json_lines: Vec<json_view::JsonLine>,
     json_view_id: String,
     json_view_paths: bool,
-}
-
-/// A small CapabilityStatement (or subtree) rendered by the unchanged shared
-/// JSON highlighter.
-#[derive(Template)]
-#[template(path = "partials/capability-json-full.html")]
-struct CapabilityJsonFullFragment {
-    i18n: I18n,
-    json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
-}
-
-/// One bounded level of a large CapabilityStatement.
-#[derive(Template)]
-#[template(path = "partials/capability-json-outline.html")]
-struct CapabilityJsonOutlineFragment {
-    i18n: I18n,
-    outline: capability_json::Outline,
 }
 
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
@@ -2924,17 +2911,26 @@ struct RenderedCapabilityCards {
     interactions: String,
     operations: String,
     resources: String,
+    /// The Raw CapabilityStatement fold (#808 follow-up to #798) — the same
+    /// htmx-lazy, paginated JSON tree HTS now renders too, in place of a
+    /// second bespoke raw-payload mechanism.
+    raw: String,
 }
 
 impl RenderedCapabilityCards {
     /// HFS's dialect of the shared cards: the backend-role footnote, the
     /// include/revinclude columns its search layer actually populates, and
     /// the progressively enhanced type filter its ~150-row table needs.
+    #[allow(clippy::too_many_arguments)]
     fn render(
         i18n: &I18n,
         view: &helios_ui_chrome::capability::CapabilityView,
         version: helios_fhir::FhirVersion,
         filter: &str,
+        raw_requested: bool,
+        raw_text: &str,
+        raw_url: &str,
+        fragment_url: &str,
     ) -> Result<Self, askama::Error> {
         let cards = helios_ui_chrome::capability::CapabilityCards::new(i18n, view)
             .transaction_note_href(Some(ROLE_MATRIX_URL))
@@ -2949,6 +2945,7 @@ impl RenderedCapabilityCards {
             interactions: cards.interactions()?,
             operations: cards.operations()?,
             resources: cards.resources()?,
+            raw: cards.raw(raw_requested, raw_text, raw_url, fragment_url)?,
         })
     }
 }
@@ -2966,19 +2963,11 @@ struct CapabilityPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    /// The four cards shared with HTS, pre-rendered (#808). `None` when the
-    /// self-fetch failed — HFS degrades the whole page to one warning, where
-    /// HTS degrades card by card, because HFS has a single source to fail.
+    /// The five cards shared with HTS, pre-rendered (#808) — the four summary
+    /// cards plus the Raw CapabilityStatement fold. `None` when the self-fetch
+    /// failed — HFS degrades the whole page to one warning, where HTS
+    /// degrades card by card, because HFS has a single source to fail.
     cards: Option<RenderedCapabilityCards>,
-    /// Pretty-printed JSON for the explicit no-JavaScript fallback. This never
-    /// passes through the highlighted renderer.
-    raw: String,
-    /// Whether this request explicitly asked for the plain JSON fallback.
-    raw_requested: bool,
-    /// Version- and filter-preserving URL used by the ordinary no-JS link.
-    raw_url: String,
-    /// Bounded, server-driven JSON root loaded by htmx.
-    fragment_url: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -3008,8 +2997,8 @@ struct CapabilityJsonQuery {
     limit: Option<usize>,
 }
 
-fn bounded_capability_fragment<T: Template>(template: T) -> Response {
-    match template.render() {
+fn bounded_capability_fragment(rendered: Result<String, askama::Error>) -> Response {
+    match rendered {
         Ok(html) if html.len() <= capability_json::MAX_FRAGMENT_HTML_BYTES => {
             Html(html).into_response()
         }
@@ -3023,6 +3012,15 @@ fn bounded_capability_fragment<T: Template>(template: T) -> Response {
             format!("template render error: {error}"),
         )
             .into_response(),
+    }
+}
+
+fn capability_json_fragment_endpoint(
+    version: helios_fhir::FhirVersion,
+) -> capability_json::FragmentEndpoint<'static> {
+    capability_json::FragmentEndpoint {
+        base_path: "/ui/capability-statement/json-fragment",
+        version: version.as_str(),
     }
 }
 
@@ -3052,24 +3050,14 @@ async fn capability_json_fragment(
         }
     };
     let limit = query.limit.unwrap_or(capability_json::DEFAULT_PAGE_SIZE);
-    match capability_json::plan(&statement, &query.path, query.offset, limit, version) {
-        Ok(capability_json::View::Full(json_lines)) => {
-            bounded_capability_fragment(CapabilityJsonFullFragment {
-                i18n: I18n::new(locale),
-                json_lines,
-                json_view_id: if query.path.is_empty() {
-                    "capability-json".to_string()
-                } else {
-                    String::new()
-                },
-                json_view_paths: false,
-            })
-        }
+    let i18n = I18n::new(locale);
+    let endpoint = capability_json_fragment_endpoint(version);
+    match capability_json::plan(&statement, &query.path, query.offset, limit, endpoint) {
+        Ok(capability_json::View::Full(json_lines)) => bounded_capability_fragment(
+            capability_json::render_full(&i18n, json_lines, query.path.is_empty()),
+        ),
         Ok(capability_json::View::Outline(outline)) => {
-            bounded_capability_fragment(CapabilityJsonOutlineFragment {
-                i18n: I18n::new(locale),
-                outline,
-            })
+            bounded_capability_fragment(capability_json::render_outline(&i18n, &outline))
         }
         Err(capability_json::Error::NotFound) => {
             (StatusCode::NOT_FOUND, "JSON path not found").into_response()
@@ -3095,9 +3083,11 @@ async fn capability_page(
         .unwrap_or(rv.0);
     let raw_requested = query.raw.as_deref() == Some("1");
     let raw_url = capability_raw_url(&filter, version);
+    let fragment_url =
+        capability_json::root_fragment_url(capability_json_fragment_endpoint(version));
     let i18n = I18n::new(locale);
     let fetched = state.conformance.metadata(version, &rt.id).await;
-    let (cards, raw) = match fetched {
+    let cards = match fetched {
         Ok(statement) => {
             let mut view = capability::build_view(&statement, version);
             if !filter.is_empty() {
@@ -3105,25 +3095,34 @@ async fn capability_page(
                 view.resources
                     .retain(|r| r.resource_type.to_lowercase().contains(&needle));
             }
-            let raw = if raw_requested {
+            let raw_text = if raw_requested {
                 serde_json::to_string_pretty(&statement).unwrap_or_default()
             } else {
                 String::new()
             };
-            match RenderedCapabilityCards::render(&i18n, &view, version, &filter) {
-                Ok(cards) => (Some(cards), raw),
+            match RenderedCapabilityCards::render(
+                &i18n,
+                &view,
+                version,
+                &filter,
+                raw_requested,
+                &raw_text,
+                &raw_url,
+                &fragment_url,
+            ) {
+                Ok(cards) => Some(cards),
                 Err(error) => {
                     // The shared partials have no fallible construct, so this
                     // is unreachable in practice — but a blank page is not an
                     // acceptable way to find that out.
                     tracing::error!("CapabilityStatement card render failed: {error}");
-                    (None, String::new())
+                    None
                 }
             }
         }
         Err(error) => {
             tracing::warn!("CapabilityStatement self-fetch failed: {error}");
-            (None, String::new())
+            None
         }
     };
     render(CapabilityPage {
@@ -3131,10 +3130,6 @@ async fn capability_page(
         i18n,
         active_page: "capability-statement",
         cards,
-        raw,
-        raw_requested,
-        raw_url,
-        fragment_url: capability_json::root_fragment_url(version),
     })
 }
 
@@ -3906,16 +3901,18 @@ mod tests {
     #[test]
     fn capability_fragments_enforce_the_rendering_budget() {
         let oversized = "x".repeat(capability_json::MAX_FRAGMENT_HTML_BYTES + 1);
-        let response =
-            bounded_capability_fragment(BoundedFragmentTestTemplate { value: &oversized });
+        let rendered = BoundedFragmentTestTemplate { value: &oversized }.render();
+        let response = bounded_capability_fragment(rendered);
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
     fn capability_fragments_report_template_errors() {
-        let response = bounded_capability_fragment(FailingFragmentTestTemplate {
+        let rendered = FailingFragmentTestTemplate {
             value: FailingDisplay,
-        });
+        }
+        .render();
+        let response = bounded_capability_fragment(rendered);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 

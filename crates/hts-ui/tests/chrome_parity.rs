@@ -690,3 +690,97 @@ async fn favicon_link_resolves_under_the_hts_mount() {
          /ui/hts/assets/ — a mount-prefix typo shows up here, not in the markup",
     );
 }
+
+// ── Track H: the Raw CapabilityStatement fold's scripts are wired in ───
+
+#[tokio::test]
+async fn capability_page_loads_the_raw_fold_scripts() {
+    // Regression (#808 follow-up). The Raw CapabilityStatement card is
+    // shared markup — `helios_ui_chrome::capability::CapabilityCards::raw`
+    // — but its *behavior* is two vanilla-JS files that each page has to
+    // include itself:
+    //
+    //   * `capability-json.js` listens for the native `toggle` event on
+    //     `details[data-capability-json-node]` and fires the htmx GET at
+    //     `data-fragment-url`, so opening the fold shows the tree;
+    //   * `json-view.js` binds the per-node fold arrows inside the
+    //     fragment that swap brings back.
+    //
+    // HTS adopted the shared card while loading neither, so the fold opened
+    // onto the server-rendered "Load JSON" fallback and simply sat there.
+    // Nothing failed to compile and no template error surfaced — a missing
+    // `<script>` degrades in total silence, which is exactly why this
+    // assertion has to exist.
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/capability-statement")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("/ui/hts/assets/capability-json.js"),
+        "Capability page must load capability-json.js — without it the raw \
+         fold opens onto its static fallback and never fetches the tree",
+    );
+    assert!(
+        html.contains("/ui/hts/assets/json-view.js"),
+        "Capability page must load json-view.js (from the base layout) — \
+         without it the fold arrows inside the swapped-in tree do nothing",
+    );
+}
+
+#[tokio::test]
+async fn capability_json_js_is_served_under_hts_assets() {
+    // Second leg of the two-legged shape `favicon_link_resolves_under_the_hts_mount`
+    // uses: asserting the markup alone would miss a mount-prefix typo. The
+    // bytes live at `crates/ui/assets/capability-json.js` and reach HTS
+    // through the same embedded `../ui/assets` folder HFS serves.
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/assets/capability-json.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "capability-json.js must be served under /ui/hts/assets/",
+    );
+    let js = body_text(response).await;
+    assert!(
+        js.contains("details[data-capability-json-node]"),
+        "capability-json.js must bind the shared card's \
+         `details[data-capability-json-node]` hook",
+    );
+}
+
+#[tokio::test]
+async fn json_view_js_is_served_under_hts_assets() {
+    // The fold-arrow delegate (`crates/ui/assets/json-view.js`) is loaded
+    // globally by the HTS base layout, mirroring HFS, so every page that
+    // ever swaps in a `partials/json-view.html` tree already has it.
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/assets/json-view.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "json-view.js must be served under /ui/hts/assets/",
+    );
+    let js = body_text(response).await;
+    assert!(
+        js.contains("[data-fold]"),
+        "json-view.js must bind the `.json-line__arrow[data-fold]` controls",
+    );
+}

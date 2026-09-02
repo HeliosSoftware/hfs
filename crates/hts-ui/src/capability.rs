@@ -2,16 +2,15 @@
 //!
 //! **Shape of record (2026-09-01, #808).** This page and HFS's
 //! `/ui/capability-statement` are no longer two implementations of one
-//! document. The parser, the view model and the four cards they have in
-//! common all live in [`helios_ui_chrome::capability`]; what stays here is
-//! what is genuinely HTS's:
+//! document. The parser, the view model, the four summary cards and — since
+//! this page's #808 follow-up — the Raw CapabilityStatement fold all live in
+//! [`helios_ui_chrome::capability`] / [`helios_ui_chrome::capability_json`];
+//! what stays here is what is genuinely HTS's:
 //!
 //!   • two upstream fetches instead of one loopback self-call,
 //!   • per-card degradation rather than a single page-level warning,
 //!   • the **Terminology capabilities** card, which only a terminology
-//!     server can declare,
-//!   • a byte cap on the raw statement, because HTS's grows with the code
-//!     systems it loads.
+//!     server can declare.
 //!
 //! It was previously called "Diagnostics" and lived at `/hts/diagnostics`;
 //! both are kept working by a 308 redirect registered in
@@ -45,23 +44,47 @@
 use askama::Template;
 use axum::{
     Router,
-    extract::State,
+    extract::{Query, State},
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use axum_htmx::HxRequest;
 use helios_ui_chrome::capability::{CapabilityCards, DocsVersion};
+use helios_ui_chrome::capability_json::{self, FragmentEndpoint};
+use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::upstream::TerminologyCapabilitiesView;
 use crate::{Chrome, HtsUiState};
 
+/// Where the router registers the fragment endpoint — relative to this
+/// crate's `/hts` prefix, the same way every other route in [`routes`] is
+/// spelled. [`JSON_FRAGMENT_URL`] is the *public* counterpart: what a browser
+/// actually requests once [`router`](crate::router) mounts this at `/ui`.
+const JSON_FRAGMENT_ROUTE: &str = "/hts/capability-statement/json-fragment";
+/// The public URL the raw fold's `data-fragment-url` and pagination links
+/// point at. Must stay `/ui` + [`JSON_FRAGMENT_ROUTE`] in sync with the mount
+/// point [`crate::router`] documents.
+const JSON_FRAGMENT_URL: &str = "/ui/hts/capability-statement/json-fragment";
+/// The no-JS fallback link: the page itself, requested with the plain-text
+/// query flag. HTS carries no filter or version query params to preserve, so
+/// (unlike HFS's `capability_raw_url`) this needs no builder.
+const PAGE_RAW_URL: &str = "/ui/hts/capability-statement?raw=1";
+
+fn root_fragment_url(state: &HtsUiState) -> String {
+    capability_json::root_fragment_url(FragmentEndpoint {
+        base_path: JSON_FRAGMENT_URL,
+        version: state.fhir_version,
+    })
+}
+
 // ── Routing ─────────────────────────────────────────────────────────────
 
 pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
     Router::new()
         .route("/hts/capability-statement", get(capability_page))
+        .route(JSON_FRAGMENT_ROUTE, get(capability_json_fragment))
         // The page shipped as `/ui/hts/diagnostics` before it was renamed to
         // match HFS. Keep the old path working — it may be bookmarked, and
         // the docs and e2e specs referenced it. `Redirect::permanent` emits
@@ -106,24 +129,23 @@ struct CapabilityPageView {
     interactions_card: Option<String>,
     operations_card: String,
     resources_card: String,
-    /// The raw statement, or `None` when `/metadata` could not be read —
-    /// there is no half-document worth folding.
-    raw: Option<RawStatement>,
+    /// The Raw CapabilityStatement fold, pre-rendered by
+    /// [`CapabilityCards::raw`] — the same shell HFS renders, lazy-loading
+    /// its tree from [`JSON_FRAGMENT_URL`] (#808 follow-up to #798). `None`
+    /// when `/metadata` could not be read — there is no half-document worth
+    /// folding.
+    raw_card: Option<String>,
     terminology: Option<TerminologyCapabilitiesView>,
     terminology_reason: Option<&'static str>,
 }
 
-/// The capped copy of the statement behind the raw fold.
-#[derive(Clone, Debug)]
-struct RawStatement {
-    text: String,
-    truncated: bool,
-    full_bytes: usize,
-}
-
 // ── View builder ────────────────────────────────────────────────────────
 
-async fn build_view(state: &HtsUiState, i18n: &I18n) -> Result<CapabilityPageView, askama::Error> {
+async fn build_view(
+    state: &HtsUiState,
+    i18n: &I18n,
+    raw_requested: bool,
+) -> Result<CapabilityPageView, askama::Error> {
     // Sequential, deliberately. Firing the probes with `tokio::join!` opens
     // simultaneous upstream connections per page load; under the crate's
     // parallel test harness (several `#[tokio::test]`s, each with its own
@@ -158,6 +180,27 @@ async fn build_view(state: &HtsUiState, i18n: &I18n) -> Result<CapabilityPageVie
         .operations_empty_key(Some("hts-capability-operations-empty"))
         .resources_empty_key("hts-capability-rest-empty");
 
+    // Unbounded and only computed on explicit request — same trade HFS makes
+    // for its own `?raw=1` no-JS fallback. The default path never serializes
+    // the whole document; it hands the fold a fragment URL instead.
+    let raw_text = if raw_requested {
+        statement
+            .map(|s| serde_json::to_string_pretty(&s.document).unwrap_or_default())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let raw_card = statement
+        .map(|_| {
+            cards.raw(
+                raw_requested,
+                &raw_text,
+                PAGE_RAW_URL,
+                &root_fragment_url(state),
+            )
+        })
+        .transpose()?;
+
     let mut view = CapabilityPageView {
         summary_card: cards.summary()?,
         interactions_card: (statement.is_some() && !projection.interactions.is_empty())
@@ -165,11 +208,7 @@ async fn build_view(state: &HtsUiState, i18n: &I18n) -> Result<CapabilityPageVie
             .transpose()?,
         operations_card: cards.operations()?,
         resources_card: cards.resources()?,
-        raw: statement.map(|s| RawStatement {
-            text: s.raw.clone(),
-            truncated: s.raw_truncated,
-            full_bytes: s.raw_full_bytes,
-        }),
+        raw_card,
         ..Default::default()
     };
     match terminology {
@@ -179,16 +218,26 @@ async fn build_view(state: &HtsUiState, i18n: &I18n) -> Result<CapabilityPageVie
     Ok(view)
 }
 
+#[derive(Deserialize, Default)]
+struct CapabilityQuery {
+    /// A string flag because the public query spelling is `raw=1`, not a
+    /// Serde boolean literal such as `raw=true` — mirrors HFS's own
+    /// `CapabilityQuery`.
+    raw: Option<String>,
+}
+
 // ── GET /hts/capability-statement ───────────────────────────────────────
 
 async fn capability_page(
     State(state): State<Arc<HtsUiState>>,
     // Taking the extractor is what arms `axum_htmx::AutoVaryLayer`, so the
     // response carries `Vary: HX-Request`. The page body is identical in
-    // both modes (HFS's capability page has no fragment endpoint either).
+    // both modes; only the raw fold's own fragment endpoint is htmx-driven.
     HxRequest(_is_htmx): HxRequest,
     locale: RequestLocale,
+    Query(query): Query<CapabilityQuery>,
 ) -> Response {
+    let raw_requested = query.raw.as_deref() == Some("1");
     let i18n = I18n::new(locale);
     let chrome = Chrome {
         i18n,
@@ -199,10 +248,85 @@ async fn capability_page(
     // Both legs are `askama::Error`: rendering the shared cards and rendering
     // the page around them fail the same way and take the same 500 path.
     render(
-        build_view(&state, &i18n)
+        build_view(&state, &i18n, raw_requested)
             .await
             .and_then(|view| CapabilityPageTemplate { chrome, view }.render()),
     )
+}
+
+#[derive(Deserialize, Default)]
+struct CapabilityJsonQuery {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+// ── GET /hts/capability-statement/json-fragment ─────────────────────────
+
+/// Mirrors HFS's `capability_json_fragment` handler: re-fetch, plan one
+/// bounded level (or the whole subtree when it is small), render.
+/// Re-fetching on every fragment click is the same cost model HFS's own
+/// loopback self-call already pays per request — see
+/// [`crate::upstream::UpstreamClient::capability_statement`].
+async fn capability_json_fragment(
+    State(state): State<Arc<HtsUiState>>,
+    locale: RequestLocale,
+    Query(query): Query<CapabilityJsonQuery>,
+) -> Response {
+    let version = DocsVersion::from_code(state.fhir_version).unwrap_or_default();
+    let document = match state.upstream.capability_statement(version).await {
+        Ok(statement) => statement.document,
+        Err(error) => {
+            tracing::warn!("CapabilityStatement fragment fetch failed: {error}");
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "CapabilityStatement is unavailable",
+            )
+                .into_response();
+        }
+    };
+    let limit = query.limit.unwrap_or(capability_json::DEFAULT_PAGE_SIZE);
+    let i18n = I18n::new(locale);
+    let endpoint = FragmentEndpoint {
+        base_path: JSON_FRAGMENT_URL,
+        version: state.fhir_version,
+    };
+    match capability_json::plan(&document, &query.path, query.offset, limit, endpoint) {
+        Ok(capability_json::View::Full(json_lines)) => bounded_fragment(
+            capability_json::render_full(&i18n, json_lines, query.path.is_empty()),
+        ),
+        Ok(capability_json::View::Outline(outline)) => {
+            bounded_fragment(capability_json::render_outline(&i18n, &outline))
+        }
+        Err(capability_json::Error::NotFound) => {
+            (axum::http::StatusCode::NOT_FOUND, "JSON path not found").into_response()
+        }
+        Err(capability_json::Error::InvalidPointer | capability_json::Error::InvalidPage) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid JSON fragment request",
+        )
+            .into_response(),
+    }
+}
+
+fn bounded_fragment(rendered: Result<String, askama::Error>) -> Response {
+    match rendered {
+        Ok(html) if html.len() <= capability_json::MAX_FRAGMENT_HTML_BYTES => {
+            Html(html).into_response()
+        }
+        Ok(_) => (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "CapabilityStatement fragment exceeds the rendering budget",
+        )
+            .into_response(),
+        Err(error) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render error: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 fn render(rendered: Result<String, askama::Error>) -> Response {

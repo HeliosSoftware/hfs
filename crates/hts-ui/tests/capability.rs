@@ -435,26 +435,41 @@ async fn capability_page_mirrors_hfs_and_declares_terminology_capabilities() {
         &closure_row[..closure_row.len().min(60)],
     );
 
-    // ── Raw CapabilityStatement, HFS's foldable block ───────────────────
+    // ── Raw CapabilityStatement, the same htmx-lazy fold HFS renders ────
+    // (#808 follow-up to #798). The default view never inlines the
+    // statement — it holds a "Load JSON" link against this server's own
+    // fragment endpoint, not HFS's.
     assert!(
-        html.contains("<details>") && html.contains(r#"<pre class="detail__code">"#),
-        "the raw statement should fold into HFS's `<details>` + `<pre>`",
-    );
-    // Askama emits numeric entities (`&#34;`), so assert on the payload
-    // rather than on a particular quoting of it.
-    let folded = html
-        .split(r#"<pre class="detail__code">"#)
-        .nth(1)
-        .and_then(|s| s.split("</pre>").next())
-        .expect("the raw block renders");
-    assert!(
-        folded.contains("resourceType") && folded.contains("CapabilityStatement"),
-        "the folded block should hold the statement; got: {}",
-        &folded[..folded.len().min(80)],
+        html.contains(r#"id="capability-json-fold""#),
+        "the raw fold should use HFS's shared shell",
     );
     assert!(
-        folded.contains("\n"),
-        "the folded statement should be pretty-printed, not one compact line",
+        html.contains(r#"data-fragment-url="/ui/hts/capability-statement/json-fragment"#),
+        "the fold should lazy-load from HTS's own fragment endpoint, not HFS's",
+    );
+    assert!(
+        !html.contains(r#"<pre class="detail__code">"#),
+        "the default view must not inline the statement any more",
+    );
+
+    // The fragment endpoint itself serves the statement, highlighted.
+    let fragment = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get(
+                "/ui/hts/capability-statement/json-fragment?path=&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fragment.status(), StatusCode::OK);
+    let fragment_html = body_text(fragment).await;
+    assert!(
+        fragment_html.contains("resourceType") && fragment_html.contains("CapabilityStatement"),
+        "the fragment should hold the statement; got: {}",
+        &fragment_html[..fragment_html.len().min(120)],
     );
 
     // ── The page fetches exactly two sources ────────────────────────────
@@ -555,12 +570,11 @@ async fn interactions_appear_when_declared_and_one_failure_degrades_only_its_car
     // A statement that grows with the data must not ship whole. HTS carries
     // one `capabilitystatement-supported-system` extension per loaded code
     // system; against the bundled seed set that is ~1,975 of them and a
-    // 422 KB raw block — 95% of the page — on every load, `<details>` or
-    // not. Only the seeded deployment exposes this; the small fixtures
-    // above never would.
-    // 400 is already ~10× the 16 KB cap; the real seed set carries ~1,975.
-    // Kept deliberately modest — this fixture is serialized and
-    // pretty-printed on every render, and a needlessly huge one only adds
+    // 422 KB raw block — 95% of the page — if it were ever inlined. Only the
+    // seeded deployment exposes this; the small fixtures above never would.
+    // 400 is already large enough to blow the fragment engine's 1,000-line
+    // render budget and force outline mode; the real seed set carries
+    // ~1,975. Kept deliberately modest — a needlessly huge fixture only adds
     // CPU to a suite that already runs eleven binaries in parallel.
     let bulky: Vec<Value> = (0..400)
         .map(|i| {
@@ -580,32 +594,79 @@ async fn interactions_appear_when_declared_and_one_failure_degrades_only_its_car
             })),
         )
         .await;
+    // The page itself never inlines the statement — #808's whole point — so
+    // it stays small however large the statement grows.
     let html = get_page(&app).await;
-    let folded = html
-        .split(r#"<pre class="detail__code">"#)
-        .nth(1)
-        .and_then(|s| s.split("</pre>").next())
-        .expect("the raw block renders");
     assert!(
-        folded.len() < 20 * 1024,
-        "the raw block must stay capped; got {} bytes",
-        folded.len(),
-    );
-    // Never a silent truncation: the note states both sizes and points at
-    // the endpoint that serves the complete document.
-    assert!(
-        html.contains("Truncated to the first"),
-        "a truncated statement must say so",
-    );
-    assert!(
-        html.contains(r#"<a href="/metadata">"#),
-        "the truncation note must link to the full statement",
+        !html.contains(r#"<pre class="detail__code">"#),
+        "the page must never inline the raw statement",
     );
     assert!(
         html.len() < 60 * 1024,
         "the whole page should stay small even against a bulky statement; got {} bytes",
         html.len(),
     );
+
+    // The root fragment cannot fully render 400 extensions inside its
+    // 1,000-line budget, so it degrades to a paginated outline rather than
+    // one gigantic swap.
+    let root_fragment = body_text(
+        app.clone()
+            .oneshot(
+                axum::http::Request::get(
+                    "/ui/hts/capability-statement/json-fragment?path=&offset=0&limit=100",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        root_fragment.contains(r#"data-capability-json-page"#),
+        "400 extensions should force the root into outline mode",
+    );
+    assert!(
+        root_fragment.contains("[ 400 ]"),
+        "the extension array should summarize its length rather than inline it",
+    );
+
+    // Following that row's own link pages through the 400 items themselves.
+    let extension_page = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get(
+                "/ui/hts/capability-statement/json-fragment?path=%2Fextension&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(extension_page.status(), StatusCode::OK);
+    let extension_html = body_text(extension_page).await;
+    assert!(extension_html.contains("1–100 / 400"));
+    // Each extension is itself an object, so this level summarizes rather
+    // than inlines it too — the same "expand one bounded level at a time"
+    // rule the root page just proved.
+    assert_eq!(extension_html.matches("{ 2 }").count(), 100);
+
+    // Drilling one level further reaches the actual padding value.
+    let item_html = body_text(
+        app.clone()
+            .oneshot(
+                axum::http::Request::get(
+                    "/ui/hts/capability-statement/json-fragment?path=%2Fextension%2F0&offset=0&limit=100",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(item_html.contains("padding-0"));
 }
 
 /// Guard: the page adds **no** CSS. Every class it names must already have
