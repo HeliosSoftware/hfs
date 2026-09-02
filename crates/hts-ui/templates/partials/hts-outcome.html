@@ -22,10 +22,17 @@
     • `location[]` renders as a small monospace list, useful for form-field
       wiring in Wave 2 slices (Ops workbench).
 -#}
-{#- `.hts-outcome*` had no rule in app.css, so severity was invisible.
-    Severity now rides on `data-severity` (no styling attached) and the box
-    reuses `.notice.notice--warn`, matching every other warning surface. -#}
-<aside class="notice notice--warn" data-severity="{{ outcome.severity }}"
+{#- Severity rides on `data-severity` (no styling attached) and the box's
+    tone comes from `.notice.notice--warn`, matching every other warning
+    surface — the old `.hts-outcome--<severity>` hooks had no rule in
+    app.css, so they painted nothing.
+
+    `.hts-outcome` is back as a *spacing* scope only, and this time with a
+    rule (#805). `.notice` is shared with HFS, whose uses put bare text in
+    the box; this partial stacks `<p>` rows instead, so it needs the
+    paragraph reset and the gap to preceding content that the primitive
+    deliberately does not carry. -#}
+<aside class="hts-outcome notice notice--warn" data-severity="{{ outcome.severity }}"
        role="{% if outcome.severity == "fatal" || outcome.severity == "error" %}alert{% else %}status{% endif %}"
        aria-live="polite">
   <p class="field__label">
@@ -40,7 +47,7 @@
   <p>{{ outcome.diagnostics }}</p>
   {% endif %}
   {% if !outcome.location.is_empty() %}
-  <ul class="filter-rail__list">
+  <ul class="hts-outcome__locations">
     {% for loc in outcome.location %}
     <li><code>{{ loc }}</code></li>
     {% endfor %}
