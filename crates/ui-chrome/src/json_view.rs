@@ -1,33 +1,40 @@
-//! A foldable, line-numbered, syntax-highlighted JSON view (#264).
+//! A foldable, line-numbered, syntax-highlighted JSON view (#264, #808).
 //!
-//! Brett's Resource Editor shows the JSON and the guided form side by side, and
-//! the JSON is a real code view — line numbers down the gutter and a fold arrow
-//! on every object and array so a big resource collapses to its shape. A
-//! `<textarea>` cannot do that, so the view is rendered here, server-side, into
-//! [`JsonLine`]s the template lays out and a few lines of JS fold.
+//! HFS's Resource Editor shows the JSON and the guided form side by side, and
+//! the JSON is a real code view — line numbers down the gutter and a fold
+//! arrow on every object and array so a big resource collapses to its shape.
+//! A `<textarea>` cannot do that, so the view is rendered here, server-side,
+//! into [`JsonLine`]s the template lays out and a few lines of JS fold.
 //!
 //! The document is walked directly rather than pretty-printed and re-parsed:
 //! that way each container knows its own line, its closing line, and its
 //! ancestry, which is exactly what folding needs.
+//!
+//! This engine moved here from `crates/ui` for [`crate::capability_json`]
+//! (#808): the Raw CapabilityStatement fold is the same bounded JSON view
+//! HFS already built for the editor, and HTS needed it too rather than a
+//! second, byte-capped `<pre>`. HFS's editor, Resources and Batch pages keep
+//! their own template that renders a [`JsonLine`] vector inline — only the
+//! engine and its data types are shared, so that stays untouched.
 
 use serde_json::Value;
 
 /// Controls metadata and resource limits while converting JSON to view lines.
 #[derive(Clone, Copy)]
-pub(crate) struct RenderOptions {
-    pub(crate) include_paths: bool,
-    pub(crate) budget: Option<RenderBudget>,
+pub struct RenderOptions {
+    pub include_paths: bool,
+    pub budget: Option<RenderBudget>,
 }
 
 /// A conservative cap on the work and eventual HTML size of a JSON view.
 #[derive(Clone, Copy)]
-pub(crate) struct RenderBudget {
-    pub(crate) max_lines: usize,
-    pub(crate) max_estimated_html_bytes: usize,
+pub struct RenderBudget {
+    pub max_lines: usize,
+    pub max_estimated_html_bytes: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RenderLimitExceeded;
+pub struct RenderLimitExceeded;
 
 /// One highlighted run within a line.
 pub struct Token {
@@ -76,7 +83,7 @@ pub fn lines(value: &Value) -> Vec<JsonLine> {
 /// A preflight walk rejects excessive line count or conservatively estimated
 /// HTML size before the line vector is allocated. `Ctx::push` enforces the
 /// line limit again while constructing the result as a defense in depth.
-pub(crate) fn try_lines(
+pub fn try_lines(
     value: &Value,
     options: RenderOptions,
 ) -> Result<Vec<JsonLine>, RenderLimitExceeded> {

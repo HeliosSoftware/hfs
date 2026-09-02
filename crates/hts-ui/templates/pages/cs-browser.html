@@ -13,10 +13,21 @@
   is the one scrolling flex child under `.content--app`, so a 25-row page
   scrolls instead of being clipped by `content--app`'s `overflow: hidden`.
 
-  Behaviour contracts preserved from the rail version:
-    • real `<form method="get" action=…/rows>` so filtering works with JS off
-    • `hx-get` + `hx-trigger="input changed delay:300ms, change, submit"`
-      debounced fragment swap of `#hts-cs-rows`
+  Behaviour contracts:
+    • filtering is htmx-only: `hx-get` + `hx-trigger="input changed
+      delay:300ms, change, submit"` swaps `#hts-cs-rows` as the operator
+      types. That debounced swap is the whole filtering mechanism.
+    • there is no Search button (#800): it re-sent the request the
+      debounced trigger had already sent, and was the toolbar's only
+      `btn--primary`. With four text inputs and no default button the form
+      cannot be submitted natively at all, so `method`/`action` are inert
+      and the `submit` trigger clause survives only as a guard, should a
+      submit ever be dispatched.
+    • filtering therefore needs JavaScript. The rail version's "works with
+      JS off" claim was already false: `browser_rows` renders the bare rows
+      fragment unconditionally (`src/code_systems.rs`), so a hard navigation
+      to `…/rows` returns headless markup, and Load-more is a
+      `<button type="button" hx-get>`. Repairing that is a separate change.
     • status is a chip row of plain links (full-page nav, no JS needed);
       the selected status rides along with the text filters as a hidden
       input so a debounced htmx swap does not silently drop it.
@@ -72,7 +83,6 @@
                  aria-label="{{ chrome.i18n.t("hts-cs-browser-filter-version") }}"
                  autocomplete="off" spellcheck="false">
         </label>
-        <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-cs-browser-filter-search") }}</button>
         <a class="btn" href="/ui/hts/code-systems">{{ chrome.i18n.t("hts-cs-browser-filter-reset") }}</a>
       </div>
 

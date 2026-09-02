@@ -125,27 +125,27 @@
     </div>
 
     {% if direction == TranslateDirection::Forward %}
-    <div role="group" aria-labelledby="translate-source-label">
+    <div class="field" role="group" aria-labelledby="translate-source-label">
       <span class="field__label" id="translate-source-label">{{ chrome.i18n.t("hts-cm-translate-source-legend") }}</span>
-    <div class="builder-grid">
-      <div class="field">
-        <label class="field__label" for="translate-system">{{ chrome.i18n.t("hts-cm-translate-source-system") }}</label>
-        <input class="field__input" id="translate-system" name="system" type="text" autocomplete="off" spellcheck="false"
-               placeholder="{{ chrome.i18n.t("hts-cm-translate-source-system-placeholder") }}">
+      <div class="builder-grid">
+        <div class="field">
+          <label class="field__label" for="translate-system">{{ chrome.i18n.t("hts-cm-translate-source-system") }}</label>
+          <input class="field__input" id="translate-system" name="system" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="{{ chrome.i18n.t("hts-cm-translate-source-system-placeholder") }}">
+        </div>
+        <div class="field">
+          <label class="field__label" for="translate-code">{{ chrome.i18n.t("hts-cm-translate-source-code") }}</label>
+          <input class="field__input" id="translate-code" name="code" type="text" autocomplete="off" spellcheck="false">
+        </div>
       </div>
       <div class="field">
-        <label class="field__label" for="translate-code">{{ chrome.i18n.t("hts-cm-translate-source-code") }}</label>
-        <input class="field__input" id="translate-code" name="code" type="text" autocomplete="off" spellcheck="false">
+        <label class="field__label" for="translate-display">{{ chrome.i18n.t("hts-cm-translate-source-display") }}</label>
+        <input class="field__input" id="translate-display" name="display" type="text" autocomplete="off" spellcheck="false"
+               placeholder="{{ chrome.i18n.t("hts-cm-translate-source-display-placeholder") }}">
       </div>
-    </div>
-    <div class="field">
-      <label class="field__label" for="translate-display">{{ chrome.i18n.t("hts-cm-translate-source-display") }}</label>
-      <input class="field__input" id="translate-display" name="display" type="text" autocomplete="off" spellcheck="false"
-             placeholder="{{ chrome.i18n.t("hts-cm-translate-source-display-placeholder") }}">
-    </div>
     </div>
     {% else %}
-    <div role="group" aria-labelledby="translate-reverse-label">
+    <div class="field" role="group" aria-labelledby="translate-reverse-label">
       <span class="field__label" id="translate-reverse-label">{{ chrome.i18n.t("hts-cm-translate-reverse-legend") }}</span>
       <div class="field">
         <label class="field__label" for="translate-target-code">{{ chrome.i18n.t("hts-cm-translate-target-code") }}</label>

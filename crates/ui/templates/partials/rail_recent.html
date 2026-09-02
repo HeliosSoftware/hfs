@@ -1,0 +1,41 @@
+<!--
+  Server-rendered "Recently used" group (#754/#755 ticket 02, RF6), shared by
+  every type rail (Resources, Search, Saved Queries, Search Parameters) and,
+  from ticket 03, the SQL rails too.
+
+  `entries` is already resolved against the rail's own live items
+  (`rail_state::RailState::resolve_recents`), so each one has the exact same
+  shape as its page's own list items
+  (`a.filter-rail__item[data-type][data-full-name][title]`, label,
+  `aria-current`, plus whichever of live count or SQL-rail meta that page's
+  list renders) — CSS, the tooltip/reveal script (`resource-filter.js`), and,
+  on Resources/Search/Saved Queries, `saved-queries.js`'s in-page repaint
+  after a rail click, all treat a recent exactly like any other rail item.
+  `meta` (ticket 03, the SQL rails' `ViewDefinition.resource`/`Library.status`
+  column) and `count` (the type rails' live count, `partials/type_rail.html`)
+  are mutually exclusive in practice — a page's `ResolvedRailEntry`s only
+  ever populate the one its own list uses — but both render conditionally so
+  the same macro serves every rail unchanged.
+
+  `rail_page` and `max_recent` are the only values a client script needs to
+  write this page's own `rails.<page>` record back — the single source for
+  both is `rail_state::RailPage::key`/`rail_state::MAX_RECENT`, never
+  redeclared in JS. The container stays present-but-`hidden` with no entries
+  (RF9: no store configured renders the same way), so CSS never has to key
+  off its absence.
+-->
+{% macro group(id, rail_list_id, rail_page, max_recent, heading, entries) %}
+<div class="filter-rail__group" id="{{ id }}"
+     data-rail-page="{{ rail_page }}" data-max-recent="{{ max_recent }}"
+     data-rail-list="{{ rail_list_id }}"{% if entries.is_empty() %} hidden{% endif %}>
+  <div class="filter-rail__heading filter-rail__heading--group">{{ heading }}</div>
+  {% for e in entries %}
+  <a class="filter-rail__item" data-type="{{ e.id }}" data-full-name="{{ e.label }}"
+     href="{{ e.href }}" title="{{ e.label }}"{% if e.current %} aria-current="true"{% endif %}>
+    <span class="filter-rail__label">{{ e.label }}</span>
+    {% if let Some(m) = e.meta %}<span class="filter-rail__meta">{{ m }}</span>{% endif %}
+    {% if let Some(c) = e.count %}<span class="count">{{ c }}</span>{% endif %}
+  </a>
+  {% endfor %}
+</div>
+{% endmacro %}

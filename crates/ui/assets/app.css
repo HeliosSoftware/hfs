@@ -1493,6 +1493,10 @@ select.field__input {
 
 .spinner,
 .btn[aria-busy="true"]::after {
+  /* Explicit border-box (#786): the `*` reset does not match pseudo-elements,
+     and content-box would render the ::after ring at 18px — off center against
+     the -7px offsets below. */
+  box-sizing: border-box;
   width: 14px;
   height: 14px;
   border-radius: 50%;
@@ -5783,6 +5787,7 @@ details.json-fold[open] > summary .icon {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 6px 18px;
+  margin-top: 8px;
   padding: 6px 0;
 }
 
@@ -6316,4 +6321,17 @@ body.app-shell .pane {
    not shadow the editor's own role="textbox" (CM6's default) landmark. */
 .vd-editor__source--mounted {
   display: none;
+}
+
+/* RF8 (#752 ticket 02): the plain `<textarea>` fallback's own height — the
+   same "min 320px, max ~70vh, scroll internally" cotas `.cm-editor` gets
+   above, so nojs and the pre-mount flash match the mounted editor's
+   footprint instead of the old fixed `rows="18"`. Scoped to this page's
+   form rather than `.json-editor` itself, which `sql-library.html` still
+   uses with its original sizing (#839 will give that page the same
+   treatment separately). */
+#vd-editor-form textarea.json-editor {
+  min-height: 320px;
+  max-height: 70vh;
+  overflow-y: auto;
 }

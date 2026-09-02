@@ -505,6 +505,8 @@ impl BulkSubmitProvider for PostgresBackend {
             processed_entries: 0,
             failed_entries: 0,
             lease_expiry: None,
+            bytes_processed: 0,
+            bytes_total: 0,
         })
     }
 
@@ -519,7 +521,7 @@ impl BulkSubmitProvider for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry
+                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total
                  FROM bulk_manifests
                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
                 &[
@@ -545,6 +547,8 @@ impl BulkSubmitProvider for PostgresBackend {
         let processed: i32 = row.get(5);
         let failed: i32 = row.get(6);
         let lease_expiry: Option<chrono::DateTime<Utc>> = row.get(7);
+        let bytes_processed: i64 = row.get(8);
+        let bytes_total: i64 = row.get(9);
 
         let status: ManifestStatus = status_str
             .parse()
@@ -560,6 +564,8 @@ impl BulkSubmitProvider for PostgresBackend {
             processed_entries: processed as u64,
             failed_entries: failed as u64,
             lease_expiry,
+            bytes_processed: bytes_processed.max(0) as u64,
+            bytes_total: bytes_total.max(0) as u64,
         }))
     }
 
@@ -689,28 +695,25 @@ impl BulkSubmitProvider for PostgresBackend {
                 continue;
             }
 
-            txn.raw_client()?
-                .execute("SAVEPOINT bulk_entry", &[])
-                .await
-                .map_err(|e| internal_error(format!("savepoint: {e}")))?;
-            let outcome = self
+            // The transaction buffers creates and sends them in batches, so
+            // an entry's conflict can surface after its `create` returned.
+            // The savepoint methods flush at the savepoint boundaries: the
+            // release raises this entry's conflict inside its own savepoint,
+            // and the rollback undoes only this entry's rows.
+            txn.savepoint("bulk_entry").await?;
+            let outcome = match self
                 .ingest_entry_in_tx(&mut txn, manifest_id, &entry, options)
-                .await;
+                .await
+            {
+                Ok(pair) => txn.release_savepoint("bulk_entry").await.map(|_| pair),
+                Err(e) => Err(e),
+            };
             let (entry_result, change) = match outcome {
-                Ok(pair) => {
-                    txn.raw_client()?
-                        .execute("RELEASE SAVEPOINT bulk_entry", &[])
-                        .await
-                        .map_err(|e| internal_error(format!("release savepoint: {e}")))?;
-                    pair
-                }
+                Ok(pair) => pair,
                 Err(e) => {
-                    txn.raw_client()?
-                        .execute("ROLLBACK TO SAVEPOINT bulk_entry", &[])
+                    txn.rollback_to_savepoint("bulk_entry")
                         .await
-                        .map_err(|se| {
-                            internal_error(format!("rollback to savepoint after '{e}': {se}"))
-                        })?;
+                        .map_err(|se| internal_error(format!("{se} after '{e}'")))?;
                     let failed = BulkEntryResult::processing_error(
                         entry.line_number,
                         &entry.resource_type,
@@ -1627,6 +1630,40 @@ impl SubmitWorkerStorage for PostgresBackend {
         }
     }
 
+    async fn update_manifest_bytes(
+        &self,
+        lease: &ManifestLease,
+        bytes_processed: u64,
+        bytes_total: u64,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "UPDATE bulk_manifests
+                 SET bytes_processed = GREATEST(bytes_processed, $1),
+                     bytes_total = GREATEST(bytes_total, $2)
+                 WHERE tenant_id = $3 AND submitter = $4 AND submission_id = $5
+                   AND manifest_id = $6 AND worker_id = $7 AND fencing_token = $8",
+                &[
+                    &(bytes_processed as i64),
+                    &(bytes_total as i64),
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("update bytes: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
     async fn record_submit_file(
         &self,
         lease: &ManifestLease,
@@ -2020,8 +2057,17 @@ impl SubmitWorkerStorage for PostgresBackend {
         let client = self.get_client().await?;
         let row = client
             .query_one(
-                "SELECT COUNT(*) FROM bulk_submissions
-                 WHERE tenant_id = $1 AND status = 'in-progress'",
+                "SELECT COUNT(*) FROM bulk_submissions s
+                 WHERE s.tenant_id = $1 AND s.status = 'in-progress'
+                   AND (NOT EXISTS (SELECT 1 FROM bulk_manifests m
+                                    WHERE m.tenant_id = s.tenant_id
+                                      AND m.submitter = s.submitter
+                                      AND m.submission_id = s.submission_id)
+                        OR EXISTS (SELECT 1 FROM bulk_manifests m
+                                   WHERE m.tenant_id = s.tenant_id
+                                     AND m.submitter = s.submitter
+                                     AND m.submission_id = s.submission_id
+                                     AND m.status IN ('pending', 'processing')))",
                 &[&tenant.tenant_id().as_str()],
             )
             .await

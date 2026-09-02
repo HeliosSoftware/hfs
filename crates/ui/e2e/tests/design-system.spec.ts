@@ -16,7 +16,15 @@ import postcss from "postcss";
 //     blocks, which nobody wrote.
 
 // Classes added at runtime by vendored libraries, not defined in app.css.
-const RUNTIME_CLASSES = /^htmx-/;
+// `^cm-` and `^ͼ` (CodeMirror 6's `ͼN` hash classes, e.g. `.ͼ1`, plus
+// layer/cursor classes like `.cm-layer-above`/`.cm-cursor-primary`): the
+// ViewDefinition editor's CodeMirror bundle (#753) mounts its own stylesheet
+// at runtime via `StyleModule.mount`, unlayered and outside app.css entirely
+// (see app.css's own note on that block) — there is no rule for the guard
+// to find, by design, whenever a page with the editor mounted is in the
+// sweep (e.g. `/ui/sql/view-definitions` with a selection restored by rail
+// state, #822).
+const RUNTIME_CLASSES = /^htmx-|^cm-|^ͼ/;
 
 // The assets are read over HTTP from the server under test, not from the
 // source tree: the CI runner drives a packaged binary with no checkout

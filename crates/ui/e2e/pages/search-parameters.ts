@@ -22,6 +22,13 @@ export class SearchParametersPage {
   railItem(type: string): Locator {
     return this.page.locator(`#sp-rail-list [data-type='${type}']`);
   }
+  /** The "All types" row: the one `#sp-rail-list` item with no `data-type`. */
+  get allTypesLink(): Locator {
+    return this.page.locator("#sp-rail-list > a.filter-rail__item:not([data-type])");
+  }
+  recentItem(type: string): Locator {
+    return this.page.locator(`#sp-rail-recent [data-type='${type}']`);
+  }
 
   facetChip(label: RegExp | string): Locator {
     return this.page.locator(".facets a.chip", { hasText: label });

@@ -1,0 +1,46 @@
+{#
+  SHARED CAPABILITY CARD -- Raw CapabilityStatement (#808 follow-up to #798).
+
+  Rendered by `helios_ui_chrome::capability::CapabilityCards::raw()` and
+  consumed by BOTH `crates/ui` (HFS) and `crates/hts-ui` (HTS). One edit here
+  changes both products' raw fold.
+
+  Bounded, incremental JSON rendering (the fragment endpoint this card's
+  `fragment_url` and `data-fragment-url` point at) lives in
+  `crate::capability_json`, not here — this file is only the shell:
+
+  * `raw_requested` false (the default): a "Load JSON" link plus a hidden
+    htmx-driven body. Nothing is fetched until the fold opens.
+  * `raw_requested` true (the `?raw=1` no-JS fallback): the full,
+    already-resolved `raw` text in a plain `<pre>`, no htmx involved. The
+    caller supplies it *unbounded* — this is an explicit, opt-in request for
+    the whole document, not the default page weight.
+
+  Both products' statements can be large (HFS's grows with registered search
+  parameters, HTS's with loaded code systems), which is exactly why the
+  default path never inlines the tree: see #798 for HFS and #808 for why HTS
+  no longer byte-caps a `<pre>` instead of sharing this.
+#}
+<details class="card json-fold" id="capability-json-fold"{% if raw_requested %} open{% else %} data-capability-json-node{% endif %}>
+  <summary class="card-head">
+    <h3>{{ i18n.t("cap-raw-toggle") }}</h3>
+    <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+  </summary>
+  <div class="card__body" id="capability-json-body"{% if !raw_requested %}
+       data-capability-json-body
+       data-loading-text="{{ i18n.t("cap-raw-loading") }}"
+       data-error-text="{{ i18n.t("cap-json-load-error") }}"
+       data-fragment-url="{{ fragment_url }}"
+       hx-indicator="#capability-json-loading"{% endif %}>
+    {% if raw_requested %}
+    <p class="notice">{{ i18n.t("cap-raw-plain") }}</p>
+    <pre class="detail__code">{{ raw }}</pre>
+    {% else %}
+    <a class="btn" href="{{ raw_url }}#capability-json-fold">{{ i18n.t("cap-raw-load") }}</a>
+    <p class="busy-status htmx-indicator" id="capability-json-loading" role="status">
+      <span class="spinner" aria-hidden="true"></span>
+      {{ i18n.t("cap-raw-loading") }}
+    </p>
+    {% endif %}
+  </div>
+</details>

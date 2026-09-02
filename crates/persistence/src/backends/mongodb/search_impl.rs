@@ -477,7 +477,7 @@ impl ConditionalStorage for MongoBackend {
             1 => {
                 let current = matches.into_iter().next().expect("single match must exist");
                 self.delete(tenant, resource_type, current.id()).await?;
-                Ok(ConditionalDeleteResult::Deleted)
+                Ok(ConditionalDeleteResult::Deleted(current))
             }
             n => Ok(ConditionalDeleteResult::MultipleMatches(n)),
         }

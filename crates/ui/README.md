@@ -117,7 +117,28 @@ the vendored bundle itself — embedded and served exactly like every other
 asset in this crate (above), nothing bundler-specific about how it ships. It
 backs the ViewDefinition editor on `/ui/sql/view-definitions`; see
 [`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
-for the full evaluation this amendment is drawn from.
+for the full evaluation this amendment is drawn from. The editor talks to two
+JSON-in-HTML-fragment-out endpoints on that page: `POST …/lint` (#753 ticket
+03), the CodeMirror linter's structural + FHIRPath-syntax check, and `POST
+…/run` (#752 ticket 01), which runs the editor's own posted text — saved or
+not — through `$sql-run` and answers with `partials/sql_run_results.html`,
+the same results-card partial the page's own initial render nests as a
+template field. `/run` always answers `200` (htmx does not swap `4xx`/`5xx`
+by default) except for a malformed request body.
+
+That page is a playground, not a Run button (#752 ticket 02): the editor card
+is always open (no fold, no separate "Run" action), and the results region
+below it wires straight to `/run` with plain `hx-*` attributes — no JavaScript
+beyond what already ships. The results region's own empty shell fires one
+`hx-trigger="load"` request when the page opens with nothing to show yet
+(a fresh selection, or `?vd=new`'s starter document), and the editor's
+`textarea` reposts on `hx-trigger="input changed delay:500ms"` as it changes —
+CodeMirror's mount already dispatches `input` on every edit, so this needs no
+mount-specific wiring. A failed run leaves the editor's text untouched and the
+last successful table on screen, relabelled "last successful run" via an
+out-of-band swap of just its meta. With JavaScript disabled there is no live
+preview at all: Save's own redirect (`?vd=<id>&saved=1`) is what renders the
+just-stored definition's results, server-side, once.
 
 ### Client-side scripts
 
@@ -133,7 +154,7 @@ it exists to be called by the others.
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
-| `saved-queries.js` | Saved queries, the visual search builder, and the `/_user/settings` read/modify/write cycle |
+| `saved-queries.js` | Saved queries, the visual search builder, the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
 | `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
 | `combobox.js` | Shared multi-select state, chips, keyboard/ARIA behavior, and progressive fallback upgrade; htmx owns transport and callers own result semantics |
@@ -142,7 +163,8 @@ it exists to be called by the others.
 | `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
-| `resource-filter.js`, `conformance-crud.js` | Shared truncated-name tooltips and the conformance viewers' rail filter/write half |
+| `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
+| `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.
@@ -460,9 +482,14 @@ falls through to the normal REST surface.
   the same rendering path. Counts reflect the **default tenant** only — an
   operator view, never exported to the public Prometheus `/metrics` endpoint.
 - **Per-user preferences** (theme, nav state, FHIR version, tenant, saved and
-  recent queries) roam in the `/_user/settings` document: weak `ETag`, JSON merge
-  patch, `If-Match` on write. Tenant-derived keys live under a reserved
-  `byTenant` map so a tenant purge can reach them.
+  recent queries, and — since #754/#755 — every sidebar rail's `rails.<page>`
+  record of `last`/`recent`, tenant-scoped, see `rail_state`) roam in the
+  `/_user/settings` document: weak `ETag`, JSON merge patch, `If-Match` on
+  write. Tenant-derived keys live under a reserved `byTenant` map so a tenant
+  purge can reach them. The server renders the "Recently used" group from
+  `recent` on every rail but Compartments — its 4-5 definitions make a group
+  noise, so it remembers only `last`; with no settings store configured, there
+  is nothing to render and every rail opens on its page default instead.
 
 ### Internationalization
 
