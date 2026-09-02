@@ -1,6 +1,6 @@
 //! ResourceStorage implementation for MongoDB.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -18,7 +18,7 @@ use crate::core::{
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
     PurgableStorage, ResourceStorage, SettingsStore, SystemHistoryProvider, TypeHistoryProvider,
     VersionedStorage, bundle_if_match_gate, bundle_if_none_exist_gate, if_match_field_satisfied,
-    normalize_etag,
+    normalize_etag, not_supported_entry,
 };
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
@@ -28,7 +28,7 @@ use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
-use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
+use crate::types::{CursorValue, Page, PageCursor, PageInfo, SearchQuery, StoredResource};
 
 use super::MongoBackend;
 
@@ -2686,6 +2686,13 @@ impl MongoBackend {
                     })?;
 
                 if let Some(search_params) = entry.if_none_exist.as_ref() {
+                    if self.is_search_offloaded() {
+                        return Ok(not_supported_entry(
+                            "ifNoneExist cannot be resolved inside a transaction when search \
+                             is offloaded to a secondary backend; submit the entry in a batch \
+                             Bundle instead",
+                        ));
+                    }
                     let matches = self
                         .find_matching_resources_in_bundle_transaction(
                             db,
@@ -3328,47 +3335,79 @@ impl MongoBackend {
             return Ok(Vec::new());
         }
 
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params);
+        let query = SearchQuery {
+            resource_type: resource_type.to_string(),
+            parameters: typed_params,
+            count: Some(1000),
+            ..Default::default()
+        };
+
         let tenant_id = tenant.tenant_id().as_str();
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let mut matched_ids: Option<HashSet<String>> = None;
 
-        let cursor = resources
-            .find(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "is_deleted": false,
-            })
-            .session(&mut *session)
-            .await
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to query conditional matches in transaction: {}",
-                    e
-                ))
-            })?;
+        for param in &query.parameters {
+            if matches!(param.name.as_str(), "_id" | "_lastUpdated") {
+                continue;
+            }
 
-        let docs = collect_session_documents(cursor, session).await?;
-        let mut matches = Vec::new();
+            let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+            let pipeline = vec![
+                doc! { "$match": filter },
+                doc! { "$group": { "_id": "$resource_id" } },
+            ];
+            let cursor = search_index
+                .aggregate(pipeline)
+                .session(&mut *session)
+                .await
+                .map_err(|e| {
+                    internal_error(format!(
+                        "Failed to query search_index in transaction: {}",
+                        e
+                    ))
+                })?;
+            let docs = collect_session_documents(cursor, session).await?;
+            let ids: HashSet<String> = docs
+                .into_iter()
+                .filter_map(|d| d.get_str("_id").ok().map(str::to_string))
+                .collect();
 
-        for doc in docs {
-            let payload = doc.get_document("data").map_err(|e| {
-                internal_error(format!(
-                    "Missing payload while matching conditionals: {}",
-                    e
-                ))
-            })?;
-            let resource = document_to_value(payload)?;
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
 
-            if resource_matches_bundle_search_params(&resource, &parsed_params)
-                && doc
-                    .get_str("resource_type")
-                    .map(|rt| rt == resource_type)
-                    .unwrap_or(true)
-            {
-                matches.push(document_to_stored_resource(&doc, tenant, resource_type)?);
+            matched_ids = Some(match matched_ids {
+                Some(current) => current.intersection(&ids).cloned().collect(),
+                None => ids,
+            });
+
+            if matched_ids.as_ref().is_some_and(|s| s.is_empty()) {
+                return Ok(Vec::new());
             }
         }
 
-        Ok(matches)
+        let filter = self.build_resource_filter(
+            tenant_id,
+            resource_type,
+            &query,
+            matched_ids.as_ref(),
+            None,
+        )?;
+
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let cursor = resources
+            .find(filter)
+            .session(&mut *session)
+            .await
+            .map_err(|e| {
+                internal_error(format!("Failed to query resources in transaction: {}", e))
+            })?;
+        let docs = collect_session_documents(cursor, session).await?;
+
+        docs.into_iter()
+            .map(|doc| document_to_stored_resource(&doc, tenant, resource_type))
+            .collect()
     }
 
     async fn index_resource_in_bundle_transaction(
@@ -3491,93 +3530,6 @@ impl MongoBackend {
                 },
             ))
         }
-    }
-}
-
-fn resource_matches_bundle_search_params(resource: &Value, params: &[(String, String)]) -> bool {
-    params.iter().all(|(name, expected)| match name.as_str() {
-        "_id" => resource
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| id == expected),
-        "identifier" => resource_identifier_matches(resource, expected),
-        _ => resource_field_matches(resource.get(name), expected),
-    })
-}
-
-fn resource_identifier_matches(resource: &Value, expected: &str) -> bool {
-    let Some(identifier_value) = resource.get("identifier") else {
-        return false;
-    };
-
-    let (system, value, has_separator) = if let Some((system, value)) = expected.split_once('|') {
-        (system, value, true)
-    } else {
-        ("", expected, false)
-    };
-
-    match identifier_value {
-        Value::Array(items) => items
-            .iter()
-            .any(|item| match_identifier_item(item, system, value, has_separator)),
-        Value::Object(_) => match_identifier_item(identifier_value, system, value, has_separator),
-        _ => false,
-    }
-}
-
-fn match_identifier_item(item: &Value, system: &str, value: &str, has_separator: bool) -> bool {
-    let item_system = item.get("system").and_then(Value::as_str);
-    let item_value = item.get("value").and_then(Value::as_str);
-
-    if has_separator {
-        let system_matches = if system.is_empty() {
-            true
-        } else {
-            item_system == Some(system)
-        };
-        let value_matches = if value.is_empty() {
-            true
-        } else {
-            item_value == Some(value)
-        };
-
-        system_matches && value_matches
-    } else {
-        item_value == Some(value)
-    }
-}
-
-fn resource_field_matches(value: Option<&Value>, expected: &str) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-
-    match value {
-        Value::String(s) => s == expected,
-        Value::Array(items) => items
-            .iter()
-            .any(|item| resource_field_matches(Some(item), expected)),
-        Value::Object(map) => {
-            if map
-                .get("reference")
-                .and_then(Value::as_str)
-                .is_some_and(|reference| reference == expected)
-            {
-                return true;
-            }
-
-            if map
-                .get("value")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == expected)
-            {
-                return true;
-            }
-
-            map.values()
-                .any(|nested| resource_field_matches(Some(nested), expected))
-        }
-        _ => false,
     }
 }
 

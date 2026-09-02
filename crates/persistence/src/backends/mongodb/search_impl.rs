@@ -807,7 +807,7 @@ impl MongoBackend {
         Ok(Some(ids))
     }
 
-    fn build_search_index_filter(
+    pub(super) fn build_search_index_filter(
         &self,
         tenant_id: &str,
         resource_type: &str,
@@ -1171,7 +1171,7 @@ impl MongoBackend {
         }
     }
 
-    fn build_resource_filter(
+    pub(super) fn build_resource_filter(
         &self,
         tenant_id: &str,
         resource_type: &str,
@@ -1423,7 +1423,7 @@ impl MongoBackend {
         Ok(result.resources.items)
     }
 
-    fn build_search_parameters(
+    pub(super) fn build_search_parameters(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
