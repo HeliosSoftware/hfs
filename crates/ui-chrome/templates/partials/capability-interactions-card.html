@@ -24,7 +24,7 @@
   <p class="notice notice--warn">{{ notice }}</p>
   {%- else %}
   <div class="card__body">
-    <p>
+    <div class="detail__tags cap-interaction-tags">
       {% for i in interactions %}
       {% if !i.href.is_empty() %}
       <a class="tag {{ i.tag_class }}" href="{{ i.href }}" target="_blank" rel="noopener">{{ i.code }}</a>
@@ -32,7 +32,7 @@
       <span class="tag {{ i.tag_class }}">{{ i.code }}</span>
       {% endif %}
       {% endfor %}
-    </p>
+    </div>
     {% if let Some(href) = transaction_note_href %}
     <p class="cap-transaction-note">
       {{ i18n.t("cap-transaction-note") }}

@@ -532,6 +532,42 @@ test("every exercised detail field gets external spacing from its direct parent"
   }
 });
 
+test("Capability cards share edge-to-edge headers and compact interaction spacing", async ({ page }) => {
+  await page.goto("/ui/capability-statement", { waitUntil: "networkidle" });
+
+  for (const selector of [".cap-operations-card", ".cap-resource-card"]) {
+    const geometry = await page.locator(selector).evaluate((card) => {
+      const header = card.querySelector<HTMLElement>(":scope > .card-head")!;
+      const cardBox = card.getBoundingClientRect();
+      const headerBox = header.getBoundingClientRect();
+      const heading = header.querySelector<HTMLElement>("h3")!;
+      return {
+        leftInset: headerBox.left - cardBox.left,
+        rightInset: cardBox.right - headerBox.right,
+        headingFont: getComputedStyle(heading).fontSize,
+      };
+    });
+    expect(Math.abs(geometry.leftInset)).toBeLessThanOrEqual(1);
+    expect(Math.abs(geometry.rightInset)).toBeLessThanOrEqual(1);
+    expect(geometry.headingFont).toBe("13px");
+  }
+
+  const interactions = page.locator(".cap-interaction-tags");
+  await expect(interactions).toHaveCSS("display", "flex");
+  await expect(interactions).toHaveCSS("margin-top", "0px");
+  await expect(interactions).toHaveCSS("margin-left", "0px");
+  const firstTag = interactions.locator(":scope > .tag").first();
+  const alignment = await interactions.evaluate((row) => {
+    const tag = row.querySelector<HTMLElement>(":scope > .tag")!;
+    const rowBox = row.getBoundingClientRect();
+    const tagBox = tag.getBoundingClientRect();
+    return { left: tagBox.left - rowBox.left, top: tagBox.top - rowBox.top };
+  });
+  expect(alignment.left).toBe(0);
+  expect(alignment.top).toBe(0);
+  await expect(firstTag).toBeVisible();
+});
+
 for (const viewport of [
   { width: 1440, height: 900, columns: 2 },
   { width: 1240, height: 800, columns: 1 },

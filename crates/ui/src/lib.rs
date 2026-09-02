@@ -1225,6 +1225,10 @@ pub fn mount_with_conformance_source_and_runtime(
             "/ui/capability-statement/json-fragment",
             get(capability_json_fragment),
         )
+        .route(
+            "/ui/capability-statement/json-expand",
+            axum::routing::post(capability_json_expand),
+        )
         // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
         .route("/ui/batch", get(batch_page))
         // SQL on FHIR workspaces (#649).
@@ -3523,7 +3527,8 @@ impl RenderedCapabilityCards {
         raw_requested: bool,
         raw_text: &str,
         raw_url: &str,
-        fragment_url: &str,
+        expand_url: &str,
+        initial_outline: Option<&capability_json::Outline>,
     ) -> Result<Self, askama::Error> {
         let cards = helios_ui_chrome::capability::CapabilityCards::new(i18n, view)
             .transaction_note_href(Some(ROLE_MATRIX_URL))
@@ -3538,7 +3543,13 @@ impl RenderedCapabilityCards {
             interactions: cards.interactions()?,
             operations: cards.operations()?,
             resources: cards.resources()?,
-            raw: cards.raw(raw_requested, raw_text, raw_url, fragment_url)?,
+            raw: cards.raw(
+                raw_requested,
+                raw_text,
+                raw_url,
+                expand_url,
+                initial_outline,
+            )?,
         })
     }
 }
@@ -3617,6 +3628,12 @@ fn capability_json_fragment_endpoint(
     }
 }
 
+fn capability_json_expand_url(version: helios_fhir::FhirVersion) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("version", version.as_str());
+    format!("/ui/capability-statement/json-expand?{}", query.finish())
+}
+
 async fn capability_json_fragment(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -3661,6 +3678,73 @@ async fn capability_json_fragment(
     }
 }
 
+async fn capability_json_expand(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<CapabilityJsonQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let version = match query.version.as_deref() {
+        Some(value) => match search_params::version_from_str(value) {
+            Some(version) => version,
+            None => return (StatusCode::BAD_REQUEST, "Unsupported FHIR version").into_response(),
+        },
+        None => rv.0,
+    };
+    if !headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            value
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid JSON page state").into_response();
+    }
+    let pages = match capability_json::parse_page_descriptors(&body) {
+        Ok(pages) => pages,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON page state").into_response(),
+    };
+    let statement = match state.conformance.metadata(version, &rt.id).await {
+        Ok(statement) => statement,
+        Err(error) => {
+            tracing::warn!("CapabilityStatement aggregate fetch failed: {error}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CapabilityStatement is unavailable",
+            )
+                .into_response();
+        }
+    };
+    let i18n = I18n::new(locale);
+    let expanded = match capability_json::plan_expanded(
+        &statement,
+        &pages,
+        capability_json_fragment_endpoint(version),
+    ) {
+        Ok(expanded) => expanded,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON page state").into_response(),
+    };
+    match capability_json::render_expanded(&i18n, &expanded) {
+        Ok(html) => Html(html).into_response(),
+        Err(capability_json::ExpandedRenderError::TooLarge) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "CapabilityStatement expansion exceeds the rendering budget",
+        )
+            .into_response(),
+        Err(capability_json::ExpandedRenderError::Template(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render error: {error}"),
+        )
+            .into_response(),
+    }
+}
+
 async fn capability_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -3676,8 +3760,7 @@ async fn capability_page(
         .unwrap_or(rv.0);
     let raw_requested = query.raw.as_deref() == Some("1");
     let raw_url = capability_raw_url(&filter, version);
-    let fragment_url =
-        capability_json::root_fragment_url(capability_json_fragment_endpoint(version));
+    let expand_url = capability_json_expand_url(version);
     let i18n = I18n::new(locale);
     let fetched = state.conformance.metadata(version, &rt.id).await;
     let cards = match fetched {
@@ -3693,6 +3776,20 @@ async fn capability_page(
             } else {
                 String::new()
             };
+            let initial_outline = if raw_requested {
+                None
+            } else {
+                match capability_json::plan(
+                    &statement,
+                    "",
+                    0,
+                    capability_json::DEFAULT_PAGE_SIZE,
+                    capability_json_fragment_endpoint(version),
+                ) {
+                    Ok(capability_json::View::Outline(outline)) => Some(outline),
+                    Ok(capability_json::View::Full(_)) | Err(_) => None,
+                }
+            };
             match RenderedCapabilityCards::render(
                 &i18n,
                 &view,
@@ -3701,7 +3798,8 @@ async fn capability_page(
                 raw_requested,
                 &raw_text,
                 &raw_url,
-                &fragment_url,
+                &expand_url,
+                initial_outline.as_ref(),
             ) {
                 Ok(cards) => Some(cards),
                 Err(error) => {

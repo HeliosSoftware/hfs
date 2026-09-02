@@ -202,8 +202,12 @@ test("the CapabilityStatement raw fallback is plain JSON with no JavaScript", as
   capabilityStatement,
 }) => {
   await capabilityStatement.goto("?filter=Patient");
-  await capabilityStatement.rawSummary.click();
-  await expect(capabilityStatement.rawLoading).toBeHidden();
+  await expect(capabilityStatement.rawCard).toBeVisible();
+  await expect(capabilityStatement.jsonOutline).toBeVisible();
+  await expect(capabilityStatement.jsonOutline).toHaveAttribute("data-path", "");
+  await expect(capabilityStatement.jsonOutline.locator("details[open]")).toHaveCount(0);
+  await expect(capabilityStatement.rawActions).toBeHidden();
+  await expect(capabilityStatement.rawLoadLink).toBeVisible();
   await capabilityStatement.rawLoadLink.click();
 
   const url = new URL(page.url());
@@ -211,11 +215,11 @@ test("the CapabilityStatement raw fallback is plain JSON with no JavaScript", as
   expect(url.searchParams.get("raw")).toBe("1");
   expect(url.searchParams.get("version")).toBe("R4");
   expect(url.searchParams.get("filter")).toBe("Patient");
-  await expect(capabilityStatement.rawDisclosure).toHaveAttribute("open", "");
-  await expect(capabilityStatement.rawBody.locator("pre.detail__code")).toBeVisible();
-  await expect(capabilityStatement.rawBody.getByText("Plain JSON fallback", { exact: false })).toBeVisible();
-  await expect(capabilityStatement.jsonView).toHaveCount(0);
-  await expect(capabilityStatement.rawBody.locator(".json-line")).toHaveCount(0);
+  await expect(capabilityStatement.rawCard.locator("pre.detail__code")).toBeVisible();
+  await expect(capabilityStatement.rawCard.getByText("Plain JSON fallback", { exact: false })).toBeVisible();
+  await expect(capabilityStatement.rawActions).toHaveCount(0);
+  await expect(capabilityStatement.rawBody).toHaveCount(0);
+  await expect(capabilityStatement.rawCard.locator(".json-line, [data-capability-json-page]")).toHaveCount(0);
 });
 
 test("a hard navigation returns the full page, not an htmx fragment", async ({ page, chrome }) => {

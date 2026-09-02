@@ -43,8 +43,23 @@
 }
 
 @layer pages {
-/* CapabilityStatement-only presentation: keep the backend note subordinate to
-   its interaction tags, and let the resource filter fit a phone-width card. */
+/* CapabilityStatement-only presentation: all card headers stay edge-to-edge,
+   while their bodies own the content rhythm appropriate to fields, tags, or
+   tables. The generic table-card keeps its padded treatment elsewhere. */
+.cap-operations-card,
+.cap-resource-card {
+  padding: 0;
+}
+
+.cap-interaction-tags {
+  margin: 0;
+}
+
+.cap-interaction-tags > .tag {
+  margin-left: 0;
+}
+
+/* Keep the backend note subordinate to its interaction tags. */
 .cap-transaction-note {
   margin: 8px 0 0 16px;
   padding-left: 10px;
@@ -64,6 +79,25 @@
   min-width: 0;
 }
 
+.capability-raw-card > .card-head {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.capability-json-actions {
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.capability-json-actions__status:empty {
+  display: none;
+}
+
+.capability-json-fallback {
+  margin: 0 0 10px;
+}
+
 @media (max-width: 520px) {
   .cap-resource-card > .card-head {
     flex-direction: column;
@@ -73,6 +107,18 @@
   .cap-resource-filter {
     flex-basis: auto;
     width: 100%;
+  }
+
+  .capability-raw-card > .card-head {
+    align-items: stretch;
+  }
+
+  .capability-json-actions {
+    width: 100%;
+  }
+
+  .capability-json-actions__status {
+    flex-basis: 100%;
   }
 }
 }
@@ -1601,23 +1647,18 @@ select.field__input {
   color: var(--muted);
 }
 
-/* The CapabilityStatement raw view is a real link without JavaScript. Keep its
-   htmx-only progress message out of that fallback, then reveal it only while
-   htmx marks this explicit indicator as the active request indicator. */
-#capability-json-loading {
-  display: none;
-}
-
-#capability-json-loading.htmx-request {
-  display: inline-flex;
-}
-
-/* Large CapabilityStatements use a page-specific incremental tree. Only the
-   currently expanded, bounded fragments exist in the DOM. */
+/* The Raw CapabilityStatement has one keyboard-focusable scroll owner. Every
+   nested outline and shared JSON fragment remains overflow-visible inside it. */
 #capability-json-body {
   max-height: 70vh;
   overflow: auto;
-  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  outline: none;
+}
+
+#capability-json-body:focus-visible {
+  border-radius: 8px;
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 .capability-json-outline {
@@ -1654,11 +1695,14 @@ select.field__input {
 .capability-json-node > summary::-webkit-details-marker { display: none; }
 .capability-json-row__fold { flex: 0 0 18px; color: var(--muted); }
 .capability-json-node[open] > summary .capability-json-row__fold { transform: rotate(90deg); }
-.capability-json-node__body { padding-left: 18px; }
+.capability-json-node__body {
+  padding-left: 18px;
+  overflow: visible;
+}
 
 .capability-json-truncated {
   color: var(--muted);
-  font-family: var(--font-sans);
+  font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 11px;
 }
 
@@ -1668,7 +1712,7 @@ select.field__input {
   justify-content: center;
   gap: 10px;
   padding: 10px;
-  font-family: var(--font-sans);
+  font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 /* Centered-popup variant of the addbox (the Bulk Import dialogs, #527): the
