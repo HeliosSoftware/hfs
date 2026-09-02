@@ -687,17 +687,27 @@ mod query_builder_tests {
 
     #[test]
     fn test_prefix_operators() {
-        // Test all prefix-to-operator mappings by using date search
-        let prefixes_and_ops = vec![
-            (SearchPrefix::Eq, "="),
-            (SearchPrefix::Ne, "!="),
-            (SearchPrefix::Gt, ">"),
-            (SearchPrefix::Lt, "<"),
-            (SearchPrefix::Ge, ">="),
-            (SearchPrefix::Le, "<="),
+        // Day-precision prefixes compare against the value's [day, day+1)
+        // range (#871), matching the date-parameter semantics from #463: eq
+        // must mean "inside the named day", gt must exclude it entirely.
+        let cases = vec![
+            (
+                SearchPrefix::Eq,
+                "last_updated >= $1 AND last_updated < $2",
+                2,
+            ),
+            (
+                SearchPrefix::Ne,
+                "(last_updated < $1 OR last_updated >= $2)",
+                2,
+            ),
+            (SearchPrefix::Gt, "last_updated >= $1", 1),
+            (SearchPrefix::Lt, "last_updated < $1", 1),
+            (SearchPrefix::Ge, "last_updated >= $1", 1),
+            (SearchPrefix::Le, "last_updated < $1", 1),
         ];
 
-        for (prefix, expected_op) in prefixes_and_ops {
+        for (prefix, expected_sql, expected_params) in cases {
             let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
                 name: "_lastUpdated".to_string(),
                 param_type: SearchParamType::Date,
@@ -711,15 +721,37 @@ mod query_builder_tests {
             assert!(result.is_some(), "Failed for prefix {:?}", prefix);
             let fragment = result.unwrap();
             assert!(
-                fragment
-                    .sql
-                    .contains(&format!("last_updated {} $", expected_op)),
-                "Expected operator '{}' for prefix {:?}, got SQL: {}",
-                expected_op,
+                fragment.sql.contains(expected_sql),
+                "Expected '{}' for prefix {:?}, got SQL: {}",
+                expected_sql,
                 prefix,
                 fragment.sql
             );
+            assert_eq!(
+                fragment.params.len(),
+                expected_params,
+                "param count for prefix {:?}",
+                prefix
+            );
         }
+
+        // A full-precision instant is a degenerate range and falls back to
+        // scalar comparison.
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "2024-01-01T10:00:00Z")],
+            chain: vec![],
+            components: vec![],
+        });
+        let fragment = PostgresQueryBuilder::build_search_query(&query, 0)
+            .expect("full-precision instant must build");
+        assert!(
+            fragment.sql.contains("last_updated > $1"),
+            "full-precision gt must stay scalar, got SQL: {}",
+            fragment.sql
+        );
     }
 }
 
