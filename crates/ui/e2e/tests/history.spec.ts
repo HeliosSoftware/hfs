@@ -20,7 +20,10 @@ test("locating an instance loads its version rail and an adjacent diff", async (
   await history.goto();
   await history.locate("Patient", id);
 
-  await expect(history.subject).toHaveText(`Patient/${id}`);
+  // #796: the rail head is the static "Versions" label; the identity lives
+  // in the path line beneath it.
+  await expect(history.subject).toHaveText("Versions");
+  await expect(history.path).toHaveText(`/Patient/${id}/_history`);
   await expect(history.versions).toHaveCount(2);
   await expect(history.controls).toBeVisible();
   // The default adjacent comparison shows the rename in the diff.

@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 17;
+pub const SCHEMA_VERSION: i32 = 18;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -298,6 +298,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             14 => migrate_v14_to_v15(conn)?,
             15 => migrate_v15_to_v16(conn)?,
             16 => migrate_v16_to_v17(conn)?,
+            17 => migrate_v17_to_v18(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1388,6 +1389,42 @@ fn migrate_v16_to_v17(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 17 to version 18: byte-level ingest
+/// progress on manifests, so the status endpoint can report a real
+/// percentage while a file streams in.
+fn migrate_v17_to_v18(conn: &Connection) -> StorageResult<()> {
+    // The columns already exist when the table was created fresh at v18 — guard
+    // with PRAGMA table_info since SQLite has no `ADD COLUMN IF NOT EXISTS`.
+    let manifest_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(bulk_manifests)")
+            .map_err(|e| migration_err(format!("pragma bulk_manifests: {e}")))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| migration_err(format!("pragma rows: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    let adds = [
+        (
+            "bytes_processed",
+            "ALTER TABLE bulk_manifests ADD COLUMN bytes_processed INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "bytes_total",
+            "ALTER TABLE bulk_manifests ADD COLUMN bytes_total INTEGER NOT NULL DEFAULT 0",
+        ),
+    ];
+    for (col, sql) in &adds {
+        if !manifest_columns.iter().any(|c| c == col) {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("add manifest byte columns: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 /// Drop all tables (for testing).
 #[cfg(test)]
 #[allow(dead_code)]
@@ -1556,6 +1593,23 @@ mod tests {
 
         let version = get_schema_version(&conn).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// Migrations must be re-runnable: a database already carrying the latest
+    /// columns can be replayed from any earlier recorded version (tests do this,
+    /// and so does a build that stamped a version before finishing its work).
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, so every `ALTER TABLE ... ADD
+    /// COLUMN` step has to guard against the column already being there.
+    #[test]
+    fn test_migration_ladder_replays_on_a_current_database() {
+        for from in 1..SCHEMA_VERSION {
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+            set_schema_version(&conn, from).unwrap();
+            initialize_schema(&conn)
+                .unwrap_or_else(|e| panic!("replay from v{from} failed: {e:?}"));
+            assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        }
     }
 
     #[test]

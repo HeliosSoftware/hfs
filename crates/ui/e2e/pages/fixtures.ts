@@ -12,6 +12,7 @@ import { SearchPage } from "./search";
 import { SearchParametersPage } from "./search-parameters";
 import { TenantsPage } from "./tenants";
 import { BulkImportPage } from "./bulk-import";
+import { BulkExportPage } from "./bulk-export";
 import { CapabilityStatementPage } from "./capability-statement";
 
 type Fixtures = {
@@ -25,6 +26,7 @@ type Fixtures = {
   searchParameters: SearchParametersPage;
   tenants: TenantsPage;
   bulkImport: BulkImportPage;
+  bulkExport: BulkExportPage;
   capabilityStatement: CapabilityStatementPage;
 };
 
@@ -33,7 +35,32 @@ export const test = base.extend<Fixtures>({
   // the rail — so a fresh page would open with the sidebar overlaying the
   // left content edge and intercepting clicks. Park the pointer in the topbar
   // after every navigation; tests that exercise the hover do so explicitly.
+  //
+  // Rail state (the 754/755 epic) is server-side and per-user: on the
+  // default (no-auth) projects every test runs as the same `l2:` user, so a
+  // "last selected" or "recently used" recorded by one test would otherwise
+  // leak into the next one's rail. Reset the `rails` record before each test
+  // with a merge patch that deletes it (`null`), same shape and endpoint
+  // `saved-queries.js` and the theme toggle already use.
+  //
+  // Purely a test-isolation convenience, so this must be 100% best-effort:
+  // it must never fail a test regardless of what the server does with it.
+  // The `auth`/`auth-degraded` projects run against `HFS_AUTH`-enabled
+  // servers and this fixture carries no bearer token, so the request comes
+  // back 401/403 there; other legs can 501 (no settings store configured) or
+  // anything else. Any response status is fine, and a network-level failure
+  // (refused connection, timeout) is caught rather than propagated — none of
+  // that is worth ever taking down a test over.
   page: async ({ page }, use) => {
+    try {
+      await page.request.patch("/_user/settings", {
+        headers: { "Content-Type": "application/json" },
+        data: { rails: null },
+      });
+    } catch {
+      // Best-effort; see above.
+    }
+
     const goto = page.goto.bind(page);
     page.goto = (async (url: string, opts?: Parameters<typeof goto>[1]) => {
       const response = await goto(url, opts);
@@ -52,6 +79,7 @@ export const test = base.extend<Fixtures>({
   searchParameters: async ({ page }, use) => use(new SearchParametersPage(page)),
   tenants: async ({ page }, use) => use(new TenantsPage(page)),
   bulkImport: async ({ page }, use) => use(new BulkImportPage(page)),
+  bulkExport: async ({ page }, use) => use(new BulkExportPage(page)),
   capabilityStatement: async ({ page }, use) => use(new CapabilityStatementPage(page)),
 });
 

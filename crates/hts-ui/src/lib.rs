@@ -31,11 +31,16 @@
 //! the binary's own host:port. `HFS_TERMINOLOGY_SERVER` is HFS-side and has
 //! no meaning here.
 //!
-//! # Assets during Phase 1
+//! # Shared chrome and assets
 //!
-//! The `Assets` embed points at `../ui/assets`. HTS-UI and HFS-UI share CSS
-//! and vendored htmx during Phase 1; Phase 8 (post-#543) will extract those
-//! into a `helios-ui-chrome` crate (see design doc §9.2).
+//! The `Assets` embed points at `../ui/assets`: HTS-UI and HFS-UI share CSS
+//! and vendored htmx from one place (see design doc §9.2). Extracting those
+//! bytes behind a crate boundary is gated on #543.
+//!
+//! Shared *markup* already lives in [`helios_ui_chrome`], which #799
+//! introduced for the topbar account menu — see [`Chrome::user_menu`]. The
+//! crate owns templates only, not assets, so the two concerns move on their
+//! own schedules.
 
 mod capability;
 mod chart;
@@ -56,11 +61,13 @@ use axum::{
 };
 use axum_embed::ServeEmbed;
 use axum_htmx::AutoVaryLayer;
-use i18n::I18n;
 use rust_embed::RustEmbed;
 use std::sync::Arc;
 
-pub use i18n::{RequestLocale, negotiate_locale};
+// `I18n` is re-exported for `tests/chrome_parity.rs`, which rebuilds the shared
+// account menu from the real Fluent catalogs and asserts the page contains it
+// (#799). `crates/ui` exports it for the same reason.
+pub use i18n::{I18n, RequestLocale, negotiate_locale};
 // Home request-rate chart (§7.1): the sample ring lives on `HtsUiState`, so
 // its type must be nameable by the `hts` binary and by the test rings.
 // `MetricsSample`/`StatusCounts` come with it — `MetricsRing::push` takes a
@@ -81,9 +88,7 @@ pub use upstream::{
 };
 // Capability & Conformance page projections. Appended below Slice F's
 // block to avoid touching the alphabetized list.
-pub use upstream::{
-    CapabilityOperation, CapabilityRestResource, CapabilityView, TerminologyCapabilitiesView,
-};
+pub use upstream::{CapabilityView, TerminologyCapabilitiesView};
 // Slice H additions (the concept information plane, Direction B). Appended
 // below rather than folded into the alphabetized list above so the two
 // concurrent slices do not collide on the same lines.
@@ -94,9 +99,17 @@ pub use upstream::{
 
 /// Static UI assets (htmx, CSS, JS) embedded into the binary at compile time.
 ///
-/// Points at the sibling `crates/ui/assets` directory: during Phase 1 the two
-/// products share bytes to avoid duplication (see design doc §9.2). Phase 8
-/// extracts these to a shared `helios-ui-chrome` crate.
+/// Points at the sibling `crates/ui/assets` directory: the two products share
+/// bytes rather than duplicating them (see design doc §9.2), and the topbar
+/// markup that consumes those bytes is now itself shared — see
+/// [`Chrome::user_menu`].
+///
+/// The `helios-ui-chrome` crate that #799 introduced owns **markup only**. The
+/// reach across into `../ui/assets` therefore stays exactly as it is: moving
+/// the CSS, the vendored htmx and the JS behind a crate boundary is gated on
+/// #543, which has to settle asset *ownership* first. Until then this embed is
+/// the single source of those bytes for both binaries, and nothing here is
+/// waiting on a later phase.
 #[derive(Clone, RustEmbed)]
 #[folder = "../ui/assets"]
 struct Assets;
@@ -172,6 +185,27 @@ pub(crate) struct Chrome<'a> {
     pub active_page: &'a str,
     pub fhir_version: &'a str,
     pub version: &'a str,
+}
+
+impl Chrome<'_> {
+    /// Render the topbar account menu from the shared chrome (#799).
+    ///
+    /// Deliberately a method rather than a `Chrome` field: HTS has no
+    /// authenticated principal to put in one. `/ui/hts` sits outside any auth
+    /// layer (cf. #320), so no request carries a signed-in user, and
+    /// [`helios_ui_chrome::UserIdentity::default`] — every field `None`,
+    /// `can_logout: false` — *is* the signed-out shape. That is byte-identical
+    /// to what HFS renders today, because `crates/ui/src/lib.rs:400-420`
+    /// hard-codes the very same values behind its `user_*` accessors.
+    ///
+    /// Keeping it a method also leaves all ten HTS page structs untouched: the
+    /// menu costs the pages nothing until there is something to show. When the
+    /// browser login flow and the claim inventory (#724) land, the default here
+    /// gives way to real claims and both products light up from one change,
+    /// because the markup is shared rather than copied.
+    pub(crate) fn user_menu(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::user_menu(&self.i18n, helios_ui_chrome::UserIdentity::default())
+    }
 }
 
 /// Askama render helper for full-page and fragment responses that already

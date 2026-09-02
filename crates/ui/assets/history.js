@@ -25,7 +25,6 @@
   if (!root || !window.fetch) return;
 
   var messages = root.dataset;
-  var subject = document.getElementById("history-subject");
   var pathEl = document.getElementById("history-path");
   var versionsEl = document.getElementById("history-versions");
   var controls = document.getElementById("history-controls");
@@ -58,11 +57,9 @@
       .then(function (bundle) {
         versions = parseBundle(bundle);
         if (!versions.length) throw new Error("not-found");
-        subject.textContent = type + "/" + id;
         render();
       })
       .catch(function (error) {
-        subject.textContent = type + "/" + id;
         versionsEl.textContent = "";
         controls.hidden = true;
         diffEl.innerHTML =

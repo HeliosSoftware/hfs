@@ -149,7 +149,8 @@ pub use history::{
 };
 pub use preconditions::{
     EntityTag, EntityTagPrecondition, MalformedPrecondition, bundle_if_match_gate,
-    if_match_field_satisfied, precondition_failed_entry,
+    bundle_if_none_exist_gate, if_match_field_satisfied, multiple_matches_entry,
+    not_supported_entry, precondition_failed_entry,
 };
 pub use search::{
     ChainedSearchProvider, FullSearchProvider, IncludeProvider, MultiTypeSearchProvider,

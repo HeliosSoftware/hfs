@@ -198,39 +198,125 @@ const CS_DETAIL: &str = include_str!("../templates/pages/cs-detail.html");
 const VS_DETAIL: &str = include_str!("../templates/pages/vs-detail.html");
 const CM_DETAIL: &str = include_str!("../templates/pages/cm-detail.html");
 
+/// Assert one detail template carries the shared HFS back-navigation idiom.
+///
+/// Slices the `<a class="back-link" …>` element out of the template source
+/// and asserts on the slice rather than pinning the whole anchor verbatim
+/// (the shape is modelled on `crates/ui/tests/bulk_export_http.rs`). That
+/// way the chevron icon markup can be revised without breaking this ring —
+/// only the contract (href, label key, two spans, ordering) is pinned.
+fn assert_back_link(source: &str, page: &str, href: &str, key: &str) {
+    assert!(
+        source.contains("<header class=\"page-head page-head--back-link\">"),
+        "{page} must wrap its header in `<header class=\"page-head page-head--back-link\">` (#801)",
+    );
+
+    let marker = format!("<a class=\"back-link\" href=\"{href}\">");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{page} must contain the shared back link `{marker}` (#801)"));
+    let end = start
+        + source[start..]
+            .find("</a>")
+            .unwrap_or_else(|| panic!("{page}'s back link has no closing `</a>`"))
+        + "</a>".len();
+    let back_link = &source[start..end];
+
+    assert!(
+        back_link.contains("{% include \"icons/chevron-left.svg\" %}"),
+        "{page}'s back link must inline the shared chevron via `{{% include \"icons/chevron-left.svg\" %}}`",
+    );
+    assert!(
+        back_link.contains(&format!("<span>{{{{ chrome.i18n.t(\"{key}\") }}}}</span>")),
+        "{page}'s back link must label itself with the `{key}` Fluent key inside a bare <span>",
+    );
+    assert_eq!(
+        back_link.matches("<span").count(),
+        2,
+        "{page}'s back link must hold exactly two spans (icon + label): {back_link}",
+    );
+    assert!(
+        !source.contains("class=\"row-link\""),
+        "{page} must not fall back to `.row-link` — that was the #801 regression",
+    );
+    assert!(
+        !source.contains('\u{2039}'),
+        "{page} must not carry the former literal chevron and space — spacing now comes from CSS",
+    );
+
+    let back_link_position = source
+        .find("class=\"back-link\"")
+        .expect("back link marker was located above");
+    let copy_position = source.find("class=\"page-head__copy\"").unwrap_or_else(|| {
+        panic!("{page}'s header children must live inside `<div class=\"page-head__copy\">` (#801)")
+    });
+    assert!(
+        back_link_position < copy_position,
+        "{page}'s back link must precede `.page-head__copy` inside the header",
+    );
+}
+
 #[test]
 fn cs_detail_template_carries_backlink_to_code_systems_browser() {
-    // §14.5: Category C clone of `crates/ui/templates/pages/bulk-import-detail.html`
-    // — hardcoded href to the list page, chevron U+2039, Fluent title key.
-    // The hook is `.row-link`, not the old `.backlink`: the V3 layout pass
-    // dropped every HTS-only class, and `.backlink` has no rule in
-    // `crates/ui/assets/app.css`.
-    // Template-source check because the backlink lives inside
+    // §14.5 / #801: the hook is `.back-link`, wrapped by
+    // `.page-head--back-link` with the former header children moved into
+    // `.page-head__copy`. Those three are the shared back-navigation
+    // primitives (`crates/ui/assets/app.css:1866-1924`) introduced by #763,
+    // and they reach HTS through the `#[folder = "../ui/assets"]` embed in
+    // `crates/hts-ui/src/lib.rs` — so this idiom needs zero new CSS. The
+    // earlier `.row-link` pick had the right instinct (use a class the
+    // shared stylesheet actually defines) but the wrong class: `.row-link`
+    // styles table rows, which is what #801 reported.
+    //
+    // Template-source check because the back link lives inside
     // `{% if let Some(summary) = self.summary() %}` and closed-loopback
     // summaries are `None`; a source check is both stricter and cheaper
     // than standing up a per-resource mock upstream.
-    let needle = "<a class=\"row-link\" href=\"/ui/hts/code-systems\">\u{2039} {{ chrome.i18n.t(\"hts-cs-browser-title\") }}</a>";
-    assert!(
-        CS_DETAIL.contains(needle),
-        "cs-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
+    assert_back_link(
+        CS_DETAIL,
+        "cs-detail.html",
+        "/ui/hts/code-systems",
+        "hts-cs-browser-title",
     );
 }
 
 #[test]
 fn vs_detail_template_carries_backlink_to_value_sets_browser() {
-    let needle = "<a class=\"row-link\" href=\"/ui/hts/value-sets\">\u{2039} {{ chrome.i18n.t(\"hts-vs-browser-title\") }}</a>";
-    assert!(
-        VS_DETAIL.contains(needle),
-        "vs-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
+    assert_back_link(
+        VS_DETAIL,
+        "vs-detail.html",
+        "/ui/hts/value-sets",
+        "hts-vs-browser-title",
     );
 }
 
 #[test]
 fn cm_detail_template_carries_backlink_to_concept_maps_browser() {
-    let needle = "<a class=\"row-link\" href=\"/ui/hts/concept-maps\">\u{2039} {{ chrome.i18n.t(\"hts-cm-browser-title\") }}</a>";
-    assert!(
-        CM_DETAIL.contains(needle),
-        "cm-detail.html must contain the backlink verbatim (chevron U+2039, hardcoded href): {needle}",
+    assert_back_link(
+        CM_DETAIL,
+        "cm-detail.html",
+        "/ui/hts/concept-maps",
+        "hts-cm-browser-title",
+    );
+}
+
+/// The back-link chevron is a deliberate *copy*, not a shared include.
+///
+/// Neither crate ships an `askama.toml`, so Askama defaults each template
+/// root to its own `$CARGO_MANIFEST_DIR/templates`: an `{% include %}` in
+/// `crates/hts-ui` simply cannot reach `crates/ui/templates/`. The icon is
+/// therefore duplicated at `crates/hts-ui/templates/icons/chevron-left.svg`.
+/// This test makes the duplication safe by refusing to let the two copies
+/// drift — HFS and HTS back links must render the same glyph at the same
+/// size, since both are styled by the one shared `.back-link` rule.
+#[test]
+fn chevron_left_icon_matches_hfs() {
+    let hfs_icon = include_str!("../../ui/templates/icons/chevron-left.svg");
+    let hts_icon = include_str!("../templates/icons/chevron-left.svg");
+    assert_eq!(
+        hfs_icon, hts_icon,
+        "chevron-left.svg drifted between crates/ui/templates/icons/ and \
+         crates/hts-ui/templates/icons/ — re-copy the HFS original",
     );
 }
 
@@ -513,5 +599,330 @@ async fn import_js_is_served_under_hts_assets() {
     assert!(
         js.contains("hts-import-bundle"),
         "import.js must write into the shared textarea `#hts-import-bundle`",
+    );
+}
+
+// ── Track G: the account menu is the shared component, not a copy ─────
+
+// Every other track in this file works the same way: it notices, after the
+// fact, that HTS's chrome has drifted from HFS's. The account menu is the one
+// place where that job has been taken away from testing entirely. #799 moved
+// the markup into `crates/ui-chrome`, and both layouts now render it with a
+// single `{{ … user_menu(…)?|safe }}` call, so there is no second copy left to
+// drift.
+//
+// That only holds while nobody pastes the markup back. This track defends the
+// structure rather than the output: one test pins the page to the shared
+// function's exact bytes, one records that the control HTS carried alone was
+// dead markup (so it does not come back as a "missing feature"), and one fails
+// the moment either product grows its own copy of the block again.
+
+#[tokio::test]
+async fn account_menu_is_the_shared_chrome_component() {
+    // Rendered here through the same public entry point the layout uses, then
+    // demanded verbatim from the page. A look-alike does not pass.
+    //
+    // The HFS twin — `the_account_menu_is_the_shared_component_verbatim` in
+    // `crates/ui/tests/router_http.rs` — asserts this same function's output
+    // against `/ui`. Neither test names the other crate, but together they pin
+    // the two products to each other through `helios-ui-chrome`: HFS ==
+    // user_menu(..) == HTS. That is the property #799 was for, and it needs no
+    // cross-crate dev-dependency to state.
+    //
+    // `RequestLocale::default()` is `en`, which is what a request with no
+    // `?lang=`, no `hts_lang` cookie and no `Accept-Language` negotiates.
+    let i18n = helios_hts_ui::I18n::new(helios_hts_ui::RequestLocale::default());
+    // `UserIdentity::default()` is the signed-out local-operator state both
+    // products render today (#320): no display name, no photo, no Sign out.
+    let expected = helios_ui_chrome::user_menu(&i18n, helios_ui_chrome::UserIdentity::default())
+        .expect("the shared user-menu template has no fallible construct")
+        .replace("\r\n", "\n");
+
+    let response = app()
+        .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await.replace("\r\n", "\n");
+
+    assert!(
+        html.contains(&expected),
+        "the HTS topbar does not contain `helios_ui_chrome::user_menu(..)` \
+         verbatim — either the account menu was re-inlined into \
+         `crates/hts-ui/templates/layouts/base.html`, or `Chrome::user_menu` \
+         is passing something other than `UserIdentity::default()` (#799).\n\n\
+         Expected to find:\n{expected}",
+    );
+}
+
+#[tokio::test]
+async fn dead_language_switcher_and_placeholder_avatar_are_gone() {
+    // Two controls HTS carried that HFS never did. The `<nav
+    // class="lang-switcher">` of three links and the hardcoded `K` initial in
+    // the avatar were both HTS-only inventions; the language options now live
+    // inside the shared menu, and the avatar falls back to the generic user
+    // icon. Only the *markup* went — `?lang=` and the `hts_lang` cookie in
+    // `src/i18n.rs` are untouched and still drive the options in their new home.
+    let response = app()
+        .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(
+        !html.contains("lang-switcher"),
+        "the topbar `lang-switcher` nav must not render — the language options \
+         moved inside the shared account menu (#799)",
+    );
+    assert!(
+        !html.contains(">K<"),
+        "the placeholder `K` avatar initial must not render — the shared menu \
+         falls back to the generic user icon (#799)",
+    );
+
+    // Second leg: *why* it went. HTS adds no CSS of its own (it embeds
+    // `crates/ui/assets` wholesale), and `.lang-switcher` has no rule there —
+    // so those three links were rendering unstyled the whole time. This is the
+    // record that removing them restored nothing and broke nothing.
+    let css = std::fs::read_to_string("../ui/assets/app.css").expect("shared app.css");
+    assert!(
+        !css.contains(".lang-switcher"),
+        "`.lang-switcher` has gained a rule in crates/ui/assets/app.css — if \
+         the control is genuinely coming back it belongs in \
+         `crates/ui-chrome`, rendered by both products, not in HTS alone",
+    );
+}
+
+#[test]
+fn neither_layout_carries_its_own_copy_of_the_account_menu() {
+    // The anti-copy-paste guard, and the point of the whole track.
+    //
+    // Source check, not a rendered check: pasting the block back into a layout
+    // would still render *something* that looks right, and might even satisfy
+    // a substring assertion on the page. What must not exist is a second place
+    // the markup can be edited.
+    //
+    // Read HFS's off disk (as the chart track does) rather than only ours —
+    // the rule binds both products equally, and the point is to notice when
+    // *HFS* re-inlines it.
+    let hfs = std::fs::read_to_string("../ui/templates/layouts/base.html")
+        .expect("HFS base.html must be readable from the hts-ui crate directory");
+    let hts = include_str!("../templates/layouts/base.html");
+
+    // Both layouts document in `{# … #}` prose why the markup left and where
+    // it went, naming these very classes. Explaining the rule must not read as
+    // breaking it.
+    let hfs = strip_askama_comments(&hfs);
+    let hts = strip_askama_comments(hts);
+
+    for (crate_path, source) in [
+        ("crates/ui/templates/layouts/base.html", hfs.as_str()),
+        ("crates/hts-ui/templates/layouts/base.html", hts.as_str()),
+    ] {
+        for marker in [
+            "menu--user",
+            "user-menu__",
+            "topbar__avatar",
+            "icons/user.svg",
+        ] {
+            assert!(
+                !source.contains(marker),
+                "`{marker}` is back in {crate_path}.\n\n\
+                 The account menu has exactly one home: `crates/ui-chrome`. \
+                 Both layouts render it with a single \
+                 `{{{{ … user_menu(…)?|safe }}}}` call and hold none of its \
+                 markup themselves — that is the entire reason #799 exists, \
+                 because the previous arrangement (a comment asserting the two \
+                 copies were byte-for-byte identical) had already silently \
+                 stopped being true. Change the partial in \
+                 `crates/ui-chrome/templates/partials/user-menu.html` instead; \
+                 if the two products genuinely need to differ, that difference \
+                 belongs in `UserIdentity`, not in a second copy of the block.",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn favicon_link_resolves_under_the_hts_mount() {
+    // HFS points its `rel="icon"` at `/ui/assets/logo.png`; HTS must point at
+    // the same file under its own mount. Asserting only the markup would miss
+    // a prefix typo, so the second leg fetches it — the same two-legged shape
+    // `figtree_woff2_is_served_under_hts_assets` uses for the font.
+    let response = app()
+        .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("<link rel=\"icon\" type=\"image/png\" href=\"/ui/hts/assets/logo.png\">"),
+        "HTS must declare a favicon link to /ui/hts/assets/logo.png (HFS parity)",
+    );
+
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/assets/logo.png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the favicon the page links to must actually be served under \
+         /ui/hts/assets/ — a mount-prefix typo shows up here, not in the markup",
+    );
+}
+
+#[test]
+fn workbench_input_group_wrappers_all_carry_the_field_class() {
+    // `.field` (`display: block; margin-bottom: 14px` in the shared app.css)
+    // is what gives a form group its trailing gap. A `role="group"` wrapper
+    // without it contributes no margin of its own and inherits whatever its
+    // last child happens to leave behind — in the case this pins (#807) that
+    // was a `.field` whose own bottom margin collapsed out through the
+    // unstyled wrapper, so the rendered geometry happened to match. That is a
+    // coincidence of margin collapsing, not a design: give such a group a
+    // non-`.field` last child (a `.facets--bare` row, say, as the Direction
+    // group above it has) or put padding on the wrapper, and its spacing
+    // silently drops to zero.
+    //
+    // Source check across all three workbench forms rather than one rendered
+    // page: the omission was in the Forward *and* Reverse branches of the
+    // translate form, and only one of those is in the DOM at a time.
+    let templates = [
+        (
+            "crates/hts-ui/templates/partials/hts-cs-validate-input.html",
+            include_str!("../templates/partials/hts-cs-validate-input.html"),
+        ),
+        (
+            "crates/hts-ui/templates/partials/hts-cm-translate-input.html",
+            include_str!("../templates/partials/hts-cm-translate-input.html"),
+        ),
+        (
+            "crates/hts-ui/templates/partials/hts-vs-expand-input.html",
+            include_str!("../templates/partials/hts-vs-expand-input.html"),
+        ),
+    ];
+
+    let mut groups = 0usize;
+    for (path, template) in templates {
+        // `role="group"` is also discussed in these files' prose.
+        let body = strip_askama_comments(template);
+        for chunk in body.split('<').skip(1) {
+            let Some(tag) = chunk.split('>').next() else {
+                continue;
+            };
+            if !tag.contains(r#"role="group""#) {
+                continue;
+            }
+            groups += 1;
+            assert!(
+                tag.contains(r#"class="field""#),
+                "a `role=\"group\"` wrapper in {path} is missing `class=\"field\"`, \
+                 so it drops out of the form's vertical rhythm:\n\n<{tag}>",
+            );
+        }
+    }
+    assert_eq!(
+        groups, 8,
+        "expected the scan to reach all eight workbench group wrappers",
+    );
+}
+
+// ── Track H: the Raw CapabilityStatement fold's scripts are wired in ───
+
+#[tokio::test]
+async fn capability_page_loads_the_raw_fold_scripts() {
+    // Regression (#808 follow-up). The Raw CapabilityStatement card is
+    // shared markup — `helios_ui_chrome::capability::CapabilityCards::raw`
+    // — but its *behavior* is two vanilla-JS files that each page has to
+    // include itself:
+    //
+    //   * `capability-json.js` listens for the native `toggle` event on
+    //     `details[data-capability-json-node]` and fires the htmx GET at
+    //     `data-fragment-url`, so opening the fold shows the tree;
+    //   * `json-view.js` binds the per-node fold arrows inside the
+    //     fragment that swap brings back.
+    //
+    // HTS adopted the shared card while loading neither, so the fold opened
+    // onto the server-rendered "Load JSON" fallback and simply sat there.
+    // Nothing failed to compile and no template error surfaced — a missing
+    // `<script>` degrades in total silence, which is exactly why this
+    // assertion has to exist.
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/capability-statement")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("/ui/hts/assets/capability-json.js"),
+        "Capability page must load capability-json.js — without it the raw \
+         fold opens onto its static fallback and never fetches the tree",
+    );
+    assert!(
+        html.contains("/ui/hts/assets/json-view.js"),
+        "Capability page must load json-view.js (from the base layout) — \
+         without it the fold arrows inside the swapped-in tree do nothing",
+    );
+}
+
+#[tokio::test]
+async fn capability_json_js_is_served_under_hts_assets() {
+    // Second leg of the two-legged shape `favicon_link_resolves_under_the_hts_mount`
+    // uses: asserting the markup alone would miss a mount-prefix typo. The
+    // bytes live at `crates/ui/assets/capability-json.js` and reach HTS
+    // through the same embedded `../ui/assets` folder HFS serves.
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/assets/capability-json.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "capability-json.js must be served under /ui/hts/assets/",
+    );
+    let js = body_text(response).await;
+    assert!(
+        js.contains("details[data-capability-json-node]"),
+        "capability-json.js must bind the shared card's \
+         `details[data-capability-json-node]` hook",
+    );
+}
+
+#[tokio::test]
+async fn json_view_js_is_served_under_hts_assets() {
+    // The fold-arrow delegate (`crates/ui/assets/json-view.js`) is loaded
+    // globally by the HTS base layout, mirroring HFS, so every page that
+    // ever swaps in a `partials/json-view.html` tree already has it.
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/assets/json-view.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "json-view.js must be served under /ui/hts/assets/",
+    );
+    let js = body_text(response).await;
+    assert!(
+        js.contains("[data-fold]"),
+        "json-view.js must bind the `.json-line__arrow[data-fold]` controls",
     );
 }

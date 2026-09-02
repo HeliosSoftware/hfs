@@ -3,7 +3,7 @@
 //! Implements the asynchronous kick-off → poll → manifest → download → delete
 //! flow from the [Bulk Data Access IG](https://build.fhir.org/ig/HL7/bulk-data/).
 
-use std::time::Duration;
+use std::{pin::Pin, time::Duration};
 
 use axum::{
     body::Body,
@@ -21,6 +21,8 @@ use helios_persistence::core::{
     ResourceStorage, StartExportInput, TypeFilter,
 };
 use helios_persistence::error::{BulkExportError, StorageError};
+use tokio::io::AsyncRead;
+use tokio_util::io::ReaderStream;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
@@ -695,24 +697,25 @@ where
     )
     .await;
 
-    let mut reader = output
+    let reader = output
         .open_reader(&file_meta.key)
         .await
         .map_err(map_storage_err)?;
-    let mut bytes = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes)
-        .await
-        .map_err(|e| RestError::InternalError {
-            message: format!("failed to read export file: {e}"),
-        })?;
 
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/fhir+ndjson")
-        .body(Body::from(bytes))
+        // The application request timeout covers the handler future, not a
+        // returned response body. Reader errors therefore propagate through
+        // the body stream without forcing a whole-file buffer here.
+        .body(streamed_reader_body(reader))
         .map_err(|e| RestError::InternalError {
             message: e.to_string(),
         })
+}
+
+fn streamed_reader_body(reader: Pin<Box<dyn AsyncRead + Send>>) -> Body {
+    Body::from_stream(ReaderStream::new(reader))
 }
 
 /// Emits a bulk-export lifecycle `AuditEvent` when an audit sink is configured.
@@ -769,6 +772,16 @@ fn owns_job(principal: Option<&Principal>, owner_subject: Option<&str>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streamed_export_body_propagates_reader_errors() {
+        let reader = tokio_test::io::Builder::new()
+            .read(b"first chunk\n")
+            .read_error(std::io::Error::other("forced reader failure"))
+            .build();
+        let result = axum::body::to_bytes(streamed_reader_body(Box::pin(reader)), usize::MAX).await;
+        assert!(result.is_err(), "reader failure must remain a body error");
+    }
 
     #[test]
     fn presigned_download_url_is_preserved_byte_for_byte() {

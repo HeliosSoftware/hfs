@@ -148,7 +148,7 @@ impl ResourceStorage for SqliteBackend {
             .get("id")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(crate::types::new_resource_id);
 
         // Check if resource already exists
         let exists: bool = conn
@@ -2813,7 +2813,7 @@ impl ConditionalStorage for SqliteBackend {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
                 self.delete(tenant, resource_type, existing.id()).await?;
-                Ok(ConditionalDeleteResult::Deleted)
+                Ok(ConditionalDeleteResult::Deleted(existing))
             }
             n => {
                 // Multiple matches - error condition
@@ -2885,31 +2885,61 @@ impl SqliteBackend {
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        // Parse search parameters into (name, value) pairs
-        let parsed_params = parse_simple_search_params(search_params_str);
-
-        if parsed_params.is_empty() {
-            // No search params means match all - but for conditional ops this is unusual
-            // Return empty to avoid unintended matches
+        let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
             return Ok(Vec::new());
-        }
-
-        // Build SearchParameter objects by looking up types from the registry
-        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-
-        // Build a SearchQuery
-        let query = SearchQuery {
-            resource_type: resource_type.to_string(),
-            parameters: search_params,
-            // No pagination limit for conditional operations - we need all matches
-            count: Some(1000), // Reasonable upper limit for conditional matching
-            ..Default::default()
         };
 
         // Use the SearchProvider implementation which uses the search index
         let result = <Self as SearchProvider>::search(self, tenant, &query).await?;
 
         Ok(result.resources.items)
+    }
+
+    /// Resolves conditional criteria on the transaction's own connection, so
+    /// the match set includes what earlier entries of the same bundle wrote
+    /// (#511). The pooled-connection twin above cannot see those rows under
+    /// `BEGIN IMMEDIATE`.
+    fn find_matching_resources_in_tx(
+        &self,
+        tenant: &TenantContext,
+        tx: &crate::backends::sqlite::transaction::SqliteTransaction,
+        resource_type: &str,
+        search_params_str: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
+        let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
+            return Ok(Vec::new());
+        };
+
+        tx.with_connection(|conn| self.search_with_connection(conn, tenant, &query, None))
+            .map(|result| result.resources.items)
+    }
+
+    /// Builds the search a conditional interaction's criteria describe, or
+    /// `None` when the criteria are empty — matching everything would be the
+    /// literal reading, but no conditional interaction means that.
+    fn conditional_query(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params_str: &str,
+    ) -> StorageResult<Option<SearchQuery>> {
+        // Parse search parameters into (name, value) pairs
+        let parsed_params = parse_simple_search_params(search_params_str);
+
+        if parsed_params.is_empty() {
+            return Ok(None);
+        }
+
+        // Build SearchParameter objects by looking up types from the registry
+        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+
+        Ok(Some(SearchQuery {
+            resource_type: resource_type.to_string(),
+            parameters: search_params,
+            // No pagination limit for conditional operations - we need all matches
+            count: Some(1000), // Reasonable upper limit for conditional matching
+            ..Default::default()
+        }))
     }
 
     /// Builds SearchParameter objects from parsed (name, value) pairs.
@@ -3214,7 +3244,7 @@ impl BundleProvider for SqliteBackend {
                 resolve_bundle_references(resource, &reference_map);
             }
 
-            let result = self.process_bundle_entry_tx(&mut tx, entry).await;
+            let result = self.process_bundle_entry_tx(tenant, &mut tx, entry).await;
 
             match result {
                 Ok(entry_result) => {
@@ -3317,6 +3347,7 @@ impl SqliteBackend {
     /// Process a single bundle entry within a transaction.
     async fn process_bundle_entry_tx(
         &self,
+        tenant: &TenantContext,
         tx: &mut crate::backends::sqlite::transaction::SqliteTransaction,
         entry: &BundleEntry,
     ) -> StorageResult<BundleEntryResult> {
@@ -3356,6 +3387,26 @@ impl SqliteBackend {
                             },
                         )
                     })?;
+
+                if let Some(criteria) = entry.if_none_exist.as_deref() {
+                    // With search offloaded to a secondary backend the local
+                    // index is empty for every row, so an in-transaction
+                    // search would always find nothing and this arm would
+                    // create the duplicate `ifNoneExist` exists to prevent.
+                    // Refuse the entry instead; the bundle rolls back (#511).
+                    if self.is_search_offloaded() {
+                        return Ok(crate::core::not_supported_entry(
+                            "ifNoneExist cannot be resolved inside a transaction when search \
+                             is offloaded to a secondary backend; submit the entry in a batch \
+                             Bundle instead",
+                        ));
+                    }
+                    let matches =
+                        self.find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)?;
+                    if let Some(gated) = crate::core::bundle_if_none_exist_gate(matches) {
+                        return Ok(gated);
+                    }
+                }
 
                 let created = tx.create(&resource_type, resource).await?;
                 Ok(BundleEntryResult::created(created))
@@ -6043,7 +6094,7 @@ mod tests {
             .unwrap();
 
         match result {
-            ConditionalDeleteResult::Deleted => {
+            ConditionalDeleteResult::Deleted(_) => {
                 // Verify resource is deleted (read returns Gone error or None)
                 let read_result = backend.read(&tenant, "Patient", "p1").await;
                 match read_result {

@@ -1,0 +1,29 @@
+{
+  "name": "hfs-codemirror-vendor",
+  "version": "0.0.0",
+  "private": true,
+  "description": "One-off vendoring ritual: bundles CodeMirror 6 + lezer-fhirpath into a single IIFE checked in at ../../assets/vendor/codemirror.bundle.js. Never run at build time or in CI — see README.md.",
+  "type": "module",
+  "scripts": {
+    "build": "rollup -c rollup.config.js"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "6.20.3",
+    "@codemirror/commands": "6.11.0",
+    "@codemirror/lang-json": "6.0.2",
+    "@codemirror/language": "6.12.4",
+    "@codemirror/lint": "6.9.7",
+    "@codemirror/search": "6.7.1",
+    "@codemirror/state": "6.7.1",
+    "@codemirror/view": "6.43.9",
+    "@lezer/common": "1.5.2",
+    "@lezer/highlight": "1.2.3",
+    "codemirror": "6.0.2",
+    "lezer-fhirpath": "1.2.0"
+  },
+  "devDependencies": {
+    "@rollup/plugin-node-resolve": "16.0.3",
+    "@rollup/plugin-terser": "1.0.0",
+    "rollup": "4.63.1"
+  }
+}

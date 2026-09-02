@@ -7,11 +7,46 @@
 //! read-only. The fetch rides the same loopback self-call as the other
 //! conformance viewers ([`crate::conformance`]); a failed fetch degrades to a
 //! warning, never to fabricated capabilities.
+//!
+//! The projection and the cards themselves live in
+//! [`helios_ui_chrome::capability`] (#808) — HTS renders the same document
+//! from the same code, so a fix lands once. What stays here is what only HFS
+//! can supply: the [`FhirVersion`] → [`DocsVersion`] mapping, the core schema
+//! pack that decides which resource types have an official page in the
+//! release being rendered, and [`CreateTargets`], which is not part of the
+//! page at all — it is how the Resources workspace decides whether it may
+//! offer to create a type.
 
 use helios_fhir::FhirVersion;
 use helios_fhir_validator::{SchemaResolver, editor, packs};
+use helios_ui_chrome::capability::{
+    CapabilityView, CoreResourceCatalog, DocsVersion, build_view as chrome_build_view,
+};
 use serde_json::Value;
 use std::collections::HashSet;
+
+/// Read a string down a fixed path, or `""`. `CreateTargets` reads the raw
+/// statement rather than the projected view: it needs `resourceType` and
+/// `rest[].mode`, which the page never renders and the shared view therefore
+/// does not carry.
+fn str_at<'a>(value: &'a Value, path: &[&str]) -> &'a str {
+    let mut cur = value;
+    for p in path {
+        match cur.get(p) {
+            Some(v) => cur = v,
+            None => return "",
+        }
+    }
+    cur.as_str().unwrap_or("")
+}
+
+fn arr<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
 
 /// Why the Resources workspace cannot create its current resource type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,232 +151,54 @@ fn sorted_csv(values: &HashSet<String>) -> String {
     values.join(",")
 }
 
-/// The server-summary block: identity fields lifted off the statement root.
-pub(crate) struct CapabilitySummary {
-    pub description: String,
-    pub implementation_url: String,
-    pub fhir_version: String,
-    pub status: String,
-    pub kind: String,
-    pub date: String,
-    pub formats: Vec<String>,
-}
-
-/// One system-level interaction (`rest[0].interaction`).
-pub(crate) struct SystemInteraction {
-    pub code: String,
-    pub href: String,
-    pub tag_class: &'static str,
-}
-
-/// One server operation (`rest[0].operation`).
-pub(crate) struct OperationRow {
-    pub name: String,
-    /// An absolute HTTP(S) canonical, without its optional `|version` suffix.
-    /// Empty when the advertised definition is not safe to navigate to.
-    pub definition_href: String,
-    pub definition: String,
-}
-
-/// An interaction code and the semantic tag style used across UI tables.
-pub(crate) struct InteractionTag {
-    pub code: String,
-    pub tag_class: &'static str,
-}
-
-/// One per-resource row (`rest[0].resource[]`).
-pub(crate) struct ResourceRow {
-    pub resource_type: String,
-    /// A safe advertised profile, or the version's official core resource
-    /// page. Empty only when neither is safe to construct.
-    pub resource_href: String,
-    pub interactions: Vec<InteractionTag>,
-    pub search_param_count: usize,
-    pub include_count: usize,
-    pub revinclude_count: usize,
-}
-
-pub(crate) struct CapabilityView {
-    pub summary: CapabilitySummary,
-    pub interactions: Vec<SystemInteraction>,
-    pub operations: Vec<OperationRow>,
-    pub resources: Vec<ResourceRow>,
-    /// The explanatory backend-role note is rendered once, even if malformed
-    /// metadata advertises the transaction interaction more than once.
-    pub has_conditional_transaction: bool,
-}
-
-fn str_at<'a>(value: &'a Value, path: &[&str]) -> &'a str {
-    let mut cur = value;
-    for p in path {
-        match cur.get(p) {
-            Some(v) => cur = v,
-            None => return "",
-        }
-    }
-    cur.as_str().unwrap_or("")
-}
-
-fn arr<'a>(value: &'a Value, key: &str) -> &'a [Value] {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
-/// Projects the raw CapabilityStatement into the page's view. Defensive over
-/// the JSON: absent fields render empty, never panic — the statement shape
-/// varies with enabled features and FHIR version.
-pub(crate) fn build_view(statement: &Value, version: FhirVersion) -> CapabilityView {
-    let rest = arr(statement, "rest")
-        .first()
-        .cloned()
-        .unwrap_or(Value::Null);
-
-    let summary = CapabilitySummary {
-        description: str_at(statement, &["implementation", "description"]).to_string(),
-        implementation_url: str_at(statement, &["implementation", "url"]).to_string(),
-        fhir_version: str_at(statement, &["fhirVersion"]).to_string(),
-        status: str_at(statement, &["status"]).to_string(),
-        kind: str_at(statement, &["kind"]).to_string(),
-        date: str_at(statement, &["date"]).to_string(),
-        formats: arr(statement, "format")
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect(),
-    };
-
-    let interactions: Vec<SystemInteraction> = arr(&rest, "interaction")
-        .iter()
-        .map(|i| {
-            let code = str_at(i, &["code"]).to_string();
-            SystemInteraction {
-                href: system_interaction_href(version, &code).unwrap_or_default(),
-                tag_class: interaction_tag_class(&code),
-                code,
-            }
-        })
-        .collect();
-    let has_conditional_transaction = interactions.iter().any(|i| i.code == "transaction");
-
-    let operations = arr(&rest, "operation")
-        .iter()
-        .map(|o| {
-            let definition = str_at(o, &["definition"]).to_string();
-            OperationRow {
-                name: str_at(o, &["name"]).to_string(),
-                definition_href: safe_canonical_href(&definition).unwrap_or_default(),
-                definition,
-            }
-        })
-        .collect();
-
-    let registry = packs::core_registry(version);
-    let resources = arr(&rest, "resource")
-        .iter()
-        .map(|r| {
-            let resource_type = str_at(r, &["type"]).to_string();
-            let advertised_profile = str_at(r, &["profile"]);
-            let resource_href = safe_canonical_href(advertised_profile).unwrap_or_else(|| {
-                if registry
-                    .resolve(&resource_type)
-                    .is_some_and(|schema| editor::is_resource(&schema))
-                {
-                    resource_definition_href(version, &resource_type)
-                } else {
-                    String::new()
-                }
-            });
-            ResourceRow {
-                resource_type,
-                resource_href,
-                interactions: arr(r, "interaction")
-                    .iter()
-                    .map(|i| {
-                        let code = str_at(i, &["code"]).to_string();
-                        InteractionTag {
-                            tag_class: interaction_tag_class(&code),
-                            code,
-                        }
-                    })
-                    .collect(),
-                search_param_count: arr(r, "searchParam").len(),
-                include_count: arr(r, "searchInclude").len(),
-                revinclude_count: arr(r, "searchRevInclude").len(),
-            }
-        })
-        .collect();
-
-    CapabilityView {
-        summary,
-        interactions,
-        operations,
-        resources,
-        has_conditional_transaction,
-    }
-}
-
-fn fhir_docs_root(version: FhirVersion) -> &'static str {
+/// The FHIR release the shared cards should link into.
+///
+/// A total `match`, not a string round-trip: `FhirVersion`'s variants are
+/// feature-gated, so this is the one place that has to know which releases
+/// this build actually carries — and adding a release makes it fail to
+/// compile rather than silently linking at the wrong specification.
+fn docs_version(version: FhirVersion) -> DocsVersion {
     match version {
         #[cfg(feature = "R4")]
-        FhirVersion::R4 => "https://hl7.org/fhir/R4/",
+        FhirVersion::R4 => DocsVersion::R4,
         #[cfg(feature = "R4B")]
-        FhirVersion::R4B => "https://hl7.org/fhir/R4B/",
+        FhirVersion::R4B => DocsVersion::R4B,
         #[cfg(feature = "R5")]
-        FhirVersion::R5 => "https://hl7.org/fhir/R5/",
+        FhirVersion::R5 => DocsVersion::R5,
         #[cfg(feature = "R6")]
-        FhirVersion::R6 => "https://build.fhir.org/",
+        FhirVersion::R6 => DocsVersion::R6,
     }
 }
 
-fn system_interaction_href(version: FhirVersion, code: &str) -> Option<String> {
-    let fragment = match code {
-        "transaction" => "http.html#transaction",
-        "batch" => "http.html#batch",
-        "search-system" => "http.html#search",
-        "history-system" => "http.html#history",
-        _ => return None,
-    };
-    Some(format!("{}{fragment}", fhir_docs_root(version)))
+/// The release's core schema pack, answering the shared projection's one
+/// open question: does this resource type have an official page in *this*
+/// release?
+///
+/// It has to be the pack rather than a hard-coded list, because the answer
+/// moves between releases — `DocumentManifest` is R4/R4B only,
+/// `ActorDefinition` is R5/R6 only — and #797 was exactly the bug of getting
+/// that wrong.
+struct CorePack(std::sync::Arc<helios_fhir_validator::SchemaRegistry>);
+
+impl CoreResourceCatalog for CorePack {
+    fn is_core_resource(&self, resource_type: &str) -> bool {
+        self.0
+            .resolve(resource_type)
+            .is_some_and(|schema| editor::is_resource(&schema))
+    }
 }
 
-fn resource_definition_href(version: FhirVersion, resource_type: &str) -> String {
-    // Callers validate the type against the version's schema registry before
-    // deriving a path. Core resource pages use lowercase ASCII slugs.
-    format!(
-        "{}{resource_slug}.html",
-        fhir_docs_root(version),
-        resource_slug = resource_type.to_ascii_lowercase()
+/// Projects the raw CapabilityStatement into the page's view.
+///
+/// A thin adapter over [`helios_ui_chrome::capability::build_view`]: this
+/// crate contributes the release mapping and the resource catalog, and the
+/// projection itself is the one HTS renders too (#808).
+pub(crate) fn build_view(statement: &Value, version: FhirVersion) -> CapabilityView {
+    chrome_build_view(
+        statement,
+        docs_version(version),
+        &CorePack(packs::core_registry(version)),
     )
-}
-
-/// Returns an absolute HTTP(S) canonical stripped of its optional FHIR
-/// `|version` qualifier. Everything else stays visible as plain text.
-fn safe_canonical_href(canonical: &str) -> Option<String> {
-    let fragment_start = canonical.find('#').unwrap_or(canonical.len());
-    let before_fragment = &canonical[..fragment_start];
-    let fragment = &canonical[fragment_start..];
-    let base = before_fragment
-        .split_once('|')
-        .map_or(before_fragment, |(url, _)| url);
-    let raw = format!("{base}{fragment}");
-    let parsed = reqwest::Url::parse(&raw).ok()?;
-    matches!(parsed.scheme(), "http" | "https")
-        .then(|| parsed.has_host())
-        .filter(|has_host| *has_host)
-        .map(|_| raw)
-}
-
-fn interaction_tag_class(code: &str) -> &'static str {
-    match code {
-        "read" | "vread" | "search-type" | "search-system" | "history-instance"
-        | "history-type" | "history-system" => "tag--member",
-        "create" | "update" | "patch" | "batch" | "transaction" => "tag--config",
-        "delete" => "tag--excluded",
-        _ => "tag--muted",
-    }
 }
 
 #[cfg(test)]
@@ -349,228 +206,67 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The shared crate proves each [`DocsVersion`] links at the right
+    /// documentation root; this proves HFS hands it the right one. Both
+    /// halves are needed — #797 was a wrong root, and a wrong *mapping*
+    /// would look identical to the operator.
     #[test]
-    #[cfg(feature = "R4")]
-    fn projects_the_statement_defensively() {
-        let statement = json!({
-            "resourceType": "CapabilityStatement",
-            "status": "active", "kind": "instance", "date": "2026-08-24",
-            "fhirVersion": "4.0.1",
-            "format": ["application/fhir+json"],
-            "implementation": {"description": "Helios FHIR Server", "url": "http://x/"},
-            "rest": [{
-                "mode": "server",
-                "interaction": [{"code": "batch"}, {"code": "transaction"}],
-                "operation": [
-                    {"name": "export", "definition": "http://x/OperationDefinition/export"},
-                    {"name": "viewdef", "definition": "http://sql-on-fhir.org/OperationDefinition/run"}
-                ],
-                "resource": [{
-                    "type": "Patient",
-                    "interaction": [{"code": "read"}, {"code": "search-type"}],
-                    "searchParam": [{"name": "name"}, {"name": "birthdate"}],
-                    "searchInclude": ["Patient:organization"]
-                }]
-            }]
-        });
-        let view = build_view(&statement, FhirVersion::R4);
-        assert_eq!(view.summary.fhir_version, "4.0.1");
-        assert_eq!(view.summary.formats.len(), 1);
-        assert!(
-            view.interactions
-                .iter()
-                .any(|i| i.code == "transaction" && i.tag_class == "tag--config")
-        );
-        assert!(
-            view.interactions
-                .iter()
-                .any(|i| i.code == "batch" && i.tag_class == "tag--config")
-        );
-        assert_eq!(
-            view.operations[0].definition_href,
-            "http://x/OperationDefinition/export"
-        );
-        assert_eq!(
-            view.operations[1].definition_href,
-            "http://sql-on-fhir.org/OperationDefinition/run"
-        );
-        assert!(view.has_conditional_transaction);
-        assert_eq!(
-            view.resources[0].resource_href,
-            "https://hl7.org/fhir/R4/patient.html"
-        );
-        assert_eq!(view.resources[0].search_param_count, 2);
-        assert_eq!(view.resources[0].include_count, 1);
-        assert_eq!(view.resources[0].revinclude_count, 0);
-
-        // An empty statement renders empty, never panics.
-        let empty = build_view(&json!({}), FhirVersion::R4);
-        assert!(empty.resources.is_empty());
-        assert!(empty.summary.fhir_version.is_empty());
-    }
-
-    #[test]
-    fn fhir_documentation_roots_are_version_aware() {
+    fn every_enabled_release_maps_onto_its_own_documentation_root() {
         #[cfg(feature = "R4")]
-        assert_eq!(fhir_docs_root(FhirVersion::R4), "https://hl7.org/fhir/R4/");
+        assert_eq!(
+            docs_version(FhirVersion::R4).docs_root(),
+            "https://hl7.org/fhir/R4/"
+        );
         #[cfg(feature = "R4B")]
         assert_eq!(
-            fhir_docs_root(FhirVersion::R4B),
+            docs_version(FhirVersion::R4B).docs_root(),
             "https://hl7.org/fhir/R4B/"
         );
         #[cfg(feature = "R5")]
-        assert_eq!(fhir_docs_root(FhirVersion::R5), "https://hl7.org/fhir/R5/");
+        assert_eq!(
+            docs_version(FhirVersion::R5).docs_root(),
+            "https://hl7.org/fhir/R5/"
+        );
         #[cfg(feature = "R6")]
-        assert_eq!(fhir_docs_root(FhirVersion::R6), "https://build.fhir.org/");
+        assert_eq!(
+            docs_version(FhirVersion::R6).docs_root(),
+            "https://hl7.org/fhir/6.0.0-ballot4/"
+        );
     }
 
     #[test]
-    fn core_resource_fallbacks_follow_each_enabled_version_root() {
-        fn assert_fallback(version: FhirVersion, expected: &str) {
-            let statement = json!({"rest": [{"resource": [{"type": "Patient"}]}]});
+    fn hfs_core_profiles_follow_each_enabled_version_root() {
+        fn assert_core_profile(version: FhirVersion, expected: &str) {
+            let statement = json!({"rest": [{"resource": [{
+                "type": "Patient",
+                "profile": "http://hl7.org/fhir/StructureDefinition/Patient"
+            }]}]});
             let view = build_view(&statement, version);
             assert_eq!(view.resources[0].resource_href, expected);
         }
 
         #[cfg(feature = "R4")]
-        assert_fallback(FhirVersion::R4, "https://hl7.org/fhir/R4/patient.html");
+        assert_core_profile(FhirVersion::R4, "https://hl7.org/fhir/R4/patient.html");
         #[cfg(feature = "R4B")]
-        assert_fallback(FhirVersion::R4B, "https://hl7.org/fhir/R4B/patient.html");
+        assert_core_profile(FhirVersion::R4B, "https://hl7.org/fhir/R4B/patient.html");
         #[cfg(feature = "R5")]
-        assert_fallback(FhirVersion::R5, "https://hl7.org/fhir/R5/patient.html");
+        assert_core_profile(FhirVersion::R5, "https://hl7.org/fhir/R5/patient.html");
         #[cfg(feature = "R6")]
-        assert_fallback(FhirVersion::R6, "https://build.fhir.org/patient.html");
+        assert_core_profile(
+            FhirVersion::R6,
+            "https://hl7.org/fhir/6.0.0-ballot4/patient.html",
+        );
     }
 
     #[test]
     #[cfg(feature = "R4")]
-    fn system_interactions_have_exact_links_and_semantic_classes() {
-        let statement = json!({"rest": [{"interaction": [
-            {"code": "transaction"}, {"code": "batch"},
-            {"code": "search-system"}, {"code": "history-system"},
-            {"code": "read"}, {"code": "delete"}, {"code": "future-code"}
-        ]}]});
-        let view = build_view(&statement, FhirVersion::R4);
-
-        let link = |code: &str| {
-            view.interactions
-                .iter()
-                .find(|interaction| interaction.code == code)
-                .map(|interaction| interaction.href.as_str())
-                .unwrap()
-        };
-        assert_eq!(
-            link("transaction"),
-            "https://hl7.org/fhir/R4/http.html#transaction"
-        );
-        assert_eq!(link("batch"), "https://hl7.org/fhir/R4/http.html#batch");
-        assert_eq!(
-            link("search-system"),
-            "https://hl7.org/fhir/R4/http.html#search"
-        );
-        assert_eq!(
-            link("history-system"),
-            "https://hl7.org/fhir/R4/http.html#history"
-        );
-        assert_eq!(link("read"), "");
-        assert_eq!(link("future-code"), "");
-
-        let class = |code: &str| {
-            view.interactions
-                .iter()
-                .find(|interaction| interaction.code == code)
-                .map(|interaction| interaction.tag_class)
-                .unwrap()
-        };
-        assert_eq!(class("transaction"), "tag--config");
-        assert_eq!(class("read"), "tag--member");
-        assert_eq!(class("delete"), "tag--excluded");
-        assert_eq!(class("future-code"), "tag--muted");
-    }
-
-    #[test]
-    fn system_interaction_links_follow_each_enabled_version_root() {
-        fn assert_links(version: FhirVersion, root: &str) {
-            for (code, fragment) in [
-                ("transaction", "http.html#transaction"),
-                ("batch", "http.html#batch"),
-                ("search-system", "http.html#search"),
-                ("history-system", "http.html#history"),
-            ] {
-                assert_eq!(
-                    system_interaction_href(version, code),
-                    Some(format!("{root}{fragment}"))
-                );
-            }
-            assert_eq!(system_interaction_href(version, "unknown"), None);
-        }
-
-        #[cfg(feature = "R4")]
-        assert_links(FhirVersion::R4, "https://hl7.org/fhir/R4/");
-        #[cfg(feature = "R4B")]
-        assert_links(FhirVersion::R4B, "https://hl7.org/fhir/R4B/");
-        #[cfg(feature = "R5")]
-        assert_links(FhirVersion::R5, "https://hl7.org/fhir/R5/");
-        #[cfg(feature = "R6")]
-        assert_links(FhirVersion::R6, "https://build.fhir.org/");
-    }
-
-    #[test]
-    fn interaction_codes_use_the_semantic_tag_palette() {
-        for code in [
-            "read",
-            "vread",
-            "search-type",
-            "search-system",
-            "history-instance",
-            "history-type",
-            "history-system",
-        ] {
-            assert_eq!(interaction_tag_class(code), "tag--member", "{code}");
-        }
-        for code in ["create", "update", "patch", "batch", "transaction"] {
-            assert_eq!(interaction_tag_class(code), "tag--config", "{code}");
-        }
-        assert_eq!(interaction_tag_class("delete"), "tag--excluded");
-        assert_eq!(interaction_tag_class("future-code"), "tag--muted");
-    }
-
-    #[test]
-    fn canonicals_are_safe_and_strip_the_fhir_version_qualifier() {
-        assert_eq!(
-            safe_canonical_href("https://example.org/OperationDefinition/export|1.2.3"),
-            Some("https://example.org/OperationDefinition/export".to_string())
-        );
-        assert_eq!(
-            safe_canonical_href("http://example.org/StructureDefinition/Patient"),
-            Some("http://example.org/StructureDefinition/Patient".to_string())
-        );
-        assert_eq!(
-            safe_canonical_href("https://example.org/Profile|1.0#details"),
-            Some("https://example.org/Profile#details".to_string())
-        );
-        assert_eq!(
-            safe_canonical_href("https://example.org/Profile#details|part"),
-            Some("https://example.org/Profile#details|part".to_string())
-        );
-        for unsafe_value in [
-            "OperationDefinition/export",
-            "/OperationDefinition/export",
-            "javascript:alert(1)",
-            "urn:oid:1.2.3",
-            "https://",
-            "not a URL",
-        ] {
-            assert_eq!(safe_canonical_href(unsafe_value), None, "{unsafe_value}");
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "R4")]
-    fn safe_profiles_precede_known_fallbacks_and_unknown_unsafe_types_stay_plain() {
+    fn core_profiles_are_versioned_while_custom_profiles_are_preserved() {
         let statement = json!({"rest": [{"resource": [
+            {"type": "Patient", "profile": "http://hl7.org/fhir/StructureDefinition/Patient"},
+            {"type": "Patient", "profile": "https://hl7.org/fhir/StructureDefinition/Patient|4.0.1"},
             {"type": "Patient", "profile": "https://example.org/Patient|2.0"},
             {"type": "Observation", "profile": "javascript:alert(1)"},
+            {"type": "Encounter"},
             {"type": "NotARealResource", "profile": "https://example.org/custom"},
             {"type": "UnknownUnsafe", "profile": "javascript:alert(2)"},
             {"type": "UnknownMissing"},
@@ -580,29 +276,105 @@ mod tests {
 
         assert_eq!(
             view.resources[0].resource_href,
-            "https://example.org/Patient"
+            "https://hl7.org/fhir/R4/patient.html"
         );
         assert_eq!(
             view.resources[1].resource_href,
-            "https://hl7.org/fhir/R4/observation.html"
+            "https://hl7.org/fhir/R4/patient.html"
         );
         assert_eq!(
             view.resources[2].resource_href,
+            "https://example.org/Patient"
+        );
+        assert_eq!(
+            view.resources[3].resource_href,
+            "https://hl7.org/fhir/R4/observation.html"
+        );
+        assert_eq!(
+            view.resources[4].resource_href,
+            "https://hl7.org/fhir/R4/encounter.html"
+        );
+        assert_eq!(
+            view.resources[5].resource_href,
             "https://example.org/custom"
         );
-        assert!(view.resources[3].resource_href.is_empty());
-        assert!(view.resources[4].resource_href.is_empty());
-        assert!(view.resources[5].resource_href.is_empty());
+        assert!(view.resources[6].resource_href.is_empty());
+        assert!(view.resources[7].resource_href.is_empty());
+        assert!(view.resources[8].resource_href.is_empty());
     }
 
     #[test]
-    #[cfg(feature = "R4")]
-    fn duplicate_transactions_produce_one_note_state() {
-        let statement = json!({"rest": [{"interaction": [
-            {"code": "transaction"}, {"code": "transaction"}
-        ]}]});
-        let view = build_view(&statement, FhirVersion::R4);
-        assert!(view.has_conditional_transaction);
+    fn version_specific_resource_links_require_a_resource_schema() {
+        fn assert_link(version: FhirVersion, resource_type: &str, expected: &str) {
+            let statement = json!({"rest": [{"resource": [{"type": resource_type}]}]});
+            let view = build_view(&statement, version);
+            assert_eq!(view.resources[0].resource_href, expected, "{resource_type}");
+        }
+
+        #[cfg(feature = "R4")]
+        {
+            assert_link(
+                FhirVersion::R4,
+                "DocumentManifest",
+                "https://hl7.org/fhir/R4/documentmanifest.html",
+            );
+            assert_link(
+                FhirVersion::R4,
+                "Media",
+                "https://hl7.org/fhir/R4/media.html",
+            );
+            assert_link(FhirVersion::R4, "SubscriptionTopic", "");
+            assert_link(FhirVersion::R4, "ActorDefinition", "");
+        }
+        #[cfg(feature = "R4B")]
+        {
+            assert_link(
+                FhirVersion::R4B,
+                "DocumentManifest",
+                "https://hl7.org/fhir/R4B/documentmanifest.html",
+            );
+            assert_link(
+                FhirVersion::R4B,
+                "SubscriptionTopic",
+                "https://hl7.org/fhir/R4B/subscriptiontopic.html",
+            );
+            assert_link(
+                FhirVersion::R4B,
+                "Media",
+                "https://hl7.org/fhir/R4B/media.html",
+            );
+            assert_link(FhirVersion::R4B, "ActorDefinition", "");
+        }
+        #[cfg(feature = "R5")]
+        {
+            assert_link(
+                FhirVersion::R5,
+                "SubscriptionTopic",
+                "https://hl7.org/fhir/R5/subscriptiontopic.html",
+            );
+            assert_link(
+                FhirVersion::R5,
+                "ActorDefinition",
+                "https://hl7.org/fhir/R5/actordefinition.html",
+            );
+            assert_link(FhirVersion::R5, "DocumentManifest", "");
+            assert_link(FhirVersion::R5, "Media", "");
+        }
+        #[cfg(feature = "R6")]
+        {
+            assert_link(
+                FhirVersion::R6,
+                "SubscriptionTopic",
+                "https://hl7.org/fhir/6.0.0-ballot4/subscriptiontopic.html",
+            );
+            assert_link(
+                FhirVersion::R6,
+                "ActorDefinition",
+                "https://hl7.org/fhir/6.0.0-ballot4/actordefinition.html",
+            );
+            assert_link(FhirVersion::R6, "DocumentManifest", "");
+            assert_link(FhirVersion::R6, "Media", "");
+        }
     }
 
     #[test]

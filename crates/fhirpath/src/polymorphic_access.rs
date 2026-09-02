@@ -4,7 +4,8 @@
 
 use helios_fhir::FhirVersion;
 use helios_fhirpath_support::{EvaluationError, EvaluationResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 /// # Polymorphic Access
 ///
@@ -191,12 +192,26 @@ fn get_polymorphic_fields(
         && let Some(table) = helios_fhir::field_types(version)
     {
         consulted_field_types = true;
-        for (parent, field, _ty, _is_collection) in table {
-            if parent != resource_type {
-                continue;
+        // `FIELD_TYPES` is sorted by `(parent, field)` — `get_field_type`
+        // binary-searches it — so one parent's fields are contiguous, and
+        // within a parent the fields sharing a prefix are contiguous too.
+        // Seek to the first candidate and stop at the last one.
+        //
+        // This used to walk the whole table. That is 8,514 entries in R4, and
+        // the evaluator reaches here on **every member access that misses**
+        // (`crate::evaluator` falls through to `access_polymorphic_element`
+        // when `obj.get(name)` returns `None`), which on the search-parameter
+        // extraction path is most of them: a union expression tries each of its
+        // branches against every resource. It cost 11.5% of the FHIR server's
+        // CPU on the benchmark's import suite.
+        let parent_type = resource_type.as_str();
+        let start = table.partition_point(|&(p, f, _, _)| (p, f) < (parent_type, base_name));
+        for &(parent, field, _ty, _is_collection) in &table[start..] {
+            if parent != parent_type {
+                break;
             }
             let Some(suffix) = field.strip_prefix(base_name) else {
-                continue;
+                break;
             };
             if !suffix
                 .chars()
@@ -208,9 +223,9 @@ fn get_polymorphic_fields(
             if matches.iter().any(|(n, _)| n == field) {
                 continue;
             }
-            if let Some(value) = obj.get(*field) {
+            if let Some(value) = obj.get(field) {
                 let converted = convert_fhir_field_to_fhirpath_type(value, suffix);
-                matches.push(((*field).to_string(), converted));
+                matches.push((field.to_string(), converted));
             }
         }
     }
@@ -253,7 +268,10 @@ fn get_polymorphic_fields(
     // it canonical), kept stable through the structural refactor above.
     if base_name == "value"
         && matches.len() > 1
-        && obj.get("resourceType") == Some(&EvaluationResult::string("Observation".to_string()))
+        && matches!(
+            obj.get("resourceType"),
+            Some(EvaluationResult::String(rt, _, _)) if rt == "Observation"
+        )
         && let Some(idx) = matches.iter().position(|(name, _)| name == "valueQuantity")
     {
         let item = matches.remove(idx);
@@ -458,14 +476,57 @@ fn is_choice_element(field_name: &str, version: FhirVersion) -> bool {
 /// version. Tightening that is tracked separately; this function only fixes
 /// which version's table is consulted.
 fn is_polymorphic_base_in_version(name: &str, version: FhirVersion) -> bool {
-    let Some(table) = helios_fhir::field_types(version) else {
-        return false;
+    polymorphic_bases(version).is_some_and(|set| set.contains(name))
+}
+
+/// Every choice-element base declared anywhere in `version`'s `FIELD_TYPES`
+/// table, computed once and cached.
+///
+/// The set is exactly `{ f[..i] : (_, f, _, _) in table, f[i] is an ASCII
+/// uppercase letter }`, which is the same predicate the linear scan this
+/// replaces evaluated per call: `name` is a base iff some declared field is
+/// `name` followed by an uppercase letter. Building it costs one pass over the
+/// table on first use, per version actually evaluated; the scan cost one pass
+/// **per missed member access**, and the evaluator misses constantly (a union
+/// expression tries every branch against every resource).
+///
+/// Returns `None` when `version`'s feature is not compiled in — the same
+/// "unknown, answer false" case the scan had.
+fn polymorphic_bases(version: FhirVersion) -> Option<&'static HashSet<&'static str>> {
+    #[cfg(feature = "R4")]
+    static R4_BASES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    #[cfg(feature = "R4B")]
+    static R4B_BASES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    #[cfg(feature = "R5")]
+    static R5_BASES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    #[cfg(feature = "R6")]
+    static R6_BASES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+    let cell: &'static OnceLock<HashSet<&'static str>> = match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => &R4_BASES,
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => &R4B_BASES,
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => &R5_BASES,
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => &R6_BASES,
+        #[allow(unreachable_patterns)]
+        _ => return None,
     };
-    table.iter().any(|(_, f, _, _)| {
-        f.strip_prefix(name)
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(|c| c.is_ascii_uppercase())
-    })
+
+    let table = helios_fhir::field_types(version)?;
+    Some(cell.get_or_init(|| {
+        let mut set = HashSet::with_capacity(table.len() * 2);
+        for &(_, field, _, _) in table {
+            for (i, c) in field.char_indices() {
+                if c.is_ascii_uppercase() {
+                    set.insert(&field[..i]);
+                }
+            }
+        }
+        set
+    }))
 }
 
 /// Applies a type-based operation to a value, handling polymorphic choice elements.
@@ -1090,6 +1151,120 @@ mod tests {
     /// `matches` is non-empty, the prefix-scan fallback never runs, and
     /// `valueAttachment` is correctly absent. A single-variant fixture would be
     /// rescued by the fallback under both versions and would prove nothing.
+    /// The memoised base set answers exactly what the linear scan it replaced
+    /// answered, for every name the scan could ever be asked about.
+    ///
+    /// The scan was `∃ f in FIELD_TYPES : f.strip_prefix(name) starts with an
+    /// ASCII uppercase letter`. This walks the table and checks both directions
+    /// on every prefix boundary in it, plus a set of names that must stay
+    /// *false* — so a set that was merely too generous would fail too.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn polymorphic_base_set_matches_the_scan_it_replaced() {
+        let table = helios_fhir::field_types(FhirVersion::R4).expect("R4 table");
+        let scan = |name: &str| {
+            table.iter().any(|(_, f, _, _)| {
+                f.strip_prefix(name)
+                    .and_then(|rest| rest.chars().next())
+                    .is_some_and(|c| c.is_ascii_uppercase())
+            })
+        };
+
+        // Every prefix the table can produce must be reported as a base.
+        let mut checked = 0usize;
+        for &(_, field, _, _) in table {
+            for (i, c) in field.char_indices() {
+                if c.is_ascii_uppercase() {
+                    let name = &field[..i];
+                    assert!(
+                        is_polymorphic_base_in_version(name, FhirVersion::R4),
+                        "{name:?} (from {field:?}) should be a choice base"
+                    );
+                    assert!(scan(name), "scan disagrees for {name:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000, "expected a large table, checked {checked}");
+
+        // …and names the scan rejects must still be rejected.
+        for name in [
+            "definitelyNotAFhirFieldPrefix",
+            "valueQuantityX",
+            "zzz",
+            "resourceTypeX",
+        ] {
+            assert_eq!(
+                is_polymorphic_base_in_version(name, FhirVersion::R4),
+                scan(name),
+                "disagreement on {name:?}"
+            );
+        }
+    }
+
+    /// The seek in `get_polymorphic_fields` must find the same fields the full
+    /// table walk found, for every `(parent, base)` the table declares.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn polymorphic_field_seek_matches_a_full_table_walk() {
+        let table = helios_fhir::field_types(FhirVersion::R4).expect("R4 table");
+
+        // Reproduce the pre-seek selection: every (parent, field) pair where
+        // `field` is `base` plus an uppercase-initial suffix.
+        let walk = |parent_type: &str, base: &str| -> Vec<&'static str> {
+            table
+                .iter()
+                .filter(|(p, f, _, _)| {
+                    *p == parent_type
+                        && f.strip_prefix(base)
+                            .and_then(|r| r.chars().next())
+                            .is_some_and(|c| c.is_ascii_uppercase())
+                })
+                .map(|(_, f, _, _)| *f)
+                .collect()
+        };
+        let seek = |parent_type: &str, base: &str| -> Vec<&'static str> {
+            let start = table.partition_point(|&(p, f, _, _)| (p, f) < (parent_type, base));
+            let mut out = Vec::new();
+            for &(p, f, _, _) in &table[start..] {
+                if p != parent_type {
+                    break;
+                }
+                let Some(suffix) = f.strip_prefix(base) else {
+                    break;
+                };
+                if suffix
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+                {
+                    out.push(f);
+                }
+            }
+            out
+        };
+
+        let mut pairs = 0usize;
+        for &(parent, field, _, _) in table {
+            for (i, c) in field.char_indices() {
+                if c.is_ascii_uppercase() {
+                    let base = &field[..i];
+                    assert_eq!(
+                        seek(parent, base),
+                        walk(parent, base),
+                        "seek and walk disagree for {parent}.{base}"
+                    );
+                    pairs += 1;
+                }
+            }
+        }
+        assert!(pairs > 1000, "expected a large table, checked {pairs}");
+
+        // A base with no variants under this parent yields nothing either way.
+        assert_eq!(seek("Patient", "value"), walk("Patient", "value"));
+        assert!(seek("Patient", "value").is_empty());
+    }
+
     #[cfg(all(feature = "R4", feature = "R5"))]
     #[test]
     fn get_polymorphic_fields_consults_the_requested_versions_table() {

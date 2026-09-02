@@ -295,7 +295,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         requires_access_token: bool,
         oauth_metadata_urls: &[String],
         encryption_key: Option<&Value>,
-    ) -> StorageResult<Box<dyn AsyncBufRead + Send + Unpin>> {
+    ) -> StorageResult<(Box<dyn AsyncBufRead + Send + Unpin>, Option<u64>)> {
         // Resolve the key before the fetch so a misconfigured submission fails
         // without pulling the file body.
         let keys = self.resolve_keys(encryption_key)?;
@@ -329,10 +329,16 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             let bytes = self
                 .decrypt_file(bytes.to_vec(), Some(keys))
                 .map_err(|e| Self::err(format!("decrypting file {url}: {e}")))?;
-            return Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
-                bytes,
-            ))));
+            let len = bytes.len() as u64;
+            return Ok((
+                Box::new(tokio::io::BufReader::new(std::io::Cursor::new(bytes))),
+                Some(len),
+            ));
         }
+        // The advertised size, when trustworthy: reqwest reports None for a
+        // transparently decompressed body, where Content-Length would be the
+        // compressed size and a byte-based percentage would overshoot.
+        let content_length = resp.content_length();
         // Stream the (gzip-decoded) body straight through to the ingestion
         // engine, so peak memory stays bounded by the buffer size rather than
         // by the file size.
@@ -340,9 +346,10 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         let stream = resp
             .bytes_stream()
             .map_err(move |e| std::io::Error::other(format!("reading file {owned_url}: {e}")));
-        Ok(Box::new(tokio::io::BufReader::new(StreamReader::new(
-            stream,
-        ))))
+        Ok((
+            Box::new(tokio::io::BufReader::new(StreamReader::new(stream))),
+            content_length,
+        ))
     }
 }
 
@@ -482,7 +489,7 @@ mod tests {
         let url = serve_two_chunks(wait).await;
         let fetcher = fetcher();
 
-        let reader = tokio::time::timeout(
+        let (reader, _len) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             fetcher.open_file_stream(&url, &[], false, &[], None),
         )

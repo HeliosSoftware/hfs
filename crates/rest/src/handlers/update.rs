@@ -123,22 +123,6 @@ where
         .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
         .await?;
 
-    // Try to read existing resource for version check.
-    //
-    // A deleted resource is brought back to life by a subsequent update
-    // (https://hl7.org/fhir/http.html#delete), so `Gone` here is not an error:
-    // it means there is no current version to match `If-Match` against, and the
-    // storage layer restores the resource on write.
-    let existing = match state
-        .storage()
-        .read(tenant.context(), &resource_type, &id)
-        .await
-    {
-        Ok(existing) => existing,
-        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-        Err(e) => return Err(e.into()),
-    };
-
     // Handle the If-Match precondition (RFC 9110 §13.1.1).
     //
     // `If-Match` is a comma-separated list and is satisfied when ANY listed tag
@@ -150,35 +134,129 @@ where
     // `*` asserts that a current representation exists, so it does NOT license
     // an update-as-create: with no existing resource (or a deleted one, which
     // has no current representation) it fails like any other tag.
+    //
+    // Parsed before storage is touched, as `delete_handler` already does: a
+    // malformed value is rejected without costing a round trip and cannot be
+    // used as a probe.
     let if_match = conditional
         .if_match_tags()
         .map_err(|e| RestError::PreconditionFailed {
             message: format!("Malformed If-Match header: {e}"),
         })?;
 
-    let current_version = existing.as_ref().map(|stored| stored.version_id());
-    if !if_match.if_match_satisfied(current_version) {
-        let message = match current_version {
-            Some(current) => format!(
-                "If-Match precondition failed: no supplied entity-tag matches the current version W/\"{current}\""
-            ),
-            None => "If-Match precondition failed: the resource has no current version to match"
-                .to_string(),
+    // Perform the update (or create).
+    //
+    // This handler used to read the resource unconditionally and then call
+    // `create_or_update`, which reads it *again* to decide between update,
+    // create and restore. Two reads of the same row, one per layer, on every
+    // `PUT`. `patch_handler` has always done it the other way round — read
+    // once, hand the row to `update` — and this brings `PUT` into line.
+    //
+    // The two branches below are not an optimisation of one path; they are two
+    // genuinely different requests:
+    //
+    // * **No `If-Match`.** `EntityTagPrecondition::Absent` is satisfied by
+    //   *everything* (`preconditions.rs`), so the read this handler did could
+    //   not change the outcome by construction: `current_version` was computed
+    //   and then compared against a precondition that returns `true` without
+    //   looking at it. Nothing else in this function consulted `existing`. So
+    //   the read is dropped outright and `create_or_update` does the single
+    //   read it was always going to do. Last-writer-wins is preserved exactly:
+    //   the decision is still made from the row `create_or_update` reads, at
+    //   the same instant it read it before.
+    //
+    // * **`If-Match` present.** The read has to happen here, because the
+    //   precondition is evaluated here. Handing the row it produced to `update`
+    //   — rather than throwing it away and letting `create_or_update` fetch its
+    //   own — removes the second read *and closes a lost update*:
+    //
+    //     handler reads v1 → `If-Match: W/"1"` is satisfied → a concurrent
+    //     writer commits v2 → `create_or_update` reads v2 → `update` compares
+    //     and swaps against v2, succeeds, and returns 200.
+    //
+    //   The client asked to write only if the resource was still v1; it was
+    //   not, and its write silently overwrote v2 anyway. Passing the row the
+    //   precondition was actually evaluated against makes the compare-and-swap
+    //   in `update` test *that* version, so the race now ends in
+    //   `VersionConflict` → 409 instead of a lost update. The window does not
+    //   move; it is the same read-to-write gap, minus one round trip inside it.
+    //
+    //   Two consequences of that, stated rather than hidden. A racing writer
+    //   that lands between the read and the write now yields 409 where the old
+    //   code returned 200 — that is the bug being fixed, not a regression. And
+    //   if the row is *soft-deleted* in that same window, the answer is 404
+    //   (`update`'s CAS matches no live row) rather than the old 201 from
+    //   `create_or_update`'s restore path: a client that conditioned its write
+    //   on a specific live version should not silently resurrect a tombstone.
+    //
+    //   A satisfied *present* precondition implies a current representation
+    //   — `Any` requires `current_version.is_some()` and `Tags` cannot match
+    //   `None` — so `existing` is `Some` on that path. The `None` arm is
+    //   unreachable and defers to the generic path rather than panicking.
+    //
+    // `Gone` is mapped to `None` exactly as before: a deleted resource is
+    // brought back to life by a subsequent update
+    // (https://hl7.org/fhir/http.html#delete), so it is not an error — it means
+    // there is no current version to match `If-Match` against, and (on the
+    // no-precondition path) the storage layer restores the resource on write.
+    let (stored, created) = if if_match.is_present() {
+        let existing = match state
+            .storage()
+            .read(tenant.context(), &resource_type, &id)
+            .await
+        {
+            Ok(existing) => existing,
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
+            Err(e) => return Err(e.into()),
         };
-        return Err(RestError::PreconditionFailed { message });
-    }
 
-    // Perform the update (or create)
-    let (stored, created) = state
-        .storage()
-        .create_or_update(
-            tenant.context(),
-            &resource_type,
-            &id,
-            resource,
-            fhir_version,
-        )
-        .await?;
+        let current_version = existing.as_ref().map(|stored| stored.version_id());
+        if !if_match.if_match_satisfied(current_version) {
+            let message = match current_version {
+                Some(current) => format!(
+                    "If-Match precondition failed: no supplied entity-tag matches the current version W/\"{current}\""
+                ),
+                None => {
+                    "If-Match precondition failed: the resource has no current version to match"
+                        .to_string()
+                }
+            };
+            return Err(RestError::PreconditionFailed { message });
+        }
+
+        match existing {
+            Some(current) => (
+                state
+                    .storage()
+                    .update(tenant.context(), &current, resource)
+                    .await?,
+                false,
+            ),
+            None => {
+                state
+                    .storage()
+                    .create_or_update(
+                        tenant.context(),
+                        &resource_type,
+                        &id,
+                        resource,
+                        fhir_version,
+                    )
+                    .await?
+            }
+        }
+    } else {
+        state
+            .storage()
+            .create_or_update(
+                tenant.context(),
+                &resource_type,
+                &id,
+                resource,
+                fhir_version,
+            )
+            .await?
+    };
 
     // Stored StructureDefinitions feed the tenant's profile registry.
     if resource_type == "StructureDefinition" {

@@ -3609,9 +3609,10 @@ mod bulk_submit_worker {
                 _requires_access_token: bool,
                 _oauth: &[String],
                 _key: Option<&serde_json::Value>,
-            ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+            ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)>
+            {
                 let data = self.files.get(url).cloned().unwrap_or_default();
-                Ok(Box::new(BufReader::new(Cursor::new(data))))
+                Ok((Box::new(BufReader::new(Cursor::new(data))), None))
             }
         }
 

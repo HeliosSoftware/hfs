@@ -282,7 +282,7 @@ test("shared query-builder actions stay 30px while their inputs keep the field s
   }
 });
 
-test("shared back links match the Figma geometry on both consumers", async ({
+test("shared back links match the Figma geometry on every consumer", async ({
   page,
   request,
 }) => {
@@ -330,9 +330,11 @@ test("shared back links match the Figma geometry on both consumers", async ({
   expect(headerRule?.["grid-template-areas"]).toContain('"back-link ."');
   expect(headerRule?.["grid-template-areas"]).toContain('"copy action"');
 
+  // One-shot bulk import (#781) dropped the detail page's action slot; its
+  // copy column simply spans. The shared link geometry still binds both.
   const consumers = [
-    { name: "bulk import detail", route: await seedBulkImportDetail(request) },
-    { name: "active bulk exports", route: "/ui/bulk-export/active" },
+    { name: "bulk import detail", route: await seedBulkImportDetail(request), hasAction: false },
+    { name: "new bulk export", route: "/ui/bulk-export/new", hasAction: false },
   ];
   for (const theme of ["light", "dark"] as const) {
     await page.goto("/ui");
@@ -357,9 +359,13 @@ test("shared back links match the Figma geometry on both consumers", async ({
         const actionControl = action.locator(
           ":scope > a.btn, :scope > details > summary.btn",
         );
-        await expect(action).toHaveCount(1);
-        await expect(actionControl).toHaveCount(1);
-        await expect(actionControl).toBeVisible();
+        if (consumer.hasAction) {
+          await expect(action).toHaveCount(1);
+          await expect(actionControl).toHaveCount(1);
+          await expect(actionControl).toBeVisible();
+        } else {
+          await expect(action).toHaveCount(0);
+        }
         // Grid items are blockified, so the authored inline-flex computes to
         // flex here. The source-rule assertion above guards the shared value.
         await expect(link).toHaveCSS("display", "flex");
@@ -369,22 +375,24 @@ test("shared back links match the Figma geometry on both consumers", async ({
         await expect(icon).toHaveAttribute("width", "5");
         await expect(icon).toHaveAttribute("height", "8");
 
-        const [linkBox, iconBox, labelBox, titleBox, actionBox] = await Promise.all([
+        const [linkBox, iconBox, labelBox, titleBox] = await Promise.all([
           link.boundingBox(),
           icon.boundingBox(),
           label.boundingBox(),
           title.boundingBox(),
-          action.boundingBox(),
         ]);
+        const actionBox = consumer.hasAction ? await action.boundingBox() : null;
         expect(linkBox).not.toBeNull();
         expect(iconBox).not.toBeNull();
         expect(labelBox).not.toBeNull();
         expect(titleBox).not.toBeNull();
-        expect(actionBox).not.toBeNull();
         expect(Math.abs(labelBox!.x - (iconBox!.x + iconBox!.width) - 7)).toBeLessThanOrEqual(1);
         expect(Math.abs(titleBox!.y - (linkBox!.y + linkBox!.height) - 24)).toBeLessThanOrEqual(1);
-        expect(actionBox!.y).toBeGreaterThan(linkBox!.y + linkBox!.height);
-        expect(Math.abs(actionBox!.y - titleBox!.y)).toBeLessThanOrEqual(1);
+        if (consumer.hasAction) {
+          expect(actionBox).not.toBeNull();
+          expect(actionBox!.y).toBeGreaterThan(linkBox!.y + linkBox!.height);
+          expect(Math.abs(actionBox!.y - titleBox!.y)).toBeLessThanOrEqual(1);
+        }
 
         const normal = await link.evaluate((element) => {
           const style = getComputedStyle(element);

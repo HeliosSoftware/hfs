@@ -52,53 +52,57 @@
   {% endif %}
 
   {% if let Some(summary) = self.summary() %}
-    <a class="row-link" href="/ui/hts/code-systems">‹ {{ chrome.i18n.t("hts-cs-browser-title") }}</a>
+    <header class="page-head page-head--back-link">
+      <a class="back-link" href="/ui/hts/code-systems">
+        <span aria-hidden="true">{% include "icons/chevron-left.svg" %}</span>
+        <span>{{ chrome.i18n.t("hts-cs-browser-title") }}</span>
+      </a>
+      <div class="page-head__copy">
+        <span class="stat__label">{{ chrome.i18n.t("hts-cs-detail-eyebrow") }}</span>
+        <h1 id="hts-cs-detail-heading" class="page-head__title">
+          {{ summary.heading() }}
+          {% if !summary.version.is_empty() %}
+            <span class="tag tag--param">v{{ summary.version }}</span>
+          {% endif %}
+          {% if !summary.status.is_empty() %}
+            <span class="tag tag--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
+              {{ chrome.i18n.t(format!("hts-cs-status-{}", summary.status).as_str()) }}
+            </span>
+          {% endif %}
+        </h1>
+        {% if !summary.description.is_empty() %}
+          <p class="page-head__lede">{{ summary.description }}</p>
+        {% endif %}
 
-    <header class="page-head">
-      <span class="stat__label">{{ chrome.i18n.t("hts-cs-detail-eyebrow") }}</span>
-      <h1 id="hts-cs-detail-heading" class="page-head__title">
-        {{ summary.heading() }}
-        {% if !summary.version.is_empty() %}
-          <span class="tag tag--param">v{{ summary.version }}</span>
-        {% endif %}
-        {% if !summary.status.is_empty() %}
-          <span class="tag tag--{{ summary.status }}" aria-label="{{ chrome.i18n.t_arg("hts-outcome-severity", "severity", summary.status.to_string()) }}">
-            {{ chrome.i18n.t(format!("hts-cs-status-{}", summary.status).as_str()) }}
-          </span>
-        {% endif %}
-      </h1>
-      {% if !summary.description.is_empty() %}
-        <p class="page-head__lede">{{ summary.description }}</p>
-      {% endif %}
+        {#-
+          Compact fact row. Only facts HTS actually returned are chipped —
+          an absent version / content mode / count renders no chip rather
+          than an em-dash placeholder.
+        -#}
+        <div class="facets facets--bare">
+          <span class="facet-label">{{ chrome.i18n.t("hts-detail-facts-label") }}</span>
+          {% if !summary.version.is_empty() %}
+          <span class="chip">{{ chrome.i18n.t("hts-detail-version-label") }} <span class="count">{{ summary.version }}</span></span>
+          {% endif %}
+          {% if !summary.status.is_empty() %}
+          <span class="chip">{{ chrome.i18n.t("hts-detail-status-label") }} <span class="count">{{ chrome.i18n.t(format!("hts-cs-status-{}", summary.status).as_str()) }}</span></span>
+          {% endif %}
+          {% if !summary.content.is_empty() %}
+          <span class="chip">{{ chrome.i18n.t("hts-cs-detail-content-mode") }} <span class="count">{{ summary.content }}</span></span>
+          {% endif %}
+          {% if let Some(n) = summary.count %}
+          <span class="chip">{{ chrome.i18n.t("hts-cs-detail-count") }} <span class="count">{{ n }}</span></span>
+          {% endif %}
+          {% if !summary.publisher.is_empty() %}
+          <span class="chip">{{ summary.publisher }}</span>
+          {% endif %}
+        </div>
 
-      {#-
-        Compact fact row. Only facts HTS actually returned are chipped —
-        an absent version / content mode / count renders no chip rather
-        than an em-dash placeholder.
-      -#}
-      <div class="facets facets--bare">
-        <span class="facet-label">{{ chrome.i18n.t("hts-detail-facts-label") }}</span>
-        {% if !summary.version.is_empty() %}
-        <span class="chip">{{ chrome.i18n.t("hts-detail-version-label") }} <span class="count">{{ summary.version }}</span></span>
-        {% endif %}
-        {% if !summary.status.is_empty() %}
-        <span class="chip">{{ chrome.i18n.t("hts-detail-status-label") }} <span class="count">{{ chrome.i18n.t(format!("hts-cs-status-{}", summary.status).as_str()) }}</span></span>
-        {% endif %}
-        {% if !summary.content.is_empty() %}
-        <span class="chip">{{ chrome.i18n.t("hts-cs-detail-content-mode") }} <span class="count">{{ summary.content }}</span></span>
-        {% endif %}
-        {% if let Some(n) = summary.count %}
-        <span class="chip">{{ chrome.i18n.t("hts-cs-detail-count") }} <span class="count">{{ n }}</span></span>
-        {% endif %}
-        {% if !summary.publisher.is_empty() %}
-        <span class="chip">{{ summary.publisher }}</span>
-        {% endif %}
-      </div>
-
-      <div class="kv-grid">
-        <div class="detail__field detail__field--wide">
-          <span>{{ chrome.i18n.t("hts-detail-canonical-url") }}</span>
-          {% if summary.url.is_empty() %}<div>&mdash;</div>{% else %}<code>{{ summary.url }}</code>{% endif %}
+        <div class="kv-grid">
+          <div class="detail__field detail__field--wide">
+            <span>{{ chrome.i18n.t("hts-detail-canonical-url") }}</span>
+            {% if summary.url.is_empty() %}<div>&mdash;</div>{% else %}<code>{{ summary.url }}</code>{% endif %}
+          </div>
         </div>
       </div>
     </header>

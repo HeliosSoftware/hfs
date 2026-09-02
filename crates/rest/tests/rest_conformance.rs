@@ -1926,6 +1926,45 @@ mod history_reads {
         assert_eq!(v3_body["name"][0]["family"], "V3");
     }
 
+    /// A vread of the version that deleted the resource is `410 Gone`, and the
+    /// versions before it are still readable.
+    ///
+    /// FHIR's vread interaction (https://hl7.org/fhir/http.html#vread) answers a
+    /// deleted version with `410`, and the history Bundle has always agreed —
+    /// `history_entry_to_json` gives a `Delete` entry `request.method = DELETE`
+    /// and no `resource` at all. This used to return `200` with whatever body
+    /// the resource held before the delete, which is not a version it ever had.
+    ///
+    /// It is also what lets the PostgreSQL delete path stop copying that body
+    /// into `resource_history`.
+    #[tokio::test]
+    async fn test_vread_of_deleted_version_is_gone() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "vread-deleted").await;
+
+        server
+            .delete("/Patient/vread-deleted")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        // v4 is the tombstone the DELETE wrote.
+        server
+            .get("/Patient/vread-deleted/_history/4")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .assert_status(StatusCode::GONE);
+
+        // The versions the resource actually had are unaffected.
+        let v3 = server
+            .get("/Patient/vread-deleted/_history/3")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        v3.assert_status_ok();
+        let v3_body: Value = v3.json();
+        assert_eq!(v3_body["name"][0]["family"], "V3");
+    }
+
     #[tokio::test]
     async fn test_vread_unknown_version_not_found() {
         let (server, _backend) = create_test_server().await;
