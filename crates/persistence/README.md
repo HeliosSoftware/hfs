@@ -1350,6 +1350,31 @@ let async_mode = SyncMode::Asynchronous;
 let hybrid = SyncMode::Hybrid { sync_for_search: true };
 ```
 
+#### Search visibility on Elasticsearch-backed composites
+
+When Elasticsearch is the search secondary, a write can return before the
+resource is findable via search. Two independent delays contribute:
+
+1. **Composite forwarding.** In `Asynchronous` mode the composite returns as
+   soon as the primary commits and forwards the index write to Elasticsearch on
+   a background worker. `Synchronous` (or `Hybrid { sync_for_search: true }`)
+   puts the document in Elasticsearch before the write returns.
+2. **Elasticsearch refresh.** An indexed document only becomes searchable at the
+   next index refresh. By default that happens on a timer
+   (`ElasticsearchConfig::refresh_interval`, applied when an index is created;
+   existing indices keep their setting). `ElasticsearchConfig::write_refresh`
+   sets the `refresh` parameter on each index/delete request instead:
+   `WriteRefreshPolicy::False` (default) leaves it to the timer, `WaitFor`
+   blocks the write until the affected shards refresh, and `True` forces a
+   refresh per write (expensive; low-volume deployments only).
+
+Read-after-write search therefore requires **both** a synchronous sync mode and
+`write_refresh: WaitFor`; either alone still leaves a window in which an
+immediate follow-up search misses the write. The `hfs` binary exposes these as
+`HFS_COMPOSITE_SYNC_MODE`, `HFS_ELASTICSEARCH_REFRESH_INTERVAL`, and
+`HFS_ELASTICSEARCH_WRITE_REFRESH` (see the
+[hfs README](../hfs/README.md#environment-variables)).
+
 ### Cost-Based Optimization
 
 The cost estimator uses benchmark-derived costs to make routing decisions:
