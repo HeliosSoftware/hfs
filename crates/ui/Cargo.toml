@@ -13,11 +13,14 @@ keywords = ["helios-software", "fhir", "ui", "htmx"]
 # FHIR version features forward to helios-fhir so the viewer read paths
 # (SearchParameter + CompartmentDefinition fetched from the FHIR API) cover
 # exactly the versions the server is built with. R4 is the workspace default.
+# helios-sof (#753 ticket 03, ViewDefinition lint) forwards the same way: its
+# own R4/R4B/R5/R6 features gate the rest of that crate, even though
+# `lint::lint_view_definition` itself is FHIR-version-agnostic (RF5).
 default = ["R4"]
-R4 = ["helios-fhir/R4", "helios-fhir-validator/R4"]
-R4B = ["helios-fhir/R4B", "helios-fhir-validator/R4B"]
-R5 = ["helios-fhir/R5", "helios-fhir-validator/R5"]
-R6 = ["helios-fhir/R6", "helios-fhir-validator/R6"]
+R4 = ["helios-fhir/R4", "helios-fhir-validator/R4", "helios-sof/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhir-validator/R4B", "helios-sof/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhir-validator/R5", "helios-sof/R5"]
+R6 = ["helios-fhir/R6", "helios-fhir-validator/R6", "helios-sof/R6"]
 
 [dependencies]
 # Read paths into the rest of the workspace: the SearchParameter spec loader
@@ -31,6 +34,19 @@ helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
 # we deliberately do not take: the live editing loop needs the cheap structural
 # pass, not the async effects pass.
 helios-fhir-validator = { path = "../fhir-validator", version = "0.2.1", default-features = false }
+
+# ViewDefinition structural + FHIRPath-syntax linting for the CodeMirror 6
+# editor's async linter (#753 ticket 03, POC evaluation — not merged
+# upstream): `lint::lint_view_definition` backs `POST
+# /ui/sql/view-definitions/lint`. This does not contradict the
+# `helios-fhir-validator` precedent above of leaving FHIRPath out: sof's own
+# `helios-fhirpath` dependency is used here only to *parse* an expression
+# (chumsky, microseconds, no I/O) for a syntax-error span — never to
+# *evaluate* one, which is the async, terminology-touching effects pass that
+# precedent avoids. helios-sof already depends on helios-fhir + helios-fhirpath
+# with default-features = false, so this adds no new dependency to the graph,
+# only a new edge to a crate the workspace already builds for `hfs`.
+helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
 
 # Deserializes the FHIR resources fetched from the server's own
 # `/SearchParameter` and `/CompartmentDefinition` endpoints, and derives the
@@ -84,6 +100,11 @@ base64 = "0.22"
 # Compile-time, type-checked, auto-escaping templates (Jinja2-like).
 # Markup lives in templates/, never in Rust source.
 askama = "0.16"
+
+# Chrome shared with the HTS admin UI (#799): the topbar account menu's markup
+# lives there once and both products render it, so they cannot drift the way
+# they did before — see crates/ui-chrome/README.md.
+helios-ui-chrome = { path = "../ui-chrome", version = "0.2.1" }
 
 # Typed htmx header handling: the infallible `HxRequest` extractor for the
 # fragment-vs-full-page branch, and `AutoVaryLayer` for correct HTTP caching

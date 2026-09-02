@@ -82,6 +82,7 @@
     <h3>{{ i18n.t("cap-resources-heading") }}</h3>
     <!-- Server-side narrowing: a plain GET form, so it works without JS. -->
     <form class="filter-rail__search cap-resource-filter" method="get" action="/ui/capability-statement" role="search">
+      <input type="hidden" name="version" value="{{ effective_version }}">
       <input type="search" name="filter" value="{{ filter }}"
              placeholder="{{ i18n.t("cap-filter-placeholder") }}"
              aria-label="{{ i18n.t("cap-filter-placeholder") }}"
@@ -126,20 +127,31 @@
   </div>
 </section>
 
-<details class="card json-fold">
+<details class="card json-fold" id="capability-json-fold"{% if raw_requested %} open{% else %} data-capability-json-node{% endif %}>
   <summary class="card-head">
     <h3>{{ i18n.t("cap-raw-toggle") }}</h3>
     <span class="icon">{% include "icons/chevron-down.svg" %}</span>
   </summary>
-  <div class="card__body">
-    {% if raw_fallback %}
+  <div class="card__body" id="capability-json-body"{% if !raw_requested %}
+       data-capability-json-body
+       data-loading-text="{{ i18n.t("cap-raw-loading") }}"
+       data-error-text="{{ i18n.t("cap-json-load-error") }}"
+       data-fragment-url="{{ fragment_url }}"
+       hx-indicator="#capability-json-loading"{% endif %}>
+    {% if raw_requested %}
+    <p class="notice">{{ i18n.t("cap-raw-plain") }}</p>
     <pre class="detail__code">{{ raw }}</pre>
     {% else %}
-    {% include "partials/json-view.html" %}
+    <a class="btn" href="{{ raw_url }}#capability-json-fold">{{ i18n.t("cap-raw-load") }}</a>
+    <p class="busy-status htmx-indicator" id="capability-json-loading" role="status">
+      <span class="spinner" aria-hidden="true"></span>
+      {{ i18n.t("cap-raw-loading") }}
+    </p>
     {% endif %}
   </div>
 </details>
 {% else %}
 <p class="notice notice--warn">{{ i18n.t("cap-unavailable") }}</p>
 {% endif %}
+<script src="/ui/assets/capability-json.js" defer></script>
 {% endblock %}

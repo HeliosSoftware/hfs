@@ -1,16 +1,15 @@
 // The persistent app chrome (layouts/base.html): the sidebar rail (expands on
-// hover, #438), theme buttons, and the language switcher. On every full page.
+// hover, #438), theme buttons, and the account menu. On every full page.
 import type { Page, Locator } from "@playwright/test";
+import { langLink, userMenu } from "./user-menu";
 
 export type Theme = "light" | "dark";
 
 export class AppChrome {
   readonly sidebar: Locator;
-  readonly langSwitcher: Locator;
 
   constructor(readonly page: Page) {
     this.sidebar = page.locator("aside.sidebar");
-    this.langSwitcher = page.locator(".lang-switcher");
   }
 
   /** A primary nav link by its destination path, e.g. "/ui/resources". */
@@ -37,14 +36,17 @@ export class AppChrome {
   }
 
   /** A language option inside the avatar user menu (#725): a real `?lang=`
-   * link behind a `<details>` disclosure, so it works without JS. */
+   * link behind a `<details>` disclosure, so it works without JS.
+   *
+   * Delegates to `pages/user-menu.ts` — the account menu is one shared
+   * template across HFS and HTS (#799), so it gets one locator definition. */
   langLink(lang: string): Locator {
-    return this.page.locator(`.menu--user a[href*='lang=${lang}']`);
+    return langLink(this.page, lang);
   }
 
   /** The avatar disclosure in the topbar (#725). */
   get userMenu(): Locator {
-    return this.page.locator("details.menu--user");
+    return userMenu(this.page);
   }
 
   /** The FHIR-version disclosure in the sidebar footer (#343): a `<details>`

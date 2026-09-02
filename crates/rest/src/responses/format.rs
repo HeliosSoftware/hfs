@@ -21,7 +21,11 @@ pub fn format_resource_response(
     format: FhirFormat,
 ) -> Result<Response, Response> {
     match format {
-        FhirFormat::Json => Ok((status, headers, axum::Json(content.clone())).into_response()),
+        // `Json` borrows: `&Value` is `Serialize`, so the body is written
+        // straight out of the caller's value. Cloning here copied the whole
+        // response — for a searchset that is every matched resource — purely to
+        // hand `Json` an owned tree it then serializes and drops.
+        FhirFormat::Json => Ok((status, headers, axum::Json(content)).into_response()),
         #[cfg(feature = "xml")]
         FhirFormat::Xml => {
             let xml = value_to_xml(content).map_err(|e| {
@@ -41,7 +45,7 @@ pub fn format_resource_response(
         }
         FhirFormat::NdJson => {
             // NdJson is typically for bulk operations, not single resource responses
-            Ok((status, headers, axum::Json(content.clone())).into_response())
+            Ok((status, headers, axum::Json(content)).into_response())
         }
     }
 }

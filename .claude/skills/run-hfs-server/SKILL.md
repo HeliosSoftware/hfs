@@ -140,9 +140,10 @@ rules to the FHIR prefixes.
 ## Per-user UI settings
 
 `GET`/`PUT`/`PATCH /_user/settings` stores an opaque, per-user JSON document (UI
-theme, default tenant, saved and recent queries). It is keyed by user only, never
-by tenant. Responses carry a weak `ETag` (`W/"{version}"`); clients may send
-`If-Match` on a write for optimistic concurrency.
+theme, default tenant, saved and recent queries, and each sidebar rail's
+`rails.<page>` last-selection/recents, see `/work-with-ui`). It is keyed by
+user only, never by tenant. Responses carry a weak `ETag` (`W/"{version}"`);
+clients may send `If-Match` on a write for optimistic concurrency.
 
 ### Tenant scoping inside the document (#313)
 

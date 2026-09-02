@@ -8,7 +8,7 @@
 //! poll per htmx fetch, exactly like the import workspace's recipient
 //! polling.
 //!
-//! Kick-offs and polls are self-calls against the configured loopback HFS base,
+//! Kick-offs, Patient lookup, and polls are self-calls against the configured loopback HFS base,
 //! with the caller's own `Authorization` and tenant forwarded — so the export
 //! runs with the user's credentials, not a service account. Advertised public
 //! paths are validated, but stored URLs are never used as outbound authorities.
@@ -25,13 +25,16 @@ use axum::{
     Extension,
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::CACHE_CONTROL},
     response::{IntoResponse, Redirect, Response},
 };
+use axum_htmx::HxRequest;
 use chrono::{Duration, SecondsFormat, Utc};
 use futures_lite::io::AsyncWriteExt as FuturesAsyncWriteExt;
+use helios_fhir::FhirVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 use tokio::io::AsyncReadExt;
 
 use crate::i18n::{I18n, RequestLocale};
@@ -60,6 +63,13 @@ pub struct ExportJob {
     pub type_filter: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub since: String,
+    /// Canonical `Patient/{logical-id}` references selected for this export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patient_refs: Vec<String>,
+    /// The request version used for the original kick-off. Optional so jobs
+    /// persisted by older HFS versions continue to deserialize and retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fhir_version: Option<FhirVersion>,
     /// `in-progress` | `complete` | `failed` | `cancelled`.
     #[serde(default)]
     pub status: String,
@@ -170,6 +180,12 @@ fn job_merge_value(job: &ExportJob) -> Value {
         "elements": optional_string(&job.elements),
         "typeFilter": optional_string(&job.type_filter),
         "since": optional_string(&job.since),
+        "patientRefs": if job.patient_refs.is_empty() {
+            Value::Null
+        } else {
+            json!(&job.patient_refs)
+        },
+        "fhirVersion": serde_json::to_value(job.fhir_version).unwrap_or(Value::Null),
         "status": job.status,
         "pollUrl": optional_string(&job.poll_url),
         "remoteJob": match job.remote_job {
@@ -561,6 +577,8 @@ struct BulkExportPage {
     available: bool,
     resource_types: Vec<String>,
     error: Option<String>,
+    patient_hint: String,
+    patient_placeholder: String,
 }
 
 #[derive(Template)]
@@ -589,6 +607,20 @@ pub(crate) struct ActiveQuery {
     delete_error: Option<String>,
 }
 
+struct PatientOption {
+    value: String,
+    label: String,
+}
+
+#[derive(Template)]
+#[template(path = "partials/bulk_export_patient_options.html")]
+struct PatientOptionsFragment {
+    options: Vec<PatientOption>,
+    message: String,
+    error: bool,
+    id_only: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -600,16 +632,42 @@ pub async fn page(
     rv: RequestVersion,
     rt: RequestTenant,
 ) -> Response {
+    bulk_export_page(&state, locale, rv.0, &rt, None).await
+}
+
+async fn bulk_export_page(
+    state: &WebState,
+    locale: RequestLocale,
+    version: FhirVersion,
+    rt: &RequestTenant,
+    error: Option<String>,
+) -> Response {
     let i18n = I18n::new(locale);
-    let status = current_status(&state, rv.0, &rt);
-    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
+    let status = current_status(state, version, rt);
+    let resource_types = state
+        .compartments
+        .resource_type_names(&rt.id, version)
+        .await;
+    let (patient_hint, patient_placeholder) = if state.patient_name_search.load(Ordering::Relaxed) {
+        (
+            i18n.t("bulk-export-field-patients-hint"),
+            i18n.t("bulk-export-field-patients-placeholder"),
+        )
+    } else {
+        (
+            i18n.t("bulk-export-field-patients-id-only-hint"),
+            i18n.t("bulk-export-field-patients-id-only-placeholder"),
+        )
+    };
     render(BulkExportPage {
         status,
         i18n,
         active_page: "bulk-export",
         available: state.settings.is_some(),
         resource_types,
-        error: None,
+        error,
+        patient_hint,
+        patient_placeholder,
     })
 }
 
@@ -620,11 +678,13 @@ pub struct StartForm {
     pub name: String,
     pub scope: String,
     pub group_id: String,
+    pub all_types: bool,
     pub types: Vec<String>,
     pub elements: String,
     pub type_filter: String,
     pub since_preset: String,
     pub since_custom: String,
+    pub patients: Vec<String>,
 }
 
 fn parse_start_form(body: &str) -> StartForm {
@@ -635,11 +695,16 @@ fn parse_start_form(body: &str) -> StartForm {
             "name" => form.name = value,
             "scope" => form.scope = value,
             "group_id" => form.group_id = value,
+            // Presence is the HTML checkbox contract. Its value is deliberately
+            // ignored so field order and manipulated payloads cannot make
+            // individual types override "All Resources".
+            "all_types" => form.all_types = true,
             "types" => form.types.push(value),
             "elements" => form.elements = value,
             "type_filter" => form.type_filter = value,
             "since_preset" => form.since_preset = value,
             "since_custom" => form.since_custom = value,
+            "patient" => form.patients.push(value),
             _ => {}
         }
     }
@@ -658,9 +723,249 @@ fn since_instant(preset: &str, custom: &str) -> String {
     }
 }
 
+fn canonical_patient_ref(value: &str) -> Option<String> {
+    let value = value.trim();
+    let id = value.strip_prefix("Patient/").unwrap_or(value);
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return None;
+    }
+    Some(format!("Patient/{id}"))
+}
+
+fn parse_patient_refs(values: &[String]) -> Result<Vec<String>, ()> {
+    let mut refs = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in values {
+        for candidate in raw.split([',', '\n', '\r']) {
+            let candidate = candidate.trim();
+            if candidate.is_empty() {
+                continue;
+            }
+            let reference = canonical_patient_ref(candidate).ok_or(())?;
+            if seen.insert(reference.clone()) {
+                refs.push(reference);
+            }
+        }
+    }
+    Ok(refs)
+}
+
+fn fhir_json(version: FhirVersion) -> String {
+    format!(
+        "application/fhir+json; fhirVersion={}",
+        version.as_mime_param()
+    )
+}
+
+fn patient_option(resource: &Value) -> Option<PatientOption> {
+    if resource.get("resourceType").and_then(Value::as_str) != Some("Patient") {
+        return None;
+    }
+    let id = resource.get("id")?.as_str()?;
+    let value = canonical_patient_ref(id)?;
+    let name = resource
+        .get("name")
+        .and_then(Value::as_array)
+        .and_then(|names| names.iter().find_map(human_name_label));
+    let label = match name {
+        Some(name) if !name.is_empty() => format!("{name} — {value}"),
+        _ => value.clone(),
+    };
+    Some(PatientOption { value, label })
+}
+
+fn human_name_label(name: &Value) -> Option<String> {
+    if let Some(text) = name.get("text").and_then(Value::as_str) {
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    let given = name
+        .get("given")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|part| !part.is_empty());
+    let family = name
+        .get("family")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|part| !part.is_empty());
+    let parts: Vec<&str> = given.chain(family).collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn options_response(fragment: PatientOptionsFragment) -> Response {
+    let mut response = render(fragment);
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        "private, no-store"
+            .parse()
+            .expect("static cache-control value"),
+    );
+    response
+}
+
+fn patient_lookup_error(i18n: &I18n, id_only: bool) -> Response {
+    options_response(PatientOptionsFragment {
+        options: Vec::new(),
+        message: i18n.t("ui-combobox-error"),
+        error: true,
+        id_only,
+    })
+}
+
+/// `POST /ui/bulk-export/patient-options` — a small HTML result fragment for
+/// the progressively-enhanced Patient selector.
+pub async fn patient_options(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    HxRequest(is_htmx): HxRequest,
+    headers: HeaderMap,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    if !is_htmx {
+        return Redirect::to("/ui/bulk-export/new").into_response();
+    }
+    let i18n = I18n::new(locale);
+    let q = form_urlencoded::parse(&body)
+        .find(|(key, _)| key == "q")
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or_default();
+    let id_only = !state.patient_name_search.load(Ordering::Relaxed);
+    if q.is_empty() {
+        return options_response(PatientOptionsFragment {
+            options: Vec::new(),
+            message: String::new(),
+            error: false,
+            id_only,
+        });
+    }
+    if q.chars().count() > 64 {
+        return patient_lookup_error(&i18n, id_only);
+    }
+
+    let Ok(client) = no_redirect_client() else {
+        return patient_lookup_error(&i18n, id_only);
+    };
+    let media = fhir_json(rv.0);
+    let exact_ref = canonical_patient_ref(&q);
+    let mut options = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(reference) = &exact_ref {
+        let id = reference.trim_start_matches("Patient/");
+        let Ok(url) = internal_api_url(&state, &rt.id, ["Patient", id]) else {
+            return patient_lookup_error(&i18n, id_only);
+        };
+        let request = forward_identity(
+            client
+                .get(url)
+                .header("Accept", &media)
+                .timeout(std::time::Duration::from_secs(10)),
+            &headers,
+            &rt.id,
+        );
+        match request.send().await {
+            Ok(response)
+                if matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::GONE) => {}
+            Ok(response) if response.status().is_success() => {
+                let Ok(resource) = response.json::<Value>().await else {
+                    return patient_lookup_error(&i18n, id_only);
+                };
+                let Some(option) = patient_option(&resource) else {
+                    return patient_lookup_error(&i18n, id_only);
+                };
+                if option.value != *reference {
+                    return patient_lookup_error(&i18n, id_only);
+                }
+                seen.insert(option.value.clone());
+                options.push(option);
+            }
+            Ok(_) | Err(_) => return patient_lookup_error(&i18n, id_only),
+        }
+    }
+
+    let search_by_name = q.chars().count() >= 2
+        && !q.starts_with("Patient/")
+        && state.patient_name_search.load(Ordering::Relaxed);
+    let mut downgraded = id_only;
+    if search_by_name {
+        let Ok(url) = internal_api_url(&state, &rt.id, ["Patient", "_search"]) else {
+            return patient_lookup_error(&i18n, false);
+        };
+        let request = forward_identity(
+            client
+                .post(url)
+                .header("Accept", &media)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&[
+                    ("name", q.as_str()),
+                    ("_count", "9"),
+                    ("_elements", "id,name"),
+                ])
+                .timeout(std::time::Duration::from_secs(10)),
+            &headers,
+            &rt.id,
+        );
+        match request.send().await {
+            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED => {
+                state.patient_name_search.store(false, Ordering::Relaxed);
+                downgraded = true;
+            }
+            Ok(response) if response.status().is_success() => {
+                let Ok(bundle) = response.json::<Value>().await else {
+                    return patient_lookup_error(&i18n, false);
+                };
+                for resource in bundle
+                    .get("entry")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.get("resource"))
+                {
+                    if let Some(option) = patient_option(resource)
+                        && seen.insert(option.value.clone())
+                    {
+                        options.push(option);
+                        if options.len() == 8 {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(_) | Err(_) => return patient_lookup_error(&i18n, false),
+        }
+    }
+
+    let message = if options.is_empty() {
+        i18n.t("bulk-export-patient-options-empty")
+    } else {
+        String::new()
+    };
+    options_response(PatientOptionsFragment {
+        options,
+        message,
+        error: false,
+        id_only: downgraded,
+    })
+}
+
 /// `POST /ui/bulk-export` — kick off the export, then land on Exports.
 pub async fn start(
     State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
     rt: RequestTenant,
     principal: Option<Extension<helios_auth::Principal>>,
     headers: HeaderMap,
@@ -668,18 +973,45 @@ pub async fn start(
 ) -> Response {
     let form = parse_start_form(&String::from_utf8_lossy(&body));
     let user_key = settings_user_key(principal.as_deref());
+    let scope = match form.scope.as_str() {
+        "patient" | "group" => form.scope.clone(),
+        _ => "system".to_string(),
+    };
+    let patient_refs = if scope == "patient" {
+        parse_patient_refs(&form.patients)
+    } else {
+        Ok(Vec::new())
+    };
+    let patient_refs = match patient_refs {
+        Ok(patient_refs) => patient_refs,
+        Err(()) => {
+            let mut response = bulk_export_page(
+                &state,
+                locale,
+                rv.0,
+                &rt,
+                Some(I18n::new(locale).t("bulk-export-patient-invalid")),
+            )
+            .await;
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            return response;
+        }
+    };
     let snapshot = load_jobs(&state, &user_key, &rt.id).await;
     let mut job = ExportJob {
         name: form.name.trim().to_string(),
-        scope: match form.scope.as_str() {
-            "patient" | "group" => form.scope.clone(),
-            _ => "system".to_string(),
-        },
+        scope,
         group_id: form.group_id.trim().to_string(),
-        types: form.types.join(","),
+        types: if form.all_types {
+            String::new()
+        } else {
+            form.types.join(",")
+        },
         elements: form.elements.trim().to_string(),
         type_filter: form.type_filter.trim().to_string(),
         since: since_instant(&form.since_preset, &form.since_custom),
+        patient_refs,
+        fhir_version: Some(rv.0),
         status: "in-progress".to_string(),
         started_at: now_stamp(),
         ..Default::default()
@@ -722,6 +1054,8 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, ten
             return;
         }
     };
+    let version = job.fhir_version.unwrap_or(state.fhir_version);
+    let media = fhir_json(version);
     let mut query: Vec<(&str, &str)> = Vec::new();
     if !job.types.is_empty() {
         query.push(("_type", &job.types));
@@ -743,11 +1077,34 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, ten
             return;
         }
     };
-    let request = forward_identity(
+    let builder = if job.scope == "patient" && !job.patient_refs.is_empty() {
+        let mut parameters = Vec::new();
+        for (name, value) in &query {
+            if *name == "_since" {
+                parameters.push(json!({ "name": name, "valueInstant": value }));
+            } else {
+                parameters.push(json!({ "name": name, "valueString": value }));
+            }
+        }
+        for reference in &job.patient_refs {
+            parameters.push(json!({
+                "name": "patient",
+                "valueReference": { "reference": reference }
+            }));
+        }
         client
-            .get(path)
-            .query(&query)
-            .header("Accept", "application/fhir+json")
+            .post(path.clone())
+            .header("Content-Type", &media)
+            .json(&json!({
+                "resourceType": "Parameters",
+                "parameter": parameters
+            }))
+    } else {
+        client.get(path).query(&query)
+    };
+    let request = forward_identity(
+        builder
+            .header("Accept", &media)
             .header("Prefer", "respond-async")
             .timeout(std::time::Duration::from_secs(15)),
         headers,
@@ -782,10 +1139,9 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, ten
         Ok(response) => {
             job.remote_job = RemoteJobProvenance::NoRemoteJob;
             let code = response.status().as_u16();
-            let mut body = response.text().await.unwrap_or_default();
-            body.truncate(300);
+            let body = response.text().await.unwrap_or_default();
             job.status = "failed".to_string();
-            job.error = format!("kick-off answered {code}: {}", body.replace('\n', " "));
+            job.error = format!("kick-off answered {code}: {}", response_diagnostics(&body));
         }
         Err(e) => {
             job.remote_job = RemoteJobProvenance::Unknown;
@@ -894,6 +1250,29 @@ async fn cleanup_or_record_recovery(
     }
 }
 
+fn response_diagnostics(body: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(body)
+        && value.get("resourceType").and_then(Value::as_str) == Some("OperationOutcome")
+    {
+        let diagnostics: Vec<&str> = value
+            .get("issue")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|issue| {
+                issue
+                    .get("diagnostics")
+                    .and_then(Value::as_str)
+                    .or_else(|| issue.pointer("/details/text").and_then(Value::as_str))
+            })
+            .collect();
+        if !diagnostics.is_empty() {
+            return diagnostics.join("; ").chars().take(300).collect();
+        }
+    }
+    body.replace('\n', " ").chars().take(300).collect()
+}
+
 /// `GET /ui/bulk-export` — the job list.
 pub async fn active(
     State(state): State<WebState>,
@@ -996,10 +1375,11 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, te
         job.error = "status poll unavailable: HTTP client setup failed".to_string();
         return;
     };
+    let media = fhir_json(job.fhir_version.unwrap_or(state.fhir_version));
     let request = forward_identity(
         client
             .get(url)
-            .header("Accept", "application/fhir+json")
+            .header("Accept", media)
             .timeout(std::time::Duration::from_secs(10)),
         headers,
         tenant,
@@ -1494,4 +1874,42 @@ pub async fn download_all(
         .header("Cache-Control", "no-store")
         .body(Body::from_stream(body_stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patient_references_accept_bare_and_canonical_ids_and_deduplicate() {
+        let values = vec![" p-1,Patient/p-2\np-1 ".to_string()];
+        assert_eq!(
+            parse_patient_refs(&values),
+            Ok(vec!["Patient/p-1".to_string(), "Patient/p-2".to_string()])
+        );
+        assert!(parse_patient_refs(&["Patient/not/valid".to_string()]).is_err());
+    }
+
+    #[test]
+    fn legacy_jobs_deserialize_without_patient_or_version_fields() {
+        let job: ExportJob = serde_json::from_value(json!({
+            "name": "legacy",
+            "scope": "patient",
+            "status": "failed",
+            "startedAt": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(job.patient_refs.is_empty());
+        assert_eq!(job.fhir_version, None);
+    }
+
+    #[test]
+    fn operation_outcome_diagnostics_surface_unknown_patient_details() {
+        let body = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"diagnostics": "Patient/missing was not found"}]
+        })
+        .to_string();
+        assert_eq!(response_diagnostics(&body), "Patient/missing was not found");
+    }
 }
