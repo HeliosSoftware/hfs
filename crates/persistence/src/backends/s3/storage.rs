@@ -19,8 +19,8 @@ use crate::core::{
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, StorageResult,
 };
-use crate::search::reindex::{ReindexSource, ResourcePage};
 use crate::search::SearchParameterLoader;
+use crate::search::reindex::{ReindexSource, ResourcePage};
 use crate::tenant::{Operation, TenantContext, TenantId, TenantPermissions};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, Pagination, PaginationMode, ResourceMethod,
@@ -349,7 +349,9 @@ impl S3Backend {
         let bucket = &location.bucket;
         let fetched: Vec<StorageResult<Option<(StoredResource, ObjectMetadata)>>> =
             stream::iter(keys)
-                .map(|key| async move { self.get_json_object::<StoredResource>(bucket, &key).await })
+                .map(
+                    |key| async move { self.get_json_object::<StoredResource>(bucket, &key).await },
+                )
                 .buffer_unordered(self.bulk_write_concurrency())
                 .collect()
                 .await;
@@ -754,12 +756,8 @@ impl ResourceStorage for S3Backend {
             Ok(_) => {
                 self.put_history_and_indexes(&location, &stored, HistoryMethod::Post)
                     .await?;
-                self.maybe_reload_search_param_cache(
-                    tenant,
-                    resource_type,
-                    Some(stored.content()),
-                )
-                .await;
+                self.maybe_reload_search_param_cache(tenant, resource_type, Some(stored.content()))
+                    .await;
                 Ok(stored)
             }
             Err(StorageError::Backend(BackendError::QueryError { .. })) => {
