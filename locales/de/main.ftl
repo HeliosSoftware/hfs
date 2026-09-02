@@ -794,6 +794,7 @@ sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
 
 sql-export-title = SQL-Export
 sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
+sql-export-active-title = SQL-Exporte
 
 sql-files-title = Dateien
 sql-files-lede = Manifeste und Ausgabedateien der SQL-Exporte.
@@ -841,24 +842,67 @@ lib-sql-heading = SQL
 lib-delete-confirm = „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
 lib-delete-failed = Die Bibliothek konnte nicht gelöscht werden.
 
-## SQL-Export- und Dateien-Seiten (#649)
+## SQL-Export- und Dateien-Seiten (#649, #833)
 
 export-start-failed = Der Export konnte nicht gestartet werden.
-export-started = Export gestartet.
-export-cancelled = Abbruch angefordert.
-export-job-heading = Exportauftrag
 export-job-id = Auftrags-ID
-export-job-state = Status
-export-state-running = Läuft
-export-state-done = Abgeschlossen
-export-state-unknown = Unbekannter Auftrag — möglicherweise abgebrochen oder bereinigt.
-export-refresh = Aktualisieren
-export-cancel = Auftrag abbrechen
-export-view-files = Dateien anzeigen
 export-new-heading = Neuer Export
 export-no-subjects = Noch nichts zu exportieren — lege zuerst eine ViewDefinition an.
 export-format = Ausgabeformat
 export-start = Export starten
+
+## Liste der aktiven SQL-Exporte und Auftragskarten (#833)
+
+sql-export-new = Neuer SQL-Export
+sql-export-unavailable = Das Storage-Backend hostet keinen Settings-Store; SQL-Exportaufträge können nicht verfolgt werden.
+sql-export-none = Noch keine SQL-Exporte. Wählen Sie „Neuer SQL-Export", um einen zu starten.
+sql-export-store-error = Der Export wurde gestartet, konnte dieser Liste aber nicht hinzugefügt werden. Auftrags-ID:
+sql-export-exports-word = Exporte
+sql-export-running = laufend
+sql-export-select-subject = Wählen Sie mindestens ein Element aus.
+sql-export-unknown-subject = Ein oder mehrere ausgewählte Elemente sind nicht mehr verfügbar. Aktualisieren Sie die Seite und versuchen Sie es erneut.
+sql-export-cancelled-reason = der Server kennt diesen Auftrag nicht mehr
+sql-export-status-in-progress = Läuft
+sql-export-status-complete = Abgeschlossen
+sql-export-status-failed = Fehlgeschlagen
+sql-export-status-cancelled = Abgebrochen
+sql-export-view-files = Dateien anzeigen
+sql-export-cancel = Abbrechen
+sql-export-retry = Erneut versuchen
+sql-export-run-again = Erneut ausführen
+sql-export-remove = Aus der Liste entfernen
+sql-export-more-actions = Weitere Aktionen
+sql-export-copy-job-id = Auftrags-ID kopieren
+sql-export-copied = Kopiert
+sql-export-progress-waiting = Warten auf den ersten Statusbericht …
+sql-export-started = gestartet
+sql-export-finished-in = fertig in
+sql-export-cancelled-at = abgebrochen um
+sql-export-status-unavailable = Status nicht verfügbar
+sql-export-format-ndjson = NDJSON
+sql-export-format-csv = CSV
+sql-export-format-json = JSON
+sql-export-format-parquet = Parquet
+sql-export-subjects-count = { $count ->
+    [one] { $count } Element
+   *[other] { $count } Elemente
+}
+sql-export-kind-view-definition = { $count ->
+    [one] { $count } ViewDefinition
+   *[other] { $count } ViewDefinitions
+}
+sql-export-kind-sql-query = { $count ->
+    [one] { $count } SQL Query
+   *[other] { $count } SQL Queries
+}
+sql-export-kind-sql-view = { $count ->
+    [one] { $count } SQL View
+   *[other] { $count } SQL Views
+}
+sql-export-files-count = { $count ->
+    [one] { $count } Datei
+   *[other] { $count } Dateien
+}
 files-job-heading = Exportauftrag
 files-load = Manifest laden
 files-error = Das Manifest konnte nicht geladen werden.

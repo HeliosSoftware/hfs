@@ -4,6 +4,22 @@ import { test, expect } from "../pages/fixtures";
 // defer, caches in localStorage, and roams the choice via PATCH /_user/settings
 // (RFC 7386). None of this is reachable by the tower::oneshot tests.
 
+// "toggling roams..." below is the only test in this file that reaches the
+// real settings store (the others intercept `/_user/settings` via
+// `page.route`), so it's the only one that could leave the shared server's
+// document at `theme: "dark"` — every other page this suite ever visits
+// with no stored theme of its own (e.g. a fresh `localStorage` cache, like
+// `batch.spec.ts`'s WCAG sweep) reads that same document and roams the
+// leftover choice onto itself. An RFC 7386 `null` deletes the key, so this
+// restores the "no stored preference" baseline a clean server starts at,
+// regardless of which test just ran.
+test.afterEach(async ({ request }) => {
+  await request.patch("/_user/settings", {
+    headers: { "Content-Type": "application/json" },
+    data: { theme: null },
+  });
+});
+
 test("a returning dark-mode user sees no flash of light", async ({ page, chrome }) => {
   await chrome.seedTheme("dark");
   // domcontentloaded, not networkidle: the attribute must already be right

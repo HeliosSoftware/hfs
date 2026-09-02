@@ -164,6 +164,7 @@ not just a closed IIFE.
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
 | `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
+| `sql-export.js` | "Copy job id" on Active SQL Exports job cards — reveals the button only when the Clipboard API is available, writes the id, shows "Copied" |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
 | `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
@@ -469,6 +470,11 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/status` | GET | System-status read path; the fragment-vs-full-page reference |
 | `/ui/version` | POST | Persists the sidebar FHIR-version choice (#343) and redirects back |
 | `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector (#344), options loaded lazily |
+| `/ui/sql/export` | GET/POST | Active SQL Exports — the user's `$sql-export` jobs as cards, most recent first (#833); POST resolves the checked subjects and kicks off the job |
+| `/ui/sql/export/new` | GET | SQL Export builder — pick stored ViewDefinitions/Libraries and an output format |
+| `/ui/sql/export/{id}/card` | GET | htmx fragment: one job's card, polling `$sql-export` status while the job is in progress |
+| `/ui/sql/export/{id}/cancel`, `/retry`, `/rerun`, `/remove` | POST | Per-job actions: cancel an in-progress job, resubmit a failed or terminal job as a new record, or drop a terminal job's record from the list |
+| `/ui/sql/files` | GET | Completion-manifest lookup by job id — *legacy job-id form, superseded by a card's own "View files" link until #835 folds it into the list* |
 | `/ui/assets/*` | GET | Embedded htmx, CSS, JS, fonts, logo |
 
 The router's `fallback_service` is the FHIR app, so anything not under `/ui`
@@ -495,7 +501,24 @@ falls through to the normal REST surface.
   purge can reach them. The server renders the "Recently used" group from
   `recent` on every rail but Compartments — its 4-5 definitions make a group
   noise, so it remembers only `last`; with no settings store configured, there
-  is nothing to render and every rail opens on its page default instead.
+  is nothing to render and every rail opens on its page default instead. The
+  async export workspaces' job lists live there too —
+  `byTenant.<tenant>.bulkExport.jobs` and `byTenant.<tenant>.sqlExport.jobs` —
+  one member per job, keyed by a locally-generated id, written with the same
+  optimistic-locking (`If-Match`) read-modify-write every other settings write
+  uses.
+- **SQL Export's self-calls carry the caller's own identity.** `$sql-export`
+  kick-off, status polling, cancel, and the completion manifest all go through
+  `ConformanceSource`'s four `$sql-export` methods with a `Caller`: the
+  browser's own `Authorization` bearer when the request carried one, the
+  configured outbound credential (`HFS_OUTBOUND_BEARER_TOKEN`) otherwise — so
+  an async export is attributable to the person who started it, not a service
+  account. Because the Active SQL Exports list is the browser's own notebook
+  rather than server state (the one `$sql-export` job controller is in-memory,
+  ownerless, and reaped after 24h), **jobs started through the API — outside
+  this UI — never appear on the list**, and a job the server has since reaped
+  or restarted away from shows as `cancelled` with an explanatory reason
+  rather than as an error.
 
 ### Internationalization
 

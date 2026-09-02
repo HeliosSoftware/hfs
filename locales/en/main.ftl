@@ -797,6 +797,7 @@ sql-views-lede = Reusable SQL views layered over ViewDefinitions.
 
 sql-export-title = SQL Export
 sql-export-lede = Long-running SQL on FHIR export jobs.
+sql-export-active-title = SQL Exports
 
 sql-files-title = Files
 sql-files-lede = Manifests and output files produced by SQL exports.
@@ -848,24 +849,67 @@ lib-sql-heading = SQL
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
 
-## SQL Export and Files pages (#649)
+## SQL Export and Files pages (#649, #833)
 
 export-start-failed = Could not start the export.
-export-started = Export started.
-export-cancelled = Cancellation requested.
-export-job-heading = Export Job
 export-job-id = Job id
-export-job-state = State
-export-state-running = Running
-export-state-done = Finished
-export-state-unknown = This job is unknown — it may have been cancelled or reclaimed.
-export-refresh = Refresh
-export-cancel = Cancel Job
-export-view-files = View Files
 export-new-heading = New Export
 export-no-subjects = Nothing to export yet — create a ViewDefinition first.
 export-format = Output format
 export-start = Start Export
+
+## Active SQL Exports list and job cards (#833)
+
+sql-export-new = New SQL Export
+sql-export-unavailable = The storage backend does not host the settings store, so SQL export jobs cannot be tracked.
+sql-export-none = No SQL exports yet. Use New SQL Export to start one.
+sql-export-store-error = The export started, but could not be added to this list. Job id:
+sql-export-exports-word = exports
+sql-export-running = running
+sql-export-select-subject = Select at least one subject.
+sql-export-unknown-subject = One or more selected subjects are no longer available. Refresh the page and try again.
+sql-export-cancelled-reason = the server no longer knows this job
+sql-export-status-in-progress = In progress
+sql-export-status-complete = Complete
+sql-export-status-failed = Failed
+sql-export-status-cancelled = Cancelled
+sql-export-view-files = View files
+sql-export-cancel = Cancel
+sql-export-retry = Retry
+sql-export-run-again = Run again
+sql-export-remove = Remove from list
+sql-export-more-actions = More actions
+sql-export-copy-job-id = Copy job id
+sql-export-copied = Copied
+sql-export-progress-waiting = Waiting for the first status report…
+sql-export-started = started
+sql-export-finished-in = finished in
+sql-export-cancelled-at = cancelled at
+sql-export-status-unavailable = status unavailable
+sql-export-format-ndjson = NDJSON
+sql-export-format-csv = CSV
+sql-export-format-json = JSON
+sql-export-format-parquet = Parquet
+sql-export-subjects-count = { $count ->
+    [one] { $count } subject
+   *[other] { $count } subjects
+}
+sql-export-kind-view-definition = { $count ->
+    [one] { $count } ViewDefinition
+   *[other] { $count } ViewDefinitions
+}
+sql-export-kind-sql-query = { $count ->
+    [one] { $count } SQL Query
+   *[other] { $count } SQL Queries
+}
+sql-export-kind-sql-view = { $count ->
+    [one] { $count } SQL View
+   *[other] { $count } SQL Views
+}
+sql-export-files-count = { $count ->
+    [one] { $count } file
+   *[other] { $count } files
+}
 files-job-heading = Export Job
 files-load = Load Manifest
 files-error = Could not load the manifest.
