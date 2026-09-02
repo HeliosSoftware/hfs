@@ -309,10 +309,16 @@ fn cm_detail_template_carries_backlink_to_concept_maps_browser() {
 /// This test makes the duplication safe by refusing to let the two copies
 /// drift — HFS and HTS back links must render the same glyph at the same
 /// size, since both are styled by the one shared `.back-link` rule.
+///
+/// Line endings are normalized before comparing: the repo has no
+/// `.gitattributes`, so what `include_str!` sees depends on the checkout's
+/// CRLF conversion, and a reused runner workspace can hand the two paths
+/// different endings for byte-identical blobs (seen on #849's CI). The
+/// glyph is the same either way; only real markup drift should fail here.
 #[test]
 fn chevron_left_icon_matches_hfs() {
-    let hfs_icon = include_str!("../../ui/templates/icons/chevron-left.svg");
-    let hts_icon = include_str!("../templates/icons/chevron-left.svg");
+    let hfs_icon = include_str!("../../ui/templates/icons/chevron-left.svg").replace("\r\n", "\n");
+    let hts_icon = include_str!("../templates/icons/chevron-left.svg").replace("\r\n", "\n");
     assert_eq!(
         hfs_icon, hts_icon,
         "chevron-left.svg drifted between crates/ui/templates/icons/ and \
