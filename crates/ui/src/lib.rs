@@ -4090,12 +4090,17 @@ mod tests {
         assert!(Assets::get("logo.png").is_some());
     }
 
-    /// #753 ticket 01: the CodeMirror 6 + lezer-fhirpath vendoring ritual's
+    /// #753: the CodeMirror 6 + lezer-fhirpath vendoring ritual's
     /// one committed output (`crates/ui/vendor/codemirror/README.md`) is
     /// embedded exactly like any other subfolder asset — `assets/fonts/` is
     /// the existing precedent for rust-embed walking into `assets/vendor/` —
     /// and opens with the license banner rollup.config.js generates, wrapping
-    /// the `window.HfsCodeMirror` global tickets 02 and 03 build against.
+    /// the `window.HfsCodeMirror` global `vd-editor.js` and `sql-editor.js`
+    /// build against.
+    ///
+    /// #838 adds `@codemirror/lang-sql` to the same ritual: this asserts
+    /// the banner lists it, so a bundle regenerated without SQL support
+    /// does not pass silently.
     #[test]
     fn codemirror_vendor_bundle_is_embedded() {
         let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
@@ -4107,6 +4112,10 @@ mod tests {
         assert!(
             source.contains("HfsCodeMirror"),
             "bundle must define the window.HfsCodeMirror global"
+        );
+        assert!(
+            source.contains("@codemirror/lang-sql"),
+            "bundle banner must list @codemirror/lang-sql (#838)"
         );
     }
 
