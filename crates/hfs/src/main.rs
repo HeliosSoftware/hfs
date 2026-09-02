@@ -660,6 +660,39 @@ async fn start_mongodb(
     )
 }
 
+/// Resolves when the process is asked to stop, returning the signal's name.
+///
+/// Ctrl-C (SIGINT) is what a developer sends from a terminal; SIGTERM is what
+/// a process supervisor, container runtime, or load-balanced rolling deploy
+/// sends. Both must drain in-flight requests and flush the audit sink the
+/// same way — an instance that ignores SIGTERM is killed after the runtime's
+/// grace period with requests still in flight.
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => {
+                warn!(%error, "failed to install the SIGTERM handler; only Ctrl-C will stop this instance");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => "SIGINT",
+        _ = terminate => "SIGTERM",
+    }
+}
+
 /// Starts the Axum HTTP server.
 async fn serve(
     app: axum::Router,
@@ -742,8 +775,8 @@ async fn serve(
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("Shutdown signal received, draining connections");
+        let signal = shutdown_signal().await;
+        info!(signal, "Shutdown signal received, draining connections");
         if let Some(state) = audit_state {
             lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
             state.sink.flush().await;
