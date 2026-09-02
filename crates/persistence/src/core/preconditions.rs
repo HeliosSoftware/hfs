@@ -55,6 +55,7 @@
 use std::fmt;
 
 use super::transaction::BundleEntryResult;
+use crate::types::StoredResource;
 
 /// A single parsed entity-tag.
 ///
@@ -461,6 +462,68 @@ pub fn precondition_failed_entry(diagnostics: &str) -> BundleEntryResult {
     )
 }
 
+/// Resolves a bundle entry's `ifNoneExist` matches into the entry result FHIR
+/// prescribes for a conditional create, so the backends' transaction executors
+/// and the REST batch arm agree by construction (the same discipline as
+/// [`bundle_if_match_gate`]).
+///
+/// - No match: `None` — proceed with the create.
+/// - One match: `Some(200)` carrying the existing resource. Its `location` is
+///   set to the match's versioned URL even though nothing was written, because
+///   every `process_transaction` loop records a POST entry's `fullUrl` →
+///   `Type/id` mapping from `entry_result.location`. Without it a later
+///   `urn:uuid:` reference to a matched entry stayed unresolved, which R4
+///   §3.1.0.11.2 forbids: references to a conditionally created entry must
+///   resolve to the match.
+/// - Several matches: `Some(412 multiple-matches)`.
+pub fn bundle_if_none_exist_gate(matches: Vec<StoredResource>) -> Option<BundleEntryResult> {
+    match matches.len() {
+        0 => None,
+        1 => {
+            let existing = matches.into_iter().next().expect("length checked");
+            let location = existing.versioned_url();
+            let mut result = BundleEntryResult::ok(existing);
+            result.location = Some(location);
+            Some(result)
+        }
+        n => Some(multiple_matches_entry("create", n)),
+    }
+}
+
+/// Builds the `412 multiple-matches` bundle entry result for a conditional
+/// `operation` (`create`, `update`, `delete`) whose criteria resolved to
+/// `count` resources.
+pub fn multiple_matches_entry(operation: &str, count: usize) -> BundleEntryResult {
+    BundleEntryResult::error(
+        412,
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "multiple-matches",
+                "diagnostics": format!("Conditional {operation} matched {count} resources"),
+            }]
+        }),
+    )
+}
+
+/// Builds the `501 not-supported` bundle entry result a backend records when
+/// it cannot honour an entry's conditional semantics inside the transaction
+/// rather than silently applying the unconditional interaction.
+pub fn not_supported_entry(diagnostics: &str) -> BundleEntryResult {
+    BundleEntryResult::error(
+        501,
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "not-supported",
+                "diagnostics": diagnostics,
+            }]
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +834,60 @@ mod tests {
         let err = EntityTagPrecondition::parse([r#""a"b""#]).unwrap_err();
         assert_eq!(err.reason, "entity-tag contains an unescaped double quote");
         assert_eq!(err.raw, r#""a"b""#);
+    }
+
+    // ── ifNoneExist gate ─────────────────────────────────────────────────────
+
+    fn stored(id: &str) -> StoredResource {
+        StoredResource::new(
+            "Patient",
+            id,
+            crate::tenant::TenantId::new("t"),
+            serde_json::json!({"resourceType": "Patient", "id": id}),
+            helios_fhir::FhirVersion::default(),
+        )
+    }
+
+    #[test]
+    fn if_none_exist_gate_proceeds_when_nothing_matches() {
+        assert!(bundle_if_none_exist_gate(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn if_none_exist_gate_answers_200_with_a_location_for_the_single_match() {
+        let result = bundle_if_none_exist_gate(vec![stored("p1")]).expect("gated");
+        assert_eq!(result.status, 200);
+        assert_eq!(result.location.as_deref(), Some("Patient/p1/_history/1"));
+        assert_eq!(
+            result
+                .resource
+                .as_ref()
+                .and_then(|r| r.get("id"))
+                .and_then(|v| v.as_str()),
+            Some("p1")
+        );
+        assert!(result.outcome.is_none());
+    }
+
+    #[test]
+    fn if_none_exist_gate_answers_412_for_several_matches() {
+        let result = bundle_if_none_exist_gate(vec![stored("p1"), stored("p2")]).expect("gated");
+        assert_eq!(result.status, 412);
+        assert!(result.resource.is_none());
+        let outcome = result.outcome.expect("outcome");
+        assert_eq!(outcome["issue"][0]["code"], "multiple-matches");
+        assert_eq!(
+            outcome["issue"][0]["diagnostics"],
+            "Conditional create matched 2 resources"
+        );
+    }
+
+    #[test]
+    fn not_supported_entry_is_a_501_with_the_diagnostics() {
+        let result = not_supported_entry("why");
+        assert_eq!(result.status, 501);
+        let outcome = result.outcome.expect("outcome");
+        assert_eq!(outcome["issue"][0]["code"], "not-supported");
+        assert_eq!(outcome["issue"][0]["diagnostics"], "why");
     }
 }

@@ -75,7 +75,11 @@ pub trait SubmitInputFetcher: Send + Sync {
         encryption_key: Option<&Value>,
     ) -> StorageResult<RemoteManifest>;
 
-    /// Opens a streaming, line-buffered reader over the NDJSON file at `url`.
+    /// Opens a streaming, line-buffered reader over the NDJSON file at `url`,
+    /// with the file's total size in bytes when the source advertises one
+    /// (`Content-Length`, or the decrypted length of a buffered JWE file).
+    /// The size is what turns the status endpoint's progress into a real
+    /// percentage; `None` degrades to count-only progress.
     ///
     /// Implementations apply `request_headers`, request `gzip` via `Accept-Encoding`
     /// and transparently decompress, and — when `requires_access_token` is true —
@@ -88,7 +92,7 @@ pub trait SubmitInputFetcher: Send + Sync {
         requires_access_token: bool,
         oauth_metadata_urls: &[String],
         encryption_key: Option<&Value>,
-    ) -> StorageResult<Box<dyn AsyncBufRead + Send + Unpin>>;
+    ) -> StorageResult<(Box<dyn AsyncBufRead + Send + Unpin>, Option<u64>)>;
 }
 
 /// Maps a submission to the stable [`ExportJobId`] used as the output-store key

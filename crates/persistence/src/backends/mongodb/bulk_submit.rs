@@ -202,6 +202,8 @@ fn decode_manifest(doc: &Document) -> StorageResult<SubmissionManifest> {
         total_entries: doc.get_i64("total_entries").unwrap_or(0).max(0) as u64,
         processed_entries: doc.get_i64("processed_entries").unwrap_or(0).max(0) as u64,
         failed_entries: doc.get_i64("failed_entries").unwrap_or(0).max(0) as u64,
+        bytes_processed: doc.get_i64("bytes_processed").unwrap_or(0).max(0) as u64,
+        bytes_total: doc.get_i64("bytes_total").unwrap_or(0).max(0) as u64,
     })
 }
 
@@ -769,6 +771,8 @@ impl BulkSubmitProvider for MongoBackend {
             processed_entries: 0,
             failed_entries: 0,
             lease_expiry: None,
+            bytes_processed: 0,
+            bytes_total: 0,
         };
 
         let mut document = manifest_filter(tenant, submission_id, &manifest.manifest_id);
@@ -784,6 +788,8 @@ impl BulkSubmitProvider for MongoBackend {
         document.insert("failed_entries", 0_i64);
         document.insert("fencing_token", 0_i64);
         document.insert("last_processed_line", 0_i64);
+        document.insert("bytes_processed", 0_i64);
+        document.insert("bytes_total", 0_i64);
 
         self.manifests()
             .await?
@@ -1347,6 +1353,22 @@ impl SubmitWorkerStorage for MongoBackend {
         .await
     }
 
+    async fn update_manifest_bytes(
+        &self,
+        lease: &ManifestLease,
+        bytes_processed: u64,
+        bytes_total: u64,
+    ) -> Result<(), LeaseError> {
+        self.fenced_update(
+            lease,
+            doc! { "$max": {
+                "bytes_processed": bytes_processed as i64,
+                "bytes_total": bytes_total as i64,
+            }},
+        )
+        .await
+    }
+
     async fn record_submit_file(
         &self,
         lease: &ManifestLease,
@@ -1648,14 +1670,69 @@ impl SubmitWorkerStorage for MongoBackend {
     }
 
     async fn count_active_submissions(&self, tenant: &TenantContext) -> StorageResult<u64> {
-        self.submissions()
+        let tenant_id = tenant.tenant_id().as_str();
+        let cursor = self
+            .submissions()
             .await?
-            .count_documents(doc! {
-                "tenant_id": tenant.tenant_id().as_str(),
+            .find(doc! {
+                "tenant_id": tenant_id,
                 "status": SubmissionStatus::InProgress.to_string(),
             })
             .await
-            .map_err(|e| internal_error(format!("count active submissions: {e}")))
+            .map_err(|e| internal_error(format!("count active submissions: {e}")))?;
+        let subs = collect(cursor).await?;
+        if subs.is_empty() {
+            return Ok(0);
+        }
+
+        let keys: Vec<Document> = subs
+            .iter()
+            .filter_map(|d| {
+                Some(doc! {
+                    "submitter": opt_str(d, "submitter")?,
+                    "submission_id": opt_str(d, "submission_id")?,
+                })
+            })
+            .collect();
+        let cursor = self
+            .manifests()
+            .await?
+            .find(doc! { "tenant_id": tenant_id, "$or": keys })
+            .await
+            .map_err(|e| internal_error(format!("count active submissions: {e}")))?;
+        // (submitter, submission_id) → has a non-terminal manifest. Presence in
+        // the map at all means the submission has manifests.
+        let mut manifests: std::collections::HashMap<(String, String), bool> =
+            std::collections::HashMap::new();
+        for m in &collect(cursor).await? {
+            let (Some(submitter), Some(submission_id)) =
+                (opt_str(m, "submitter"), opt_str(m, "submission_id"))
+            else {
+                continue;
+            };
+            let live = matches!(
+                m.get_str("status").unwrap_or_default(),
+                "pending" | "processing"
+            );
+            *manifests.entry((submitter, submission_id)).or_insert(false) |= live;
+        }
+
+        Ok(subs
+            .iter()
+            .filter(|d| {
+                let (Some(submitter), Some(submission_id)) =
+                    (opt_str(d, "submitter"), opt_str(d, "submission_id"))
+                else {
+                    return false;
+                };
+                // No manifests yet → awaiting its first kick-off; otherwise it
+                // counts only while a manifest is still pending/processing.
+                manifests
+                    .get(&(submitter, submission_id))
+                    .copied()
+                    .unwrap_or(true)
+            })
+            .count() as u64)
     }
 
     async fn list_expired_submissions(

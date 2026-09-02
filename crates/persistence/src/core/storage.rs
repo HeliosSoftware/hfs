@@ -927,9 +927,13 @@ pub enum ConditionalUpdateResult {
 
 /// Result of a conditional delete operation.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConditionalDeleteResult {
-    /// Resource was deleted.
-    Deleted,
+    /// Resource was deleted. Carries the pre-delete snapshot so callers can
+    /// name the entity they removed — an audit event, a secondary-index sync,
+    /// or a bundle entry response all need the id that the criteria resolved
+    /// to, and nothing else on this path has it.
+    Deleted(StoredResource),
     /// No resource matched the condition.
     NoMatch,
     /// Multiple resources matched (error condition).
@@ -1119,7 +1123,13 @@ mod tests {
 
     #[test]
     fn test_conditional_delete_result_variants() {
-        let _deleted = ConditionalDeleteResult::Deleted;
+        let _deleted = ConditionalDeleteResult::Deleted(StoredResource::new(
+            "Patient",
+            "p1",
+            crate::tenant::TenantId::new("t"),
+            serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+            FhirVersion::default(),
+        ));
         let _no_match = ConditionalDeleteResult::NoMatch;
         let _multiple = ConditionalDeleteResult::MultipleMatches(5);
     }

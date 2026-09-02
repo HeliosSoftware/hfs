@@ -200,18 +200,30 @@ impl StoredResource {
     /// are preserved; `versionId`/`lastUpdated` are overwritten because the
     /// server's row is authoritative for both.
     pub fn content_with_meta(&self) -> Value {
-        let mut content = self.content.clone();
+        Self::merge_meta(self.content.clone(), &self.version_id, self.last_modified)
+    }
+
+    /// Consumes self and returns the content with server-populated
+    /// `meta.versionId` / `meta.lastUpdated` merged in.
+    ///
+    /// This is [`Self::content_with_meta`] without the clone — for callers
+    /// that are about to drop the `StoredResource` anyway (see
+    /// `SearchResult::into_bundle`).
+    pub fn into_content_with_meta(self) -> Value {
+        Self::merge_meta(self.content, &self.version_id, self.last_modified)
+    }
+
+    fn merge_meta(mut content: Value, version_id: &str, last_modified: DateTime<Utc>) -> Value {
         if let Value::Object(obj) = &mut content {
             let meta = obj
                 .entry("meta")
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
             if let Value::Object(meta) = meta {
-                meta.insert("versionId".into(), Value::String(self.version_id.clone()));
+                meta.insert("versionId".into(), Value::String(version_id.to_string()));
                 meta.insert(
                     "lastUpdated".into(),
                     Value::String(
-                        self.last_modified
-                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        last_modified.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     ),
                 );
             }
