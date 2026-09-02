@@ -246,6 +246,20 @@ async fn bootstrap_sync(
         concepts = stats.concepts,
         "bootstrap sync complete"
     );
+    // Mirrors what print_import_summary already does for the CLI path (see
+    // below): a bootstrap file that partially fails still reports overall
+    // success above, so surface the non-fatal errors here too instead of
+    // discarding them — that silence is exactly how issue #802 went
+    // unnoticed (14,567 "no separator" errors, zero concepts, clean logs).
+    if !stats.errors.is_empty() {
+        tracing::warn!(
+            error_count = stats.errors.len(),
+            "bootstrap sync completed with non-fatal errors"
+        );
+        for e in stats.errors.iter().take(10) {
+            tracing::warn!(error = %e, "bootstrap import error");
+        }
+    }
     Ok(())
 }
 

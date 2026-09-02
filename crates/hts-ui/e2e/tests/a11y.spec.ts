@@ -11,7 +11,7 @@ import AxeBuilder from "@axe-core/playwright";
 const WCAG = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
 const THEMES = ["light", "dark"] as const;
 
-// The fixture roster seeded by `seed.mjs` (globalSetup) — NOT the official
+// The fixture roster seeded by `seed.ts` (globalSetup) — NOT the official
 // bootstrap ids. `{id}` routes are pinned to these so the scan is hermetic.
 const CS = "ex-cs-1";
 const VS = "ex-vs-1";
