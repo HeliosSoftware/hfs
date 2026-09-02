@@ -26,29 +26,36 @@ use super::schema;
 /// database. Used as the [`TenantSearchRegistries`] loader closure — it captures
 /// only the pool + FHIR version, never the backend, so an Elasticsearch backend
 /// sharing the container resolves per-tenant params through this same query.
+///
+/// Returns `None` on a genuine connection/query failure — e.g. a pooled
+/// connection whose in-memory database turned out empty because `cache=shared`
+/// was silently inert on the SQLite build in use (#787) — so
+/// `TenantSearchRegistries::for_tenant` does not cache a false "tenant has no
+/// stored params" result and permanently poison the tenant. A row that fails
+/// to parse is skipped individually; that is not a load failure.
 fn load_tenant_stored_params(
     pool: &Pool<SqliteConnectionManager>,
     fhir_version: FhirVersion,
     tenant_id: &str,
-) -> Vec<SearchParameterDefinition> {
+) -> Option<Vec<SearchParameterDefinition>> {
     use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
     let Ok(conn) = pool.get() else {
         tracing::warn!("SearchParameter loader: could not get connection");
-        return Vec::new();
+        return None;
     };
     let Ok(mut stmt) = conn.prepare(
         "SELECT data FROM resources WHERE resource_type = 'SearchParameter' \
          AND tenant_id = ?1 AND is_deleted = 0",
     ) else {
         tracing::warn!("SearchParameter loader: prepare failed");
-        return Vec::new();
+        return None;
     };
     let rows = match stmt.query_map([tenant_id], |row| row.get::<_, Vec<u8>>(0)) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("SearchParameter loader: query failed: {e}");
-            return Vec::new();
+            return None;
         }
     };
     let loader = SearchParameterLoader::new(fhir_version);
@@ -65,7 +72,7 @@ fn load_tenant_stored_params(
             }
         }
     }
-    defs
+    Some(defs)
 }
 
 /// Counter for generating unique in-memory database names.

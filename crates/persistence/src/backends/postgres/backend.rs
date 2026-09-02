@@ -319,11 +319,16 @@ impl PostgresBackend {
         let loader_cache = stored_by_tenant.clone();
         let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
             move |tenant_id: &str| {
-                loader_cache
-                    .read()
-                    .get(tenant_id)
-                    .cloned()
-                    .unwrap_or_default()
+                // A HashMap lookup cannot fail the way a live query can — a
+                // missing entry legitimately means "no stored params yet",
+                // not "load failed" — so this always reports success (#787).
+                Some(
+                    loader_cache
+                        .read()
+                        .get(tenant_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
             },
         )));
         Self::initialize_search_registry(registries.base(), &config);
