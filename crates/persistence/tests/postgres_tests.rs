@@ -5537,6 +5537,136 @@ mod postgres_integration {
         );
     }
 
+    /// #872: the batched ingest commits entry writes, rollback records, and
+    /// per-line receipts together, and a failing entry is contained to its
+    /// savepoint — on Postgres a failed statement aborts the transaction, so
+    /// without the savepoint one bad entry would poison the whole batch.
+    #[tokio::test]
+    async fn postgres_bulk_submit_batch_commits_bookkeeping_and_contains_errors() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
+            SubmissionId,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_batch");
+        let sub_id = SubmissionId::generate("pg-batch-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/b.json"), None)
+            .await
+            .unwrap();
+        // Move the manifest out of `pending` right away: the test binary
+        // shares one container database, and a concurrently running test that
+        // calls claim_next_manifest would otherwise claim this one (the claim
+        // queue is cross-tenant by design).
+        backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                Vec::new(),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        // An existing resource for the update path, and a soft-deleted id
+        // whose create fails with AlreadyExists inside the batch.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-upd","name":[{"family":"Old"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-gone"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", "pg-batch-gone")
+            .await
+            .unwrap();
+
+        let entries = vec![
+            NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-new","name":[{"family":"BatchNew"}]}),
+            ),
+            NdjsonEntry::new(
+                2,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-gone"}),
+            ),
+            NdjsonEntry::new(
+                3,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-upd","name":[{"family":"BatchUpd"}]}),
+            ),
+        ];
+        let results = backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                entries,
+                &BulkProcessingOptions::new().with_file_url("https://provider/p.ndjson"),
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].is_success() && results[0].created);
+        assert!(
+            results[1].is_error(),
+            "the soft-deleted id must fail its entry, got {:?}",
+            results[1]
+        );
+        assert!(results[2].is_success() && !results[2].created);
+
+        // The failed entry did not poison the batch: both writes committed,
+        // together with their receipts and rollback records.
+        assert!(
+            backend
+                .read(&tenant, "Patient", "pg-batch-new")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let updated = backend
+            .read(&tenant, "Patient", "pg-batch-upd")
+            .await
+            .unwrap()
+            .expect("updated patient");
+        assert_eq!(updated.content()["name"], json!([{"family":"BatchUpd"}]));
+
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.success, 2);
+        assert_eq!(counts.processing_error, 1);
+
+        let changes = backend.list_changes(&tenant, &sub_id, 10, 0).await.unwrap();
+        assert_eq!(
+            changes.len(),
+            2,
+            "one rollback record per successful write, none for the failed entry"
+        );
+    }
+
     // ========================================================================
     // Issue #311 — `ifMatch` on bundle entries, on a real PostgreSQL instance
     //

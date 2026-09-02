@@ -93,6 +93,13 @@ impl PostgresTransaction {
             .ok_or_else(|| StorageError::Transaction(TransactionError::InvalidTransaction))
     }
 
+    /// The transaction's client, for sibling modules that batch their own
+    /// bookkeeping statements (savepoints, rollback records, receipts) into
+    /// the same commit — see the bulk-submit batch ingest (#872).
+    pub(crate) fn raw_client(&self) -> StorageResult<&Client> {
+        self.client()
+    }
+
     /// Index a resource for search within the transaction.
     async fn index_resource(
         &self,
@@ -122,17 +129,22 @@ impl PostgresTransaction {
             .extract(resource, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
-        // Write each extracted value to the index
-        for value in values {
+        // Write the extracted values pipelined on the transaction's
+        // connection: polled concurrently, tokio-postgres sends the inserts
+        // back-to-back instead of paying one round trip each — a resource
+        // with 15+ indexed parameters was 15+ serial round trips, the
+        // dominant cost of batch ingestion (#872). Statements still execute
+        // in order on the connection, inside this transaction.
+        futures::future::try_join_all(values.iter().map(|value| {
             PostgresSearchIndexWriter::write_entry(
                 client,
                 tenant_id,
                 resource_type,
                 resource_id,
-                &value,
+                value,
             )
-            .await?;
-        }
+        }))
+        .await?;
 
         tracing::debug!(
             "Indexed resource {}/{} within transaction",
@@ -201,25 +213,31 @@ impl Transaction for PostgresTransaction {
         let fhir_version_str = self.fhir_version.as_mime_param();
         let is_deleted = false;
 
-        // Insert the resource
-        client
-            .execute(
-                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &version_id, &data, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
-
-        // Insert into history
-        client
-            .execute(
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &version_id, &data, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        // Insert the resource and its history row pipelined on the
+        // transaction's connection (independent statements, one round trip).
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 8] = [
+            &tenant_id,
+            &resource_type,
+            &id,
+            &version_id,
+            &data,
+            &now,
+            &is_deleted,
+            &fhir_version_str,
+        ];
+        let insert_resource = client.execute(
+            "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &params,
+        );
+        let insert_history = client.execute(
+            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &params,
+        );
+        let (res, hist) = futures::future::join(insert_resource, insert_history).await;
+        res.map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
+        hist.map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Index the resource for search
         self.index_resource(tenant_id, resource_type, &id, &data)
@@ -379,7 +397,9 @@ impl Transaction for PostgresTransaction {
             .await
             .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
 
-        // Insert into history
+        // Insert into history. Not pipelined with the UPDATE above: both
+        // touch the same logical row's lineage and the UPDATE's row lock is
+        // what serializes concurrent writers.
         client
             .execute(
                 "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
