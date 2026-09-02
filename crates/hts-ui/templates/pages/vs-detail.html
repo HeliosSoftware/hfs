@@ -92,8 +92,11 @@
     </header>
 
     <section class="card panel" style="margin-bottom:16px">
-      <details>
-        <summary class="field__label">{{ chrome.i18n.t("hts-vs-detail-facts-summary") }}</summary>
+      <details class="disclosure">
+        <summary class="disclosure__summary">
+          <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
+          {{ chrome.i18n.t("hts-vs-detail-facts-summary") }}
+        </summary>
         <div class="kv-grid" style="margin:14px 0 0">
           <div class="detail__field detail__field--wide">
             <span>{{ chrome.i18n.t("hts-detail-canonical-url") }}</span>

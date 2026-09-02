@@ -1272,7 +1272,15 @@ fn cm_detail_page_uses_the_v3_compact_header_shape() {
         r#"class="page-head__title""#,
         r#"class="facets facets--bare""#,
         r#"class="detail__field detail__field--wide""#,
-        r#"<summary class="field__label">"#,
+        // #806: the facts fold uses HFS's shared `.disclosure` pattern, so
+        // the summary is a `list-item` with a chevron and a pointer cursor.
+        // The summary now spans several lines, so the class and the label
+        // are pinned separately rather than as one `<summary …>…</summary>`.
+        r#"<details class="disclosure">"#,
+        r#"<summary class="disclosure__summary">"#,
+        r#"<span class="icon disclosure__chevron" aria-hidden="true">"#,
+        r#"{% include "icons/chevron-down.svg" %}"#,
+        r#"{{ chrome.i18n.t("hts-cm-detail-facts-summary") }}"#,
     ] {
         assert!(
             body.contains(hook),
@@ -1296,6 +1304,40 @@ fn cm_detail_page_uses_the_v3_compact_header_shape() {
         !body.contains("<details open"),
         "the facts disclosure must render collapsed",
     );
+}
+
+/// #806 regression guard: a `<summary>` carrying `.field__label` is
+/// `display: block`, so the browser draws no disclosure marker, and the
+/// rule sets no `cursor` — the fold looked like an inert grey label. The
+/// ConceptMap templates must keep using the shared `.disclosure` pattern
+/// and must never reintroduce that summary class.
+#[test]
+fn cm_detail_folds_never_reintroduce_the_markerless_field_label_summary() {
+    let templates = [
+        (
+            "pages/cm-detail.html",
+            include_str!("../templates/pages/cm-detail.html"),
+        ),
+        (
+            "partials/hts-cm-translate-result.html",
+            include_str!("../templates/partials/hts-cm-translate-result.html"),
+        ),
+    ];
+
+    for (name, template) in templates {
+        let body = strip_template_comments(template);
+        assert!(
+            !body.contains(r#"<summary class="field__label""#),
+            "{name} must not pin a `.field__label` summary: it kills the \
+             native disclosure marker and leaves no pointer cursor (#806)",
+        );
+        assert!(
+            body.contains(r#"<details class="disclosure">"#)
+                && body.contains(r#"<summary class="disclosure__summary">"#)
+                && body.contains(r#"class="icon disclosure__chevron""#),
+            "{name} must use the shared `.disclosure` fold shape",
+        );
+    }
 }
 
 /// Reverse-mode `$translate` responses carry no `originMap`, so the Origin

@@ -3226,6 +3226,16 @@ details.json-fold[open] > summary .icon {
   margin: 14px 0;
 }
 
+/* #806: the HTS folds adopting this pattern sit directly in a `.panel`,
+   usually as the card's only child. `.panel`'s own 18px padding already
+   spaces them, and a panel is a plain block — so the margin above cannot
+   collapse into anything and would simply make every collapsed card 28px
+   taller. The dialog folds this pattern was written for are not in a
+   `.panel`, so they keep the default. */
+.panel > .disclosure {
+  margin: 0;
+}
+
 .disclosure__summary {
   display: inline-flex;
   align-items: center;
