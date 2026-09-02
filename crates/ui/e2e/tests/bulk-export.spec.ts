@@ -1,6 +1,7 @@
 import { test, expect } from "../pages/fixtures";
 import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
+import { createResource, waitSearchable } from "../pages/api";
 
 const patientOptions = `
   <button type="button" class="combobox__option" data-combobox-option
@@ -677,6 +678,31 @@ test("Patient combobox supports keyboard selection, dedupe, removal, and scope s
   await expect(bulkExport.patientSearch).toBeFocused();
 });
 
+test("Patient combobox finds and selects a patient by exact identifier", async ({
+  request,
+  bulkExport,
+}) => {
+  const identifier = "MRN-829-E2E";
+  const patientId = await createResource(request, "Patient", {
+    name: [{ given: ["Marisol"], family: "Vega" }],
+    identifier: [{ system: "urn:example:mrn", value: identifier }],
+  });
+  await waitSearchable(request, "Patient", patientId);
+
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill(identifier);
+  const option = bulkExport.patientListbox.locator(
+    `[data-combobox-option][data-value="Patient/${patientId}"]`,
+  );
+  await expect(option).toBeVisible();
+  await expect(option).toContainText("Marisol Vega");
+  await option.click();
+
+  await expect(bulkExport.selectedPatients).toHaveCount(1);
+  await expect(bulkExport.selectedPatients).toHaveValue(`Patient/${patientId}`);
+});
+
 test("Patient combobox closes on Tab and Clear removes selected patients", async ({
   page,
   bulkExport,
@@ -742,6 +768,10 @@ test("Patient combobox shows empty and error messages and persists a runtime ID-
   });
   await bulkExport.goto();
   await bulkExport.scopeRadio("patient").check();
+  await expect(bulkExport.patientSearch).toHaveAttribute("placeholder", "Search patients");
+  await expect(bulkExport.patientHint).toContainText(
+    "Search by name, surname or exact identifier.",
+  );
 
   await bulkExport.patientSearch.fill("zz");
   await expect(bulkExport.patientListbox).toBeHidden();
@@ -805,18 +835,18 @@ test("Patient combobox shows empty and error messages and persists a runtime ID-
   await bulkExport.patientSearch.fill("Nobody");
   await expect(bulkExport.patientMessage).toHaveText("No matching patients found.");
   await expect(bulkExport.patientCombobox).toHaveAttribute("data-combobox-mode", "alternate");
-  await expect(bulkExport.patientHint).toContainText("exact logical FHIR ID");
-  await expect(bulkExport.patientSearch).toHaveAttribute("placeholder", "Search exact FHIR ID");
+  await expect(bulkExport.patientHint).toContainText("exact FHIR ID");
+  await expect(bulkExport.patientSearch).toHaveAttribute("placeholder", "Search patients");
   await expect(bulkExport.patientMessage).not.toHaveText(await bulkExport.patientHint.innerText());
   await bulkExport.patientSearch.press("Escape");
-  await expect(bulkExport.patientHint).toContainText("exact logical FHIR ID");
-  await expect(bulkExport.patientSearch).toHaveAttribute("placeholder", "Search exact FHIR ID");
+  await expect(bulkExport.patientHint).toContainText("exact FHIR ID");
+  await expect(bulkExport.patientSearch).toHaveAttribute("placeholder", "Search patients");
   await bulkExport.clearButton.click();
   await bulkExport.scopeRadio("patient").check();
   await expect(bulkExport.patientMessage).toBeHidden();
   await expect(bulkExport.patientCombobox).toHaveAttribute("data-combobox-mode", "alternate");
-  await expect(bulkExport.patientHint).toContainText("exact logical FHIR ID");
-  await expect(bulkExport.patientSearch).toHaveAttribute("placeholder", "Search exact FHIR ID");
+  await expect(bulkExport.patientHint).toContainText("exact FHIR ID");
+  await expect(bulkExport.patientSearch).toHaveAttribute("placeholder", "Search patients");
   violations = (await new AxeBuilder({ page }).analyze()).violations;
   expect(violations, axeSummary(violations)).toEqual([]);
 });

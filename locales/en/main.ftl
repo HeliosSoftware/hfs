@@ -697,12 +697,11 @@ bulk-export-scope-group-hint = Just the members of a cohort you've already defin
 bulk-export-field-group-id = Group ID
 bulk-export-field-group-id-hint = Required for the Group scope: the id of the FHIR Group to export.
 bulk-export-field-patients = Patients
-bulk-export-field-patients-placeholder = Search name, surname, or exact FHIR ID
-bulk-export-field-patients-hint = Search by the beginning of a given name or family name, or enter an exact logical FHIR ID such as Patient/p-104. Leave empty to export every patient.
-bulk-export-field-patients-fallback-placeholder = Patient/p-104, Patient/p-205
+bulk-export-field-patients-placeholder = Search patients
+bulk-export-field-patients-hint = Search by name, surname or exact identifier. Leave empty to export every patient.
+bulk-export-field-patients-fallback-placeholder = Patient FHIR IDs
 bulk-export-field-patients-fallback-hint = Enter exact logical FHIR IDs separated by commas or new lines. Leave empty to export every patient.
-bulk-export-field-patients-id-only-hint = Search by exact logical FHIR ID, such as Patient/p-104. Leave empty to export every patient.
-bulk-export-field-patients-id-only-placeholder = Search exact FHIR ID
+bulk-export-field-patients-id-only-hint = Search by exact FHIR ID. Leave empty to export every patient.
 bulk-export-patient-options-empty = No matching patients found.
 bulk-export-patient-invalid = Enter only valid logical Patient IDs, separated by commas or new lines.
 bulk-export-field-name = Name
@@ -822,8 +821,15 @@ vd-delete = Delete
 vd-delete-confirm = Delete view definition "{ $name }"? This cannot be undone.
 vd-delete-failed = Could not delete the view definition.
 vd-json-heading = Definition (JSON)
+vd-run-hint = Runs as you type — results follow the current definition, saved or not
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
+# #752 ticket 01: the $sql-run preview's row/duration meta, shared by the
+# page's own render and the `/run` fragment endpoint.
+vd-results-meta = { $rows } rows · { $ms } ms
+# #752 ticket 01: the results meta after a failed run — the previous table
+# stays on screen, relabelled.
+vd-results-stale = last successful run
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next

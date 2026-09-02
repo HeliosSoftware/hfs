@@ -30,6 +30,7 @@ use axum::{
 };
 use axum_htmx::HxRequest;
 use chrono::{Duration, SecondsFormat, Utc};
+use futures_lite::future::zip;
 use futures_lite::io::AsyncWriteExt as FuturesAsyncWriteExt;
 use helios_fhir::FhirVersion;
 use serde::{Deserialize, Serialize};
@@ -583,7 +584,6 @@ struct BulkExportPage {
     rejected: bool,
     patient_value: String,
     patient_hint: String,
-    patient_placeholder: String,
 }
 
 #[derive(Template)]
@@ -666,16 +666,10 @@ async fn bulk_export_page(
         .await;
     form.normalize_for_view(&resource_types);
     let patient_value = form.patients.join("\n");
-    let (patient_hint, patient_placeholder) = if state.patient_name_search.load(Ordering::Relaxed) {
-        (
-            i18n.t("bulk-export-field-patients-hint"),
-            i18n.t("bulk-export-field-patients-placeholder"),
-        )
+    let patient_hint = if state.patient_name_search.load(Ordering::Relaxed) {
+        i18n.t("bulk-export-field-patients-hint")
     } else {
-        (
-            i18n.t("bulk-export-field-patients-id-only-hint"),
-            i18n.t("bulk-export-field-patients-id-only-placeholder"),
-        )
+        i18n.t("bulk-export-field-patients-id-only-hint")
     };
     let rejected = errors.rejected || error.is_some();
     render(BulkExportPage {
@@ -691,7 +685,6 @@ async fn bulk_export_page(
         rejected,
         patient_value,
         patient_hint,
-        patient_placeholder,
     })
 }
 
@@ -966,6 +959,39 @@ fn patient_lookup_error(i18n: &I18n, id_only: bool) -> Response {
     })
 }
 
+fn patient_search_options(bundle: &Value) -> Option<Vec<PatientOption>> {
+    let bundle = bundle.as_object()?;
+    if bundle.get("resourceType").and_then(Value::as_str) != Some("Bundle")
+        || bundle.get("type").and_then(Value::as_str) != Some("searchset")
+    {
+        return None;
+    }
+    let entries = match bundle.get("entry") {
+        None => return Some(Vec::new()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => return None,
+    };
+    entries
+        .iter()
+        .map(|entry| patient_option(entry.as_object()?.get("resource")?))
+        .collect()
+}
+
+fn append_patient_options(
+    source: Vec<PatientOption>,
+    options: &mut Vec<PatientOption>,
+    seen: &mut HashSet<String>,
+) {
+    for option in source {
+        if options.len() >= 8 {
+            break;
+        }
+        if seen.insert(option.value.clone()) {
+            options.push(option);
+        }
+    }
+}
+
 /// `POST /ui/bulk-export/patient-options` — a small HTML result fragment for
 /// the progressively-enhanced Patient selector.
 pub async fn patient_options(
@@ -1039,15 +1065,27 @@ pub async fn patient_options(
         }
     }
 
-    let search_by_name = q.chars().count() >= 2
-        && !q.starts_with("Patient/")
-        && state.patient_name_search.load(Ordering::Relaxed);
+    let search_patients = q.chars().count() >= 2 && !q.starts_with("Patient/") && !id_only;
     let mut downgraded = id_only;
-    if search_by_name {
+    if search_patients {
         let Ok(url) = internal_api_url(&state, &rt.id, ["Patient", "_search"]) else {
             return patient_lookup_error(&i18n, false);
         };
-        let request = forward_identity(
+        let identifier_request = forward_identity(
+            client
+                .post(url.clone())
+                .header("Accept", &media)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&[
+                    ("identifier", q.as_str()),
+                    ("_count", "9"),
+                    ("_elements", "id,name"),
+                ])
+                .timeout(std::time::Duration::from_secs(10)),
+            &headers,
+            &rt.id,
+        );
+        let name_request = forward_identity(
             client
                 .post(url)
                 .header("Accept", &media)
@@ -1061,33 +1099,41 @@ pub async fn patient_options(
             &headers,
             &rt.id,
         );
-        match request.send().await {
-            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED => {
-                state.patient_name_search.store(false, Ordering::Relaxed);
-                downgraded = true;
+        let (identifier_result, name_result) =
+            zip(identifier_request.send(), name_request.send()).await;
+
+        let not_implemented = matches!(
+            &identifier_result,
+            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED
+        ) || matches!(
+            &name_result,
+            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED
+        );
+        if not_implemented {
+            state.patient_name_search.store(false, Ordering::Relaxed);
+            downgraded = true;
+        } else {
+            let (Ok(identifier_response), Ok(name_response)) = (identifier_result, name_result)
+            else {
+                return patient_lookup_error(&i18n, false);
+            };
+            if !identifier_response.status().is_success() || !name_response.status().is_success() {
+                return patient_lookup_error(&i18n, false);
             }
-            Ok(response) if response.status().is_success() => {
-                let Ok(bundle) = response.json::<Value>().await else {
-                    return patient_lookup_error(&i18n, false);
-                };
-                for resource in bundle
-                    .get("entry")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|entry| entry.get("resource"))
-                {
-                    if let Some(option) = patient_option(resource)
-                        && seen.insert(option.value.clone())
-                    {
-                        options.push(option);
-                        if options.len() == 8 {
-                            break;
-                        }
-                    }
-                }
-            }
-            Ok(_) | Err(_) => return patient_lookup_error(&i18n, false),
+            let Ok(identifier_bundle) = identifier_response.json::<Value>().await else {
+                return patient_lookup_error(&i18n, false);
+            };
+            let Ok(name_bundle) = name_response.json::<Value>().await else {
+                return patient_lookup_error(&i18n, false);
+            };
+            let Some(identifier_options) = patient_search_options(&identifier_bundle) else {
+                return patient_lookup_error(&i18n, false);
+            };
+            let Some(name_options) = patient_search_options(&name_bundle) else {
+                return patient_lookup_error(&i18n, false);
+            };
+            append_patient_options(identifier_options, &mut options, &mut seen);
+            append_patient_options(name_options, &mut options, &mut seen);
         }
     }
 

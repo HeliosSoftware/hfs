@@ -6337,3 +6337,16 @@ body.app-shell .pane {
 .vd-editor__source--mounted {
   display: none;
 }
+
+/* RF8 (#752 ticket 02): the plain `<textarea>` fallback's own height — the
+   same "min 320px, max ~70vh, scroll internally" cotas `.cm-editor` gets
+   above, so nojs and the pre-mount flash match the mounted editor's
+   footprint instead of the old fixed `rows="18"`. Scoped to this page's
+   form rather than `.json-editor` itself, which `sql-library.html` still
+   uses with its original sizing (#839 will give that page the same
+   treatment separately). */
+#vd-editor-form textarea.json-editor {
+  min-height: 320px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
