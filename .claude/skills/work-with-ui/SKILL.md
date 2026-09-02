@@ -157,10 +157,17 @@ planned follow-up (`crates/auth/src/outbound.rs`).
 
 ### Per-user preferences
 
-Theme, nav state, FHIR version, tenant, and saved/recent queries roam in the
-`/_user/settings` document (weak `ETag`, JSON merge patch, `If-Match` on write).
-Tenant-derived keys live under a reserved `byTenant` map so a tenant purge can
-reach them — see `/run-hfs-server` for the full semantics.
+Theme, nav state, FHIR version, tenant, saved/recent queries, and — since
+#754/#755 — every sidebar rail's `rails.<page>` record of `last`/`recent`
+(`rail_state`) roam in the `/_user/settings` document (weak `ETag`, JSON
+merge patch, `If-Match` on write). Tenant-derived keys live under a reserved
+`byTenant` map so a tenant purge can reach them — see `/run-hfs-server` for
+the full semantics. The server renders each rail's "Recently used" group
+from `recent`; Compartments is the one exception — it remembers only `last`,
+no group, since its 4-5 definitions would make one noise. With no settings
+store configured there is nothing to render or restore, and every rail opens
+on its page default. `resource-filter.js` now only owns a rail's tooltip and
+scroll-to-selection on arrival — recents are server-rendered, not client-side.
 
 ### i18n
 

@@ -151,3 +151,141 @@ test("a selection the filter excludes from the rail still shows its own editor",
   // directly by id rather than dropped as "not found" (#741).
   await expect(page.locator("textarea[name='json']")).toContainText(`zsel_${stamp}_keep`);
 });
+
+// "Recently used" group (#754/#755 ticket 03, server-rendered per RF4/RF6):
+// same MRU/cap/restore/prune contract as the type rails (ticket 02), plus the
+// snapshot rule its server-paged, filtered rail needs.
+
+test("visiting six views in order keeps the five most recent, MRU-ordered, deduplicated", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const ids = await Promise.all(
+    [1, 2, 3, 4, 5, 6].map((n) => createResource(request, "ViewDefinition", starter(`zmru_${stamp}_${n}`))),
+  );
+  await Promise.all(ids.map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+  for (const id of ids) {
+    await page.goto(`/ui/sql/view-definitions?vd=${id}`);
+  }
+  await page.reload();
+
+  const recentGroup = page.locator("#vd-rail-recent");
+  await expect(recentGroup.locator(".filter-rail__item")).toHaveCount(5);
+  // The oldest visit (ids[0]) is the one capped out.
+  await expect(recentGroup.locator(`[data-type='${ids[0]}']`)).toHaveCount(0);
+  const order = await recentGroup
+    .locator(".filter-rail__item")
+    .evaluateAll((els) => els.map((el) => el.getAttribute("data-type")));
+  expect(order[0]).toBe(ids[5]);
+
+  // Re-visiting an older entry moves it to the front without duplicating it.
+  await page.goto(`/ui/sql/view-definitions?vd=${ids[2]}`);
+  await page.reload();
+  const reordered = await recentGroup
+    .locator(".filter-rail__item")
+    .evaluateAll((els) => els.map((el) => el.getAttribute("data-type")));
+  expect(reordered[0]).toBe(ids[2]);
+  expect(reordered.filter((id) => id === ids[2])).toHaveLength(1);
+});
+
+test("visiting a view and returning through a plain arrival (no ?vd=) restores it", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(
+    request,
+    "ViewDefinition",
+    starter(`znav_${Date.now().toString(36)}`),
+  );
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  // Leaving to another page and coming back with no `?vd=` at all — the same
+  // "no explicit selection" request shape a nav click produces — restores it
+  // server-side (RF1.2), not merely through browser history.
+  await page.goto("/ui/resources");
+  await page.goto("/ui/sql/view-definitions");
+  await expect(page.locator(`#vd-rail-list [data-type='${vdId}']`)).toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+});
+
+test("a filtered-out recent stays in the group; deleting the selected view falls back, and clicking the stale recent prunes it", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const keepId = await createResource(request, "ViewDefinition", starter(`zdel_${stamp}_a_keep`));
+  const deleteId = await createResource(
+    request,
+    "ViewDefinition",
+    starter(`zdel_${stamp}_b_delete`),
+  );
+  await Promise.all([keepId, deleteId].map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+  // Select "delete" (recent[0]/last), then filter it out of the rail's own
+  // list — RF4: the group still shows it, unaffected by `?filter=`.
+  await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
+  await page.goto(`/ui/sql/view-definitions?filter=${stamp}_a_keep`);
+  await expect(page.locator(`#vd-rail-list [data-type='${deleteId}']`)).toHaveCount(0);
+  const recentGroup = page.locator("#vd-rail-recent");
+  await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toBeVisible();
+
+  // Delete it through the UI (conformance-crud.js).
+  await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
+  page.once("dialog", (d) => d.accept());
+  await page.locator("[data-crud-delete]").click();
+  await expect(page).toHaveURL(/\/ui\/sql\/view-definitions$/);
+
+  // The stored `last` no longer resolves: the page falls back to the rail's
+  // first visible entry, in silence (RF1.3) — some real, non-deleted view
+  // (the redirect carries no `?filter=`, so which one exactly depends on the
+  // shared e2e server's full ViewDefinition collection, not just this test's
+  // own two) — but the group still shows the now-deleted entry from its
+  // snapshot, since a silent fallback never prunes.
+  //
+  // Not `.toBeVisible()`: the CodeMirror editor (#753/#820) progressively
+  // enhances this textarea and hides it once mounted (`vd-editor__source--
+  // mounted`, `display: none`), while staying its form's live source of
+  // truth. A non-empty value proves a real selection landed regardless of
+  // which of the two — raw textarea or its mounted replacement — is the one
+  // actually on screen; the "no selection" render has no textarea at all
+  // (see the pruned case's `toHaveCount(0)` below).
+  await expect(page.locator("textarea[name='json']")).not.toHaveValue("");
+  await expect(page.locator(`#vd-rail-list [data-type='${deleteId}']`)).toHaveCount(0);
+  await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toBeVisible();
+
+  // Clicking that stale recent (an explicit `?vd=`) prunes it (RF3): the page
+  // lands on its no-selection render and the group no longer shows it.
+  await recentGroup.locator(`[data-type='${deleteId}']`).click();
+  await expect(page).toHaveURL(new RegExp(`vd=${deleteId}`));
+  await expect(page.locator("textarea[name='json']")).toHaveCount(0);
+  await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toHaveCount(0);
+});
+
+test("a long name clipped by the rail shows an accessible tooltip on keyboard focus", async ({
+  page,
+  request,
+}) => {
+  const longName = `ztip_${Date.now().toString(36)}_a_view_definition_name_long_enough_to_clip_in_the_rail`;
+  const vdId = await createResource(request, "ViewDefinition", starter(longName));
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  // Select it so it also renders (identically) in the "Recently used" group —
+  // the tooltip script is delegated and covers both the list and the group.
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  await page.reload();
+
+  const recentItem = page.locator(`#vd-rail-recent [data-type='${vdId}']`);
+  await expect(recentItem).toBeVisible();
+  await recentItem.focus();
+  const tooltip = page.locator("#filter-rail-tooltip");
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(longName);
+
+  await recentItem.blur();
+  await expect(tooltip).toBeHidden();
+});

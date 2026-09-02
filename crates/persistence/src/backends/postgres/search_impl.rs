@@ -25,6 +25,7 @@ use crate::types::{
 };
 
 use super::PostgresBackend;
+use super::cached::{query_dyn_cached, query_one_dyn_cached};
 use super::search::chain_builder::ChainQueryBuilder;
 use super::search::query_builder::{PostgresQueryBuilder, SortValueKind, SqlParam};
 
@@ -34,6 +35,24 @@ fn internal_error(message: String) -> StorageError {
         message,
         source: None,
     })
+}
+
+/// Whether a built search statement's text is drawn from a bounded family, and
+/// so may be kept in the connection's prepared-statement cache.
+///
+/// Everything the query builder varies is bounded except one thing. The
+/// predicate shape is bounded by the parameter types; the inlined `param_name`
+/// is bounded by the SearchParameter registry; the inlined `LIMIT` is bounded
+/// because `_count` is clamped to 1000 by `extractors::pagination`. `OFFSET` is
+/// not bounded by anything, and it is inlined too — so an offset-paged crawl
+/// mints one statement per page, for as long as the client keeps paging. Those
+/// stay off the cached path rather than rely on the cache's flush to clean up
+/// after them.
+///
+/// Cursor pagination is unaffected: it binds its keyset values as parameters, so
+/// every page of a cursor-paged search shares one statement text.
+fn statement_is_reusable(query: &SearchQuery) -> bool {
+    query.offset.unwrap_or(0) == 0
 }
 
 fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
@@ -49,6 +68,131 @@ fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
         }));
     }
     Ok(())
+}
+
+/// Decides whether a page can be resolved from `search_index` alone, returning
+/// the predicate to resolve it with.
+///
+/// Gates, and why each one is load-bearing:
+/// - `Denormalized` layout: on a legacy database the rows carry no sort key, so
+///   the fast path would order by NULL and return an arbitrary page.
+/// - no cursor, no offset: both paginate against `resources`.
+/// - default sort: any other sort key is not on the index row.
+/// - exactly one membership test: a conjunction needs rows that jointly satisfy
+///   it, which a single-row predicate cannot express.
+fn fast_index_pred(
+    query: &SearchQuery,
+    filter_sql: Option<&str>,
+    layout: super::schema::IndexLayout,
+    has_cursor: bool,
+) -> Option<String> {
+    if has_cursor
+        || query.offset.is_some()
+        || !query.sort.is_empty()
+        || layout != super::schema::IndexLayout::Denormalized
+    {
+        return None;
+    }
+    PostgresQueryBuilder::single_index_predicate(filter_sql?).map(str::to_string)
+}
+
+/// Whether the fast path's ordered scan needs a guard against an empty match
+/// set.
+///
+/// # The defect this closes
+///
+/// The fast path takes its page from `idx_search_quantity_recent`, which is
+/// keyed `(tenant_id, resource_type, param_name, last_updated DESC,
+/// resource_id)` — the scan streams the parameter slice newest-first and
+/// filters `value_quantity_value` from the payload as it goes, so the `LIMIT`
+/// can stop after 21 matches. Costing that plan needs the *selectivity* of the
+/// value predicate, and Postgres has only a table-wide histogram of
+/// `value_quantity_value` — one column shared by every `param_name` of every
+/// resource type. On the benchmark corpus `Observation.value-quantity` tops out
+/// at 54,786 while `component-value-quantity` rows in the same column reach
+/// 995,710, so `value_quantity_value >= 99999.5` is estimated at a fraction of
+/// a percent of the slice when the true count is **zero**. The planner prices
+/// the ordered scan as "read a few thousand entries and stop"; it walks all
+/// 512,311 entries of the slice and returns nothing.
+///
+/// Measured on run 33213565802: 199.5 s across 23,847 calls — **25.9 % of the
+/// whole search suite's Postgres execution time** — in the single statement
+/// ending `AND (value_quantity_value >= $3) ORDER BY last_updated DESC …
+/// LIMIT 21`, against 15.7 s across 23,823 calls for the two-sided `eq` form of
+/// the same parameter, which Postgres estimates correctly and serves from the
+/// value-first `idx_search_quantity`. 4.65 % of `value-quantity` requests took
+/// over 100 ms (p50 5.3 ms, p99 199.9 ms, max 438 ms), uniformly across the
+/// run, and the two `(value, prefix)` combinations `k6/searchConfig.js` issues
+/// with zero true matches — `gt 99999`, `ge 99999` — are 2 of its 42
+/// combinations, i.e. 4.76 %.
+///
+/// # Why a guard rather than an index or a statistics change
+///
+/// A one-sided range cannot be served by any single index at both densities:
+/// value-first reads only the matches but must sort them all to answer
+/// `ORDER BY last_updated` (500k rows for a broad range), recent-first is
+/// already ordered but must walk the slice until the `LIMIT` fills. Both
+/// indexes exist (v19/v20) precisely so the planner can choose per query, and
+/// that remains right — the estimate is what is wrong, not the index set.
+///
+/// So this adds an **uncorrelated `EXISTS` over the same predicate**. Postgres
+/// cannot pull an uncorrelated `EXISTS` up into a semi-join, so it becomes an
+/// InitPlan evaluated once, before the scan, against the value-first index:
+/// a single seek. When it is false the ordered scan is gated off entirely by a
+/// `One-Time Filter` and the whole statement costs one index descent instead of
+/// a full slice walk. When it is true the guard added one seek and changed
+/// nothing else.
+///
+/// It is a tautology given the outer predicate — the outer `WHERE` already
+/// requires a row satisfying it, so `EXISTS` over the identical predicate can
+/// only be false when the result is empty. No row can be added or removed.
+///
+/// It does **not** fix the sparse-but-non-empty case (say 5 matches in 512,311
+/// rows), which is the same misestimate with a smaller multiplier; that needs
+/// per-`param_name` statistics on `value_quantity_value`, which is a schema
+/// change.
+///
+/// # Scope
+///
+/// Quantity and number only, and only for an open-ended comparator. Both are
+/// built by `numeric_predicate` and both read a column whose value range varies
+/// by orders of magnitude between parameters sharing it.
+///
+/// Not `date`, which has the same query shape and is measurably unaffected:
+/// every date parameter in the table shares one calendar range, so the pooled
+/// `value_date` histogram is a good proxy for each slice. The benchmark issues
+/// `Observation?date=gt2070-01-01T00:00:00` and `Patient?birthdate=gt2070-01-01`
+/// — both zero-match, one over a 689,080-row slice — and both stay at p99
+/// 17 ms because the planner correctly estimates zero and picks the value-first
+/// index. The same latent failure exists for date if a deployment ever mixes
+/// wildly different date ranges under one column, but it is not present here
+/// and a guard is not free.
+///
+/// Not equality forms (token, reference, uri, `_id`): v21/v27 put the value
+/// ahead of the sort key in those indexes, so the scan seeks straight to the
+/// value and the `LIMIT` stops after 21 whatever the selectivity. Selectivity
+/// stops mattering, and there is nothing to guard.
+fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
+    let [param] = query.parameters.as_slice() else {
+        return false;
+    };
+    if !matches!(
+        param.param_type,
+        crate::types::SearchParamType::Quantity | crate::types::SearchParamType::Number
+    ) {
+        return false;
+    }
+    param.values.iter().any(|v| {
+        matches!(
+            v.prefix,
+            crate::types::SearchPrefix::Gt
+                | crate::types::SearchPrefix::Ge
+                | crate::types::SearchPrefix::Lt
+                | crate::types::SearchPrefix::Le
+                | crate::types::SearchPrefix::Sa
+                | crate::types::SearchPrefix::Eb
+        )
+    })
 }
 
 #[async_trait]
@@ -102,10 +246,25 @@ impl SearchProvider for PostgresBackend {
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
         let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
-            PostgresQueryBuilder::build_search_query(query, param_offset)
+            PostgresQueryBuilder::build_search_query_for(query, param_offset, self.index_layout())
         } else {
             None
         };
+        // v18 fast path: resolve the page from `search_index` alone.
+        //
+        // The sort key lives on every index row (see `migrate_v16_to_v17`), so a
+        // single-parameter search can take its top-n before touching `resources`
+        // and then fetch only the rows it returns. The general form below has to
+        // join every match first — 42,927 whole resources for a 21-row page on
+        // the benchmark dataset — because the planner cannot estimate a range
+        // predicate whose selectivity is conditional on `param_name`.
+        let fast_index_pred = fast_index_pred(
+            query,
+            search_filter.as_ref().map(|f| f.sql.as_str()),
+            self.index_layout(),
+            cursor.is_some(),
+        );
+
         let filter_clause = search_filter
             .as_ref()
             .map(|f| format!(" AND ({})", f.sql))
@@ -129,7 +288,39 @@ impl SearchProvider for PostgresBackend {
         };
 
         // Build query based on pagination mode.
-        let (sql, has_previous) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
+        let (sql, has_previous) = if let Some(pred) = &fast_index_pred {
+            // `keyset` is always `Some` here: the fast path requires the default
+            // sort, which yields the `last_updated` keyset.
+            // Gate the ordered scan on the predicate matching anything at all;
+            // see `open_range_needs_empty_guard`. The subquery is uncorrelated,
+            // so it is an InitPlan run once against the value-first index, and
+            // its unqualified column references bind to its own `g`.
+            let guard = if open_range_needs_empty_guard(query) {
+                format!(
+                    " AND EXISTS (SELECT 1 FROM search_index g \
+                                  WHERE g.tenant_id = $1 AND g.resource_type = $2 AND {pred})"
+                )
+            } else {
+                String::new()
+            };
+            let sql = format!(
+                "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+                        r.last_updated AS sort_key \
+                 FROM ( \
+                   SELECT DISTINCT resource_id, last_updated FROM search_index \
+                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard} \
+                   ORDER BY last_updated DESC, resource_id ASC LIMIT {lim} \
+                 ) c \
+                 JOIN resources r \
+                   ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = c.resource_id \
+                 WHERE r.is_deleted = FALSE \
+                 ORDER BY c.last_updated DESC, c.resource_id ASC",
+                pred = pred,
+                guard = guard,
+                lim = count + 1,
+            );
+            (sql, false)
+        } else if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
             let e = &k.expr;
             let asc = k.direction == crate::types::SortDirection::Ascending;
             match cursor.direction() {
@@ -214,10 +405,12 @@ impl SearchProvider for PostgresBackend {
             .iter()
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
-        let rows = client
-            .query(&sql, &param_refs)
-            .await
-            .or_query_error("Failed to execute search")?;
+        let rows = if statement_is_reusable(query) {
+            query_dyn_cached(&client, &sql, &param_refs).await
+        } else {
+            client.query(&sql, &param_refs).await
+        }
+        .or_query_error("Failed to execute search")?;
 
         // Parse rows, capturing the sort key for cursor construction.
         let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
@@ -313,7 +506,8 @@ impl SearchProvider for PostgresBackend {
             String,
             Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
         ) = if !query.parameters.is_empty() || query.compartment.is_some() {
-            let filter = PostgresQueryBuilder::build_search_query(query, 2);
+            let filter =
+                PostgresQueryBuilder::build_search_query_for(query, 2, self.index_layout());
 
             let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
                 Box::new(tenant_id.to_string()),
@@ -355,8 +549,10 @@ impl SearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let row = client
-            .query_one(&sql, &param_refs)
+        // No `LIMIT`/`OFFSET` in this one at all: the text varies only by
+        // predicate shape and inlined `param_name`, so it is unconditionally
+        // reusable.
+        let row = query_one_dyn_cached(&client, &sql, &param_refs)
             .await
             .or_query_error("Failed to count resources")?;
 
@@ -418,10 +614,14 @@ impl MultiTypeSearchProvider for PostgresBackend {
             offset
         );
 
-        let rows = client
-            .query(&sql, &[&tenant_id])
-            .await
-            .or_query_error("Failed to execute multi-type search")?;
+        // Same `OFFSET` reservation as `search`; the type list is inlined but is
+        // bounded by the resource types a client can name.
+        let rows = if offset == 0 {
+            query_dyn_cached(&client, &sql, &[&tenant_id]).await
+        } else {
+            client.query(&sql, &[&tenant_id]).await
+        }
+        .or_query_error("Failed to execute multi-type search")?;
 
         let mut resources = Vec::new();
         for row in &rows {
@@ -586,6 +786,13 @@ impl RevincludeProvider for PostgresBackend {
                 .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
 
+            // Deliberately NOT cached. `placeholders` has one entry per
+            // reference value, and there are two per resource on the page, so
+            // the statement text is a function of the page's size — up to 2,000
+            // placeholders, a distinct text for every page width a client asks
+            // for, and a large one. That is precisely the unbounded key the
+            // statement cache must not be fed. It also runs once per search
+            // rather than once per result, so there is little to win.
             let rows = client
                 .query(&sql, &param_refs)
                 .await
@@ -689,6 +896,15 @@ impl ChainedSearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
+        // Deliberately NOT cached: `chain_builder` splices a token's *system*
+        // into the SQL as a literal (search/chain_builder.rs, the `Token` arms of
+        // `build_terminal_condition` and its reverse twin). The value is
+        // quote-escaped, so this is a cache-key problem rather than an injection
+        // one — but a client-supplied value in the text means a distinct
+        // statement per system, which is exactly the unbounded key to avoid.
+        // Binding it instead means renumbering the chain builder's placeholder
+        // accounting, which another seat is already inside; recorded rather than
+        // fixed here.
         let rows = client
             .query(&sql, &param_refs)
             .await
@@ -737,6 +953,7 @@ impl ChainedSearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
+        // Not cached, for the reason given in `resolve_chain`.
         let rows = client
             .query(&sql, &param_refs)
             .await
@@ -773,8 +990,7 @@ impl TextSearchProvider for PostgresBackend {
             count + 1
         );
 
-        let rows = client
-            .query(&sql, &[&tenant_id, &resource_type, &text])
+        let rows = query_dyn_cached(&client, &sql, &[&tenant_id, &resource_type, &text])
             .await
             .or_query_error("Failed to execute text search")?;
 
@@ -848,8 +1064,7 @@ impl TextSearchProvider for PostgresBackend {
             count + 1
         );
 
-        let rows = client
-            .query(&sql, &[&tenant_id, &resource_type, &content])
+        let rows = query_dyn_cached(&client, &sql, &[&tenant_id, &resource_type, &content])
             .await
             .or_query_error("Failed to execute content search")?;
 
@@ -975,8 +1190,7 @@ impl PostgresBackend {
                         .iter()
                         .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                         .collect();
-                    let rows = client
-                        .query(&fragment.sql, &param_refs)
+                    let rows = query_dyn_cached(&client, &fragment.sql, &param_refs)
                         .await
                         .or_query_error("Failed to execute contained query")?;
                     rows.iter()
@@ -1189,14 +1403,18 @@ impl PostgresBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<Option<StoredResource>> {
-        let rows = client
-            .query(
-                "SELECT version_id, data, last_updated, fhir_version FROM resources
+        // One statement per included reference: an `_include` that resolves 20
+        // subjects issues this 20 times for one search. Literal text, primary-key
+        // lookup — the safest thing in the file to cache, and it was the only
+        // hot uncached statement left outside the query builder's output.
+        let rows = query_dyn_cached(
+            client,
+            "SELECT version_id, data, last_updated, fhir_version FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .or_query_error("Failed to fetch resource")?;
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .or_query_error("Failed to fetch resource")?;
 
         if rows.is_empty() {
             return Ok(None);
@@ -1221,5 +1439,135 @@ impl PostgresBackend {
             None,
             fhir_version,
         )))
+    }
+}
+
+#[cfg(test)]
+mod statement_reuse_tests {
+    use super::*;
+    use crate::types::SearchQuery;
+
+    fn q() -> SearchQuery {
+        SearchQuery::new("Patient")
+    }
+
+    #[test]
+    fn a_first_page_is_reusable() {
+        assert!(statement_is_reusable(&q()));
+    }
+
+    #[test]
+    fn an_explicit_zero_offset_is_reusable() {
+        let mut query = q();
+        query.offset = Some(0);
+        assert!(statement_is_reusable(&query));
+    }
+
+    #[test]
+    fn a_nonzero_offset_is_not_reusable() {
+        // `_offset` is inlined into the SQL and nothing clamps it, so caching
+        // this text would mint one prepared statement per page crawled.
+        let mut query = q();
+        query.offset = Some(50);
+        assert!(!statement_is_reusable(&query));
+    }
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::*;
+    use crate::backends::postgres::schema::IndexLayout;
+    use crate::types::{
+        SearchParamType, SearchParameter, SearchPrefix, SearchValue, SortDirective,
+    };
+
+    fn date_query() -> SearchQuery {
+        SearchQuery::new("Encounter").with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "2010-01-01")],
+            chain: vec![],
+            components: vec![],
+        })
+    }
+
+    fn filter_of(query: &SearchQuery) -> String {
+        PostgresQueryBuilder::build_search_query(query, 2)
+            .expect("condition")
+            .sql
+    }
+
+    #[test]
+    fn taken_for_a_default_sorted_single_parameter_page() {
+        let q = date_query();
+        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
+        assert_eq!(
+            pred.as_deref(),
+            Some("param_name = 'date' AND value_date >= $3")
+        );
+    }
+
+    /// The string fast path is the statement v34 rewrote — 30% of the search
+    /// suite's Postgres time in run 33128380492 — so pin that its two-parameter
+    /// range form still matches `INDEX_MEMBERSHIP_PREFIX` exactly. If it stopped
+    /// matching, the page would silently fall back to the join-everything path
+    /// and the seek would be worth nothing.
+    #[test]
+    fn taken_for_the_v33_string_range_form() {
+        let q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "address".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "Springfield")],
+            chain: vec![],
+            components: vec![],
+        });
+        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
+        assert_eq!(
+            pred.as_deref(),
+            Some(
+                "param_name = 'address' AND \
+                 COALESCE(value_string_folded, lower(value_string)) ~>=~ $3 AND \
+                 COALESCE(value_string_folded, lower(value_string)) ~<~ $4"
+            )
+        );
+    }
+
+    #[test]
+    fn refused_on_a_legacy_layout() {
+        // The decisive gate: legacy rows have no `last_updated`, so ordering by
+        // it would return an arbitrary page rather than the first one.
+        let q = date_query();
+        assert!(fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Legacy, false).is_none());
+    }
+
+    #[test]
+    fn refused_with_a_cursor_or_offset() {
+        let q = date_query();
+        let filter = filter_of(&q);
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, true).is_none());
+
+        let mut q2 = date_query();
+        q2.offset = Some(40);
+        assert!(fast_index_pred(&q2, Some(&filter), IndexLayout::Denormalized, false).is_none());
+    }
+
+    #[test]
+    fn refused_for_a_non_default_sort() {
+        let mut q = date_query();
+        q.sort = vec![SortDirective {
+            parameter: "_id".to_string(),
+            direction: crate::types::SortDirection::Ascending,
+            param_type: Some(SearchParamType::Token),
+        }];
+        let filter = filter_of(&q);
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, false).is_none());
+    }
+
+    #[test]
+    fn refused_without_a_filter() {
+        let q = SearchQuery::new("Encounter");
+        assert!(fast_index_pred(&q, None, IndexLayout::Denormalized, false).is_none());
     }
 }
