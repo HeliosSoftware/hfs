@@ -42,3 +42,26 @@ test("with JavaScript disabled, the results region only fills after Save", async
   await expect(page.locator(".data-table")).toBeVisible();
   await expect(page.locator(".data-table td", { hasText: patientId }).first()).toBeVisible();
 });
+
+// #843: `theme.js` never runs `<html class="js">` here, so `needs-js`
+// keeps the guided-form card out of the accessibility tree and off-screen —
+// the grid collapses to the editor alone, exactly like the page before this
+// ticket. The Save → results flow above still passes unmodified: nothing
+// about the guided form is on the critical path for it.
+test("with JavaScript disabled, the guided-form card stays hidden and the editor works alone", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_nojs_no_guided_form",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  await expect(page.locator("html")).not.toHaveClass(/\bjs\b/);
+  await expect(page.locator("section.editor-form")).toBeHidden();
+  await expect(page.locator("textarea[name='json']")).toBeVisible();
+});
