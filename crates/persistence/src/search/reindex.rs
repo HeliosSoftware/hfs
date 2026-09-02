@@ -17,7 +17,6 @@ use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
 use super::errors::ReindexError;
-use super::extractor::SearchParameterExtractor;
 
 /// Audit event helpers for reindex operations.
 pub mod audit {
@@ -168,6 +167,35 @@ pub trait ReindexTarget: Send + Sync {
     ///
     /// Implementations MUST scope the deletion to `tenant` and nothing else.
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64>;
+
+    /// Rebuilds a whole page of resources — delete each one's stale entries,
+    /// write fresh ones — returning a per-resource result of entries written,
+    /// in input order.
+    ///
+    /// The default loops the per-resource methods and is what every writer
+    /// got before pages existed. Backends whose per-resource writes each pay
+    /// an autocommit (SQLite: 15–30 index rows *and* an FTS row per resource,
+    /// each its own implicit transaction) override this to wrap the page in
+    /// one transaction — the reindex-side counterpart of the #815 batch
+    /// ingest, and what keeps the fast-load rebuild (#903) from giving back
+    /// the throughput the deferred ingest won.
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut results = Vec::with_capacity(resources.len());
+        for resource in resources {
+            let deleted = self
+                .delete_search_entries(tenant, resource.resource_type(), resource.id())
+                .await;
+            match deleted {
+                Ok(_) => results.push(self.write_search_entries(tenant, resource).await),
+                Err(e) => results.push(Err(e)),
+            }
+        }
+        results
+    }
 }
 
 /// A backend that is both a [`ReindexSource`] and a [`ReindexTarget`] —
@@ -700,9 +728,10 @@ async fn run_reindex(
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
     mut cancel_rx: mpsc::Receiver<()>,
 ) {
-    // Extract with the reindexed tenant's registry (base + that tenant's overlay).
-    let extractor =
-        SearchParameterExtractor::new(registries.for_tenant(tenant.tenant_id().as_str()));
+    // The writers extract with their own tenant registries; the driver no
+    // longer runs a second extraction just to count entries — the per-page
+    // outcomes report what was actually written.
+    let _ = registries;
     // Mark as started
     {
         let mut jobs_guard = jobs.write();
@@ -804,63 +833,40 @@ async fn run_reindex(
                 }
             };
 
-            // Process each resource
-            for resource in &page.resources {
-                // How many entries this resource yields, for the progress
-                // counter. A failure here means the resource cannot be indexed
-                // at all, so skip it rather than half-writing it.
-                let entry_count = match extractor.extract(resource.content(), resource_type) {
-                    Ok(values) => values.len() as u64,
-                    Err(e) => {
-                        let mut jobs_guard = jobs.write();
-                        if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                            progress.processed_resources += 1;
+            // Rebuild the page through every writer. Page-at-a-time so a
+            // writer can wrap it in one transaction; each writer reports a
+            // per-resource outcome for error attribution. The entry count for
+            // progress comes from the writers' own extraction — the driver no
+            // longer extracts a second time just to count.
+            let mut wrote_any: Vec<bool> = vec![false; page.resources.len()];
+            let mut entry_counts: Vec<u64> = vec![0; page.resources.len()];
+            for writer in &writers {
+                let outcomes = writer
+                    .write_search_entries_page(&tenant, &page.resources)
+                    .await;
+                for (i, outcome) in outcomes.into_iter().enumerate() {
+                    match outcome {
+                        Ok(written) => {
+                            wrote_any[i] = true;
+                            entry_counts[i] = entry_counts[i].max(written as u64);
                         }
-                        drop(jobs_guard);
-                        push_error(
-                            &jobs,
-                            &job_id,
-                            resource_type,
-                            resource.id(),
-                            format!("Extraction failed: {e}"),
-                        );
-                        continue;
-                    }
-                };
-
-                let mut wrote_any = false;
-                for writer in &writers {
-                    if let Err(e) = writer
-                        .delete_search_entries(&tenant, resource_type, resource.id())
-                        .await
-                    {
-                        push_error(
-                            &jobs,
-                            &job_id,
-                            resource_type,
-                            resource.id(),
-                            format!("Failed to delete index entries: {e}"),
-                        );
-                        continue;
-                    }
-
-                    match writer.write_search_entries(&tenant, resource).await {
-                        Ok(_written) => wrote_any = true,
                         Err(e) => push_error(
                             &jobs,
                             &job_id,
                             resource_type,
-                            resource.id(),
-                            format!("Failed to write index entries: {e}"),
+                            page.resources[i].id(),
+                            format!("Failed to rebuild index entries: {e}"),
                         ),
                     }
                 }
+            }
 
+            for (i, _resource) in page.resources.iter().enumerate() {
                 let mut jobs_guard = jobs.write();
                 if let Some(progress) = jobs_guard.get_mut(&job_id) {
                     progress.processed_resources += 1;
-                    if wrote_any {
-                        progress.entries_created += entry_count;
+                    if wrote_any[i] {
+                        progress.entries_created += entry_counts[i];
                     }
                 }
             }

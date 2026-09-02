@@ -3642,6 +3642,75 @@ impl ReindexSource for SqliteBackend {
 
 // ReindexTarget: SQLite keeps search entries in its own `search_index`
 // table, so it is also a writer and can reindex itself standalone.
+impl SqliteBackend {
+    /// Writes one resource's search entries — dynamic extraction, contained
+    /// resources, and the FTS row — on the caller's connection, so a batched
+    /// reindex can put a whole page inside one transaction.
+    fn write_search_entries_on(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
+
+        // Use the dynamic extraction over the tenant's registry
+        let values = self
+            .tenant_extractor(tenant.tenant_id().as_str())
+            .extract(content, resource_type)
+            .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
+
+        let mut count = 0;
+        for value in values {
+            self.write_index_entry(
+                conn,
+                tenant.tenant_id().as_str(),
+                resource_type,
+                resource_id,
+                &value,
+            )?;
+            count += 1;
+        }
+
+        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
+        // search entries.
+        count += self.index_contained_resources(
+            conn,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            resource_id,
+            content,
+        )?;
+
+        // Rebuild the full-text row as well. Without this, `$reindex` was a
+        // *destructive* operation for `_text`/`_content`: `run_reindex` deletes
+        // each resource's search entries via `delete_search_entries` ->
+        // `delete_search_index`, which does drop the FTS row, and nothing here
+        // put it back. That happened on every reindex, with or without
+        // `clear_existing`, so the documented recovery operation silently
+        // disabled full-text search until each resource was next written.
+        //
+        // Not counted in `count`: that value is the number of `search_index`
+        // entries, which `$reindex-status` reports, and an FTS row is not one.
+        //
+        // Safe against duplicates because every caller deletes the resource's
+        // search entries (FTS row included) immediately before this, and
+        // SQLite's `index_fts_content` is a bare INSERT with no delete-first.
+        // If that ordering ever changes, this must become delete-then-insert.
+        self.index_fts_content(
+            conn,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            resource_id,
+            content,
+        )?;
+
+        Ok(count)
+    }
+}
+
 #[async_trait]
 impl ReindexTarget for SqliteBackend {
     async fn delete_search_entries(
@@ -3667,62 +3736,52 @@ impl ReindexTarget for SqliteBackend {
         resource: &StoredResource,
     ) -> StorageResult<usize> {
         let conn = self.get_connection()?;
-        let resource_type = resource.resource_type();
-        let resource_id = resource.id();
-        let content = resource.content();
+        self.write_search_entries_on(&conn, tenant, resource)
+    }
 
-        // Use the dynamic extraction over the tenant's registry
-        let values = self
-            .tenant_extractor(tenant.tenant_id().as_str())
-            .extract(content, resource_type)
-            .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
-
-        let mut count = 0;
-        for value in values {
-            self.write_index_entry(
-                &conn,
-                tenant.tenant_id().as_str(),
-                resource_type,
-                resource_id,
-                &value,
-            )?;
-            count += 1;
+    /// Rebuilds a page of resources inside one IMMEDIATE transaction — the
+    /// reindex-side counterpart of the #815 batch ingest. Per-resource
+    /// autocommit made the fast-load rebuild (#903) run at ~50-100
+    /// resources/s, giving back most of what the deferred ingest won.
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let conn = match self.get_connection() {
+            Ok(conn) => conn,
+            Err(e) => {
+                let msg = e.to_string();
+                return resources
+                    .iter()
+                    .map(|_| Err(internal_error(msg.clone())))
+                    .collect();
+            }
+        };
+        if let Err(e) = conn.execute("BEGIN IMMEDIATE", []) {
+            let msg = format!("Failed to begin reindex batch: {e}");
+            return resources
+                .iter()
+                .map(|_| Err(internal_error(msg.clone())))
+                .collect();
         }
-
-        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
-        // search entries.
-        count += self.index_contained_resources(
-            &conn,
-            tenant.tenant_id().as_str(),
-            resource_type,
-            resource_id,
-            content,
-        )?;
-
-        // Rebuild the full-text row as well. Without this, `$reindex` was a
-        // *destructive* operation for `_text`/`_content`: `run_reindex` deletes
-        // each resource's search entries via `delete_search_entries` ->
-        // `delete_search_index`, which does drop the FTS row, and nothing here
-        // put it back. That happened on every reindex, with or without
-        // `clear_existing`, so the documented recovery operation silently
-        // disabled full-text search until each resource was next written.
-        //
-        // Not counted in `count`: that value is the number of `search_index`
-        // entries, which `$reindex-status` reports, and an FTS row is not one.
-        //
-        // Safe against duplicates because `run_reindex` always calls
-        // `delete_search_entries` for the resource immediately before this, and
-        // SQLite's `index_fts_content` is a bare INSERT with no delete-first.
-        // If that ordering ever changes, this must become delete-then-insert.
-        self.index_fts_content(
-            &conn,
-            tenant.tenant_id().as_str(),
-            resource_type,
-            resource_id,
-            content,
-        )?;
-
-        Ok(count)
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut results: Vec<StorageResult<usize>> = Vec::with_capacity(resources.len());
+        for resource in resources {
+            let outcome = self
+                .delete_search_index(&conn, tenant_id, resource.resource_type(), resource.id())
+                .and_then(|_| self.write_search_entries_on(&conn, tenant, resource));
+            results.push(outcome);
+        }
+        if let Err(e) = conn.execute("COMMIT", []) {
+            let _ = conn.execute("ROLLBACK", []);
+            let msg = format!("Failed to commit reindex batch: {e}");
+            return resources
+                .iter()
+                .map(|_| Err(internal_error(msg.clone())))
+                .collect();
+        }
+        results
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
