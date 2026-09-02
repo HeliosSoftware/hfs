@@ -47,7 +47,7 @@ use crate::core::bulk_submit_worker::{
 use crate::core::storage::ResourceStorage;
 use crate::core::{ActivityCell, DailyResourceCount, ResourceCountDelta, SofRunner, TenantRecord};
 use crate::error::{BackendError, StorageResult};
-use crate::tenant::{TenantContext, TenantId};
+use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
 use super::storage::CompositeStorage;
@@ -776,7 +776,7 @@ mod tests {
     use crate::composite::config::CompositeConfig;
     use crate::composite::storage::DynStorage;
     use crate::core::BackendKind;
-    use crate::tenant::TenantPermissions;
+    use crate::tenant::{TenantId, TenantPermissions};
     use parking_lot::Mutex;
     use serde_json::json;
     use std::collections::HashMap;
