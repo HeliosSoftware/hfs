@@ -1202,7 +1202,7 @@ pub fn mount_with_conformance_source_and_runtime(
             "/ui/sql/view-definitions",
             get(sql_view_definitions_page).post(sql_view_definitions_save),
         )
-        // #753 ticket 03 (evaluation POC): the editor's async server lint.
+        // #753 (evaluation POC): the editor's async server lint.
         .route(
             "/ui/sql/view-definitions/lint",
             axum::routing::post(sql_view_definitions_lint),
@@ -2324,19 +2324,19 @@ async fn sql_view_definitions_save(
     }
 }
 
-/// #753 ticket 03 (evaluation POC, not merged upstream): structural +
+/// #753 (evaluation POC, not merged upstream): structural +
 /// FHIRPath-syntax lint for the ViewDefinition editor's async CodeMirror 6
-/// linter (ticket 02's `vd-editor.js`, RF7). Delegates entirely to
+/// linter (`vd-editor.js`). Delegates entirely to
 /// [`helios_sof::lint::lint_view_definition`] — this handler only decodes
 /// the request body and shapes the response; it never touches storage, the
 /// tenant, or the configured FHIR version, because the lint itself is
-/// purely structural (RF5) and version-agnostic.
+/// purely structural and version-agnostic.
 ///
 /// Plain JSON in, JSON out — no htmx swap involved, matching the precedent
 /// `/ui/editor/expand` already sets for a browser-facing JSON endpoint that
 /// exists to support an editor rather than to mirror the FHIR REST surface.
 /// The body is read as raw bytes (not the `Json` extractor) so a malformed
-/// body reports RF5's exact `{"error": "..."}` shape instead of axum's
+/// body reports the lint's exact `{"error": "..."}` shape instead of axum's
 /// generic rejection body.
 async fn sql_view_definitions_lint(body: Bytes) -> Response {
     let doc: serde_json::Value = match serde_json::from_slice(&body) {
@@ -4119,12 +4119,20 @@ mod tests {
         );
     }
 
-    /// #753 ticket 02: vd-editor.js — the hand-written mount script that
-    /// progressively enhances the ViewDefinition textarea with the ticket 01
+    /// #753: vd-editor.js — the hand-written mount script that
+    /// progressively enhances the ViewDefinition textarea with the vendored
     /// bundle — is embedded like every other page script.
     #[test]
     fn vd_editor_script_is_embedded() {
         assert!(Assets::get("vd-editor.js").is_some());
+    }
+
+    /// #838: `code-editor.js`, the mount helper `vd-editor.js` was
+    /// generalized out of (and every future CodeMirror editor in this crate
+    /// builds on), is embedded like every other page script.
+    #[test]
+    fn code_editor_helper_script_is_embedded() {
+        assert!(Assets::get("code-editor.js").is_some());
     }
 
     /// The theme script persists the choice to the per-user settings document
