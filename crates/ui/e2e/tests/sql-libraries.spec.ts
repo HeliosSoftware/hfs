@@ -55,3 +55,47 @@ test("a stored SQLQuery lists, decodes its SQL, and previews rows", async ({ pag
   await expect(page.locator(".data-table")).toBeVisible();
   await expect(page.locator(".data-table th", { hasText: "n" }).first()).toBeVisible();
 });
+
+/** A minimal savable sql-query Library, named for the rail. */
+function starterLibrary(name: string) {
+  return {
+    name,
+    status: "active",
+    type: {
+      coding: [
+        {
+          system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+          code: "sql-query",
+        },
+      ],
+    },
+  };
+}
+
+// "Recently used" group (#754/#755 ticket 03): SQL Queries restores its own
+// stored `last` on plain arrival, and an explicit `?lib=` deep link always
+// wins over it — the same resolution order the View Definitions rail proves
+// (RF1), exercised here through the Library-backed page instead.
+test("restores the stored last selection on plain arrival; a deep link with ?lib= wins", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const libA = await createResource(request, "Library", starterLibrary(`zq_${stamp}_a`));
+  const libB = await createResource(request, "Library", starterLibrary(`zq_${stamp}_b`));
+  await Promise.all([libA, libB].map((id) => waitSearchable(request, "Library", id)));
+
+  await page.goto(`/ui/sql/queries?lib=${libA}`);
+  await page.goto("/ui/sql/queries");
+  await expect(page.locator(`#lib-rail-list [data-type='${libA}']`)).toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+
+  // A deep link always wins over the stored last, even to a different item.
+  await page.goto(`/ui/sql/queries?lib=${libB}`);
+  await expect(page.locator(`#lib-rail-list [data-type='${libB}']`)).toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+});

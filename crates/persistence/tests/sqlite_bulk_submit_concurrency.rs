@@ -154,11 +154,13 @@ async fn two_workers_run_whole_manifests_to_completion() {
             _requires_access_token: bool,
             _oauth: &[String],
             _key: Option<&serde_json::Value>,
-        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
             let data = self.files.get(url).cloned().unwrap_or_default();
-            Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
-                data,
-            ))))
+            let len = data.len() as u64;
+            Ok((
+                Box::new(tokio::io::BufReader::new(std::io::Cursor::new(data))),
+                Some(len),
+            ))
         }
     }
 
@@ -283,7 +285,7 @@ async fn a_file_slower_than_the_lease_stays_leased_to_completion() {
             _requires_access_token: bool,
             _oauth: &[String],
             _key: Option<&serde_json::Value>,
-        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
             // Trickle the file over ~6 seconds — three times the lease.
             let (reader, mut writer) = tokio::io::duplex(1024);
             let lines = self.lines.clone();
@@ -296,7 +298,7 @@ async fn a_file_slower_than_the_lease_stays_leased_to_completion() {
                     tokio::time::sleep(Duration::from_millis(150)).await;
                 }
             });
-            Ok(Box::new(tokio::io::BufReader::new(reader)))
+            Ok((Box::new(tokio::io::BufReader::new(reader)), None))
         }
     }
 
@@ -509,11 +511,14 @@ async fn a_ready_heavy_stream_still_renews_the_lease() {
             _requires_access_token: bool,
             _oauth: &[String],
             _key: Option<&serde_json::Value>,
-        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
-            Ok(Box::new(tokio::io::BufReader::new(BusyReader {
-                data: self.lines.clone(),
-                pos: 0,
-            })))
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            Ok((
+                Box::new(tokio::io::BufReader::new(BusyReader {
+                    data: self.lines.clone(),
+                    pos: 0,
+                })),
+                None,
+            ))
         }
     }
 
@@ -612,7 +617,7 @@ async fn a_lost_lease_aborts_the_run_quietly() {
             _requires_access_token: bool,
             _oauth: &[String],
             _key: Option<&serde_json::Value>,
-        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
             let (reader, mut writer) = tokio::io::duplex(1024);
             let lines = self.lines.clone();
             tokio::spawn(async move {
@@ -624,7 +629,7 @@ async fn a_lost_lease_aborts_the_run_quietly() {
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 }
             });
-            Ok(Box::new(tokio::io::BufReader::new(reader)))
+            Ok((Box::new(tokio::io::BufReader::new(reader)), None))
         }
     }
 

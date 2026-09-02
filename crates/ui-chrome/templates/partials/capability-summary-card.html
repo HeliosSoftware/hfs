@@ -1,0 +1,41 @@
+{#
+  SHARED CAPABILITY CARD -- Server Summary (#808).
+
+  Rendered by `helios_ui_chrome::capability::CapabilityCards::summary()` and
+  consumed by BOTH `crates/ui` (HFS) and `crates/hts-ui` (HTS). One edit here
+  changes both products. Do NOT copy this markup back into either crate's
+  templates: that fork is the drift this module exists to make impossible.
+
+  Structure is load-bearing, not decorative. `crates/ui/e2e/tests/
+  design-system.spec.ts` asserts, at three viewports, that this card is
+  `section.card > .card__body > .kv-grid > .detail__field` with exactly seven
+  fields, the first two spanning full width. The responsive column rules in
+  `crates/ui/assets/app.css` key off that shape.
+
+  Contract: `i18n` is a `&dyn ChromeLabels`; `summary` is a
+  `&CapabilitySummary`; `notice` is an already-translated warning sentence
+  that replaces the body while keeping the heading (HTS per-card degradation).
+
+  An absent field renders an em-dash rather than an empty cell -- "the server
+  did not say" and "the server said nothing" look identical otherwise.
+#}
+<section class="card">
+  <div class="card-head">
+    <h3>{{ i18n.t("cap-summary-heading") }}</h3>
+  </div>
+  {%- if let Some(notice) = notice %}
+  <p class="notice notice--warn">{{ notice }}</p>
+  {%- else %}
+  <div class="card__body">
+    <div class="kv-grid kv-grid--flush">
+      <div class="detail__field detail__field--wide"><span>{{ i18n.t("cap-summary-description") }}</span><div>{% if !summary.description.is_empty() %}{{ summary.description }}{% else %}&mdash;{% endif %}</div></div>
+      <div class="detail__field detail__field--wide"><span>{{ i18n.t("cap-summary-url") }}</span><div>{% if !summary.implementation_url.is_empty() %}{{ summary.implementation_url }}{% else %}&mdash;{% endif %}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-fhir-version") }}</span><div>{% if !summary.fhir_version.is_empty() %}{{ summary.fhir_version }}{% else %}&mdash;{% endif %}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-status") }}</span><div>{% if !summary.status.is_empty() %}{{ summary.status }}{% else %}&mdash;{% endif %}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-kind") }}</span><div>{% if !summary.kind.is_empty() %}{{ summary.kind }}{% else %}&mdash;{% endif %}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-date") }}</span><div>{% if !summary.date.is_empty() %}{{ summary.date }}{% else %}&mdash;{% endif %}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-formats") }}</span><div>{% if !summary.formats.is_empty() %}{{ summary.formats.join(", ") }}{% else %}&mdash;{% endif %}</div></div>
+    </div>
+  </div>
+  {%- endif %}
+</section>

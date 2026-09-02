@@ -607,6 +607,7 @@ bulk-import-detail-created = Erstellt
 bulk-import-detail-status = Status
 bulk-import-detail-auth = Authentifizierung
 bulk-import-abort = Abbrechen
+bulk-import-mark-completed = Als abgeschlossen markieren
 bulk-import-delete = Löschen
 bulk-import-edit = Bearbeiten
 bulk-import-edit-title = Submission bearbeiten
@@ -804,6 +805,7 @@ vd-new = Neu erstellen
 vd-new-title = Neue View-Definition
 vd-rail-label = View-Definitionen
 vd-rail-heading = View-Definitionen
+vd-rail-all-heading = Alle View-Definitionen
 vd-filter = Views filtern
 vd-none = Noch keine View-Definitionen.
 vd-empty-lede = Lege mit „Neu erstellen" die erste ViewDefinition an.
@@ -827,6 +829,8 @@ vd-page-next = Weiter
 
 sql-queries-new-title = Neue SQL-Abfrage
 sql-views-new-title = Neue SQL-View
+sql-queries-rail-all-heading = Alle SQL-Abfragen
+sql-views-rail-all-heading = Alle SQL-Views
 lib-filter = Bibliotheken filtern
 lib-none = Noch keine Bibliotheken.
 lib-empty-lede = Lege mit „Neu erstellen" die erste Bibliothek an.
@@ -1449,8 +1453,6 @@ hts-capability-closure = Closure-Pflege
 hts-capability-code-systems-declared = Deklarierte Codesysteme
 hts-capability-flag-true = Ja
 hts-capability-flag-false = Nein
-hts-capability-raw-truncated = Auf die ersten { $shown } von { $total } Bytes gekürzt — die Deklaration dieses Servers wächst mit den geladenen Codesystemen.
-hts-capability-raw-full = Vollständige Deklaration ansehen
 
 # Home V3 tile sub-lines. The mockup folds Backend, FHIR version,
 # Bundled data and Avg latency into the sub-line of the tile each
