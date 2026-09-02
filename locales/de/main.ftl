@@ -1058,6 +1058,8 @@ hts-cs-subsumes-outcome-not-subsumed = Keiner der Codes subsumiert den anderen.
 hts-workbench-run = Ausführen
 hts-workbench-raw-response = Rohanfrage und -antwort
 hts-workbench-copy-url = Anfrage-URL
+hts-workbench-request-body = Anfragekörper
+hts-workbench-response-body = Antwortkörper
 
 ## Zusätzlicher Degradiert-Grund für 404 beim CodeSystem-Read (§7.3).
 

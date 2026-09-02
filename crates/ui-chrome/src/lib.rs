@@ -36,11 +36,18 @@
 //! supplies the newline after `</details>`, so the render must not end with
 //! one. See `tests/user_menu.rs::renders_without_a_trailing_newline`.
 //!
+//! The second thing shared here is the JSON viewer — [`json_view`] — for the
+//! same reason. It arrived in #803, when the HTS workbench's raw request and
+//! response fold needed the line-numbered, foldable, highlighted view HFS has
+//! rendered since #264, and the only alternatives were depending on the whole
+//! HFS UI crate or forking a 400-line tokenizer.
+//!
 //! # What is deliberately *not* shared here
 //!
 //! CSS. `crates/ui/assets/app.css` is already shared byte-for-byte by
 //! `crates/hts-ui/src/lib.rs` embedding `../ui/assets` directly, and lifting
-//! it into a neutral crate is gated on #543.
+//! it into a neutral crate is gated on #543. The same goes for
+//! `json-view.js`, which drives the folding for both products from that embed.
 //!
 //! # Usage
 //!
@@ -68,6 +75,8 @@
 
 use askama::Template;
 
+pub mod json_view;
+
 /// The localisation surface the shared chrome needs from its host.
 ///
 /// Both products already own a fluent-backed i18n type; this trait is the
@@ -89,8 +98,9 @@ pub trait ChromeLabels {
     ///
     /// The keys the chrome asks for are `user-menu-label`, `user-anonymous`,
     /// `user-local-hint`, `language-label`, `language-en`, `language-es`,
-    /// `language-de`, and `user-logout`. A consumer missing any of them will
-    /// render whatever its bundle's fallback produces.
+    /// `language-de`, and `user-logout`, plus `json-view-toggle-fold` for
+    /// [`json_view::render`]. A consumer missing any of them will render
+    /// whatever its bundle's fallback produces.
     ///
     /// The returned text is HTML-escaped by the template. Do not pre-escape it,
     /// and do not return markup expecting it to render as markup.

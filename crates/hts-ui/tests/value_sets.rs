@@ -761,8 +761,11 @@ async fn expand_flat_renders_load_more_when_total_exceeds_page() {
     // Tree and flat now share one `.data-table`; depth is the only
     // difference and it is expressed as an inline `padding-left` on the
     // Code cell. A flat window has no depth, so no row may be indented.
+    // Matched on the cell rather than the bare property: since #803 the raw
+    // fold below the table renders a JSON view, whose gutter indents its own
+    // lines with `padding-left` too.
     assert!(
-        !html.contains("padding-left"),
+        !html.contains(r#"<td style="padding-left"#),
         "flat mode result must not indent any row",
     );
 }

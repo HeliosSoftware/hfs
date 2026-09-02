@@ -705,3 +705,200 @@ fn cs_detail_page_uses_the_v3_compact_header_shape() {
         "the facts disclosure must render collapsed",
     );
 }
+
+// ── The "Raw request and response" fold (#803) ──────────────────────────
+//
+// Three defects, all reproduced on `$lookup` and all fixed in the shared
+// `partials/hts-raw-fold.html`:
+//
+// 1. The fold had no expand affordance — `<summary class="field__label">`
+//    sets `display: block`, and a `<summary>` only draws the native
+//    disclosure marker at `display: list-item`, so the triangle was gone in
+//    every engine and the cursor never changed.
+// 2. The payload was an unhighlighted `<pre>` blob.
+// 3. On a failed lookup there was no response JSON at all — `raw_body` was
+//    populated only on the success path — and the request body was never
+//    shown on any path, despite the heading promising it.
+
+/// A `$lookup` mock that answers with `canned` and seeds the search legs
+/// `read_code_system` needs so the run takes the §8.2 canonical path.
+async fn start_lookup_mock(status: StatusCode, canned: serde_json::Value) -> String {
+    let canned = Arc::new(canned);
+    let router: Router = Router::new()
+        .route(
+            "/__mock_ready",
+            axum::routing::get(|| async { (StatusCode::OK, "ok") }),
+        )
+        .route(
+            "/CodeSystem",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "resourceType": "Bundle",
+                    "type": "searchset",
+                    "entry": [{
+                        "resource": {
+                            "resourceType": "CodeSystem",
+                            "id": "icd9cm",
+                            "url": "http://hl7.org/fhir/sid/icd-9-cm",
+                            "name": "ICD-9-CM",
+                            "status": "active"
+                        }
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/CodeSystem/$lookup",
+            axum::routing::post(move || {
+                let canned = Arc::clone(&canned);
+                async move { (status, axum::Json((*canned).clone())) }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream listener");
+    let addr: std::net::SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let base = format!("http://{addr}");
+    let probe = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .expect("build ready-probe client");
+    let ready_url = format!("{base}/__mock_ready");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match probe.get(&ready_url).send().await {
+            Ok(r) if r.status().is_success() => break,
+            _ => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    base
+}
+
+async fn run_lookup(base: &str, form: &'static str) -> String {
+    let response = app_pointing_at(base)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/code-systems/icd9cm/lookup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::ACCEPT_LANGUAGE, "en")
+                .header("HX-Request", "true")
+                .body(Body::from(form))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_text(response).await
+}
+
+#[tokio::test]
+async fn raw_fold_reads_as_a_control_and_highlights_both_payloads() {
+    let base = start_lookup_mock(
+        StatusCode::OK,
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "display", "valueString": "Cholera" },
+                { "name": "system", "valueUri": "http://hl7.org/fhir/sid/icd-9-cm" }
+            ]
+        }),
+    )
+    .await;
+    let html = run_lookup(&base, "code=001").await;
+
+    // 1. The HFS `json-fold` idiom: an explicit chevron on a `.card-head`
+    //    summary, which `details.json-fold > summary` gives `cursor: pointer`
+    //    and strips the (already absent) native marker from.
+    assert!(
+        html.contains(r#"<details class="card json-fold">"#)
+            && html.contains(r#"<summary class="card-head">"#)
+            && html.contains(r#"<span class="icon">"#),
+        "the fold must render the chevron idiom, not a bare summary; got:\n{html}",
+    );
+    assert!(
+        !html.contains(r#"<summary class="field__label">"#),
+        "`.field__label` on a summary is what removed the disclosure marker",
+    );
+
+    // 2. Both payloads go through the shared highlighted JSON view.
+    assert_eq!(
+        html.matches(r#"class="json-view""#).count(),
+        2,
+        "request and response must each render a JSON view; got:\n{html}",
+    );
+    assert!(
+        html.contains(r#"class="jt--key""#),
+        "tokens must be coloured"
+    );
+
+    // 3. The request body is shown at all — the heading has promised it
+    //    since it was written.
+    assert!(
+        html.contains("valueCode") && html.contains("001"),
+        "the POSTed Parameters must be visible; got:\n{html}",
+    );
+    assert!(html.contains("/CodeSystem/$lookup"), "and the request URL");
+}
+
+#[tokio::test]
+async fn a_failed_lookup_still_shows_the_response_payload() {
+    // The body was never unavailable on this path — `status_to_error`
+    // parsed it for its OperationOutcome and dropped the JSON, so a 404
+    // showed the request URL and nothing else, precisely when the raw
+    // payload is most wanted.
+    let base = start_lookup_mock(
+        StatusCode::NOT_FOUND,
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "not-found",
+                "diagnostics": "code 999 not found in http://hl7.org/fhir/sid/icd-9-cm"
+            }]
+        }),
+    )
+    .await;
+    let html = run_lookup(&base, "code=999").await;
+
+    assert!(
+        html.contains(r#"data-severity="error""#),
+        "the structured outcome must still render above the fold",
+    );
+    assert!(
+        html.contains(r#"<details class="card json-fold">"#),
+        "a failed lookup must still render the fold; got:\n{html}",
+    );
+    assert!(
+        html.contains("code 999 not found"),
+        "the response payload must survive the error path; got:\n{html}",
+    );
+    assert!(
+        html.contains("999") && html.contains("valueCode"),
+        "so must the request body that provoked it",
+    );
+}
+
+#[tokio::test]
+async fn a_submit_rejected_before_sending_renders_no_fold() {
+    // Nothing went over the wire, so there is no exchange to disclose and
+    // an empty fold would be worse than none.
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/code-systems/icd9cm/lookup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(""))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+
+    assert!(!html.contains("json-fold"), "got:\n{html}");
+}

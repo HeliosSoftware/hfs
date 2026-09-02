@@ -44,7 +44,7 @@
       textarea cannot number lines or fold objects). Every object and array
       carries a fold arrow; the gutter counts lines like a code editor.
     -->
-    {% include "partials/json-view.html" %}
+    {{ json_view|safe }}
 
     <!-- Raw editing, one toggle away. On apply it re-parses and the form
          re-renders from it. -->

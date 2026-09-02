@@ -190,26 +190,5 @@
     </article>
   {% endif %}
 
-  {#- Raw request + response echo (§7.3 wireframe). Kept last so the
-      readable summary above stays visually primary. A bare
-      <details>/<summary> keeps the native disclosure marker; `.detail__code`
-      is the shared preformatted-payload token. -#}
-  {% if !view.raw_body.is_empty() || !view.request_url.is_empty() %}
-  <section class="card panel">
-    <details>
-      <summary class="field__label">{{ chrome.i18n.t("hts-workbench-raw-response") }}</summary>
-      {% if !view.request_url.is_empty() %}
-      <div class="kv-grid" style="margin:14px 0">
-        <div class="detail__field detail__field--wide">
-          <span>{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
-          <code>{{ view.request_url }}</code>
-        </div>
-      </div>
-      {% endif %}
-      {% if !view.raw_body.is_empty() %}
-      <pre class="detail__code" tabindex="0">{{ view.raw_body }}</pre>
-      {% endif %}
-    </details>
-  </section>
-  {% endif %}
+  {% include "partials/hts-raw-fold.html" %}
 </div>

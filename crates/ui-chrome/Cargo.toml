@@ -23,3 +23,8 @@ keywords = ["helios-software", "hl7", "fhir", "helios-fhir-server", "askama"]
 # `askama::Error` (the error type of `user_menu()`) without having to keep its
 # own askama version in lockstep with ours.
 askama = "0.16"
+
+# The JSON viewer walks a `serde_json::Value` directly rather than
+# pretty-printing and re-parsing it, so each container knows its own opening
+# line, its closing line, and its ancestry — which is what folding needs.
+serde_json = "1"

@@ -1058,6 +1058,8 @@ hts-cs-subsumes-outcome-not-subsumed = Ninguno subsume al otro.
 hts-workbench-run = Ejecutar
 hts-workbench-raw-response = Solicitud y respuesta sin procesar
 hts-workbench-copy-url = URL de la solicitud
+hts-workbench-request-body = Cuerpo de la solicitud
+hts-workbench-response-body = Cuerpo de la respuesta
 
 ## Razón degradada adicional para 404 al leer CS (states matrix §7.3).
 

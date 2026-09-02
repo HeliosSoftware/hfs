@@ -1059,6 +1059,8 @@ hts-cs-subsumes-outcome-not-subsumed = Neither code subsumes the other.
 hts-workbench-run = Run
 hts-workbench-raw-response = Raw request and response
 hts-workbench-copy-url = Request URL
+hts-workbench-request-body = Request body
+hts-workbench-response-body = Response body
 
 ## Additional degraded reason for CS-read 404s (design doc §7.3 states matrix).
 

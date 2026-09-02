@@ -47,7 +47,10 @@ mod conformance;
 mod editor;
 mod history;
 mod i18n;
-mod json_view;
+/// The foldable, line-numbered JSON view, shared with the HTS UI since #803.
+/// Re-exported under its historical `crate::json_view` path so every call site
+/// here reads as it did when the module was local.
+pub(crate) use helios_ui_chrome::json_view;
 mod rail_state;
 mod search_params;
 mod sql_export;
@@ -821,25 +824,16 @@ struct BatchPage {
     active_page: &'static str,
 }
 
-/// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
-#[derive(Template)]
-#[template(path = "partials/json-view.html")]
-struct JsonViewFragment {
-    i18n: I18n,
-    json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
-}
-
 /// A small CapabilityStatement (or subtree) rendered by the unchanged shared
 /// JSON highlighter.
 #[derive(Template)]
 #[template(path = "partials/capability-json-full.html")]
 struct CapabilityJsonFullFragment {
-    i18n: I18n,
-    json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
+    /// The `.json-view` fragment, pre-rendered by `helios-ui-chrome`. The
+    /// viewer moved there in #803 so the HTS workbench could use it too, and
+    /// an askama `include` cannot cross a crate's template root — so the host
+    /// splices the rendered markup instead.
+    json_view: String,
 }
 
 /// One bounded level of a large CapabilityStatement.
@@ -2321,12 +2315,13 @@ async fn render_json_view(
         }
     };
 
-    render(JsonViewFragment {
-        i18n: I18n::new(locale),
-        json_lines,
-        json_view_id: String::new(),
-        json_view_paths: false,
-    })
+    Html(json_view_fragment(
+        &I18n::new(locale),
+        &json_lines,
+        "",
+        false,
+    ))
+    .into_response()
 }
 
 /// Batch/Transaction workspace page (#476). The shell is server-rendered;
@@ -3613,15 +3608,15 @@ async fn capability_json_fragment(
     let limit = query.limit.unwrap_or(capability_json::DEFAULT_PAGE_SIZE);
     match capability_json::plan(&statement, &query.path, query.offset, limit, version) {
         Ok(capability_json::View::Full(json_lines)) => {
+            // Only the whole-statement fragment claims the id capability-json.js
+            // scrolls to; a subtree is spliced in beneath one that already has it.
+            let id = if query.path.is_empty() {
+                "capability-json"
+            } else {
+                ""
+            };
             bounded_capability_fragment(CapabilityJsonFullFragment {
-                i18n: I18n::new(locale),
-                json_lines,
-                json_view_id: if query.path.is_empty() {
-                    "capability-json".to_string()
-                } else {
-                    String::new()
-                },
-                json_view_paths: false,
+                json_view: json_view_fragment(&I18n::new(locale), &json_lines, id, false),
             })
         }
         Ok(capability_json::View::Outline(outline)) => {
@@ -4445,6 +4440,26 @@ pub(crate) fn current_status(
         show_tenant_picker: tenant.multi,
         terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
     }
+}
+
+/// Renders the shared `.json-view` fragment for splicing into a host template
+/// with `|safe`.
+///
+/// The viewer lives in `helios-ui-chrome` since #803, and an askama `include`
+/// cannot reach across a crate's template root, so hosts hold the rendered
+/// markup instead of the line vector. A render failure degrades to an empty
+/// fragment: the partial has no fallible construct, so this arm is
+/// unreachable in practice and is not worth failing a whole page over.
+pub(crate) fn json_view_fragment(
+    i18n: &I18n,
+    lines: &[json_view::JsonLine],
+    id: &str,
+    paths: bool,
+) -> String {
+    json_view::render(i18n, lines, id, paths).unwrap_or_else(|error| {
+        tracing::error!(%error, "json view fragment render failed");
+        String::new()
+    })
 }
 
 pub(crate) fn render<T: Template>(template: T) -> Response {
