@@ -8,6 +8,7 @@ crates/ui/assets/**/*.js text eol=lf
 crates/ui/assets/**/*.css text eol=lf
 crates/ui/tests/golden/** text eol=lf
 crates/ui-chrome/templates/** text eol=lf
+crates/hts-ui/templates/** text eol=lf
 crates/ui-chrome/tests/golden/** text eol=lf
 locales/** text eol=lf
 
