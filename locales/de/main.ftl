@@ -607,6 +607,7 @@ bulk-import-detail-created = Erstellt
 bulk-import-detail-status = Status
 bulk-import-detail-auth = Authentifizierung
 bulk-import-abort = Abbrechen
+bulk-import-mark-completed = Als abgeschlossen markieren
 bulk-import-delete = Löschen
 bulk-import-edit = Bearbeiten
 bulk-import-edit-title = Submission bearbeiten
@@ -693,16 +694,16 @@ bulk-export-scope-group-hint = Nur die Mitglieder einer bereits definierten Koho
 bulk-export-field-group-id = Gruppen-ID
 bulk-export-field-group-id-hint = Erforderlich für den Gruppen-Umfang: die ID der zu exportierenden FHIR-Group.
 bulk-export-field-patients = Patienten
-bulk-export-field-patients-placeholder = Name, Nachname oder exakte FHIR-ID suchen
-bulk-export-field-patients-hint = Suchen Sie nach dem Anfang eines Vor- oder Familiennamens oder geben Sie eine exakte logische FHIR-ID wie Patient/p-104 ein. Leer lassen, um alle Patienten zu exportieren.
-bulk-export-field-patients-fallback-placeholder = Patient/p-104, Patient/p-205
+bulk-export-field-patients-placeholder = Patienten suchen
+bulk-export-field-patients-hint = Suchen Sie nach Vorname, Nachname oder exaktem Identifier. Leer lassen, um alle Patienten zu exportieren.
+bulk-export-field-patients-fallback-placeholder = FHIR-IDs der Patienten
 bulk-export-field-patients-fallback-hint = Geben Sie exakte logische FHIR-IDs durch Kommas oder Zeilenumbrüche getrennt ein. Leer lassen, um alle Patienten zu exportieren.
-bulk-export-field-patients-id-only-hint = Suchen Sie nach einer exakten logischen FHIR-ID wie Patient/p-104. Leer lassen, um alle Patienten zu exportieren.
-bulk-export-field-patients-id-only-placeholder = Exakte FHIR-ID suchen
+bulk-export-field-patients-id-only-hint = Suchen Sie nach einer exakten FHIR-ID. Leer lassen, um alle Patienten zu exportieren.
 bulk-export-patient-options-empty = Keine passenden Patienten gefunden.
 bulk-export-patient-invalid = Geben Sie nur gültige logische Patient-IDs ein, getrennt durch Kommas oder Zeilenumbrüche.
 bulk-export-field-name = Name
 bulk-export-field-name-placeholder = Diabetes-Register 2024
+bulk-export-name-required = Geben Sie einen Namen für diesen Export ein.
 bulk-export-types = Ressourcentypen
 bulk-export-all-resources = Alle Ressourcen
 bulk-export-narrow = Eingrenzen
@@ -715,7 +716,7 @@ bulk-export-since-week = Letzte 7 Tage
 bulk-export-since-month = Letzte 4 Wochen
 bulk-export-since-custom = Benutzerdefiniert
 bulk-export-field-since-custom = Benutzerdefinierter Zeitpunkt
-bulk-export-field-since-custom-hint = Gilt, wenn Seit auf Benutzerdefiniert steht. RFC 3339, z. B. 2026-08-01T00:00:00Z.
+bulk-export-since-invalid = Geben Sie einen gültigen FHIR-Zeitpunkt ein, zum Beispiel 2026-08-01T00:00:00Z.
 bulk-export-start = Export starten
 bulk-export-running = laufend
 bulk-export-clear = Leeren
@@ -793,6 +794,7 @@ sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
 
 sql-export-title = SQL-Export
 sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
+sql-export-active-title = SQL-Exporte
 
 sql-files-title = Dateien
 sql-files-lede = Manifeste und Ausgabedateien der SQL-Exporte.
@@ -803,6 +805,7 @@ vd-new = Neu erstellen
 vd-new-title = Neue View-Definition
 vd-rail-label = View-Definitionen
 vd-rail-heading = View-Definitionen
+vd-rail-all-heading = Alle View-Definitionen
 vd-filter = Views filtern
 vd-none = Noch keine View-Definitionen.
 vd-empty-lede = Lege mit „Neu erstellen" die erste ViewDefinition an.
@@ -816,8 +819,11 @@ vd-delete = Löschen
 vd-delete-confirm = View-Definition „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
 vd-delete-failed = Die View-Definition konnte nicht gelöscht werden.
 vd-json-heading = Definition (JSON)
+vd-run-hint = Läuft während der Eingabe – die Ergebnisse folgen der aktuellen Definition, gespeichert oder nicht
 vd-results-heading = Ergebnisse
 vd-results-empty = Die View hat keine Zeilen erzeugt.
+vd-results-meta = { $rows } Zeilen · { $ms } ms
+vd-results-stale = letzter erfolgreicher Lauf
 vd-pagination-label = View-Definitionsseiten
 vd-page-prev = Zurück
 vd-page-next = Weiter
@@ -826,6 +832,8 @@ vd-page-next = Weiter
 
 sql-queries-new-title = Neue SQL-Abfrage
 sql-views-new-title = Neue SQL-View
+sql-queries-rail-all-heading = Alle SQL-Abfragen
+sql-views-rail-all-heading = Alle SQL-Views
 lib-filter = Bibliotheken filtern
 lib-none = Noch keine Bibliotheken.
 lib-empty-lede = Lege mit „Neu erstellen" die erste Bibliothek an.
@@ -834,24 +842,67 @@ lib-sql-heading = SQL
 lib-delete-confirm = „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
 lib-delete-failed = Die Bibliothek konnte nicht gelöscht werden.
 
-## SQL-Export- und Dateien-Seiten (#649)
+## SQL-Export- und Dateien-Seiten (#649, #833)
 
 export-start-failed = Der Export konnte nicht gestartet werden.
-export-started = Export gestartet.
-export-cancelled = Abbruch angefordert.
-export-job-heading = Exportauftrag
 export-job-id = Auftrags-ID
-export-job-state = Status
-export-state-running = Läuft
-export-state-done = Abgeschlossen
-export-state-unknown = Unbekannter Auftrag — möglicherweise abgebrochen oder bereinigt.
-export-refresh = Aktualisieren
-export-cancel = Auftrag abbrechen
-export-view-files = Dateien anzeigen
 export-new-heading = Neuer Export
 export-no-subjects = Noch nichts zu exportieren — lege zuerst eine ViewDefinition an.
 export-format = Ausgabeformat
 export-start = Export starten
+
+## Liste der aktiven SQL-Exporte und Auftragskarten (#833)
+
+sql-export-new = Neuer SQL-Export
+sql-export-unavailable = Das Storage-Backend hostet keinen Settings-Store; SQL-Exportaufträge können nicht verfolgt werden.
+sql-export-none = Noch keine SQL-Exporte. Wählen Sie „Neuer SQL-Export", um einen zu starten.
+sql-export-store-error = Der Export wurde gestartet, konnte dieser Liste aber nicht hinzugefügt werden. Auftrags-ID:
+sql-export-exports-word = Exporte
+sql-export-running = laufend
+sql-export-select-subject = Wählen Sie mindestens ein Element aus.
+sql-export-unknown-subject = Ein oder mehrere ausgewählte Elemente sind nicht mehr verfügbar. Aktualisieren Sie die Seite und versuchen Sie es erneut.
+sql-export-cancelled-reason = der Server kennt diesen Auftrag nicht mehr
+sql-export-status-in-progress = Läuft
+sql-export-status-complete = Abgeschlossen
+sql-export-status-failed = Fehlgeschlagen
+sql-export-status-cancelled = Abgebrochen
+sql-export-view-files = Dateien anzeigen
+sql-export-cancel = Abbrechen
+sql-export-retry = Erneut versuchen
+sql-export-run-again = Erneut ausführen
+sql-export-remove = Aus der Liste entfernen
+sql-export-more-actions = Weitere Aktionen
+sql-export-copy-job-id = Auftrags-ID kopieren
+sql-export-copied = Kopiert
+sql-export-progress-waiting = Warten auf den ersten Statusbericht …
+sql-export-started = gestartet
+sql-export-finished-in = fertig in
+sql-export-cancelled-at = abgebrochen um
+sql-export-status-unavailable = Status nicht verfügbar
+sql-export-format-ndjson = NDJSON
+sql-export-format-csv = CSV
+sql-export-format-json = JSON
+sql-export-format-parquet = Parquet
+sql-export-subjects-count = { $count ->
+    [one] { $count } Element
+   *[other] { $count } Elemente
+}
+sql-export-kind-view-definition = { $count ->
+    [one] { $count } ViewDefinition
+   *[other] { $count } ViewDefinitions
+}
+sql-export-kind-sql-query = { $count ->
+    [one] { $count } SQL Query
+   *[other] { $count } SQL Queries
+}
+sql-export-kind-sql-view = { $count ->
+    [one] { $count } SQL View
+   *[other] { $count } SQL Views
+}
+sql-export-files-count = { $count ->
+    [one] { $count } Datei
+   *[other] { $count } Dateien
+}
 files-job-heading = Exportauftrag
 files-load = Manifest laden
 files-error = Das Manifest konnte nicht geladen werden.
@@ -1029,6 +1080,7 @@ hts-cs-validate-heading = Code validieren
 hts-cs-validate-mode-legend = Eingabemodus
 hts-cs-validate-mode-code = Einzelcode
 hts-cs-validate-mode-coding = Coding
+hts-cs-validate-code-legend = Einzelcode
 hts-cs-validate-code = Code
 hts-cs-validate-display = Anzeige
 hts-cs-validate-coding-legend = Coding
@@ -1055,6 +1107,8 @@ hts-cs-subsumes-outcome-not-subsumed = Keiner der Codes subsumiert den anderen.
 hts-workbench-run = Ausführen
 hts-workbench-raw-response = Rohanfrage und -antwort
 hts-workbench-copy-url = Anfrage-URL
+hts-workbench-request-body = Anfragekörper
+hts-workbench-response-body = Antwortkörper
 
 ## Zusätzlicher Degradiert-Grund für 404 beim CodeSystem-Read (§7.3).
 
@@ -1448,8 +1502,6 @@ hts-capability-closure = Closure-Pflege
 hts-capability-code-systems-declared = Deklarierte Codesysteme
 hts-capability-flag-true = Ja
 hts-capability-flag-false = Nein
-hts-capability-raw-truncated = Auf die ersten { $shown } von { $total } Bytes gekürzt — die Deklaration dieses Servers wächst mit den geladenen Codesystemen.
-hts-capability-raw-full = Vollständige Deklaration ansehen
 
 # Home V3 tile sub-lines. The mockup folds Backend, FHIR version,
 # Bundled data and Avg latency into the sub-line of the tile each

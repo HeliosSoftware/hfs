@@ -20,6 +20,36 @@ use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::PostgresBackend;
 
+/// Appends the `_since` / `_until` window to an export query, binds the bounds,
+/// and returns the next free parameter index.
+///
+/// Both are inclusive, matching the S3 backend's `last_modified() < since` /
+/// `> until` skips. Every export query path uses this, so a job's count and its
+/// emitted rows cannot disagree about the window.
+///
+/// The bounds bind as `DateTime<Utc>`, never as a string: `tokio_postgres`
+/// will not bind `String`/`&str` to `TIMESTAMPTZ`, and a `$n::timestamptz` cast
+/// does not change that — it only tells PG what type to infer for the
+/// parameter.
+fn push_export_window(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    request: &ExportRequest,
+    mut param_idx: usize,
+) -> usize {
+    if let Some(since) = request.since {
+        sql.push_str(&format!(" AND last_updated >= ${}", param_idx));
+        params.push(Box::new(since));
+        param_idx += 1;
+    }
+    if let Some(until) = request.until {
+        sql.push_str(&format!(" AND last_updated <= ${}", param_idx));
+        params.push(Box::new(until));
+        param_idx += 1;
+    }
+    param_idx
+}
+
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "postgres".to_string(),
@@ -1002,27 +1032,16 @@ impl ExportDataProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let (sql, params): (
-            String,
-            Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
-        ) = if let Some(since) = request.since {
-            (
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND last_updated >= $3".to_string(),
-                vec![
-                    Box::new(tenant_id.to_string()),
-                    Box::new(resource_type.to_string()),
-                    Box::new(since),
-                ],
-            )
-        } else {
-            (
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string(),
-                vec![
-                    Box::new(tenant_id.to_string()),
-                    Box::new(resource_type.to_string()),
-                ],
-            )
-        };
+        // Built incrementally rather than as one SQL string per combination of
+        // bounds: with both `_since` and `_until` that is four spellings to keep
+        // in step with `fetch_export_batch`, which is how a count and its rows
+        // drift apart.
+        let mut sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        push_export_window(&mut sql, &mut params, request, 3);
 
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
             .iter()
@@ -1054,13 +1073,7 @@ impl ExportDataProvider for PostgresBackend {
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
         ];
-        let mut param_idx = 3;
-
-        if let Some(since) = request.since {
-            sql.push_str(&format!(" AND last_updated >= ${}", param_idx));
-            params.push(Box::new(since));
-            param_idx += 1;
-        }
+        let param_idx = push_export_window(&mut sql, &mut params, request, 3);
 
         if let Some(cursor) = cursor {
             let parts: Vec<&str> = cursor.splitn(2, '|').collect();
@@ -1138,6 +1151,12 @@ impl PatientExportProvider for PostgresBackend {
             vec![Box::new(tenant_id.to_string())];
         let mut param_idx = 2;
 
+        // `_since` only, deliberately: this selects WHICH patients are in scope,
+        // not which of their resources are exported. Bounding it above by
+        // `_until` would drop a patient whose own record was touched after the
+        // window and take their in-window compartment resources with them. The
+        // Patient resource itself is still bounded, by the compartment fetch.
+        // S3 makes the same distinction (`backends/s3/bulk_export.rs:216`).
         if let Some(since) = request.since {
             sql.push_str(&format!(" AND last_updated >= ${}", param_idx));
             params.push(Box::new(since));
@@ -1199,16 +1218,10 @@ impl PatientExportProvider for PostgresBackend {
                 Box::new(resource_type.to_string()),
                 Box::new(patient_ids.to_vec()),
             ];
-            // The same `_since` bound the non-Patient branch below applies.
-            // Bound before the cursor clause so it does not consume $4/$5.
-            // Binds as `DateTime<Utc>`: tokio_postgres will not bind a string
-            // to TIMESTAMPTZ, and a `::timestamptz` cast would not change that.
-            let mut param_idx = 4;
-            if let Some(since) = request.since {
-                sql.push_str(&format!(" AND last_updated >= ${}", param_idx));
-                params.push(Box::new(since));
-                param_idx += 1;
-            }
+            // Same `_since` / `_until` window as the non-Patient branch below.
+            // Bound before the cursor clause so it does not consume the
+            // placeholders the cursor needs.
+            let param_idx = push_export_window(&mut sql, &mut params, request, 4);
 
             if let Some(cursor) = cursor {
                 let parts: Vec<&str> = cursor.splitn(2, '|').collect();
@@ -1292,13 +1305,7 @@ impl PatientExportProvider for PostgresBackend {
             Box::new(resource_type.to_string()),
             Box::new(patient_refs),
         ];
-        let mut param_idx = 4;
-
-        if let Some(since) = request.since {
-            sql.push_str(&format!(" AND last_updated >= ${}", param_idx));
-            params.push(Box::new(since));
-            param_idx += 1;
-        }
+        let param_idx = push_export_window(&mut sql, &mut params, request, 4);
 
         if let Some(cursor) = cursor {
             let parts: Vec<&str> = cursor.splitn(2, '|').collect();

@@ -1082,6 +1082,89 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
 }
 
 #[tokio::test]
+async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_references() {
+    let Some(backend) = create_backend("if_none_exist_urn").await else {
+        eprintln!(
+            "Skipping mongodb_integration_transaction_if_none_exist_match_resolves_urn_references (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-if-none-exist-urn");
+
+    let existing = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org/mrn", "value": "MRN-URN-1"}],
+                "name": [{"family": "AlreadyThere"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let entries = vec![
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org/mrn", "value": "MRN-URN-1"}],
+                "name": [{"family": "Duplicate"}]
+            })),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: Some("identifier=http://example.org/mrn|MRN-URN-1".to_string()),
+            full_url: Some("urn:uuid:patient".to_string()),
+        },
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".to_string(),
+            resource: Some(json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "code": {"text": "test"},
+                "subject": {"reference": "urn:uuid:patient"}
+            })),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: Some("urn:uuid:observation".to_string()),
+        },
+    ];
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        entries,
+        "mongodb_integration_transaction_if_none_exist_match_resolves_urn_references",
+    )
+    .await
+    else {
+        return;
+    };
+
+    assert_eq!(
+        result.entries[0].status, 200,
+        "the match is answered, not duplicated"
+    );
+    assert_eq!(result.entries[1].status, 201);
+
+    let observation = result.entries[1]
+        .resource
+        .as_ref()
+        .expect("created observation is echoed");
+    assert_eq!(
+        observation["subject"]["reference"],
+        json!(format!("Patient/{}", existing.id())),
+        "a urn:uuid reference to a matched ifNoneExist entry must resolve to the match"
+    );
+}
+
+#[tokio::test]
 async fn mongodb_integration_transaction_bundle_conditional_headers() {
     let Some(backend) = create_backend("bundle_conditional_headers").await else {
         eprintln!(
@@ -1129,6 +1212,13 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
         return;
     };
     assert_eq!(second_create.entries[0].status, 200);
+    // A matched `ifNoneExist` names the match in `location`, exactly as a
+    // fresh create names the row it wrote; that is what the transaction's
+    // fullUrl → id map is built from (#511).
+    assert_eq!(
+        second_create.entries[0].location, first_create.entries[0].location,
+        "the 200 entry must point at the resource the 201 entry created"
+    );
 
     backend
         .create(
@@ -2573,7 +2663,7 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
         )
         .await
         .unwrap();
-    assert!(matches!(deleted, ConditionalDeleteResult::Deleted));
+    assert!(matches!(deleted, ConditionalDeleteResult::Deleted(_)));
 
     let no_match = backend
         .conditional_delete(
@@ -3736,11 +3826,13 @@ mod bulk_submit {
             _requires_access_token: bool,
             _oauth: &[String],
             _key: Option<&serde_json::Value>,
-        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
             let data = self.files.get(url).cloned().unwrap_or_default();
-            Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
-                data,
-            ))))
+            let len = data.len() as u64;
+            Ok((
+                Box::new(tokio::io::BufReader::new(std::io::Cursor::new(data))),
+                Some(len),
+            ))
         }
     }
 
@@ -4274,4 +4366,152 @@ mod bulk_submit {
             "a line of the wrong type must not be stored"
         );
     }
+}
+
+// ============================================================================
+// Bulk Export — the `_since` / `_until` window (#657).
+// ============================================================================
+
+/// Pins a stored resource's `last_updated` so a window test does not depend on
+/// wall-clock timing.
+async fn pin_last_updated(backend: &MongoBackend, id: &str, at: chrono::DateTime<chrono::Utc>) {
+    use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
+    let db = backend.get_database().await.unwrap();
+    let resources = db.collection::<Document>("resources");
+    resources
+        .update_one(
+            doc! { "id": id },
+            doc! { "$set": { "last_updated": BsonDateTime::from_millis(at.timestamp_millis()) } },
+        )
+        .await
+        .unwrap();
+}
+
+async fn seed_patient_at(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let stored = backend
+        .create(
+            tenant,
+            "Patient",
+            serde_json::json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let id = stored.id().to_string();
+    pin_last_updated(backend, &id, at).await;
+    id
+}
+
+fn instant(s: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+/// `_until` excludes a resource modified after the bound, and the count agrees
+/// with what the fetch emits.
+#[tokio::test]
+async fn mongodb_integration_export_until_bounds_count_and_fetch() {
+    use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
+
+    let Some(backend) = create_backend("export_until").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_until_bounds_count_and_fetch (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-until");
+
+    let early = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+    let _late = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+    let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+
+    let count = backend
+        .count_export_resources(&tenant, &request, "Patient")
+        .await
+        .unwrap();
+    let batch = backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(count, 1, "count must apply the upper bound");
+    assert_eq!(batch.lines.len(), 1, "fetch must apply the upper bound");
+    assert_eq!(
+        count as usize,
+        batch.lines.len(),
+        "count and fetch must agree about the window"
+    );
+    assert!(batch.lines[0].contains(&early));
+}
+
+/// `_since` and `_until` together bound the window at both ends.
+///
+/// This is the case that catches the document-shape trap: `last_updated` is one
+/// key, so writing the two bounds as two `insert`s would keep only the second.
+#[tokio::test]
+async fn mongodb_integration_export_since_and_until_bound_the_window() {
+    use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
+
+    let Some(backend) = create_backend("export_window").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_since_and_until_bound_the_window (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-window");
+
+    let _before = seed_patient_at(&backend, &tenant, instant("2025-12-01T00:00:00Z")).await;
+    let inside = seed_patient_at(&backend, &tenant, instant("2026-01-15T00:00:00Z")).await;
+    let _after = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+    let request = ExportRequest::system()
+        .with_since(instant("2026-01-01T00:00:00Z"))
+        .with_until(instant("2026-02-01T00:00:00Z"));
+
+    let count = backend
+        .count_export_resources(&tenant, &request, "Patient")
+        .await
+        .unwrap();
+    let batch = backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(count, 1, "both bounds must survive into one range document");
+    assert_eq!(batch.lines.len(), 1);
+    assert!(batch.lines[0].contains(&inside));
+}
+
+/// The bound is inclusive, matching S3.
+#[tokio::test]
+async fn mongodb_integration_export_until_is_inclusive() {
+    use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
+
+    let Some(backend) = create_backend("export_until_incl").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_until_is_inclusive (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-until-incl");
+
+    seed_patient_at(&backend, &tenant, instant("2026-02-01T00:00:00Z")).await;
+
+    let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+    let batch = backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        batch.lines.len(),
+        1,
+        "a resource exactly on the bound is included"
+    );
 }

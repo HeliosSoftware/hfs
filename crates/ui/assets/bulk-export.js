@@ -9,10 +9,136 @@
 
   var allTypes = form.querySelector('input[name="all_types"]');
   var types = Array.prototype.slice.call(form.querySelectorAll('input[name="types"]'));
+  var nameInput = form.querySelector('input[name="name"]');
+  var nameHeading = document.querySelector("[data-bulk-export-name-heading]");
+  var defaultHeading = nameHeading ? nameHeading.textContent : "";
+  var nameError = form.querySelector("#bulk-export-name-error");
   var sincePreset = form.querySelector('select[name="since_preset"]');
   var sinceCustom = form.querySelector('input[name="since_custom"]');
+  var sinceCustomError = form.querySelector("#bulk-export-since-custom-error");
   var scopeRadios = Array.prototype.slice.call(form.querySelectorAll('input[name="scope"]'));
   var patientCombobox = form.querySelector(".combobox--scope-patient");
+  var validationStarted = form.getAttribute("data-validation-started") === "true";
+
+  function setFieldError(input, error, invalid) {
+    if (!input || !error) return;
+
+    var describedBy = (input.getAttribute("aria-describedby") || "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .filter(function (id) {
+        return id !== error.id;
+      });
+
+    if (invalid) {
+      input.setAttribute("aria-invalid", "true");
+      describedBy.push(error.id);
+      error.hidden = false;
+    } else {
+      input.removeAttribute("aria-invalid");
+      error.hidden = true;
+    }
+
+    if (describedBy.length) {
+      input.setAttribute("aria-describedby", describedBy.join(" "));
+    } else {
+      input.removeAttribute("aria-describedby");
+    }
+  }
+
+  function validateName() {
+    var invalid = Boolean(nameInput && !nameInput.value.trim());
+    setFieldError(nameInput, nameError, invalid);
+    return !invalid;
+  }
+
+  function synchronizeName() {
+    if (!nameInput || !nameHeading) return;
+    nameHeading.textContent = nameInput.value.trim() || defaultHeading;
+  }
+
+  function isValidFhirInstant(value) {
+    var pattern = sinceCustom && sinceCustom.getAttribute("data-pattern");
+    if (!pattern || !new RegExp("^(?:" + pattern + ")$").test(value)) return false;
+
+    var parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-](\d{2}):(\d{2}))$/.exec(
+      value,
+    );
+    if (!parts) return false;
+
+    var year = Number(parts[1]);
+    var month = Number(parts[2]);
+    var day = Number(parts[3]);
+    var hour = Number(parts[4]);
+    var minute = Number(parts[5]);
+    var second = Number(parts[6]);
+    if (year < 1 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 60) {
+      return false;
+    }
+
+    var leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    var daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (day < 1 || day > daysInMonth[month - 1]) return false;
+
+    if (parts[7] !== "Z") {
+      var offsetHour = Number(parts[8]);
+      var offsetMinute = Number(parts[9]);
+      if (offsetMinute > 59 || offsetHour > 14 || (offsetHour === 14 && offsetMinute !== 0)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  function validateSince() {
+    var invalid = false;
+    if (sincePreset && sinceCustom && sincePreset.value === "custom") {
+      var value = sinceCustom.value.trim();
+      invalid = Boolean(value && !isValidFhirInstant(value));
+    }
+    setFieldError(sinceCustom, sinceCustomError, invalid);
+    return !invalid;
+  }
+
+  var submitButton = form.querySelector('button[type="submit"]');
+  var releaseSubmitBusy = null;
+  var submitAttempt = 0;
+
+  function prefetchNavigationAsset(href, as) {
+    var link = document.createElement("link");
+    if (link.relList && link.relList.supports && !link.relList.supports("prefetch")) {
+      return Promise.resolve();
+    }
+
+    return new Promise(function (resolve) {
+      var settled = false;
+      var timeout = window.setTimeout(settle, 1000);
+
+      function settle() {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        link.removeEventListener("load", settle);
+        link.removeEventListener("error", settle);
+        resolve();
+      }
+
+      link.rel = "prefetch";
+      link.href = href;
+      link.as = as;
+      link.addEventListener("load", settle);
+      link.addEventListener("error", settle);
+      document.head.appendChild(link);
+    });
+  }
+
+  function prefetchNavigationAssets() {
+    return Promise.all([
+      prefetchNavigationAsset("/ui/assets/app.css", "style"),
+      prefetchNavigationAsset("/ui/assets/theme.js", "script"),
+    ]);
+  }
 
   function synchronizeTypes(clearIndividualTypes) {
     if (!allTypes) return;
@@ -48,6 +174,7 @@
   // their restored individual selections; only the default checked state
   // upgrades the grid to its checked-and-disabled presentation.
   synchronizeTypes(false);
+  synchronizeName();
   synchronizeSince();
   synchronizePatientScope();
 
@@ -57,7 +184,23 @@
     });
   }
 
-  if (sincePreset) sincePreset.addEventListener("change", synchronizeSince);
+  if (nameInput) {
+    nameInput.addEventListener("input", function () {
+      synchronizeName();
+      if (validationStarted) validateName();
+    });
+  }
+  if (sincePreset) {
+    sincePreset.addEventListener("change", function () {
+      synchronizeSince();
+      if (validationStarted) validateSince();
+    });
+  }
+  if (sinceCustom) {
+    sinceCustom.addEventListener("input", function () {
+      if (validationStarted) validateSince();
+    });
+  }
   scopeRadios.forEach(function (scope) {
     scope.addEventListener("change", synchronizePatientScope);
   });
@@ -65,12 +208,58 @@
     patientCombobox.addEventListener("hfs:combobox-change", synchronizePatientScope);
   }
 
+  form.addEventListener("submit", function (event) {
+    validationStarted = true;
+    var nameValid = validateName();
+    var sinceValid = validateSince();
+    if (!nameValid || !sinceValid) {
+      event.preventDefault();
+      if (!nameValid && nameInput) {
+        nameInput.focus();
+      } else if (!sinceValid && sinceCustom) {
+        sinceCustom.focus();
+      }
+      return;
+    }
+
+    if (!submitButton || !window.hfsBusy) return;
+
+    event.preventDefault();
+    window.hfsBusy.during([submitButton], function () {
+      submitAttempt += 1;
+      var currentAttempt = submitAttempt;
+
+      prefetchNavigationAssets().then(function () {
+        if (currentAttempt !== submitAttempt) return;
+        HTMLFormElement.prototype.submit.call(form);
+      });
+
+      // Navigation normally discards this document. A bfcache restore keeps
+      // it alive, so pageshow below releases the state in that one case.
+      return new Promise(function (resolve) {
+        releaseSubmitBusy = resolve;
+      });
+    });
+  });
+
+  window.addEventListener("pageshow", function (event) {
+    if (!event.persisted || !releaseSubmitBusy) return;
+    submitAttempt += 1;
+    var release = releaseSubmitBusy;
+    releaseSubmitBusy = null;
+    release();
+  });
+
   // The reset event fires before native controls regain their default values.
   form.addEventListener("reset", function () {
+    validationStarted = false;
     window.setTimeout(function () {
       synchronizeTypes(false);
+      synchronizeName();
       synchronizeSince();
       synchronizePatientScope();
+      setFieldError(nameInput, nameError, false);
+      setFieldError(sinceCustom, sinceCustomError, false);
     }, 0);
   });
 })();

@@ -505,6 +505,8 @@ impl BulkSubmitProvider for PostgresBackend {
             processed_entries: 0,
             failed_entries: 0,
             lease_expiry: None,
+            bytes_processed: 0,
+            bytes_total: 0,
         })
     }
 
@@ -519,7 +521,7 @@ impl BulkSubmitProvider for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry
+                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total
                  FROM bulk_manifests
                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
                 &[
@@ -545,6 +547,8 @@ impl BulkSubmitProvider for PostgresBackend {
         let processed: i32 = row.get(5);
         let failed: i32 = row.get(6);
         let lease_expiry: Option<chrono::DateTime<Utc>> = row.get(7);
+        let bytes_processed: i64 = row.get(8);
+        let bytes_total: i64 = row.get(9);
 
         let status: ManifestStatus = status_str
             .parse()
@@ -560,6 +564,8 @@ impl BulkSubmitProvider for PostgresBackend {
             processed_entries: processed as u64,
             failed_entries: failed as u64,
             lease_expiry,
+            bytes_processed: bytes_processed.max(0) as u64,
+            bytes_total: bytes_total.max(0) as u64,
         }))
     }
 
@@ -607,7 +613,6 @@ impl BulkSubmitProvider for PostgresBackend {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
-        let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
         // Verify manifest exists
@@ -624,52 +629,92 @@ impl BulkSubmitProvider for PostgresBackend {
             ));
         }
 
-        // Update manifest status to processing
-        client
-            .execute(
-                "UPDATE bulk_manifests SET status = 'processing'
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
-                &[
-                    &tenant_id,
-                    &submission_id.submitter.as_str(),
-                    &submission_id.submission_id.as_str(),
-                    &manifest_id,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
+        // Update manifest status to processing, on a client scoped to this one
+        // statement.
+        {
+            let client = self.get_client().await?;
+            client
+                .execute(
+                    "UPDATE bulk_manifests SET status = 'processing'
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission_id.submitter.as_str(),
+                        &submission_id.submission_id.as_str(),
+                        &manifest_id,
+                    ],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
+        }
 
         let mut results = Vec::new();
         let mut error_count = 0u32;
+        let mut aborted_on_max_errors = false;
+        let file_url = options.file_url.as_deref().unwrap_or("");
+
+        // One transaction per batch (#872, mirroring the SQLite batch ingest
+        // from #815): entry rows, history, search-index writes, rollback
+        // records, and per-line receipts commit together — one WAL flush per
+        // batch instead of four-plus autocommit round trips per resource, and
+        // the rollback log can never diverge from what was actually written.
+        // Each entry runs under a savepoint: on Postgres a failed statement
+        // aborts the whole transaction, and the savepoint contains a failure
+        // to its one entry the way SQLite's per-statement independence does.
+        let mut txn = <Self as crate::core::TransactionProvider>::begin_transaction(
+            self,
+            tenant,
+            crate::core::TransactionOptions {
+                fhir_version: Some(FhirVersion::default_enabled()),
+                ..Default::default()
+            },
+        )
+        .await?;
 
         for entry in entries {
             if options.max_errors > 0 && error_count >= options.max_errors {
                 if !options.continue_on_error {
-                    return Err(StorageError::BulkSubmit(
-                        BulkSubmitError::MaxErrorsExceeded {
-                            submission_id: submission_id.submission_id.clone(),
-                            max_errors: options.max_errors,
-                        },
-                    ));
+                    aborted_on_max_errors = true;
+                    break;
                 }
                 let skip_result = BulkEntryResult::skipped(
                     entry.line_number,
                     &entry.resource_type,
                     "max errors exceeded",
                 );
+                Self::write_entry_rows_tx(
+                    &txn,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    &skip_result,
+                    None,
+                )
+                .await?;
                 results.push(skip_result);
                 continue;
             }
 
-            let result = self
-                .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
-                .await;
-
-            let entry_result = match result {
-                Ok(r) => r,
+            // The transaction buffers creates and sends them in batches, so
+            // an entry's conflict can surface after its `create` returned.
+            // The savepoint methods flush at the savepoint boundaries: the
+            // release raises this entry's conflict inside its own savepoint,
+            // and the rollback undoes only this entry's rows.
+            txn.savepoint("bulk_entry").await?;
+            let outcome = match self
+                .ingest_entry_in_tx(&mut txn, manifest_id, &entry, options)
+                .await
+            {
+                Ok(pair) => txn.release_savepoint("bulk_entry").await.map(|_| pair),
+                Err(e) => Err(e),
+            };
+            let (entry_result, change) = match outcome {
+                Ok(pair) => pair,
                 Err(e) => {
-                    error_count += 1;
-                    BulkEntryResult::processing_error(
+                    txn.rollback_to_savepoint("bulk_entry")
+                        .await
+                        .map_err(|se| internal_error(format!("{se} after '{e}'")))?;
+                    let failed = BulkEntryResult::processing_error(
                         entry.line_number,
                         &entry.resource_type,
                         serde_json::json!({
@@ -680,7 +725,8 @@ impl BulkSubmitProvider for PostgresBackend {
                                 "diagnostics": e.to_string()
                             }]
                         }),
-                    )
+                    );
+                    (failed, None)
                 }
             };
 
@@ -688,16 +734,27 @@ impl BulkSubmitProvider for PostgresBackend {
                 error_count += 1;
             }
 
-            self.store_entry_result(
-                tenant,
+            Self::write_entry_rows_tx(
+                &txn,
                 submission_id,
                 manifest_id,
-                options.file_url.as_deref().unwrap_or(""),
+                file_url,
                 &entry_result,
+                change.as_ref(),
             )
             .await?;
-
             results.push(entry_result);
+        }
+
+        crate::core::Transaction::commit(Box::new(txn)).await?;
+
+        if aborted_on_max_errors {
+            return Err(StorageError::BulkSubmit(
+                BulkSubmitError::MaxErrorsExceeded {
+                    submission_id: submission_id.submission_id.clone(),
+                    max_errors: options.max_errors,
+                },
+            ));
         }
 
         // Update manifest counts, on a fresh client for the tail statements.
@@ -860,27 +917,34 @@ impl BulkSubmitProvider for PostgresBackend {
 }
 
 impl PostgresBackend {
-    /// Process a single NDJSON entry.
-    async fn process_single_entry(
+    /// Applies one NDJSON entry inside the batch transaction, returning the
+    /// entry's result plus the rollback record to write with it.
+    ///
+    /// Mirrors the SQLite `ingest_entry_in_txn` exactly: read-for-upsert,
+    /// import-mode-aware update, create for new ids. A soft-deleted row reads
+    /// as `None` and then fails the create with `AlreadyExists` — the same
+    /// outcome the storage-path create produced, recorded as this entry's
+    /// error by the caller's savepoint arm.
+    async fn ingest_entry_in_tx(
         &self,
-        tenant: &TenantContext,
-        submission_id: &SubmissionId,
+        txn: &mut super::transaction::PostgresTransaction,
         manifest_id: &str,
         entry: &NdjsonEntry,
         options: &BulkProcessingOptions,
-    ) -> StorageResult<BulkEntryResult> {
-        let resource_id = entry.resource_id.as_ref();
+    ) -> StorageResult<(BulkEntryResult, Option<SubmissionChange>)> {
+        use crate::core::Transaction;
 
-        if let Some(id) = resource_id {
-            let existing = self.read(tenant, &entry.resource_type, id).await;
-
-            match existing {
-                Ok(Some(current)) => {
+        if let Some(id) = entry.resource_id.as_ref() {
+            match txn.read(&entry.resource_type, id).await? {
+                Some(current) => {
                     if !options.allow_updates {
-                        return Ok(BulkEntryResult::skipped(
-                            entry.line_number,
-                            &entry.resource_type,
-                            "updates not allowed",
+                        return Ok((
+                            BulkEntryResult::skipped(
+                                entry.line_number,
+                                &entry.resource_type,
+                                "updates not allowed",
+                            ),
+                            None,
                         ));
                     }
 
@@ -892,118 +956,150 @@ impl PostgresBackend {
                         (current.version_id().parse::<i32>().unwrap_or(0) + 1).to_string(),
                         current.content().clone(),
                     );
-                    self.record_change(tenant, submission_id, &change).await?;
 
                     // Update the resource, honoring the submission's import mode.
                     let content = options.content_for_update(current.content(), &entry.resource);
-                    let updated = self.update(tenant, &current, content).await?;
+                    let updated = txn.update(&current, content).await?;
 
-                    Ok(BulkEntryResult::success(
-                        entry.line_number,
-                        &entry.resource_type,
-                        updated.id(),
-                        false,
+                    Ok((
+                        BulkEntryResult::success(
+                            entry.line_number,
+                            &entry.resource_type,
+                            updated.id(),
+                            false,
+                        ),
+                        Some(change),
                     ))
                 }
-                Ok(None)
-                | Err(StorageError::Resource(crate::error::ResourceError::Gone { .. })) => {
-                    let created = self
-                        .create(
-                            tenant,
-                            &entry.resource_type,
-                            entry.resource.clone(),
-                            FhirVersion::default_enabled(),
-                        )
+                None => {
+                    let created = txn
+                        .create(&entry.resource_type, entry.resource.clone())
                         .await?;
-
                     let change = SubmissionChange::create(
                         manifest_id,
                         &entry.resource_type,
                         created.id(),
                         created.version_id(),
                     );
-                    self.record_change(tenant, submission_id, &change).await?;
 
-                    Ok(BulkEntryResult::success(
-                        entry.line_number,
-                        &entry.resource_type,
-                        created.id(),
-                        true,
+                    Ok((
+                        BulkEntryResult::success(
+                            entry.line_number,
+                            &entry.resource_type,
+                            created.id(),
+                            true,
+                        ),
+                        Some(change),
                     ))
                 }
-                Err(e) => Err(e),
             }
         } else {
-            let created = self
-                .create(
-                    tenant,
-                    &entry.resource_type,
-                    entry.resource.clone(),
-                    FhirVersion::default_enabled(),
-                )
+            let created = txn
+                .create(&entry.resource_type, entry.resource.clone())
                 .await?;
-
             let change = SubmissionChange::create(
                 manifest_id,
                 &entry.resource_type,
                 created.id(),
                 created.version_id(),
             );
-            self.record_change(tenant, submission_id, &change).await?;
 
-            Ok(BulkEntryResult::success(
-                entry.line_number,
-                &entry.resource_type,
-                created.id(),
-                true,
+            Ok((
+                BulkEntryResult::success(
+                    entry.line_number,
+                    &entry.resource_type,
+                    created.id(),
+                    true,
+                ),
+                Some(change),
             ))
         }
     }
 
-    /// Store an entry result in the database.
-    async fn store_entry_result(
-        &self,
-        tenant: &TenantContext,
+    /// Writes an entry's rollback record and per-line receipt on the batch
+    /// transaction's client, so both commit (or vanish) with the entry writes.
+    async fn write_entry_rows_tx(
+        txn: &super::transaction::PostgresTransaction,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: &str,
         result: &BulkEntryResult,
+        change: Option<&SubmissionChange>,
     ) -> StorageResult<()> {
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
+        use crate::core::Transaction;
 
+        let client = txn.raw_client()?;
+        let tenant_id = txn.tenant().tenant_id().as_str().to_string();
+
+        let previous_content_json: Option<Value> = change
+            .map(|c| c.previous_content.clone())
+            .unwrap_or_default();
         let outcome_json: Option<Value> = result.operation_outcome.clone();
 
-        client
-            .execute(
-                // Upsert: the worker re-fetches a whole file after a transient
-                // failure, and the retry must overwrite its own earlier rows
-                // instead of colliding with them (#457).
-                "INSERT INTO bulk_entry_results
-                 (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                 ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url, line_number)
-                 DO UPDATE SET resource_type = EXCLUDED.resource_type,
-                               resource_id = EXCLUDED.resource_id,
-                               created = EXCLUDED.created,
-                               outcome = EXCLUDED.outcome,
-                               operation_outcome = EXCLUDED.operation_outcome",
-                &[
-                    &tenant_id,
-                    &submission_id.submitter.as_str(),
-                    &submission_id.submission_id.as_str(),
-                    &manifest_id,
-                    &file_url,
-                    &(result.line_number as i32),
-                    &result.resource_type.as_str(),
-                    &result.resource_id,
-                    &result.created,
-                    &result.outcome.to_string().as_str(),
-                    &outcome_json,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to store entry result: {}", e)))?;
+        // The two bookkeeping inserts are independent: pipelined on the
+        // transaction's connection they cost one round trip, not two.
+        let record_change = async {
+            let Some(change) = change else {
+                return Ok(0);
+            };
+            client
+                .execute(
+                    "INSERT INTO bulk_submission_changes
+                     (tenant_id, submitter, submission_id, change_id, manifest_id, change_type, resource_type, resource_id, previous_version, new_version, previous_content, changed_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                    &[
+                        &tenant_id,
+                        &submission_id.submitter.as_str(),
+                        &submission_id.submission_id.as_str(),
+                        &change.change_id.as_str(),
+                        &change.manifest_id.as_str(),
+                        &change.change_type.to_string().as_str(),
+                        &change.resource_type.as_str(),
+                        &change.resource_id.as_str(),
+                        &change.previous_version,
+                        &change.new_version.as_str(),
+                        &previous_content_json,
+                        &change.changed_at,
+                    ],
+                )
+                .await
+        };
+        let submitter = submission_id.submitter.as_str();
+        let sub_id_str = submission_id.submission_id.as_str();
+        let line_number = result.line_number as i32;
+        let result_type = result.resource_type.as_str();
+        let outcome_code = result.outcome.to_string();
+        let receipt_params: [&(dyn tokio_postgres::types::ToSql + Sync); 11] = [
+            &tenant_id,
+            &submitter,
+            &sub_id_str,
+            &manifest_id,
+            &file_url,
+            &line_number,
+            &result_type,
+            &result.resource_id,
+            &result.created,
+            &outcome_code,
+            &outcome_json,
+        ];
+        let store_receipt = client.execute(
+            // Upsert: the worker re-fetches a whole file after a transient
+            // failure, and the retry must overwrite its own earlier rows
+            // instead of colliding with them (#457).
+            "INSERT INTO bulk_entry_results
+             (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url, line_number)
+             DO UPDATE SET resource_type = EXCLUDED.resource_type,
+                           resource_id = EXCLUDED.resource_id,
+                           created = EXCLUDED.created,
+                           outcome = EXCLUDED.outcome,
+                           operation_outcome = EXCLUDED.operation_outcome",
+            &receipt_params,
+        );
+        let (change_res, receipt_res) = futures::future::join(record_change, store_receipt).await;
+        change_res.map_err(|e| internal_error(format!("Failed to record change: {}", e)))?;
+        receipt_res.map_err(|e| internal_error(format!("Failed to store entry result: {}", e)))?;
 
         Ok(())
     }
@@ -1534,6 +1630,40 @@ impl SubmitWorkerStorage for PostgresBackend {
         }
     }
 
+    async fn update_manifest_bytes(
+        &self,
+        lease: &ManifestLease,
+        bytes_processed: u64,
+        bytes_total: u64,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "UPDATE bulk_manifests
+                 SET bytes_processed = GREATEST(bytes_processed, $1),
+                     bytes_total = GREATEST(bytes_total, $2)
+                 WHERE tenant_id = $3 AND submitter = $4 AND submission_id = $5
+                   AND manifest_id = $6 AND worker_id = $7 AND fencing_token = $8",
+                &[
+                    &(bytes_processed as i64),
+                    &(bytes_total as i64),
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("update bytes: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
     async fn record_submit_file(
         &self,
         lease: &ManifestLease,
@@ -1927,8 +2057,17 @@ impl SubmitWorkerStorage for PostgresBackend {
         let client = self.get_client().await?;
         let row = client
             .query_one(
-                "SELECT COUNT(*) FROM bulk_submissions
-                 WHERE tenant_id = $1 AND status = 'in-progress'",
+                "SELECT COUNT(*) FROM bulk_submissions s
+                 WHERE s.tenant_id = $1 AND s.status = 'in-progress'
+                   AND (NOT EXISTS (SELECT 1 FROM bulk_manifests m
+                                    WHERE m.tenant_id = s.tenant_id
+                                      AND m.submitter = s.submitter
+                                      AND m.submission_id = s.submission_id)
+                        OR EXISTS (SELECT 1 FROM bulk_manifests m
+                                   WHERE m.tenant_id = s.tenant_id
+                                     AND m.submitter = s.submitter
+                                     AND m.submission_id = s.submission_id
+                                     AND m.status IN ('pending', 'processing')))",
                 &[&tenant.tenant_id().as_str()],
             )
             .await

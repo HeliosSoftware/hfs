@@ -4,7 +4,7 @@
   selection and keyboard behavior. The fallback textarea remains the usable
   control until JavaScript completes initialization.
 -->
-{% macro multi_select(id, name, label, placeholder, hint, fallback_placeholder, fallback_hint, endpoint, extra_class="", alternate_hint="", alternate_placeholder="", query_name="q") %}
+{% macro multi_select(id, name, label, placeholder, hint, fallback_placeholder, fallback_hint, endpoint, extra_class="", alternate_hint="", alternate_placeholder="", query_name="q", initial_value="") %}
 <fieldset id="{{ id }}" class="field combobox{% if !extra_class.is_empty() %} {{ extra_class }}{% endif %}"
           data-combobox data-combobox-name="{{ name }}" data-combobox-query-name="{{ query_name }}"
           {% if !alternate_hint.is_empty() %}data-combobox-alternate-hint="{{ alternate_hint }}"{% endif %}
@@ -21,7 +21,7 @@
     <textarea class="field__input" name="{{ name }}" rows="2"
               placeholder="{{ fallback_placeholder }}"
               aria-labelledby="{{ id }}-label"
-              aria-describedby="{{ id }}-fallback-hint"></textarea>
+              aria-describedby="{{ id }}-fallback-hint">{{ initial_value }}</textarea>
     <span id="{{ id }}-fallback-hint" class="field__hint">{{ fallback_hint }}</span>
   </div>
 

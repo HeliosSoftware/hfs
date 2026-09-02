@@ -545,27 +545,46 @@ and `HEAD` are refused as described under Current Limitations.
   list RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
 - `ifNoneMatch` — **parsed and ignored.** `parse_bundle_entry` populates
   `BundleEntry.if_none_match`; no handler or backend reads it.
-- `ifNoneExist` — **MongoDB transactions only.** MongoDB resolves it inside the
-  bundle's session. The batch path never reads it, and SQLite/PostgreSQL ignore it
-  in a transaction and create a duplicate. Tracked by #511.
+- `ifNoneExist` — **supported** on `POST` entries, in both `batch` and
+  `transaction` bundles, on every backend that implements `ConditionalStorage`
+  (SQLite, PostgreSQL, MongoDB; S3's implementation is a stub and answers `501`
+  per entry). The value is passed to storage verbatim, as the `If-None-Exist`
+  header is. No match creates (`201`); one match answers `200` with the existing
+  resource and its `location`, so a `urn:uuid` reference to that entry resolves to
+  the match; several matches answer `412 multiple-matches`. In a transaction the
+  criteria are resolved inside the open transaction, so two entries with the same
+  criteria in one bundle yield one resource. When search is offloaded to a
+  secondary backend (composite SQLite/PostgreSQL + Elasticsearch) the local index
+  is empty, so a transaction `ifNoneExist` entry is refused with `501` and the
+  bundle fails at that entry rather than creating a duplicate.
 
 Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
-`DELETE [type]?[criteria]`) are **not resolved**:
+`DELETE [type]?[criteria]`):
 
-- In a `batch`, such an entry is refused per-entry with `400`; nothing is written.
-- In a `transaction`, any non-`GET` entry whose URL carries a query string
-  declines the whole bundle with `400 not-supported` before anything executes,
-  because the backends parse entry URLs query-blind and would otherwise commit
-  the criteria as part of the resource type or the id.
+- In a `batch`, they are **resolved** with the status mapping the resource
+  endpoints use. `PUT`: one match updates (`200`, `location` = `[type]/[id]`), no
+  match creates (`201`), several matches `412`. `DELETE`: deleted or no match
+  `204`, several matches `412` (`/metadata` elects `conditionalDelete: "single"`).
+  The criteria are percent-decoded like a request URL's query, with repeated
+  parameters kept. A bundle carrying a conditional entry runs its entries
+  serially, because the backends resolve criteria as read-then-write rather than
+  compare-and-swap. `ifMatch` on a conditional entry is `400`: it names a
+  version of an instance the server has yet to resolve. Criteria on a `POST` are
+  `400`; a conditional create is expressed through `ifNoneExist`.
+- In a `transaction`, any non-`GET` entry whose URL carries a query string still
+  declines the whole bundle with `400 not-supported` before anything executes.
+  Resolving URL criteria inside a transaction's atomic scope needs a search
+  surface on the `Transaction` trait and the R4 §3.1.0.11.2 overlapping-identity
+  pre-pass, and is tracked by #859.
 
 Note that `/metadata` advertises `conditionalCreate`, `conditionalUpdate` and
-`conditionalDelete` for every resource type. That is accurate for the resource
-endpoints and **not** for bundle entries; reconciling the two is #511.
+`conditionalDelete` for every resource type regardless of backend; gating it per
+backend is #514.
 
 ### Current Limitations
 
 The following FHIR transaction features are not yet implemented:
-- **Conditional interactions in bundle entries** - `[type]?[criteria]` URLs are refused rather than resolved (#511)
+- **Conditional URL criteria in transactions** - `[type]?[criteria]` entries are declined whole in a `transaction` (resolved in a `batch`; #859)
 - **Conditional reference resolution** - References like `Patient?identifier=12345` are not resolved
 - **PATCH method** - PATCH operations in bundles return 501 Not Implemented, in both `batch` (per entry) and `transaction` (whole bundle). Send the patch to the instance endpoint instead
 - **HEAD entries** - refused with 405. `HEAD` is a legal `http-verb` code and is served on the instance-read route, but not inside a Bundle

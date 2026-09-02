@@ -1,7 +1,7 @@
 import { test, expect } from "../pages/fixtures";
 import type { APIRequestContext } from "@playwright/test";
 import { ROUTES, seedBulkImportDetail } from "../pages/routes";
-import { createResource, waitSearchable } from "../pages/api";
+import { createResource, deleteResources, waitSearchable } from "../pages/api";
 import { expectDetailFieldSpacing } from "../pages/detail-spacing";
 import postcss from "postcss";
 
@@ -15,8 +15,17 @@ import postcss from "postcss";
 //   - a selector defined twice renders as the cascade-merge of two authors'
 //     blocks, which nobody wrote.
 
-// Classes added at runtime by vendored libraries, not defined in app.css.
-const RUNTIME_CLASSES = /^htmx-/;
+// Classes added at runtime by vendored libraries, not defined in app.css:
+// htmx's own state classes, and CodeMirror 6's (#753, extended by #838) —
+// it mounts its own `<style>` via `StyleModule.mount` at runtime (see
+// app.css's "Shared CodeMirror 6 chrome" comment) and injects both internal
+// implementation classes ("cm-layer-above", "cm-cursor-primary", ...) and
+// auto-generated, per-load-unique theme classes ("ͼ1", "ͼ2", ...) that no
+// app.css rule can reasonably target. The "cm-" prefix requires the literal
+// hyphen, so it does not also swallow "cmt-" — this crate's own
+// token-highlighting classes (e.g. `cmt-sql-keyword`, `cmt-json-key`) —
+// which stay held to the same "must have a rule" bar as everything else.
+const RUNTIME_CLASSES = /^(?:htmx-|cm-|ͼ)/;
 
 // The assets are read over HTTP from the server under test, not from the
 // source tree: the CI runner drives a packaged binary with no checkout
@@ -485,32 +494,42 @@ test("every exercised detail field gets external spacing from its direct parent"
     resource: "Patient",
     select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
   });
-  await waitSearchable(request, "ViewDefinition", viewDefinitionId);
+  try {
+    await waitSearchable(request, "ViewDefinition", viewDefinitionId);
 
-  await page.goto("/ui/capability-statement", { waitUntil: "networkidle" });
-  await expectDetailFieldSpacing(page, "Capability Statement summary");
+    await page.goto("/ui/capability-statement", { waitUntil: "networkidle" });
+    await expectDetailFieldSpacing(page, "Capability Statement summary");
 
-  await page.goto("/ui/sql/export", { waitUntil: "networkidle" });
-  await expectDetailFieldSpacing(page, "SQL Export form");
+    await page.goto("/ui/sql/export/new", { waitUntil: "networkidle" });
+    await expectDetailFieldSpacing(page, "SQL Export form");
 
-  await page.goto("/ui/sql/files", { waitUntil: "networkidle" });
-  await expectDetailFieldSpacing(page, "SQL Files form");
+    await page.goto("/ui/sql/files", { waitUntil: "networkidle" });
+    await expectDetailFieldSpacing(page, "SQL Files form");
 
-  await page.goto("/ui/search-parameters", { waitUntil: "networkidle" });
-  await page.locator("a.row-link").first().click();
-  await expect(page.locator(".detail .detail__field").first()).toBeVisible();
-  await expectDetailFieldSpacing(page, "Search Parameters detail");
+    await page.goto("/ui/search-parameters", { waitUntil: "networkidle" });
+    await page.locator("a.row-link").first().click();
+    await expect(page.locator(".detail .detail__field").first()).toBeVisible();
+    await expectDetailFieldSpacing(page, "Search Parameters detail");
 
-  await page.goto("/ui/compartments", { waitUntil: "networkidle" });
-  await expectDetailFieldSpacing(page, "Compartments definition");
-  await page.locator(".tabs .tab").last().click();
-  const tester = page.locator("form.tester");
-  await expect(tester).toBeVisible();
-  await expect(tester.locator(":scope > .detail__field").first()).toBeVisible();
-  await expectDetailFieldSpacing(page, "Compartments tester");
+    await page.goto("/ui/compartments", { waitUntil: "networkidle" });
+    await expectDetailFieldSpacing(page, "Compartments definition");
+    await page.locator(".tabs .tab").last().click();
+    const tester = page.locator("form.tester");
+    await expect(tester).toBeVisible();
+    await expect(tester.locator(":scope > .detail__field").first()).toBeVisible();
+    await expectDetailFieldSpacing(page, "Compartments tester");
 
-  await page.goto(await seedBulkImportDetail(request), { waitUntil: "networkidle" });
-  await expectDetailFieldSpacing(page, "Bulk Import summary");
+    await page.goto(await seedBulkImportDetail(request), { waitUntil: "networkidle" });
+    await expectDetailFieldSpacing(page, "Bulk Import summary");
+  } finally {
+    // A ViewDefinition is real, tenant-visible data on the shared server
+    // (playwright.config.ts: fullyParallel: false, workers: 1) — left
+    // behind, it becomes /ui/sql/view-definitions's default rail selection
+    // and mounts its CodeMirror editor, which then fails this very file's
+    // "every class used" sweep on whatever run happens to follow this one
+    // against the same reused local dev server.
+    await deleteResources(request, "ViewDefinition", [viewDefinitionId]);
+  }
 });
 
 for (const viewport of [

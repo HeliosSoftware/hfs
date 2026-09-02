@@ -2753,7 +2753,7 @@ impl ConditionalStorage for PostgresBackend {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
                 self.delete(tenant, resource_type, existing.id()).await?;
-                Ok(ConditionalDeleteResult::Deleted)
+                Ok(ConditionalDeleteResult::Deleted(existing))
             }
             n => {
                 // Multiple matches - error condition
@@ -2815,29 +2815,66 @@ impl PostgresBackend {
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        // Parse search parameters into (name, value) pairs
-        let parsed_params = parse_simple_search_params(search_params_str);
-
-        if parsed_params.is_empty() {
-            // No search params means match all - but for conditional ops this is unusual
+        let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
             return Ok(Vec::new());
-        }
-
-        // Build SearchParameter objects by looking up types from the registry
-        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-
-        // Build a SearchQuery
-        let query = SearchQuery {
-            resource_type: resource_type.to_string(),
-            parameters: search_params,
-            count: Some(1000),
-            ..Default::default()
         };
 
         // Use the SearchProvider implementation
         let result = <Self as SearchProvider>::search(self, tenant, &query).await?;
 
         Ok(result.resources.items)
+    }
+
+    /// Resolves conditional criteria on the transaction's own client, so the
+    /// match set includes what earlier entries of the same bundle wrote (#511).
+    /// Buffered creates are flushed first, exactly as `read` does, so they are
+    /// visible too; a bundle that puts `ifNoneExist` on every entry therefore
+    /// forfeits create batching, which is the correct trade.
+    async fn find_matching_resources_in_tx(
+        &self,
+        tenant: &TenantContext,
+        tx: &mut crate::backends::postgres::transaction::PostgresTransaction,
+        resource_type: &str,
+        search_params_str: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
+        let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
+            return Ok(Vec::new());
+        };
+
+        tx.flush().await?;
+        let client = tx.client()?;
+        let result = self
+            .search_with_client(client, tenant, &query, None)
+            .await?;
+
+        Ok(result.resources.items)
+    }
+
+    /// Builds the search a conditional interaction's criteria describe, or
+    /// `None` when the criteria are empty — matching everything would be the
+    /// literal reading, but no conditional interaction means that.
+    fn conditional_query(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params_str: &str,
+    ) -> StorageResult<Option<SearchQuery>> {
+        // Parse search parameters into (name, value) pairs
+        let parsed_params = parse_simple_search_params(search_params_str);
+
+        if parsed_params.is_empty() {
+            return Ok(None);
+        }
+
+        // Build SearchParameter objects by looking up types from the registry
+        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+
+        Ok(Some(SearchQuery {
+            resource_type: resource_type.to_string(),
+            parameters: search_params,
+            count: Some(1000),
+            ..Default::default()
+        }))
     }
 
     /// Builds SearchParameter objects from parsed (name, value) pairs.
@@ -3092,6 +3129,15 @@ impl BundleProvider for PostgresBackend {
         // Build a map of fullUrl -> assigned reference for reference resolution
         let mut reference_map: HashMap<String, String> = HashMap::new();
 
+        // Whether any entry in this transaction writes a SearchParameter that
+        // affects this tenant's cached overlay (#787: transaction-bundle writes
+        // never invalidated the registry, so a SearchParameter POSTed inside a
+        // Bundle — e.g. by Inferno's US Core setup — never took effect until
+        // the TTL cache refresh). Mirrors the non-transactional create/update/
+        // delete checks below (create is conditional via `create_affects_overlay`;
+        // update/delete are unconditional).
+        let mut search_param_overlay_changed = false;
+
         // Make entries mutable for reference resolution
         let mut entries = entries;
 
@@ -3103,7 +3149,7 @@ impl BundleProvider for PostgresBackend {
             }
 
             let creates_before = tx.creates_seen();
-            let result = self.process_bundle_entry_tx(&mut tx, entry).await;
+            let result = self.process_bundle_entry_tx(tenant, &mut tx, entry).await;
             for _ in creates_before..tx.creates_seen() {
                 create_entry_index.push(idx);
             }
@@ -3116,6 +3162,38 @@ impl BundleProvider for PostgresBackend {
                             format!("Entry failed with status {}", entry_result.status),
                         ));
                         break;
+                    }
+
+                    if !search_param_overlay_changed {
+                        search_param_overlay_changed =
+                            match entry_result.status {
+                                // Created (POST, or PUT-as-create): only overlay-affecting
+                                // creates need to invalidate (see `create_affects_overlay`).
+                                201 => entry_result
+                                    .resource
+                                    .as_ref()
+                                    .filter(|r| {
+                                        r.get("resourceType").and_then(|v| v.as_str())
+                                            == Some("SearchParameter")
+                                    })
+                                    .is_some_and(|r| {
+                                        self.tenant_registries().create_affects_overlay(r)
+                                    }),
+                                // Updated (PUT/PATCH): unconditional, like the
+                                // non-transactional update path.
+                                200 => {
+                                    entry_result.resource.as_ref().and_then(|r| {
+                                        r.get("resourceType").and_then(|v| v.as_str())
+                                    }) == Some("SearchParameter")
+                                }
+                                // Deleted: the emptied result carries no resource, so
+                                // parse the type from the entry's URL instead.
+                                204 => self
+                                    .parse_url(&entry.url)
+                                    .map(|(resource_type, _)| resource_type == "SearchParameter")
+                                    .unwrap_or(false),
+                                _ => false,
+                            };
                     }
 
                     // If this was a create (POST) and we have a fullUrl, record the mapping
@@ -3165,6 +3243,20 @@ impl BundleProvider for PostgresBackend {
                 reason: format!("Commit failed: {}", e),
             })?;
 
+        // A committed SearchParameter write in this transaction changes this
+        // tenant's cached overlay. Unlike SQLite's synchronous, DB-backed
+        // per-tenant loader (which just needs `invalidate` — it re-queries
+        // storage lazily on next access), Postgres's loader reads a
+        // synchronous in-memory cache (`stored_by_tenant`) that only
+        // `reload_stored_cache` refreshes from the database; every other
+        // SearchParameter write path on this backend (create/update/delete)
+        // already calls it for the same reason (#787).
+        if search_param_overlay_changed {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
+
         Ok(BundleResult {
             bundle_type: BundleType::Transaction,
             entries: results,
@@ -3202,6 +3294,7 @@ impl PostgresBackend {
     /// Process a single bundle entry within a transaction.
     async fn process_bundle_entry_tx(
         &self,
+        tenant: &TenantContext,
         tx: &mut super::transaction::PostgresTransaction,
         entry: &BundleEntry,
     ) -> StorageResult<BundleEntryResult> {
@@ -3239,6 +3332,27 @@ impl PostgresBackend {
                             },
                         )
                     })?;
+
+                if let Some(criteria) = entry.if_none_exist.as_deref() {
+                    // With search offloaded to a secondary backend the local
+                    // index is empty for every row, so an in-transaction
+                    // search would always find nothing and this arm would
+                    // create the duplicate `ifNoneExist` exists to prevent.
+                    // Refuse the entry instead; the bundle rolls back (#511).
+                    if self.is_search_offloaded() {
+                        return Ok(crate::core::not_supported_entry(
+                            "ifNoneExist cannot be resolved inside a transaction when search \
+                             is offloaded to a secondary backend; submit the entry in a batch \
+                             Bundle instead",
+                        ));
+                    }
+                    let matches = self
+                        .find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)
+                        .await?;
+                    if let Some(gated) = crate::core::bundle_if_none_exist_gate(matches) {
+                        return Ok(gated);
+                    }
+                }
 
                 let created = tx.create(&resource_type, resource).await?;
                 Ok(BundleEntryResult::created(created))

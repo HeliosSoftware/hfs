@@ -1,33 +1,47 @@
-//! A foldable, line-numbered, syntax-highlighted JSON view (#264).
+//! A foldable, line-numbered, syntax-highlighted JSON view (#264, #808).
 //!
-//! Brett's Resource Editor shows the JSON and the guided form side by side, and
-//! the JSON is a real code view — line numbers down the gutter and a fold arrow
-//! on every object and array so a big resource collapses to its shape. A
-//! `<textarea>` cannot do that, so the view is rendered here, server-side, into
-//! [`JsonLine`]s the template lays out and a few lines of JS fold.
+//! HFS's Resource Editor shows the JSON and the guided form side by side, and
+//! the JSON is a real code view — line numbers down the gutter and a fold
+//! arrow on every object and array so a big resource collapses to its shape.
+//! A `<textarea>` cannot do that, so the view is rendered here, server-side,
+//! into [`JsonLine`]s the template lays out and a few lines of JS fold.
 //!
 //! The document is walked directly rather than pretty-printed and re-parsed:
 //! that way each container knows its own line, its closing line, and its
 //! ancestry, which is exactly what folding needs.
+//!
+//! This engine moved here from `crates/ui` for [`crate::capability_json`]
+//! (#808): the Raw CapabilityStatement fold is the same bounded JSON view
+//! HFS already built for the editor, and HTS needed it too rather than a
+//! second, byte-capped `<pre>`. HFS's editor, Resources and Batch pages keep
+//! their own template that renders a [`JsonLine`] vector inline — only the
+//! engine and its data types are shared.
+//!
+//! The HTS workbench's "Raw request and response" fold (#803) renders the
+//! same markup through [`render`], and the browser-side folding is
+//! `crates/ui/assets/json-view.js`, which HTS already serves from the shared
+//! asset embed.
 
+use crate::ChromeLabels;
+use askama::Template;
 use serde_json::Value;
 
 /// Controls metadata and resource limits while converting JSON to view lines.
 #[derive(Clone, Copy)]
-pub(crate) struct RenderOptions {
-    pub(crate) include_paths: bool,
-    pub(crate) budget: Option<RenderBudget>,
+pub struct RenderOptions {
+    pub include_paths: bool,
+    pub budget: Option<RenderBudget>,
 }
 
 /// A conservative cap on the work and eventual HTML size of a JSON view.
 #[derive(Clone, Copy)]
-pub(crate) struct RenderBudget {
-    pub(crate) max_lines: usize,
-    pub(crate) max_estimated_html_bytes: usize,
+pub struct RenderBudget {
+    pub max_lines: usize,
+    pub max_estimated_html_bytes: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RenderLimitExceeded;
+pub struct RenderLimitExceeded;
 
 /// One highlighted run within a line.
 pub struct Token {
@@ -76,7 +90,7 @@ pub fn lines(value: &Value) -> Vec<JsonLine> {
 /// A preflight walk rejects excessive line count or conservatively estimated
 /// HTML size before the line vector is allocated. `Ctx::push` enforces the
 /// line limit again while constructing the result as a defense in depth.
-pub(crate) fn try_lines(
+pub fn try_lines(
     value: &Value,
     options: RenderOptions,
 ) -> Result<Vec<JsonLine>, RenderLimitExceeded> {
@@ -93,6 +107,51 @@ pub(crate) fn try_lines(
     let mut root = Line::new(0, &[], String::new());
     ctx.walk(value, &mut root, &[], true)?;
     Ok(ctx.lines)
+}
+
+/// Renders [`JsonLine`]s into the shared `.json-view` markup.
+///
+/// `id` is the element id the caller's JavaScript addresses the view by —
+/// empty when nothing needs to find it. `paths` emits the `data-jpath`
+/// attribute the Resource Editor cross-highlights on; a consumer that has no
+/// guided form to point at passes `false` and saves the bytes.
+///
+/// The fragment is spliced into a page with `|safe`. That is sound because
+/// every value reaching the output goes through askama's default HTML escaper
+/// first — see `tests/json_view.rs::values_are_html_escaped_before_the_safe_filter`.
+///
+/// # Errors
+///
+/// Propagates [`askama::Error`] from rendering. The template has no fallible
+/// construct, so this is a formality the signature keeps honest.
+pub fn render(
+    i18n: &dyn ChromeLabels,
+    json_lines: &[JsonLine],
+    id: &str,
+    paths: bool,
+) -> Result<String, askama::Error> {
+    JsonViewTemplate {
+        i18n,
+        json_lines,
+        json_view_id: id,
+        json_view_paths: paths,
+    }
+    .render()
+}
+
+/// The one binding of the shared partial.
+///
+/// The fields keep the names the markup already used while it lived in
+/// `crates/ui` (`i18n`, `json_lines`, `json_view_id`, `json_view_paths`), so
+/// the template moved here byte-for-byte and every HFS page it backs still
+/// renders identical bytes.
+#[derive(Template)]
+#[template(path = "partials/json-view.html")]
+struct JsonViewTemplate<'a> {
+    i18n: &'a dyn ChromeLabels,
+    json_lines: &'a [JsonLine],
+    json_view_id: &'a str,
+    json_view_paths: bool,
 }
 
 /// The template has roughly 300 bytes of fixed markup per line before token

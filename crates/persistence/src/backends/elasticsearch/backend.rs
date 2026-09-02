@@ -22,6 +22,55 @@ use crate::search::{
     TenantSearchRegistries,
 };
 
+/// The `refresh` query parameter applied to Elasticsearch index and delete operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteRefreshPolicy {
+    /// Do not refresh on write (Elasticsearch default behavior).
+    #[default]
+    False,
+    /// Wait for the next refresh to make the write visible before returning.
+    WaitFor,
+    /// Force a refresh of the affected shards immediately after the write.
+    True,
+}
+
+impl WriteRefreshPolicy {
+    pub(crate) fn as_refresh_param(self) -> Option<elasticsearch::params::Refresh> {
+        match self {
+            WriteRefreshPolicy::False => None,
+            WriteRefreshPolicy::WaitFor => Some(elasticsearch::params::Refresh::WaitFor),
+            WriteRefreshPolicy::True => Some(elasticsearch::params::Refresh::True),
+        }
+    }
+}
+
+impl std::str::FromStr for WriteRefreshPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "false" => Ok(WriteRefreshPolicy::False),
+            "wait_for" | "wait-for" => Ok(WriteRefreshPolicy::WaitFor),
+            "true" => Ok(WriteRefreshPolicy::True),
+            other => Err(format!(
+                "Invalid Elasticsearch write refresh policy '{}'. Valid values: false, wait_for, true",
+                other
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for WriteRefreshPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteRefreshPolicy::False => write!(f, "false"),
+            WriteRefreshPolicy::WaitFor => write!(f, "wait_for"),
+            WriteRefreshPolicy::True => write!(f, "true"),
+        }
+    }
+}
+
 /// Authentication configuration for Elasticsearch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ElasticsearchAuth {
@@ -62,6 +111,10 @@ pub struct ElasticsearchConfig {
     /// Refresh interval (default: "1s").
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval: String,
+
+    /// Refresh behavior for index/delete operations (default: [`WriteRefreshPolicy::False`]).
+    #[serde(default)]
+    pub write_refresh: WriteRefreshPolicy,
 
     /// Maximum result window size (default: 10000).
     #[serde(default = "default_max_result_window")]
@@ -117,6 +170,7 @@ impl Default for ElasticsearchConfig {
             number_of_shards: default_shards(),
             number_of_replicas: default_replicas(),
             refresh_interval: default_refresh_interval(),
+            write_refresh: WriteRefreshPolicy::default(),
             max_result_window: default_max_result_window(),
             request_timeout_ms: default_request_timeout_ms(),
             auth: None,
@@ -304,6 +358,10 @@ impl ElasticsearchBackend {
     /// Returns the backend configuration.
     pub fn config(&self) -> &ElasticsearchConfig {
         &self.config
+    }
+
+    pub(crate) fn write_refresh_param(&self) -> Option<elasticsearch::params::Refresh> {
+        self.config.write_refresh.as_refresh_param()
     }
 
     /// Returns the per-tenant search parameter registries (shared base + tenant

@@ -52,6 +52,7 @@ mod i18n;
 mod import;
 mod metrics_parse;
 mod metrics_ring;
+mod raw_fold;
 mod upstream;
 mod value_sets;
 
@@ -88,9 +89,7 @@ pub use upstream::{
 };
 // Capability & Conformance page projections. Appended below Slice F's
 // block to avoid touching the alphabetized list.
-pub use upstream::{
-    CapabilityOperation, CapabilityRestResource, CapabilityView, TerminologyCapabilitiesView,
-};
+pub use upstream::{CapabilityView, TerminologyCapabilitiesView};
 // Slice H additions (the concept information plane, Direction B). Appended
 // below rather than folded into the alphabetized list above so the two
 // concurrent slices do not collide on the same lines.

@@ -31,6 +31,9 @@
 //! body is also echoed verbatim into the "Raw response" workbench panel per
 //! §7.3, so nothing is discarded.
 
+use helios_ui_chrome::capability::{
+    CoreResourceCatalog, DocsVersion, build_view as build_capability_view,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -290,6 +293,61 @@ impl UpstreamError {
             Self::Decode { .. } => "upstream-shape",
         }
     }
+}
+
+/// What actually went over the wire for one workbench operation.
+///
+/// The workbench's "Raw request and response" fold reproduces a call by hand,
+/// so it needs the URL, the `Parameters` resource that was POSTed, and the
+/// response body — pretty-printed. Before #803 the response was kept only on
+/// the success path: `status_to_error` parsed the body for its
+/// OperationOutcome and dropped the JSON, so an unknown code or a 400 showed
+/// the URL and nothing else, precisely when the payload is most wanted. The
+/// exchange now rides the error path too.
+///
+/// `response_body` is empty when there was no response to read — a connect
+/// failure or a timeout. The URL and the request body are always known.
+#[derive(Clone, Debug, Default)]
+pub struct RawExchange {
+    pub request_url: String,
+    pub request_body: String,
+    pub response_body: String,
+}
+
+/// A failed upstream operation that kept its [`RawExchange`].
+///
+/// Returned by the operation proxies the workbenches call. Every other caller
+/// only classifies the failure, and the `From` impl below lets those keep
+/// using `?` against a `Result<_, UpstreamError>` unchanged.
+///
+/// The exchange is boxed to keep `Result<_, OpFailure>` under clippy's
+/// `result_large_err` threshold — the same reason [`UpstreamError::Outcome`]
+/// boxes its `OutcomeView`.
+#[derive(Debug)]
+pub struct OpFailure {
+    pub error: UpstreamError,
+    pub exchange: Box<RawExchange>,
+}
+
+impl OpFailure {
+    fn new(error: UpstreamError, exchange: RawExchange) -> Self {
+        Self {
+            error,
+            exchange: Box::new(exchange),
+        }
+    }
+}
+
+impl From<OpFailure> for UpstreamError {
+    fn from(failure: OpFailure) -> Self {
+        failure.error
+    }
+}
+
+/// Pretty-printed JSON for the raw fold. Falls back to the compact form,
+/// which `serde_json::Value` can always produce.
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 // ── Helpers required by templates ────────────────────────────────────────
@@ -743,7 +801,9 @@ pub struct LookupParams {
 /// Response projection for `$lookup` (design doc §6.3 concept renderer).
 ///
 /// `raw_body` is the pretty-printed HTS JSON so the workbench can echo it in
-/// its "Raw response" panel unchanged (design doc §7.3 wireframe).
+/// its "Raw response" panel unchanged (design doc §7.3 wireframe), and
+/// `request_body` is the `Parameters` resource that produced it — the fold is
+/// titled "Raw request and response", and until #803 only ever showed the URL.
 #[derive(Clone, Debug, Default)]
 pub struct LookupResult {
     pub name: String,
@@ -753,6 +813,7 @@ pub struct LookupResult {
     pub designations: Vec<LookupDesignation>,
     pub properties: Vec<LookupProperty>,
     pub raw_body: String,
+    pub request_body: String,
     pub request_url: String,
     /// The canonical system `$lookup` resolved, echoed back by HTS
     /// (`lookup.rs` always pushes `system` / `code` so the caller can confirm
@@ -850,6 +911,7 @@ pub struct ValidateCodeResult {
     pub message: String,
     pub issues: Option<OutcomeView>,
     pub raw_body: String,
+    pub request_body: String,
     pub request_url: String,
 }
 
@@ -871,6 +933,7 @@ pub struct SubsumesParams {
 pub struct SubsumesResult {
     pub outcome: String,
     pub raw_body: String,
+    pub request_body: String,
     pub request_url: String,
 }
 
@@ -1145,7 +1208,7 @@ impl UpstreamClient {
         &self,
         id: &str,
         params: LookupParams,
-    ) -> Result<LookupResult, UpstreamError> {
+    ) -> Result<LookupResult, OpFailure> {
         let requested_code = params.code.clone();
         let mut parameters: Vec<Value> = Vec::new();
         parameters.push(json!({"name": "code", "valueCode": params.code}));
@@ -1169,6 +1232,7 @@ impl UpstreamClient {
         let (raw, parsed) = self.post_parameters("cs-lookup", &url, &body).await?;
         let mut result = LookupResult {
             raw_body: raw,
+            request_body: pretty_json(&body),
             request_url: url.clone(),
             // Seeded from the request; overwritten by the echoed parameters
             // below when the server sends them. The instance route derives
@@ -1224,7 +1288,7 @@ impl UpstreamClient {
         &self,
         canonical_url: &str,
         params: ValidateCodeParams,
-    ) -> Result<ValidateCodeResult, UpstreamError> {
+    ) -> Result<ValidateCodeResult, OpFailure> {
         let mut parameters: Vec<Value> = Vec::new();
         parameters.push(json!({"name": "url", "valueUri": canonical_url}));
         match params.mode {
@@ -1264,6 +1328,7 @@ impl UpstreamClient {
         let (raw, parsed) = self.post_parameters("cs-validate", &url, &body).await?;
         let mut out = ValidateCodeResult {
             raw_body: raw,
+            request_body: pretty_json(&body),
             request_url: url.clone(),
             ..ValidateCodeResult::default()
         };
@@ -1300,7 +1365,7 @@ impl UpstreamClient {
         &self,
         canonical_url: &str,
         params: SubsumesParams,
-    ) -> Result<SubsumesResult, UpstreamError> {
+    ) -> Result<SubsumesResult, OpFailure> {
         let mut parameters: Vec<Value> = Vec::new();
         parameters.push(json!({"name": "system", "valueUri": canonical_url}));
         parameters.push(json!({"name": "codeA", "valueCode": params.code_a}));
@@ -1316,6 +1381,7 @@ impl UpstreamClient {
         let (raw, parsed) = self.post_parameters("cs-subsumes", &url, &body).await?;
         let mut out = SubsumesResult {
             raw_body: raw,
+            request_body: pretty_json(&body),
             request_url: url.clone(),
             ..SubsumesResult::default()
         };
@@ -1336,7 +1402,7 @@ impl UpstreamClient {
         &self,
         system: &str,
         params: LookupParams,
-    ) -> Result<LookupResult, UpstreamError> {
+    ) -> Result<LookupResult, OpFailure> {
         let system = system.trim();
         let requested_code = params.code.clone();
         let mut parameters: Vec<Value> = Vec::new();
@@ -1362,6 +1428,7 @@ impl UpstreamClient {
         let (raw, parsed) = self.post_parameters("cs-lookup", &url, &body).await?;
         let mut result = LookupResult {
             raw_body: raw,
+            request_body: pretty_json(&body),
             request_url: url,
             // Seeded from the request so the concept permalink resolves even
             // against a server that does not echo the address back.
@@ -1416,32 +1483,8 @@ impl UpstreamClient {
         op: &'static str,
         url: &str,
         body: &Value,
-    ) -> Result<(String, Value), UpstreamError> {
-        let response = self
-            .client
-            .post(url)
-            .header("Accept", "application/fhir+json")
-            .header("Content-Type", "application/fhir+json")
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest(op, url, e))?;
-        let status = response.status();
-        let raw = response.text().await.map_err(|e| UpstreamError::Decode {
-            op,
-            url: url.to_owned(),
-            message: e.to_string(),
-        })?;
-        let parsed: Value = serde_json::from_str(&raw).map_err(|e| UpstreamError::Decode {
-            op,
-            url: url.to_owned(),
-            message: e.to_string(),
-        })?;
-        if !status.is_success() {
-            return Err(status_to_error(op, url, status.as_u16(), &parsed));
-        }
-        let pretty = serde_json::to_string_pretty(&parsed).unwrap_or(raw);
-        Ok((pretty, parsed))
+    ) -> Result<(String, Value), OpFailure> {
+        self.post_parameters_with_headers(op, url, body, None).await
     }
 }
 
@@ -1859,6 +1902,7 @@ pub struct ExpansionResult {
     pub echoed_parameters: Vec<(String, String)>,
     pub request_url: String,
     pub raw_body: String,
+    pub request_body: String,
     /// The `filter` value the user submitted, echoed so the "no filter
     /// match" neutral-state message can reference it. Empty when no
     /// filter was applied.
@@ -2059,7 +2103,7 @@ impl UpstreamClient {
         &self,
         id: &str,
         params: &ExpandParams,
-    ) -> Result<ExpansionResult, UpstreamError> {
+    ) -> Result<ExpansionResult, OpFailure> {
         let mut parameters: Vec<Value> = Vec::new();
         if let Some(v) = params.filter.as_deref().and_then(non_empty_str) {
             parameters.push(json!({"name": "filter", "valueString": v}));
@@ -2184,6 +2228,7 @@ impl UpstreamClient {
             echoed_parameters,
             request_url: url,
             raw_body: raw,
+            request_body: pretty_json(&body),
             requested_filter: params.filter.clone().unwrap_or_default(),
             requested_count: params.count.unwrap_or(0),
             requested_offset: params.offset.unwrap_or(0),
@@ -2204,7 +2249,7 @@ impl UpstreamClient {
         &self,
         canonical_url: &str,
         params: &ExpandParams,
-    ) -> Result<ExpansionResult, UpstreamError> {
+    ) -> Result<ExpansionResult, OpFailure> {
         let mut parameters: Vec<Value> = vec![json!({"name": "url", "valueUri": canonical_url})];
         if let Some(v) = params.filter.as_deref().and_then(non_empty_str) {
             parameters.push(json!({"name": "filter", "valueString": v}));
@@ -2321,6 +2366,7 @@ impl UpstreamClient {
             echoed_parameters,
             request_url: url,
             raw_body: raw,
+            request_body: pretty_json(&body),
             requested_filter: params.filter.clone().unwrap_or_default(),
             requested_count: params.count.unwrap_or(0),
             requested_offset: params.offset.unwrap_or(0),
@@ -2333,13 +2379,26 @@ impl UpstreamClient {
     /// optional extra header (used for `X-TOO-COSTLY-THRESHOLD`). Kept
     /// distinct from `post_parameters` so the CS operation methods stay
     /// header-free.
+    ///
+    /// Every failure arm carries the [`RawExchange`] built so far, so the
+    /// workbench fold can show the payload of a call that failed (#803). A
+    /// body that arrived but did not parse as JSON is echoed verbatim — it is
+    /// the only form of it there is, and seeing it is how an operator works
+    /// out what the upstream actually sent.
     async fn post_parameters_with_headers(
         &self,
         op: &'static str,
         url: &str,
         body: &Value,
         extra_header: Option<(String, String)>,
-    ) -> Result<(String, Value), UpstreamError> {
+    ) -> Result<(String, Value), OpFailure> {
+        let mut exchange = RawExchange {
+            request_url: url.to_owned(),
+            request_body: pretty_json(body),
+            response_body: String::new(),
+        };
+        let fail = |error, exchange: &RawExchange| OpFailure::new(error, exchange.clone());
+
         let mut request = self
             .client
             .post(url)
@@ -2352,22 +2411,37 @@ impl UpstreamClient {
         let response = request
             .send()
             .await
-            .map_err(|e| UpstreamError::from_reqwest(op, url, e))?;
+            .map_err(|e| fail(UpstreamError::from_reqwest(op, url, e), &exchange))?;
         let status = response.status();
-        let raw = response.text().await.map_err(|e| UpstreamError::Decode {
-            op,
-            url: url.to_owned(),
-            message: e.to_string(),
+        let raw = response.text().await.map_err(|e| {
+            fail(
+                UpstreamError::Decode {
+                    op,
+                    url: url.to_owned(),
+                    message: e.to_string(),
+                },
+                &exchange,
+            )
         })?;
-        let parsed: Value = serde_json::from_str(&raw).map_err(|e| UpstreamError::Decode {
-            op,
-            url: url.to_owned(),
-            message: e.to_string(),
+        exchange.response_body = raw.clone();
+        let parsed: Value = serde_json::from_str(&raw).map_err(|e| {
+            fail(
+                UpstreamError::Decode {
+                    op,
+                    url: url.to_owned(),
+                    message: e.to_string(),
+                },
+                &exchange,
+            )
         })?;
+        let pretty = pretty_json(&parsed);
+        exchange.response_body = pretty.clone();
         if !status.is_success() {
-            return Err(status_to_error(op, url, status.as_u16(), &parsed));
+            return Err(fail(
+                status_to_error(op, url, status.as_u16(), &parsed),
+                &exchange,
+            ));
         }
-        let pretty = serde_json::to_string_pretty(&parsed).unwrap_or(raw);
         Ok((pretty, parsed))
     }
 }
@@ -2887,6 +2961,7 @@ pub struct TranslateResult {
     pub matches: Vec<TranslateMatch>,
     pub mapping_kind: MappingKind,
     pub raw_body: String,
+    pub request_body: String,
     pub request_url: String,
 }
 
@@ -2981,7 +3056,7 @@ impl UpstreamClient {
         &self,
         id: &str,
         params: &TranslateParams,
-    ) -> Result<TranslateResult, UpstreamError> {
+    ) -> Result<TranslateResult, OpFailure> {
         let mut parameters: Vec<Value> = Vec::new();
         match params.direction {
             TranslateDirection::Forward => {
@@ -3023,6 +3098,7 @@ impl UpstreamClient {
 
         let mut out = TranslateResult {
             raw_body: raw,
+            request_body: pretty_json(&body),
             request_url: url.clone(),
             ..TranslateResult::default()
         };
@@ -3067,7 +3143,7 @@ impl UpstreamClient {
         &self,
         canonical_url: &str,
         params: &TranslateParams,
-    ) -> Result<TranslateResult, UpstreamError> {
+    ) -> Result<TranslateResult, OpFailure> {
         let mut parameters: Vec<Value> =
             vec![json!({"name": "url", "valueCanonical": canonical_url})];
         match params.direction {
@@ -3110,6 +3186,7 @@ impl UpstreamClient {
 
         let mut out = TranslateResult {
             raw_body: raw,
+            request_body: pretty_json(&body),
             request_url: url.clone(),
             ..TranslateResult::default()
         };
@@ -4045,88 +4122,49 @@ fn parse_closure_edges(resource: &Value) -> Vec<ClosureEdge> {
 // dashboard chart; the capability page folds the raw *CapabilityStatement*
 // instead, mirroring HFS.
 
-/// Projection of a FHIR `CapabilityStatement` for the Capability &
-/// Conformance page.
+/// What the Capability & Conformance page needs from `GET /metadata`.
 ///
-/// Field-for-field this mirrors HFS's `crates/ui/src/capability.rs`
-/// (`CapabilitySummary` + `OperationRow` + `ResourceRow`) so the two pages
-/// can share templates and Fluent keys. It is a documentation surface, not
-/// a machine consumer, so unknown fields are silently dropped.
+/// The projection itself is [`helios_ui_chrome::capability::CapabilityView`]
+/// (#808) — the same one HFS renders, produced by the same parser, so the two
+/// pages cannot disagree about what a statement says and a fix to either
+/// lands on both.
+///
+/// [`Self::document`] keeps the fetched body around rather than a
+/// pre-rendered string: the Raw CapabilityStatement fold is now the same
+/// bounded, paginated JSON-fragment engine HFS built for #798
+/// ([`helios_ui_chrome::capability_json`]), which pages through a statement
+/// of any size — HTS's grows with the data, one
+/// `capabilitystatement-supported-system` extension per loaded code system,
+/// ~1,975 of them and 422 KB against the bundled seed set — rather than
+/// requiring a byte cap up front.
 #[derive(Clone, Debug, Default)]
 pub struct CapabilityView {
-    pub url: String,
-    pub version: String,
-    pub name: String,
-    pub title: String,
-    pub status: String,
-    pub date: String,
-    /// `implementation.description` — HFS shows this as the first summary row.
-    pub description: String,
-    pub fhir_version: String,
-    pub kind: String,
-    /// `format[]` — the wire formats the server accepts.
-    pub formats: Vec<String>,
-    /// System-level `rest[].interaction[].code`.
-    ///
-    /// **Empty against HTS today**: HTS serves `POST /` (batch) but does not
-    /// advertise it in `rest[].interaction`. The template therefore renders
-    /// this card only when the list is non-empty, so it appears on its own
-    /// if HTS ever declares them — rather than showing a permanently blank
-    /// card or, worse, a fabricated list.
-    pub interactions: Vec<String>,
-    /// System-level `rest[].operation[]`.
-    pub operations: Vec<CapabilityOperation>,
-    /// Flattened `rest[].resource[]` summary — resource type + the list of
-    /// advertised interaction verbs (`read`, `search-type`, ...). Empty
-    /// when the upstream response does not carry a `rest[]` section.
-    pub resources: Vec<CapabilityRestResource>,
-    /// Pretty-printed statement for the foldable raw block, mirroring the
-    /// `raw` field HFS keeps on its `CapabilityPage`. Retained from the
-    /// response already in hand — no second fetch.
-    ///
-    /// **Capped at [`RAW_STATEMENT_BYTE_CAP`].** HFS can inline its whole
-    /// statement because that document is a fixed size; HTS's grows with
-    /// the data, because it carries one
-    /// `capabilitystatement-supported-system` extension per loaded code
-    /// system. Against the bundled seed set that is ~1,975 extensions and a
-    /// 422 KB block — 95% of the page — on every load, `<details>` or not.
-    /// The cap is never silent: [`Self::raw_truncated`] drives a note that
-    /// states both sizes and links to `/metadata` for the complete document.
-    pub raw: String,
-    /// Whether [`Self::raw`] was cut short by the cap.
-    pub raw_truncated: bool,
-    /// Full pretty-printed length in bytes, so the note can state what was
-    /// withheld rather than just admitting that something was.
-    pub raw_full_bytes: usize,
+    /// The shared projection, fed straight to
+    /// [`helios_ui_chrome::capability::CapabilityCards`].
+    pub cards: helios_ui_chrome::capability::CapabilityView,
+    /// The fetched body, unmodified. Feeds the JSON-fragment endpoint's
+    /// `capability_json::plan` and the `?raw=1` no-JS fallback's full
+    /// pretty-print — both read it fresh from a re-fetch, same as HFS's own
+    /// loopback self-call per request.
+    pub document: Value,
 }
 
-/// Byte budget for the inlined raw statement (see [`CapabilityView::raw`]).
+/// The resource types a Helios terminology server can advertise.
 ///
-/// Sized to hold a whole statement from a server whose `/metadata` does not
-/// scale with its content, so the cap only ever engages on a seed-heavy
-/// terminology server — exactly the case where inlining it would be wrong.
-pub const RAW_STATEMENT_BYTE_CAP: usize = 16 * 1024;
+/// HTS's `/metadata` declares exactly CodeSystem, ValueSet and ConceptMap
+/// (`crates/hts/src/operations/metadata.rs`), and all three are core
+/// resources in every release from R4 to R6 — so answering the shared
+/// projection's catalog question needs no schema pack, which is what keeps
+/// this crate off the validator's embedded core packs. A resource type HTS
+/// grows later is simply not linked into the specification until it is added
+/// here; an unlinked row is the safe failure, a link to a page that does not
+/// exist is not.
+struct TerminologyResources;
 
-/// One row in [`CapabilityView::operations`].
-///
-/// HFS's equivalent (`OperationRow`) also carries a `definition_path` for
-/// operations whose canonical resolves to a same-server
-/// `/OperationDefinition/{id}`. Every operation HTS advertises points at an
-/// `hl7.org` canonical instead, so there is nothing to link and the field
-/// is omitted rather than always-empty.
-#[derive(Clone, Debug, Default)]
-pub struct CapabilityOperation {
-    pub name: String,
-    pub definition: String,
-}
-
-/// One row in [`CapabilityView::resources`].
-#[derive(Clone, Debug, Default)]
-pub struct CapabilityRestResource {
-    pub resource_type: String,
-    pub interactions: Vec<String>,
-    /// `searchParam[].len()` — HFS shows the same count as a numeric column.
-    pub search_param_count: usize,
+impl CoreResourceCatalog for TerminologyResources {
+    fn is_core_resource(&self, resource_type: &str) -> bool {
+        matches!(resource_type, "CodeSystem" | "ValueSet" | "ConceptMap")
+    }
 }
 
 /// Projection of the `TerminologyCapabilities` fields the Diagnostics
@@ -4168,7 +4206,16 @@ pub struct TerminologyCapabilitiesView {
 impl UpstreamClient {
     /// `GET /metadata` — the FHIR `CapabilityStatement`. Feeds the
     /// Capability &amp; Conformance page.
-    pub async fn capability_statement(&self) -> Result<CapabilityView, UpstreamError> {
+    ///
+    /// `version` is the release this binary was built for, and decides which
+    /// FHIR specification the rendered links point at. It is taken from the
+    /// caller rather than read off the statement's own `fhirVersion` so the
+    /// page links at the spec the *server* implements even when an upstream
+    /// answers with something else.
+    pub async fn capability_statement(
+        &self,
+        version: DocsVersion,
+    ) -> Result<CapabilityView, UpstreamError> {
         let url = format!("{}/metadata", self.base_url);
         let response = self
             .client
@@ -4185,12 +4232,13 @@ impl UpstreamClient {
                 status: status.as_u16(),
             });
         }
-        let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
+        let document: Value = response.json().await.map_err(|e| UpstreamError::Decode {
             op: "metadata",
             url: url.clone(),
             message: e.to_string(),
         })?;
-        Ok(parse_capability_statement(&body))
+        let cards = build_capability_view(&document, version, &TerminologyResources);
+        Ok(CapabilityView { cards, document })
     }
 
     /// `GET /metadata?mode=terminology` — the FHIR
@@ -4251,137 +4299,6 @@ impl UpstreamClient {
             url,
             message: e.to_string(),
         })
-    }
-}
-
-fn parse_capability_statement(body: &Value) -> CapabilityView {
-    let get_str = |key: &str| -> String {
-        body.get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let resources = body
-        .get("rest")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .flat_map(|rest| {
-                    rest.get("resource")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                        .unwrap_or_default()
-                })
-                .map(|resource| CapabilityRestResource {
-                    resource_type: resource
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_owned(),
-                    interactions: resource
-                        .get("interaction")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|i| {
-                                    i.get("code").and_then(|c| c.as_str()).map(|s| s.to_owned())
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    search_param_count: resource
-                        .get("searchParam")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // System-level `rest[].interaction[]` and `rest[].operation[]`. Both are
-    // flattened across every `rest[]` entry for the same reason `resources`
-    // is: a server may legitimately publish more than one mode.
-    let rest = |key: &str| -> Vec<Value> {
-        body.get("rest")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .flat_map(|r| {
-                        r.get(key)
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let interactions = rest("interaction")
-        .iter()
-        .filter_map(|i| i.get("code").and_then(|c| c.as_str()).map(str::to_owned))
-        .collect();
-    let operations = rest("operation")
-        .iter()
-        .map(|o| CapabilityOperation {
-            name: o
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_owned(),
-            definition: o
-                .get("definition")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_owned(),
-        })
-        .collect();
-
-    // Pretty-printed so the foldable block is readable, then capped — see
-    // `CapabilityView::raw`. Cut on a char boundary; `floor_char_boundary`
-    // is still unstable, so walk back to one.
-    let raw_full = serde_json::to_string_pretty(body).unwrap_or_default();
-    let raw_full_bytes = raw_full.len();
-    let raw = if raw_full_bytes <= RAW_STATEMENT_BYTE_CAP {
-        raw_full
-    } else {
-        let mut end = RAW_STATEMENT_BYTE_CAP;
-        while end > 0 && !raw_full.is_char_boundary(end) {
-            end -= 1;
-        }
-        raw_full[..end].to_owned()
-    };
-
-    CapabilityView {
-        url: get_str("url"),
-        version: get_str("version"),
-        name: get_str("name"),
-        title: get_str("title"),
-        status: get_str("status"),
-        date: get_str("date"),
-        description: body
-            .get("implementation")
-            .and_then(|i| i.get("description"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_owned(),
-        fhir_version: get_str("fhirVersion"),
-        kind: get_str("kind"),
-        formats: body
-            .get("format")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|f| f.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        interactions,
-        operations,
-        resources,
-        raw,
-        raw_truncated: raw_full_bytes > RAW_STATEMENT_BYTE_CAP,
-        raw_full_bytes,
     }
 }
 
@@ -5521,7 +5438,9 @@ impl UpstreamClient {
             };
             match outcome {
                 Ok(result) => row.outcome = result.outcome,
-                Err(err) => match &err {
+                // The subsumption table has no raw fold, so the exchange the
+                // proxy kept for the workbench is simply not read here.
+                Err(err) => match &err.error {
                     UpstreamError::Outcome { outcome, .. } => {
                         row.outcome_error = Some((**outcome).clone())
                     }

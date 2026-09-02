@@ -273,12 +273,27 @@ where
 
     use helios_persistence::core::ConditionalDeleteResult;
     match result {
-        ConditionalDeleteResult::Deleted => {
+        ConditionalDeleteResult::Deleted(deleted) => {
             debug!(
                 resource_type = %resource_type,
+                id = %deleted.id(),
                 "Resource conditionally deleted"
             );
-            Ok(StatusCode::NO_CONTENT.into_response())
+            // Name the entity in the audit trail, as the instance delete does.
+            // Before the result carried the snapshot, a delete-by-criteria
+            // produced an AuditEvent with no entity at all.
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            response
+                .extensions_mut()
+                .insert(helios_audit::AuditResponseContext {
+                    resource_type: Some(resource_type.clone()),
+                    resource_id: Some(deleted.id().to_string()),
+                    patient_reference: super::extract_patient_from_resource(
+                        &resource_type,
+                        deleted.content(),
+                    ),
+                });
+            Ok(response)
         }
         ConditionalDeleteResult::NoMatch => {
             // Per FHIR spec, no match on conditional delete is success

@@ -18,11 +18,53 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
+
+/// Who is asking on the loopback self-call that backs `$sql-export` (#833):
+/// the effective tenant, and — when the browser sent one — the
+/// `Authorization` header verbatim.
+///
+/// Built once per request from the incoming headers and the tenant the
+/// request already resolved to (the crate's `RequestTenant` extractor), and
+/// threaded unchanged through the four `$sql-export` methods of
+/// [`ConformanceSource`]. It never decodes, validates, or re-derives a
+/// token — it only carries what the browser sent so the self-call can
+/// forward it verbatim, keeping kick-off and polling under the same identity
+/// the async FHIR pattern and SMART scopes assume.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Caller {
+    /// The tenant the request resolved to; sent as `X-Tenant-ID` unless
+    /// empty (the server-default tenant needs no header, same rule as every
+    /// other self-call in this module).
+    pub tenant: String,
+    /// The `Authorization` header value the browser sent, if any. When
+    /// present it is forwarded verbatim to the self-call in place of the
+    /// [`OutboundAuthProvider`](helios_auth::outbound::OutboundAuthProvider)'s
+    /// credentials.
+    pub authorization: Option<String>,
+}
+
+impl Caller {
+    /// Builds a [`Caller`] from a request's headers and its resolved tenant.
+    ///
+    /// Reads only the `Authorization` header (case-insensitive, per
+    /// `HeaderMap`) and copies its value as-is — no parsing, no scheme
+    /// check, no decoding. An absent or non-UTF-8 header yields `None`,
+    /// which falls back to the server's outbound credentials.
+    pub fn from_request(headers: &axum::http::HeaderMap, tenant: &str) -> Self {
+        Self {
+            tenant: tenant.to_string(),
+            authorization: headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from),
+        }
+    }
+}
 
 /// Fetches all FHIR resources of a conformance type for a FHIR version, as the
 /// raw resource JSON `Value`s (the `entry[].resource` of a searchset Bundle).
@@ -76,31 +118,35 @@ pub trait ConformanceSource: Send + Sync {
 
     /// Submits a `$sql-export` job over `(output name, reference)` subjects
     /// and returns the job id from its `Content-Location` (#649).
+    ///
+    /// `caller` carries the tenant and, when the browser sent one, the
+    /// `Authorization` to run the job under (#833) — see [`Caller`].
     async fn sql_export_start(
         &self,
         subjects: &[(String, String)],
         format: &str,
-        tenant: &str,
+        caller: &Caller,
     ) -> Result<String, String> {
-        let _ = (subjects, format, tenant);
+        let _ = (subjects, format, caller);
         Err("$sql-export is not available from this source".to_string())
     }
 
-    /// Polls a job's status URL (#649).
-    async fn sql_export_status(&self, job_id: &str, tenant: &str) -> SqlExportStatus {
-        let _ = (job_id, tenant);
+    /// Polls a job's status URL (#649), under the same [`Caller`] identity
+    /// the kick-off used (#833).
+    async fn sql_export_status(&self, job_id: &str, caller: &Caller) -> SqlExportStatus {
+        let _ = (job_id, caller);
         SqlExportStatus::Unknown
     }
 
     /// Cancels a job; `Ok` when the server accepted the cancellation (#649).
-    async fn sql_export_cancel(&self, job_id: &str, tenant: &str) -> Result<(), String> {
-        let _ = (job_id, tenant);
+    async fn sql_export_cancel(&self, job_id: &str, caller: &Caller) -> Result<(), String> {
+        let _ = (job_id, caller);
         Err("$sql-export is not available from this source".to_string())
     }
 
     /// The completion manifest `Parameters` of a finished job (#649).
-    async fn sql_export_manifest(&self, job_id: &str, tenant: &str) -> Result<Value, String> {
-        let _ = (job_id, tenant);
+    async fn sql_export_manifest(&self, job_id: &str, caller: &Caller) -> Result<Value, String> {
+        let _ = (job_id, caller);
         Err("$sql-export is not available from this source".to_string())
     }
 
@@ -156,6 +202,13 @@ pub enum SqlExportStatus {
     Done,
     /// `404` — unknown, cancelled, or reclaimed.
     Unknown,
+    /// Anything else: a transport failure (connection refused, timeout, …)
+    /// or a response that is not 202/303/404 — most notably 401/403 (the
+    /// forwarded credential was rejected) or a 5xx. The job is *not* known
+    /// to be gone, unlike [`Unknown`](Self::Unknown); callers should keep
+    /// treating it as in progress and retry the poll (#833). The message is
+    /// short and names the cause, e.g. `"status poll answered 401"`.
+    Unavailable(String),
 }
 
 /// Reads conformance resources from the server's own FHIR API over HTTP.
@@ -212,6 +265,35 @@ impl HttpConformanceSource {
             .authorize(request, &self.base_url)
             .await
             .map_err(|e| format!("outbound auth failed: {e}"))
+    }
+
+    /// A request with the caller's tenant and credentials applied — the one
+    /// place that decides between the two credential sources for the
+    /// `$sql-export` self-calls (#833).
+    ///
+    /// `X-Tenant-ID` follows the same rule as [`authorized`](Self::authorized)
+    /// (omitted when the tenant is empty). Credentials: `caller.authorization`
+    /// wins when present, forwarded verbatim; otherwise the configured
+    /// [`OutboundAuthProvider`](helios_auth::outbound::OutboundAuthProvider)
+    /// is consulted, exactly as every other self-call in this module does.
+    async fn authorized_for(
+        &self,
+        request: reqwest::RequestBuilder,
+        caller: &Caller,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let request = if caller.tenant.is_empty() {
+            request
+        } else {
+            request.header("X-Tenant-ID", &caller.tenant)
+        };
+        match &caller.authorization {
+            Some(authorization) => Ok(request.header("Authorization", authorization)),
+            None => self
+                .outbound_auth
+                .authorize(request, &self.base_url)
+                .await
+                .map_err(|e| format!("outbound auth failed: {e}")),
+        }
     }
 
     /// Loads `resource_type` for a non-default `version` from the shipped
@@ -563,21 +645,21 @@ impl ConformanceSource for HttpConformanceSource {
         &self,
         subjects: &[(String, String)],
         format: &str,
-        tenant: &str,
+        caller: &Caller,
     ) -> Result<String, String> {
-        self.export_start(subjects, format, tenant).await
+        self.export_start(subjects, format, caller).await
     }
 
-    async fn sql_export_status(&self, job_id: &str, tenant: &str) -> SqlExportStatus {
-        self.export_status(job_id, tenant).await
+    async fn sql_export_status(&self, job_id: &str, caller: &Caller) -> SqlExportStatus {
+        self.export_status(job_id, caller).await
     }
 
-    async fn sql_export_cancel(&self, job_id: &str, tenant: &str) -> Result<(), String> {
-        self.export_cancel(job_id, tenant).await
+    async fn sql_export_cancel(&self, job_id: &str, caller: &Caller) -> Result<(), String> {
+        self.export_cancel(job_id, caller).await
     }
 
-    async fn sql_export_manifest(&self, job_id: &str, tenant: &str) -> Result<Value, String> {
-        self.export_manifest(job_id, tenant).await
+    async fn sql_export_manifest(&self, job_id: &str, caller: &Caller) -> Result<Value, String> {
+        self.export_manifest(job_id, caller).await
     }
 }
 
@@ -586,7 +668,7 @@ impl HttpConformanceSource {
         &self,
         subjects: &[(String, String)],
         format: &str,
-        tenant: &str,
+        caller: &Caller,
     ) -> Result<String, String> {
         let mut params: Vec<Value> = vec![serde_json::json!({
             "name": "_format", "valueCode": format,
@@ -608,7 +690,7 @@ impl HttpConformanceSource {
             .header("Prefer", "respond-async")
             .json(&serde_json::json!({ "resourceType": "Parameters", "parameter": params }));
         let response = self
-            .authorized(request, tenant)
+            .authorized_for(request, caller)
             .await?
             .send()
             .await
@@ -640,32 +722,41 @@ impl HttpConformanceSource {
             .ok_or_else(|| "the 202 carried no job id in Content-Location".to_string())
     }
 
-    async fn export_status(&self, job_id: &str, tenant: &str) -> SqlExportStatus {
+    /// Polls a job's status. `202`/`303`/`404` map to `Running`/`Done`/
+    /// `Unknown` as before; every other outcome — a transport failure or any
+    /// other status (401/403/5xx…) — maps to `Unavailable` rather than being
+    /// folded into `Unknown`, so a rejected credential does not read as "the
+    /// server forgot this job" (#833).
+    async fn export_status(&self, job_id: &str, caller: &Caller) -> SqlExportStatus {
         let url = format!("{}/export/{job_id}/status", self.base_url);
-        let request = match self.authorized(self.client.get(&url), tenant).await {
+        let request = match self.authorized_for(self.client.get(&url), caller).await {
             Ok(r) => r,
-            Err(_) => return SqlExportStatus::Unknown,
+            Err(e) => return SqlExportStatus::Unavailable(e),
         };
         match request.send().await {
-            Ok(response) => match response.status().as_u16() {
-                202 => SqlExportStatus::Running(
-                    response
-                        .headers()
-                        .get("x-progress")
-                        .and_then(|v| v.to_str().ok())
-                        .map(String::from),
-                ),
-                303 => SqlExportStatus::Done,
-                _ => SqlExportStatus::Unknown,
-            },
-            Err(_) => SqlExportStatus::Unknown,
+            Ok(response) => {
+                let status = response.status();
+                match status.as_u16() {
+                    202 => SqlExportStatus::Running(
+                        response
+                            .headers()
+                            .get("x-progress")
+                            .and_then(|v| v.to_str().ok())
+                            .map(String::from),
+                    ),
+                    303 => SqlExportStatus::Done,
+                    404 => SqlExportStatus::Unknown,
+                    _ => SqlExportStatus::Unavailable(format!("status poll answered {status}")),
+                }
+            }
+            Err(e) => SqlExportStatus::Unavailable(format!("status poll request failed: {e}")),
         }
     }
 
-    async fn export_cancel(&self, job_id: &str, tenant: &str) -> Result<(), String> {
+    async fn export_cancel(&self, job_id: &str, caller: &Caller) -> Result<(), String> {
         let url = format!("{}/export/{job_id}/status", self.base_url);
         let response = self
-            .authorized(self.client.delete(&url), tenant)
+            .authorized_for(self.client.delete(&url), caller)
             .await?
             .send()
             .await
@@ -677,10 +768,10 @@ impl HttpConformanceSource {
         }
     }
 
-    async fn export_manifest(&self, job_id: &str, tenant: &str) -> Result<Value, String> {
+    async fn export_manifest(&self, job_id: &str, caller: &Caller) -> Result<Value, String> {
         let url = format!("{}/export/{job_id}/result", self.base_url);
         let response = self
-            .authorized(self.client.get(&url), tenant)
+            .authorized_for(self.client.get(&url), caller)
             .await?
             .send()
             .await
@@ -752,15 +843,36 @@ fn extract_bundle_resources(bundle: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// One `$sql-export` operation as [`StaticConformanceSource`] received it —
+/// which method, the [`Caller`] it was called with (#833), and — for
+/// `"start"` only — the `(output name, reference)` subjects submitted, so a
+/// test can assert on the output names a kick-off actually sent (#833
+/// gate-fix, FALLA 1) without standing up a real server. Empty for every
+/// other operation, which does not carry subjects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedExportCall {
+    /// `"start"`, `"status"`, `"cancel"`, or `"manifest"`.
+    pub operation: &'static str,
+    pub caller: Caller,
+    pub subjects: Vec<(String, String)>,
+}
+
 /// In-memory conformance source for tests: returns whatever resources it was
 /// seeded with, keyed by `(resource_type, version)`. Offline and deterministic.
+///
+/// `export_calls` is behind an `Arc<Mutex<_>>` so the log survives the clone
+/// that a test typically keeps for itself before moving the other clone into
+/// an `Arc<dyn ConformanceSource>` for the app under test (#833) — both see
+/// the same recorded calls.
 #[doc(hidden)]
+#[derive(Clone)]
 pub struct StaticConformanceSource {
     map: HashMap<(String, FhirVersion), Vec<Value>>,
     metadata: Option<Value>,
     sql_rows: Option<Result<Vec<Value>, String>>,
     export_status: SqlExportStatus,
     export_manifest: Option<Result<Value, String>>,
+    export_calls: Arc<Mutex<Vec<RecordedExportCall>>>,
 }
 
 impl StaticConformanceSource {
@@ -772,7 +884,37 @@ impl StaticConformanceSource {
             sql_rows: None,
             export_status: SqlExportStatus::Unknown,
             export_manifest: None,
+            export_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// The `$sql-export` calls this source has received so far, in call
+    /// order — for tests to assert on which [`Caller`] reached which
+    /// operation (#833).
+    pub fn export_calls(&self) -> Vec<RecordedExportCall> {
+        self.export_calls
+            .lock()
+            .expect("export_calls mutex is never held across a panic")
+            .clone()
+    }
+
+    /// Records one `$sql-export` call, shared across every clone of this
+    /// source (see the struct docs). `subjects` is only ever non-empty for
+    /// `"start"`.
+    fn record_export_call(
+        &self,
+        operation: &'static str,
+        caller: &Caller,
+        subjects: &[(String, String)],
+    ) {
+        self.export_calls
+            .lock()
+            .expect("export_calls mutex is never held across a panic")
+            .push(RecordedExportCall {
+                operation,
+                caller: caller.clone(),
+                subjects: subjects.to_vec(),
+            });
     }
 
     /// Seeds what `sql_export_status()` answers (#649).
@@ -870,22 +1012,26 @@ impl ConformanceSource for StaticConformanceSource {
 
     async fn sql_export_start(
         &self,
-        _subjects: &[(String, String)],
+        subjects: &[(String, String)],
         _format: &str,
-        _tenant: &str,
+        caller: &Caller,
     ) -> Result<String, String> {
+        self.record_export_call("start", caller, subjects);
         Ok("static-job".to_string())
     }
 
-    async fn sql_export_status(&self, _job_id: &str, _tenant: &str) -> SqlExportStatus {
+    async fn sql_export_status(&self, _job_id: &str, caller: &Caller) -> SqlExportStatus {
+        self.record_export_call("status", caller, &[]);
         self.export_status.clone()
     }
 
-    async fn sql_export_cancel(&self, _job_id: &str, _tenant: &str) -> Result<(), String> {
+    async fn sql_export_cancel(&self, _job_id: &str, caller: &Caller) -> Result<(), String> {
+        self.record_export_call("cancel", caller, &[]);
         Ok(())
     }
 
-    async fn sql_export_manifest(&self, _job_id: &str, _tenant: &str) -> Result<Value, String> {
+    async fn sql_export_manifest(&self, _job_id: &str, caller: &Caller) -> Result<Value, String> {
+        self.record_export_call("manifest", caller, &[]);
         self.export_manifest
             .clone()
             .unwrap_or_else(|| Err("no manifest seeded".to_string()))
@@ -1426,5 +1572,204 @@ mod tests {
             .await
             .expect_err("no such id");
         assert!(missing.contains("missing"), "{missing}");
+    }
+
+    /// #833: `Caller::from_request` copies the `Authorization` header
+    /// verbatim (case-insensitively, per `HeaderMap`) and never touches it
+    /// otherwise; a request with none yields `None`.
+    #[test]
+    fn caller_from_request_reads_authorization_verbatim() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("Authorization", "Bearer user-token".parse().unwrap());
+        let caller = Caller::from_request(&headers, "clinic-a");
+        assert_eq!(caller.tenant, "clinic-a");
+        assert_eq!(caller.authorization.as_deref(), Some("Bearer user-token"));
+
+        let none = Caller::from_request(&axum::http::HeaderMap::new(), "clinic-a");
+        assert_eq!(none.authorization, None);
+    }
+
+    /// #833: the one credentials rule every `$sql-export` self-call shares —
+    /// `caller.authorization` wins and is forwarded verbatim, even when the
+    /// outbound provider would supply a different (service) credential;
+    /// without one, the outbound provider is consulted as every other
+    /// self-call does. `X-Tenant-ID` follows the caller's tenant, omitted
+    /// when it is empty.
+    #[tokio::test]
+    async fn export_credentials_prefer_the_caller_over_the_outbound_provider() {
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+
+        async fn start(headers: HeaderMap) -> axum::response::Response {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>");
+            let tenant = headers
+                .get("x-tenant-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>");
+            // Echo what was received back as the job id, via Content-Location,
+            // so the test can assert on it through the public API rather than
+            // shared mutable state.
+            (
+                axum::http::StatusCode::ACCEPTED,
+                [(
+                    "content-location",
+                    format!("/export/{auth}::{tenant}/status"),
+                )],
+                "",
+            )
+                .into_response()
+        }
+
+        let app = axum::Router::new().route("/$sql-export", post(start));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::StaticBearerOutboundAuthProvider::new("service-token")),
+            FhirVersion::R4,
+            None,
+        );
+
+        // The caller's own bearer wins over the outbound provider.
+        let with_bearer = Caller {
+            tenant: "clinic-a".to_string(),
+            authorization: Some("Bearer user-token".to_string()),
+        };
+        let job = source
+            .sql_export_start(&[], "ndjson", &with_bearer)
+            .await
+            .expect("202 carries a job id");
+        assert_eq!(job, "Bearer user-token::clinic-a");
+
+        // No caller bearer: falls back to the outbound provider's credential.
+        let no_bearer = Caller {
+            tenant: "clinic-a".to_string(),
+            authorization: None,
+        };
+        let job = source
+            .sql_export_start(&[], "ndjson", &no_bearer)
+            .await
+            .expect("202 carries a job id");
+        assert_eq!(job, "Bearer service-token::clinic-a");
+
+        // An empty tenant omits X-Tenant-ID, same rule as every other
+        // self-call in this module.
+        let no_tenant = Caller {
+            tenant: String::new(),
+            authorization: Some("Bearer user-token".to_string()),
+        };
+        let job = source
+            .sql_export_start(&[], "ndjson", &no_tenant)
+            .await
+            .expect("202 carries a job id");
+        assert_eq!(job, "Bearer user-token::<none>");
+    }
+
+    /// #833: `export_status` maps every self-call outcome to the right
+    /// variant — `202`/`303`/`404` unchanged, and everything else (401, 500,
+    /// …) to `Unavailable` with a short cause naming the status, rather than
+    /// being folded into `Unknown` — a job the server still knows about must
+    /// not read as "the server forgot this job".
+    #[tokio::test]
+    async fn export_status_maps_every_http_outcome() {
+        use axum::extract::Path;
+        use axum::http::StatusCode as AxStatus;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+
+        async fn status(Path(id): Path<String>) -> axum::response::Response {
+            match id.as_str() {
+                "running" => (AxStatus::ACCEPTED, [("x-progress", "42")], "").into_response(),
+                "done" => AxStatus::SEE_OTHER.into_response(),
+                "gone" => AxStatus::NOT_FOUND.into_response(),
+                "denied" => AxStatus::UNAUTHORIZED.into_response(),
+                "broken" => AxStatus::INTERNAL_SERVER_ERROR.into_response(),
+                other => panic!("unexpected job id {other}"),
+            }
+        }
+
+        let app = axum::Router::new().route("/export/{id}/status", get(status));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+        let caller = Caller::default();
+
+        assert_eq!(
+            source.sql_export_status("running", &caller).await,
+            SqlExportStatus::Running(Some("42".to_string()))
+        );
+        assert_eq!(
+            source.sql_export_status("done", &caller).await,
+            SqlExportStatus::Done
+        );
+        assert_eq!(
+            source.sql_export_status("gone", &caller).await,
+            SqlExportStatus::Unknown
+        );
+        match source.sql_export_status("denied", &caller).await {
+            SqlExportStatus::Unavailable(message) => assert!(message.contains("401"), "{message}"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        match source.sql_export_status("broken", &caller).await {
+            SqlExportStatus::Unavailable(message) => assert!(message.contains("500"), "{message}"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// #833: a self-call that cannot even reach the server (connection
+    /// refused) also maps to `Unavailable`, never `Unknown` — the server has
+    /// said nothing about the job, so it must not read as "gone".
+    #[tokio::test]
+    async fn export_status_maps_a_transport_failure_to_unavailable() {
+        let source = HttpConformanceSource::new(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+        match source.sql_export_status("any", &Caller::default()).await {
+            SqlExportStatus::Unavailable(_) => {}
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// #833: [`StaticConformanceSource`] records every `$sql-export` call it
+    /// receives — which operation and which [`Caller`] — and the log is
+    /// shared across clones, so a test can keep one clone for itself while
+    /// handing another to the app under test.
+    #[tokio::test]
+    async fn static_source_records_export_calls_across_clones() {
+        let source = StaticConformanceSource::empty();
+        let recorder = source.clone();
+
+        let caller = Caller {
+            tenant: "clinic-a".to_string(),
+            authorization: Some("Bearer user-token".to_string()),
+        };
+        source
+            .sql_export_start(&[], "csv", &caller)
+            .await
+            .expect("static source always accepts a start");
+        let _ = source.sql_export_status("job-1", &caller).await;
+        let _ = source.sql_export_cancel("job-1", &caller).await;
+        let _ = source.sql_export_manifest("job-1", &caller).await;
+
+        let calls = recorder.export_calls();
+        let operations: Vec<&str> = calls.iter().map(|c| c.operation).collect();
+        assert_eq!(operations, vec!["start", "status", "cancel", "manifest"]);
+        assert!(calls.iter().all(|c| c.caller == caller));
     }
 }

@@ -1,0 +1,131 @@
+import { test, expect } from "../../pages/fixtures";
+import { createResources, deleteResources } from "../../pages/api";
+
+// This file runs in the `nojs` project (javaScriptEnabled: false): htmx,
+// sql-export.js, and every `data-*` handler are inert here — the Active SQL
+// Exports list (#833) has to work as plain `<a href>`/`<form>` fallbacks, and
+// a card's own `hx-trigger="every 5s"` poll never fires, so it only ever
+// catches up on a fresh reload.
+//
+// `evaluateAll` below is Playwright's own instrumentation, not a page
+// `<script>`: it keeps working with JavaScript "disabled" (the flag disables
+// the page's own script execution, not Playwright's), the same way
+// `tests/nojs/progressive-enhancement.spec.ts` already relies on it to read
+// the Bulk Export type grid's checked/disabled state in bulk.
+
+// A `$sql-export` job over a single tiny ViewDefinition finishes in well
+// under 100ms — before the redirect that lands on the list even renders —
+// so there is no reliable way to observe it in-progress, let alone catch it
+// with Cancel. Padding the job with this many trivial subjects (a single
+// self-search round trip apiece) buys a window measured in seconds, long
+// enough for a real interaction, without ever waiting on a fixed clock
+// (RNF3): every wait below still polls actual DOM/network state.
+const PADDING_SUBJECTS = 200;
+
+// Every padding `ViewDefinition` the test below seeds gets its id pushed
+// here, then deleted in this file's own `afterEach`. Left behind, a
+// `ViewDefinition` is a real, tenant-visible resource that
+// `/ui/sql/view-definitions` lists with no filter of its own — it becomes
+// that page's default selection on whatever run happens to follow this one
+// against the same shared server (see the chromium `sql-export.spec.ts` for
+// the full mechanism).
+let seededViewDefinitionIds: string[] = [];
+
+test.afterEach(async ({ request }) => {
+  const ids = seededViewDefinitionIds;
+  seededViewDefinitionIds = [];
+  await deleteResources(request, "ViewDefinition", ids);
+
+  // The jobs this test starts live in the per-user settings document under
+  // `byTenant.<tenant>.sqlExport.jobs` (crates/ui/src/sql_export.rs); the
+  // generic `/_user/settings` endpoint projects tenant-scoped keys flat for
+  // the caller's own tenant, so an RFC 7386 `{"sqlExport": null}`
+  // merge-patch — the same shape `theme.spec.ts` uses for `theme` — deletes
+  // this tenant's whole job store in one call (the cancelled job above is
+  // never removed from the list, so it would otherwise survive into
+  // whatever run follows this one against the same reused local dev
+  // server).
+  await request.patch("/_user/settings", {
+    headers: { "Content-Type": "application/json" },
+    data: { sqlExport: null },
+  });
+});
+
+test("SQL Export lifecycle works without JavaScript", async ({ page, request, sqlExport }) => {
+  // Two padded jobs, each needing its own genuinely observable in-progress
+  // window (see PADDING_SUBJECTS above).
+  test.setTimeout(120_000);
+
+  async function startPaddedExport(name: string): Promise<void> {
+    const ids = await createResources(
+      request,
+      Array.from({ length: PADDING_SUBJECTS }, (_, i) => ({
+        type: "ViewDefinition",
+        body: {
+          name: `${name}_${i}`,
+          status: "active",
+          resource: "Patient",
+          select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+        },
+      })),
+    );
+    seededViewDefinitionIds.push(...ids);
+
+    await sqlExport.gotoNew();
+    const checkboxes = ids
+      .map((id) => `input[name="subject"][value="ViewDefinition/${id}"]`)
+      .join(",");
+    await expect(page.locator(checkboxes)).toHaveCount(ids.length);
+    await page.locator(checkboxes).evaluateAll((inputs) => {
+      inputs.forEach((input) => {
+        (input as HTMLInputElement).checked = true;
+      });
+    });
+    await sqlExport.startButton.click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+  }
+
+  const cancelledName = `nojs_sql_export_cancel_${Date.now()}`;
+  await startPaddedExport(cancelledName);
+  let cancelledCard = sqlExport.card(cancelledName);
+  await expect(cancelledCard).toBeVisible();
+  await expect(cancelledCard.locator(".tag")).toHaveText("In progress");
+
+  // The overflow would hold nothing but the JS-only Copy job id button while
+  // in-progress, so the whole `<details>` starts (and, with no script to
+  // reveal it, stays) hidden — never a dead "…" control (RNF1 of ticket 03).
+  const overflow = cancelledCard.locator("details.menu");
+  await expect(overflow).toHaveCount(1);
+  await expect(overflow).toBeHidden();
+
+  // Cancel is a plain form and works without JavaScript.
+  await cancelledCard.getByRole("button", { name: "Cancel" }).click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+  cancelledCard = sqlExport.card(cancelledName);
+  await expect(cancelledCard.locator(".tag")).toHaveText("Cancelled");
+
+  const completedName = `nojs_sql_export_complete_${Date.now()}`;
+  await startPaddedExport(completedName);
+  let completedCard = sqlExport.card(completedName);
+  await expect(completedCard).toBeVisible();
+  await expect(completedCard.locator(".tag")).toHaveText("In progress");
+
+  // No htmx here: the card only catches up on a fresh GET of the list.
+  await expect
+    .poll(
+      async () => {
+        await page.reload();
+        completedCard = sqlExport.card(completedName);
+        return completedCard.locator(".tag").innerText();
+      },
+      { timeout: 30_000, intervals: [500, 1_000, 2_000] },
+    )
+    .toBe("Complete");
+
+  // Remove from list lives behind the overflow's native `<details>`
+  // disclosure — no JS needed to open it — and is itself a plain form.
+  await completedCard.locator("summary").click();
+  await completedCard.getByRole("button", { name: "Remove from list" }).click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+  await expect(sqlExport.card(completedName)).toHaveCount(0);
+});

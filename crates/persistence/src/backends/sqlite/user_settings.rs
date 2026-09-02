@@ -31,8 +31,16 @@ impl SqliteBackend {
         compute: impl FnOnce(Option<Value>) -> Value,
     ) -> StorageResult<StoredUserSettings> {
         let mut conn = self.get_connection()?;
+        // IMMEDIATE, not the DEFERRED default: this transaction reads the
+        // current row before it writes the new one. Under WAL a deferred
+        // transaction takes a read snapshot on that first read and then fails
+        // the read-to-write upgrade with SQLITE_BUSY_SNAPSHOT if another
+        // connection committed in between - the busy handler (and its
+        // configured busy_timeout) is never invoked for that failure. Taking
+        // the write lock up front avoids it, same reasoning as
+        // `purge_tenant_data`/`PurgableStorage::purge` in storage.rs.
         let txn = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| backend_err(format!("begin user_settings transaction: {e}")))?;
 
         let current: Option<(i64, Vec<u8>)> = txn
@@ -211,8 +219,11 @@ impl SettingsStore for SqliteBackend {
 
     async fn purge_tenant_settings(&self, tenant_id: &str) -> StorageResult<u64> {
         let mut conn = self.get_connection()?;
+        // IMMEDIATE for the same read-then-write/WAL reason as `write_settings`
+        // above: `purge_tenant_settings_in_txn` scans every row before it
+        // updates the ones it touches.
         let txn = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| backend_err(format!("begin user_settings purge: {e}")))?;
         let changed = Self::purge_tenant_settings_in_txn(&txn, tenant_id)?;
         txn.commit()

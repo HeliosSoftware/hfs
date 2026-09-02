@@ -26,6 +26,7 @@ export const ROUTES = [
   "/ui/sql/queries",
   "/ui/sql/views",
   "/ui/sql/export",
+  "/ui/sql/export/new",
   "/ui/sql/files",
 ];
 
