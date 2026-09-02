@@ -177,7 +177,12 @@ mod postgres_tests {
 
     async fn server() -> TestServer {
         let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+        // Pin the major version. testcontainers-modules defaults to
+        // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC the
+        // backend sends as a startup option, so PG 11 rejects every connection
+        // FATAL ("db error" from the pool). The rest of the repo runs 16.
         let container = Postgres::default()
+            .with_tag("16-alpine")
             .with_label("github.run_id", &run_id)
             .start()
             .await
