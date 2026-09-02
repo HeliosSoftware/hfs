@@ -40,6 +40,8 @@
 -#}
 {% extends "layouts/base.html" %}
 
+{% block content_class %} content--capability{% endblock %}
+
 {% block title %}{{ chrome.i18n.t("cap-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
 
 {% block content %}
