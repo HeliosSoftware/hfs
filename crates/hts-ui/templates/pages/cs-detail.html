@@ -241,6 +241,7 @@
           {% include "partials/hts-cs-lookup-input.html" %}
         {% when CsTab::Validate %}
           {% let summary = Some(summary.clone()) %}
+          {% let mode = self.mode() %}
           {% include "partials/hts-cs-validate-input.html" %}
         {% when CsTab::Subsumes %}
           {% let summary = Some(summary.clone()) %}

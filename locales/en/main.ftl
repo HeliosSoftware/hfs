@@ -1041,6 +1041,7 @@ hts-cs-validate-heading = Validate a code
 hts-cs-validate-mode-legend = Input mode
 hts-cs-validate-mode-code = Bare code
 hts-cs-validate-mode-coding = Coding
+hts-cs-validate-code-legend = Bare code
 hts-cs-validate-code = Code
 hts-cs-validate-display = Display
 hts-cs-validate-coding-legend = Coding
