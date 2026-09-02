@@ -100,6 +100,11 @@ fn urlencode(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
+/// The `$sql-run` preview's row cap, shared by the page's own `?run=1`
+/// render and the `/run` fragment endpoint (#752 ticket 01): a navigation or
+/// keystroke preview, never an export.
+pub(crate) const RUN_LIMIT: usize = 50;
+
 /// The view's output column names, in declaration order: a depth-first walk of
 /// `select[].column[].name` through nested `select` and `unionAll` branches.
 /// This is the authoritative column order — `_format=json` rows are objects,

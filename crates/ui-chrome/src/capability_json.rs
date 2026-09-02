@@ -1,19 +1,28 @@
-//! Bounded, incremental JSON rendering for the CapabilityStatement page.
+//! Bounded, incremental JSON rendering for the CapabilityStatement page
+//! (#808, generalized from HFS's original #798 work).
 //!
 //! CapabilityStatements are server-owned but can be tens of thousands of
-//! lines. Rendering one as a complete highlighted DOM is substantially more
-//! expensive than returning its JSON. This adapter keeps that exceptional
-//! case local to the CapabilityStatement page: small subtrees still use the
-//! shared JSON renderer, while large containers expose one bounded level at a
-//! time through validated JSON Pointer requests.
+//! lines — HTS's grows with every loaded code system, ~1,975
+//! `capabilitystatement-supported-system` extensions and 422 KB against the
+//! bundled seed set. Rendering one as a complete highlighted DOM is
+//! substantially more expensive than returning its JSON. This adapter keeps
+//! that exceptional case local to the CapabilityStatement page: small
+//! subtrees still use the shared JSON renderer ([`crate::json_view`]), while
+//! large containers expose one bounded level at a time through validated
+//! JSON Pointer requests.
+//!
+//! HFS and HTS mount the fragment endpoint at different paths and echo back
+//! different version codes, so every function here takes a
+//! [`FragmentEndpoint`] rather than hard-coding either.
 
+use crate::ChromeLabels;
 use crate::json_view;
-use helios_fhir::FhirVersion;
+use askama::Template;
 use serde_json::Value;
 
-pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
-pub(crate) const MAX_PAGE_SIZE: usize = 100;
-pub(crate) const MAX_FRAGMENT_HTML_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_PAGE_SIZE: usize = 100;
+pub const MAX_PAGE_SIZE: usize = 100;
+pub const MAX_FRAGMENT_HTML_BYTES: usize = 1024 * 1024;
 
 const MAX_POINTER_BYTES: usize = 1024;
 const MAX_POINTER_DEPTH: usize = 32;
@@ -22,48 +31,59 @@ const FULL_MAX_ESTIMATED_HTML_BYTES: usize = MAX_FRAGMENT_HTML_BYTES;
 const MAX_DISPLAY_KEY_CHARS: usize = 128;
 const MAX_DISPLAY_STRING_CHARS: usize = 256;
 
-pub(crate) enum View {
+/// Where the fragment endpoint lives and which release code to echo back on
+/// every paginated link — the two bits of context only the caller knows.
+/// HFS mounts at `/ui/capability-statement/json-fragment` and echoes a
+/// `FhirVersion`; HTS mounts at `/ui/hts/capability-statement/json-fragment`
+/// and echoes the release the binary was built for.
+#[derive(Clone, Copy)]
+pub struct FragmentEndpoint<'a> {
+    pub base_path: &'a str,
+    pub version: &'a str,
+}
+
+pub enum View {
     Full(Vec<json_view::JsonLine>),
     Outline(Outline),
 }
 
-pub(crate) struct Outline {
-    pub(crate) rows: Vec<Row>,
-    pub(crate) opening: &'static str,
-    pub(crate) closing: &'static str,
-    pub(crate) has_previous: bool,
-    pub(crate) previous_url: String,
-    pub(crate) has_next: bool,
-    pub(crate) next_url: String,
-    pub(crate) first_item: usize,
-    pub(crate) last_item: usize,
-    pub(crate) total_items: usize,
+pub struct Outline {
+    pub rows: Vec<Row>,
+    pub opening: &'static str,
+    pub closing: &'static str,
+    pub has_previous: bool,
+    pub previous_url: String,
+    pub has_next: bool,
+    pub next_url: String,
+    pub first_item: usize,
+    pub last_item: usize,
+    pub total_items: usize,
 }
 
-pub(crate) struct Row {
-    pub(crate) prefix: String,
-    pub(crate) tokens: Vec<json_view::Token>,
-    pub(crate) is_container: bool,
-    pub(crate) summary: String,
-    pub(crate) fragment_url: String,
-    pub(crate) expandable: bool,
-    pub(crate) truncated: bool,
-    pub(crate) comma: bool,
+pub struct Row {
+    pub prefix: String,
+    pub tokens: Vec<json_view::Token>,
+    pub is_container: bool,
+    pub summary: String,
+    pub fragment_url: String,
+    pub expandable: bool,
+    pub truncated: bool,
+    pub comma: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Error {
+pub enum Error {
     InvalidPointer,
     InvalidPage,
     NotFound,
 }
 
-pub(crate) fn plan(
+pub fn plan(
     document: &Value,
     pointer: &str,
     offset: usize,
     limit: usize,
-    version: FhirVersion,
+    endpoint: FragmentEndpoint,
 ) -> Result<View, Error> {
     validate_pointer(pointer)?;
     if limit == 0 || limit > MAX_PAGE_SIZE {
@@ -92,7 +112,7 @@ pub(crate) fn plan(
         return Ok(View::Full(lines));
     }
 
-    outline(value, pointer, offset, limit, version).map(View::Outline)
+    outline(value, pointer, offset, limit, endpoint).map(View::Outline)
 }
 
 fn outline(
@@ -100,7 +120,7 @@ fn outline(
     pointer: &str,
     offset: usize,
     limit: usize,
-    version: FhirVersion,
+    endpoint: FragmentEndpoint,
 ) -> Result<Outline, Error> {
     let total_items = container_len(value).ok_or(Error::InvalidPointer)?;
     if offset > total_items {
@@ -117,7 +137,7 @@ fn outline(
                     child,
                     child_pointer(pointer, key),
                     index + 1 < total_items,
-                    version,
+                    endpoint,
                 ));
             }
         }
@@ -128,7 +148,7 @@ fn outline(
                     child,
                     child_pointer(pointer, &index.to_string()),
                     index + 1 < total_items,
-                    version,
+                    endpoint,
                 ));
             }
         }
@@ -140,9 +160,9 @@ fn outline(
         opening: if value.is_object() { "{" } else { "[" },
         closing: if value.is_object() { "}" } else { "]" },
         has_previous: offset > 0,
-        previous_url: fragment_url(version, pointer, offset.saturating_sub(limit), limit),
+        previous_url: fragment_url(endpoint, pointer, offset.saturating_sub(limit), limit),
         has_next: end < total_items,
-        next_url: fragment_url(version, pointer, end, limit),
+        next_url: fragment_url(endpoint, pointer, end, limit),
         first_item: if total_items == 0 { 0 } else { offset + 1 },
         last_item: end,
         total_items,
@@ -154,7 +174,7 @@ fn row(
     value: &Value,
     pointer: Option<String>,
     comma: bool,
-    version: FhirVersion,
+    endpoint: FragmentEndpoint,
 ) -> Row {
     let (display_key, key_truncated) = key
         .map(|key| truncate(key, MAX_DISPLAY_KEY_CHARS))
@@ -175,7 +195,7 @@ fn row(
         let fragment_url = pointer
             .as_deref()
             .filter(|_| expandable)
-            .map(|pointer| fragment_url(version, pointer, 0, DEFAULT_PAGE_SIZE))
+            .map(|pointer| fragment_url(endpoint, pointer, 0, DEFAULT_PAGE_SIZE))
             .unwrap_or_default();
         return Row {
             prefix,
@@ -237,17 +257,17 @@ fn child_pointer(parent: &str, segment: &str) -> Option<String> {
     (pointer.len() <= MAX_POINTER_BYTES).then_some(pointer)
 }
 
-fn fragment_url(version: FhirVersion, pointer: &str, offset: usize, limit: usize) -> String {
+fn fragment_url(endpoint: FragmentEndpoint, pointer: &str, offset: usize, limit: usize) -> String {
     let mut query = form_urlencoded::Serializer::new(String::new());
-    query.append_pair("version", version.as_str());
+    query.append_pair("version", endpoint.version);
     query.append_pair("path", pointer);
     query.append_pair("offset", &offset.to_string());
     query.append_pair("limit", &limit.to_string());
-    format!("/ui/capability-statement/json-fragment?{}", query.finish())
+    format!("{}?{}", endpoint.base_path, query.finish())
 }
 
-pub(crate) fn root_fragment_url(version: FhirVersion) -> String {
-    fragment_url(version, "", 0, DEFAULT_PAGE_SIZE)
+pub fn root_fragment_url(endpoint: FragmentEndpoint) -> String {
+    fragment_url(endpoint, "", 0, DEFAULT_PAGE_SIZE)
 }
 
 fn validate_pointer(pointer: &str) -> Result<(), Error> {
@@ -291,10 +311,61 @@ fn json_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+// ── Fragment templates ──────────────────────────────────────────────────────
+
+/// A small CapabilityStatement (or subtree) rendered by the shared JSON
+/// highlighter.
+#[derive(Template)]
+#[template(path = "partials/capability-json-full.html")]
+struct FullFragmentTemplate<'a> {
+    i18n: &'a dyn ChromeLabels,
+    json_lines: Vec<json_view::JsonLine>,
+    json_view_id: &'a str,
+    /// Always false here: `plan()` calls `json_view::try_lines` with
+    /// `include_paths: false`, so every [`json_view::JsonLine::path`] this
+    /// template would key off is already empty.
+    json_view_paths: bool,
+}
+
+/// One bounded level of a large CapabilityStatement.
+#[derive(Template)]
+#[template(path = "partials/capability-json-outline.html")]
+struct OutlineFragmentTemplate<'a> {
+    i18n: &'a dyn ChromeLabels,
+    outline: &'a Outline,
+}
+
+/// Renders a [`View::Full`] payload. `is_root` selects the DOM id the page's
+/// own fold controls key off (`#capability-json`); a nested fragment gets no
+/// id of its own.
+pub fn render_full(
+    i18n: &dyn ChromeLabels,
+    json_lines: Vec<json_view::JsonLine>,
+    is_root: bool,
+) -> Result<String, askama::Error> {
+    FullFragmentTemplate {
+        i18n,
+        json_lines,
+        json_view_id: if is_root { "capability-json" } else { "" },
+        json_view_paths: false,
+    }
+    .render()
+}
+
+/// Renders a [`View::Outline`] page.
+pub fn render_outline(i18n: &dyn ChromeLabels, outline: &Outline) -> Result<String, askama::Error> {
+    OutlineFragmentTemplate { i18n, outline }.render()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const ENDPOINT: FragmentEndpoint<'static> = FragmentEndpoint {
+        base_path: "/ui/capability-statement/json-fragment",
+        version: "R4",
+    };
 
     fn expect_outline(view: View) -> Outline {
         match view {
@@ -312,43 +383,42 @@ mod tests {
 
     #[test]
     fn rejects_invalid_or_excessively_deep_pointers() {
-        let version = FhirVersion::default_enabled();
         assert_eq!(
-            plan(&json!({}), "not-a-pointer", 0, 10, version).err(),
+            plan(&json!({}), "not-a-pointer", 0, 10, ENDPOINT).err(),
             Some(Error::InvalidPointer)
         );
         assert_eq!(
-            plan(&json!({}), "/bad~2escape", 0, 10, version).err(),
+            plan(&json!({}), "/bad~2escape", 0, 10, ENDPOINT).err(),
             Some(Error::InvalidPointer)
         );
         let deep = format!("/{}", vec!["x"; MAX_POINTER_DEPTH + 1].join("/"));
         assert_eq!(
-            plan(&json!({}), &deep, 0, 10, version).err(),
+            plan(&json!({}), &deep, 0, 10, ENDPOINT).err(),
             Some(Error::InvalidPointer)
         );
         let overlong = format!("/{}", "x".repeat(MAX_POINTER_BYTES));
         assert_eq!(
-            plan(&json!({}), &overlong, 0, 10, version).err(),
+            plan(&json!({}), &overlong, 0, 10, ENDPOINT).err(),
             Some(Error::InvalidPointer)
         );
         assert_eq!(
-            plan(&json!(true), "", 1, 10, version).err(),
+            plan(&json!(true), "", 1, 10, ENDPOINT).err(),
             Some(Error::InvalidPointer)
         );
     }
 
     #[test]
     fn large_arrays_are_paged_and_keep_pointer_escaping() {
-        let version = FhirVersion::default_enabled();
         let document = json!({"a/b~c": (0..205).collect::<Vec<_>>()});
-        let first = expect_outline(plan(&document, "/a~1b~0c", 0, MAX_PAGE_SIZE, version).unwrap());
+        let first =
+            expect_outline(plan(&document, "/a~1b~0c", 0, MAX_PAGE_SIZE, ENDPOINT).unwrap());
         assert_eq!(first.rows.len(), 100);
         assert_eq!((first.first_item, first.last_item), (1, 100));
         assert!(first.has_next);
         assert!(first.next_url.contains("offset=100"));
 
         let last =
-            expect_outline(plan(&document, "/a~1b~0c", 200, MAX_PAGE_SIZE, version).unwrap());
+            expect_outline(plan(&document, "/a~1b~0c", 200, MAX_PAGE_SIZE, ENDPOINT).unwrap());
         assert_eq!(last.rows.len(), 5);
         assert_eq!((last.first_item, last.last_item), (201, 205));
         assert!(!last.has_next);
@@ -357,16 +427,7 @@ mod tests {
 
     #[test]
     fn small_values_keep_using_the_shared_renderer() {
-        let lines = expect_full(
-            plan(
-                &json!({"ok": true}),
-                "",
-                0,
-                100,
-                FhirVersion::default_enabled(),
-            )
-            .unwrap(),
-        );
+        let lines = expect_full(plan(&json!({"ok": true}), "", 0, 100, ENDPOINT).unwrap());
         assert!(
             lines
                 .iter()
@@ -376,13 +437,12 @@ mod tests {
 
     #[test]
     fn object_rows_and_long_scalars_expose_bounded_summaries() {
-        let version = FhirVersion::default_enabled();
         let object = row(
             Some("nested"),
             &json!({"value": true}),
             Some("/nested".to_string()),
             false,
-            version,
+            ENDPOINT,
         );
         assert_eq!(object.summary, "{ 1 }");
         assert!(object.expandable);
@@ -393,28 +453,25 @@ mod tests {
     #[test]
     #[should_panic(expected = "expected an outline")]
     fn outline_test_helper_rejects_full_views() {
-        let view = plan(
-            &json!({"ok": true}),
-            "",
-            0,
-            100,
-            FhirVersion::default_enabled(),
-        )
-        .unwrap();
+        let view = plan(&json!({"ok": true}), "", 0, 100, ENDPOINT).unwrap();
         expect_outline(view);
     }
 
     #[test]
     #[should_panic(expected = "expected the shared renderer")]
     fn full_test_helper_rejects_outlines() {
-        let view = plan(
-            &json!((0..101).collect::<Vec<_>>()),
-            "",
-            0,
-            100,
-            FhirVersion::default_enabled(),
-        )
-        .unwrap();
+        let view = plan(&json!((0..101).collect::<Vec<_>>()), "", 0, 100, ENDPOINT).unwrap();
         expect_full(view);
+    }
+
+    #[test]
+    fn fragment_urls_carry_the_callers_own_base_path_and_version() {
+        let hts_endpoint = FragmentEndpoint {
+            base_path: "/ui/hts/capability-statement/json-fragment",
+            version: "R4",
+        };
+        let url = root_fragment_url(hts_endpoint);
+        assert!(url.starts_with("/ui/hts/capability-statement/json-fragment?"));
+        assert!(url.contains("version=R4"));
     }
 }

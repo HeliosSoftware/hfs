@@ -376,6 +376,13 @@ impl<'a> DetailPageTemplate<'a> {
     fn summary(&self) -> Option<&CodeSystemSummary> {
         self.detail.as_ref().ok()
     }
+
+    /// Validate input-mode echo for the Validate-input partial (#804).
+    /// `None` workbench (first GET of the tab) falls back to the `code`
+    /// default via `ValidateInputMode::default()`.
+    fn mode(&self) -> ValidateInputMode {
+        self.workbench.as_ref().map(|w| w.mode).unwrap_or_default()
+    }
 }
 
 /// Base detail URL — permanent-redirects to the default operation tab
@@ -489,6 +496,10 @@ pub struct WorkbenchResultView {
     /// through a wrapper struct — the doc-comment cost is smaller.
     #[allow(dead_code)]
     pub op: CsTab,
+    /// The Validate input-mode the operator submitted. Echoed back so the
+    /// no-JS re-render keeps the same radio checked (#804); irrelevant to
+    /// the other two ops, which just carry the default.
+    pub mode: ValidateInputMode,
     /// What went over the wire, for the "Raw request and response" fold.
     pub raw: RawFold,
     pub lookup: Option<LookupResult>,
@@ -502,6 +513,7 @@ impl WorkbenchResultView {
     fn empty(op: CsTab) -> Self {
         Self {
             op,
+            mode: ValidateInputMode::default(),
             raw: RawFold::default(),
             lookup: None,
             validate: None,
@@ -601,6 +613,7 @@ async fn lookup_run(
         match result {
             Ok(result) => WorkbenchResultView {
                 op: CsTab::Lookup,
+                mode: ValidateInputMode::default(),
                 raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
                 lookup: Some(result),
                 validate: None,
@@ -633,6 +646,10 @@ async fn validate_run(
         coding_display: opt(&form, "coding.display"),
         display_language: opt(&form, "displayLanguage"),
     };
+    // `params` moves into `cs_validate_code` below; capture the submitted
+    // mode up front so every branch can echo it back into the re-rendered
+    // form (#804 — the no-JS path must keep the same radio checked).
+    let submitted_mode = params.mode;
     let chrome = Chrome {
         i18n: I18n::new(locale),
         active_page: "code-systems",
@@ -646,6 +663,7 @@ async fn validate_run(
     let canonical = cs.as_ref().map(|s| s.url.clone()).unwrap_or_default();
     let view = if canonical.is_empty() {
         WorkbenchResultView {
+            mode: submitted_mode,
             outcome: Some(OutcomeView::invalid_input(
                 "CodeSystem canonical url unavailable".to_string(),
             )),
@@ -653,6 +671,7 @@ async fn validate_run(
         }
     } else if matches!(params.mode, ValidateInputMode::Code) && params.code.trim().is_empty() {
         WorkbenchResultView {
+            mode: submitted_mode,
             outcome: Some(OutcomeView::invalid_input("code is required".to_string())),
             ..WorkbenchResultView::empty(CsTab::Validate)
         }
@@ -660,6 +679,7 @@ async fn validate_run(
         && (params.coding_code.trim().is_empty() || params.coding_system.trim().is_empty())
     {
         WorkbenchResultView {
+            mode: submitted_mode,
             outcome: Some(OutcomeView::invalid_input(
                 "coding.system and coding.code are required".to_string(),
             )),
@@ -669,6 +689,7 @@ async fn validate_run(
         match state.upstream.cs_validate_code(&canonical, params).await {
             Ok(result) => WorkbenchResultView {
                 op: CsTab::Validate,
+                mode: submitted_mode,
                 raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
                 lookup: None,
                 validate: Some(result),
@@ -676,7 +697,11 @@ async fn validate_run(
                 outcome: None,
                 degraded_reason: None,
             },
-            Err(err) => WorkbenchResultView::from_error(CsTab::Validate, &err),
+            Err(err) => {
+                let mut view = WorkbenchResultView::from_error(CsTab::Validate, &err);
+                view.mode = submitted_mode;
+                view
+            }
         }
     };
     respond_workbench(&state, chrome, id, CsTab::Validate, view, is_htmx).await
@@ -721,6 +746,7 @@ async fn subsumes_run(
         match state.upstream.cs_subsumes(&canonical, params).await {
             Ok(result) => WorkbenchResultView {
                 op: CsTab::Subsumes,
+                mode: ValidateInputMode::default(),
                 raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
                 lookup: None,
                 validate: None,

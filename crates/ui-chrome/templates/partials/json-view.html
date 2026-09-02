@@ -1,3 +1,11 @@
+{#
+  Renders a `Vec<json_view::JsonLine>` (crate::json_view). Byte-identical to
+  `crates/ui/templates/partials/json-view.html`, which HFS's Editor, Batch and
+  Resources pages still include directly — Askama resolves `{% include %}`
+  against the including crate's own `templates/` root, so this leaf partial
+  has to exist in both places even though the Rust engine behind it (#808)
+  does not. Keep the two in lockstep if `JsonLine`'s fields ever change.
+#}
 <div class="json-view"{% if !json_view_id.is_empty() %} id="{{ json_view_id }}"{% endif %}>
   {% for line in json_lines %}
   <div class="json-line{% if line.foldable %} json-line--foldable{% endif %}"

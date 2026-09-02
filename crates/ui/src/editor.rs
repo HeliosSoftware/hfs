@@ -134,11 +134,12 @@ pub struct EditorBody {
     pub document: String,
     /// Pretty JSON, for the raw-edit textarea.
     pub pretty: String,
-    /// The foldable, line-numbered JSON view shown beside the guided form,
-    /// pre-rendered by `helios-ui-chrome` (see [`render_json_view`]). Editor
-    /// hosts keep the legacy `json-view` id and the `data-jpath` metadata
-    /// editor-sync.js cross-highlights on.
-    pub json_view: String,
+    /// The foldable, line-numbered JSON view shown beside the guided form.
+    pub json_lines: Vec<crate::json_view::JsonLine>,
+    /// Shared JSON-view partial options. Editor hosts keep the legacy id and
+    /// path metadata used by editor-sync.js.
+    pub json_view_id: &'static str,
+    pub json_view_paths: bool,
     pub error_count: usize,
     /// Issues the validator reported against a path no row owns (an invariant
     /// on a backbone element, say). Surfaced rather than swallowed.
@@ -220,16 +221,15 @@ pub async fn render_body(
         Ok(value) => value,
         Err(error) => {
             // A malformed document is the source view's fault, and the user is
-            // mid-keystroke. Say what is wrong and keep their text. The JSON
-            // pane still renders — empty, but present, because editor-sync.js
-            // addresses it by id.
-            let json_view = crate::json_view_fragment(&i18n, &[], "json-view", true);
+            // mid-keystroke. Say what is wrong and keep their text.
             return render(EditorBody {
                 i18n,
                 rows: Vec::new(),
                 document: form.doc.clone(),
                 pretty: form.doc,
-                json_view,
+                json_lines: Vec::new(),
+                json_view_id: "json-view",
+                json_view_paths: true,
                 error_count: 0,
                 orphan_errors: Vec::new(),
                 parse_error: Some(error.to_string()),
@@ -406,18 +406,13 @@ fn build_body(
         .map(|o| o.keys().all(|k| k == "resourceType"))
         .unwrap_or(false);
 
-    let json_view = crate::json_view_fragment(
-        &i18n,
-        &crate::json_view::lines(&document),
-        "json-view",
-        true,
-    );
-
     EditorBody {
         i18n,
         document: serde_json::to_string(&document).unwrap_or_default(),
         pretty: serde_json::to_string_pretty(&document).unwrap_or_default(),
-        json_view,
+        json_lines: crate::json_view::lines(&document),
+        json_view_id: "json-view",
+        json_view_paths: true,
         error_count: errors.len(),
         orphan_errors,
         rows,

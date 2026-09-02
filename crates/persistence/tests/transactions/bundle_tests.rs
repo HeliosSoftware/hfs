@@ -10,13 +10,51 @@ use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider, Resour
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
 #[cfg(feature = "sqlite")]
-use helios_persistence::backends::sqlite::SqliteBackend;
+use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 
 #[cfg(feature = "sqlite")]
 fn create_sqlite_backend() -> SqliteBackend {
     let backend = SqliteBackend::in_memory().expect("Failed to create SQLite backend");
     backend.init_schema().expect("Failed to initialize schema");
     backend
+}
+
+/// An in-memory backend that also loads the spec `SearchParameter`s from the
+/// workspace `data/` directory. `in_memory()` indexes only the embedded minimal
+/// set, which does not include `identifier`, so conditional criteria on it
+/// would silently match nothing.
+#[cfg(feature = "sqlite")]
+fn create_sqlite_backend_with_spec_params() -> SqliteBackend {
+    let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))
+        .expect("workspace root");
+    let config = SqliteBackendConfig {
+        data_dir: Some(data_dir),
+        ..Default::default()
+    };
+    let backend =
+        SqliteBackend::with_config(":memory:", config).expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to initialize schema");
+    backend
+}
+
+#[cfg(feature = "sqlite")]
+fn if_none_exist_entry(family: &str, full_url: &str) -> BundleEntry {
+    BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://example.org", "value": "12345"}],
+            "name": [{"family": family}]
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("identifier=http://example.org|12345".to_string()),
+        full_url: Some(full_url.to_string()),
+    }
 }
 
 fn create_tenant() -> TenantContext {
@@ -348,64 +386,218 @@ async fn test_bundle_internal_references() {
 
 /// Test bundle with conditional create (if-none-exist).
 ///
-/// Ported to the current bundle API for structure, but `#[ignore]`d: the
-/// transaction bundle path does not implement `if-none-exist` conditional
-/// creates — a POST always creates a new resource — so the "should not create
-/// a duplicate" assertions do not hold. Preserved for the #306 follow-up.
+/// The transaction executor resolves `ifNoneExist` on the transaction's own
+/// connection (#511); before that a POST always created, and this test was
+/// `#[ignore]`d for the #306 follow-up.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-#[ignore = "#306 follow-up: if-none-exist conditional create not implemented in transaction bundle API"]
 async fn test_bundle_conditional_create() {
-    let backend = create_sqlite_backend();
+    let backend = create_sqlite_backend_with_spec_params();
     let tenant = create_tenant();
 
     // First bundle - should create
-    let bundle1 = vec![BundleEntry {
-        method: BundleMethod::Post,
-        url: "Patient".to_string(),
-        resource: Some(json!({
-            "resourceType": "Patient",
-            "identifier": [{"system": "http://example.org", "value": "12345"}],
-            "name": [{"family": "Conditional"}]
-        })),
-        if_match: None,
-        if_none_match: None,
-        if_none_exist: Some("identifier=http://example.org|12345".to_string()),
-        full_url: Some("urn:uuid:conditional".to_string()),
-    }];
-
     let result1 = backend
-        .process_transaction(&tenant, bundle1, FhirVersion::default())
+        .process_transaction(
+            &tenant,
+            vec![if_none_exist_entry("Conditional", "urn:uuid:conditional")],
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
     assert_eq!(result1.entries[0].status, 201);
 
     // Second bundle with same condition - should return existing
-    let bundle2 = vec![BundleEntry {
-        method: BundleMethod::Post,
-        url: "Patient".to_string(),
-        resource: Some(json!({
-            "resourceType": "Patient",
-            "identifier": [{"system": "http://example.org", "value": "12345"}],
-            "name": [{"family": "ShouldNotCreate"}]
-        })),
-        if_match: None,
-        if_none_match: None,
-        if_none_exist: Some("identifier=http://example.org|12345".to_string()),
-        full_url: Some("urn:uuid:conditional".to_string()),
-    }];
-
     let result2 = backend
-        .process_transaction(&tenant, bundle2, FhirVersion::default())
+        .process_transaction(
+            &tenant,
+            vec![if_none_exist_entry(
+                "ShouldNotCreate",
+                "urn:uuid:conditional",
+            )],
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
-    // Should not create duplicate
-    assert_ne!(result2.entries[0].status, 201);
+    assert_eq!(
+        result2.entries[0].status, 200,
+        "the match is answered, not duplicated"
+    );
+    assert_eq!(
+        result2.entries[0].location, result1.entries[0].location,
+        "the 200 entry must name the resource the 201 entry created"
+    );
+    let echoed = result2.entries[0].resource.as_ref().expect("match echoed");
+    assert_eq!(echoed["name"][0]["family"], "Conditional");
 
     // Only one patient should exist
     let count = backend.count(&tenant, Some("Patient")).await.unwrap();
     assert_eq!(count, 1);
+}
+
+/// A `urn:uuid` reference to a matched `ifNoneExist` entry resolves to the
+/// match (R4 §3.1.0.11.2), which needs the 200 entry's `location`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_if_none_exist_match_resolves_urn_references() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+
+    let existing = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org", "value": "12345"}],
+                "name": [{"family": "AlreadyThere"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let entries = vec![
+        if_none_exist_entry("Duplicate", "urn:uuid:patient"),
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".to_string(),
+            resource: Some(json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "code": {"text": "test"},
+                "subject": {"reference": "urn:uuid:patient"}
+            })),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: Some("urn:uuid:observation".to_string()),
+        },
+    ];
+
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[1].status, 201);
+    let observation = result.entries[1].resource.as_ref().expect("created");
+    assert_eq!(
+        observation["subject"]["reference"],
+        json!(format!("Patient/{}", existing.id()))
+    );
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+}
+
+/// Criteria that match several resources fail the entry with 412 and roll the
+/// whole bundle back, including entries that already succeeded.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_if_none_exist_multiple_matches_rolls_back() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+
+    for family in ["One", "Two"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "identifier": [{"system": "http://example.org", "value": "12345"}],
+                    "name": [{"family": family}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let entries = vec![
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({"resourceType": "Patient", "name": [{"family": "Plain"}]})),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+        },
+        if_none_exist_entry("Ambiguous", "urn:uuid:ambiguous"),
+    ];
+
+    let err = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .expect_err("an ambiguous ifNoneExist must fail the bundle");
+    match err {
+        helios_persistence::error::TransactionError::BundleError { index, message } => {
+            assert_eq!(index, 1);
+            assert!(message.contains("412"), "{message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        2,
+        "the plain create in entry 0 must have been rolled back"
+    );
+}
+
+/// Two entries with the same criteria in one bundle: the second sees the row
+/// the first wrote, because the search runs on the transaction's connection.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_if_none_exist_same_criteria_twice_in_one_bundle() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![
+                if_none_exist_entry("First", "urn:uuid:first"),
+                if_none_exist_entry("Second", "urn:uuid:second"),
+            ],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(result.entries[1].status, 200);
+    assert_eq!(result.entries[1].location, result.entries[0].location);
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+}
+
+/// With search offloaded to a secondary backend the local index is empty, so
+/// the executor refuses the entry rather than creating the duplicate an
+/// always-empty match set would allow.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_if_none_exist_is_refused_when_search_is_offloaded() {
+    let mut backend = create_sqlite_backend_with_spec_params();
+    backend.set_search_offloaded(true);
+    let tenant = create_tenant();
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![if_none_exist_entry("Offloaded", "urn:uuid:offloaded")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("ifNoneExist must be refused, not silently ignored");
+    match err {
+        helios_persistence::error::TransactionError::BundleError { index, message } => {
+            assert_eq!(index, 0);
+            assert!(message.contains("501"), "{message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
 }
 
 /// Test bundle with conditional update (if-match).

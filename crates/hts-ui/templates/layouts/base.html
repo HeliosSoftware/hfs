@@ -146,5 +146,14 @@
       {% block content %}{% endblock %}
     </main>
   </div>
+  {#-
+    Fold-arrow wiring for the shared JSON tree partial
+    (`crates/ui-chrome/templates/partials/json-view.html`). Loaded
+    unconditionally and last, exactly where HFS puts it in its own
+    `crates/ui/templates/layouts/base.html` — the fragments htmx swaps in
+    arrive after page load, and the script binds by delegation, so a global
+    include is both correct and the parity-preserving placement.
+  -#}
+  <script src="/ui/hts/assets/json-view.js" defer></script>
 </body>
 </html>

@@ -1,23 +1,26 @@
-//! A foldable, line-numbered, syntax-highlighted JSON view (#264).
+//! A foldable, line-numbered, syntax-highlighted JSON view (#264, #808).
 //!
-//! Brett's Resource Editor shows the JSON and the guided form side by side, and
-//! the JSON is a real code view — line numbers down the gutter and a fold arrow
-//! on every object and array so a big resource collapses to its shape. A
-//! `<textarea>` cannot do that, so the view is rendered here, server-side, into
-//! [`JsonLine`]s the template lays out and a few lines of JS fold.
+//! HFS's Resource Editor shows the JSON and the guided form side by side, and
+//! the JSON is a real code view — line numbers down the gutter and a fold
+//! arrow on every object and array so a big resource collapses to its shape.
+//! A `<textarea>` cannot do that, so the view is rendered here, server-side,
+//! into [`JsonLine`]s the template lays out and a few lines of JS fold.
 //!
 //! The document is walked directly rather than pretty-printed and re-parsed:
 //! that way each container knows its own line, its closing line, and its
 //! ancestry, which is exactly what folding needs.
 //!
-//! # Why it lives in this crate
+//! This engine moved here from `crates/ui` for [`crate::capability_json`]
+//! (#808): the Raw CapabilityStatement fold is the same bounded JSON view
+//! HFS already built for the editor, and HTS needed it too rather than a
+//! second, byte-capped `<pre>`. HFS's editor, Resources and Batch pages keep
+//! their own template that renders a [`JsonLine`] vector inline — only the
+//! engine and its data types are shared.
 //!
-//! It was `crates/ui`'s private module until #803, where the HTS workbench's
-//! "Raw request and response" fold needed the same viewer and could only reach
-//! it by depending on the whole HFS UI crate or forking the tokenizer. Both
-//! products render the same markup through [`render`], and the browser-side
-//! folding is `crates/ui/assets/json-view.js`, which HTS already serves from
-//! the shared asset embed.
+//! The HTS workbench's "Raw request and response" fold (#803) renders the
+//! same markup through [`render`], and the browser-side folding is
+//! `crates/ui/assets/json-view.js`, which HTS already serves from the shared
+//! asset embed.
 
 use crate::ChromeLabels;
 use askama::Template;

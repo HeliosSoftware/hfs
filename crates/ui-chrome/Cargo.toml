@@ -24,7 +24,18 @@ keywords = ["helios-software", "hl7", "fhir", "helios-fhir-server", "askama"]
 # own askama version in lockstep with ours.
 askama = "0.16"
 
-# The JSON viewer walks a `serde_json::Value` directly rather than
-# pretty-printing and re-parsing it, so each container knows its own opening
-# line, its closing line, and its ancestry — which is what folding needs.
+# The Capability Statement projection (#808) reads the raw statement JSON.
+# Both products already hand it around as a `serde_json::Value`, so the shared
+# parser takes one rather than inventing a typed model neither crate has.
 serde_json = "1"
+
+# `safe_canonical_href` parses advertised canonicals before turning any of
+# them into an `href`. `url` directly, not `reqwest::Url`: this crate has no
+# business pulling an HTTP client in to validate a scheme, and `url` is
+# already in the workspace lock as reqwest's own dependency.
+url = "2"
+
+# `capability_json`'s paginated fragment links (#808) build a `version=` /
+# `path=` / `offset=` / `limit=` query string. Already in the workspace lock
+# as a transitive dependency of both host crates.
+form_urlencoded = "1"

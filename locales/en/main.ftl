@@ -610,6 +610,7 @@ bulk-import-detail-created = Created
 bulk-import-detail-status = Status
 bulk-import-detail-auth = Authentication
 bulk-import-abort = Abort
+bulk-import-mark-completed = Mark completed
 bulk-import-delete = Delete
 bulk-import-edit = Edit
 bulk-import-edit-title = Edit Submission
@@ -696,16 +697,16 @@ bulk-export-scope-group-hint = Just the members of a cohort you've already defin
 bulk-export-field-group-id = Group ID
 bulk-export-field-group-id-hint = Required for the Group scope: the id of the FHIR Group to export.
 bulk-export-field-patients = Patients
-bulk-export-field-patients-placeholder = Search name, surname, or exact FHIR ID
-bulk-export-field-patients-hint = Search by the beginning of a given name or family name, or enter an exact logical FHIR ID such as Patient/p-104. Leave empty to export every patient.
-bulk-export-field-patients-fallback-placeholder = Patient/p-104, Patient/p-205
+bulk-export-field-patients-placeholder = Search patients
+bulk-export-field-patients-hint = Search by name, surname or exact identifier. Leave empty to export every patient.
+bulk-export-field-patients-fallback-placeholder = Patient FHIR IDs
 bulk-export-field-patients-fallback-hint = Enter exact logical FHIR IDs separated by commas or new lines. Leave empty to export every patient.
-bulk-export-field-patients-id-only-hint = Search by exact logical FHIR ID, such as Patient/p-104. Leave empty to export every patient.
-bulk-export-field-patients-id-only-placeholder = Search exact FHIR ID
+bulk-export-field-patients-id-only-hint = Search by exact FHIR ID. Leave empty to export every patient.
 bulk-export-patient-options-empty = No matching patients found.
 bulk-export-patient-invalid = Enter only valid logical Patient IDs, separated by commas or new lines.
 bulk-export-field-name = Name
 bulk-export-field-name-placeholder = Diabetes registry 2024
+bulk-export-name-required = Enter a name for this export.
 bulk-export-types = Resource types
 bulk-export-all-resources = All Resources
 bulk-export-narrow = Narrow it down
@@ -718,7 +719,7 @@ bulk-export-since-week = Last 7 days
 bulk-export-since-month = Last 4 weeks
 bulk-export-since-custom = Custom
 bulk-export-field-since-custom = Custom instant
-bulk-export-field-since-custom-hint = Used when Since is Custom. RFC 3339, e.g. 2026-08-01T00:00:00Z.
+bulk-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
 bulk-export-start = Start Export
 bulk-export-running = running
 bulk-export-clear = Clear
@@ -820,8 +821,15 @@ vd-delete = Delete
 vd-delete-confirm = Delete view definition "{ $name }"? This cannot be undone.
 vd-delete-failed = Could not delete the view definition.
 vd-json-heading = Definition (JSON)
+vd-run-hint = Runs as you type — results follow the current definition, saved or not
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
+# #752 ticket 01: the $sql-run preview's row/duration meta, shared by the
+# page's own render and the `/run` fragment endpoint.
+vd-results-meta = { $rows } rows · { $ms } ms
+# #752 ticket 01: the results meta after a failed run — the previous table
+# stays on screen, relabelled.
+vd-results-stale = last successful run
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next
@@ -1033,6 +1041,7 @@ hts-cs-validate-heading = Validate a code
 hts-cs-validate-mode-legend = Input mode
 hts-cs-validate-mode-code = Bare code
 hts-cs-validate-mode-coding = Coding
+hts-cs-validate-code-legend = Bare code
 hts-cs-validate-code = Code
 hts-cs-validate-display = Display
 hts-cs-validate-coding-legend = Coding
@@ -1474,8 +1483,6 @@ hts-capability-closure = Closure maintenance
 hts-capability-code-systems-declared = Code systems declared
 hts-capability-flag-true = Yes
 hts-capability-flag-false = No
-hts-capability-raw-truncated = Truncated to the first { $shown } of { $total } bytes — this server's statement grows with the code systems it loads.
-hts-capability-raw-full = View the complete statement
 
 # Home V3 tile sub-lines. The mockup folds Backend, FHIR version,
 # Bundled data and Avg latency into the sub-line of the tile each

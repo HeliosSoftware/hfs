@@ -67,13 +67,22 @@ fn renders_without_a_trailing_newline() {
 /// The id is what `capability-json.js` and `editor-sync.js` address the view
 /// by; a host with nothing to find must not emit an empty `id=""` on the
 /// container. (Per-line `data-fold-id` is unrelated and always present.)
+///
+/// The partial opens with an askama comment explaining why it exists in two
+/// crates, and askama keeps the newline after `#}`, so the fragment starts
+/// with a line break before the container.
 #[test]
 fn the_id_attribute_is_emitted_only_when_asked_for() {
     assert!(
         render(json!({ "a": 1 }), "json-view", false)
+            .trim_start()
             .starts_with(r#"<div class="json-view" id="json-view">"#)
     );
-    assert!(render(json!({ "a": 1 }), "", false).starts_with(r#"<div class="json-view">"#));
+    assert!(
+        render(json!({ "a": 1 }), "", false)
+            .trim_start()
+            .starts_with(r#"<div class="json-view">"#)
+    );
 }
 
 /// `data-jpath` is the Resource Editor's cross-highlight hook. Every other
