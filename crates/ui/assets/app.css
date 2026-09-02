@@ -45,8 +45,7 @@
 @layer pages {
 /* CapabilityStatement-only presentation: keep the backend note subordinate to
    its interaction tags, and let the resource filter fit a phone-width card. */
-.cap-transaction-note {
-  margin: 8px 0 0 16px;
+.content--capability .cap-transaction-note {
   padding-left: 10px;
   border-left: 2px solid var(--surface-border);
   color: var(--muted);
@@ -325,6 +324,9 @@ svg {
 
 @layer components {
 /* ---------- Sidebar ---------- */
+.content--capability .card__body p {
+  margin: 0;
+}
 
 .sidebar {
   position: fixed;
@@ -873,6 +875,12 @@ button.menu__option {
   padding: 14px;
 }
 
+.content--capability .card__body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 /* An empty-state pane: breathing room between the lede and its call to
    action (the lede's own margin is 0 for the page head, where the section
    gap already separates it). */
@@ -1346,6 +1354,10 @@ button.pill {
 
 .table-card {
   padding: 20px;
+}
+
+.content--capability .table-card {
+  padding: 0;
 }
 
 .toolbar {
@@ -2957,6 +2969,10 @@ details.json-fold[open] > summary .icon {
   overflow-x: auto;
 }
 
+.content--capability .table-wrap {
+  padding-inline: 20px;
+}
+
 .data-table {
   width: 100%;
   border-collapse: collapse;
@@ -3070,6 +3086,23 @@ details.json-fold[open] > summary .icon {
   font-weight: 600;
 }
 
+.content--capability .tag {
+  margin-inline: 0 8px;
+}
+
+.content--capability {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.content--capability > .page-head {
+  margin-bottom: 0px;
+}
+
+.content--capability > .card ~ .card {
+  margin-top: 0px;
+}
 .tag--type {
   background: var(--accent-soft);
   color: var(--text);
@@ -4372,6 +4405,12 @@ details.json-fold[open] > summary .icon {
 .card-head__tools {
   display: flex;
   gap: 6px;
+}
+
+.card-head__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .editor-json__act {

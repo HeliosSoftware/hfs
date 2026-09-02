@@ -61,13 +61,8 @@
     if (body) reset(body, false);
   }
 
-  function closeOtherBranches(details) {
-    var root = details.closest("#capability-json-fold");
-    if (!root || details === root) return;
-    root.querySelectorAll("details[data-capability-json-node][open]").forEach(function (open) {
-      if (open === details || open === root || open.contains(details)) return;
-      collapse(open);
-    });
+  function rootFor(details) {
+    return details.closest("#capability-json-fold");
   }
 
   function triggerLoad(body) {
@@ -92,6 +87,39 @@
     }
   }
 
+  function expandNext(root) {
+    if (!root || root.dataset.capabilityJsonExpandAll !== "true") return;
+    var nodes = root.querySelectorAll("details[data-capability-json-node]");
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      if (node.open) continue;
+      node.open = true;
+      var body = bodyFor(node);
+      if (body) {
+        triggerLoad(body);
+        return;
+      }
+    }
+  }
+
+  function setAll(details, expand) {
+    var root = rootFor(details);
+    if (!root) return;
+    root.dataset.capabilityJsonExpandAll = expand ? "true" : "false";
+    if (expand) {
+      root.open = true;
+      var rootBody = bodyFor(root);
+      if (rootBody) {
+        triggerLoad(rootBody);
+        expandNext(root);
+      }
+      return;
+    }
+    root.querySelectorAll("details[data-capability-json-node]").forEach(function (node) {
+      collapse(node);
+    });
+  }
+
   document.addEventListener(
     "toggle",
     function (event) {
@@ -101,16 +129,26 @@
       if (!body) return;
 
       if (details.open) {
-        closeOtherBranches(details);
         triggerLoad(body);
       } else {
         // Removing the swapped subtree is the DOM budget: reopening issues a
         // fresh, bounded request rather than retaining descendants invisibly.
+        if (details === rootFor(details)) details.dataset.capabilityJsonExpandAll = "false";
         reset(body, false);
       }
     },
     true,
   );
+
+  document.addEventListener("click", function (event) {
+    var control = event.target.closest && event.target.closest("[data-capability-json-fold]");
+    if (!control) return;
+    event.preventDefault();
+    event.stopPropagation();
+    var details = control.closest("#capability-json-fold");
+    if (!details) return;
+    setAll(details, control.dataset.capabilityJsonFold === "none");
+  });
 
   document.addEventListener("htmx:beforeRequest", function (event) {
     var target = event.detail && event.detail.target;
@@ -152,6 +190,7 @@
       var control = preferred || fallback;
       if (control) control.focus({ preventScroll: true });
     }
+    expandNext(rootFor(target));
   });
 
   document.addEventListener("htmx:afterRequest", function (event) {
@@ -162,6 +201,8 @@
     if (!(status >= 200 && status < 400)) {
       var details = target.closest("details[data-capability-json-node]");
       reset(target, !!(details && details.open));
+      var root = rootFor(target);
+      if (root) root.dataset.capabilityJsonExpandAll = "false";
     }
   });
 })();

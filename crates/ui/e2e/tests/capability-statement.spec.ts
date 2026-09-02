@@ -97,9 +97,19 @@ test("Capability Statement JSON expands in bounded reloadable fragments", async 
 
   await expect(capabilityStatement.jsonOutline).toBeVisible();
   await expect(capabilityStatement.jsonOutline).toHaveAttribute("data-item-count", /\d+/);
+  await expect(capabilityStatement.collapseAllJson).toBeVisible();
+  await expect(capabilityStatement.expandAllJson).toBeVisible();
+  await expect(capabilityStatement.rawDisclosure).toHaveAttribute("open", "");
+  await expect(capabilityStatement.rawBody).toHaveAttribute("tabindex", "0");
 
   const format = capabilityStatement.jsonNode(capabilityStatement.jsonOutline, "format");
   const formatBody = capabilityStatement.nodeBody(format);
+  await capabilityStatement.expandAllJson.click();
+  await expect(format).toHaveAttribute("open", "");
+  await expect(formatBody.locator("[data-capability-json-page], .json-view").first()).toBeVisible();
+  await capabilityStatement.collapseAllJson.click();
+  await expect(format).not.toHaveAttribute("open", "");
+  await expect(capabilityStatement.rawDisclosure).toHaveAttribute("open", "");
   await format.locator(":scope > summary").click();
   await expect(formatBody.locator("[data-capability-json-page], .json-view").first()).toBeVisible();
   await expect(capabilityStatement.rawBody).toHaveCSS("overflow-y", "auto");
@@ -109,10 +119,9 @@ test("Capability Statement JSON expands in bounded reloadable fragments", async 
   const rest = capabilityStatement.jsonNode(capabilityStatement.jsonOutline, "rest");
   const restBody = capabilityStatement.nodeBody(rest);
   // An in-flight request is aborted and its busy state cleared when the node
-  // closes. Opening this sibling also closes and unloads the format branch.
+  // closes. Opening this sibling leaves the format branch available.
   await rest.locator(":scope > summary").click();
-  await expect(format).not.toHaveAttribute("open", "");
-  await expect(formatBody.locator("[data-capability-json-page], .json-view")).toHaveCount(0);
+  await expect(format).toHaveAttribute("open", "");
   await expect(restBody).toHaveAttribute("aria-busy", "true");
   await rest.locator(":scope > summary").click();
   await expect(restBody).not.toHaveAttribute("aria-busy", "true");
@@ -171,6 +180,12 @@ test("Capability Statement JSON expands in bounded reloadable fragments", async 
     "data-item-count",
     "100",
   );
+  await expect
+    .poll(() => capabilityStatement.rawBody.evaluate((body) => body.scrollHeight > body.clientHeight))
+    .toBe(true);
+  await capabilityStatement.rawBody.focus();
+  await capabilityStatement.rawBody.press("PageDown");
+  await expect.poll(() => capabilityStatement.rawBody.evaluate((body) => body.scrollTop)).toBeGreaterThan(0);
   const next = capabilityStatement.pageControl(resourceBody, "next");
   await expect(next).toBeEnabled();
   await next.click();
@@ -191,6 +206,11 @@ test("Capability Statement JSON expands in bounded reloadable fragments", async 
   expect(secondPageCount).toBeLessThanOrEqual(100);
   expect(fragmentRequests.get("/rest/0/resource")).toBe(2);
 
+  await capabilityStatement.collapseAllJson.click();
+  await expect(format).not.toHaveAttribute("open", "");
+  await expect(rest).not.toHaveAttribute("open", "");
+  await expect(capabilityStatement.rawDisclosure).toHaveAttribute("open", "");
+
   // Closing the top-level disclosure unloads the entire incremental tree.
   await capabilityStatement.rawSummary.click();
   await expect(capabilityStatement.rawDisclosure).not.toHaveAttribute("open", "");
@@ -200,7 +220,6 @@ test("Capability Statement JSON expands in bounded reloadable fragments", async 
   await expect(capabilityStatement.jsonOutline).toBeVisible();
   expect(fragmentRequests.get("")).toBe(2);
 });
-
 test("typing filters resource capabilities live", async ({ capabilityStatement }) => {
   await capabilityStatement.goto();
   await expect(capabilityStatement.resourceRow("Patient")).toBeVisible();

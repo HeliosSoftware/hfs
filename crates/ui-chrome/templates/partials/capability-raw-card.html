@@ -24,9 +24,16 @@
 <details class="card json-fold" id="capability-json-fold"{% if raw_requested %} open{% else %} data-capability-json-node{% endif %}>
   <summary class="card-head">
     <h3>{{ i18n.t("cap-raw-toggle") }}</h3>
-    <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+    <div class="card-head__actions">
+      <div class="card-head__tools">
+        <button type="button" class="editor-json__act" data-capability-json-fold="all" title="{{ i18n.t("editor-collapse-all") }}">{{ i18n.t("editor-collapse-all") }}</button>
+        <button type="button" class="editor-json__act" data-capability-json-fold="none" title="{{ i18n.t("editor-expand-all") }}">{{ i18n.t("editor-expand-all") }}</button>
+      </div>
+      <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+    </div>
   </summary>
-  <div class="card__body" id="capability-json-body"{% if !raw_requested %}
+    <div class="card__body" id="capability-json-body"{% if !raw_requested %}
+      role="region" tabindex="0" aria-label="{{ i18n.t("cap-raw-toggle") }}"
        data-capability-json-body
        data-loading-text="{{ i18n.t("cap-raw-loading") }}"
        data-error-text="{{ i18n.t("cap-json-load-error") }}"

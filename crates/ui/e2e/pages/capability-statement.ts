@@ -61,6 +61,14 @@ export class CapabilityStatementPage {
     return this.rawBody.locator("#capability-json-loading");
   }
 
+  get collapseAllJson(): Locator {
+    return this.rawDisclosure.locator('[data-capability-json-fold="all"]');
+  }
+
+  get expandAllJson(): Locator {
+    return this.rawDisclosure.locator('[data-capability-json-fold="none"]');
+  }
+
   get jsonView(): Locator {
     return this.rawBody.locator("#capability-json");
   }
