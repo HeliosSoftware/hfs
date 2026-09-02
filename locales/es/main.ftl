@@ -793,6 +793,7 @@ sql-views-lede = Vistas SQL reutilizables construidas sobre ViewDefinitions.
 
 sql-export-title = Exportación SQL
 sql-export-lede = Trabajos de exportación SQL on FHIR de larga duración.
+sql-export-active-title = Exportaciones SQL
 
 sql-files-title = Archivos
 sql-files-lede = Manifiestos y archivos de salida producidos por las exportaciones SQL.
@@ -834,24 +835,67 @@ lib-sql-heading = SQL
 lib-delete-confirm = ¿Eliminar «{ $name }»? Esta acción no se puede deshacer.
 lib-delete-failed = No se pudo eliminar la biblioteca.
 
-## Páginas de exportación SQL y archivos (#649)
+## Páginas de exportación SQL y archivos (#649, #833)
 
 export-start-failed = No se pudo iniciar la exportación.
-export-started = Exportación iniciada.
-export-cancelled = Cancelación solicitada.
-export-job-heading = Trabajo de exportación
 export-job-id = Id del trabajo
-export-job-state = Estado
-export-state-running = En ejecución
-export-state-done = Terminado
-export-state-unknown = Trabajo desconocido: puede haberse cancelado o purgado.
-export-refresh = Actualizar
-export-cancel = Cancelar trabajo
-export-view-files = Ver archivos
 export-new-heading = Nueva exportación
 export-no-subjects = Nada que exportar todavía: crea primero una ViewDefinition.
 export-format = Formato de salida
 export-start = Iniciar exportación
+
+## Lista de exportaciones SQL activas y tarjetas de trabajo (#833)
+
+sql-export-new = Nueva exportación SQL
+sql-export-unavailable = El backend de almacenamiento no aloja el settings store; no se pueden rastrear los trabajos de exportación SQL.
+sql-export-none = Aún no hay exportaciones SQL. Use Nueva exportación SQL para iniciar una.
+sql-export-store-error = La exportación se inició, pero no se pudo agregar a esta lista. Id del trabajo:
+sql-export-exports-word = exportaciones
+sql-export-running = en curso
+sql-export-select-subject = Seleccione al menos un elemento.
+sql-export-unknown-subject = Uno o más elementos seleccionados ya no están disponibles. Actualice la página e inténtelo de nuevo.
+sql-export-cancelled-reason = el servidor ya no conoce este trabajo
+sql-export-status-in-progress = En curso
+sql-export-status-complete = Completada
+sql-export-status-failed = Fallida
+sql-export-status-cancelled = Cancelada
+sql-export-view-files = Ver archivos
+sql-export-cancel = Cancelar
+sql-export-retry = Reintentar
+sql-export-run-again = Volver a ejecutar
+sql-export-remove = Quitar de la lista
+sql-export-more-actions = Más acciones
+sql-export-copy-job-id = Copiar id del trabajo
+sql-export-copied = Copiado
+sql-export-progress-waiting = Esperando el primer reporte de estado…
+sql-export-started = iniciada
+sql-export-finished-in = terminada en
+sql-export-cancelled-at = cancelada a las
+sql-export-status-unavailable = estado no disponible
+sql-export-format-ndjson = NDJSON
+sql-export-format-csv = CSV
+sql-export-format-json = JSON
+sql-export-format-parquet = Parquet
+sql-export-subjects-count = { $count ->
+    [one] { $count } elemento
+   *[other] { $count } elementos
+}
+sql-export-kind-view-definition = { $count ->
+    [one] { $count } ViewDefinition
+   *[other] { $count } ViewDefinitions
+}
+sql-export-kind-sql-query = { $count ->
+    [one] { $count } SQL Query
+   *[other] { $count } SQL Queries
+}
+sql-export-kind-sql-view = { $count ->
+    [one] { $count } SQL View
+   *[other] { $count } SQL Views
+}
+sql-export-files-count = { $count ->
+    [one] { $count } archivo
+   *[other] { $count } archivos
+}
 files-job-heading = Trabajo de exportación
 files-load = Cargar manifiesto
 files-error = No se pudo cargar el manifiesto.

@@ -157,6 +157,11 @@
   --warn: #8a5a00;
   --warn-soft: #fdf2dd;
   --danger-soft: #f0dfde;
+  /* Neutral pair for the cancelled state (#833 gate-fix, FALLA 3): the same
+     shape as the ok/warn/danger soft pairs above, but genuinely gray so
+     "Cancelled" never reads as an accent-tinted (blue) or danger (red)
+     status. */
+  --muted-soft: #e9e9e9;
   /* Menu panel input */
   --input-bg: #f5f5f5;
   /* Pill scrollbars: thin bar, fully-rounded track and thumb. */
@@ -208,6 +213,7 @@
   --warn: #e8c07a;
   --warn-soft: #2f2410;
   --danger-soft: #453534;
+  --muted-soft: #333333;
   /* Same value as light for now (#681) — the point to adjust from if flat
      black at 45% is later found to read too heavy/light over the dark bg. */
   --scrim: rgb(0 0 0 / 45%);
@@ -3111,7 +3117,7 @@ details.json-fold[open] > summary .icon {
 }
 
 .tag--cancelled {
-  background: var(--accent-soft);
+  background: var(--muted-soft);
   color: var(--muted);
 }
 
@@ -5964,9 +5970,12 @@ details.json-fold[open] > summary .icon {
   background: var(--ok);
 }
 
-.progress--failed .progress__bar,
-.progress--cancelled .progress__bar {
+.progress--failed .progress__bar {
   background: var(--danger);
+}
+
+.progress--cancelled .progress__bar {
+  background: var(--muted);
 }
 
 .job-card__meta {
