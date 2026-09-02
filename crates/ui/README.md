@@ -136,7 +136,7 @@ not just a closed IIFE.
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
-| `saved-queries.js` | Saved queries, the visual search builder, and the `/_user/settings` read/modify/write cycle |
+| `saved-queries.js` | Saved queries, the visual search builder, the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
 | `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
 | `combobox.js` | Shared multi-select state, chips, keyboard/ARIA behavior, and progressive fallback upgrade; htmx owns transport and callers own result semantics |
@@ -145,7 +145,8 @@ not just a closed IIFE.
 | `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
-| `resource-filter.js`, `conformance-crud.js` | Shared truncated-name tooltips and the conformance viewers' rail filter/write half |
+| `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
+| `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
 | `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)`, exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of |
 | `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838) |
 | `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, no fold or lint yet (#838) |
@@ -466,9 +467,14 @@ falls through to the normal REST surface.
   the same rendering path. Counts reflect the **default tenant** only — an
   operator view, never exported to the public Prometheus `/metrics` endpoint.
 - **Per-user preferences** (theme, nav state, FHIR version, tenant, saved and
-  recent queries) roam in the `/_user/settings` document: weak `ETag`, JSON merge
-  patch, `If-Match` on write. Tenant-derived keys live under a reserved
-  `byTenant` map so a tenant purge can reach them.
+  recent queries, and — since #754/#755 — every sidebar rail's `rails.<page>`
+  record of `last`/`recent`, tenant-scoped, see `rail_state`) roam in the
+  `/_user/settings` document: weak `ETag`, JSON merge patch, `If-Match` on
+  write. Tenant-derived keys live under a reserved `byTenant` map so a tenant
+  purge can reach them. The server renders the "Recently used" group from
+  `recent` on every rail but Compartments — its 4-5 definitions make a group
+  noise, so it remembers only `last`; with no settings store configured, there
+  is nothing to render and every rail opens on its page default instead.
 
 ### Internationalization
 

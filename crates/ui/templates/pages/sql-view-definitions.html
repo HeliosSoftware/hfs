@@ -1,4 +1,5 @@
 {% extends "layouts/base.html" %}
+{% import "partials/rail_recent.html" as recent %}
 
 {#
   View Definitions workspace (#649, Figma 420-2): rail of stored
@@ -6,10 +7,14 @@
   collapsible JSON fold, and a $sql-run Results preview. The rail is one page
   of a server-side search (#741) — the search box filters by name, and plain
   previous/next links at its foot page through the rest — so it never loads
-  the tenant's whole ViewDefinition collection. Save/Duplicate are submit
-  buttons of one plain form (POST back to this route); Run is a plain link
-  (?run=1); Delete rides conformance-crud.js like the other conformance
-  viewers. Everything works without JavaScript.
+  the tenant's whole ViewDefinition collection. Above the list, a
+  server-rendered "Recently used" group (#754/#755 ticket 03) restores the
+  last-picked view on arrival and remembers up to `max_recent` more, with a
+  `{id, name, meta}` snapshot so a recent still renders when it is off the
+  current page or filter. Save/Duplicate are submit buttons of one plain form
+  (POST back to this route); Run is a plain link (?run=1); Delete rides
+  conformance-crud.js like the other conformance viewers. Everything works
+  without JavaScript.
 
   #753 (evaluation POC, not merged): the JSON fold below still posts the
   plain `<textarea name="json">`, but vd-editor.js progressively enhances it
@@ -49,6 +54,9 @@
       <input type="search" name="filter" value="{{ filter }}"
              placeholder="{{ i18n.t("vd-filter") }}" aria-label="{{ i18n.t("vd-filter") }}">
     </form>
+    {% call recent::group("vd-rail-recent", "vd-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries) %}{% endcall %}
+    <div class="filter-rail__divider" aria-hidden="true"></div>
+    <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("vd-rail-all-heading") }}</div>
     <div class="filter-rail__list" id="vd-rail-list">
       {% for item in rail %}
       <a class="filter-rail__item" data-type="{{ item.id }}" data-full-name="{{ item.name }}"
@@ -163,6 +171,7 @@
   </div>
 </div>
 
+<script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/conformance-crud.js" defer></script>
 <!-- The ViewDefinition editor (#753, its mount helper generalized for
      #838): the vendored CodeMirror 6 bundle must load before the shared

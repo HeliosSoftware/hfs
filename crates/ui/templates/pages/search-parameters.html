@@ -1,4 +1,5 @@
 {% extends "layouts/base.html" %}
+{% import "partials/rail_recent.html" as recent %}
 
 {% block title %}{{ i18n.t("sp-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
@@ -28,10 +29,9 @@
 <div class="filter-layout" hx-boost="true">
   <!--
     Resource Filter rail: a search box over resource types, an "All types"
-    row, a Recently-used group (populated client-side; see
-    resource-filter.js), and a live count next to every type. The registry is
-    already keyed base → code → param, so the rail is a direct view of the
-    outer map.
+    row, a server-rendered Recently-used group (RF6), and a live count next
+    to every type. The registry is already keyed base → code → param, so the
+    rail is a direct view of the outer map.
 
     Same flat rail as Resources/Search/Saved Queries (#603 follow-up): the
     "RESOURCE TYPES" heading, rounded filter input, and item rows share the
@@ -42,9 +42,8 @@
     per-type totals the macro's `count: Option` branch expects, and the
     "All types" row has no `data-type` equivalent. `#sp-rail-recent` and the
     divider/heading before `#sp-rail-list` stay outside that id on purpose:
-    the htmx search only swaps `#sp-rail-list`, and swapping the recent
-    group with the server's (always-empty) render of it would blow away
-    what resource-filter.js populated from localStorage.
+    the htmx search only swaps `#sp-rail-list`, and a stale group would
+    otherwise survive a search that changed the visible types.
   -->
   <aside class="filter-rail" aria-label="{{ i18n.t("sp-rail-label") }}">
     <div class="filter-rail__heading">{{ i18n.t("sp-rail-types") }}</div>
@@ -60,9 +59,7 @@
              hx-trigger="input changed delay:300ms, search"
              hx-target="#sp-rail-list" hx-select="#sp-rail-list" hx-swap="outerHTML">
     </form>
-    <div class="filter-rail__group" id="sp-rail-recent" data-recent-key="hfs-recent-types" hidden>
-      <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("sp-rail-recent") }}</div>
-    </div>
+    {% call recent::group("sp-rail-recent", "sp-rail-list", view.rail_page, view.max_recent, i18n.t("sp-rail-recent"), view.recent) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
     <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
     <div class="filter-rail__list" id="sp-rail-list">

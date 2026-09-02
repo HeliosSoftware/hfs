@@ -341,6 +341,93 @@ impl BundleBuilder {
     }
 }
 
+/// Renders a persistence-layer [`SearchBundle`] as FHIR JSON, moving each
+/// resource into its entry instead of copying it.
+///
+/// `map_resource` is applied to each entry's resource on the way through; the
+/// search handler passes `_summary` / `_elements` subsetting, the compartment
+/// handler passes the identity. It receives the resource by value, so a caller
+/// that does not subset does no work at all.
+///
+/// Key order is load-bearing and reproduces what the `serde_json::json!`
+/// construction this replaced emitted, member for member: the workspace builds
+/// `serde_json` with `preserve_order` (required by `helios-fhir-validator`), so
+/// `Value::Object` is insertion-ordered and the emitted JSON follows the order
+/// the members are inserted here — `resourceType`, `type`, `total`, `link`,
+/// `entry`; then `fullUrl`, `resource`, `search`; then `mode`, `score`. `total`
+/// is emitted as `null` when absent, `link` and `entry` as arrays that may be
+/// empty, exactly as before.
+pub(crate) fn searchset_to_json(
+    bundle: helios_persistence::types::SearchBundle,
+    mut map_resource: impl FnMut(Value) -> Value,
+) -> Value {
+    use helios_persistence::types::SearchEntryMode;
+    use serde_json::Map;
+
+    let link: Vec<Value> = bundle
+        .link
+        .into_iter()
+        .map(|l| {
+            let mut m = Map::new();
+            m.insert("relation".to_string(), Value::String(l.relation));
+            m.insert("url".to_string(), Value::String(l.url));
+            Value::Object(m)
+        })
+        .collect();
+
+    let entry: Vec<Value> = bundle
+        .entry
+        .into_iter()
+        .map(|e| {
+            let mut m = Map::new();
+            if let Some(full_url) = e.full_url {
+                m.insert("fullUrl".to_string(), Value::String(full_url));
+            }
+            if let Some(resource) = e.resource {
+                m.insert("resource".to_string(), map_resource(resource));
+            }
+            if let Some(search) = e.search {
+                let mut s = Map::new();
+                s.insert(
+                    "mode".to_string(),
+                    Value::String(
+                        match search.mode {
+                            SearchEntryMode::Match => "match",
+                            SearchEntryMode::Include => "include",
+                            SearchEntryMode::Outcome => "outcome",
+                        }
+                        .to_string(),
+                    ),
+                );
+                // `Value::from(f64)` is what `json!(score)` resolved to: a
+                // non-finite score becomes `null` rather than an error.
+                if let Some(score) = search.score {
+                    s.insert("score".to_string(), Value::from(score));
+                }
+                m.insert("search".to_string(), Value::Object(s));
+            }
+            Value::Object(m)
+        })
+        .collect();
+
+    let mut root = Map::new();
+    root.insert(
+        "resourceType".to_string(),
+        Value::String("Bundle".to_string()),
+    );
+    root.insert("type".to_string(), Value::String(bundle.bundle_type));
+    root.insert(
+        "total".to_string(),
+        match bundle.total {
+            Some(total) => Value::Number(total.into()),
+            None => Value::Null,
+        },
+    );
+    root.insert("link".to_string(), Value::Array(link));
+    root.insert("entry".to_string(), Value::Array(entry));
+    Value::Object(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

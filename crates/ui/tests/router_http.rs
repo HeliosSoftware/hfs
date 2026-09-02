@@ -1545,10 +1545,12 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     // The client-side template for the label update on rail clicks (#605):
     // the literal `{type}` placeholder, not the interpolated per-request value.
     assert!(html.contains(r#"data-msg-create="Create new {type}""#));
-    // The "Recently used" group (#603) is present but hidden until
-    // resource-filter.js populates it from localStorage.
+    // The "Recently used" group (#603, server-rendered since #754/#755) is
+    // present but hidden: no settings store is wired for this test's app, so
+    // there is nothing stored to show (RF9).
     assert!(html.contains(r#"id="type-rail-recent""#));
-    assert!(html.contains(r#"data-recent-key="hfs-recent-types""#));
+    assert!(html.contains(r#"data-rail-page="resources""#));
+    assert!(html.contains(r#"data-max-recent="5""#));
     assert!(html.contains(r#"data-rail-list="type-rail-list""#));
     let recent_start = html.find(r#"id="type-rail-recent""#).unwrap();
     let recent_tag_end = html[recent_start..].find('>').unwrap() + recent_start;
@@ -2836,6 +2838,24 @@ fn view_definitions_app(source: helios_ui::StaticConformanceSource) -> Router {
     )
 }
 
+/// The `id="vd-rail-list"` (or `id="lib-rail-list"`) scrollable list's own
+/// HTML — its opening tag up to the closing `</div>` immediately after it,
+/// with no nested `<div>` in between (the list holds only `<a>` items and,
+/// when empty, a `<p>`) — so a test can assert what the paginated/filtered
+/// list shows without also matching the "Recently used" group above it,
+/// which (ticket 03) can legitimately render an id the list itself excludes
+/// (RF4: the group is never filtered).
+fn rail_list_html<'a>(html: &'a str, list_id: &str) -> &'a str {
+    let start = html
+        .find(&format!(r#"id="{list_id}""#))
+        .unwrap_or_else(|| panic!("{list_id} present"));
+    let end = html[start..]
+        .find("</div>")
+        .map(|i| i + start)
+        .unwrap_or_else(|| panic!("{list_id} closing tag present"));
+    &html[start..end]
+}
+
 /// #741: the rail is one page of a server-side search, not the whole
 /// tenant collection — with more than one page of stored views, page 1 holds
 /// the first 50 (name-sorted) with a "next" link, and page 2 holds the rest
@@ -2994,10 +3014,16 @@ async fn view_definitions_selection_survives_a_filter_that_excludes_it() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    // The rail shows only what the filter matches...
-    assert!(html.contains(r#"data-type="other""#));
-    assert!(!html.contains(r#"data-type="keep""#));
-    // ...but the editor still holds the selected view the filter excluded.
+    // The rail's scrollable list shows only what the filter matches...
+    let list = rail_list_html(&html, "vd-rail-list");
+    assert!(list.contains(r#"data-type="other""#));
+    assert!(!list.contains(r#"data-type="keep""#));
+    // ...but the just-selected "keep" still surfaces through the "Recently
+    // used" group above it (ticket 03, RF4: the group is never itself
+    // filtered) — from its snapshot, since the filter takes it off the list
+    // this render shows.
+    assert!(html.contains(r#"id="vd-rail-recent""#));
+    // ...and the editor still holds the selected view the filter excluded.
     assert!(html.contains(r#"name="json""#));
     assert!(html.contains("keep_me"));
 }
