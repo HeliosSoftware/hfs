@@ -22,35 +22,22 @@ use crate::search::{
 
 use super::schema;
 
-/// Reads a tenant's stored (POSTed) active SearchParameter definitions from the
-/// database. Used as the [`TenantSearchRegistries`] loader closure — it captures
-/// only the pool + FHIR version, never the backend, so an Elasticsearch backend
-/// sharing the container resolves per-tenant params through this same query.
-fn load_tenant_stored_params(
-    pool: &Pool<SqliteConnectionManager>,
+/// The query shared by both stored-SearchParameter loader variants below.
+const STORED_SEARCH_PARAMS_QUERY: &str = "SELECT data FROM resources \
+    WHERE resource_type = 'SearchParameter' AND tenant_id = ?1 AND is_deleted = 0";
+
+/// Parses each row's raw JSON into an active, stored SearchParameter
+/// definition. A row that fails to decode or parse is skipped individually —
+/// that is not a load failure, unlike a connection/query error in the two
+/// loader variants below (which return `None`/`Err` instead of an empty
+/// result, so callers never mistake "could not even ask" for "asked, and
+/// there is genuinely nothing").
+fn parse_stored_search_params(
+    rows: impl Iterator<Item = rusqlite::Result<Vec<u8>>>,
     fhir_version: FhirVersion,
-    tenant_id: &str,
 ) -> Vec<SearchParameterDefinition> {
     use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
-    let Ok(conn) = pool.get() else {
-        tracing::warn!("SearchParameter loader: could not get connection");
-        return Vec::new();
-    };
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT data FROM resources WHERE resource_type = 'SearchParameter' \
-         AND tenant_id = ?1 AND is_deleted = 0",
-    ) else {
-        tracing::warn!("SearchParameter loader: prepare failed");
-        return Vec::new();
-    };
-    let rows = match stmt.query_map([tenant_id], |row| row.get::<_, Vec<u8>>(0)) {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!("SearchParameter loader: query failed: {e}");
-            return Vec::new();
-        }
-    };
     let loader = SearchParameterLoader::new(fhir_version);
     let mut defs = Vec::new();
     for row in rows {
@@ -66,6 +53,71 @@ fn load_tenant_stored_params(
         }
     }
     defs
+}
+
+/// Reads a tenant's stored (POSTed) active SearchParameter definitions from the
+/// database via a fresh connection from the pool. Used as the
+/// [`TenantSearchRegistries`] loader closure — it captures only the pool + FHIR
+/// version, never the backend, so an Elasticsearch backend sharing the
+/// container resolves per-tenant params through this same query.
+///
+/// Returns `None` on a genuine connection/query failure — e.g. a pooled
+/// connection whose in-memory database turned out empty because `cache=shared`
+/// was silently inert on the SQLite build in use (#787) — so
+/// `TenantSearchRegistries::for_tenant` does not cache a false "tenant has no
+/// stored params" result and permanently poison the tenant.
+///
+/// Not used by `begin_transaction` — see
+/// [`load_tenant_stored_params_with_conn`], which reuses the transaction's own
+/// connection instead of asking the pool for a second, simultaneous one (the
+/// actual trigger of #787: a second connection can see a *different*,
+/// potentially empty, in-memory database on a build where `cache=shared` is
+/// inert).
+fn load_tenant_stored_params(
+    pool: &Pool<SqliteConnectionManager>,
+    fhir_version: FhirVersion,
+    tenant_id: &str,
+) -> Option<Vec<SearchParameterDefinition>> {
+    let Ok(conn) = pool.get() else {
+        tracing::warn!("SearchParameter loader: could not get connection");
+        return None;
+    };
+    let Ok(mut stmt) = conn.prepare(STORED_SEARCH_PARAMS_QUERY) else {
+        tracing::warn!("SearchParameter loader: prepare failed");
+        return None;
+    };
+    let rows = match stmt.query_map([tenant_id], |row| row.get::<_, Vec<u8>>(0)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("SearchParameter loader: query failed: {e}");
+            return None;
+        }
+    };
+    Some(parse_stored_search_params(rows, fhir_version))
+}
+
+/// Reads a tenant's stored (POSTed) active SearchParameter definitions using
+/// an already-held connection, instead of requesting a separate one from the
+/// pool. `begin_transaction` (`transaction.rs`) uses this — on a cache miss,
+/// building the transaction's search-parameter extractor from a *different*
+/// pooled connection than the one the transaction itself holds meant two
+/// connections were needed at the same instant; on a build where
+/// `cache=shared` is silently inert, that second connection could see an
+/// empty database, and the resulting (previously silently-swallowed) empty
+/// overlay got baked into every resource the transaction indexed — no later
+/// cache heal fixes an already-written index row (#787). Reusing the
+/// transaction's own connection removes the two-connections requirement
+/// entirely; propagating a real error here (rather than defaulting to an
+/// empty overlay) means `begin_transaction` fails loudly instead of silently
+/// mis-indexing.
+pub(crate) fn load_tenant_stored_params_with_conn(
+    conn: &rusqlite::Connection,
+    fhir_version: FhirVersion,
+    tenant_id: &str,
+) -> rusqlite::Result<Vec<SearchParameterDefinition>> {
+    let mut stmt = conn.prepare(STORED_SEARCH_PARAMS_QUERY)?;
+    let rows = stmt.query_map([tenant_id], |row| row.get::<_, Vec<u8>>(0))?;
+    Ok(parse_stored_search_params(rows, fhir_version))
 }
 
 /// Counter for generating unique in-memory database names.
