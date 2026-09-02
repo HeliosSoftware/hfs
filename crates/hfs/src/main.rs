@@ -1889,7 +1889,18 @@ async fn start_sqlite_elasticsearch(
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(sqlite.clone());
 
     let export_bundle = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await?;
-    let submit_bundle = build_bulk_submit(&config, sqlite.clone()).await?;
+    // Bulk ingestion runs on the SQLite primary's engine, but wrapped so that
+    // finished manifests sync their resources into Elasticsearch — the raw
+    // primary skips local indexing when search is offloaded, and without the
+    // wrapper bulk-loaded data is invisible to every search (#882).
+    let submit_bundle = build_bulk_submit(
+        &config,
+        Arc::new(helios_persistence::composite::CompositeSubmitJobs::new(
+            sqlite.clone(),
+            composite.clone(),
+        )),
+    )
+    .await?;
     // Reindex reads from the SQLite primary and rebuilds BOTH indexes: SQLite's
     // own search_index table and the Elasticsearch index that actually serves
     // search here.
@@ -2138,7 +2149,16 @@ async fn start_postgres_elasticsearch(
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(pg.clone());
 
     let export_bundle = build_bulk_export(&config, pg.clone(), pg.clone()).await?;
-    let submit_bundle = build_bulk_submit(&config, pg.clone()).await?;
+    // Wrapped like sqlite-es: finished manifests sync their ingested
+    // resources into Elasticsearch, which the raw primary never does (#882).
+    let submit_bundle = build_bulk_submit(
+        &config,
+        Arc::new(helios_persistence::composite::CompositeSubmitJobs::new(
+            pg.clone(),
+            composite.clone(),
+        )),
+    )
+    .await?;
     let ops = composite_ops(
         composite.clone(),
         pg.clone(),

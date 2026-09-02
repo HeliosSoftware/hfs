@@ -452,7 +452,7 @@ impl CompositeStorage {
     }
 
     /// Synchronizes a resource change to secondary backends.
-    async fn sync_to_secondaries(&self, event: SyncEvent) -> StorageResult<()> {
+    pub(crate) async fn sync_to_secondaries(&self, event: SyncEvent) -> StorageResult<()> {
         if let Some(ref sync_manager) = self.sync_manager {
             sync_manager.sync(&event, &self.secondaries).await?;
         }
