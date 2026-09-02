@@ -125,6 +125,43 @@
 //!   Unlike `savedQueries`, this is an array on purpose: it is a small
 //!   bounded cache rewritten wholesale on every run, not sibling-keyed
 //!   state, so RFC 7386's replace-the-array semantics are exactly right.
+//!
+//! - `rails` — per-page "recently used" + "last selected" state for the web
+//!   UI's eight sidebar rails (Resources, Search, Saved Queries, Search
+//!   Parameters, Compartments, View Definitions, SQL Queries, SQL Views),
+//!   keyed by a short page name:
+//!
+//!   ```json
+//!   {
+//!     "rails": {
+//!       "resources":        { "last": "Observation", "recent": [{"id": "Observation"}, {"id": "Patient"}] },
+//!       "searchParameters":  { "last": "", "recent": [{"id": "Encounter"}] },
+//!       "viewDefinitions":  { "last": "abc", "recent": [{"id": "abc", "name": "active_patients", "meta": "Patient"}] }
+//!     }
+//!   }
+//!   ```
+//!
+//!   `recent` is newest first, holds no duplicate `id`s, and is capped at a
+//!   small fixed size (`MAX_RECENT`, defined once in `helios-ui`'s
+//!   `rail_state` module). `name`/`meta` are an optional snapshot: the type
+//!   rails omit them (the id is the label, and the live rail always has the
+//!   item), while the SQL rails include them because their rail is a
+//!   server-paged search (#741) that will not always list the recent item on
+//!   the current page. `last`, when non-empty, is always an `id` equal to
+//!   `recent[0]` — the one exception is `last: ""`, Search Parameters'
+//!   explicit "All types", which is not an item and therefore cannot be a
+//!   recent, so it leaves `recent` untouched. A page absent from `rails`, or a
+//!   `rails` key absent from the whole document, means "never selected on
+//!   this page", not "reset to a default".
+//!
+//!   Like `recentSearches`, this is an array rather than sibling-keyed like
+//!   `savedQueries`: it is a small bounded cache rewritten wholesale on every
+//!   selection, not state a merge patch needs to touch member-wise.
+//!
+//!   Not in [`GLOBAL_SETTINGS_KEYS`]: the ids it remembers (ViewDefinition,
+//!   Library, saved-query ids) and even which resource types are valid are
+//!   tenant-scoped facts, so `rails` is ordinary tenant-scoped state, reached
+//!   by a tenant purge like any other key not on that list.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

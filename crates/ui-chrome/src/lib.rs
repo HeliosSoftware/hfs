@@ -36,6 +36,10 @@
 //! supplies the newline after `</details>`, so the render must not end with
 //! one. See `tests/user_menu.rs::renders_without_a_trailing_newline`.
 //!
+//! [`capability`] shares more than markup: the CapabilityStatement projection
+//! itself lives there, because HFS and HTS were each parsing the same document
+//! into their own `CapabilityView` and each fixing the result separately.
+//!
 //! # What is deliberately *not* shared here
 //!
 //! CSS. `crates/ui/assets/app.css` is already shared byte-for-byte by
@@ -67,6 +71,25 @@
 //! [`user_menu`] about why that is sound.
 
 use askama::Template;
+
+/// The CapabilityStatement read model and cards shared by both products
+/// (#808). Markup *and* projection, unlike the chrome above, because the two
+/// pages disagreeing about what `/metadata` says would be worse than the two
+/// topbars disagreeing about a button.
+pub mod capability;
+
+/// The bounded, incremental JSON-fragment engine behind the Raw
+/// CapabilityStatement card (#808, generalized from HFS's #798). Both
+/// products lazy-load the same paginated, highlighted tree via htmx instead
+/// of each choosing its own compromise (HFS's render budget vs. HTS's
+/// byte-capped `<pre>`).
+pub mod capability_json;
+
+/// A foldable, line-numbered, syntax-highlighted JSON view (#264, #808).
+/// [`capability_json`] builds on this; HFS's Resource Editor, Batch, and
+/// Resources pages also render a [`json_view::JsonLine`] vector through
+/// their own copy of the partial this engine feeds.
+pub mod json_view;
 
 /// The localisation surface the shared chrome needs from its host.
 ///

@@ -2811,7 +2811,7 @@ async fn test_conditional_delete_with_identifier() {
         "identifier": [{"system": "http://hospital.org/mrn", "value": "MRN-DELETE-1"}],
         "name": [{"family": "ToDelete"}]
     });
-    backend
+    let created = backend
         .create(&tenant, "Patient", patient, FhirVersion::default())
         .await
         .unwrap();
@@ -2826,9 +2826,13 @@ async fn test_conditional_delete_with_identifier() {
         .await
         .unwrap();
 
-    assert!(
-        matches!(result, ConditionalDeleteResult::Deleted),
-        "Conditional delete should find and delete resource"
+    let ConditionalDeleteResult::Deleted(deleted) = result else {
+        panic!("Conditional delete should find and delete resource, got {result:?}");
+    };
+    assert_eq!(
+        deleted.id(),
+        created.id(),
+        "the carried snapshot must name the row the criteria resolved to"
     );
 
     // Verify deletion by searching - should not find

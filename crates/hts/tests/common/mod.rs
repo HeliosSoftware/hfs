@@ -69,7 +69,12 @@ async fn start_http_postgres_for_test()
 
     let mut last_err = None;
     for attempt in 1..=3u32 {
+        // Pin the major version. testcontainers-modules defaults to
+        // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
+        // the backend sends as a startup option, so PG 11 rejects every
+        // connection FATAL. The rest of the repo runs 16.
         match Postgres::default()
+            .with_tag("16-alpine")
             .with_label(HTTP_PG_LABEL_KEY, HTTP_PG_LABEL_VALUE)
             .start()
             .await

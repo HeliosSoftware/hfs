@@ -1,3 +1,20 @@
+{#-
+  Capability Statement (/ui/capability-statement, #653).
+
+  All five cards — the four summaries and the Raw CapabilityStatement fold —
+  are rendered by `helios_ui_chrome::capability::CapabilityCards` and are
+  byte-identical to the ones HTS renders at /ui/hts/capability-statement
+  (#808). Do NOT inline that markup back here: two copies of this page is
+  exactly what #808 removed. Card *content* changes belong in
+  `crates/ui-chrome/templates/partials/capability-*.html`.
+
+  The raw fold is not a `<pre>` of the whole document but a bounded,
+  paginated JSON-fragment tree loaded on demand (#798, generalized in #808).
+  Its endpoint (`/ui/capability-statement/json-fragment`) stays HFS's own —
+  HTS mounts an equivalent at `/ui/hts/capability-statement/json-fragment`
+  against its own upstream fetch — but the card shell, the fragment
+  templates and the JSON-rendering engine behind both are the same code.
+-#}
 {% extends "layouts/base.html" %}
 
 {% block title %}{{ i18n.t("cap-title") }} — {{ i18n.t("app-title") }}{% endblock %}
@@ -8,148 +25,16 @@
   <p class="page-head__lede">{{ i18n.t("cap-lede") }}</p>
 </section>
 
-{% if let Some(view) = view %}
-<section class="card">
-  <div class="card-head">
-    <h3>{{ i18n.t("cap-summary-heading") }}</h3>
-  </div>
-  <div class="card__body">
-    <div class="kv-grid kv-grid--flush">
-      <div class="detail__field detail__field--wide"><span>{{ i18n.t("cap-summary-description") }}</span><div>{{ view.summary.description }}</div></div>
-      <div class="detail__field detail__field--wide"><span>{{ i18n.t("cap-summary-url") }}</span><div>{{ view.summary.implementation_url }}</div></div>
-      <div class="detail__field"><span>{{ i18n.t("cap-summary-fhir-version") }}</span><div>{{ view.summary.fhir_version }}</div></div>
-      <div class="detail__field"><span>{{ i18n.t("cap-summary-status") }}</span><div>{{ view.summary.status }}</div></div>
-      <div class="detail__field"><span>{{ i18n.t("cap-summary-kind") }}</span><div>{{ view.summary.kind }}</div></div>
-      <div class="detail__field"><span>{{ i18n.t("cap-summary-date") }}</span><div>{{ view.summary.date }}</div></div>
-      <div class="detail__field"><span>{{ i18n.t("cap-summary-formats") }}</span><div>{{ view.summary.formats.join(", ") }}</div></div>
-    </div>
-  </div>
-</section>
+{% if let Some(cards) = cards %}
+{{ cards.summary|safe }}
 
-<section class="card">
-  <div class="card-head">
-    <h3>{{ i18n.t("cap-interactions-heading") }}</h3>
-  </div>
-  <div class="card__body">
-    <p>
-      {% for i in view.interactions %}
-      {% if !i.href.is_empty() %}
-      <a class="tag {{ i.tag_class }}" href="{{ i.href }}" target="_blank" rel="noopener">{{ i.code }}</a>
-      {% else %}
-      <span class="tag {{ i.tag_class }}">{{ i.code }}</span>
-      {% endif %}
-      {% endfor %}
-    </p>
-    {% if view.has_conditional_transaction %}
-    <p class="cap-transaction-note">
-      {{ i18n.t("cap-transaction-note") }}
-      <a href="https://github.com/HeliosSoftware/hfs/blob/main/crates/persistence/README.md#primarysecondary-role-matrix"
-         target="_blank" rel="noopener">{{ i18n.t("cap-role-matrix") }}</a>
-    </p>
-    {% endif %}
-  </div>
-</section>
+{{ cards.interactions|safe }}
 
-<section class="card table-card">
-  <div class="card-head">
-    <h3>{{ i18n.t("cap-operations-heading") }}</h3>
-  </div>
-  <div class="table-wrap">
-    <table class="data-table">
-      <thead>
-        <tr><th>{{ i18n.t("cap-col-operation") }}</th><th>{{ i18n.t("cap-col-definition") }}</th></tr>
-      </thead>
-      <tbody>
-        {% for op in view.operations %}
-        <tr>
-          <td>${{ op.name }}</td>
-          <td>
-            {% if !op.definition_href.is_empty() %}
-            <a class="url" href="{{ op.definition_href }}" target="_blank" rel="noopener">{{ op.definition }}</a>
-            {% else %}
-            <span class="url">{{ op.definition }}</span>
-            {% endif %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</section>
+{{ cards.operations|safe }}
 
-<section class="card table-card cap-resource-card">
-  <div class="card-head">
-    <h3>{{ i18n.t("cap-resources-heading") }}</h3>
-    <!-- Server-side narrowing: a plain GET form, so it works without JS. -->
-    <form class="filter-rail__search cap-resource-filter" method="get" action="/ui/capability-statement" role="search">
-      <input type="hidden" name="version" value="{{ effective_version }}">
-      <input type="search" name="filter" value="{{ filter }}"
-             placeholder="{{ i18n.t("cap-filter-placeholder") }}"
-             aria-label="{{ i18n.t("cap-filter-placeholder") }}"
-             hx-get="/ui/capability-statement" hx-include="closest form"
-             hx-trigger="input changed delay:300ms, search"
-             hx-target="#cap-resource-table" hx-select="#cap-resource-table"
-             hx-swap="outerHTML">
-    </form>
-  </div>
-  <div class="table-wrap" id="cap-resource-table">
-    <table class="data-table">
-      <thead>
-        <tr>
-          <th>{{ i18n.t("cap-col-type") }}</th>
-          <th>{{ i18n.t("cap-col-interactions") }}</th>
-          <th class="col-num">{{ i18n.t("cap-col-search-params") }}</th>
-          <th class="col-num">{{ i18n.t("cap-col-includes") }}</th>
-          <th class="col-num">{{ i18n.t("cap-col-revincludes") }}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for r in view.resources %}
-        <tr>
-          <td>
-            {% if !r.resource_href.is_empty() %}
-            <a href="{{ r.resource_href }}" target="_blank" rel="noopener">{{ r.resource_type }}</a>
-            {% else %}
-            <span>{{ r.resource_type }}</span>
-            {% endif %}
-          </td>
-          <td>{% for i in r.interactions %}<span class="tag {{ i.tag_class }}">{{ i.code }}</span> {% endfor %}</td>
-          <td class="col-num">{{ r.search_param_count }}</td>
-          <td class="col-num">{{ r.include_count }}</td>
-          <td class="col-num">{{ r.revinclude_count }}</td>
-        </tr>
-        {% endfor %}
-        {% if view.resources.is_empty() %}
-        <tr class="data-table__empty"><td colspan="5">{{ i18n.t("cap-resources-empty") }}</td></tr>
-        {% endif %}
-      </tbody>
-    </table>
-  </div>
-</section>
+{{ cards.resources|safe }}
 
-<details class="card json-fold" id="capability-json-fold"{% if raw_requested %} open{% else %} data-capability-json-node{% endif %}>
-  <summary class="card-head">
-    <h3>{{ i18n.t("cap-raw-toggle") }}</h3>
-    <span class="icon">{% include "icons/chevron-down.svg" %}</span>
-  </summary>
-  <div class="card__body" id="capability-json-body"{% if !raw_requested %}
-       data-capability-json-body
-       data-loading-text="{{ i18n.t("cap-raw-loading") }}"
-       data-error-text="{{ i18n.t("cap-json-load-error") }}"
-       data-fragment-url="{{ fragment_url }}"
-       hx-indicator="#capability-json-loading"{% endif %}>
-    {% if raw_requested %}
-    <p class="notice">{{ i18n.t("cap-raw-plain") }}</p>
-    <pre class="detail__code">{{ raw }}</pre>
-    {% else %}
-    <a class="btn" href="{{ raw_url }}#capability-json-fold">{{ i18n.t("cap-raw-load") }}</a>
-    <p class="busy-status htmx-indicator" id="capability-json-loading" role="status">
-      <span class="spinner" aria-hidden="true"></span>
-      {{ i18n.t("cap-raw-loading") }}
-    </p>
-    {% endif %}
-  </div>
-</details>
+{{ cards.raw|safe }}
 {% else %}
 <p class="notice notice--warn">{{ i18n.t("cap-unavailable") }}</p>
 {% endif %}

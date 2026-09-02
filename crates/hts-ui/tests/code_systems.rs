@@ -69,7 +69,7 @@ async fn browser_renders_full_page_with_translated_heading() {
     );
     for key in [
         "hts-cs-browser-title",
-        "hts-cs-browser-filter-search",
+        "hts-cs-browser-filter-reset",
         "hts-cs-browser-column-url",
         "hts-cs-browser-load-more",
         "hts-workbench-run",
@@ -661,13 +661,18 @@ fn cs_detail_templates_only_use_classes_that_exist_in_app_css() {
 /// chip row plus one `.detail__field--wide` canonical URL, and the full
 /// fact set lives behind a collapsed bare `<details>` — never `.addbox`,
 /// which is the Add-tenant dropdown and renders as a floating popover.
+/// Since #801 the head also takes the HFS back-link idiom: a
+/// `.page-head--back-link` modifier, a leading `.back-link`, and the rest
+/// of the head wrapped in `.page-head__copy`.
 #[test]
 fn cs_detail_page_uses_the_v3_compact_header_shape() {
     const PAGE: &str = include_str!("../templates/pages/cs-detail.html");
     let body = strip_template_comments(PAGE);
 
     for hook in [
-        r#"<header class="page-head">"#,
+        r#"<header class="page-head page-head--back-link">"#,
+        r#"class="back-link""#,
+        r#"class="page-head__copy""#,
         r#"class="page-head__title""#,
         r#"class="stat__label""#,
         r#"class="facets facets--bare""#,
@@ -685,6 +690,7 @@ fn cs_detail_page_uses_the_v3_compact_header_shape() {
         "addbox",
         "hts-cs-detail__",
         "backlink",
+        "row-link",
         "<dl",
     ] {
         assert!(

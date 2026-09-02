@@ -80,7 +80,7 @@ async fn serve(build: impl FnOnce(SocketAddr) -> (String, String)) -> SocketAddr
 }
 
 async fn read_all(fetcher: &HttpSubmitInputFetcher, url: &str, key: Option<&Value>) -> String {
-    let mut reader = fetcher
+    let (mut reader, _len) = fetcher
         .open_file_stream(url, &[], false, &[], key)
         .await
         .expect("open file stream");

@@ -15,7 +15,8 @@ use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::{
     BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, ExportOutputStore, RemoteFile,
-    RemoteManifest, ResourceStorage, SubmitClaimStrategy, SubmitInputFetcher, WorkerId,
+    RemoteManifest, ResourceStorage, SubmitClaimStrategy, SubmitInputFetcher, SubmitWorkerStorage,
+    WorkerId,
 };
 use helios_persistence::error::StorageResult;
 use helios_rest::ServerConfig;
@@ -52,11 +53,13 @@ impl SubmitInputFetcher for MockFetcher {
         _requires_access_token: bool,
         _oauth: &[String],
         _encryption_key: Option<&Value>,
-    ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+    ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
         let data = self.files.get(url).cloned().unwrap_or_default();
-        Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
-            data,
-        ))))
+        let len = data.len() as u64;
+        Ok((
+            Box::new(tokio::io::BufReader::new(std::io::Cursor::new(data))),
+            Some(len),
+        ))
     }
 }
 
@@ -325,6 +328,55 @@ async fn test_completed_status_finalizes_submission() {
             .await
             .status_code(),
         StatusCode::CONFLICT
+    );
+}
+
+/// #850: a drained submission — every manifest terminal, but never closed
+/// with `submissionStatus=completed` — must not hold a tenant concurrency
+/// slot. A submitter that ingests and walks away used to leak its slot
+/// forever, until the tenant's every kick-off returned 429.
+#[tokio::test]
+async fn test_drained_submission_frees_its_concurrency_slot() {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            max_concurrent_per_tenant: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // First submission ingests to the end; the submitter never closes it.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("leak-1", "in-progress"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    drain_submit(&backend, &fetcher, &output).await;
+
+    // Drained, the open submission holds no slot: a second one is admitted.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("leak-2", "in-progress"))
+            .await
+            .status_code(),
+        StatusCode::OK,
+        "a drained submission must not consume the tenant's only slot"
+    );
+
+    // The second one's manifest is still pending, so the cap is now real.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("leak-3", "in-progress"))
+            .await
+            .status_code(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a submission with work in flight must still count toward the cap"
     );
 }
 
@@ -1091,6 +1143,40 @@ async fn test_poll_rate_limit_of_zero_disables_throttling() {
             "poll rate limiting must be off when the limit is 0"
         );
     }
+}
+
+/// The in-progress percentage is byte-based: a worker that has streamed part
+/// of a file moves the poll's X-Progress long before any manifest turns
+/// terminal, instead of a single-manifest submission sitting at 0% to the end.
+#[tokio::test]
+async fn test_poll_percentage_tracks_ingested_bytes() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("byte-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_bytes(&lease, 350, 1_000)
+        .await
+        .expect("bytes update");
+
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let progress = resp
+        .headers()
+        .get("x-progress")
+        .expect("X-Progress")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        progress.contains("processing 35% complete"),
+        "the percentage must follow ingested bytes, got: {progress}"
+    );
 }
 
 /// #646: a `processing` manifest whose worker lease expired without renewal

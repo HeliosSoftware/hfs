@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::backends::postgres::schema::IndexLayout;
 use crate::search::fold_text;
 use crate::types::{
     CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
@@ -41,8 +42,71 @@ fn like_escape(value: &str) -> String {
 /// `idx_search_string_folded_pattern` under `text_pattern_ops`, can.
 ///
 /// Must stay character-for-character identical to the index definition in
-/// `schema.rs::migrate_v13_to_v14`, or Postgres will not use the index.
+/// `schema.rs::migrate_v32_to_v33`, or Postgres will not use the index.
+///
+/// ## Why the default (starts-with) form carries no `value_string IS NOT NULL`
+///
+/// v25 added that conjunct so the pattern index — then partial on
+/// `WHERE value_string IS NOT NULL` — could be *proved* usable, because
+/// `COALESCE(a, b) LIKE …` does not imply it (COALESCE is not strict). It did
+/// make the index legal. It also made it unreachable on cost, and v34 measured
+/// why: the conjunct is a second, independently-multiplied selectivity factor on
+/// a table where only 0.9% of rows have a string value, and `param_name` already
+/// determines that column. Postgres estimated the `(Patient, address)` slice at
+/// 25 rows instead of 5,000 and picked the physically smallest index that could
+/// supply the `(tenant, type, param)` prefix — `idx_search_string`, 50 MB —
+/// filtering the rest. See `schema.rs::migrate_v32_to_v33` for the plans.
+///
+/// v34 moves the reachability proof into the operator instead: `~>=~` and `~~`
+/// are both strict in the expression, so either implies the index's new
+/// `COALESCE(…) IS NOT NULL` predicate on its own, and the conjunct — with its
+/// wrong estimate — is gone from every modifier that reads this expression.
+/// `:exact` never had it (`value_string = $n` is strict on the bare column).
 const FOLDED_STRING_EXPR: &str = "COALESCE(value_string_folded, lower(value_string))";
+
+/// The exclusive upper bound of the byte-ordered range that holds exactly the
+/// strings beginning with `prefix`, or `None` when no such bound exists.
+///
+/// `~>=~`/`~<~` (the `text_pattern_ops` operators) compare bytewise, and UTF-8
+/// byte order is code-point order, so `prefix <= x < next(prefix)` selects
+/// exactly the values whose byte prefix — equivalently, whose character prefix,
+/// UTF-8 being self-synchronizing — is `prefix`. `next` is `prefix` with its
+/// last character replaced by the next code point.
+///
+/// This is the same construction `match_pattern_prefix` (`indxpath.c`) performs
+/// when it can see a `LIKE` pattern as a `Const`; doing it here is what makes
+/// the seek survive a *parameterized* pattern, which the planner cannot rewrite
+/// at all — see `migrate_v32_to_v33`.
+///
+/// Two cases have no bound and fall back to `LIKE`:
+/// - an empty prefix (every value matches, and there is nothing to increment);
+/// - a prefix that is entirely `char::MAX`, for which nothing sorts higher.
+///
+/// The UTF-16 surrogate block is skipped because it holds no scalar value: no
+/// text a Postgres UTF-8 database can store falls inside it, so widening the
+/// bound across it cannot admit a row.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        if let Some(next) = next_char(last) {
+            let mut bound: String = chars.into_iter().collect();
+            bound.push(next);
+            return Some(bound);
+        }
+        // `last` is `char::MAX`: nothing sorts after it in this position, so the
+        // increment has to carry into the preceding character.
+    }
+    None
+}
+
+/// The next Unicode scalar value after `c`, skipping the surrogate block.
+fn next_char(c: char) -> Option<char> {
+    let mut next = c as u32 + 1;
+    if next == 0xD800 {
+        next = 0xE000;
+    }
+    char::from_u32(next)
+}
 
 /// Builds the numeric comparison SQL for `col` against the implicit-precision
 /// range `[lo, hi)` per the FHIR prefix semantics, advancing `next` and
@@ -263,11 +327,28 @@ impl PostgresQueryBuilder {
     /// Returns a SQL fragment that selects DISTINCT resource_ids from search_index
     /// matching the given search parameters.
     pub fn build_search_query(query: &SearchQuery, param_offset: usize) -> Option<SqlFragment> {
+        Self::build_search_query_for(query, param_offset, IndexLayout::Denormalized)
+    }
+
+    /// As [`Self::build_search_query`], but emitting the form that matches the
+    /// database's actual `search_index` layout.
+    ///
+    /// Only composite search differs. Under [`IndexLayout::Denormalized`] every
+    /// component of one composite instance shares a row, so the match is a plain
+    /// conjunction. A database that predates v18 still stores one row per
+    /// component, where that conjunction matches nothing at all — the search
+    /// silently returns an empty bundle rather than failing.
+    pub fn build_search_query_for(
+        query: &SearchQuery,
+        param_offset: usize,
+        layout: IndexLayout,
+    ) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
         let mut current_offset = param_offset;
 
         for param in &query.parameters {
-            if let Some(condition) = Self::build_parameter_condition(param, current_offset) {
+            if let Some(condition) = Self::build_parameter_condition(param, current_offset, layout)
+            {
                 current_offset += condition.params.len();
                 conditions.push(condition);
             }
@@ -317,15 +398,20 @@ impl PostgresQueryBuilder {
 
         let base = strip_reference_version(&comp.reference).to_string();
         let p1 = param_offset + 1;
-        let p2 = param_offset + 2;
 
+        // A plain equality. `value_reference` holds the version-agnostic base
+        // (schema v33), so the `LIKE $n || '/_history/%'` arm this used to carry
+        // could match nothing — and it was the worst-shaped predicate in the
+        // backend: the pattern is an `OpExpr` built in SQL rather than a `Const`,
+        // so no fixed prefix could be derived from it under *any* plan, and an OR
+        // is index-usable only when every arm is.
         Some(SqlFragment::with_params(
             format!(
                 "id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name IN ({in_list}) \
-                 AND (value_reference = ${p1} OR value_reference LIKE ${p2} || '/_history/%'))"
+                 AND value_reference = ${p1})"
             ),
-            vec![SqlParam::text(&base), SqlParam::text(&base)],
+            vec![SqlParam::text(&base)],
         ))
     }
 
@@ -368,7 +454,10 @@ impl PostgresQueryBuilder {
                     | SearchParamType::Number
                     | SearchParamType::Quantity
                     | SearchParamType::Date => {
-                        Self::build_composite_component(value, param.param_type, offset)
+                        // Not a composite: this reuses the component predicate
+                        // builder for an ordinary single-valued parameter, which
+                        // always lives in slot 1.
+                        Self::build_composite_component(value, param.param_type, offset, 1)
                     }
                     SearchParamType::Reference => Some((
                         format!("value_reference = ${}", offset + 1),
@@ -456,6 +545,29 @@ impl PostgresQueryBuilder {
         format!("ORDER BY {}", clauses.join(", "))
     }
 
+    /// The membership wrapper every single-parameter condition is built with.
+    ///
+    /// `SqlFragment::and` parenthesizes both sides, so a conjunction never
+    /// matches this prefix — only a lone membership test does.
+    const INDEX_MEMBERSHIP_PREFIX: &'static str = "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND ";
+
+    /// Returns the bare `search_index` predicate when `sql` is exactly one
+    /// membership test, so the caller can resolve the page against
+    /// `search_index` directly instead of through a subquery on `resources`.
+    pub fn single_index_predicate(sql: &str) -> Option<&str> {
+        let inner = sql
+            .strip_prefix(Self::INDEX_MEMBERSHIP_PREFIX)?
+            .strip_suffix(')')?;
+        // Defensive: nothing that still mentions the table can be a lone test,
+        // and the legacy composite form is an aggregate rather than a row
+        // predicate — splicing it into a `SELECT DISTINCT ... ORDER BY` would be
+        // nonsense. (Layouts are mutually exclusive, so this is belt and braces.)
+        if inner.contains("FROM search_index") || inner.contains("GROUP BY") {
+            return None;
+        }
+        Some(inner)
+    }
+
     /// Returns the keyset sort key for cursor pagination, or `None` when the
     /// query has multiple sort fields (those are returned as a single page
     /// rather than paged with a possibly-inconsistent keyset).
@@ -510,6 +622,7 @@ impl PostgresQueryBuilder {
     fn build_parameter_condition(
         param: &SearchParameter,
         param_offset: usize,
+        layout: IndexLayout,
     ) -> Option<SqlFragment> {
         if param.values.is_empty() {
             return None;
@@ -552,7 +665,10 @@ impl PostgresQueryBuilder {
             SearchParamType::Quantity => Self::build_quantity_condition(param, param_offset),
             SearchParamType::Reference => Self::build_reference_condition(param, param_offset),
             SearchParamType::Uri => Self::build_uri_condition(param, param_offset),
-            SearchParamType::Composite => Self::build_composite_condition(param, param_offset),
+            SearchParamType::Composite => match layout {
+                IndexLayout::Denormalized => Self::build_composite_condition(param, param_offset),
+                IndexLayout::Legacy => Self::build_composite_condition_legacy(param, param_offset),
+            },
             SearchParamType::Special => None,
         }
     }
@@ -753,54 +869,107 @@ impl PostgresQueryBuilder {
         SqlFragment::new(sql)
     }
 
+    /// Builds the `id IN (…)` membership test for a `string` parameter.
+    ///
+    /// The three FHIR modifiers land on three different index shapes:
+    /// - default (starts-with) — a bytewise range on `FOLDED_STRING_EXPR`, which
+    ///   `idx_search_string_folded_pattern` seeks. Two bind parameters.
+    /// - `:contains`/`:text` — a substring `LIKE`, which no btree can seek;
+    ///   served by the trigram GIN index `idx_search_string_trgm` (v34), and by
+    ///   the btree pattern index where `pg_trgm` is unavailable.
+    /// - `:exact` — `value_string = $n` on the bare column, served by
+    ///   `idx_search_string`.
     fn build_string_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         let modifier = param.modifier.as_ref();
         let mut conditions = Vec::new();
+        // A value does not always cost exactly one bind parameter — the
+        // starts-with form binds a low and a high bound — so the placeholder
+        // number is carried rather than derived from the value's position.
+        let mut next = offset;
 
-        for (i, value) in param.values.iter().enumerate() {
-            let param_num = offset + i + 1;
+        for value in param.values.iter() {
             let condition = match modifier {
-                Some(SearchModifier::Exact) => SqlFragment::with_params(
-                    format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string = ${})",
-                        param.name, param_num
-                    ),
-                    vec![SqlParam::text(&value.value)],
-                ),
+                Some(SearchModifier::Exact) => {
+                    next += 1;
+                    SqlFragment::with_params(
+                        format!(
+                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string = ${})",
+                            param.name, next
+                        ),
+                        vec![SqlParam::text(&value.value)],
+                    )
+                }
                 // `:text` on a string is a case-insensitive partial match,
                 // implemented here as a substring match (same as `:contains`).
                 // Match the accent-folded column (falling back to the raw column
                 // for not-yet-reindexed rows) against a folded pattern.
                 //
-                // A leading `%` is not btree-sargable; this stays a scan unless the
-                // optional pg_trgm index is present. It is at least now scoped to
-                // one parameter's slice of the index rather than the whole table.
-                Some(SearchModifier::Contains | SearchModifier::Text) => SqlFragment::with_params(
-                    format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
-                        param.name, FOLDED_STRING_EXPR, param_num
-                    ),
-                    vec![SqlParam::text(&format!(
-                        "%{}%",
-                        like_escape(&fold_text(&value.value))
-                    ))],
-                ),
-                _ => {
-                    // Default: starts-with (case- and accent-insensitive).
-                    //
-                    // `LIKE`, not `ILIKE`: `fold_text` already lowercases both the
-                    // stored column and the pattern, so `ILIKE` was doing no work
-                    // that `LIKE` doesn't — but it made the predicate unindexable.
+                // A leading `%` is not btree-sargable, so this is served by the
+                // trigram GIN index v34 adds — which is why the
+                // `value_string IS NOT NULL` conjunct is absent here too. It cost
+                // the same 200x row-estimate error it cost the starts-with form,
+                // and on that estimate the planner never costed the GIN scan
+                // competitively. `~~` is strict in the COALESCE, so it proves both
+                // the trigram index's predicate and the btree pattern index's
+                // without help. Where the extension is unavailable the btree
+                // pattern index serves it at parity with the pre-v34 plan.
+                Some(SearchModifier::Contains | SearchModifier::Text) => {
+                    next += 1;
                     SqlFragment::with_params(
                         format!(
                             "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
-                            param.name, FOLDED_STRING_EXPR, param_num
+                            param.name, FOLDED_STRING_EXPR, next
                         ),
                         vec![SqlParam::text(&format!(
-                            "{}%",
+                            "%{}%",
                             like_escape(&fold_text(&value.value))
                         ))],
                     )
+                }
+                _ => {
+                    // Default: starts-with (case- and accent-insensitive).
+                    //
+                    // Emitted as an explicit bytewise range rather than
+                    // `LIKE 'prefix%'`. The two are exactly equivalent —
+                    // `like_escape` makes the pattern a pure literal prefix, and
+                    // `prefix_upper_bound` is the same bound Postgres derives
+                    // itself — but a range is sargable unconditionally, whereas
+                    // `LIKE` is only sargable when the planner can see the
+                    // pattern as a `Const`. It never can here: the pattern is a
+                    // bind parameter, and any generic plan turns the whole
+                    // predicate into `~~ like_escape($n, '\')`, a function call
+                    // on a parameter, from which no prefix can be extracted.
+                    let folded = fold_text(&value.value);
+                    match prefix_upper_bound(&folded) {
+                        Some(upper) => {
+                            let lo = next + 1;
+                            let hi = next + 2;
+                            next += 2;
+                            SqlFragment::with_params(
+                                format!(
+                                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {expr} ~>=~ ${lo} AND {expr} ~<~ ${hi})",
+                                    param.name,
+                                    expr = FOLDED_STRING_EXPR,
+                                ),
+                                vec![SqlParam::text(&folded), SqlParam::text(&upper)],
+                            )
+                        }
+                        // No upper bound exists: an empty search value (which
+                        // matches every indexed value) or an all-`char::MAX`
+                        // prefix. Fall back to the `LIKE` form. The strict `~~`
+                        // still proves the index predicate, so this needs no
+                        // conjunct either.
+                        None => {
+                            next += 1;
+                            SqlFragment::with_params(
+                                format!(
+                                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
+                                    param.name, FOLDED_STRING_EXPR, next
+                                ),
+                                vec![SqlParam::text(&format!("{}%", like_escape(&folded)))],
+                            )
+                        }
+                    }
                 }
             };
             conditions.push(condition);
@@ -885,9 +1054,37 @@ impl PostgresQueryBuilder {
                     predicates.push(format!("value_token_code = ${}", next));
                     params.push(SqlParam::text(code));
                 } else if code.is_empty() {
-                    // system| - match any code in system
+                    // system| - match any code in system.
+                    //
+                    // `value_token_code IS NOT NULL` is a deliberate,
+                    // row-set-preserving conjunct, not a filter: it is what makes
+                    // the partial `idx_search_token_code_recent` (v22, `WHERE
+                    // value_token_code IS NOT NULL`) a legal candidate for this
+                    // shape, so a *broad* system streams recent-first and stops
+                    // at the LIMIT instead of heap-fetching and sorting its whole
+                    // match set. v31 measures 1074 buffers -> 26 for a 66,667-row
+                    // system, and it is the reason v31 could replace the 2,283 MB
+                    // `idx_search_token` with a seek-only index.
+                    //
+                    // As of v32 it is not merely helpful, it is LOAD-BEARING:
+                    // v32 dropped `idx_search_token_system` (the planner pointed
+                    // `system|code` at it — 80,089,347 tuples read, 358 ms p99),
+                    // so `idx_search_token_code_recent` is now the ONLY index a
+                    // `system|` predicate can reach. Remove this conjunct and the
+                    // form falls back to a sequential-scale scan of the
+                    // (tenant, type) slice.
+                    //
+                    // It excludes nothing. `IndexValue::Token` declares
+                    // `code: String`, and both writer paths set the column
+                    // unconditionally beside the system —
+                    // `IndexRow::from_extracted` and `CompositeRow::place` — so
+                    // no row this backend has ever written has a system without
+                    // a code. An empty code is a non-NULL empty string.
                     next += 1;
-                    predicates.push(format!("value_token_system = ${}", next));
+                    predicates.push(format!(
+                        "(value_token_code IS NOT NULL AND value_token_system = ${})",
+                        next
+                    ));
                     params.push(SqlParam::text(system));
                 } else {
                     // system|code - exact match
@@ -1003,6 +1200,24 @@ impl PostgresQueryBuilder {
         let mut all_params: Vec<SqlParam> = Vec::new();
         let mut current = offset;
 
+        // Slot each component within its column family, in the parameter's own
+        // component order — the identical rule the extractor uses when it writes
+        // the denormalized row (`ExtractedValue::composite_slot`). Both sides
+        // derive it from the same registry ordering, so no mapping is stored.
+        let component_slots: Vec<u8> = {
+            let mut seen: std::collections::HashMap<SearchParamType, u8> =
+                std::collections::HashMap::new();
+            param
+                .components
+                .iter()
+                .map(|c| {
+                    let slot = seen.entry(c.param_type).or_insert(0);
+                    *slot += 1;
+                    *slot
+                })
+                .collect()
+        };
+
         for value in &param.values {
             let parts: Vec<&str> = value.value.split('$').collect();
             if parts.len() != param.components.len() {
@@ -1021,9 +1236,13 @@ impl PostgresQueryBuilder {
             let mut next = current;
             let mut ok = true;
 
-            for (part, component) in parts.iter().zip(param.components.iter()) {
+            for ((part, component), slot) in parts
+                .iter()
+                .zip(param.components.iter())
+                .zip(component_slots.iter())
+            {
                 let cv = Self::parse_component_value(part);
-                match Self::build_composite_component(&cv, component.param_type, next) {
+                match Self::build_composite_component(&cv, component.param_type, next, *slot) {
                     Some((sql, params)) => {
                         next += params.len();
                         staged_params.extend(params);
@@ -1098,15 +1317,117 @@ impl PostgresQueryBuilder {
             // composite group with every component's value column populated, so a
             // single index answers "code = X AND value > Y within one group" directly.
             // Tracked separately — it needs a writer change, a migration and a backfill.
+            // With the denormalized layout every component of one composite
+            // instance lives in a single row, so "code = X AND value > Y within
+            // the same group" is a plain conjunction — no prefilter, no
+            // GROUP BY, no HAVING. The covering index
+            // `idx_search_composite_flat` answers it directly and the LIMIT can
+            // stop early, which is what removes the ~110k-row / ~108k-heap-block
+            // scan the grouped form performed to return 21 rows.
+            //
+            // Parenthesize each component: a token component emits
+            // `sys = $n AND code = $m`, and relying on AND-before-OR precedence
+            // is a trap for the next component type someone adds.
+            let conjunction = predicates
+                .iter()
+                .map(|p| format!("({})", p))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+
+            value_conditions.push(format!(
+                "id IN (SELECT resource_id FROM search_index \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' \
+                 AND composite_group IS NOT NULL AND {})",
+                param.name, conjunction
+            ));
+        }
+
+        if value_conditions.is_empty() {
+            return None;
+        }
+        Some(SqlFragment::with_params(
+            value_conditions.join(" OR "),
+            all_params,
+        ))
+    }
+
+    /// Composite search against a pre-v18 `search_index`, where each component of
+    /// a composite instance is its own row.
+    ///
+    /// A resource matches only when every component is satisfied by some row
+    /// *within the same* `composite_group` — that grouping is what stops a blood
+    /// pressure panel's systolic value from pairing with its diastolic code, so
+    /// the GROUP BY / HAVING structure is load-bearing.
+    ///
+    /// The WHERE prefilter is result-preserving: a row satisfying no component
+    /// contributes 0 to every `MAX(CASE ...)` in the HAVING, so it can never turn
+    /// a 0 into a 1, and a group the prefilter empties could not have satisfied
+    /// the HAVING anyway. Without it the subquery aggregates the resource type's
+    /// entire composite slice on every request (#224's timeout).
+    ///
+    /// This is the pre-#279 form, restored verbatim in behaviour. It is slow —
+    /// that slowness is exactly why the denormalized layout exists — but it is
+    /// correct against rows the denormalized conjunction cannot match at all.
+    /// Components read the base value columns (slot 1): the `_2` columns only
+    /// exist to pack two same-type components into one denormalized row.
+    fn build_composite_condition_legacy(
+        param: &SearchParameter,
+        offset: usize,
+    ) -> Option<SqlFragment> {
+        if param.components.is_empty() {
+            return None;
+        }
+
+        let mut value_conditions = Vec::new();
+        let mut all_params: Vec<SqlParam> = Vec::new();
+        let mut current = offset;
+
+        for value in &param.values {
+            let parts: Vec<&str> = value.value.split('$').collect();
+            if parts.len() != param.components.len() {
+                value_conditions.push("1 = 0".to_string());
+                continue;
+            }
+
+            // Stage this value's params and commit them only once every component
+            // has parsed, so a component that fails midway cannot leave its
+            // predecessors bound with no placeholder in the final statement.
+            let mut staged_params: Vec<SqlParam> = Vec::new();
+            let mut predicates: Vec<String> = Vec::new();
+            let mut next = current;
+            let mut ok = true;
+
+            for (part, component) in parts.iter().zip(param.components.iter()) {
+                let cv = Self::parse_component_value(part);
+                match Self::build_composite_component(&cv, component.param_type, next, 1) {
+                    Some((sql, params)) => {
+                        next += params.len();
+                        staged_params.extend(params);
+                        predicates.push(sql);
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if !ok || predicates.is_empty() {
+                value_conditions.push("1 = 0".to_string());
+                continue;
+            }
+
+            current = next;
+            all_params.extend(staged_params);
+
             let havings = predicates
                 .iter()
                 .map(|p| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", p))
                 .collect::<Vec<_>>()
                 .join(" AND ");
             // Parenthesize each component before OR-ing: a token component emits
-            // `sys = $n AND code = $m`, and while SQL's AND-before-OR precedence
-            // happens to group that correctly, relying on it is a trap for the next
-            // component type someone adds.
+            // `sys = $n AND code = $m`, and relying on AND-before-OR precedence is
+            // a trap for the next component type someone adds.
             let prefilter = predicates
                 .iter()
                 .map(|p| format!("({})", p))
@@ -1158,6 +1479,21 @@ impl PostgresQueryBuilder {
         }
     }
 
+    /// The column a composite component's value lives in, for a given slot.
+    ///
+    /// Slot 1 is the ordinary value column. Slot 2 is the `_2` variant, used
+    /// when a composite has two components of the same type (24 of the 46 R4
+    /// composites do — see `ExtractedValue::composite_slot`). The writer
+    /// assigns slots from the same registry component order, so both sides
+    /// agree without storing a mapping.
+    fn composite_col(base: &str, slot: u8) -> String {
+        if slot >= 2 {
+            format!("{base}_{slot}")
+        } else {
+            base.to_string()
+        }
+    }
+
     /// Builds a single composite component as a bare column predicate (no
     /// `id IN (...)` wrapper — the caller scopes it to the composite row).
     /// Returns `None` if the value cannot be parsed for the component type.
@@ -1165,24 +1501,28 @@ impl PostgresQueryBuilder {
         value: &SearchValue,
         param_type: SearchParamType,
         offset: usize,
+        slot: u8,
     ) -> Option<(String, Vec<SqlParam>)> {
+        let token_code = Self::composite_col("value_token_code", slot);
+        let token_system = Self::composite_col("value_token_system", slot);
+        let number = Self::composite_col("value_number", slot);
         match param_type {
             SearchParamType::Token => {
                 if let Some((system, code)) = value.value.split_once('|') {
                     if system.is_empty() {
                         Some((
-                            format!("value_token_code = ${}", offset + 1),
+                            format!("{token_code} = ${}", offset + 1),
                             vec![SqlParam::text(code)],
                         ))
                     } else if code.is_empty() {
                         Some((
-                            format!("value_token_system = ${}", offset + 1),
+                            format!("{token_system} = ${}", offset + 1),
                             vec![SqlParam::text(system)],
                         ))
                     } else {
                         Some((
                             format!(
-                                "value_token_system = ${} AND value_token_code = ${}",
+                                "{token_system} = ${} AND {token_code} = ${}",
                                 offset + 1,
                                 offset + 2
                             ),
@@ -1191,7 +1531,7 @@ impl PostgresQueryBuilder {
                     }
                 } else {
                     Some((
-                        format!("value_token_code = ${}", offset + 1),
+                        format!("{token_code} = ${}", offset + 1),
                         vec![SqlParam::text(&value.value)],
                     ))
                 }
@@ -1204,7 +1544,7 @@ impl PostgresQueryBuilder {
                 let num = value.value.parse::<f64>().ok()?;
                 let op = Self::prefix_to_operator(&value.prefix);
                 Some((
-                    format!("value_number {} ${}", op, offset + 1),
+                    format!("{} {} ${}", number, op, offset + 1),
                     vec![SqlParam::Float(num)],
                 ))
             }
@@ -1496,8 +1836,64 @@ impl PostgresQueryBuilder {
     }
 
     /// Builds the `:identifier` condition: match references whose target
-    /// resource has an identifier equal to the supplied `system|value`. Mirrors
-    /// the SQLite implementation using PG's `SUBSTRING`/`POSITION`.
+    /// resource has an identifier equal to the supplied `system|value`.
+    ///
+    /// # Direction
+    ///
+    /// The identifier lookup **drives**; the reference index is seeked with what
+    /// it produces. The sub-select yields the target's `Type/id` — the exact
+    /// form the writer stores (schema v33 also strips any `/_history/<vid>`, so
+    /// there is no other stored form to consider) — and the enclosing
+    /// `value_reference` is compared against that set. This is the shape the
+    /// SQLite backend has always used (`build_identifier_condition`), reached
+    /// there for a correctness reason rather than a performance one.
+    ///
+    /// It used to be written the other way round: a correlated `EXISTS` that
+    /// pulled the target id out of each reference row with
+    /// `SUBSTRING(ref.value_reference FROM POSITION('/' IN …) + 1)` and looked
+    /// it up. That form has no seekable predicate on `ref` at all, so the whole
+    /// parameter slice has to be materialized before anything can be discarded,
+    /// and the inner lookup bound only `tenant_id` and `param_name` — never
+    /// `resource_type` — so it could not seek any index on `search_index` past
+    /// its first key column either.
+    ///
+    /// Measured on a 3.4M-row replica (PostgreSQL 18.6, warm), one
+    /// `Observation.subject` identifier search against a 1.34M-row slice and
+    /// 490,000 `identifier` rows:
+    ///
+    /// ```text
+    /// correlated EXISTS (before)          Parallel Seq Scan, 80,393 buffers   285.6 ms
+    ///   + resource_type bound in EXISTS   Parallel Seq Scan, 81,069 buffers   338.2 ms
+    /// identifier drives (this)            Index Scan,           845 buffers     1.4 ms
+    /// ```
+    ///
+    /// The middle row is the point. Binding `resource_type` inside the
+    /// correlated `EXISTS` — the obvious repair, and the one the missing bind
+    /// invites — makes it **slower**: the inner lookup was never the cost, and
+    /// the extra join key only widens the hash. The cost is that the outer
+    /// `ref` scan cannot be restricted at all, and only reversing the direction
+    /// removes it. 209x, and 95x fewer buffers.
+    ///
+    /// # What changes semantically
+    ///
+    /// Nothing that a valid FHIR reference can express. `Reference.reference` is
+    /// a relative `Type/id`, an absolute URL, or a `#fragment`. The old
+    /// `SUBSTRING` never resolved an absolute URL either — it splits on the
+    /// *first* `/`, so `http://ex.org/fhir/Patient/1` yielded
+    /// `/ex.org/fhir/Patient/1` and matched no resource id — and a `#fragment`
+    /// resolved to itself, which is not a resource id. Both are unmatched before
+    /// and after. The one input that behaved differently is a bare stored id
+    /// (`"reference": "123"`), which the old form matched against **any**
+    /// resource type's identifier rows in the tenant; that is invalid FHIR and
+    /// was a cross-type collision rather than a feature.
+    ///
+    /// # The inner lookup still does not bind `resource_type`
+    ///
+    /// It cannot: the target's type is what the sub-select is discovering. On
+    /// PostgreSQL 18 the btree skip scan handles the gap (`Index Searches: 9` in
+    /// the measurement above). On 13-17 it degrades to scanning the tenant's
+    /// slice of `idx_search_token_code` with the type filtered — but that is now
+    /// **one** scan feeding a seek, not a scan per row of the reference slice.
     fn build_reference_identifier_condition(
         param: &SearchParameter,
         offset: usize,
@@ -1506,9 +1902,6 @@ impl PostgresQueryBuilder {
         let mut next = offset; // running 0-based param offset
 
         for value in &param.values {
-            // Correlate the target resource id (the part after '/') with an
-            // 'identifier' index row for that resource.
-            let target = "idx.resource_id = SUBSTRING(ref.value_reference FROM POSITION('/' IN ref.value_reference) + 1)";
             let (filter, params): (String, Vec<SqlParam>) = match value.value.split_once('|') {
                 Some(("", code)) => {
                     next += 1;
@@ -1543,13 +1936,19 @@ impl PostgresQueryBuilder {
                     )
                 }
             };
+            // The target's `Type/id`, compared against the stored reference.
+            // `idx.tenant_id = $1` is load-bearing, not defensive: without it the
+            // sub-select yields any tenant's target, and this tenant's rows match
+            // on the strength of another tenant's identifiers.
             conditions.push(SqlFragment::with_params(
                 format!(
                     "id IN (SELECT ref.resource_id FROM search_index ref \
                      WHERE ref.tenant_id = $1 AND ref.resource_type = $2 AND ref.param_name = '{}' \
-                     AND EXISTS (SELECT 1 FROM search_index idx \
-                       WHERE idx.tenant_id = $1 AND idx.param_name = 'identifier' \
-                       AND {target} AND {filter}))",
+                     AND ref.value_reference IN \
+                       (SELECT idx.resource_type || '/' || idx.resource_id \
+                          FROM search_index idx \
+                         WHERE idx.tenant_id = $1 AND idx.param_name = 'identifier' \
+                           AND {filter}))",
                     param.name
                 ),
                 params,
@@ -1584,8 +1983,32 @@ impl PostgresQueryBuilder {
     /// is normalized to `Patient/<id>` and matched as a type-prefixed reference,
     /// mirroring the SQLite handler.
     ///
-    /// Matching stays version-agnostic throughout: the search value is stripped of
-    /// any `/_history/<vid>`, and a stored versioned reference still matches.
+    /// Matching stays version-agnostic throughout, but from **both** ends now:
+    /// the search value is stripped of any `/_history/<vid>` here, and the stored
+    /// value was stripped by the writer (schema v33). The `OR value_reference
+    /// LIKE '<base>/\_history/%'` arm this used to carry is therefore gone —
+    /// there is no longer a stored form for it to find. That arm was the second
+    /// index probe of every reference search in the benchmark and it forced the
+    /// whole predicate into a `BitmapOr`, which costs a bitmap build and a
+    /// re-check of the full disjunction (a `LIKE` per row) on every matching
+    /// heap tuple. Measured on a 3.4M-row replica over 300 searches, warm:
+    /// **1.50 ms/call -> 0.47 ms/call**.
+    ///
+    /// # The bare-id form is still not sargable, and that is not fixed here
+    ///
+    /// `Observation?patient=<id>` emits `value_reference = $n OR value_reference
+    /// LIKE '%/<id>'`. A leading-wildcard `LIKE` cannot be turned into index
+    /// bounds in any operator class, and an OR is index-usable only when every
+    /// arm is — so the planner has no index for the value at all. Measured on
+    /// the same replica against a 1.34M-row `Observation.subject` slice: a
+    /// **parallel Seq Scan of the whole `search_index`**, 259 ms and 71,943
+    /// buffers, against 0.47 ms for the `Type/id` form. The benchmark only ever
+    /// sends `Type/id`, which is why this has never shown up in a run.
+    ///
+    /// Making it sargable needs a stored bare target id — a column plus an index,
+    /// i.e. one more btree insert per reference row on the write path v28 spent
+    /// a whole migration reducing. It is a separate change with its own
+    /// arithmetic; it is written down here rather than guessed at.
     ///
     /// # LIKE escaping
     ///
@@ -1660,32 +2083,27 @@ impl PostgresQueryBuilder {
                 };
                 let escaped = like_escape(&base);
 
-                // `\_history` — the escape keeps the underscore literal.
                 if base.contains('/') {
-                    // `Type/id` or an absolute URL: match the base reference, or
-                    // the same reference carrying any `_history` version.
+                    // `Type/id` or an absolute URL. One equality: the stored
+                    // value is the version-agnostic base (schema v33), so a
+                    // stored version cannot hide a match from it.
                     let exact = param_num + 1;
-                    let versioned = param_num + 2;
-                    param_num += 2;
+                    param_num += 1;
                     params.push(SqlParam::text(&base));
-                    params.push(SqlParam::text(&format!("{}/\\_history/%", escaped)));
-                    format!(
-                        "(value_reference = ${exact} OR value_reference LIKE ${versioned} ESCAPE '\\')"
-                    )
+                    format!("value_reference = ${exact}")
                 } else {
-                    // Bare logical id: also match any reference ending in `/id`,
-                    // with or without a trailing `_history` version.
+                    // Bare logical id: also match any reference ending in `/id`.
+                    // The suffix arm is a leading-wildcard `LIKE` and is not
+                    // sargable in any operator class — see the note on this
+                    // function about what that costs.
                     let exact = param_num + 1;
                     let suffix = param_num + 2;
-                    let versioned = param_num + 3;
-                    param_num += 3;
+                    param_num += 2;
                     params.push(SqlParam::text(&base));
                     params.push(SqlParam::text(&format!("%/{}", escaped)));
-                    params.push(SqlParam::text(&format!("%/{}/\\_history/%", escaped)));
                     format!(
                         "(value_reference = ${exact} \
-                          OR value_reference LIKE ${suffix} ESCAPE '\\' \
-                          OR value_reference LIKE ${versioned} ESCAPE '\\')"
+                          OR value_reference LIKE ${suffix} ESCAPE '\\')"
                     )
                 }
             };
@@ -1806,6 +2224,170 @@ mod tests {
     use super::*;
     use crate::types::{CompositeSearchComponent, SearchModifier, SearchQuery};
 
+    fn date_param(name: &str, prefix: SearchPrefix, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(prefix, value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    #[test]
+    fn single_membership_test_is_extractable() {
+        let query = SearchQuery::new("Encounter").with_parameter(date_param(
+            "date",
+            SearchPrefix::Gt,
+            "2010-01-01",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(pred, "param_name = 'date' AND value_date >= $3");
+        // The extracted predicate must stand alone against `search_index`.
+        assert!(!pred.contains("resources"));
+        assert!(!pred.contains("SELECT"));
+    }
+
+    #[test]
+    fn conjunction_is_not_extractable() {
+        // Two parameters AND together, so no single index predicate resolves the
+        // page — taking either one alone would over-match.
+        let query = SearchQuery::new("Encounter")
+            .with_parameter(date_param("date", SearchPrefix::Gt, "2010-01-01"))
+            .with_parameter(date_param("date", SearchPrefix::Lt, "2020-01-01"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
+
+    #[test]
+    fn repeated_values_of_one_param_are_not_extractable() {
+        // `date=gt..&date=lt..` on one parameter also ANDs at resource level: two
+        // index rows may satisfy it jointly, which a single-row predicate cannot
+        // express.
+        let param = SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Gt, "2010-01-01"),
+                SearchValue::new(SearchPrefix::Lt, "2020-01-01"),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
+
+    #[test]
+    fn missing_modifier_is_not_extractable() {
+        // `:missing=true` is an absence test, so the rows it selects are exactly
+        // the ones `search_index` does not hold.
+        let mut param = date_param("date", SearchPrefix::Eq, "true");
+        param.modifier = Some(SearchModifier::Missing);
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
+
+    #[test]
+    fn legacy_layout_keeps_the_grouped_composite_form() {
+        // A database that predates v18 stores one row per composite component.
+        // The denormalized conjunction matches none of them, and would return an
+        // empty bundle rather than an error — so the layout must select the form.
+        let param = SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "http://loinc.org|8480-6$lt60",
+            )],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value".to_string(),
+                },
+            ],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+
+        let legacy = PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy)
+            .expect("legacy composite condition");
+        assert!(
+            legacy
+                .sql
+                .contains("GROUP BY resource_id, composite_group HAVING"),
+            "grouping is what confines components to one composite instance: {}",
+            legacy.sql
+        );
+        assert!(
+            legacy.sql.contains("MAX(CASE WHEN"),
+            "per-component HAVING must survive: {}",
+            legacy.sql
+        );
+        // Components read the base columns; the `_2` columns exist only to pack
+        // two same-type components into one denormalized row.
+        assert!(!legacy.sql.contains("value_token_code_2"), "{}", legacy.sql);
+
+        let flat =
+            PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Denormalized)
+                .expect("denormalized composite condition");
+        assert!(!flat.sql.contains("GROUP BY"), "{}", flat.sql);
+        assert!(
+            flat.sql.contains("composite_group IS NOT NULL"),
+            "{}",
+            flat.sql
+        );
+
+        // Both forms must bind the same values, or the two layouts would disagree
+        // about what was searched for.
+        assert_eq!(legacy.params.len(), flat.params.len());
+    }
+
+    #[test]
+    fn the_legacy_composite_form_is_never_taken_as_a_fast_path() {
+        // It is an aggregate, not a row predicate; splicing it into a
+        // `SELECT DISTINCT ... ORDER BY` would be nonsense.
+        let param = SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "http://loinc.org|8480-6$lt60",
+            )],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value".to_string(),
+                },
+            ],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let legacy = PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy)
+            .expect("condition");
+        assert!(PostgresQueryBuilder::single_index_predicate(&legacy.sql).is_none());
+    }
+
     #[test]
     fn composite_token_quantity_sql() {
         let param = SearchParameter {
@@ -1839,6 +2421,140 @@ mod tests {
         assert!(frag.sql.contains("value_quantity_value < $5"));
         // token (system+code) = 2 params, quantity (no unit) = 1 param.
         assert_eq!(frag.params.len(), 3);
+    }
+
+    /// The two composite spellings, pinned. These are the exact texts the v28
+    /// composite indexes are shaped for, and the exact texts whose partial
+    /// predicates `predtest.c` has to prove:
+    ///
+    /// - `composite_group IS NOT NULL` appears literally, so
+    ///   `WHERE composite_group IS NOT NULL` is provable;
+    /// - the quantity component is a strict operator over
+    ///   `value_quantity_value`, so `WHERE value_quantity_value IS NOT NULL` is
+    ///   provable;
+    /// - the token component is an equality on `value_token_code`, which is why
+    ///   that column leads the index key ahead of the sort key (v21's rule).
+    ///
+    /// If any of these change, the v28 indexes silently stop being reachable
+    /// and composite search falls back to a full sort. Reachability is not
+    /// something a `#[test]` can observe, so it is pinned here instead.
+    fn composite_param(name: &str, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, value)],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn composite_bare_code_emits_what_the_v27_index_is_keyed_for() {
+        // `combo-code-value-quantity=8867-4$gt100` — 21 of the 27 composite
+        // values in `k6/searchConfig.js` are this spelling.
+        let query = SearchQuery::new("Observation")
+            .with_parameter(composite_param("combo-code-value-quantity", "8867-4$gt100"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert_eq!(
+            frag.sql,
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 \
+             AND resource_type = $2 AND param_name = 'combo-code-value-quantity' \
+             AND composite_group IS NOT NULL \
+             AND (value_token_code = $3) AND (value_quantity_value > $4))",
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 2);
+    }
+
+    #[test]
+    fn composite_system_qualified_code_keeps_the_system_in_the_predicate() {
+        // The other 6 values, and the second `pg_stat_statements` entry (7,767
+        // calls). `value_token_system` is payload on the v28 index so this
+        // stays index-only rather than fetching the heap per candidate.
+        let query = SearchQuery::new("Observation").with_parameter(composite_param(
+            "combo-code-value-quantity",
+            "http://loinc.org|8480-6$gt140",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert_eq!(
+            frag.sql,
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 \
+             AND resource_type = $2 AND param_name = 'combo-code-value-quantity' \
+             AND composite_group IS NOT NULL \
+             AND (value_token_system = $3 AND value_token_code = $4) \
+             AND (value_quantity_value > $5))",
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 3);
+    }
+
+    #[test]
+    fn every_composite_quantity_prefix_is_a_strict_operator() {
+        // `WHERE value_quantity_value IS NOT NULL` on the composite index is
+        // only provable from a STRICT operator over that column. Every prefix
+        // the benchmark can send — and every prefix `parse_component_value`
+        // recognises — must therefore emit one. `IS DISTINCT FROM` or a
+        // `COALESCE` here would strand the index without any test failing.
+        for (spelling, op) in [
+            ("gt100", ">"),
+            ("lt100", "<"),
+            ("ge100", ">="),
+            ("le100", "<="),
+            ("ne100", "!="),
+            ("sa100", ">"),
+            ("eb100", "<"),
+            ("ap100", "="),
+            ("100", "="),
+        ] {
+            let query = SearchQuery::new("Observation").with_parameter(composite_param(
+                "combo-code-value-quantity",
+                &format!("8867-4${spelling}"),
+            ));
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+            assert!(
+                frag.sql
+                    .contains(&format!("(value_quantity_value {op} $4)")),
+                "{spelling} must emit a strict operator: {}",
+                frag.sql
+            );
+        }
+    }
+
+    #[test]
+    fn the_composite_fast_path_predicate_is_extractable() {
+        // The whole point of keying the composite index on the fast path's sort
+        // key is that composite search TAKES the fast path. It does, because a
+        // lone composite parameter is exactly one membership test — this is the
+        // gate, and it is the reason `ORDER BY last_updated DESC, resource_id
+        // ASC` is what the index has to serve.
+        let query = SearchQuery::new("Observation")
+            .with_parameter(composite_param("combo-code-value-quantity", "8867-4$gt100"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone composite test is extractable");
+
+        assert_eq!(
+            pred,
+            "param_name = 'combo-code-value-quantity' AND composite_group IS NOT NULL \
+             AND (value_token_code = $3) AND (value_quantity_value > $4)"
+        );
+        // It has to stand alone against `search_index`.
+        assert!(!pred.contains("resources"));
+        assert!(!pred.contains("SELECT"));
     }
 
     fn special_param(name: &str, values: Vec<SearchValue>) -> SearchParameter {
@@ -2062,10 +2778,23 @@ mod tests {
     }
 
     #[test]
-    fn composite_prefilters_but_keeps_group_semantics() {
-        // The WHERE gains an OR-prefilter so the subquery stops reading every
-        // composite row for the parameter, but the GROUP BY / HAVING must survive
-        // intact — it is what forces both components into the SAME composite_group.
+    fn composite_confines_components_to_one_group() {
+        // The invariant under test is unchanged from the grouped form: a
+        // resource may only match when BOTH components are satisfied within the
+        // SAME composite instance — a blood-pressure panel's systolic value must
+        // never pair with its diastolic code.
+        //
+        // What changed is how that is enforced. The old form read one row per
+        // component and used GROUP BY resource_id, composite_group + HAVING
+        // MAX(CASE …) to require both within a group. The denormalized layout
+        // (#279) stores one row per (resource, composite_group) carrying every
+        // component's value, so a plain conjunction over ONE row enforces the
+        // same thing by construction — components cannot come from different
+        // groups because they cannot come from different rows.
+        //
+        // So this asserts the new mechanism, and deliberately asserts the
+        // absence of the old one: if GROUP BY reappears here alongside the flat
+        // predicate, the two layouts have been mixed and the result is wrong.
         let param = SearchParameter {
             name: "combo-code-value-quantity".to_string(),
             param_type: SearchParamType::Composite,
@@ -2090,22 +2819,28 @@ mod tests {
         let frag =
             PostgresQueryBuilder::build_search_query(&query, 2).expect("composite condition");
 
+        // One row per composite instance: the predicate is scoped to composite
+        // rows and every component is ANDed within that single row.
         assert!(
+            frag.sql.contains("composite_group IS NOT NULL"),
+            "the subquery must be confined to composite rows: {}",
             frag.sql
-                .contains("GROUP BY resource_id, composite_group HAVING"),
-            "composite_group grouping must be preserved — without it, components \
-             match across different composite groups: {}",
+        );
+        assert!(
+            frag.sql.contains(") AND (value_quantity_value"),
+            "components must be ANDed within one row, not OR-prefiltered: {}",
+            frag.sql
+        );
+        // The old aggregate form must be gone — mixing the two layouts would
+        // aggregate over already-denormalized rows and match across groups.
+        assert!(
+            !frag.sql.contains("GROUP BY resource_id, composite_group"),
+            "the denormalized layout must not re-aggregate: {}",
             frag.sql
         );
         assert!(
-            frag.sql.contains("MAX(CASE WHEN"),
-            "per-component HAVING must be preserved: {}",
-            frag.sql
-        );
-        // The prefilter: components OR'd inside the WHERE.
-        assert!(
-            frag.sql.contains(") OR (value_quantity_value"),
-            "expected an OR-prefilter over the components in the WHERE clause: {}",
+            !frag.sql.contains("MAX(CASE WHEN"),
+            "the denormalized layout must not use the HAVING form: {}",
             frag.sql
         );
     }
@@ -2180,13 +2915,17 @@ mod tests {
     #[test]
     fn string_search_is_sargable_and_escapes_wildcards() {
         // `ILIKE` can never use a btree, and the raw `COALESCE(folded, value_string)`
-        // could not be matched by any index. The emitted predicate must be a `LIKE`
-        // against the exact expression the v14 index is built on.
+        // could not be matched by any index. v34 goes further than `LIKE`: the
+        // starts-with form is emitted as an explicit bytewise range, because a
+        // `LIKE` whose pattern is a bind parameter cannot be turned into an
+        // index range by the planner at all (`match_pattern_prefix` needs a
+        // `Const`). See `migrate_v32_to_v33`.
         let param = SearchParameter {
             name: "name".to_string(),
             param_type: SearchParamType::String,
             modifier: None,
-            // A literal '%' in the search value must not become a wildcard.
+            // A literal '%' in the search value is not a wildcard, and in the
+            // range form it never becomes one — there is no pattern to escape.
             values: vec![SearchValue::new(SearchPrefix::Eq, "50%Off")],
             chain: vec![],
             components: vec![],
@@ -2195,9 +2934,11 @@ mod tests {
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
 
         assert!(
-            frag.sql
-                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"),
-            "string search must LIKE against the indexed folded expression: {}",
+            frag.sql.contains(
+                "COALESCE(value_string_folded, lower(value_string)) ~>=~ $3 AND \
+                 COALESCE(value_string_folded, lower(value_string)) ~<~ $4"
+            ),
+            "starts-with must be a bytewise range on the indexed folded expression: {}",
             frag.sql
         );
         assert!(
@@ -2205,14 +2946,565 @@ mod tests {
             "ILIKE is not btree-sargable: {}",
             frag.sql
         );
+        let bounds: Vec<&str> = frag
+            .params
+            .iter()
+            .map(|p| match p {
+                SqlParam::Text(s) => s.as_str(),
+                other => panic!("expected a text bound, got {:?}", other),
+            })
+            .collect();
+        assert_eq!(
+            bounds,
+            vec!["50%off", "50%ofg"],
+            "the bounds are the folded value and its successor, and carry no              LIKE escaping because there is no pattern"
+        );
+    }
+
+    #[test]
+    fn prefix_upper_bound_covers_exactly_the_prefix() {
+        // ASCII: increment the last character.
+        assert_eq!(prefix_upper_bound("emilia").as_deref(), Some("emilib"));
+        assert_eq!(prefix_upper_bound("a").as_deref(), Some("b"));
+        // Multi-byte: the successor is the next code point, and UTF-8 byte order
+        // is code-point order, so `~<~` (bytewise) still bounds the prefix.
+        assert_eq!(
+            prefix_upper_bound("caf\u{e9}").as_deref(),
+            Some("caf\u{ea}")
+        );
+        // The surrogate block holds no scalar value, so it is stepped over.
+        assert_eq!(prefix_upper_bound("\u{d7ff}").as_deref(), Some("\u{e000}"));
+        // `char::MAX` has no successor: the increment carries left.
+        assert_eq!(prefix_upper_bound("a\u{10ffff}").as_deref(), Some("b"));
+        // Nothing sorts above an all-`char::MAX` prefix, and an empty prefix
+        // matches everything. Both fall back to `LIKE`.
+        assert_eq!(prefix_upper_bound("\u{10ffff}"), None);
+        assert_eq!(prefix_upper_bound(""), None);
+    }
+
+    /// Every value the FHIR benchmark's `searchConfig.js` sends for a `string`
+    /// parameter must take the seeking path, not the `LIKE` fallback.
+    ///
+    /// Run 33179839720 left 24,865 calls on the `LIKE` statement, and the first
+    /// hypothesis was that `prefix_upper_bound` was returning `None` more often
+    /// than expected. It was not — the remainder is `:contains`, which the
+    /// script sends for half of every string request — but the question is
+    /// worth closing permanently rather than re-deriving.
+    #[test]
+    fn every_benchmark_search_term_gets_a_bound() {
+        // Verbatim from HealthSamurai/fhir-server-performance-benchmark,
+        // k6/searchConfig.js, the "string" block.
+        let terms = [
+            "NON-EXISTS",
+            "Emilia",
+            "Carolynn",
+            "Stefan",
+            "Linh",
+            "Harold",
+            "Pilar",
+            "Ron",
+            "Garfield",
+            "Margaretta",
+            "Giovanna",
+            "Dione",
+            "Arron",
+            "Lanny",
+            "Harvey",
+            "Beatriz",
+            "Donovan",
+            "Reyes",
+            "Santiago",
+            "Kyong",
+            "Curtis",
+            "Raynham",
+            "Springfield",
+            "Lowell",
+            "Southwick",
+            "Mashpee",
+            "Holbrook",
+            "Falmouth",
+            "Revere",
+            "Sturbridge",
+            "Blackstone",
+            "Westport",
+            "Walpole",
+            "Northampton",
+            "Fall River",
+            "Waltham",
+            "Acushnet Center",
+            "Newton",
+            "Winchester",
+            "Maynard",
+            "ORLEANS MEDICAL CENTER, P.C.",
+            "ENCOMPASS HEALTH BRAINTREE HOSPITAL OF BRAINTREE",
+            "STEWARD HOLY FAMILY HOSPITAL INC",
+            "THE NORTHEAST HEALTH GROUP, INC",
+            "PLYMOUTH BAY INTERNAL MEDICINE",
+            "ART OF CARE INC",
+            "T MASSACHUSETTS, LLC",
+            "RIVERBEND OF SOUTH NATICK",
+            "NEW ENGLAND PROFESSIONAL HOME HEALTH CARE LLC",
+            "HDH CORPORATION",
+            // The script escapes `\ , $ |` before sending; if any survives to
+            // here it is still a literal prefix character, in the range exactly
+            // as it was in the `LIKE` pattern after `like_escape`.
+            "ORLEANS MEDICAL CENTER\\, P.C.",
+        ];
+        for term in terms {
+            let query =
+                SearchQuery::new("Patient").with_parameter(string_param("name", None, term));
+            let frag =
+                PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+            assert!(
+                frag.sql.contains("~>=~ $3 AND") && frag.sql.contains("~<~ $4)"),
+                "{:?} fell back to the LIKE form: {}",
+                term,
+                frag.sql
+            );
+            assert!(
+                !frag.sql.contains("IS NOT NULL"),
+                "{:?} kept the conjunct: {}",
+                term,
+                frag.sql
+            );
+        }
+    }
+
+    #[test]
+    fn empty_string_value_falls_back_to_the_like_form() {
+        // `name=` matches every indexed value; there is no prefix to bound, so
+        // the `LIKE '%'` form is emitted. The strict `~~` proves the index
+        // predicate on its own, so it carries no conjunct either.
+        let query = SearchQuery::new("Patient").with_parameter(string_param("name", None, ""));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+
+        assert!(
+            frag.sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"),
+            "{}",
+            frag.sql
+        );
+        assert!(!frag.sql.contains("IS NOT NULL"), "{}", frag.sql);
         match &frag.params[0] {
-            SqlParam::Text(p) => assert_eq!(
-                p, "50\\%off%",
-                "the value's own '%' must be escaped; only the trailing \
-                 starts-with wildcard is live"
-            ),
+            SqlParam::Text(p) => assert_eq!(p, "%"),
             other => panic!("expected a text param, got {:?}", other),
         }
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn multi_value_string_search_numbers_both_bounds_of_every_value() {
+        // The starts-with form binds two parameters per value, so a two-value
+        // OR-list must be numbered $3..$6 — not $3,$4 — or every later
+        // parameter in the query is bound to the wrong placeholder.
+        let param = SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Eq, "ann"),
+                SearchValue::new(SearchPrefix::Eq, "bob"),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Patient").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+
+        assert!(frag.sql.contains("~>=~ $3 AND"), "{}", frag.sql);
+        assert!(frag.sql.contains("~<~ $4)"), "{}", frag.sql);
+        assert!(frag.sql.contains("~>=~ $5 AND"), "{}", frag.sql);
+        assert!(frag.sql.contains("~<~ $6)"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 4);
+    }
+
+    /// Builds a string `SearchParameter` with an optional modifier.
+    fn string_param(name: &str, modifier: Option<SearchModifier>, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::String,
+            modifier,
+            values: vec![SearchValue::new(SearchPrefix::Eq, value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    #[test]
+    fn folded_string_search_implies_the_partial_index_predicate() {
+        // `idx_search_string_folded_pattern` is partial, and Postgres only uses
+        // a partial index when the query implies its predicate.
+        //
+        // v25 got there with an explicit `value_string IS NOT NULL` conjunct,
+        // because `COALESCE(a, b) LIKE …` does not imply it (COALESCE is not
+        // strict). v34 rewords the index predicate onto the COALESCE itself and
+        // lets the strict operator do the proving — which also takes the
+        // conjunct, and the 200x row-estimate error it caused, out of the
+        // starts-with plan. See `migrate_v32_to_v33`.
+        let query =
+            SearchQuery::new("Patient").with_parameter(string_param("name", None, "Emilia"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+        assert!(
+            frag.sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) ~>=~ $3"),
+            "starts-with must prove the predicate through the strict operator: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("IS NOT NULL"),
+            "the conjunct is what made the planner estimate 25 rows for a \
+             5,000-row slice; it must not come back: {}",
+            frag.sql
+        );
+
+        // `:contains`/`:text` lose it too. `~~` is strict in the COALESCE, so
+        // it proves the predicate of both the trigram GIN index and the btree
+        // pattern index; carrying the conjunct as well only reintroduced the
+        // estimate error, and on that estimate the planner never costed the GIN
+        // scan competitively (measured: 1,709 buffers on the btree slice scan
+        // versus 58 once the conjunct is gone and the GIN index exists).
+        for modifier in [Some(SearchModifier::Contains), Some(SearchModifier::Text)] {
+            let query = SearchQuery::new("Patient").with_parameter(string_param(
+                "name",
+                modifier.clone(),
+                "Emilia",
+            ));
+            let frag =
+                PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+            assert!(
+                frag.sql
+                    .contains("COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"),
+                "modifier {:?} must match the folded expression: {}",
+                modifier,
+                frag.sql
+            );
+            assert!(
+                !frag.sql.contains("IS NOT NULL"),
+                "modifier {:?} must not carry the conjunct — it is what kept the \
+                 planner off the trigram index: {}",
+                modifier,
+                frag.sql
+            );
+        }
+    }
+
+    #[test]
+    fn exact_string_search_keeps_the_bare_column_predicate() {
+        // `:exact` reads `value_string` directly, which is already strict, so it
+        // must not acquire the redundant conjunct — `idx_search_string` serves it.
+        let query = SearchQuery::new("Patient").with_parameter(string_param(
+            "name",
+            Some(SearchModifier::Exact),
+            "Emilia",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+
+        assert!(frag.sql.contains("value_string = $3"), "{}", frag.sql);
+        assert!(!frag.sql.contains("IS NOT NULL"), "{}", frag.sql);
+        assert!(!frag.sql.contains("COALESCE"), "{}", frag.sql);
+    }
+
+    /// Builds a token `SearchParameter` with an optional modifier.
+    fn token_param(name: &str, modifier: Option<SearchModifier>, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: vec![SearchValue::new(SearchPrefix::Eq, value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    /// Builds a reference `SearchParameter` with an optional modifier.
+    fn reference_param(
+        name: &str,
+        modifier: Option<SearchModifier>,
+        value: &str,
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Reference,
+            modifier,
+            values: vec![SearchValue::new(SearchPrefix::Eq, value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    /// v28 dropped `idx_search_string_folded`, the btree on the bare
+    /// `value_string_folded` column, because no emitted predicate can seek it:
+    /// the column is only ever read through `COALESCE(value_string_folded,
+    /// lower(value_string))`, which an index on the bare column cannot match,
+    /// and `sort_value_column` maps `String` to `value_string`.
+    ///
+    /// If a bare predicate on the folded column is ever added back it will get a
+    /// sequential scan and nobody will notice, so pin the rule here.
+    #[test]
+    fn the_folded_column_is_only_ever_read_through_the_coalesce() {
+        for modifier in [
+            None,
+            Some(SearchModifier::Contains),
+            Some(SearchModifier::Text),
+            Some(SearchModifier::Exact),
+        ] {
+            let query = SearchQuery::new("Patient").with_parameter(string_param(
+                "name",
+                modifier.clone(),
+                "Emilia",
+            ));
+            let frag =
+                PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+            assert_eq!(
+                frag.sql.matches("value_string_folded").count(),
+                frag.sql.matches(FOLDED_STRING_EXPR).count(),
+                "modifier {:?} reads the folded column outside the indexed \
+                 COALESCE, which no index in the schema can serve: {}",
+                modifier,
+                frag.sql
+            );
+        }
+        assert_eq!(
+            sort_value_column(SearchParamType::String),
+            Some("value_string")
+        );
+    }
+
+    /// v28 dropped `idx_search_token_display` and `idx_search_reference_display`.
+    /// Both were btrees in the default operator class, and `ILIKE` is not
+    /// sargable against one at any prefix — so they were only ever scanners of
+    /// their `(tenant_id, resource_type, param_name)` slice, which
+    /// `idx_search_token_code` and `idx_search_reference_pattern` cover over a
+    /// superset of the rows.
+    ///
+    /// The drop is safe exactly as long as `ILIKE` stays the only operator on
+    /// these columns. An `=` or a prefix `LIKE` added later WOULD be sargable
+    /// and would then want an index that no longer exists.
+    #[test]
+    fn display_columns_are_only_ever_matched_with_ilike() {
+        let cases: Vec<(SearchQuery, &str)> = vec![
+            (
+                SearchQuery::new("Observation").with_parameter(token_param(
+                    "code",
+                    Some(SearchModifier::Text),
+                    "Blood",
+                )),
+                "value_token_display",
+            ),
+            (
+                SearchQuery::new("Observation").with_parameter(token_param(
+                    "code",
+                    Some(SearchModifier::CodeText),
+                    "Blood",
+                )),
+                "value_token_display",
+            ),
+            (
+                SearchQuery::new("Observation").with_parameter(reference_param(
+                    "subject",
+                    Some(SearchModifier::Text),
+                    "Emilia",
+                )),
+                "value_reference_display",
+            ),
+            (
+                SearchQuery::new("Observation").with_parameter(reference_param(
+                    "subject",
+                    Some(SearchModifier::CodeText),
+                    "Emilia",
+                )),
+                "value_reference_display",
+            ),
+        ];
+
+        for (query, column) in cases {
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("display shape");
+            let mentions = frag.sql.matches(column).count();
+            assert!(mentions > 0, "expected a {column} predicate: {}", frag.sql);
+            assert_eq!(
+                frag.sql.matches(&format!("{column} ILIKE")).count(),
+                mentions,
+                "{column} must only ever be matched with ILIKE — anything \
+                 sargable needs an index this schema no longer has: {}",
+                frag.sql
+            );
+        }
+    }
+
+    /// v28 dropped `idx_search_reference` and kept its `text_pattern_ops` twin
+    /// `idx_search_reference_pattern`, which has the same key columns and the
+    /// same partial predicate. That family carries `=` but NOT the ordering
+    /// operators, so the drop holds only while every predicate on
+    /// `value_reference` is equality or a `LIKE` — and it is the pattern index,
+    /// not this one, that the prefix `LIKE`s need.
+    #[test]
+    fn reference_predicates_never_need_a_collation_ordered_index() {
+        let queries = [
+            SearchQuery::new("Observation").with_parameter(reference_param(
+                "subject",
+                None,
+                "Patient/p1",
+            )),
+            SearchQuery::new("Observation").with_parameter(reference_param("subject", None, "p1")),
+            SearchQuery::new("Observation").with_parameter(reference_param(
+                "subject",
+                Some(SearchModifier::Below),
+                "http://h/Organization/o1",
+            )),
+            SearchQuery::new("Observation").with_parameter(reference_param(
+                "subject",
+                Some(SearchModifier::Contains),
+                "p1",
+            )),
+        ];
+
+        for query in queries {
+            let frag =
+                PostgresQueryBuilder::build_search_query(&query, 2).expect("reference shape");
+            for op in [" < ", " > ", " <= ", " >= ", "ORDER BY value_reference"] {
+                assert!(
+                    !frag.sql.contains(op),
+                    "an ordering comparison on value_reference cannot use the \
+                     text_pattern_ops index that survives v28 (`{op}`): {}",
+                    frag.sql
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn system_qualified_token_is_one_extractable_equality_conjunction() {
+        // `Encounter?class=http://…v3-ActCode|AMB`. This is the shape v25's
+        // `idx_search_token` is keyed for: every column ahead of the sort key is
+        // bound by equality, so the index can return the fast path's rows already
+        // ordered. If this ever became a range, an OR, or a second sublink, that
+        // index could no longer stream and the LIMIT would stop terminating early.
+        let param = SearchParameter {
+            name: "class".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "http://terminology.hl7.org/CodeSystem/v3-ActCode|AMB",
+            )],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(
+            pred,
+            "param_name = 'class' AND ((value_token_system = $3 AND value_token_code = $4))"
+        );
+        assert_eq!(frag.params.len(), 2);
+        match (&frag.params[0], &frag.params[1]) {
+            (SqlParam::Text(system), SqlParam::Text(code)) => {
+                assert_eq!(system, "http://terminology.hl7.org/CodeSystem/v3-ActCode");
+                assert_eq!(code, "AMB");
+            }
+            other => panic!("expected two text params, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bare_token_predicate_never_mentions_the_system_column() {
+        // The counterpart to the test above, and the reason `Encounter?status` is
+        // 4x cheaper than `Encounter?class` on identical data: a bare code is not
+        // strict in `value_token_system`, so it cannot reach the partial
+        // `idx_search_token` at all and is served by the code-first indexes.
+        let param = SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "finished")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(pred, "param_name = 'status' AND (value_token_code = $3)");
+        assert!(!pred.contains("value_token_system"));
+    }
+
+    /// v31 replaced `idx_search_token` (2,283 MB, system-first, and unable to
+    /// give this shape the sort key because `value_token_code` sat between the
+    /// system and `last_updated`) with a seek-only `idx_search_token_system`;
+    /// v32 dropped that too, because `system|code` is strict in
+    /// `value_token_system` as well and the planner pointed it there —
+    /// 80,089,347 tuples read for a 358 ms p99.
+    ///
+    /// So `idx_search_token_code_recent` is now the ONLY index the `system|`
+    /// form can reach, and the `value_token_code IS NOT NULL` conjunct below is
+    /// the only reason it can: that index is partial on exactly that predicate.
+    /// Drop the conjunct and this shape has no index at all; turn it into a
+    /// comparison against a code VALUE and the search becomes wrong.
+    #[test]
+    fn system_only_token_implies_the_code_partial_predicate() {
+        let param = SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "http://loinc.org|")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(
+            pred,
+            "param_name = 'code' AND ((value_token_code IS NOT NULL AND value_token_system = $3))"
+        );
+        assert_eq!(frag.params.len(), 1);
+        match &frag.params[0] {
+            SqlParam::Text(system) => assert_eq!(system, "http://loinc.org"),
+            other => panic!("expected one text param, got {:?}", other),
+        }
+    }
+
+    /// The `system|` conjunct is only row-set-preserving while every token row
+    /// that carries a system also carries a code. `IndexValue::Token` makes that
+    /// a type-level fact (`code: String`), but an OR-list mixing spellings must
+    /// still put each arm's conjunct inside its own parentheses, or `AND`
+    /// binding tighter than `OR` would be the only thing keeping the grouping
+    /// correct.
+    #[test]
+    fn mixed_token_or_list_keeps_each_arm_parenthesized() {
+        let param = SearchParameter {
+            name: "class".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Eq, "AMB"),
+                SearchValue::new(
+                    SearchPrefix::Eq,
+                    "http://terminology.hl7.org/CodeSystem/v3-ActCode|",
+                ),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token OR-list");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(
+            pred,
+            concat!(
+                "param_name = 'class' AND (value_token_code = $3 OR ",
+                "(value_token_code IS NOT NULL AND value_token_system = $4))"
+            )
+        );
+        assert_eq!(frag.params.len(), 2);
     }
 
     #[test]
@@ -2237,10 +3529,14 @@ mod tests {
             "reference OR-list must be one sublink: {}",
             frag.sql
         );
-        // Two params per type-prefixed value: the exact base and the
-        // `/_history/%` pattern (the pattern is built in Rust so the value can be
-        // LIKE-escaped, rather than concatenated onto the raw bind in SQL).
-        assert_eq!(frag.params.len(), 4);
+        // One param per type-prefixed value since v33: the base. The stored
+        // value is the base too, so there is no second form to match.
+        assert_eq!(frag.params.len(), 2);
+        assert!(
+            !frag.sql.contains("LIKE"),
+            "the OR-list must be pure equalities: {}",
+            frag.sql
+        );
     }
 
     /// A bare logical id is the primary form of a reference search
@@ -2270,8 +3566,8 @@ mod tests {
             .collect();
         assert_eq!(
             params,
-            vec!["patient-1", "%/patient-1", "%/patient-1/\\_history/%"],
-            "a bare id must match exactly, as a `/id` suffix, and versioned: {}",
+            vec!["patient-1", "%/patient-1"],
+            "a bare id must match exactly and as a `/id` suffix: {}",
             frag.sql
         );
         assert_eq!(
@@ -2307,10 +3603,134 @@ mod tests {
             .collect();
         assert_eq!(
             params,
-            vec!["Patient/patient-1", "Patient/patient-1/\\_history/%"],
-            "the type modifier pins the reference, so no `/id` suffix match: {}",
+            vec!["Patient/patient-1"],
+            "the type modifier pins the reference to one equality: {}",
             frag.sql
         );
+    }
+
+    /// v33's read-side claim, pinned. The `Type/id` form — every reference
+    /// search the benchmark sends, and 18% of the search suite's Postgres time —
+    /// must emit ONE equality. A disjunction here forces a `BitmapOr` and a
+    /// `Bitmap Heap Scan` whose `Filter` re-evaluates the whole predicate on
+    /// every matching heap tuple: measured 1.50 ms/call against 0.47 ms.
+    #[test]
+    fn reference_type_prefixed_emits_one_sargable_equality() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "Patient/patient-1")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("Type/id reference");
+
+        assert!(
+            frag.sql.contains("value_reference = $3"),
+            "must be an equality on the bound base: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("LIKE") && !frag.sql.contains(" OR "),
+            "no disjunction: an OR is index-usable only when every arm is, and \
+             the `/_history/%` arm was the one that never matched: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    /// A versioned SEARCH value is still stripped, and now meets a stored value
+    /// that was stripped by the writer — so the two ends agree without a
+    /// pattern.
+    #[test]
+    fn reference_type_prefixed_version_is_stripped_from_the_search_value() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "Patient/patient-1/_history/7",
+            )],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("versioned Type/id");
+        match &frag.params[0] {
+            SqlParam::Text(t) => assert_eq!(t, "Patient/patient-1"),
+            other => panic!("expected a text param, got {:?}", other),
+        }
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    /// The compartment predicate carried the worst-shaped arm in the backend:
+    /// `LIKE $n || '/_history/%'` builds the pattern in SQL, so it is an
+    /// `OpExpr` rather than a `Const` and no fixed prefix can be derived from it
+    /// under *any* plan — while still costing the whole predicate its index,
+    /// because an OR needs every arm indexable.
+    #[test]
+    fn compartment_membership_is_one_equality_per_param_set() {
+        let mut query = SearchQuery::new("Observation");
+        query.compartment = Some(CompartmentMembership {
+            reference: "Patient/patient-1/_history/3".to_string(),
+            params: vec!["subject".to_string(), "performer".to_string()],
+        });
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("compartment");
+        assert!(
+            !frag.sql.contains("LIKE"),
+            "no pattern arm survives: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1, "one bind, not two: {}", frag.sql);
+        match &frag.params[0] {
+            SqlParam::Text(t) => assert_eq!(t, "Patient/patient-1"),
+            other => panic!("expected a text param, got {:?}", other),
+        }
+    }
+
+    /// `:identifier` must be driven by the identifier lookup, not by a
+    /// correlated `EXISTS` over the reference slice. The old form measured
+    /// 285.6 ms / 80,393 buffers against 1.4 ms / 845 on the same replica, and
+    /// binding `resource_type` into it — the repair the missing bind invites —
+    /// measured 338.2 ms, i.e. slower still.
+    #[test]
+    fn reference_identifier_is_driven_by_the_identifier_lookup() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: Some(SearchModifier::Identifier),
+            values: vec![SearchValue::new(SearchPrefix::Eq, "http://ex.org/mrn|A1")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect(":identifier");
+
+        assert!(
+            !frag.sql.contains("SUBSTRING") && !frag.sql.contains("EXISTS"),
+            "the correlated form must be gone: {}",
+            frag.sql
+        );
+        assert!(
+            frag.sql.contains("ref.value_reference IN")
+                && frag
+                    .sql
+                    .contains("idx.resource_type || '/' || idx.resource_id"),
+            "the sub-select must yield the target's Type/id: {}",
+            frag.sql
+        );
+        // Both levels stay tenant-scoped. Dropping `idx.tenant_id` would let
+        // another tenant's identifier select this tenant's rows.
+        assert_eq!(
+            frag.sql.matches("tenant_id = $1").count(),
+            2,
+            "both levels scoped: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 2);
     }
 
     /// A versioned search value is stripped before the bare-id suffix match, so
@@ -2333,7 +3753,7 @@ mod tests {
             SqlParam::Text(t) => assert_eq!(t, "patient-1"),
             other => panic!("expected a text param, got {:?}", other),
         }
-        assert_eq!(frag.params.len(), 3, "version-stripped back to a bare id");
+        assert_eq!(frag.params.len(), 2, "version-stripped back to a bare id");
     }
 
     /// The suffix match makes LIKE escaping load-bearing: unescaped, `patient=%`

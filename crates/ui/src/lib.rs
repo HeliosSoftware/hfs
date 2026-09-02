@@ -41,15 +41,22 @@
 mod bulk_export;
 mod bulk_import;
 mod capability;
-mod capability_json;
 mod compartments;
 mod conformance;
 mod editor;
 mod history;
 mod i18n;
-mod json_view;
+mod rail_state;
 mod search_params;
 mod sql_export;
+
+/// The bounded JSON-fragment engine behind the Raw CapabilityStatement fold
+/// moved to `helios-ui-chrome` (#808) so HTS renders the same paginated tree
+/// instead of a byte-capped `<pre>`. Re-exported under their old in-crate
+/// names so every existing `capability_json::`/`json_view::` reference below
+/// — `editor.rs` included — keeps compiling unchanged.
+pub(crate) use helios_ui_chrome::capability_json;
+pub(crate) use helios_ui_chrome::json_view;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
@@ -285,23 +292,22 @@ async fn resolve_prefs(
         return next.run(request).await;
     }
 
+    let user_key = settings_user_key(request.extensions().get::<helios_auth::Principal>());
     let mut version = state.fhir_version;
     let mut tenant = RequestTenant {
         id: state.default_tenant.clone(),
         display: None,
         multi: false,
     };
-    let document = match &state.settings {
-        Some(store) => {
-            let user = settings_user_key(request.extensions().get::<helios_auth::Principal>());
-            match store.get_settings(&user).await {
-                Ok(stored) => stored.map(|s| s.document),
-                Err(_) => None,
-            }
-        }
+    // The single settings read every rail page's state (`rail_state::RequestSettings`,
+    // stamped below) is built from too — reading it again per page would break
+    // that module's zero-extra-reads contract.
+    let stored = match &state.settings {
+        Some(store) => store.get_settings(&user_key).await.ok().flatten(),
         None => None,
     };
-    if let Some(document) = &document {
+    if let Some(stored) = &stored {
+        let document = &stored.document;
         if let Some(choice) = document
             .get(SETTINGS_VERSION_KEY)
             .and_then(|v| v.as_str())
@@ -336,6 +342,13 @@ async fn resolve_prefs(
         };
     request.extensions_mut().insert(RequestVersion(version));
     request.extensions_mut().insert(tenant);
+    request
+        .extensions_mut()
+        .insert(rail_state::RequestSettings {
+            version: stored.as_ref().map(|s| s.version).unwrap_or(0),
+            document: stored.map(|s| s.document),
+            user_key,
+        });
     next.run(request).await
 }
 
@@ -692,6 +705,21 @@ struct SearchPage {
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
+    /// This request's resolved rail selection (rail_state RF1): explicit
+    /// `?type=` when given, else the stored `rails.search.last` when it still
+    /// resolves, else `Patient`. Exposed as `data-selected-type` so
+    /// `saved-queries.js` never falls back to a hardcoded default on initial
+    /// load or `popstate` (RF5) — the same contract `ResourcesPage` already
+    /// carries.
+    selected_type: String,
+    /// The "Recently used" group's rows (RF6), server-rendered by
+    /// `partials/rail_recent.html`.
+    recent_entries: Vec<rail_state::ResolvedRailEntry>,
+    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
+    /// carried to the client so `saved-queries.js` never redeclares it.
+    rail_page: &'static str,
+    /// `rail_state::MAX_RECENT`, carried the same way.
+    max_recent: usize,
     /// No-JS prefill for the builder's URL input (see `ResourcesPage`'s field
     /// of the same name); this page opens with no type context, so it is
     /// always `None`.
@@ -722,6 +750,14 @@ struct ResourcesPage {
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
+    /// The "Recently used" group's rows (RF6), server-rendered by
+    /// `partials/rail_recent.html`.
+    recent_entries: Vec<rail_state::ResolvedRailEntry>,
+    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
+    /// carried to the client so `saved-queries.js` never redeclares it.
+    rail_page: &'static str,
+    /// `rail_state::MAX_RECENT`, carried the same way.
+    max_recent: usize,
     /// No-JS prefill for the builder's URL input (#605): `GET /{selected_type}`,
     /// so the form already shows the query the client JS runs on load.
     builder_url: Option<String>,
@@ -753,6 +789,17 @@ struct QueriesPage {
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
+    /// This request's resolved rail selection — see `SearchPage`'s field of
+    /// the same name.
+    selected_type: String,
+    /// The "Recently used" group's rows (RF6), server-rendered by
+    /// `partials/rail_recent.html`.
+    recent_entries: Vec<rail_state::ResolvedRailEntry>,
+    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
+    /// carried to the client so `saved-queries.js` never redeclares it.
+    rail_page: &'static str,
+    /// `rail_state::MAX_RECENT`, carried the same way.
+    max_recent: usize,
     /// No-JS prefill for the builder's URL input (see `ResourcesPage`'s field
     /// of the same name); this page opens with no type context, so it is
     /// always `None`.
@@ -788,25 +835,6 @@ struct JsonViewFragment {
     json_lines: Vec<json_view::JsonLine>,
     json_view_id: String,
     json_view_paths: bool,
-}
-
-/// A small CapabilityStatement (or subtree) rendered by the unchanged shared
-/// JSON highlighter.
-#[derive(Template)]
-#[template(path = "partials/capability-json-full.html")]
-struct CapabilityJsonFullFragment {
-    i18n: I18n,
-    json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
-}
-
-/// One bounded level of a large CapabilityStatement.
-#[derive(Template)]
-#[template(path = "partials/capability-json-outline.html")]
-struct CapabilityJsonOutlineFragment {
-    i18n: I18n,
-    outline: capability_json::Outline,
 }
 
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
@@ -1297,6 +1325,10 @@ pub fn mount_with_conformance_source_and_runtime(
             "/ui/bulk-import/{id}/abort",
             axum::routing::post(bulk_import::abort),
         )
+        .route(
+            "/ui/bulk-import/{id}/complete",
+            axum::routing::post(bulk_import::complete),
+        )
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
@@ -1624,6 +1656,124 @@ fn build_rail_entries(
         .collect()
 }
 
+/// RF1.2/RF1.3 for a type rail (Resources, Search, Saved Queries): the
+/// stored `last` when it still names one of `resource_types`, else
+/// `fallback`. Only consulted when the request carried no explicit selection
+/// at all — an explicit one always wins outright, valid or not (see
+/// `resources_query_context`'s doc for why Resources needs its own explicit
+/// resolution).
+fn resolve_stored_type(last: Option<&str>, resource_types: &[String], fallback: &str) -> String {
+    last.filter(|id| resource_types.iter().any(|t| t == id))
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// RF3/RF4: records an explicit, resolving type selection as this page's
+/// rail state, persisting only when [`rail_state::RailState::select`] says
+/// something actually changed (RNF2). Returns `rail` unchanged when
+/// `explicit` is absent or does not name a real type — an invalid explicit
+/// choice still renders (RF1.1), it is simply never remembered (RF3) — so a
+/// caller can always render this request's "Recently used" group from the
+/// returned state, whether or not a write just landed.
+async fn record_type_selection(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    page: rail_state::RailPage,
+    rail: rail_state::RailState,
+    explicit: Option<&str>,
+    resource_types: &[String],
+) -> rail_state::RailState {
+    let Some(id) = explicit.filter(|id| resource_types.iter().any(|t| t == id)) else {
+        return rail;
+    };
+    match rail.select(rail_state::RailEntry::id_only(id)) {
+        Some(next) => {
+            rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
+            next
+        }
+        None => rail,
+    }
+}
+
+/// RF6: the "Recently used" group's rows for a type rail, resolved against
+/// this render's own live entries so label/count/href/current always match
+/// what the scrollable list already shows. An id no longer valid for the
+/// request's tenant/version (absent from `entries`) is hidden, never pruned
+/// — RF1 already lets a stale `last` fall back to the page default in
+/// silence, and a filtered render costs nothing.
+fn resolve_type_recents(
+    rail: &rail_state::RailState,
+    entries: &[RailEntry],
+    base: &str,
+) -> Vec<rail_state::ResolvedRailEntry> {
+    let live: std::collections::HashMap<String, rail_state::LiveRailItem> = entries
+        .iter()
+        .map(|e| {
+            (
+                e.name.clone(),
+                rail_state::LiveRailItem {
+                    label: e.name.clone(),
+                    meta: None,
+                    count: e.count.clone(),
+                    href: e.href.clone(),
+                    current: e.current,
+                },
+            )
+        })
+        .collect();
+    let is_valid: &dyn Fn(&str) -> bool = &|id| live.contains_key(id);
+    rail.resolve_recents(&live, |id| format!("{base}?type={id}"), Some(is_valid))
+}
+
+/// RF2 for a SQL rail (View Definitions, SQL Queries, SQL Views): records an
+/// explicit, resolving selection as this page's rail state — `select` with
+/// the resource's own `{id, name, meta}` snapshot `entry`, since the SQL
+/// rails are server-paged/filtered (#741) and cannot rely on the live rail
+/// always holding a recent the way a type rail does. Persists only when
+/// [`rail_state::RailState::select`] says something actually changed
+/// (RNF2). The counterpart to [`record_type_selection`] for the three pages
+/// that carry a snapshot instead of a bare id.
+async fn record_snapshot_selection(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    page: rail_state::RailPage,
+    rail: rail_state::RailState,
+    entry: rail_state::RailEntry,
+) -> rail_state::RailState {
+    match rail.select(entry) {
+        Some(next) => {
+            rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
+            next
+        }
+        None => rail,
+    }
+}
+
+/// RF3 for a SQL rail: prunes an explicit selection that did not resolve (a
+/// deleted or mistyped id) from the stored registry, persisting only when
+/// the id was actually recorded (RNF2 — [`rail_state::RailState::prune`]
+/// already reports the no-op case). The request itself keeps its current
+/// "no selection" render either way; this only cleans the record so a later
+/// visit does not keep resolving the same id to a resource that is gone.
+async fn prune_stale_selection(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    page: rail_state::RailPage,
+    rail: rail_state::RailState,
+    id: &str,
+) -> rail_state::RailState {
+    match rail.prune(id) {
+        Some(next) => {
+            rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
+            next
+        }
+        None => rail,
+    }
+}
+
 /// Search page: natural language and the visual builder over one editable query.
 async fn search(
     State(state): State<WebState>,
@@ -1631,8 +1781,23 @@ async fn search(
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<SearchQuery>,
+    settings: rail_state::RequestSettings,
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
+    let explicit_type = query.resource_type.as_deref().filter(|t| !t.is_empty());
+    let rail = record_type_selection(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        rail_state::RailPage::Search,
+        settings.rail(rail_state::RailPage::Search, &rt.id),
+        explicit_type,
+        &resource_types,
+    )
+    .await;
+    let selected_type = explicit_type
+        .map(str::to_string)
+        .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
     let live =
         helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
             .await;
@@ -1640,8 +1805,9 @@ async fn search(
         "/ui/search",
         &resource_types,
         live.as_ref().map(|s| s.available.as_slice()),
-        query.resource_type.as_deref(),
+        Some(selected_type.as_str()),
     );
+    let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/search");
     render(SearchPage {
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1651,6 +1817,10 @@ async fn search(
         resource_types,
         show_save: false,
         rail_entries,
+        selected_type,
+        recent_entries,
+        rail_page: rail_state::RailPage::Search.key(),
+        max_recent: rail_state::MAX_RECENT,
         builder_url: None,
     })
 }
@@ -1670,8 +1840,23 @@ async fn queries(
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<QueriesQuery>,
+    settings: rail_state::RequestSettings,
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
+    let explicit_type = query.resource_type.as_deref().filter(|t| !t.is_empty());
+    let rail = record_type_selection(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        rail_state::RailPage::Queries,
+        settings.rail(rail_state::RailPage::Queries, &rt.id),
+        explicit_type,
+        &resource_types,
+    )
+    .await;
+    let selected_type = explicit_type
+        .map(str::to_string)
+        .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
     let live =
         helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
             .await;
@@ -1679,8 +1864,9 @@ async fn queries(
         "/ui/queries",
         &resource_types,
         live.as_ref().map(|s| s.available.as_slice()),
-        query.resource_type.as_deref(),
+        Some(selected_type.as_str()),
     );
+    let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/queries");
     render(QueriesPage {
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -1688,6 +1874,10 @@ async fn queries(
         resource_types,
         show_save: true,
         rail_entries,
+        selected_type,
+        recent_entries,
+        rail_page: rail_state::RailPage::Queries.key(),
+        max_recent: rail_state::MAX_RECENT,
         builder_url: None,
     })
 }
@@ -1711,12 +1901,29 @@ async fn resources(
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<ResourcesQuery>,
+    settings: rail_state::RequestSettings,
 ) -> Response {
     let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
     // `url` is the builder's actual query, so it wins over the convenience
     // `type` bookmark. Parse it here too: Create must be safe before the
-    // deferred client script hydrates the page.
-    let (selected_type, builder_url) = resources_query_context(&query);
+    // deferred client script hydrates the page. `explicit_type` is `None`
+    // only when neither `url` nor `type` named anything at all — RF1.1 always
+    // wins outright once present, invalid or not, so only its absence falls
+    // through to the stored/fallback resolution below.
+    let (explicit_type, url_from_query) = resources_query_context(&query);
+    let rail = record_type_selection(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        rail_state::RailPage::Resources,
+        settings.rail(rail_state::RailPage::Resources, &rt.id),
+        explicit_type.as_deref(),
+        &resource_types,
+    )
+    .await;
+    let selected_type = explicit_type
+        .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
+    let builder_url = url_from_query.or_else(|| Some(format!("/{selected_type}")));
     let targets = match state.conformance.metadata(rv.0, &rt.id).await {
         Ok(statement) => {
             match capability::CreateTargets::from_statement(&resource_types, &statement, rv.0) {
@@ -1757,6 +1964,7 @@ async fn resources(
         live.as_ref().map(|s| s.available.as_slice()),
         Some(selected_type.as_str()),
     );
+    let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/resources");
     render(ResourcesPage {
         status: current_status(&state, rv.0, &rt),
         i18n,
@@ -1783,6 +1991,9 @@ async fn resources(
         create_metadata_available: targets.is_some(),
         show_save: false,
         rail_entries,
+        recent_entries,
+        rail_page: rail_state::RailPage::Resources.key(),
+        max_recent: rail_state::MAX_RECENT,
         builder_url,
     })
 }
@@ -1811,7 +2022,23 @@ struct ResourcesQuery {
     url: Option<String>,
 }
 
-fn resources_query_context(query: &ResourcesQuery) -> (String, Option<String>) {
+/// Resolves the Resources page's explicit RF1.1 selection and no-JS builder
+/// prefill from the query string, ahead of RF1.2/RF1.3's stored/fallback
+/// resolution.
+///
+/// `?url=` wins outright when present — the builder's actual query, so it
+/// beats the convenience `?type=` bookmark (#605) — even when no type can be
+/// parsed from it: an opaque or malformed URL still searches verbatim
+/// (`Some(String::new())`, never re-routed through the stored/fallback path),
+/// matching the page's existing "preserve invalid input" contract. Otherwise
+/// `?type=` (when non-empty) is the explicit type, also used verbatim even if
+/// it names no real resource type — `record_type_selection` is what decides
+/// whether an explicit choice is remembered, never whether it renders.
+///
+/// Returns `(None, None)` only when neither is present at all, letting
+/// RF1.2/RF1.3 resolve the selection and synthesize `/{selected_type}` as the
+/// builder prefill.
+fn resources_query_context(query: &ResourcesQuery) -> (Option<String>, Option<String>) {
     if let Some(raw_url) = &query.url {
         let visible = raw_url
             .trim()
@@ -1820,18 +2047,17 @@ fn resources_query_context(query: &ResourcesQuery) -> (String, Option<String>) {
             .unwrap_or(raw_url.trim())
             .to_string();
         return (
-            resource_type_from_search_url(&visible).unwrap_or_default(),
+            Some(resource_type_from_search_url(&visible).unwrap_or_default()),
             Some(visible),
         );
     }
 
-    let selected = query
+    let explicit = query
         .resource_type
         .as_deref()
         .filter(|value| !value.is_empty())
-        .unwrap_or("Patient")
-        .to_string();
-    (selected.clone(), Some(format!("/{selected}")))
+        .map(str::to_string);
+    (explicit, None)
 }
 
 fn resource_type_from_search_url(raw: &str) -> Option<String> {
@@ -1899,6 +2125,11 @@ async fn query_params_catalog(
 
 /// Query string for the SearchParameter viewer. Every filter is a link and
 /// the search box is a GET form, so the page works without JavaScript.
+///
+/// `base` is left as the raw, three-state `Option<String>` Serde gives it —
+/// absent, present-and-empty, present-and-named all mean something different
+/// to RF1/RF2 (see [`resolve_sp_base`]) — rather than collapsing "absent" and
+/// "explicit all types" into one `None` the way `main` used to.
 #[derive(Deserialize, Default)]
 struct SearchParametersQuery {
     version: Option<String>,
@@ -1914,6 +2145,76 @@ struct SearchParametersQuery {
     refresh: Option<String>,
 }
 
+/// RF1 + RF3 for Search Parameters' `base`, whose one exception (RF2) is that
+/// "All types" is itself an explicit, persistable state
+/// ([`rail_state::RailState::select_all`], `last: ""`), not merely the
+/// absence of a selection:
+///
+/// - `?base=` present and empty is explicit "All types".
+/// - `?base=<name>` present is explicit, whether or not `<name>` is one of
+///   `bases` — resolving only decides whether it is written (RF3), never
+///   whether it renders (RF1.1 always wins, as `build_view` already did for
+///   an unknown base before this ticket).
+/// - `?base=` absent falls back to the stored `last` when it still resolves
+///   (including a stored "All types"), else the page's own fallback, "All
+///   types" — neither is written, since nothing was explicitly asked.
+///
+/// Returns the base to render (`None` for "All types") alongside the
+/// possibly-updated [`rail_state::RailState`], so this same response's
+/// "Recently used" group reflects a write this request just made.
+async fn resolve_sp_base(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    rail: rail_state::RailState,
+    explicit_base: Option<&str>,
+    bases: &std::collections::HashSet<&str>,
+) -> (Option<String>, rail_state::RailState) {
+    async fn persist_if_changed(
+        state: &WebState,
+        user_key: &str,
+        tenant: &str,
+        rail: rail_state::RailState,
+        next: Option<rail_state::RailState>,
+    ) -> rail_state::RailState {
+        match next {
+            Some(next) => {
+                rail_state::persist(
+                    &state.settings,
+                    user_key,
+                    tenant,
+                    rail_state::RailPage::SearchParameters,
+                    &next,
+                )
+                .await;
+                next
+            }
+            None => rail,
+        }
+    }
+
+    match explicit_base {
+        Some("") => {
+            let next = rail.select_all();
+            let rail = persist_if_changed(state, user_key, tenant, rail, next).await;
+            (None, rail)
+        }
+        Some(base) if bases.contains(base) => {
+            let next = rail.select(rail_state::RailEntry::id_only(base));
+            let rail = persist_if_changed(state, user_key, tenant, rail, next).await;
+            (Some(base.to_string()), rail)
+        }
+        Some(base) => (Some(base.to_string()), rail),
+        None => {
+            let resolved = match rail.last.as_deref() {
+                Some(name) if !name.is_empty() && bases.contains(name) => Some(name.to_string()),
+                _ => None,
+            };
+            (resolved, rail)
+        }
+    }
+}
+
 /// SearchParameter viewer page.
 async fn search_parameters(
     State(state): State<WebState>,
@@ -1921,29 +2222,46 @@ async fn search_parameters(
     rv: RequestVersion,
     rt: RequestTenant,
     Query(raw): Query<SearchParametersQuery>,
+    settings: rail_state::RequestSettings,
 ) -> Response {
+    // Explicit ?version= wins; otherwise the user's stored choice (#343).
+    let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
+    let fhir_version = version
+        .as_deref()
+        .and_then(search_params::version_from_str)
+        .unwrap_or_default();
+    if raw.refresh.is_some() {
+        state.sp_catalog.invalidate(&rt.id, fhir_version);
+    }
+    let snapshot = state.sp_catalog.snapshot(&rt.id, fhir_version).await;
+    let bases: std::collections::HashSet<&str> = snapshot
+        .params
+        .iter()
+        .flat_map(|p| p.base.iter().map(String::as_str))
+        .collect();
+    let (base, rail) = resolve_sp_base(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        settings.rail(rail_state::RailPage::SearchParameters, &rt.id),
+        raw.base.as_deref(),
+        &bases,
+    )
+    .await;
     let query = search_params::SpQuery {
-        // Explicit ?version= wins; otherwise the user's stored choice (#343).
-        version: raw.version.or_else(|| Some(rv.0.as_str().to_string())),
-        base: raw.base.filter(|b| !b.is_empty()),
+        version,
+        base,
         ptype: raw.ptype.filter(|t| !t.is_empty()),
         source: raw.source.filter(|s| !s.is_empty()),
         q: raw.q,
         page: raw.page.unwrap_or(1),
         sel: raw.sel.filter(|s| !s.is_empty()),
     };
-    if raw.refresh.is_some() {
-        state.sp_catalog.invalidate(&rt.id, query.fhir_version());
-    }
-    let snapshot = state
-        .sp_catalog
-        .snapshot(&rt.id, query.fhir_version())
-        .await;
     render(SearchParametersPage {
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "search-parameters",
-        view: search_params::build_view(&snapshot, &query),
+        view: search_params::build_view(&snapshot, &query, &rail),
     })
 }
 
@@ -2047,6 +2365,15 @@ struct SqlViewDefinitionsPage {
     run_error: Option<String>,
     save_error: Option<String>,
     saved: bool,
+    /// RF4/RF6: the "Recently used" group's own rows.
+    recent_entries: Vec<rail_state::ResolvedRailEntry>,
+    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
+    /// carried to the template so `partials/rail_recent.html`'s clones can
+    /// name it without redeclaring it.
+    rail_page: &'static str,
+    /// The recents cap a tampered client can never exceed, likewise from
+    /// `rail_state::MAX_RECENT`, carried the same way.
+    max_recent: usize,
 }
 
 struct SelectedVd {
@@ -2067,6 +2394,94 @@ struct SqlVdQuery {
     page: Option<String>,
 }
 
+/// Shapes a stored `ViewDefinition` resource into the editor's `(id, name,
+/// json)` triple. `name` falls back to `id` when the resource itself has
+/// none, the same default the rail's own summaries use.
+fn shape_vd(vd: &serde_json::Value) -> (String, String, String) {
+    let id = vd
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let name = vd
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&id)
+        .to_string();
+    let json = serde_json::to_string_pretty(vd).unwrap_or_default();
+    (id, name, json)
+}
+
+/// Resolves one candidate ViewDefinition id against this render's own page
+/// of the server-paged rail search (#741) or, when it is off that page (a
+/// different page, or a filter that excludes it), a direct read by id — the
+/// same fallback the explicit `?vd=` selection has always used (RF1.1), now
+/// shared with a stored `last` id that is off the visible page too (RF1.2),
+/// and with the fallback candidate the page falls back to when neither an
+/// explicit nor a stored selection resolves (RF1.3).
+async fn resolve_vd_by_id(
+    state: &WebState,
+    rv: helios_fhir::FhirVersion,
+    tenant: &str,
+    id: &str,
+    page_resources: &mut Vec<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if let Some(i) = page_resources
+        .iter()
+        .position(|vd| vd.get("id").and_then(serde_json::Value::as_str) == Some(id))
+    {
+        return Some(page_resources.swap_remove(i));
+    }
+    match state
+        .conformance
+        .read_resource("ViewDefinition", id, rv, tenant)
+        .await
+    {
+        Ok(vd) => Some(vd),
+        Err(error) => {
+            // A stale or mistyped id is ordinary navigation, not an operator
+            // concern — the caller falls back to its own no-selection or
+            // next-candidate handling.
+            tracing::debug!("ViewDefinition read failed for vd={id}: {error}");
+            None
+        }
+    }
+}
+
+/// RF6 for View Definitions: the "Recently used" group's rows, resolved
+/// against this render's own page of the server-paged rail search so
+/// label/meta/href/current match what the list already shows. RF4's "the
+/// group is never itself filtered by `?filter=`" falls out for free: an id
+/// the current page/filter excludes is simply absent from `summaries` (and
+/// so from `live`), so [`rail_state::RailState::resolve_recents`] renders it
+/// from its stored `{name, meta}` snapshot instead.
+fn resolve_vd_recents(
+    rail: &rail_state::RailState,
+    summaries: &[sql_views::VdSummary],
+    selected_id: Option<&str>,
+) -> Vec<rail_state::ResolvedRailEntry> {
+    let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                rail_state::LiveRailItem {
+                    label: item.name.clone(),
+                    meta: Some(item.resource.clone()),
+                    count: None,
+                    href: format!("/ui/sql/view-definitions?vd={}", item.id),
+                    current: selected_id == Some(item.id.as_str()),
+                },
+            )
+        })
+        .collect();
+    rail.resolve_recents(
+        &live,
+        |id| format!("/ui/sql/view-definitions?vd={id}"),
+        None,
+    )
+}
+
 /// `GET /ui/sql/view-definitions`: the rail is one page of a server-side
 /// `ViewDefinition` search (#741) — `name:contains`, `_sort=name`,
 /// `_count`/`_offset` — never the full-collection fetch this page used
@@ -2081,6 +2496,7 @@ async fn sql_view_definitions_page(
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<SqlVdQuery>,
+    settings: rail_state::RequestSettings,
 ) -> Response {
     let filter = query.filter.unwrap_or_default();
     // Absent or non-numeric falls back to page 1 rather than 400ing — a
@@ -2122,8 +2538,11 @@ async fn sql_view_definitions_page(
         (page > 1).then(|| sql_views::page_href(&filter, query.vd.as_deref(), page - 1));
     let next_href = has_next.then(|| sql_views::page_href(&filter, query.vd.as_deref(), page + 1));
 
+    let rail_before = settings.rail(rail_state::RailPage::ViewDefinitions, &rt.id);
     let is_new = query.vd.as_deref() == Some("new");
-    let (selected, selected_value) = if is_new {
+    let (selected, selected_value, rail) = if is_new {
+        // "Create New" is never a selection (RF1's `?vd=new` exception):
+        // nothing here reads or writes `rails.viewDefinitions`.
         (
             Some(SelectedVd {
                 id: String::new(),
@@ -2131,63 +2550,73 @@ async fn sql_view_definitions_page(
                 json: sql_views::starter_view_definition(),
             }),
             None,
+            rail_before,
         )
-    } else {
-        // ?vd=<id>, defaulting to the rail's first visible entry. When the id
-        // is on the visible page the resource is taken from the search
-        // above — no second round trip; otherwise (a different page, or a
-        // filter that no longer matches it) it's read directly by id, so
-        // selection stays independent of what the rail currently shows
-        // (#741).
-        let wanted = query
-            .vd
-            .clone()
-            .or_else(|| summaries.first().map(|e| e.id.clone()));
-        let on_page = wanted.as_deref().and_then(|id| {
-            page_resources
-                .iter()
-                .position(|vd| vd.get("id").and_then(serde_json::Value::as_str) == Some(id))
-        });
-        let resource = match on_page {
-            Some(i) => Some(page_resources.swap_remove(i)),
-            None => match &wanted {
-                Some(id) => {
-                    match state
-                        .conformance
-                        .read_resource("ViewDefinition", id, rv.0, &rt.id)
-                        .await
-                    {
-                        Ok(vd) => Some(vd),
-                        Err(error) => {
-                            // A stale or mistyped id is ordinary navigation,
-                            // not an operator concern — the page just falls
-                            // back to its no-selection state below.
-                            tracing::debug!("ViewDefinition read failed for vd={id}: {error}");
-                            None
-                        }
-                    }
-                }
-                None => None,
-            },
-        };
-        match resource {
+    } else if let Some(explicit_id) = query.vd.clone() {
+        // RF1.1: an explicit `?vd=` always wins, resolved or not.
+        match resolve_vd_by_id(&state, rv.0, &rt.id, &explicit_id, &mut page_resources).await {
             Some(vd) => {
-                let id = vd
-                    .get("id")
+                let (id, name, json) = shape_vd(&vd);
+                let meta = vd
+                    .get("resource")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let name = vd
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&id)
-                    .to_string();
-                let json = serde_json::to_string_pretty(&vd).unwrap_or_default();
-                (Some(SelectedVd { id, name, json }), Some(vd))
+                    .map(str::to_string);
+                let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
+                let rail = record_snapshot_selection(
+                    &state,
+                    &settings.user_key,
+                    &rt.id,
+                    rail_state::RailPage::ViewDefinitions,
+                    rail_before,
+                    entry,
+                )
+                .await;
+                (Some(SelectedVd { id, name, json }), Some(vd), rail)
             }
-            None => (None, None),
+            None => {
+                // RF3: a stale or mistyped explicit id is pruned from the
+                // registry; the page itself keeps its current "no selection"
+                // render either way.
+                let rail = prune_stale_selection(
+                    &state,
+                    &settings.user_key,
+                    &rt.id,
+                    rail_state::RailPage::ViewDefinitions,
+                    rail_before,
+                    &explicit_id,
+                )
+                .await;
+                (None, None, rail)
+            }
+        }
+    } else {
+        // No explicit selection: try the stored `last` (RF1.2), falling
+        // back to the rail's first visible entry (RF1.3, "comportamiento
+        // actual") when there is none or it no longer resolves — both
+        // silently, per RF1's "en silencio" clause: no write either way.
+        let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
+        let mut resolved = match stored_id.as_deref() {
+            Some(id) => resolve_vd_by_id(&state, rv.0, &rt.id, id, &mut page_resources).await,
+            None => None,
+        };
+        if resolved.is_none() {
+            let fallback_id = summaries.first().map(|e| e.id.clone());
+            resolved = match fallback_id.as_deref() {
+                Some(id) => resolve_vd_by_id(&state, rv.0, &rt.id, id, &mut page_resources).await,
+                None => None,
+            };
+        }
+        match resolved {
+            Some(vd) => {
+                let (id, name, json) = shape_vd(&vd);
+                (Some(SelectedVd { id, name, json }), Some(vd), rail_before)
+            }
+            None => (None, None, rail_before),
         }
     };
+
+    let recent_entries =
+        resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));
 
     // `?run=1` previews the selected view through $sql-run — a plain link, so
     // it works without JavaScript. Capped: this is a preview, not an export.
@@ -2214,6 +2643,9 @@ async fn sql_view_definitions_page(
         run_error,
         save_error: None,
         saved: query.saved.as_deref() == Some("1"),
+        recent_entries,
+        rail_page: rail_state::RailPage::ViewDefinitions.key(),
+        max_recent: rail_state::MAX_RECENT,
     })
 }
 
@@ -2259,6 +2691,11 @@ async fn sql_view_definitions_save(
             run_error: None,
             save_error: Some(save_error),
             saved: false,
+            // A form-validation error re-renders in place, not a navigation —
+            // there is nothing new to record and no rail to repaint.
+            recent_entries: Vec::new(),
+            rail_page: rail_state::RailPage::ViewDefinitions.key(),
+            max_recent: rail_state::MAX_RECENT,
         };
 
     let duplicate = form.action == "duplicate";
@@ -2363,7 +2800,10 @@ async fn sql_view_definitions_lint(body: Bytes) -> Response {
 
 /// What tells the SQL Queries workspace apart from SQL Views: both edit and
 /// run `Library` resources, differing only in the `LibraryTypesCodes` code,
-/// their route, and their labels.
+/// their route, their labels, and — the page key each writes/reads its own
+/// `rails.<page>` record under (RF1's "sqlQueries / sqlViews son distintas y
+/// no se contaminan entre sí"), never hardcoded in the shared handler or
+/// template.
 struct LibraryKind {
     code: &'static str,
     base_href: &'static str,
@@ -2371,6 +2811,8 @@ struct LibraryKind {
     title_key: &'static str,
     lede_key: &'static str,
     new_title_key: &'static str,
+    all_heading_key: &'static str,
+    page: rail_state::RailPage,
 }
 
 const SQL_QUERY_KIND: LibraryKind = LibraryKind {
@@ -2380,6 +2822,8 @@ const SQL_QUERY_KIND: LibraryKind = LibraryKind {
     title_key: "sql-queries-title",
     lede_key: "sql-queries-lede",
     new_title_key: "sql-queries-new-title",
+    all_heading_key: "sql-queries-rail-all-heading",
+    page: rail_state::RailPage::SqlQueries,
 };
 
 const SQL_VIEW_KIND: LibraryKind = LibraryKind {
@@ -2389,6 +2833,8 @@ const SQL_VIEW_KIND: LibraryKind = LibraryKind {
     title_key: "sql-views-title",
     lede_key: "sql-views-lede",
     new_title_key: "sql-views-new-title",
+    all_heading_key: "sql-views-rail-all-heading",
+    page: rail_state::RailPage::SqlViews,
 };
 
 /// The SQL Queries / SQL Views workspace (#649): the same shape as View
@@ -2405,6 +2851,7 @@ struct SqlLibraryPage {
     title_key: &'static str,
     lede_key: &'static str,
     new_title_key: &'static str,
+    all_heading_key: &'static str,
     rail: Vec<sql_libraries::LibSummary>,
     filter: String,
     degraded: Option<String>,
@@ -2414,6 +2861,15 @@ struct SqlLibraryPage {
     run_error: Option<String>,
     save_error: Option<String>,
     saved: bool,
+    /// RF4/RF6: the "Recently used" group's own rows.
+    recent_entries: Vec<rail_state::ResolvedRailEntry>,
+    /// `rails.<page>` key this page writes/reads (`kind.page.key()`), carried
+    /// to the template so `partials/rail_recent.html`'s clones can name it
+    /// without redeclaring it.
+    rail_page: &'static str,
+    /// The recents cap a tampered client can never exceed, likewise from
+    /// `rail_state::MAX_RECENT`, carried the same way.
+    max_recent: usize,
 }
 
 struct SelectedLib {
@@ -2431,6 +2887,75 @@ struct SqlLibQuery {
     saved: Option<String>,
 }
 
+/// Shapes a stored `Library` resource into the editor's `(id, name, json,
+/// sql)` quadruple, decoding the SQL pane out of its base64 attachment.
+fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
+    let id = lib
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let name = lib
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&id)
+        .to_string();
+    let sql = sql_libraries::extract_sql(lib);
+    let json = serde_json::to_string_pretty(lib).unwrap_or_default();
+    (id, name, json, sql)
+}
+
+/// Resolves one candidate Library id, requiring it to carry `code` — RF1.2's
+/// "si está en la colección cargada de esa clase": a stored `last` or the
+/// rail's own fallback candidate must belong to this page's kind, never
+/// resolve to a Library of the other one. Deliberately stricter than the
+/// explicit `?lib=` lookup in [`sql_library_page`] below, which — as #649
+/// always has — trusts whatever id the URL names outright; narrowing that
+/// one too is a pre-existing behavior this ticket leaves alone.
+fn resolve_lib_of_kind(
+    id: &str,
+    code: &str,
+    libraries: &mut Vec<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let i = libraries.iter().position(|l| {
+        l.get("id").and_then(serde_json::Value::as_str) == Some(id)
+            && sql_libraries::has_library_code(l, code)
+    })?;
+    Some(libraries.swap_remove(i))
+}
+
+/// RF6 for the Library-backed rails (SQL Queries, SQL Views): the "Recently
+/// used" group's rows, resolved against this render's own (kind- and
+/// search-box-filtered) rail list so label/meta/href/current match what the
+/// list already shows. RF4's "the group is never itself filtered by
+/// `?filter=`" falls out for free: an id the current filter excludes is
+/// simply absent from `summaries` (and so from `live`), so
+/// [`rail_state::RailState::resolve_recents`] renders it from its stored
+/// `{name, meta}` snapshot instead.
+fn resolve_lib_recents(
+    rail: &rail_state::RailState,
+    summaries: &[sql_libraries::LibSummary],
+    base_href: &str,
+    selected_id: Option<&str>,
+) -> Vec<rail_state::ResolvedRailEntry> {
+    let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                rail_state::LiveRailItem {
+                    label: item.name.clone(),
+                    meta: Some(item.status.clone()),
+                    count: None,
+                    href: format!("{base_href}?lib={}", item.id),
+                    current: selected_id == Some(item.id.as_str()),
+                },
+            )
+        })
+        .collect();
+    rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None)
+}
+
 async fn sql_library_page(
     state: WebState,
     locale: RequestLocale,
@@ -2438,6 +2963,7 @@ async fn sql_library_page(
     rt: RequestTenant,
     query: SqlLibQuery,
     kind: &LibraryKind,
+    settings: rail_state::RequestSettings,
 ) -> Response {
     let filter = query.filter.unwrap_or_default();
     let (mut libraries, degraded) = match state.conformance.fetch("Library", rv.0, &rt.id).await {
@@ -2456,8 +2982,11 @@ async fn sql_library_page(
         s
     };
 
+    let rail_before = settings.rail(kind.page, &rt.id);
     let is_new = query.lib.as_deref() == Some("new");
-    let (selected, selected_value) = if is_new {
+    let (selected, selected_value, rail) = if is_new {
+        // "Create New" is never a selection (RF1's `?lib=new` exception):
+        // nothing here reads or writes `rails.<page>`.
         (
             Some(SelectedLib {
                 id: String::new(),
@@ -2466,31 +2995,30 @@ async fn sql_library_page(
                 sql: sql_libraries::STARTER_SQL.to_string(),
             }),
             None,
+            rail_before,
         )
-    } else {
-        let wanted = query
-            .lib
-            .clone()
-            .or_else(|| summaries.first().map(|e| e.id.clone()));
-        let found = wanted.and_then(|id| {
-            libraries
-                .iter()
-                .position(|l| l.get("id").and_then(serde_json::Value::as_str) == Some(&id))
-        });
+    } else if let Some(explicit_id) = query.lib.clone() {
+        // RF1.1: an explicit `?lib=` always wins, resolved or not.
+        let found = libraries
+            .iter()
+            .position(|l| l.get("id").and_then(serde_json::Value::as_str) == Some(&explicit_id));
         match found.map(|i| libraries.swap_remove(i)) {
             Some(lib) => {
-                let id = lib
-                    .get("id")
+                let (id, name, json, sql) = shape_lib(&lib);
+                let meta = lib
+                    .get("status")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let name = lib
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&id)
-                    .to_string();
-                let sql = sql_libraries::extract_sql(&lib);
-                let json = serde_json::to_string_pretty(&lib).unwrap_or_default();
+                    .map(str::to_string);
+                let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
+                let rail = record_snapshot_selection(
+                    &state,
+                    &settings.user_key,
+                    &rt.id,
+                    kind.page,
+                    rail_before,
+                    entry,
+                )
+                .await;
                 (
                     Some(SelectedLib {
                         id,
@@ -2499,11 +3027,62 @@ async fn sql_library_page(
                         sql,
                     }),
                     Some(lib),
+                    rail,
                 )
             }
-            None => (None, None),
+            None => {
+                // RF3: a stale or mistyped explicit id is pruned from the
+                // registry; the page itself keeps its current "no selection"
+                // render either way.
+                let rail = prune_stale_selection(
+                    &state,
+                    &settings.user_key,
+                    &rt.id,
+                    kind.page,
+                    rail_before,
+                    &explicit_id,
+                )
+                .await;
+                (None, None, rail)
+            }
+        }
+    } else {
+        // No explicit selection: try the stored `last` (RF1.2), falling
+        // back to the rail's first visible entry (RF1.3, "comportamiento
+        // actual") when there is none or it no longer resolves — both
+        // silently, per RF1's "en silencio" clause: no write either way.
+        let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
+        let mut resolved =
+            stored_id.and_then(|id| resolve_lib_of_kind(&id, kind.code, &mut libraries));
+        if resolved.is_none() {
+            let fallback_id = summaries.first().map(|e| e.id.clone());
+            resolved =
+                fallback_id.and_then(|id| resolve_lib_of_kind(&id, kind.code, &mut libraries));
+        }
+        match resolved {
+            Some(lib) => {
+                let (id, name, json, sql) = shape_lib(&lib);
+                (
+                    Some(SelectedLib {
+                        id,
+                        name,
+                        json,
+                        sql,
+                    }),
+                    Some(lib),
+                    rail_before,
+                )
+            }
+            None => (None, None, rail_before),
         }
     };
+
+    let recent_entries = resolve_lib_recents(
+        &rail,
+        &summaries,
+        kind.base_href,
+        selected.as_ref().map(|s| s.id.as_str()),
+    );
 
     let (results, run_error) = match (&selected_value, query.run.as_deref() == Some("1")) {
         (Some(lib), true) => match state.conformance.sql_run(lib, 50, rv.0, &rt.id).await {
@@ -2521,6 +3100,7 @@ async fn sql_library_page(
         title_key: kind.title_key,
         lede_key: kind.lede_key,
         new_title_key: kind.new_title_key,
+        all_heading_key: kind.all_heading_key,
         rail: summaries,
         filter,
         degraded,
@@ -2530,6 +3110,9 @@ async fn sql_library_page(
         run_error,
         save_error: None,
         saved: query.saved.as_deref() == Some("1"),
+        recent_entries,
+        rail_page: kind.page.key(),
+        max_recent: rail_state::MAX_RECENT,
     })
 }
 
@@ -2562,6 +3145,7 @@ async fn sql_library_save(
             title_key: kind.title_key,
             lede_key: kind.lede_key,
             new_title_key: kind.new_title_key,
+            all_heading_key: kind.all_heading_key,
             rail: Vec::new(),
             filter: String::new(),
             degraded: None,
@@ -2576,6 +3160,11 @@ async fn sql_library_save(
             run_error: None,
             save_error: Some(save_error),
             saved: false,
+            // A form-validation error re-renders in place, not a navigation —
+            // there is nothing new to record and no rail to repaint.
+            recent_entries: Vec::new(),
+            rail_page: kind.page.key(),
+            max_recent: rail_state::MAX_RECENT,
         };
 
     let duplicate = form.action == "duplicate";
@@ -2651,8 +3240,9 @@ async fn sql_queries_page(
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<SqlLibQuery>,
+    settings: rail_state::RequestSettings,
 ) -> Response {
-    sql_library_page(state, locale, rv, rt, query, &SQL_QUERY_KIND).await
+    sql_library_page(state, locale, rv, rt, query, &SQL_QUERY_KIND, settings).await
 }
 
 async fn sql_queries_save(
@@ -2671,8 +3261,9 @@ async fn sql_views_page(
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<SqlLibQuery>,
+    settings: rail_state::RequestSettings,
 ) -> Response {
-    sql_library_page(state, locale, rv, rt, query, &SQL_VIEW_KIND).await
+    sql_library_page(state, locale, rv, rt, query, &SQL_VIEW_KIND, settings).await
 }
 
 async fn sql_views_save(
@@ -2914,6 +3505,59 @@ async fn sql_files_page(
     })
 }
 
+/// The shared cards, already HTML.
+///
+/// Rendered in the handler rather than from the template so the page keeps
+/// one error path: `CapabilityCards` returns `Result`, and a template that
+/// called it would have to decide what a half-rendered page looks like.
+struct RenderedCapabilityCards {
+    summary: String,
+    interactions: String,
+    operations: String,
+    resources: String,
+    /// The Raw CapabilityStatement fold (#808 follow-up to #798) — the same
+    /// htmx-lazy, paginated JSON tree HTS now renders too, in place of a
+    /// second bespoke raw-payload mechanism.
+    raw: String,
+}
+
+impl RenderedCapabilityCards {
+    /// HFS's dialect of the shared cards: the backend-role footnote, the
+    /// include/revinclude columns its search layer actually populates, and
+    /// the progressively enhanced type filter its ~150-row table needs.
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        i18n: &I18n,
+        view: &helios_ui_chrome::capability::CapabilityView,
+        version: helios_fhir::FhirVersion,
+        filter: &str,
+        raw_requested: bool,
+        raw_text: &str,
+        raw_url: &str,
+        fragment_url: &str,
+    ) -> Result<Self, askama::Error> {
+        let cards = helios_ui_chrome::capability::CapabilityCards::new(i18n, view)
+            .transaction_note_href(Some(ROLE_MATRIX_URL))
+            .show_include_columns(true)
+            .filter(Some(helios_ui_chrome::capability::ResourceFilter {
+                action: "/ui/capability-statement",
+                version: version.as_str(),
+                value: filter,
+            }));
+        Ok(Self {
+            summary: cards.summary()?,
+            interactions: cards.interactions()?,
+            operations: cards.operations()?,
+            resources: cards.resources()?,
+            raw: cards.raw(raw_requested, raw_text, raw_url, fragment_url)?,
+        })
+    }
+}
+
+/// Where the `transaction` footnote sends an operator asking why the verb is
+/// advertised here and not on another deployment.
+const ROLE_MATRIX_URL: &str = "https://github.com/HeliosSoftware/hfs/blob/main/crates/persistence/README.md#primarysecondary-role-matrix";
+
 /// The read-only CapabilityStatement page (#653): the live `/metadata`
 /// answer for the sidebar's tenant and FHIR version, summarized and filterable,
 /// with the raw statement one fold away.
@@ -2923,21 +3567,11 @@ struct CapabilityPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    /// `None` when the self-fetch failed — the page degrades to a warning.
-    view: Option<capability::CapabilityView>,
-    /// Pretty-printed JSON for the explicit no-JavaScript fallback. This never
-    /// passes through the highlighted renderer.
-    raw: String,
-    /// Whether this request explicitly asked for the plain JSON fallback.
-    raw_requested: bool,
-    /// Version- and filter-preserving URL used by the ordinary no-JS link.
-    raw_url: String,
-    /// Bounded, server-driven JSON root loaded by htmx.
-    fragment_url: String,
-    /// Effective version carried by the resource filter's ordinary GET form.
-    effective_version: &'static str,
-    /// The server-side resource-type filter, echoed back into the form.
-    filter: String,
+    /// The five cards shared with HTS, pre-rendered (#808) — the four summary
+    /// cards plus the Raw CapabilityStatement fold. `None` when the self-fetch
+    /// failed — HFS degrades the whole page to one warning, where HTS
+    /// degrades card by card, because HFS has a single source to fail.
+    cards: Option<RenderedCapabilityCards>,
 }
 
 #[derive(Deserialize, Default)]
@@ -2967,8 +3601,8 @@ struct CapabilityJsonQuery {
     limit: Option<usize>,
 }
 
-fn bounded_capability_fragment<T: Template>(template: T) -> Response {
-    match template.render() {
+fn bounded_capability_fragment(rendered: Result<String, askama::Error>) -> Response {
+    match rendered {
         Ok(html) if html.len() <= capability_json::MAX_FRAGMENT_HTML_BYTES => {
             Html(html).into_response()
         }
@@ -2982,6 +3616,15 @@ fn bounded_capability_fragment<T: Template>(template: T) -> Response {
             format!("template render error: {error}"),
         )
             .into_response(),
+    }
+}
+
+fn capability_json_fragment_endpoint(
+    version: helios_fhir::FhirVersion,
+) -> capability_json::FragmentEndpoint<'static> {
+    capability_json::FragmentEndpoint {
+        base_path: "/ui/capability-statement/json-fragment",
+        version: version.as_str(),
     }
 }
 
@@ -3011,24 +3654,14 @@ async fn capability_json_fragment(
         }
     };
     let limit = query.limit.unwrap_or(capability_json::DEFAULT_PAGE_SIZE);
-    match capability_json::plan(&statement, &query.path, query.offset, limit, version) {
-        Ok(capability_json::View::Full(json_lines)) => {
-            bounded_capability_fragment(CapabilityJsonFullFragment {
-                i18n: I18n::new(locale),
-                json_lines,
-                json_view_id: if query.path.is_empty() {
-                    "capability-json".to_string()
-                } else {
-                    String::new()
-                },
-                json_view_paths: false,
-            })
-        }
+    let i18n = I18n::new(locale);
+    let endpoint = capability_json_fragment_endpoint(version);
+    match capability_json::plan(&statement, &query.path, query.offset, limit, endpoint) {
+        Ok(capability_json::View::Full(json_lines)) => bounded_capability_fragment(
+            capability_json::render_full(&i18n, json_lines, query.path.is_empty()),
+        ),
         Ok(capability_json::View::Outline(outline)) => {
-            bounded_capability_fragment(CapabilityJsonOutlineFragment {
-                i18n: I18n::new(locale),
-                outline,
-            })
+            bounded_capability_fragment(capability_json::render_outline(&i18n, &outline))
         }
         Err(capability_json::Error::NotFound) => {
             (StatusCode::NOT_FOUND, "JSON path not found").into_response()
@@ -3054,8 +3687,11 @@ async fn capability_page(
         .unwrap_or(rv.0);
     let raw_requested = query.raw.as_deref() == Some("1");
     let raw_url = capability_raw_url(&filter, version);
+    let fragment_url =
+        capability_json::root_fragment_url(capability_json_fragment_endpoint(version));
+    let i18n = I18n::new(locale);
     let fetched = state.conformance.metadata(version, &rt.id).await;
-    let (view, raw) = match fetched {
+    let cards = match fetched {
         Ok(statement) => {
             let mut view = capability::build_view(&statement, version);
             if !filter.is_empty() {
@@ -3063,56 +3699,107 @@ async fn capability_page(
                 view.resources
                     .retain(|r| r.resource_type.to_lowercase().contains(&needle));
             }
-            let raw = if raw_requested {
+            let raw_text = if raw_requested {
                 serde_json::to_string_pretty(&statement).unwrap_or_default()
             } else {
                 String::new()
             };
-            (Some(view), raw)
+            match RenderedCapabilityCards::render(
+                &i18n,
+                &view,
+                version,
+                &filter,
+                raw_requested,
+                &raw_text,
+                &raw_url,
+                &fragment_url,
+            ) {
+                Ok(cards) => Some(cards),
+                Err(error) => {
+                    // The shared partials have no fallible construct, so this
+                    // is unreachable in practice — but a blank page is not an
+                    // acceptable way to find that out.
+                    tracing::error!("CapabilityStatement card render failed: {error}");
+                    None
+                }
+            }
         }
         Err(error) => {
             tracing::warn!("CapabilityStatement self-fetch failed: {error}");
-            (None, String::new())
+            None
         }
     };
     render(CapabilityPage {
         status: current_status(&state, version, &rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: "capability-statement",
-        view,
-        raw,
-        raw_requested,
-        raw_url,
-        fragment_url: capability_json::root_fragment_url(version),
-        effective_version: version.as_str(),
-        filter,
+        cards,
     })
 }
 
 /// Compartment viewer & tester page.
+///
+/// RF1/RF2 of the compartments-restore ticket: `def` is resolved *before*
+/// `CmpQuery` is built, reusing the same [`record_type_selection`] the type
+/// rails already write through — its "explicit wins outright, invalid or
+/// not; otherwise the stored `last` only if it still names a real choice"
+/// contract is exactly what Compartments needs, with `defs`' codes standing
+/// in for `resource_types`. That keeps [`compartments::build_view`] pure and
+/// untouched: it still owns the `Patient` → first fallback chain, so an
+/// unresolvable explicit code or a stale `last` both fall through to it in
+/// silence, with nothing written. Compartments has no "Recently used" group
+/// (the epic: 4-5 definitions would make one noise), so `rail` is otherwise
+/// only read to resolve `def` — never rendered.
 async fn compartments_page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
     Query(raw): Query<CompartmentsQuery>,
+    settings: rail_state::RequestSettings,
 ) -> Response {
+    // Explicit ?version= wins; otherwise the user's stored choice (#343).
+    let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
+    let fhir_version = version
+        .as_deref()
+        .and_then(search_params::version_from_str)
+        .unwrap_or_default();
+    if raw.refresh.is_some() {
+        state.compartments.invalidate(&rt.id, fhir_version);
+    }
+    let defs = state.compartments.definitions(&rt.id, fhir_version).await;
+    let codes: Vec<String> = defs.iter().map(|d| d.code.clone()).collect();
+
+    let explicit_def = raw.def.as_deref().filter(|d| !d.is_empty());
+    let rail = record_type_selection(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        rail_state::RailPage::Compartments,
+        settings.rail(rail_state::RailPage::Compartments, &rt.id),
+        explicit_def,
+        &codes,
+    )
+    .await;
+    // Explicit always wins verbatim (build_view falls back on its own for an
+    // unknown code); otherwise the stored `last` is used only when it still
+    // names one of this version's definitions — a stale `last` is left
+    // absent so build_view's own fallback applies, silently.
+    let def = raw.def.or_else(|| {
+        rail.last
+            .as_deref()
+            .filter(|id| !id.is_empty() && codes.iter().any(|code| code == id))
+            .map(str::to_string)
+    });
+
     let query = compartments::CmpQuery {
-        // Explicit ?version= wins; otherwise the user's stored choice (#343).
-        version: raw.version.or_else(|| Some(rv.0.as_str().to_string())),
-        def: raw.def,
+        version,
+        def,
         tab: raw.tab,
         filter: raw.filter,
         id: raw.id,
         target: raw.target,
     };
-    if raw.refresh.is_some() {
-        state.compartments.invalidate(&rt.id, query.fhir_version());
-    }
-    let defs = state
-        .compartments
-        .definitions(&rt.id, query.fhir_version())
-        .await;
     match compartments::build_view(&query, &defs) {
         Some(view) => render(CompartmentsPage {
             status: current_status(&state, rv.0, &rt),
@@ -3857,16 +4544,18 @@ mod tests {
     #[test]
     fn capability_fragments_enforce_the_rendering_budget() {
         let oversized = "x".repeat(capability_json::MAX_FRAGMENT_HTML_BYTES + 1);
-        let response =
-            bounded_capability_fragment(BoundedFragmentTestTemplate { value: &oversized });
+        let rendered = BoundedFragmentTestTemplate { value: &oversized }.render();
+        let response = bounded_capability_fragment(rendered);
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
     fn capability_fragments_report_template_errors() {
-        let response = bounded_capability_fragment(FailingFragmentTestTemplate {
+        let rendered = FailingFragmentTestTemplate {
             value: FailingDisplay,
-        });
+        }
+        .render();
+        let response = bounded_capability_fragment(rendered);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -4150,7 +4839,11 @@ mod tests {
             active_page: "queries",
             show_save: true,
             resource_types,
+            selected_type: String::new(),
             rail_entries,
+            recent_entries: Vec::new(),
+            rail_page: rail_state::RailPage::Queries.key(),
+            max_recent: rail_state::MAX_RECENT,
             builder_url: None,
         }
         .render()
@@ -4211,7 +4904,11 @@ mod tests {
             active_page: "queries",
             show_save: true,
             resource_types,
+            selected_type: String::new(),
             rail_entries,
+            recent_entries: Vec::new(),
+            rail_page: rail_state::RailPage::Queries.key(),
+            max_recent: rail_state::MAX_RECENT,
             builder_url: None,
         }
         .render()

@@ -1220,15 +1220,19 @@ mod conditional_references {
 }
 
 // =============================================================================
-// Conditional Entry Tests (#503)
+// Conditional Entry Tests (#503, #511)
 // =============================================================================
 
-/// Conditional interactions expressed in an entry URL (`[type]?[criteria]`) are
-/// refused rather than resolved, and — the point of #503 — nothing is written.
+/// Conditional interactions in batch entries — `PUT`/`DELETE [type]?[criteria]`
+/// and `POST` with `ifNoneExist` — resolve against storage with the status
+/// mapping the resource endpoints use (#511), and `ifNoneExist` resolves inside
+/// a transaction.
 ///
-/// Before the fix the criteria rode along inside the parsed resource type, so a
+/// Before #503 the criteria rode along inside the parsed resource type, so a
 /// conditional `PUT`/`DELETE` addressed storage with a type like
-/// `Patient?identifier=http:` and an empty id. Resolving these is #511.
+/// `Patient?identifier=http:` and an empty id; the type-level guards below keep
+/// that row from ever being written. URL criteria inside a transaction remain
+/// declined whole.
 mod conditional_entries {
     use super::*;
 
@@ -1253,68 +1257,373 @@ mod conditional_entries {
             .expect("count failed")
     }
 
+    async fn seed_patient_with_identifier(backend: &SqliteBackend, id: &str, family: &str) {
+        backend
+            .create(
+                &test_tenant(),
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "identifier": [{"system": "http://example.org", "value": "12345"}],
+                    "name": [{"family": family}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("Failed to seed patient");
+    }
+
+    fn conditional_put(url: &str, family: &str) -> Value {
+        json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{
+                "request": { "method": "PUT", "url": url },
+                "resource": {
+                    "resourceType": "Patient",
+                    "identifier": [{"system": "http://example.org", "value": "12345"}],
+                    "name": [{"family": family}]
+                }
+            }]
+        })
+    }
+
+    fn if_none_exist_post(criteria: &str, family: &str, full_url: Option<&str>) -> Value {
+        let mut entry = json!({
+            "request": { "method": "POST", "url": "Patient", "ifNoneExist": criteria },
+            "resource": {
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org", "value": "12345"}],
+                "name": [{"family": family}]
+            }
+        });
+        if let Some(full_url) = full_url {
+            entry["fullUrl"] = json!(full_url);
+        }
+        entry
+    }
+
+    async fn family_of(backend: &SqliteBackend, id: &str) -> String {
+        backend
+            .read(&test_tenant(), "Patient", id)
+            .await
+            .expect("read failed")
+            .expect("patient exists")
+            .content()["name"][0]["family"]
+            .as_str()
+            .expect("family")
+            .to_string()
+    }
+
+    // ── PUT [type]?[criteria] ────────────────────────────────────────────────
+
     #[tokio::test]
-    async fn conditional_put_is_refused_and_writes_nothing() {
+    async fn conditional_put_creates_when_nothing_matches() {
         let (server, backend) = create_test_server().await;
-        seed_patient(&backend, "p1", "Nguyen").await;
         let before = patient_count(&backend).await;
 
         let body = post_batch(
             &server,
-            json!({
-                "resourceType": "Bundle",
-                "type": "batch",
-                "entry": [{
-                    "request": {
-                        "method": "PUT",
-                        "url": "Patient?identifier=http://example.org|12345"
-                    },
-                    "resource": { "resourceType": "Patient", "name": [{"family": "Conditional"}] }
-                }]
-            }),
+            conditional_put("Patient?identifier=http://example.org|12345", "Conditional"),
         )
         .await;
 
-        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        let entry = &body["entry"][0];
+        assert_eq!(entry["response"]["status"], "201 Created", "{entry}");
+        assert!(
+            entry["response"]["location"]
+                .as_str()
+                .is_some_and(|l| l.starts_with("Patient/") && l.contains("/_history/1")),
+            "{entry}"
+        );
+        assert_eq!(entry["resource"]["name"][0]["family"], "Conditional");
+        assert_eq!(patient_count(&backend).await, before + 1);
+    }
+
+    #[tokio::test]
+    async fn conditional_put_updates_the_single_match() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            conditional_put("Patient?identifier=http://example.org|12345", "Updated"),
+        )
+        .await;
+
+        let entry = &body["entry"][0];
+        assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
+        assert_eq!(entry["response"]["location"], "Patient/p1");
+        assert_eq!(entry["resource"]["id"], "p1");
+        assert_eq!(family_of(&backend, "p1").await, "Updated");
         assert_eq!(
             patient_count(&backend).await,
             before,
-            "a refused conditional PUT must not create a resource"
+            "an update creates nothing"
         );
     }
 
     #[tokio::test]
-    async fn conditional_delete_is_refused_and_deletes_nothing() {
+    async fn conditional_put_with_several_matches_is_412_and_writes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "One").await;
+        seed_patient_with_identifier(&backend, "p2", "Two").await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            conditional_put("Patient?identifier=http://example.org|12345", "Ambiguous"),
+        )
+        .await;
+
+        let entry = &body["entry"][0];
+        assert_eq!(
+            entry["response"]["status"], "412 Precondition Failed",
+            "{entry}"
+        );
+        // Entry failures render through `create_error_result`, which carries
+        // the message in `details.text` (the issue-code refinement is #516).
+        assert!(
+            entry["response"]["outcome"]["issue"][0]["details"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("matched 2")),
+            "{entry}"
+        );
+        assert_eq!(patient_count(&backend).await, before);
+        assert_eq!(family_of(&backend, "p1").await, "One");
+        assert_eq!(family_of(&backend, "p2").await, "Two");
+    }
+
+    /// Bundle entry URLs arrive percent-encoded; the criteria are decoded
+    /// before the backend sees them, as a request URL's query would be.
+    #[tokio::test]
+    async fn percent_encoded_criteria_match_the_decoded_identifier() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+
+        let body = post_batch(
+            &server,
+            conditional_put(
+                "Patient?identifier=http%3A%2F%2Fexample.org%7C12345",
+                "Decoded",
+            ),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "200 OK", "{body}");
+        assert_eq!(family_of(&backend, "p1").await, "Decoded");
+    }
+
+    #[tokio::test]
+    async fn if_match_on_a_conditional_entry_is_400_and_writes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+
+        let mut bundle = conditional_put("Patient?identifier=http://example.org|12345", "Stale");
+        bundle["entry"][0]["request"]["ifMatch"] = json!("W/\"1\"");
+        let body = post_batch(&server, bundle).await;
+
+        assert_eq!(
+            body["entry"][0]["response"]["status"], "400 Bad Request",
+            "{body}"
+        );
+        assert_eq!(family_of(&backend, "p1").await, "Nguyen");
+    }
+
+    // ── DELETE [type]?[criteria] ─────────────────────────────────────────────
+
+    fn conditional_delete(url: &str) -> Value {
+        json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{ "request": { "method": "DELETE", "url": url } }]
+        })
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_removes_the_single_match() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+        seed_patient(&backend, "p2", "Bystander").await;
+
+        let body = post_batch(
+            &server,
+            conditional_delete("Patient?identifier=http://example.org|12345"),
+        )
+        .await;
+
+        let entry = &body["entry"][0];
+        assert_eq!(entry["response"]["status"], "204 No Content", "{entry}");
+        assert!(
+            entry.get("resource").is_none(),
+            "a 204 carries no body: {entry}"
+        );
+        assert!(
+            !matches!(
+                backend.read(&test_tenant(), "Patient", "p1").await,
+                Ok(Some(_))
+            ),
+            "the match must be gone"
+        );
+        assert_eq!(family_of(&backend, "p2").await, "Bystander");
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_with_no_match_is_204() {
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "p1", "Nguyen").await;
         let before = patient_count(&backend).await;
 
         let body = post_batch(
             &server,
+            conditional_delete("Patient?identifier=http://example.org|nobody"),
+        )
+        .await;
+
+        assert_eq!(
+            body["entry"][0]["response"]["status"], "204 No Content",
+            "{body}"
+        );
+        assert_eq!(patient_count(&backend).await, before);
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_with_several_matches_is_412_and_deletes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "One").await;
+        seed_patient_with_identifier(&backend, "p2", "Two").await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            conditional_delete("Patient?identifier=http://example.org|12345"),
+        )
+        .await;
+
+        assert_eq!(
+            body["entry"][0]["response"]["status"], "412 Precondition Failed",
+            "{body}"
+        );
+        assert_eq!(patient_count(&backend).await, before);
+    }
+
+    // ── POST + ifNoneExist ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn if_none_exist_creates_then_answers_the_match() {
+        let (server, backend) = create_test_server().await;
+        let bundle = |family: &str| {
             json!({
                 "resourceType": "Bundle",
                 "type": "batch",
-                "entry": [{
-                    "request": { "method": "DELETE", "url": "Patient?name=Nguyen" }
-                }]
+                "entry": [if_none_exist_post("identifier=http://example.org|12345", family, None)]
+            })
+        };
+
+        let first = post_batch(&server, bundle("First")).await;
+        let first_entry = &first["entry"][0];
+        assert_eq!(
+            first_entry["response"]["status"], "201 Created",
+            "{first_entry}"
+        );
+        let created_location = first_entry["response"]["location"]
+            .as_str()
+            .expect("location")
+            .to_string();
+
+        let second = post_batch(&server, bundle("Second")).await;
+        let second_entry = &second["entry"][0];
+        assert_eq!(
+            second_entry["response"]["status"], "200 OK",
+            "{second_entry}"
+        );
+        assert_eq!(
+            second_entry["response"]["location"], created_location,
+            "the match is named, exactly as the create was"
+        );
+        assert_eq!(second_entry["resource"]["name"][0]["family"], "First");
+        assert_eq!(patient_count(&backend).await, 1);
+    }
+
+    #[tokio::test]
+    async fn if_none_exist_with_several_matches_is_412() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "One").await;
+        seed_patient_with_identifier(&backend, "p2", "Two").await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [if_none_exist_post("identifier=http://example.org|12345", "Third", None)]
             }),
         )
         .await;
 
-        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
         assert_eq!(
-            patient_count(&backend).await,
-            before,
-            "a refused conditional DELETE must not remove a resource"
+            body["entry"][0]["response"]["status"], "412 Precondition Failed",
+            "{body}"
         );
-        assert!(
-            backend
-                .read(&test_tenant(), "Patient", "p1")
-                .await
-                .expect("read failed")
-                .is_some(),
-            "the seeded patient must survive"
+        assert_eq!(patient_count(&backend).await, 2);
+    }
+
+    /// The transaction executor resolves `ifNoneExist` inside the transaction:
+    /// the same transaction twice creates once, and on the replay a `urn:uuid`
+    /// reference to the matched entry resolves to the match.
+    #[tokio::test]
+    async fn transaction_if_none_exist_is_idempotent_and_resolves_references() {
+        let (server, backend) = create_test_server().await;
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [
+                if_none_exist_post(
+                    "identifier=http://example.org|12345",
+                    "Once",
+                    Some("urn:uuid:patient")
+                ),
+                {
+                    "fullUrl": "urn:uuid:observation",
+                    "request": { "method": "POST", "url": "Observation" },
+                    "resource": {
+                        "resourceType": "Observation",
+                        "status": "final",
+                        "code": {"text": "test"},
+                        "subject": {"reference": "urn:uuid:patient"}
+                    }
+                }
+            ]
+        });
+
+        let first = post_batch(&server, bundle.clone()).await;
+        assert_eq!(
+            first["entry"][0]["response"]["status"], "201 Created",
+            "{first}"
         );
+        let patient_id = first["entry"][0]["resource"]["id"]
+            .as_str()
+            .expect("created patient id")
+            .to_string();
+        assert_eq!(
+            first["entry"][1]["resource"]["subject"]["reference"],
+            json!(format!("Patient/{patient_id}"))
+        );
+
+        let second = post_batch(&server, bundle).await;
+        assert_eq!(
+            second["entry"][0]["response"]["status"], "200 OK",
+            "{second}"
+        );
+        assert_eq!(second["entry"][0]["resource"]["id"], json!(patient_id));
+        assert_eq!(
+            second["entry"][1]["resource"]["subject"]["reference"],
+            json!(format!("Patient/{patient_id}")),
+            "a urn:uuid reference to the matched entry resolves to the match"
+        );
+        assert_eq!(patient_count(&backend).await, 1);
     }
 
     /// The corruption #503 closes: `create_or_update` with an empty id inserts

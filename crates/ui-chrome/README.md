@@ -32,8 +32,29 @@ feeds it:
 - `ChromeLabels` — the narrow i18n slice the chrome needs (`lang()`, `t(key)`).
   This crate depends on no i18n library; each product adapts its own bundle.
 - `UserIdentity` — who the menu says is signed in.
+- `capability` — the CapabilityStatement read model and the four cards both
+  products stack on their Capability & Conformance page (#808):
+  `templates/partials/capability-{summary,interactions,operations,resources}-card.html`
+  plus the projection behind them. More than markup, because HFS and HTS were
+  each parsing the same `/metadata` document into their own `CapabilityView`
+  and each fixing the result separately — HFS had version-correct
+  specification links and colour-coded interaction chips, HTS had neither.
 
-The partial is a byte-verbatim extract of what was
+  It stays a leaf: `serde_json` and `url`, no axum, no HTTP client, and no
+  FHIR schema dependency. The two things it cannot answer on its own are
+  supplied by the caller — the release to link into (`DocsVersion`, so this
+  crate is not dragged into the R4/R4B/R5/R6 feature matrix) and whether a
+  resource type has an official page in that release (`CoreResourceCatalog`;
+  HFS answers from the validator's core packs, HTS from the three types a
+  terminology server serves).
+
+  What is *not* here: fetching, and the raw-statement block. HFS self-calls
+  over loopback and streams the raw document through a paginated fragment
+  endpoint; HTS proxies two upstreams, needs per-card isolation, and byte-caps
+  an inline `<pre>` because its statement grows with the code systems it
+  loads. Those differences are real, not drift.
+
+The user-menu partial is a byte-verbatim extract of what was
 `crates/ui/templates/layouts/base.html:233-267`, so the move changed no HFS page
 byte. Two things preserve that and must survive future edits:
 
