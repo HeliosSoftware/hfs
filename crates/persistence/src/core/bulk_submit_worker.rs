@@ -379,13 +379,6 @@ impl<T> BulkSubmitJobStore for T where
 {
 }
 
-/// The default in-process submit worker.
-///
-/// Binds a [`BulkSubmitJobStore`] (job state + claim + worker storage + ingestion
-/// engine), a [`SubmitInputFetcher`] (remote manifest + NDJSON fetch), and an
-/// [`ExportOutputStore`] (where status-manifest artifacts go), and drives a claimed
-/// manifest to completion: fetch → ingest each `output` file via the existing
-/// `process_ndjson_stream` engine → emit `output`/`error` artifacts → finish.
 /// Rebuilds deferred search indexes once a manifest finishes ingesting
 /// (bulk fast-load, #903). Implemented over the reindex machinery by the
 /// server wiring; fire-and-forget from the worker's perspective.
@@ -395,6 +388,13 @@ pub trait DeferredReindexHook: Send + Sync {
     async fn reindex_types(&self, tenant: &TenantContext, resource_types: Vec<String>);
 }
 
+/// The default in-process submit worker.
+///
+/// Binds a [`BulkSubmitJobStore`] (job state + claim + worker storage + ingestion
+/// engine), a [`SubmitInputFetcher`] (remote manifest + NDJSON fetch), and an
+/// [`ExportOutputStore`] (where status-manifest artifacts go), and drives a claimed
+/// manifest to completion: fetch → ingest each `output` file via the existing
+/// `process_ndjson_stream` engine → emit `output`/`error` artifacts → finish.
 pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     jobs: Arc<Js>,
     fetcher: Arc<Fetcher>,
