@@ -70,7 +70,7 @@
   "relationship": {
     "coding": [
       {
-        "system": "http://terminology.hl7.org/CodeSystem/deviceassociation-relationship",
+        "system": "http://hl7.org/fhir/deviceassociation-relationship",
         "code": "implanted-in",
         "display": "Implanted In"
       }
@@ -80,7 +80,7 @@
   "relationshipStatus": {
     "coding": [
       {
-        "system": "http://terminology.hl7.org/CodeSystem/deviceassociation-relationship-status",
+        "system": "http://hl7.org/fhir/deviceassociation-relationship-status",
         "code": "active",
         "display": "Active"
       }

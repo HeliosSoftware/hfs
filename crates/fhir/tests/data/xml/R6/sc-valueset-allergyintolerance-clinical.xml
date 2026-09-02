@@ -16,7 +16,7 @@
       </p>
       <br/>
       <p>Mapping from 
-        <a href="http://terminology.hl7.org/7.3.0/CodeSystem-allergyintolerance-clinical.html">AllergyIntolerance Clinical Status Codes</a> to 
+        <a href="http://terminology.hl7.org/7.2.0/CodeSystem-allergyintolerance-clinical.html">AllergyIntolerance Clinical Status Codes</a> to 
         <a href="codesystem-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <table class="grid">

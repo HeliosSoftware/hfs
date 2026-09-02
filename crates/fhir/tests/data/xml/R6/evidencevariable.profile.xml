@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="EvidenceVariable"/>
   <meta>
-    <lastUpdated value="2026-08-28T18:37:46.371+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -663,7 +663,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">documentation | justification | citation | predecessor | successor | derived-from | depends-on | composed-of | part-of | amends | amended-with | appends | appended-with | cites | cited-by | comments-on | comment-in | contains | contained-in | corrects | correction-in | replaces | replaced-with | retracts | retracted-by | signs | similar-to | supports | supported-with | transforms | transformed-into | transformed-with | documents | specification-of | created-with | cite-as | reprint | reprint-of | summarizes
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-artifact-relationship-type.html">Artifact Relationship Type</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-artifact-relationship-type.html">Artifact Relationship Type</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1039,7 +1039,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">boolean | continuous | dichotomous | ordinal | polychotomous | time-to-event | not-specified
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-evidence-variable-handling.html">Evidence Variable Handling</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-evidence-variable-handling.html">Evidence Variable Handling</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1514,7 +1514,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Rule for acceptable data values
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-evidence-variable-constraint.html">Evidence Variable Constraint</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-evidence-variable-constraint.html">Evidence Variable Constraint</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1635,7 +1635,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">How erroneous data is processed
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-evidence-variable-unacceptable-data-handling.html">Evidence Variable Unacceptable Data Handling</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-evidence-variable-unacceptable-data-handling.html">Evidence Variable Unacceptable Data Handling</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
             <br/>
@@ -1673,7 +1673,7 @@
   <name value="EvidenceVariable"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-08-28T18:37:46+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Clinical Decision Support"/>
   <contact>
     <telecom>

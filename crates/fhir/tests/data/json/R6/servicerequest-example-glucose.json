@@ -3,18 +3,6 @@
   "id": "glucose",
   "status": "active",
   "intent": "original-order",
-  "code": {
-    "concept": {
-      "coding": [
-        {
-          "system": "http://loinc.org",
-          "code": "2345-7",
-          "display": "Glucose [Mass/volume] in Serum or Plasma"
-        }
-      ],
-      "text": "Glucose test"
-    }
-  },
   "subject": {
     "reference": "Patient/dicom"
   },

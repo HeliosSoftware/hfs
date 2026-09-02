@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="DetectedIssue"/>
   <meta>
-    <lastUpdated value="2026-08-28T18:37:46.371+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -121,7 +121,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">High level categorization of detected issue
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-detectedissue-category.html">Detected Issue Category</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-detectedissue-category.html">Detected Issue Category</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -145,7 +145,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Specific type of detected issue, e.g. drug-drug, duplicate therapy, etc
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-detectedissue-code.html">Detected Issue Code</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-detectedissue-code.html">Detected Issue Code</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -168,7 +168,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">high | moderate | low
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-detectedissue-severity.html">Detected Issue Severity</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-detectedissue-severity.html">Detected Issue Severity</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -453,7 +453,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The quality of the evidence supporting the detected issue
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-evidence-quality.html">QualityOfEvidenceRating</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-evidence-quality.html">QualityOfEvidenceRating</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -474,7 +474,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Time frame of clinical effect
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-detectedissue-expected-onset-type.html">Detected Issue Expected Onset Type</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-detectedissue-expected-onset-type.html">Detected Issue Expected Onset Type</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -558,7 +558,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">What mitigation?
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-detectedissue-mitigation-action.html">Detected Issue Mitigation Action</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-detectedissue-mitigation-action.html">Detected Issue Mitigation Action</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -652,7 +652,7 @@
   <name value="DetectedIssue"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-08-28T18:37:46+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Clinical Decision Support"/>
   <contact>
     <telecom>
@@ -749,7 +749,7 @@
           <valueBoolean value="true"/>
         </extension>
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-          <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
+          <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
         </extension>
         <key value="dom-6"/>
         <severity value="warning"/>

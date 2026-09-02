@@ -2,7 +2,7 @@
   "resourceType": "Bundle",
   "id": "dataelements",
   "meta": {
-    "lastUpdated": "2026-08-28T18:37:46.371+00:00",
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00",
     "tag": [
       {
         "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
@@ -19,7 +19,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-date.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33,7 +33,7 @@
         "title": "date.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -113,7 +113,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-date.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -127,7 +127,7 @@
         "title": "date.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -211,7 +211,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-dateTime.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -225,7 +225,7 @@
         "title": "dateTime.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -305,7 +305,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-dateTime.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -319,7 +319,7 @@
         "title": "dateTime.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -403,7 +403,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-string.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -417,7 +417,7 @@
         "title": "string.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -497,7 +497,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-string.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -511,7 +511,7 @@
         "title": "string.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -596,7 +596,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-integer64.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -610,7 +610,7 @@
         "title": "integer64.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -690,7 +690,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-integer64.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -704,7 +704,7 @@
         "title": "integer64.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -790,7 +790,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-integer.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -804,7 +804,7 @@
         "title": "integer.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -884,7 +884,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-integer.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -898,7 +898,7 @@
         "title": "integer.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -984,7 +984,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-uri.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -998,7 +998,7 @@
         "title": "uri.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -1078,7 +1078,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-uri.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -1092,7 +1092,7 @@
         "title": "uri.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -1176,7 +1176,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-instant.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -1190,7 +1190,7 @@
         "title": "instant.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -1270,7 +1270,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-instant.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -1284,7 +1284,7 @@
         "title": "instant.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -1368,7 +1368,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-boolean.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -1382,7 +1382,7 @@
         "title": "boolean.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -1462,7 +1462,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-boolean.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -1476,7 +1476,7 @@
         "title": "boolean.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -1560,7 +1560,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-base64Binary.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -1574,7 +1574,7 @@
         "title": "base64Binary.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -1654,7 +1654,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-base64Binary.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -1668,7 +1668,7 @@
         "title": "base64Binary.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -1752,7 +1752,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-time.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -1766,7 +1766,7 @@
         "title": "time.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -1846,7 +1846,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-time.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -1860,7 +1860,7 @@
         "title": "time.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -1944,7 +1944,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-decimal.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -1958,7 +1958,7 @@
         "title": "decimal.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -2038,7 +2038,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-decimal.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -2052,7 +2052,7 @@
         "title": "decimal.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -2136,7 +2136,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-xhtml.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -2150,7 +2150,7 @@
         "title": "xhtml.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -2230,7 +2230,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-xhtml.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -2244,7 +2244,7 @@
         "title": "xhtml.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -2324,7 +2324,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Meta.versionId",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -2338,7 +2338,7 @@
         "title": "Meta.versionId",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -2417,7 +2417,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Meta.lastUpdated",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -2431,7 +2431,7 @@
         "title": "Meta.lastUpdated",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -2510,7 +2510,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Meta.source",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -2524,7 +2524,7 @@
         "title": "Meta.source",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -2603,7 +2603,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Meta.profile",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -2617,7 +2617,7 @@
         "title": "Meta.profile",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -2699,7 +2699,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Meta.security",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -2713,7 +2713,7 @@
         "title": "Meta.security",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -2811,7 +2811,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Meta.tag",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -2825,7 +2825,7 @@
         "title": "Meta.tag",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -2919,7 +2919,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Address.use",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -2933,7 +2933,7 @@
         "title": "Address.use",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -3064,7 +3064,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Address.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -3078,7 +3078,7 @@
         "title": "Address.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -3207,7 +3207,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Address.text",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -3221,7 +3221,7 @@
         "title": "Address.text",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -3336,7 +3336,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Address.line",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -3350,7 +3350,7 @@
         "title": "Address.line",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -3468,7 +3468,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Address.city",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -3482,7 +3482,7 @@
         "title": "Address.city",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -3602,7 +3602,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Address.district",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -3616,7 +3616,7 @@
         "title": "Address.district",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -3729,7 +3729,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Address.state",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -3743,7 +3743,7 @@
         "title": "Address.state",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -3858,7 +3858,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Address.postalCode",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -3872,7 +3872,7 @@
         "title": "Address.postalCode",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -3992,7 +3992,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Address.country",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -4006,7 +4006,7 @@
         "title": "Address.country",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -4118,7 +4118,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Address.period",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -4132,7 +4132,7 @@
         "title": "Address.period",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -4249,7 +4249,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.contentType",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -4263,7 +4263,7 @@
         "title": "Attachment.contentType",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -4385,7 +4385,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.language",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -4399,7 +4399,7 @@
         "title": "Attachment.language",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -4520,7 +4520,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.data",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -4534,7 +4534,7 @@
         "title": "Attachment.data",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -4632,7 +4632,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.url",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -4646,7 +4646,7 @@
         "title": "Attachment.url",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -4747,7 +4747,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.size",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -4761,7 +4761,7 @@
         "title": "Attachment.size",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -4852,7 +4852,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.hash",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -4866,7 +4866,7 @@
         "title": "Attachment.hash",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -4957,7 +4957,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.title",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -4971,7 +4971,7 @@
         "title": "Attachment.title",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -5074,7 +5074,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.creation",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -5088,7 +5088,7 @@
         "title": "Attachment.creation",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -5178,7 +5178,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.height",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -5192,7 +5192,7 @@
         "title": "Attachment.height",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -5281,7 +5281,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.width",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -5295,7 +5295,7 @@
         "title": "Attachment.width",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -5384,7 +5384,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.frames",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -5398,7 +5398,7 @@
         "title": "Attachment.frames",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -5488,7 +5488,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.duration",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -5502,7 +5502,7 @@
         "title": "Attachment.duration",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -5592,7 +5592,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Attachment.pages",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -5606,7 +5606,7 @@
         "title": "Attachment.pages",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -5689,7 +5689,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -5703,7 +5703,7 @@
         "title": "DataRequirement.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -5800,7 +5800,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.profile",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -5814,7 +5814,7 @@
         "title": "DataRequirement.profile",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -5895,7 +5895,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.subjectX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -5909,7 +5909,7 @@
         "title": "DataRequirement.subject[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6014,7 +6014,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.mustSupport",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6028,7 +6028,7 @@
         "title": "DataRequirement.mustSupport",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6106,7 +6106,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.codeFilter.path",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6120,7 +6120,7 @@
         "title": "DataRequirement.codeFilter.path",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6202,7 +6202,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.codeFilter.searchParam",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6216,7 +6216,7 @@
         "title": "DataRequirement.codeFilter.searchParam",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6297,7 +6297,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.codeFilter.valueSet",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6311,7 +6311,7 @@
         "title": "DataRequirement.codeFilter.valueSet",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6392,7 +6392,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.codeFilter.code",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6406,7 +6406,7 @@
         "title": "DataRequirement.codeFilter.code",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6484,7 +6484,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.dateFilter.path",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6498,7 +6498,7 @@
         "title": "DataRequirement.dateFilter.path",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6580,7 +6580,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.dateFilter.searchParam",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6594,7 +6594,7 @@
         "title": "DataRequirement.dateFilter.searchParam",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6675,7 +6675,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.dateFilter.valueX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6689,7 +6689,7 @@
         "title": "DataRequirement.dateFilter.value[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6773,7 +6773,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.valueFilter.path",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6787,7 +6787,7 @@
         "title": "DataRequirement.valueFilter.path",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6866,7 +6866,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.valueFilter.searchParam",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6880,7 +6880,7 @@
         "title": "DataRequirement.valueFilter.searchParam",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -6958,7 +6958,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.valueFilter.comparator",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -6972,7 +6972,7 @@
         "title": "DataRequirement.valueFilter.comparator",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -7065,7 +7065,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.valueFilter.valueX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -7079,7 +7079,7 @@
         "title": "DataRequirement.valueFilter.value[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -7175,7 +7175,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.limit",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -7189,7 +7189,7 @@
         "title": "DataRequirement.limit",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -7269,7 +7269,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.sort.path",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -7283,7 +7283,7 @@
         "title": "DataRequirement.sort.path",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -7361,7 +7361,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DataRequirement.sort.direction",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -7375,7 +7375,7 @@
         "title": "DataRequirement.sort.direction",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -7468,7 +7468,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.condition",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -7482,7 +7482,7 @@
         "title": "Dosage.condition",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -7565,7 +7565,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.text",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -7579,7 +7579,7 @@
         "title": "Dosage.text",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -7673,7 +7673,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.additionalInstruction",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -7687,7 +7687,7 @@
         "title": "Dosage.additionalInstruction",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -7797,7 +7797,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.patientInstruction",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -7811,7 +7811,7 @@
         "title": "Dosage.patientInstruction",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -7904,7 +7904,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.timing",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -7918,7 +7918,7 @@
         "title": "Dosage.timing",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -8009,7 +8009,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.asNeeded",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -8023,7 +8023,7 @@
         "title": "Dosage.asNeeded",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -8120,7 +8120,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.asNeededFor",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -8134,7 +8134,7 @@
         "title": "Dosage.asNeededFor",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -8246,7 +8246,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.site",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -8260,7 +8260,7 @@
         "title": "Dosage.site",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -8373,7 +8373,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.route",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -8387,7 +8387,7 @@
         "title": "Dosage.route",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -8496,7 +8496,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.method",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -8510,7 +8510,7 @@
         "title": "Dosage.method",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -8620,7 +8620,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.doseAndRate.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -8634,7 +8634,7 @@
         "title": "Dosage.doseAndRate.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -8739,7 +8739,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.doseAndRate.doseX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -8753,7 +8753,7 @@
         "title": "Dosage.doseAndRate.dose[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -8857,7 +8857,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.doseAndRate.rateX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -8871,7 +8871,7 @@
         "title": "Dosage.doseAndRate.rate[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -8978,7 +8978,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Dosage.safety",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -8992,7 +8992,7 @@
         "title": "Dosage.safety",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -9075,7 +9075,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelativeTime.contextReference",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -9089,7 +9089,7 @@
         "title": "RelativeTime.contextReference",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -9173,7 +9173,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelativeTime.contextDefinition",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -9187,7 +9187,7 @@
         "title": "RelativeTime.contextDefinition",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -9274,7 +9274,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelativeTime.contextPath",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -9288,7 +9288,7 @@
         "title": "RelativeTime.contextPath",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -9369,7 +9369,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelativeTime.contextCode",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -9383,7 +9383,7 @@
         "title": "RelativeTime.contextCode",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -9476,7 +9476,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelativeTime.offsetX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -9490,7 +9490,7 @@
         "title": "RelativeTime.offset[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -9571,7 +9571,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelativeTime.text",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -9585,7 +9585,7 @@
         "title": "RelativeTime.text",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -9663,7 +9663,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-MonetaryComponent.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -9677,7 +9677,7 @@
         "title": "MonetaryComponent.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -9770,7 +9770,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-MonetaryComponent.code",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -9784,7 +9784,7 @@
         "title": "MonetaryComponent.code",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -9877,7 +9877,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-MonetaryComponent.factor",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -9891,7 +9891,7 @@
         "title": "MonetaryComponent.factor",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -9969,7 +9969,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-MonetaryComponent.amount",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -9983,7 +9983,7 @@
         "title": "MonetaryComponent.amount",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -10061,7 +10061,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Money.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -10075,7 +10075,7 @@
         "title": "Money.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -10166,7 +10166,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Money.currency",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -10180,7 +10180,7 @@
         "title": "Money.currency",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -10289,7 +10289,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-HumanName.use",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -10303,7 +10303,7 @@
         "title": "HumanName.use",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -10423,7 +10423,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-HumanName.text",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -10437,7 +10437,7 @@
         "title": "HumanName.text",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -10537,7 +10537,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-HumanName.family",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -10551,7 +10551,7 @@
         "title": "HumanName.family",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -10657,7 +10657,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-HumanName.given",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -10671,7 +10671,7 @@
         "title": "HumanName.given",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -10779,7 +10779,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-HumanName.prefix",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -10793,7 +10793,7 @@
         "title": "HumanName.prefix",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -10896,7 +10896,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-HumanName.suffix",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -10910,7 +10910,7 @@
         "title": "HumanName.suffix",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -11009,7 +11009,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-HumanName.period",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -11023,7 +11023,7 @@
         "title": "HumanName.period",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -11126,7 +11126,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ContactPoint.system",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -11140,7 +11140,7 @@
         "title": "ContactPoint.system",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -11260,7 +11260,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ContactPoint.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -11274,7 +11274,7 @@
         "title": "ContactPoint.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -11381,7 +11381,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ContactPoint.use",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -11395,7 +11395,7 @@
         "title": "ContactPoint.use",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -11515,7 +11515,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ContactPoint.rank",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -11529,7 +11529,7 @@
         "title": "ContactPoint.rank",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -11628,7 +11628,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ContactPoint.period",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -11642,7 +11642,7 @@
         "title": "ContactPoint.period",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -11744,7 +11744,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-MarketingStatus.country",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -11758,7 +11758,7 @@
         "title": "MarketingStatus.country",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -11841,7 +11841,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-MarketingStatus.jurisdiction",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -11855,7 +11855,7 @@
         "title": "MarketingStatus.jurisdiction",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -11938,7 +11938,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-MarketingStatus.status",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -11952,7 +11952,7 @@
         "title": "MarketingStatus.status",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -12035,7 +12035,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-MarketingStatus.dateRange",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -12049,7 +12049,7 @@
         "title": "MarketingStatus.dateRange",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -12132,7 +12132,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-MarketingStatus.restoreDate",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -12146,7 +12146,7 @@
         "title": "MarketingStatus.restoreDate",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -12229,7 +12229,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Identifier.use",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -12243,7 +12243,7 @@
         "title": "Identifier.use",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -12359,7 +12359,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Identifier.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -12373,7 +12373,7 @@
         "title": "Identifier.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -12492,7 +12492,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Identifier.system",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -12506,7 +12506,7 @@
         "title": "Identifier.system",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -12616,7 +12616,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Identifier.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -12630,7 +12630,7 @@
         "title": "Identifier.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -12742,7 +12742,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Identifier.period",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -12756,7 +12756,7 @@
         "title": "Identifier.period",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -12858,7 +12858,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Identifier.assigner",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -12872,7 +12872,7 @@
         "title": "Identifier.assigner",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -12978,7 +12978,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RatioRange.lowNumerator",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -12992,7 +12992,7 @@
         "title": "RatioRange.lowNumerator",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -13093,7 +13093,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RatioRange.highNumerator",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -13107,7 +13107,7 @@
         "title": "RatioRange.highNumerator",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -13208,7 +13208,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RatioRange.denominator",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -13222,7 +13222,7 @@
         "title": "RatioRange.denominator",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -13311,7 +13311,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Coding.system",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -13325,7 +13325,7 @@
         "title": "Coding.system",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -13429,7 +13429,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Coding.version",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -13443,7 +13443,7 @@
         "title": "Coding.version",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -13546,7 +13546,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Coding.code",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -13560,7 +13560,7 @@
         "title": "Coding.code",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -13672,7 +13672,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Coding.display",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -13686,7 +13686,7 @@
         "title": "Coding.display",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -13798,7 +13798,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Coding.userSelected",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -13812,7 +13812,7 @@
         "title": "Coding.userSelected",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -13916,7 +13916,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageSafety.doseLimit.valueX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -13930,7 +13930,7 @@
         "title": "DosageSafety.doseLimit.value[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -14014,7 +14014,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageSafety.doseLimit.scope",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -14028,7 +14028,7 @@
         "title": "DosageSafety.doseLimit.scope",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -14121,7 +14121,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageSafety.doseLimit.period",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -14135,7 +14135,7 @@
         "title": "DosageSafety.doseLimit.period",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -14213,7 +14213,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageSafety.doseLimit.text",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -14227,7 +14227,7 @@
         "title": "DosageSafety.doseLimit.text",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -14305,7 +14305,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageSafety.ifExceeded",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -14319,7 +14319,7 @@
         "title": "DosageSafety.ifExceeded",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -14397,7 +14397,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-SampledData.origin",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -14411,7 +14411,7 @@
         "title": "SampledData.origin",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -14503,7 +14503,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-SampledData.interval",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -14517,7 +14517,7 @@
         "title": "SampledData.interval",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -14610,7 +14610,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-SampledData.intervalUnit",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -14624,7 +14624,7 @@
         "title": "SampledData.intervalUnit",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -14722,7 +14722,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-SampledData.factor",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -14736,7 +14736,7 @@
         "title": "SampledData.factor",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -14826,7 +14826,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-SampledData.lowerLimit",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -14840,7 +14840,7 @@
         "title": "SampledData.lowerLimit",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -14929,7 +14929,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-SampledData.upperLimit",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -14943,7 +14943,7 @@
         "title": "SampledData.upperLimit",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -15032,7 +15032,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-SampledData.dimensions",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -15046,7 +15046,7 @@
         "title": "SampledData.dimensions",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -15136,7 +15136,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-SampledData.codeMap",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -15150,7 +15150,7 @@
         "title": "SampledData.codeMap",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -15243,7 +15243,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-SampledData.offsets",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -15257,7 +15257,7 @@
         "title": "SampledData.offsets",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -15350,7 +15350,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-SampledData.data",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -15364,7 +15364,7 @@
         "title": "SampledData.data",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -15454,7 +15454,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Ratio.numerator",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -15468,7 +15468,7 @@
         "title": "Ratio.numerator",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -15560,7 +15560,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Ratio.denominator",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -15574,7 +15574,7 @@
         "title": "Ratio.denominator",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -15669,7 +15669,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.path",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -15683,7 +15683,7 @@
         "title": "ElementDefinition.path",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -15794,7 +15794,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.representation",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -15808,7 +15808,7 @@
         "title": "ElementDefinition.representation",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -15931,7 +15931,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.sliceName",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -15945,7 +15945,7 @@
         "title": "ElementDefinition.sliceName",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -16058,7 +16058,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.sliceIsConstraining",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -16072,7 +16072,7 @@
         "title": "ElementDefinition.sliceIsConstraining",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -16184,7 +16184,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.label",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -16198,7 +16198,7 @@
         "title": "ElementDefinition.label",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -16308,7 +16308,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.code",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -16322,7 +16322,7 @@
         "title": "ElementDefinition.code",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -16446,7 +16446,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.slicing.discriminator.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -16460,7 +16460,7 @@
         "title": "ElementDefinition.slicing.discriminator.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -16575,7 +16575,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.slicing.discriminator.path",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -16589,7 +16589,7 @@
         "title": "ElementDefinition.slicing.discriminator.path",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -16692,7 +16692,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.slicing.description",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -16706,7 +16706,7 @@
         "title": "ElementDefinition.slicing.description",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -16812,7 +16812,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.slicing.ordered",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -16826,7 +16826,7 @@
         "title": "ElementDefinition.slicing.ordered",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -16934,7 +16934,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.slicing.rules",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -16948,7 +16948,7 @@
         "title": "ElementDefinition.slicing.rules",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -17070,7 +17070,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.short",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -17084,7 +17084,7 @@
         "title": "ElementDefinition.short",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -17194,7 +17194,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.definition",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -17208,7 +17208,7 @@
         "title": "ElementDefinition.definition",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -17326,7 +17326,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.comment",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -17340,7 +17340,7 @@
         "title": "ElementDefinition.comment",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -17454,7 +17454,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.requirements",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -17468,7 +17468,7 @@
         "title": "ElementDefinition.requirements",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -17578,7 +17578,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.alias",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -17592,7 +17592,7 @@
         "title": "ElementDefinition.alias",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -17710,7 +17710,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.min",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -17724,7 +17724,7 @@
         "title": "ElementDefinition.min",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -17830,7 +17830,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.max",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -17844,7 +17844,7 @@
         "title": "ElementDefinition.max",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -17963,7 +17963,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.base.path",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -17977,7 +17977,7 @@
         "title": "ElementDefinition.base.path",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -18080,7 +18080,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.base.min",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -18094,7 +18094,7 @@
         "title": "ElementDefinition.base.min",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -18198,7 +18198,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.base.max",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -18212,7 +18212,7 @@
         "title": "ElementDefinition.base.max",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -18316,7 +18316,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.contentReference",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -18330,7 +18330,7 @@
         "title": "ElementDefinition.contentReference",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -18433,7 +18433,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.type.code",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -18447,7 +18447,7 @@
         "title": "ElementDefinition.type.code",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -18580,7 +18580,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.type.profile",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -18594,7 +18594,7 @@
         "title": "ElementDefinition.type.profile",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -18702,7 +18702,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.type.targetProfile",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -18716,7 +18716,7 @@
         "title": "ElementDefinition.type.targetProfile",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -18826,7 +18826,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.type.aggregation",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -18840,7 +18840,7 @@
         "title": "ElementDefinition.type.aggregation",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -18962,7 +18962,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.type.versioning",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -18976,7 +18976,7 @@
         "title": "ElementDefinition.type.versioning",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -19091,7 +19091,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.defaultValueX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -19105,7 +19105,7 @@
         "title": "ElementDefinition.defaultValue[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -19371,7 +19371,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.meaningWhenMissing",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -19385,7 +19385,7 @@
         "title": "ElementDefinition.meaningWhenMissing",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -19494,7 +19494,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.orderMeaning",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -19508,7 +19508,7 @@
         "title": "ElementDefinition.orderMeaning",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -19611,7 +19611,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.fixedX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -19625,7 +19625,7 @@
         "title": "ElementDefinition.fixed[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -19897,7 +19897,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.patternX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -19911,7 +19911,7 @@
         "title": "ElementDefinition.pattern[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -20178,7 +20178,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.example.label",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -20192,7 +20192,7 @@
         "title": "ElementDefinition.example.label",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -20297,7 +20297,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.example.valueX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -20311,7 +20311,7 @@
         "title": "ElementDefinition.example.value[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -20576,7 +20576,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.minValueX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -20590,7 +20590,7 @@
         "title": "ElementDefinition.minValue[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -20720,7 +20720,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.maxValueX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -20734,7 +20734,7 @@
         "title": "ElementDefinition.maxValue[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -20864,7 +20864,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.maxLength",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -20878,7 +20878,7 @@
         "title": "ElementDefinition.maxLength",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -20989,7 +20989,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.condition",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -21003,7 +21003,7 @@
         "title": "ElementDefinition.condition",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -21102,7 +21102,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.constraint.key",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -21116,7 +21116,7 @@
         "title": "ElementDefinition.constraint.key",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -21218,7 +21218,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.constraint.requirements",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -21232,7 +21232,7 @@
         "title": "ElementDefinition.constraint.requirements",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -21332,7 +21332,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.constraint.severity",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -21346,7 +21346,7 @@
         "title": "ElementDefinition.constraint.severity",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -21464,7 +21464,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.constraint.suppress",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -21478,7 +21478,7 @@
         "title": "ElementDefinition.constraint.suppress",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -21581,7 +21581,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.constraint.human",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -21595,7 +21595,7 @@
         "title": "ElementDefinition.constraint.human",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -21701,7 +21701,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.constraint.expression",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -21715,7 +21715,7 @@
         "title": "ElementDefinition.constraint.expression",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -21819,7 +21819,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.constraint.source",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -21833,7 +21833,7 @@
         "title": "ElementDefinition.constraint.source",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -21936,7 +21936,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.mustHaveValue",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -21950,7 +21950,7 @@
         "title": "ElementDefinition.mustHaveValue",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -22047,7 +22047,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.valueAlternatives",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -22061,7 +22061,7 @@
         "title": "ElementDefinition.valueAlternatives",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -22162,7 +22162,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.mustSupport",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -22176,7 +22176,7 @@
         "title": "ElementDefinition.mustSupport",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -22282,7 +22282,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.isModifier",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -22296,7 +22296,7 @@
         "title": "ElementDefinition.isModifier",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -22405,7 +22405,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.isModifierReason",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -22419,7 +22419,7 @@
         "title": "ElementDefinition.isModifierReason",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -22521,7 +22521,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.isSummary",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -22535,7 +22535,7 @@
         "title": "ElementDefinition.isSummary",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -22641,7 +22641,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.binding.strength",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -22655,7 +22655,7 @@
         "title": "ElementDefinition.binding.strength",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -22782,7 +22782,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.binding.description",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -22796,7 +22796,7 @@
         "title": "ElementDefinition.binding.description",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -22909,7 +22909,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.binding.valueSet",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -22923,7 +22923,7 @@
         "title": "ElementDefinition.binding.valueSet",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -23038,7 +23038,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.binding.additional.key",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -23052,7 +23052,7 @@
         "title": "ElementDefinition.binding.additional.key",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -23145,7 +23145,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.binding.additional.purpose",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -23159,7 +23159,7 @@
         "title": "ElementDefinition.binding.additional.purpose",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -23268,7 +23268,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.binding.additional.valueSet",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -23282,7 +23282,7 @@
         "title": "ElementDefinition.binding.additional.valueSet",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -23378,7 +23378,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.binding.additional.documentation",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -23392,7 +23392,7 @@
         "title": "ElementDefinition.binding.additional.documentation",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -23485,7 +23485,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.binding.additional.shortDoco",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -23499,7 +23499,7 @@
         "title": "ElementDefinition.binding.additional.shortDoco",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -23592,7 +23592,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.binding.additional.usage",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -23606,7 +23606,7 @@
         "title": "ElementDefinition.binding.additional.usage",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -23700,7 +23700,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.binding.additional.any",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -23714,7 +23714,7 @@
         "title": "ElementDefinition.binding.additional.any",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -23808,7 +23808,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.mapping.identity",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -23822,7 +23822,7 @@
         "title": "ElementDefinition.mapping.identity",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -23924,7 +23924,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.mapping.language",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -23938,7 +23938,7 @@
         "title": "ElementDefinition.mapping.language",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -24057,7 +24057,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.mapping.map",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -24071,7 +24071,7 @@
         "title": "ElementDefinition.mapping.map",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -24175,7 +24175,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ElementDefinition.mapping.comment",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -24189,7 +24189,7 @@
         "title": "ElementDefinition.mapping.comment",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -24288,7 +24288,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-VirtualServiceDetail.channelType",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -24302,7 +24302,7 @@
         "title": "VirtualServiceDetail.channelType",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -24396,7 +24396,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-VirtualServiceDetail.addressX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -24410,7 +24410,7 @@
         "title": "VirtualServiceDetail.address[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -24497,7 +24497,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-VirtualServiceDetail.additionalInfo",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -24511,7 +24511,7 @@
         "title": "VirtualServiceDetail.additionalInfo",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -24589,7 +24589,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-VirtualServiceDetail.maxParticipants",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -24603,7 +24603,7 @@
         "title": "VirtualServiceDetail.maxParticipants",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -24682,7 +24682,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-VirtualServiceDetail.sessionKey",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -24696,7 +24696,7 @@
         "title": "VirtualServiceDetail.sessionKey",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -24775,7 +24775,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Availability.period",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -24789,7 +24789,7 @@
         "title": "Availability.period",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -24868,7 +24868,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Availability.availableTime.daysOfWeek",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -24882,7 +24882,7 @@
         "title": "Availability.availableTime.daysOfWeek",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -24975,7 +24975,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Availability.availableTime.allDay",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -24989,7 +24989,7 @@
         "title": "Availability.availableTime.allDay",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -25070,7 +25070,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Availability.availableTime.availableStartTime",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -25084,7 +25084,7 @@
         "title": "Availability.availableTime.availableStartTime",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -25166,7 +25166,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Availability.availableTime.availableEndTime",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -25180,7 +25180,7 @@
         "title": "Availability.availableTime.availableEndTime",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -25262,7 +25262,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Availability.notAvailableTime.description",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -25276,7 +25276,7 @@
         "title": "Availability.notAvailableTime.description",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -25355,7 +25355,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Availability.notAvailableTime.during",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -25369,7 +25369,7 @@
         "title": "Availability.notAvailableTime.during",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -25447,7 +25447,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Reference.reference",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -25461,7 +25461,7 @@
         "title": "Reference.reference",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -25550,7 +25550,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Reference.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -25564,7 +25564,7 @@
         "title": "Reference.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -25668,7 +25668,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Reference.identifier",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -25682,7 +25682,7 @@
         "title": "Reference.identifier",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -25770,7 +25770,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Reference.display",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -25784,7 +25784,7 @@
         "title": "Reference.display",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -25878,7 +25878,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-TriggerDefinition.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -25892,7 +25892,7 @@
         "title": "TriggerDefinition.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -25988,7 +25988,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-TriggerDefinition.name",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -26002,7 +26002,7 @@
         "title": "TriggerDefinition.name",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -26084,7 +26084,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-TriggerDefinition.code",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -26098,7 +26098,7 @@
         "title": "TriggerDefinition.code",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -26179,7 +26179,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-TriggerDefinition.subscriptionTopic",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -26193,7 +26193,7 @@
         "title": "TriggerDefinition.subscriptionTopic",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -26277,7 +26277,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-TriggerDefinition.timingX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -26291,7 +26291,7 @@
         "title": "TriggerDefinition.timing[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -26379,7 +26379,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-TriggerDefinition.data",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -26393,7 +26393,7 @@
         "title": "TriggerDefinition.data",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -26476,7 +26476,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-TriggerDefinition.condition",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -26490,7 +26490,7 @@
         "title": "TriggerDefinition.condition",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -26570,7 +26570,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Quantity.value",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -26584,7 +26584,7 @@
         "title": "Quantity.value",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -26679,7 +26679,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Quantity.comparator",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -26693,7 +26693,7 @@
         "title": "Quantity.comparator",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -26804,7 +26804,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Quantity.unit",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -26818,7 +26818,7 @@
         "title": "Quantity.unit",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -26918,7 +26918,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Quantity.system",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -26932,7 +26932,7 @@
         "title": "Quantity.system",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -27029,7 +27029,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Quantity.code",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -27043,7 +27043,7 @@
         "title": "Quantity.code",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -27147,7 +27147,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Period.start",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -27161,7 +27161,7 @@
         "title": "Period.start",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -27258,7 +27258,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Period.end",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -27272,7 +27272,7 @@
         "title": "Period.end",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -27370,7 +27370,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Range.low",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -27384,7 +27384,7 @@
         "title": "Range.low",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -27484,7 +27484,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Range.high",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -27498,7 +27498,7 @@
         "title": "Range.high",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -27598,7 +27598,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelatedArtifact.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -27612,7 +27612,7 @@
         "title": "RelatedArtifact.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -27706,7 +27706,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelatedArtifact.label",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -27720,7 +27720,7 @@
         "title": "RelatedArtifact.label",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -27798,7 +27798,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelatedArtifact.display",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -27812,7 +27812,7 @@
         "title": "RelatedArtifact.display",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -27890,7 +27890,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelatedArtifact.citation",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -27904,7 +27904,7 @@
         "title": "RelatedArtifact.citation",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -27983,7 +27983,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelatedArtifact.url",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -27997,7 +27997,7 @@
         "title": "RelatedArtifact.url",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -28075,7 +28075,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelatedArtifact.document",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -28089,7 +28089,7 @@
         "title": "RelatedArtifact.document",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -28168,7 +28168,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelatedArtifact.resource",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -28182,7 +28182,7 @@
         "title": "RelatedArtifact.resource",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -28264,7 +28264,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-RelatedArtifact.resourceReference",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -28278,7 +28278,7 @@
         "title": "RelatedArtifact.resourceReference",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -28360,7 +28360,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Annotation.authorX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -28374,7 +28374,7 @@
         "title": "Annotation.author[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -28478,7 +28478,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Annotation.time",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -28492,7 +28492,7 @@
         "title": "Annotation.time",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -28585,7 +28585,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Annotation.text",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -28599,7 +28599,7 @@
         "title": "Annotation.text",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -28692,7 +28692,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ProductShelfLife.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -28706,7 +28706,7 @@
         "title": "ProductShelfLife.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -28789,7 +28789,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ProductShelfLife.periodX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -28803,7 +28803,7 @@
         "title": "ProductShelfLife.period[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -28889,7 +28889,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ProductShelfLife.specialPrecautionsForStorage",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -28903,7 +28903,7 @@
         "title": "ProductShelfLife.specialPrecautionsForStorage",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -28986,7 +28986,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ContactDetail.name",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -29000,7 +29000,7 @@
         "title": "ContactDetail.name",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -29079,7 +29079,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ContactDetail.telecom",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -29093,7 +29093,7 @@
         "title": "ContactDetail.telecom",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -29171,7 +29171,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageCondition.code",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -29185,7 +29185,7 @@
         "title": "DosageCondition.code",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -29278,7 +29278,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageCondition.details",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -29292,7 +29292,7 @@
         "title": "DosageCondition.details",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -29385,7 +29385,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageCondition.operation",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -29399,7 +29399,7 @@
         "title": "DosageCondition.operation",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -29492,7 +29492,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageCondition.valueX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -29506,7 +29506,7 @@
         "title": "DosageCondition.value[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -29746,7 +29746,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageCondition.text",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -29760,7 +29760,7 @@
         "title": "DosageCondition.text",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -29838,7 +29838,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-UsageContext.code",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -29852,7 +29852,7 @@
         "title": "UsageContext.code",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -29945,7 +29945,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-UsageContext.valueX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -29959,7 +29959,7 @@
         "title": "UsageContext.value[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -30079,7 +30079,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Expression.description",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -30093,7 +30093,7 @@
         "title": "Expression.description",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -30171,7 +30171,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Expression.name",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -30185,7 +30185,7 @@
         "title": "Expression.name",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -30273,7 +30273,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Expression.language",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -30287,7 +30287,7 @@
         "title": "Expression.language",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -30387,7 +30387,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Expression.expression",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -30401,7 +30401,7 @@
         "title": "Expression.expression",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -30483,7 +30483,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Expression.reference",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -30497,7 +30497,7 @@
         "title": "Expression.reference",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -30579,7 +30579,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-CodeableReference.concept",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -30593,7 +30593,7 @@
         "title": "CodeableReference.concept",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -30677,7 +30677,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-CodeableReference.reference",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -30691,7 +30691,7 @@
         "title": "CodeableReference.reference",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -30775,7 +30775,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Signature.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -30789,7 +30789,7 @@
         "title": "Signature.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -30883,7 +30883,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Signature.when",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -30897,7 +30897,7 @@
         "title": "Signature.when",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -30976,7 +30976,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Signature.who",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -30990,7 +30990,7 @@
         "title": "Signature.who",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -31077,7 +31077,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Signature.onBehalfOf",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -31091,7 +31091,7 @@
         "title": "Signature.onBehalfOf",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -31179,7 +31179,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Signature.targetFormat",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -31193,7 +31193,7 @@
         "title": "Signature.targetFormat",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -31291,7 +31291,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Signature.sigFormat",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -31305,7 +31305,7 @@
         "title": "Signature.sigFormat",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -31402,7 +31402,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Signature.data",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -31416,7 +31416,7 @@
         "title": "Signature.data",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -31495,7 +31495,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.event",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -31509,7 +31509,7 @@
         "title": "Timing.event",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -31599,7 +31599,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.boundsX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -31613,7 +31613,7 @@
         "title": "Timing.repeat.bounds[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -31708,7 +31708,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.count",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -31722,7 +31722,7 @@
         "title": "Timing.repeat.count",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -31816,7 +31816,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.countMax",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -31830,7 +31830,7 @@
         "title": "Timing.repeat.countMax",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -31922,7 +31922,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.duration",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -31936,7 +31936,7 @@
         "title": "Timing.repeat.duration",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -32032,7 +32032,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.durationMax",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -32046,7 +32046,7 @@
         "title": "Timing.repeat.durationMax",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -32140,7 +32140,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.durationUnit",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -32154,7 +32154,7 @@
         "title": "Timing.repeat.durationUnit",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -32261,7 +32261,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.frequency",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -32275,7 +32275,7 @@
         "title": "Timing.repeat.frequency",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -32365,7 +32365,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.frequencyMax",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -32379,7 +32379,7 @@
         "title": "Timing.repeat.frequencyMax",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -32468,7 +32468,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.period",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -32482,7 +32482,7 @@
         "title": "Timing.repeat.period",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -32576,7 +32576,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.periodMax",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -32590,7 +32590,7 @@
         "title": "Timing.repeat.periodMax",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -32682,7 +32682,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.periodUnit",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -32696,7 +32696,7 @@
         "title": "Timing.repeat.periodUnit",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -32803,7 +32803,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.startOffset",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -32817,7 +32817,7 @@
         "title": "Timing.repeat.startOffset",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -32910,7 +32910,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.endOffset",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -32924,7 +32924,7 @@
         "title": "Timing.repeat.endOffset",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -33017,7 +33017,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.dayOfWeek",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33031,7 +33031,7 @@
         "title": "Timing.repeat.dayOfWeek",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -33131,7 +33131,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.timeOfDay",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33145,7 +33145,7 @@
         "title": "Timing.repeat.timeOfDay",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -33238,7 +33238,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.when",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33252,7 +33252,7 @@
         "title": "Timing.repeat.when",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -33362,7 +33362,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.repeat.offset",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33376,7 +33376,7 @@
         "title": "Timing.repeat.offset",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -33468,7 +33468,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Timing.code",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33482,7 +33482,7 @@
         "title": "Timing.code",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -33587,7 +33587,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ExtendedContactDetail.purpose",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33601,7 +33601,7 @@
         "title": "ExtendedContactDetail.purpose",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -33695,7 +33695,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ExtendedContactDetail.name",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33709,7 +33709,7 @@
         "title": "ExtendedContactDetail.name",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -33788,7 +33788,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ExtendedContactDetail.telecom",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33802,7 +33802,7 @@
         "title": "ExtendedContactDetail.telecom",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -33880,7 +33880,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ExtendedContactDetail.address",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33894,7 +33894,7 @@
         "title": "ExtendedContactDetail.address",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -33973,7 +33973,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ExtendedContactDetail.organization",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -33987,7 +33987,7 @@
         "title": "ExtendedContactDetail.organization",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -34069,7 +34069,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ExtendedContactDetail.period",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -34083,7 +34083,7 @@
         "title": "ExtendedContactDetail.period",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -34162,7 +34162,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageDetails.renderedInstruction",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -34176,7 +34176,7 @@
         "title": "DosageDetails.renderedInstruction",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -34255,7 +34255,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageDetails.step.start",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -34269,7 +34269,7 @@
         "title": "DosageDetails.step.start",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -34347,7 +34347,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageDetails.step.end",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -34361,7 +34361,7 @@
         "title": "DosageDetails.step.end",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -34439,7 +34439,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageDetails.step.count",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -34453,7 +34453,7 @@
         "title": "DosageDetails.step.count",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -34531,7 +34531,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageDetails.step.component",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -34545,7 +34545,7 @@
         "title": "DosageDetails.step.component",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -34623,7 +34623,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageDetails.step.safety",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -34637,7 +34637,7 @@
         "title": "DosageDetails.step.safety",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -34715,7 +34715,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-DosageDetails.safety",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -34729,7 +34729,7 @@
         "title": "DosageDetails.safety",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -34807,7 +34807,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-CodeableConcept.coding",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -34821,7 +34821,7 @@
         "title": "CodeableConcept.coding",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -34925,7 +34925,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-CodeableConcept.text",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -34939,7 +34939,7 @@
         "title": "CodeableConcept.text",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -35049,7 +35049,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ParameterDefinition.name",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -35063,7 +35063,7 @@
         "title": "ParameterDefinition.name",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -35147,7 +35147,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ParameterDefinition.use",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -35161,7 +35161,7 @@
         "title": "ParameterDefinition.use",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -35254,7 +35254,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ParameterDefinition.min",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -35268,7 +35268,7 @@
         "title": "ParameterDefinition.min",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -35346,7 +35346,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ParameterDefinition.max",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -35360,7 +35360,7 @@
         "title": "ParameterDefinition.max",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -35438,7 +35438,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ParameterDefinition.documentation",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -35452,7 +35452,7 @@
         "title": "ParameterDefinition.documentation",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -35530,7 +35530,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ParameterDefinition.type",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -35544,7 +35544,7 @@
         "title": "ParameterDefinition.type",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -35641,7 +35641,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-ParameterDefinition.profile",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -35655,7 +35655,7 @@
         "title": "ParameterDefinition.profile",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -35736,7 +35736,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Extension.url",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -35750,7 +35750,7 @@
         "title": "Extension.url",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -35844,7 +35844,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Extension.valueX",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -35858,7 +35858,7 @@
         "title": "Extension.value[x]",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -36107,7 +36107,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-BackboneElement.modifierExtension",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -36121,7 +36121,7 @@
         "title": "BackboneElement.modifierExtension",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -36223,7 +36223,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Narrative.status",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -36237,7 +36237,7 @@
         "title": "Narrative.status",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -36336,7 +36336,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Narrative.div",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -36350,7 +36350,7 @@
         "title": "Narrative.div",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -36444,7 +36444,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Element.id",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -36458,7 +36458,7 @@
         "title": "Element.id",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -36554,7 +36554,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-Element.extension",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -36568,7 +36568,7 @@
         "title": "Element.extension",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -36667,7 +36667,7 @@
         "resourceType": "StructureDefinition",
         "id": "de-BackboneType.modifierExtension",
         "meta": {
-          "lastUpdated": "2026-08-28T18:37:46.371+00:00"
+          "lastUpdated": "2026-07-17T03:44:13.245+00:00"
         },
         "extension": [
           {
@@ -36681,7 +36681,7 @@
         "title": "BackboneType.modifierExtension",
         "status": "draft",
         "experimental": true,
-        "date": "2026-08-28T18:37:46+00:00",
+        "date": "2026-07-17T03:44:13+00:00",
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {

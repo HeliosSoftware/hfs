@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ServiceRequest"/>
   <meta>
-    <lastUpdated value="2026-08-28T18:37:46.371+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -984,7 +984,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Requested location
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v3-ServiceDeliveryLocationRoleType.html">ServiceDeliveryLocationRoleType</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-v3-ServiceDeliveryLocationRoleType.html">ServiceDeliveryLocationRoleType</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
             <br/>
@@ -1011,11 +1011,7 @@
             <a href="documentreference.html">DocumentReference</a> | 
             <a href="detectedissue.html">DetectedIssue</a> | 
             <a href="procedure.html">Procedure</a> | 
-            <a href="riskassessment.html">RiskAssessment</a> | 
-            <a href="familymemberhistory.html">FamilyMemberHistory</a> | 
-            <a href="medicationadministration.html">MedicationAdministration</a> | 
-            <a href="medicationrequest.html">MedicationRequest</a> | 
-            <a href="allergyintolerance.html">AllergyIntolerance</a>)
+            <a href="riskassessment.html">RiskAssessment</a>)
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Reason or indication for requesting the service
             <br/>Binding: 
@@ -1231,7 +1227,7 @@
   <name value="ServiceRequest"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-08-28T18:37:46+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -1342,7 +1338,7 @@
           <valueBoolean value="true"/>
         </extension>
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-          <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
+          <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
         </extension>
         <key value="dom-6"/>
         <severity value="warning"/>
@@ -3122,10 +3118,6 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/DetectedIssue"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Procedure"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RiskAssessment"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/FamilyMemberHistory"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/MedicationAdministration"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/MedicationRequest"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/AllergyIntolerance"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -4526,10 +4518,6 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/DetectedIssue"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Procedure"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RiskAssessment"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/FamilyMemberHistory"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/MedicationAdministration"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/MedicationRequest"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/AllergyIntolerance"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>

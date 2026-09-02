@@ -1,35 +1,6 @@
 {
   "resourceType": "ServiceRequest",
   "id": "ft4",
-  "contained": [
-    {
-      "resourceType": "ServiceRequest",
-      "id": "tsh",
-      "status": "completed",
-      "intent": "original-order",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://loinc.org",
-              "code": "3016-3",
-              "display": "Thyrotropin [Units/volume] in Serum or Plasma"
-            }
-          ],
-          "text": "TSH"
-        }
-      },
-      "subject": {
-        "reference": "Patient/pat2"
-      }
-    }
-  ],
-  "basedOn": [
-    {
-      "reference": "#tsh",
-      "display": "Original request for TSH test"
-    }
-  ],
   "status": "active",
   "intent": "reflex-order",
   "code": {

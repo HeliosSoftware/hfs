@@ -42,7 +42,7 @@
   </device>
   <relationship>
     <coding>
-      <system value="http://terminology.hl7.org/CodeSystem/deviceassociation-relationship"/>
+      <system value="http://hl7.org/fhir/deviceassociation-relationship"/>
       <code value="used-by"/>
       <display value="Used By"/>
     </coding>
@@ -50,7 +50,7 @@
   <status value="active"/>
   <relationshipStatus>
     <coding>
-      <system value="http://terminology.hl7.org/CodeSystem/deviceassociation-relationship-status"/>
+      <system value="http://hl7.org/fhir/deviceassociation-relationship-status"/>
       <code value="ended"/>
       <display value="Ended"/>
     </coding>

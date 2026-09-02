@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="MeasureReport"/>
   <meta>
-    <lastUpdated value="2026-08-28T18:37:46.371+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -506,7 +506,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">process | outcome | structure | patient-reported-outcome
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-measure-type.html">MeasureType</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-measure-type.html">MeasureType</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -561,7 +561,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">What scoring method (e.g. proportion, ratio, continuous-variable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-measure-scoring.html">Measure Scoring</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-measure-scoring.html">Measure Scoring</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -585,7 +585,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">opportunity | all-or-nothing | linear | weighted
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-composite-measure-scoring.html">CompositeMeasureScoring</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-composite-measure-scoring.html">CompositeMeasureScoring</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -609,7 +609,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">increase | decrease
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-measure-improvement-notation.html" title="Observation values that indicate what change in a measurement value or score is indicative of an improvement in the measured item or scored issue.">MeasureImprovementNotation</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-measure-improvement-notation.html" title="Observation values that indicate what change in a measurement value or score is indicative of an improvement in the measured item or scored issue.">MeasureImprovementNotation</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -719,7 +719,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">initial-population | numerator | numerator-exclusion | denominator | denominator-exclusion | denominator-exception | measure-population | measure-population-exclusion | measure-observation
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-measure-population.html">MeasurePopulationType</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-measure-population.html">MeasurePopulationType</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1614,7 +1614,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">initial-population | numerator | numerator-exclusion | denominator | denominator-exclusion | denominator-exception | measure-population | measure-population-exclusion | measure-observation
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-measure-population.html">MeasurePopulationType</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-measure-population.html">MeasurePopulationType</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1977,7 +1977,7 @@
   <name value="MeasureReport"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-08-28T18:37:46+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Clinical Quality Information"/>
   <contact>
     <telecom>
@@ -2060,7 +2060,7 @@
           <valueBoolean value="true"/>
         </extension>
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-          <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
+          <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
         </extension>
         <key value="dom-6"/>
         <severity value="warning"/>

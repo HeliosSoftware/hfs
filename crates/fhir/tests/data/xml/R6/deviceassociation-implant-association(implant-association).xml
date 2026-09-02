@@ -60,7 +60,7 @@
   </device>
   <relationship>
     <coding>
-      <system value="http://terminology.hl7.org/CodeSystem/deviceassociation-relationship"/>
+      <system value="http://hl7.org/fhir/deviceassociation-relationship"/>
       <code value="implanted-in"/>
       <display value="Implanted In"/>
     </coding>
@@ -68,7 +68,7 @@
   <status value="active"/>
   <relationshipStatus>
     <coding>
-      <system value="http://terminology.hl7.org/CodeSystem/deviceassociation-relationship-status"/>
+      <system value="http://hl7.org/fhir/deviceassociation-relationship-status"/>
       <code value="active"/>
       <display value="Active"/>
     </coding>
