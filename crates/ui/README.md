@@ -119,7 +119,28 @@ asset in this crate (above), nothing bundler-specific about how it ships. It
 backs the ViewDefinition JSON editor on `/ui/sql/view-definitions` and the SQL
 pane editors on `/ui/sql/queries` and `/ui/sql/views`; see
 [`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
-for the full evaluation this amendment is drawn from.
+for the full evaluation this amendment is drawn from. The editor talks to two
+JSON-in-HTML-fragment-out endpoints on that page: `POST …/lint` (#753 ticket
+03), the CodeMirror linter's structural + FHIRPath-syntax check, and `POST
+…/run` (#752 ticket 01), which runs the editor's own posted text — saved or
+not — through `$sql-run` and answers with `partials/sql_run_results.html`,
+the same results-card partial the page's own initial render nests as a
+template field. `/run` always answers `200` (htmx does not swap `4xx`/`5xx`
+by default) except for a malformed request body.
+
+That page is a playground, not a Run button (#752 ticket 02): the editor card
+is always open (no fold, no separate "Run" action), and the results region
+below it wires straight to `/run` with plain `hx-*` attributes — no JavaScript
+beyond what already ships. The results region's own empty shell fires one
+`hx-trigger="load"` request when the page opens with nothing to show yet
+(a fresh selection, or `?vd=new`'s starter document), and the editor's
+`textarea` reposts on `hx-trigger="input changed delay:500ms"` as it changes —
+CodeMirror's mount already dispatches `input` on every edit, so this needs no
+mount-specific wiring. A failed run leaves the editor's text untouched and the
+last successful table on screen, relabelled "last successful run" via an
+out-of-band swap of just its meta. With JavaScript disabled there is no live
+preview at all: Save's own redirect (`?vd=<id>&saved=1`) is what renders the
+just-stored definition's results, server-side, once.
 
 ### Client-side scripts
 

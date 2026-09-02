@@ -195,31 +195,22 @@ fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
     })
 }
 
-#[async_trait]
-impl SearchProvider for PostgresBackend {
-    async fn search(
+impl PostgresBackend {
+    /// The body of [`SearchProvider::search`], run on a caller-supplied client.
+    ///
+    /// `SearchProvider::search` takes a fresh pooled client, which cannot see
+    /// rows an open transaction has written. A bundle entry that must resolve
+    /// `ifNoneExist` against what earlier entries in the same transaction wrote
+    /// runs this on the transaction's own client instead (#511). `total` is
+    /// computed by the caller so the count query's client is not held across
+    /// this one's await points.
+    pub(crate) async fn search_with_client(
         &self,
+        client: &deadpool_postgres::Client,
         tenant: &TenantContext,
         query: &SearchQuery,
+        total: Option<u64>,
     ) -> StorageResult<SearchResult> {
-        reject_contained_missing(query)?;
-
-        // `_contained` search uses a dedicated path (different index columns and
-        // heterogeneous result types); standard search handles `_contained=false`.
-        if query.contained != crate::types::ContainedMode::Off {
-            return self.search_contained(tenant, query).await;
-        }
-
-        // Populate Bundle.total only when the client asked for it
-        // (`_total=accurate|estimate`). Computed up-front so the count query's
-        // client is not held across the main query's await points.
-        let total = if query.wants_total() {
-            Some(self.search_count(tenant, query).await?)
-        } else {
-            None
-        };
-
-        let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
 
@@ -406,7 +397,7 @@ impl SearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
         let rows = if statement_is_reusable(query) {
-            query_dyn_cached(&client, &sql, &param_refs).await
+            query_dyn_cached(client, &sql, &param_refs).await
         } else {
             client.query(&sql, &param_refs).await
         }
@@ -489,6 +480,35 @@ impl SearchProvider for PostgresBackend {
             total,
             scores: Default::default(),
         })
+    }
+}
+
+#[async_trait]
+impl SearchProvider for PostgresBackend {
+    async fn search(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        reject_contained_missing(query)?;
+
+        // `_contained` search uses a dedicated path (different index columns and
+        // heterogeneous result types); standard search handles `_contained=false`.
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+
+        // Populate Bundle.total only when the client asked for it
+        // (`_total=accurate|estimate`). Computed up-front so the count query's
+        // client is not held across the main query's await points.
+        let total = if query.wants_total() {
+            Some(self.search_count(tenant, query).await?)
+        } else {
+            None
+        };
+
+        let client = self.get_client().await?;
+        self.search_with_client(&client, tenant, query, total).await
     }
 
     async fn search_count(

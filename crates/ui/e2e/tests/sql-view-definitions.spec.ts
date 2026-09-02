@@ -1,10 +1,12 @@
-// View Definitions workspace (#649): a stored ViewDefinition lists in the
-// rail, its JSON lands in the editor, Run previews rows through $sql-run, and
-// Create New offers the starter document. Everything here is plain links and
-// forms, so it also holds with JavaScript disabled (the nojs sweep loads the
-// route; the flows are exercised in the chromium project only). The rail
-// itself is a server-side search — name filter, `_sort=name`, 50-item pages
-// with plain previous/next links (#741) — not a full-collection fetch.
+// View Definitions playground (#649; #752 re-focus): a stored ViewDefinition
+// lists in the rail, its JSON lands in the always-open editor card, the
+// $sql-run preview loads itself on arrival and refreshes live as the editor
+// changes, and Create New offers the starter document. There is no Run
+// button — the live preview is progressive enhancement (`crates/ui/e2e/tests/
+// nojs/sql-view-definitions.spec.ts` covers the Save-shows-results fallback
+// without JavaScript). The rail itself is a server-side search — name
+// filter, `_sort=name`, 50-item pages with plain previous/next links (#741)
+// — not a full-collection fetch.
 import { expect, test } from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
 
@@ -41,8 +43,9 @@ test("a stored ViewDefinition lists, edits, and previews rows", async ({ page, r
   await expect(createNew).toHaveCSS("height", "30px");
   await expect(createNew).toHaveCSS("padding-left", "12px");
 
-  // Run previews the output; the seeded patient's key is among the rows.
-  await page.locator("a[href*='run=1']").click();
+  // #752 ticket 02, RF4: the preview loads itself — no click, no Run link at
+  // all — and the seeded patient's key is among the rows.
+  await expect(page.locator("a[href*='run=1']")).toHaveCount(0);
   await expect(page.locator(".data-table")).toBeVisible();
   await expect(page.locator(".data-table td", { hasText: patientId }).first()).toBeVisible();
 
@@ -106,6 +109,85 @@ test("the CodeMirror editor syncs typed keystrokes to the hidden textarea, saves
   await page.waitForURL(/saved=1/);
   await expect(page.locator("textarea[name='json']")).toContainText(`zcm_${stamp}_after`);
   await expect(page.locator(".vd-editor .cm-content")).toContainText(`zcm_${stamp}_after`);
+});
+
+// #752 ticket 02: the live preview follows the editor's *current* text, in
+// or out of CodeMirror — RF4 (load), RF5 (debounced edits), RF7 (failure
+// keeps the last good table and marks its meta stale, then a fix clears it).
+
+test("editing the view in CodeMirror refreshes the results live, without a page reload", async ({
+  page,
+  request,
+}) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "VdLiveE2E" }],
+  });
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_live_preview",
+    status: "active",
+    resource: "Patient",
+    where: [{ path: "name.family = 'VdLiveE2E'" }],
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await waitSearchable(request, "Patient", patientId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  await expect(page.locator(".data-table th")).toHaveText(["id"]);
+  await expect(page.locator(".data-table td", { hasText: patientId }).first()).toBeVisible();
+
+  const good = JSON.stringify(
+    {
+      resourceType: "ViewDefinition",
+      id: vdId,
+      name: "e2e_live_preview",
+      status: "active",
+      resource: "Patient",
+      where: [{ path: "name.family = 'VdLiveE2E'" }],
+      select: [{ column: [{ name: "patient_key", path: "getResourceKey()" }] }],
+    },
+    null,
+    2,
+  );
+
+  // The mounted CodeMirror content — RF5's `input` events come from here.
+  const cmContent = page.locator("#vd-editor .cm-content");
+  await cmContent.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(good);
+
+  // RF5: the debounced live preview lands within ~3s, with no navigation.
+  await expect(page.locator(".data-table th")).toHaveText(["patient_key"], { timeout: 3000 });
+  await expect(page).toHaveURL(new RegExp(`vd=${vdId}$`));
+  await expect(cmContent).toBeFocused();
+  await expect(cmContent).toContainText("patient_key");
+
+  // RF7: broken JSON reports the failure and keeps the last good table,
+  // relabelled "last successful run" — the editor keeps the broken text.
+  const broken = good.replace(/}\s*$/, "");
+  await cmContent.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(broken);
+  await expect(page.locator(".notice--warn")).toContainText("Could not run the view", {
+    timeout: 3000,
+  });
+  await expect(page.locator(".data-table th")).toHaveText(["patient_key"]);
+  await expect(page.locator("#vd-results-meta")).toHaveText("last successful run");
+  await expect(cmContent).toContainText("patient_key");
+
+  // Fixing the JSON clears the notice and restores a fresh `rows · ms` meta.
+  await cmContent.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(good);
+  await expect(page.locator(".notice--warn")).toHaveCount(0, { timeout: 3000 });
+  await expect(page.locator("#vd-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/);
+});
+
+test("?vd=new produces results on arrival, before any edit", async ({ page }) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  await expect(page.locator("textarea[name='json']")).toContainText("new_view");
+  await expect(page.locator("#vd-results")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator(".data-table")).toBeVisible();
 });
 
 /** A minimal savable ViewDefinition, named for the rail. */

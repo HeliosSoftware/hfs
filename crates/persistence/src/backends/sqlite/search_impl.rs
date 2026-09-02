@@ -83,31 +83,24 @@ fn bind_cursor_value(
     Ok(())
 }
 
-#[async_trait]
-impl SearchProvider for SqliteBackend {
-    async fn search(
+impl SqliteBackend {
+    /// The body of [`SearchProvider::search`], run on a caller-supplied
+    /// connection.
+    ///
+    /// `SearchProvider::search` takes a fresh pooled connection, which under
+    /// `BEGIN IMMEDIATE` sees pre-transaction state only. A bundle entry that
+    /// must resolve `ifNoneExist` against what earlier entries in the same
+    /// transaction wrote runs this on the transaction's own connection instead
+    /// (via `SqliteTransaction::with_connection`, #511). `total` is computed by
+    /// the caller because `search_count` is async and this is not.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn search_with_connection(
         &self,
+        conn: &rusqlite::Connection,
         tenant: &TenantContext,
         query: &SearchQuery,
+        total: Option<u64>,
     ) -> StorageResult<SearchResult> {
-        reject_contained_missing(query)?;
-
-        // `_contained` search uses a dedicated path (different index columns and
-        // heterogeneous result types); standard search handles `_contained=false`.
-        if query.contained != crate::types::ContainedMode::Off {
-            return self.search_contained(tenant, query).await;
-        }
-
-        // Populate Bundle.total only when the client asked for it
-        // (`_total=accurate|estimate`). Computed up-front, before acquiring the
-        // (non-Send) connection, so it is not held across this await.
-        let total = if query.wants_total() {
-            Some(self.search_count(tenant, query).await?)
-        } else {
-            None
-        };
-
-        let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
 
@@ -351,6 +344,35 @@ impl SearchProvider for SqliteBackend {
             total,
             scores: Default::default(),
         })
+    }
+}
+
+#[async_trait]
+impl SearchProvider for SqliteBackend {
+    async fn search(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        reject_contained_missing(query)?;
+
+        // `_contained` search uses a dedicated path (different index columns and
+        // heterogeneous result types); standard search handles `_contained=false`.
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+
+        // Populate Bundle.total only when the client asked for it
+        // (`_total=accurate|estimate`). Computed up-front, before acquiring the
+        // (non-Send) connection, so it is not held across this await.
+        let total = if query.wants_total() {
+            Some(self.search_count(tenant, query).await?)
+        } else {
+            None
+        };
+
+        let conn = self.get_connection()?;
+        self.search_with_connection(&conn, tenant, query, total)
     }
 
     async fn search_count(

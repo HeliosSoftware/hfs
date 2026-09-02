@@ -779,6 +779,8 @@ async fn add_bulk_submit_worker_schema(
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS last_processed_line BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS import_directives TEXT",
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS submission_metadata TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS bytes_processed BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS bytes_total BIGINT NOT NULL DEFAULT 0",
     ];
     for sql in &migrations {
         client
