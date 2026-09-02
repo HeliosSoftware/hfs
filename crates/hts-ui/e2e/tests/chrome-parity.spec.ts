@@ -22,7 +22,7 @@ import { expect, test } from "@playwright/test";
 // crates/ui/assets/app.css and reaches HTS through the shared
 // `#[folder = "../ui/assets"]` embed.
 //
-// Seed dependency: seed.mjs already provisions ex-cs-1, ex-vs-1, ex-cm-1
+// Seed dependency: seed.ts already provisions ex-cs-1, ex-vs-1, ex-cm-1
 // through /import, so the detail pages actually render `summary =
 // Some(...)` and the back link appears. No extra fixture bytes required.
 

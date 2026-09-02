@@ -559,6 +559,57 @@ pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<(
     Ok(())
 }
 
+/// One-time backfill for issue #802: the ICD-9-CM importer previously
+/// required a pipe delimiter that the real bundled CMS file never has, so
+/// every code silently failed to parse and the file was still recorded as a
+/// successful bootstrap import. Fixing the parser does not repair a database
+/// that already has that stale, content-hash-unchanged ledger row — it would
+/// be skipped on every future restart. This clears it exactly once.
+///
+/// Unlike [`migrate_authority_rank`], this fix needs no new column to
+/// piggyback the one-shot detection on, so it uses a sentinel row in
+/// `bootstrap_imports` itself: present means the migration already ran,
+/// absent means run it now. The `#`-prefixed key can never collide with a
+/// real bootstrap file path (those are always real directory entry names).
+pub fn migrate_icd9cm_reimport(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+
+    const MARKER: &str = "#migration:icd9cm-space-delimited-802";
+
+    let already_ran: bool = conn
+        .query_row(
+            "SELECT 1 FROM bootstrap_imports WHERE path = ?1",
+            [MARKER],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if already_ran {
+        return Ok(());
+    }
+
+    // SQLite's LIKE is ASCII case-insensitive by default, so this also
+    // catches 'ICD-9-CM...zip' regardless of case; 'icd10cm' matches
+    // neither pattern.
+    let cleared = conn.execute(
+        "DELETE FROM bootstrap_imports WHERE path LIKE '%icd-9-cm%' OR path LIKE '%icd9cm%'",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
+        [MARKER],
+    )?;
+
+    if cleared > 0 {
+        tracing::info!(
+            cleared_ledger_entries = cleared,
+            "Cleared ICD-9-CM bootstrap ledger entry so the corrected parser re-imports it"
+        );
+    }
+
+    Ok(())
+}
+
 /// Add the `mtime_unix` and `languages` columns to an existing
 /// `bootstrap_imports` ledger.
 ///
@@ -917,5 +968,86 @@ mod tests {
 
         assert_eq!(ledger_paths(&conn).len(), 1);
         assert!(has_authority_rank(&conn, "code_systems"));
+    }
+
+    const ICD9CM_MARKER: &str = "#migration:icd9cm-space-delimited-802";
+
+    #[test]
+    fn icd9cm_reimport_migration_clears_only_icd9_rows() {
+        let conn = legacy_db();
+        conn.execute(
+            "INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
+             VALUES ('/app/terminology-data/ICD-9-CM-v32-master-descriptions.zip', 'h5', 5)",
+            [],
+        )
+        .unwrap();
+
+        migrate_icd9cm_reimport(&conn).expect("migration should succeed");
+
+        let paths = ledger_paths(&conn);
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p != ICD9CM_MARKER && (p.contains("ICD-9-CM") || p.contains("icd9cm"))),
+            "the real ICD-9-CM file row must be cleared (marker itself is expected): {paths:?}"
+        );
+        assert!(
+            paths.contains(&ICD9CM_MARKER.to_string()),
+            "the sentinel marker must be planted: {paths:?}"
+        );
+        // Everything else — including icd10cm, which must NOT match the
+        // icd9cm LIKE patterns — is left alone.
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("icd10cm-table-and-index-2026.zip")),
+            "icd10cm must not be swept up by the icd9cm cleanup: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("hl7.terminology-7.1.0.tgz"))
+        );
+        assert!(paths.iter().any(|p| p.ends_with("ucum-essence-v2.2.xml")));
+    }
+
+    #[test]
+    fn icd9cm_reimport_migration_is_idempotent() {
+        let conn = legacy_db();
+        conn.execute(
+            "INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
+             VALUES ('/app/terminology-data/ICD-9-CM-v32-master-descriptions.zip', 'h5', 5)",
+            [],
+        )
+        .unwrap();
+        migrate_icd9cm_reimport(&conn).unwrap();
+
+        // Simulate the corrected parser successfully re-importing the file.
+        conn.execute(
+            "INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
+             VALUES ('/app/terminology-data/ICD-9-CM-v32-master-descriptions.zip', 'h5-fixed', 5)",
+            [],
+        )
+        .unwrap();
+
+        // A second run (e.g. next restart) must NOT clear it again — the
+        // marker is already present, so the function returns early.
+        migrate_icd9cm_reimport(&conn).expect("migration must be idempotent");
+        assert!(
+            ledger_paths(&conn)
+                .iter()
+                .any(|p| p.ends_with("ICD-9-CM-v32-master-descriptions.zip")),
+            "an already-migrated database must not re-clear a freshly re-imported row"
+        );
+    }
+
+    #[test]
+    fn icd9cm_reimport_migration_on_fresh_db_only_plants_marker() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+
+        migrate_icd9cm_reimport(&conn).unwrap();
+
+        assert_eq!(ledger_paths(&conn), vec![ICD9CM_MARKER.to_string()]);
     }
 }

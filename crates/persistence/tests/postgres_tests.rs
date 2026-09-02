@@ -5159,9 +5159,10 @@ mod postgres_integration {
     // Bulk Export — Phase 2 multi-instance job state on Postgres.
     // ========================================================================
 
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use helios_persistence::core::bulk_export::{
-        BulkExportStorage, ExportRequest, ExportStatus, StartExportInput, TypeExportProgress,
+        BulkExportStorage, ExportDataProvider, ExportRequest, ExportStatus, PatientExportProvider,
+        StartExportInput, TypeExportProgress,
     };
     use helios_persistence::core::bulk_export_worker::{
         ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId,
@@ -5249,6 +5250,152 @@ mod postgres_integration {
 
         let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
         assert_eq!(progress.status, ExportStatus::Complete);
+    }
+
+    /// Pins a stored resource's `last_updated` so a window test does not depend
+    /// on wall-clock timing.
+    async fn pin_last_updated(backend: &PostgresBackend, id: &str, at: DateTime<Utc>) {
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "UPDATE resources SET last_updated = $1 WHERE id = $2",
+                &[&at, &id],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn seed_patient_at(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        at: DateTime<Utc>,
+    ) -> String {
+        let stored = backend
+            .create(
+                tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = stored.id().to_string();
+        pin_last_updated(backend, &id, at).await;
+        id
+    }
+
+    fn instant(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// `_until` excludes a resource modified after the bound, and the count
+    /// agrees with what the fetch emits.
+    #[tokio::test]
+    async fn postgres_integration_export_until_bounds_count_and_fetch() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-until");
+
+        let early = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let _late = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+        let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+
+        let count = backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap();
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1, "count must apply the upper bound");
+        assert_eq!(batch.lines.len(), 1, "fetch must apply the upper bound");
+        assert_eq!(
+            count as usize,
+            batch.lines.len(),
+            "count and fetch must agree about the window"
+        );
+        assert!(batch.lines[0].contains(&early));
+    }
+
+    /// The bound is inclusive, matching S3.
+    #[tokio::test]
+    async fn postgres_integration_export_until_is_inclusive() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-until-incl");
+
+        seed_patient_at(&backend, &tenant, instant("2026-02-01T00:00:00Z")).await;
+
+        let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "a resource exactly on the bound is included"
+        );
+    }
+
+    /// `_since` and `_until` together bound the window at both ends.
+    #[tokio::test]
+    async fn postgres_integration_export_since_and_until_bound_the_window() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-window");
+
+        let _before = seed_patient_at(&backend, &tenant, instant("2025-12-01T00:00:00Z")).await;
+        let inside = seed_patient_at(&backend, &tenant, instant("2026-01-15T00:00:00Z")).await;
+        let _after = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+        let request = ExportRequest::system()
+            .with_since(instant("2026-01-01T00:00:00Z"))
+            .with_until(instant("2026-02-01T00:00:00Z"));
+
+        let count = backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap();
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(batch.lines.len(), 1);
+        assert!(batch.lines[0].contains(&inside));
+    }
+
+    /// The patient-compartment path applies the bound too — it builds its own
+    /// query, separate from `fetch_export_batch`.
+    #[tokio::test]
+    async fn postgres_integration_export_until_bounds_patient_compartment() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-compartment");
+
+        let early = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let late = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+        let request = ExportRequest::patient().with_until(instant("2026-02-01T00:00:00Z"));
+        let ids = vec![early.clone(), late.clone()];
+
+        let batch = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &ids, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "the compartment fetch applies the upper bound"
+        );
+        assert!(batch.lines[0].contains(&early));
     }
 
     #[tokio::test]

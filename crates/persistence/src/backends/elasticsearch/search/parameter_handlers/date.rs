@@ -4,113 +4,67 @@ use serde_json::{Value, json};
 
 use crate::types::SearchPrefix;
 
-/// Builds an ES query clause for a date search parameter.
+/// A precision-aware comparison on one ES date field, ready to be wrapped in
+/// whatever query shape the caller needs (nested for indexed parameters, a
+/// bare top-level clause for `_lastUpdated`).
+#[derive(Debug)]
+pub(crate) enum DateRange {
+    /// `{ "range": { field: bounds } }` — the value must fall inside.
+    Within(Value),
+    /// `{ "range": { field: bounds } }` — the value must fall *outside*
+    /// (`ne`). The caller negates it with `must_not` so the negation is
+    /// applied at the right level of the enclosing query.
+    Outside(Value),
+}
+
+/// Builds the `range` comparison for `field` at the value's inherent
+/// precision: `eq` at day precision means `[day, day+1)`, `ne` its
+/// complement, `gt`/`sa` start strictly after the whole period, `lt`/`eb`
+/// end strictly before it, and `le` reaches the end of the period.
+///
+/// A full-precision instant (`2024-01-15T10:00:00Z`) has no period, so it
+/// falls back to scalar comparison rather than an empty half-open range.
+pub(crate) fn field_range(field: &str, value: &str, prefix: SearchPrefix) -> DateRange {
+    let (lower, upper) = date_precision_range(value);
+    let degenerate = lower == upper;
+    let range = |bounds: Value| json!({ "range": { field: bounds } });
+
+    match prefix {
+        // `ap` on a date is the precision range itself: ES has no fuzzy
+        // date matching, and the implied period is the natural tolerance.
+        SearchPrefix::Eq | SearchPrefix::Ap if degenerate => {
+            DateRange::Within(range(json!({ "gte": lower, "lte": lower })))
+        }
+        SearchPrefix::Eq | SearchPrefix::Ap => {
+            DateRange::Within(range(json!({ "gte": lower, "lt": upper })))
+        }
+        SearchPrefix::Ne if degenerate => {
+            DateRange::Outside(range(json!({ "gte": lower, "lte": lower })))
+        }
+        SearchPrefix::Ne => DateRange::Outside(range(json!({ "gte": lower, "lt": upper }))),
+        SearchPrefix::Gt | SearchPrefix::Sa if degenerate => {
+            DateRange::Within(range(json!({ "gt": lower })))
+        }
+        SearchPrefix::Gt | SearchPrefix::Sa => DateRange::Within(range(json!({ "gte": upper }))),
+        SearchPrefix::Lt | SearchPrefix::Eb => DateRange::Within(range(json!({ "lt": lower }))),
+        SearchPrefix::Ge => DateRange::Within(range(json!({ "gte": lower }))),
+        SearchPrefix::Le if degenerate => DateRange::Within(range(json!({ "lte": lower }))),
+        SearchPrefix::Le => DateRange::Within(range(json!({ "lt": upper }))),
+    }
+}
+
+/// Builds an ES query clause for an indexed date search parameter.
 pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Value> {
-    let range_condition = match prefix {
-        SearchPrefix::Eq => {
-            // Equality accounting for precision:
-            // "2024-01-15" matches the full day
-            let (lower, upper) = date_precision_range(value);
-            json!({
-                "range": {
-                    "search_params.date.value": {
-                        "gte": lower,
-                        "lt": upper
-                    }
-                }
-            })
-        }
-        SearchPrefix::Ne => {
-            let (lower, upper) = date_precision_range(value);
-            return Some(json!({
-                "nested": {
-                    "path": "search_params.date",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                { "term": { "search_params.date.name": name } }
-                            ],
-                            "must_not": [
-                                {
-                                    "range": {
-                                        "search_params.date.value": {
-                                            "gte": lower,
-                                            "lt": upper
-                                        }
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                }
-            }));
-        }
-        SearchPrefix::Gt | SearchPrefix::Sa => {
-            let (_, upper) = date_precision_range(value);
-            json!({
-                "range": {
-                    "search_params.date.value": {
-                        "gte": upper
-                    }
-                }
-            })
-        }
-        SearchPrefix::Lt | SearchPrefix::Eb => {
-            let (lower, _) = date_precision_range(value);
-            json!({
-                "range": {
-                    "search_params.date.value": {
-                        "lt": lower
-                    }
-                }
-            })
-        }
-        SearchPrefix::Ge => {
-            let (lower, _) = date_precision_range(value);
-            json!({
-                "range": {
-                    "search_params.date.value": {
-                        "gte": lower
-                    }
-                }
-            })
-        }
-        SearchPrefix::Le => {
-            let (_, upper) = date_precision_range(value);
-            json!({
-                "range": {
-                    "search_params.date.value": {
-                        "lt": upper
-                    }
-                }
-            })
-        }
-        SearchPrefix::Ap => {
-            // Approximately: ±10% of the precision range
-            let (lower, upper) = date_precision_range(value);
-            // For approximate, we use the range itself (ES handles fuzzy matching)
-            json!({
-                "range": {
-                    "search_params.date.value": {
-                        "gte": lower,
-                        "lt": upper
-                    }
-                }
-            })
-        }
+    let name_term = json!({ "term": { "search_params.date.name": name } });
+    let bool_body = match field_range("search_params.date.value", value, prefix) {
+        DateRange::Within(range) => json!({ "must": [name_term, range] }),
+        DateRange::Outside(range) => json!({ "must": [name_term], "must_not": [range] }),
     };
 
     Some(json!({
         "nested": {
             "path": "search_params.date",
-            "query": {
-                "bool": {
-                    "must": [
-                        { "term": { "search_params.date.name": name } },
-                        range_condition
-                    ]
-                }
-            }
+            "query": { "bool": bool_body }
         }
     }))
 }
@@ -205,5 +159,52 @@ mod tests {
         let s = serde_json::to_string(&clause).unwrap();
         assert!(s.contains("gte"));
         assert!(s.contains("2024-01-16")); // starts after precision range
+    }
+
+    #[test]
+    fn ne_is_the_negated_precision_range() {
+        let clause = build_clause("birthdate", "2024-01-15", SearchPrefix::Ne).unwrap();
+        let bool_body = &clause["nested"]["query"]["bool"];
+        assert_eq!(
+            bool_body["must"][0]["term"]["search_params.date.name"],
+            "birthdate"
+        );
+        let range = &bool_body["must_not"][0]["range"]["search_params.date.value"];
+        assert_eq!(range["gte"], "2024-01-15");
+        assert_eq!(range["lt"], "2024-01-16");
+    }
+
+    #[test]
+    fn sa_and_eb_mirror_gt_and_lt_on_the_whole_period() {
+        let sa = field_range("f", "2024-01", SearchPrefix::Sa);
+        let DateRange::Within(sa) = sa else {
+            panic!("sa must be a plain range: {sa:?}")
+        };
+        assert_eq!(sa["range"]["f"], json!({ "gte": "2024-02-01" }));
+
+        let eb = field_range("f", "2024-01", SearchPrefix::Eb);
+        let DateRange::Within(eb) = eb else {
+            panic!("eb must be a plain range: {eb:?}")
+        };
+        assert_eq!(eb["range"]["f"], json!({ "lt": "2024-01-01" }));
+    }
+
+    #[test]
+    fn full_precision_instant_is_scalar_not_an_empty_range() {
+        let instant = "2024-01-15T10:00:00Z";
+        let DateRange::Within(eq) = field_range("f", instant, SearchPrefix::Eq) else {
+            panic!("eq must be a plain range")
+        };
+        assert_eq!(eq["range"]["f"], json!({ "gte": instant, "lte": instant }));
+
+        let DateRange::Within(gt) = field_range("f", instant, SearchPrefix::Gt) else {
+            panic!("gt must be a plain range")
+        };
+        assert_eq!(gt["range"]["f"], json!({ "gt": instant }));
+
+        let DateRange::Within(le) = field_range("f", instant, SearchPrefix::Le) else {
+            panic!("le must be a plain range")
+        };
+        assert_eq!(le["range"]["f"], json!({ "lte": instant }));
     }
 }
