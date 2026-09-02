@@ -598,6 +598,31 @@ async fn abort_sends_a_status_only_kickoff() {
     assert_eq!(status_code, "stopped");
 }
 
+/// #850: "Mark completed" is the Data Provider's closing signal — without it
+/// the recipient keeps the submission open and its concurrency slot held.
+#[tokio::test]
+async fn complete_sends_a_status_only_kickoff() {
+    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let ctx = ctx(&recipient_url);
+
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "in-progress").await;
+    post_form(&ctx, &format!("{detail_path}/complete"), "").await;
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains("Completed"), "{html}");
+    assert!(html.contains("Recipient acknowledged (200)"), "{html}");
+
+    let bodies = received.lock().unwrap().clone();
+    let params = bodies.last().unwrap()["parameter"].as_array().unwrap();
+    assert!(params.iter().all(|p| p["name"] != "manifestUrl"));
+    let status_code = params
+        .iter()
+        .find(|p| p["name"] == "submissionStatus")
+        .and_then(|p| p["valueCoding"]["code"].as_str())
+        .unwrap();
+    assert_eq!(status_code, "completed");
+}
+
 #[tokio::test]
 async fn a_rejected_status_change_keeps_the_status_and_logs_it() {
     let (recipient_url, _) = mock_recipient(StatusCode::CONFLICT).await;
@@ -1169,18 +1194,24 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
 
     // First status fetch: one poll happens -> 202 progress recorded, the
     // fragment keeps polling, and the in-progress card offers Abort. A 0%
-    // report renders the indeterminate bar (manifest-granular percentages
-    // sit at 0 for a one-shot submission's whole run).
+    // report renders a determinate bar at zero — the recipient's percentage
+    // is byte-based now, so an early zero fills within seconds instead of
+    // sweeping indeterminately for the whole run.
     let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("processing 0% complete"), "{html}");
-    assert!(html.contains("progress-track--indeterminate"), "{html}");
+    assert!(html.contains(r#"aria-valuenow="0""#), "{html}");
+    assert!(!html.contains("progress-track--indeterminate"), "{html}");
     assert!(html.contains("every 5s"), "keeps polling: {html}");
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
     assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
     assert!(
         html.contains(&format!(r#"action="{detail_path}/abort""#)),
         "abort on the progress card: {html}"
+    );
+    assert!(
+        html.contains(&format!(r#"action="{detail_path}/complete""#)),
+        "mark-completed on the progress card: {html}"
     );
     assert!(!html.contains(r#"class="card detail""#));
 

@@ -610,6 +610,7 @@ bulk-import-detail-created = Created
 bulk-import-detail-status = Status
 bulk-import-detail-auth = Authentication
 bulk-import-abort = Abort
+bulk-import-mark-completed = Mark completed
 bulk-import-delete = Delete
 bulk-import-edit = Edit
 bulk-import-edit-title = Edit Submission

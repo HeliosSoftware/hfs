@@ -1076,6 +1076,19 @@ pub async fn abort(
     set_status(state, rt, _principal, id, "stopped").await
 }
 
+/// `POST /ui/bulk-import/{id}/complete` — status-only kick-off, `completed`:
+/// the Data Provider's signal that no further manifests are coming. The
+/// recipient keeps draining already-registered manifests and frees the
+/// submission's concurrency slot (#850).
+pub async fn complete(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    _principal: Option<Extension<helios_auth::Principal>>,
+    Path(id): Path<String>,
+) -> Response {
+    set_status(state, rt, _principal, id, "completed").await
+}
+
 async fn set_status(
     state: WebState,
     rt: RequestTenant,
@@ -1170,13 +1183,13 @@ pub async fn status_fragment(
 }
 
 /// The determinate share of the recipient's `X-Progress`, when it reports
-/// one. The percentage is manifest-granular, so a one-shot submission reads
-/// `0%` for its whole run — that renders as an indeterminate bar rather than
-/// a permanently empty one.
+/// one. `0%` counts: HFS reports byte-level progress, so an early zero is a
+/// bar about to fill, not a percentage that never moves — the indeterminate
+/// sweep is reserved for recipients that report no percentage at all.
 fn progress_percent(progress: &str) -> Option<u8> {
     let rest = progress.strip_prefix("processing ")?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    let pct: u8 = digits.parse().ok().filter(|p| *p > 0 && *p <= 100)?;
+    let pct: u8 = digits.parse().ok().filter(|p| *p <= 100)?;
     Some(pct)
 }
 
