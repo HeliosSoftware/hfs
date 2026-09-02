@@ -485,6 +485,17 @@ editor-must-support-badge = MS
 editor-binding-hint = Bound to a value set — codes come from it; strength shown
 editor-legend-live = Checked as you type: structure, cardinality, required bindings
 editor-legend-save = Checked on save: constraints and terminology
+# ViewDefinition's own single-line legend (#843): Save stays permissive
+# there, so promising a "checked on save" pass would be misleading — this
+# names everything the guided form's per-keystroke pass actually covers,
+# folding in the SQL-on-FHIR-specific checks the generic validator above
+# does not run.
+vd-form-legend-live = Checked as you type: structure, cardinality, required bindings, and FHIRPath syntax / SQL-on-FHIR rules
+# The guided form's validity chip (#843), client-side only, while the JSON
+# editor's text does not parse at all — short like the chip's other two
+# states ("No issues.", "3 issues"), never the longer editor-invalid-json
+# sentence.
+vd-form-invalid-chip = Invalid JSON
 editor-deferred-badge = on save
 editor-deferred-hint = Codes are verified against the value set when you save (and live in the picker where a terminology server is configured)
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element

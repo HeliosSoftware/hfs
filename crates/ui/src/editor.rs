@@ -132,7 +132,10 @@ pub struct EditorBody {
     /// The in-flight document. This *is* the editor's state: it rides in a
     /// hidden field and comes back with every mutation.
     pub document: String,
-    /// Pretty JSON, for the raw-edit textarea.
+    /// Pretty JSON (2-space indent, key order preserved), for the raw-edit
+    /// textarea and for `#editor-pretty` (#843) — a host that mirrors the
+    /// document into its own text editor always has the same pretty-printed
+    /// text the guided form itself computed.
     pub pretty: String,
     /// The foldable, line-numbered JSON view shown beside the guided form.
     pub json_lines: Vec<crate::json_view::JsonLine>,
@@ -152,6 +155,54 @@ pub struct EditorBody {
     /// Whether the root add-picker opens by itself — a document with no
     /// elements gives the user nothing else to act on (#547).
     pub auto_open_add: bool,
+    /// `resourceType == "ViewDefinition"` (#843): selects the ViewDefinition
+    /// legend (`vd-form-legend-live` only, no "checked on save" line — Save
+    /// stays permissive there) in place of the Resource Editor's own two-line
+    /// legend. `rows`/`orphan_errors` already carry the SOF-only lint
+    /// diagnostics when this is set; see [`analyze`].
+    pub is_view_definition: bool,
+    /// Whether the guided-form card (via `partials/editor-form-pane.html`,
+    /// shared with [`EditorFormPane`]) needs `needs-js` on its own root
+    /// element — true only for a host that renders this card inline,
+    /// server-side, ahead of any client-side script running (View
+    /// Definitions, #843). The Resource Editor's own body — the only
+    /// consumer of `EditorBody` — always fills `#editor-body` from
+    /// `editor.js`'s own fetch, so this is always `false` here: rendering it
+    /// `true` would hide a card that page has no other way to reveal.
+    pub needs_js: bool,
+}
+
+/// The `pane=form` fragment (#843): the guided-form panel alone, for a host —
+/// View Definitions — that keeps its own JSON view (a CodeMirror pane, not
+/// this crate's line-numbered [`crate::json_view`]) and only wants the form
+/// half re-rendered on every keystroke. Carries the same hidden-state
+/// contract as [`EditorBody`] (`partials/editor-hidden-form.html`, shared by
+/// both templates) plus the form card, minus the JSON pane, `.editor__grid`,
+/// and the raw-edit textarea.
+#[derive(Template)]
+#[template(path = "partials/editor-form-fragment.html")]
+pub struct EditorFormPane {
+    pub i18n: I18n,
+    pub rows: Vec<Row>,
+    pub document: String,
+    pub pretty: String,
+    pub error_count: usize,
+    pub orphan_errors: Vec<String>,
+    pub parse_error: Option<String>,
+    pub focus_path: String,
+    pub auto_open_add: bool,
+    pub is_view_definition: bool,
+    /// Whether this pane's card carries `needs-js` (#843) — true only when
+    /// the View Definitions page built this directly
+    /// (`crate::render_vd_form_pane`, `crate::invalid_vd_form_pane`) for its
+    /// own inline, server-side first paint; `false` for every response this
+    /// crate's own `POST /ui/editor/render` (`pane=form`) hands back, so a
+    /// consumer whose page does not run `theme.js`'s `<html class="js">`
+    /// marker before rendering this card server-side — the Resources modal,
+    /// the standalone editor, today — never renders a card `.needs-js` can
+    /// leave permanently hidden. See `app.css`'s `.needs-js` for the reveal
+    /// rule this flag ultimately controls.
+    pub needs_js: bool,
 }
 
 #[derive(Deserialize)]
@@ -182,6 +233,12 @@ pub struct EditorForm {
     pub modifier: String,
     #[serde(default)]
     pub slice: String,
+    /// `form` renders only the guided-form panel — [`EditorFormPane`] instead
+    /// of the full [`EditorBody`] (#843): a host with its own JSON view
+    /// (View Definitions' CodeMirror pane) re-requests only this half on
+    /// every keystroke. Absent or empty behaves exactly as today.
+    #[serde(default)]
+    pub pane: String,
 }
 
 /// The editor shell. The resource itself is fetched by the browser from the
@@ -216,26 +273,47 @@ pub async fn render_body(
     // The sidebar's FHIR version picks the schema pack (#488): an R4B build
     // edits against R4B schemas — and offers R4B's extension catalogue.
     let registry = packs::core_registry(rv.0);
+    // #843: `pane=form` swaps only the guided-form fragment; empty or absent
+    // is the full body, unchanged.
+    let form_pane_only = form.pane == "form";
 
     let mut document: Value = match serde_json::from_str(&form.doc) {
         Ok(value) => value,
         Err(error) => {
             // A malformed document is the source view's fault, and the user is
             // mid-keystroke. Say what is wrong and keep their text.
-            return render(EditorBody {
-                i18n,
-                rows: Vec::new(),
-                document: form.doc.clone(),
-                pretty: form.doc,
-                json_lines: Vec::new(),
-                json_view_id: "json-view",
-                json_view_paths: true,
-                error_count: 0,
-                orphan_errors: Vec::new(),
-                parse_error: Some(error.to_string()),
-                focus_path: String::new(),
-                auto_open_add: false,
-            });
+            return if form_pane_only {
+                render(EditorFormPane {
+                    i18n,
+                    rows: Vec::new(),
+                    document: form.doc.clone(),
+                    pretty: form.doc,
+                    error_count: 0,
+                    orphan_errors: Vec::new(),
+                    parse_error: Some(error.to_string()),
+                    focus_path: String::new(),
+                    auto_open_add: false,
+                    is_view_definition: false,
+                    needs_js: false,
+                })
+            } else {
+                render(EditorBody {
+                    i18n,
+                    rows: Vec::new(),
+                    document: form.doc.clone(),
+                    pretty: form.doc,
+                    json_lines: Vec::new(),
+                    json_view_id: "json-view",
+                    json_view_paths: true,
+                    error_count: 0,
+                    orphan_errors: Vec::new(),
+                    parse_error: Some(error.to_string()),
+                    focus_path: String::new(),
+                    auto_open_add: false,
+                    is_view_definition: false,
+                    needs_js: false,
+                })
+            };
         }
     };
 
@@ -247,15 +325,27 @@ pub async fn render_body(
 
     let created = apply(&*registry, &resource_type, &mut document, &form);
 
-    render(build_body(
-        i18n,
-        registry,
-        rv.0,
-        resource_type,
-        document,
-        None,
-        created,
-    ))
+    if form_pane_only {
+        render(build_form_pane(
+            i18n,
+            registry,
+            rv.0,
+            resource_type,
+            document,
+            created,
+            false, // #843: this HTTP endpoint never renders needs-js — see EditorFormPane::needs_js
+        ))
+    } else {
+        render(build_body(
+            i18n,
+            registry,
+            rv.0,
+            resource_type,
+            document,
+            None,
+            created,
+        ))
+    }
 }
 
 /// Applies one mutation to the document.
@@ -318,24 +408,62 @@ fn apply(
     None
 }
 
-/// Validates, flattens, and packages the editor body.
-fn build_body(
-    i18n: I18n,
-    registry: Arc<helios_fhir_validator::SchemaRegistry>,
+/// Lint codes [`helios_sof::lint::lint_view_definition`] reports that the
+/// generic structural validator ([`Validator::validate_sync`], run first in
+/// [`analyze`]) cannot see — because they are ViewDefinition/SQL-on-FHIR
+/// semantics, not FHIR Schema structure: an invalid FHIRPath expression, a
+/// `%constant` no `constant[]` declares, two columns in one row sharing a
+/// name, a `select` with no `column`/`select`/`unionAll`, or more than one of
+/// `forEach`/`forEachOrNull`/`repeat` on one `select` (#843).
+///
+/// The lint's remaining codes — `not-a-view-definition`, `unknown-key`,
+/// `missing-required`, `wrong-type`, `empty-required` — are deliberately
+/// **not** here: FHIR Schema (via the embedded core packs, already covering
+/// `ViewDefinition` on every enabled version) reports those same problems
+/// through the validator above, and appending the lint's copy would double
+/// every one of them on the same row. Adding a lint code later means
+/// deciding, here, which side of that line it falls on.
+const SOF_ONLY_LINT_CODES: &[helios_sof::lint::DiagnosticCode] = &[
+    helios_sof::lint::DiagnosticCode::FhirPathSyntax,
+    helios_sof::lint::DiagnosticCode::UndeclaredConstant,
+    helios_sof::lint::DiagnosticCode::DuplicateColumnName,
+    helios_sof::lint::DiagnosticCode::SelectWithoutOutput,
+    helios_sof::lint::DiagnosticCode::MultipleIterationDirectives,
+];
+
+/// Row-anchored validation, flattened rows, and the document's serialized
+/// forms — everything [`EditorBody`] and [`EditorFormPane`] both render,
+/// computed once so the two response shapes can never disagree about what a
+/// document's issues are (#843).
+struct FormAnalysis {
+    rows: Vec<Row>,
+    document: String,
+    pretty: String,
+    error_count: usize,
+    orphan_errors: Vec<String>,
+    focus_path: String,
+    auto_open_add: bool,
+    is_view_definition: bool,
+}
+
+/// Validates and flattens `document` into [`FormAnalysis`]. Shared by
+/// [`build_body`] and [`build_form_pane`] — the full body and the
+/// `pane=form` fragment are two views onto exactly this one pass.
+fn analyze(
+    registry: &Arc<helios_fhir_validator::SchemaRegistry>,
     version: helios_fhir::FhirVersion,
-    resource_type: String,
-    document: Value,
-    parse_error: Option<String>,
+    resource_type: &str,
+    document: &Value,
     created: Option<editor::Path>,
-) -> EditorBody {
+) -> FormAnalysis {
     // The cheap pass, on every mutation. Pure, no I/O — this is what makes
     // continuous validation affordable at all.
-    let resolver: Arc<dyn helios_fhir_validator::SchemaResolver> = Arc::clone(&registry) as _;
+    let resolver: Arc<dyn helios_fhir_validator::SchemaResolver> = Arc::clone(registry) as _;
     let validator = Validator::new(resolver);
     let SyncOutcome {
         mut errors,
         deferred,
-    } = validator.validate_sync(&document, &ValidationOptions::default());
+    } = validator.validate_sync(document, &ValidationOptions::default());
     // The editor's issue count blocks saving, so only error-severity issues
     // belong in it — warnings (e.g. extension context, #615) are $validate
     // guidance, not save blockers.
@@ -347,6 +475,8 @@ fn build_body(
     errors.extend(
         helios_fhir_validator::core_terminology(version).required_binding_errors(&deferred),
     );
+
+    let mut error_count = errors.len();
 
     // Anchor each issue to its node. The validator reports `Patient.name.0.given`
     // and our rows are keyed on `name.0.given`, so this is string equality —
@@ -361,13 +491,39 @@ fn build_body(
         by_path.entry(path).or_default().push(error.message.clone());
     }
 
+    // A ViewDefinition also gets the SOF-only lint diagnostics the generic
+    // validator above cannot see (#843) — anchored the same way, by the same
+    // RFC 6901-pointer-to-dotted-path conversion the unit tests below cover.
+    let is_view_definition = resource_type == "ViewDefinition";
+    if is_view_definition {
+        let sof_diagnostics = helios_sof::lint::lint_view_definition(document)
+            .into_iter()
+            .filter(|d| {
+                d.severity == helios_sof::lint::Severity::Error
+                    && SOF_ONLY_LINT_CODES.contains(&d.code)
+            });
+        for diagnostic in sof_diagnostics {
+            error_count += 1;
+            let path = dotted_path_from_pointer(&diagnostic.pointer);
+            by_path.entry(path).or_default().push(diagnostic.message);
+        }
+    }
+
+    // The same text never appears twice on one row: the validator and the
+    // lint check different things, but nothing rules out them agreeing on
+    // the same words for the same node.
+    for messages in by_path.values_mut() {
+        let mut seen = std::collections::HashSet::new();
+        messages.retain(|message| seen.insert(message.clone()));
+    }
+
     let mut rows = Vec::new();
     build_rows(
         &RowCtx {
             resolver: registry.as_ref(),
             registry: registry.as_ref(),
-            resource_type: &resource_type,
-            document: &document,
+            resource_type,
+            document,
             errors: &by_path,
         },
         &[],
@@ -406,22 +562,114 @@ fn build_body(
         .map(|o| o.keys().all(|k| k == "resourceType"))
         .unwrap_or(false);
 
-    EditorBody {
-        i18n,
-        document: serde_json::to_string(&document).unwrap_or_default(),
-        pretty: serde_json::to_string_pretty(&document).unwrap_or_default(),
-        json_lines: crate::json_view::lines(&document),
-        json_view_id: "json-view",
-        json_view_paths: true,
-        error_count: errors.len(),
+    FormAnalysis {
+        document: serde_json::to_string(document).unwrap_or_default(),
+        pretty: serde_json::to_string_pretty(document).unwrap_or_default(),
+        error_count,
         orphan_errors,
         rows,
-        parse_error,
         focus_path: created
             .map(|path| editor::path_to_string(&path))
             .unwrap_or_default(),
         auto_open_add,
+        is_view_definition,
     }
+}
+
+/// Validates, flattens, and packages the full editor body.
+///
+/// `needs_js` on the returned [`EditorBody`] is always `false`: the Resource
+/// Editor — this struct's only renderer — fills `#editor-body` from
+/// `editor.js`'s own client-side fetch, so a card marked `needs-js` here
+/// would have no page to reveal it (#843).
+fn build_body(
+    i18n: I18n,
+    registry: Arc<helios_fhir_validator::SchemaRegistry>,
+    version: helios_fhir::FhirVersion,
+    resource_type: String,
+    document: Value,
+    parse_error: Option<String>,
+    created: Option<editor::Path>,
+) -> EditorBody {
+    let analysis = analyze(&registry, version, &resource_type, &document, created);
+    EditorBody {
+        i18n,
+        json_lines: crate::json_view::lines(&document),
+        json_view_id: "json-view",
+        json_view_paths: true,
+        document: analysis.document,
+        pretty: analysis.pretty,
+        error_count: analysis.error_count,
+        orphan_errors: analysis.orphan_errors,
+        rows: analysis.rows,
+        parse_error,
+        focus_path: analysis.focus_path,
+        auto_open_add: analysis.auto_open_add,
+        is_view_definition: analysis.is_view_definition,
+        needs_js: false,
+    }
+}
+
+/// Validates, flattens, and packages the `pane=form` fragment (#843) — the
+/// same analysis as [`build_body`], packaged without the JSON pane.
+///
+/// `pub(crate)`: besides `render_body`'s own `pane=form` branch (which
+/// always passes `needs_js: false` — see [`EditorFormPane::needs_js`]), the
+/// View Definitions page (`crate::sql_view_definitions_page`,
+/// `crate::sql_view_definitions_save`) calls this directly, `needs_js: true`,
+/// to render the guided-form card inline, server-side, on the page's own
+/// first paint — there is no HTTP round trip to make for a document this
+/// render already has parsed.
+pub(crate) fn build_form_pane(
+    i18n: I18n,
+    registry: Arc<helios_fhir_validator::SchemaRegistry>,
+    version: helios_fhir::FhirVersion,
+    resource_type: String,
+    document: Value,
+    created: Option<editor::Path>,
+    needs_js: bool,
+) -> EditorFormPane {
+    let analysis = analyze(&registry, version, &resource_type, &document, created);
+    EditorFormPane {
+        i18n,
+        document: analysis.document,
+        pretty: analysis.pretty,
+        error_count: analysis.error_count,
+        orphan_errors: analysis.orphan_errors,
+        rows: analysis.rows,
+        parse_error: None,
+        focus_path: analysis.focus_path,
+        auto_open_add: analysis.auto_open_add,
+        is_view_definition: analysis.is_view_definition,
+        needs_js,
+    }
+}
+
+/// Converts an RFC 6901 JSON pointer, as [`helios_sof::lint::Diagnostic::pointer`]
+/// reports it (`/select/0/column/0/path`), to the dotted-path form the
+/// editor's rows are keyed on (`select.0.column.0.path`) — the same form
+/// [`editor::path_to_string`] produces — so a lint diagnostic anchors onto a
+/// row the same way a validator issue does: string equality. `~1`/`~0`
+/// escapes are undone per RFC 6901 (`~1` before `~0`, the reverse of how they
+/// are applied, so a literal `~` immediately followed by a literal `/`
+/// round-trips correctly); the root pointer `""` maps to `""`, the root row's
+/// own path.
+fn dotted_path_from_pointer(pointer: &str) -> String {
+    if pointer.is_empty() {
+        return String::new();
+    }
+    pointer
+        .split('/')
+        .skip(1)
+        .map(|segment| {
+            if segment.contains('~') {
+                segment.replace("~1", "/").replace("~0", "~")
+            } else {
+                segment.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// What a row walk carries unchanged all the way down.
@@ -684,5 +932,41 @@ fn to_option(addable: Addable) -> AddOption {
         must_support: addable.must_support,
         short: addable.short.unwrap_or_default(),
         slice: addable.slice.unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dotted_path_from_pointer_converts_the_lint_examples() {
+        assert_eq!(
+            dotted_path_from_pointer("/select/0/column/0/path"),
+            "select.0.column.0.path"
+        );
+        assert_eq!(dotted_path_from_pointer("/status"), "status");
+    }
+
+    #[test]
+    fn dotted_path_from_pointer_maps_the_root_pointer_to_the_root_row() {
+        // `""` is the whole document (RFC 6901) — the root row's own `path`
+        // is also `""` (`editor::path_to_string(&[])`), so a diagnostic
+        // anchored at the document root lands on that row.
+        assert_eq!(dotted_path_from_pointer(""), "");
+    }
+
+    #[test]
+    fn dotted_path_from_pointer_undoes_tilde_and_slash_escapes() {
+        // RFC 6901: `~1` must be restored to `/` before `~0` is restored to
+        // `~`, or a literal `~` immediately followed by a literal `/` would
+        // round-trip incorrectly.
+        assert_eq!(dotted_path_from_pointer("/a~1b"), "a/b");
+        assert_eq!(dotted_path_from_pointer("/a~0b"), "a~b");
+        assert_eq!(dotted_path_from_pointer("/a~01"), "a~1");
+        assert_eq!(
+            dotted_path_from_pointer("/select/0~1x/name"),
+            "select.0/x.name"
+        );
     }
 }

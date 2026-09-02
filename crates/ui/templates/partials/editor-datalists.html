@@ -1,0 +1,11 @@
+<!--
+  Required bindings become closed lists; the codes come from the schema.
+  Shared by the full editor body and the `pane=form` fragment (#843) — both
+  render the same `<input list="vs-...">` controls in `editor-form-pane.html`
+  and need the matching `<datalist>` elements alongside them.
+-->
+{% for row in rows %}
+{% if let Some(vs) = row.binding %}
+<datalist id="vs-{{ vs }}"></datalist>
+{% endif %}
+{% endfor %}
