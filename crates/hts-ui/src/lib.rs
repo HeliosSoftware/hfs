@@ -52,6 +52,7 @@ mod i18n;
 mod import;
 mod metrics_parse;
 mod metrics_ring;
+mod raw_fold;
 mod upstream;
 mod value_sets;
 

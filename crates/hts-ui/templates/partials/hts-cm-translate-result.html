@@ -139,27 +139,5 @@
     </article>
   {% endif %}
 
-  {#- Raw request + response echo (§7.5 wireframe). Kept last so the
-      readable summary stays visually primary. -#}
-  {% if !view.raw_body.is_empty() || !view.request_url.is_empty() %}
-  <section class="card panel">
-    <details class="disclosure">
-      <summary class="disclosure__summary">
-        <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
-        {{ chrome.i18n.t("hts-workbench-raw-response") }}
-      </summary>
-      {% if !view.request_url.is_empty() %}
-      <div class="kv-grid" style="margin:14px 0">
-        <div class="detail__field detail__field--wide">
-          <span>{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
-          <code>{{ view.request_url }}</code>
-        </div>
-      </div>
-      {% endif %}
-      {% if !view.raw_body.is_empty() %}
-      <pre class="detail__code" tabindex="0">{{ view.raw_body }}</pre>
-      {% endif %}
-    </details>
-  </section>
-  {% endif %}
+  {% include "partials/hts-raw-fold.html" %}
 </div>

@@ -15,8 +15,15 @@
 //! HFS already built for the editor, and HTS needed it too rather than a
 //! second, byte-capped `<pre>`. HFS's editor, Resources and Batch pages keep
 //! their own template that renders a [`JsonLine`] vector inline — only the
-//! engine and its data types are shared, so that stays untouched.
+//! engine and its data types are shared.
+//!
+//! The HTS workbench's "Raw request and response" fold (#803) renders the
+//! same markup through [`render`], and the browser-side folding is
+//! `crates/ui/assets/json-view.js`, which HTS already serves from the shared
+//! asset embed.
 
+use crate::ChromeLabels;
+use askama::Template;
 use serde_json::Value;
 
 /// Controls metadata and resource limits while converting JSON to view lines.
@@ -100,6 +107,51 @@ pub fn try_lines(
     let mut root = Line::new(0, &[], String::new());
     ctx.walk(value, &mut root, &[], true)?;
     Ok(ctx.lines)
+}
+
+/// Renders [`JsonLine`]s into the shared `.json-view` markup.
+///
+/// `id` is the element id the caller's JavaScript addresses the view by —
+/// empty when nothing needs to find it. `paths` emits the `data-jpath`
+/// attribute the Resource Editor cross-highlights on; a consumer that has no
+/// guided form to point at passes `false` and saves the bytes.
+///
+/// The fragment is spliced into a page with `|safe`. That is sound because
+/// every value reaching the output goes through askama's default HTML escaper
+/// first — see `tests/json_view.rs::values_are_html_escaped_before_the_safe_filter`.
+///
+/// # Errors
+///
+/// Propagates [`askama::Error`] from rendering. The template has no fallible
+/// construct, so this is a formality the signature keeps honest.
+pub fn render(
+    i18n: &dyn ChromeLabels,
+    json_lines: &[JsonLine],
+    id: &str,
+    paths: bool,
+) -> Result<String, askama::Error> {
+    JsonViewTemplate {
+        i18n,
+        json_lines,
+        json_view_id: id,
+        json_view_paths: paths,
+    }
+    .render()
+}
+
+/// The one binding of the shared partial.
+///
+/// The fields keep the names the markup already used while it lived in
+/// `crates/ui` (`i18n`, `json_lines`, `json_view_id`, `json_view_paths`), so
+/// the template moved here byte-for-byte and every HFS page it backs still
+/// renders identical bytes.
+#[derive(Template)]
+#[template(path = "partials/json-view.html")]
+struct JsonViewTemplate<'a> {
+    i18n: &'a dyn ChromeLabels,
+    json_lines: &'a [JsonLine],
+    json_view_id: &'a str,
+    json_view_paths: bool,
 }
 
 /// The template has roughly 300 bytes of fixed markup per line before token

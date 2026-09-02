@@ -1313,24 +1313,37 @@ fn cm_detail_page_uses_the_v3_compact_header_shape() {
 /// and must never reintroduce that summary class.
 #[test]
 fn cm_detail_folds_never_reintroduce_the_markerless_field_label_summary() {
+    // (template, carries a fold of its own). The translate result includes
+    // the raw fold from `partials/hts-raw-fold.html` (#803), so the shape
+    // is asserted on the partial rather than on the includer.
     let templates = [
         (
             "pages/cm-detail.html",
             include_str!("../templates/pages/cm-detail.html"),
+            true,
         ),
         (
             "partials/hts-cm-translate-result.html",
             include_str!("../templates/partials/hts-cm-translate-result.html"),
+            false,
+        ),
+        (
+            "partials/hts-raw-fold.html",
+            include_str!("../templates/partials/hts-raw-fold.html"),
+            true,
         ),
     ];
 
-    for (name, template) in templates {
+    for (name, template, carries_fold) in templates {
         let body = strip_template_comments(template);
         assert!(
             !body.contains(r#"<summary class="field__label""#),
             "{name} must not pin a `.field__label` summary: it kills the \
              native disclosure marker and leaves no pointer cursor (#806)",
         );
+        if !carries_fold {
+            continue;
+        }
         assert!(
             body.contains(r#"<details class="disclosure">"#)
                 && body.contains(r#"<summary class="disclosure__summary">"#)

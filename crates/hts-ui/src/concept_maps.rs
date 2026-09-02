@@ -45,8 +45,9 @@ use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
+use crate::raw_fold::RawFold;
 use crate::upstream::{
-    CmBrowserFilters, CmBrowserPage, ConceptMapSummary, OutcomeView, TranslateDirection,
+    CmBrowserFilters, CmBrowserPage, ConceptMapSummary, OpFailure, OutcomeView, TranslateDirection,
     TranslateParams, TranslateResult, UpstreamError,
 };
 use crate::{Chrome, HtsUiState};
@@ -458,8 +459,8 @@ struct TranslateResultTemplate<'a> {
 /// until enough operations demand a cross-slice refactor.
 #[derive(Clone, Debug)]
 pub struct TranslateResultView {
-    pub request_url: String,
-    pub raw_body: String,
+    /// What went over the wire, for the "Raw request and response" fold.
+    pub raw: RawFold,
     pub result: Option<TranslateResult>,
     pub outcome: Option<OutcomeView>,
     pub degraded_reason: Option<&'static str>,
@@ -471,8 +472,7 @@ pub struct TranslateResultView {
 impl TranslateResultView {
     fn empty(direction: TranslateDirection) -> Self {
         Self {
-            request_url: String::new(),
-            raw_body: String::new(),
+            raw: RawFold::default(),
             result: None,
             outcome: None,
             degraded_reason: None,
@@ -480,10 +480,13 @@ impl TranslateResultView {
         }
     }
 
-    fn from_error(request_url: String, direction: TranslateDirection, err: &UpstreamError) -> Self {
+    /// The view for a failed call. The exchange the proxy kept rides along, so
+    /// the raw fold shows the payload of the failure rather than going blank
+    /// on it (#803).
+    fn from_error(direction: TranslateDirection, failure: &OpFailure) -> Self {
         let mut view = Self::empty(direction);
-        view.request_url = request_url;
-        match err {
+        view.raw = RawFold::from_exchange(&failure.exchange);
+        match &failure.error {
             UpstreamError::Outcome { outcome, .. } => view.outcome = Some((**outcome).clone()),
             UpstreamError::NotFound { .. } => {
                 view.outcome = Some(OutcomeView {
@@ -507,7 +510,7 @@ impl TranslateResultView {
             UpstreamError::Connect { .. }
             | UpstreamError::Timeout { .. }
             | UpstreamError::ClientBuild { .. } => {
-                view.degraded_reason = Some(err.degraded_reason());
+                view.degraded_reason = Some(failure.error.degraded_reason());
             }
             UpstreamError::Decode { message, .. } => {
                 view.outcome = Some(OutcomeView::invalid_input(message.clone()));
@@ -572,21 +575,13 @@ async fn translate_run(
     };
     let view = match translate_result {
         Ok(result) => TranslateResultView {
-            request_url: result.request_url.clone(),
-            raw_body: result.raw_body.clone(),
+            raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
             direction,
             result: Some(result),
             outcome: None,
             degraded_reason: None,
         },
-        Err(err) => {
-            let request_url = if !canonical.is_empty() {
-                format!("{}/ConceptMap/$translate", state.upstream.base_url())
-            } else {
-                format!("{}/ConceptMap/{}/$translate", state.upstream.base_url(), id)
-            };
-            TranslateResultView::from_error(request_url, direction, &err)
-        }
+        Err(err) => TranslateResultView::from_error(direction, &err),
     };
     respond_workbench(&state, chrome, id, view, is_htmx).await
 }
@@ -621,9 +616,12 @@ async fn respond_workbench<'a>(
     state: &HtsUiState,
     chrome: Chrome<'a>,
     id: String,
-    view: TranslateResultView,
+    mut view: TranslateResultView,
     is_htmx: bool,
 ) -> Response {
+    // Both response shapes render the same raw fold, so the payloads are
+    // highlighted once, here, where the request locale is in hand.
+    view.raw.highlight(&chrome.i18n);
     if is_htmx {
         return render(TranslateResultTemplate { chrome, view }.render());
     }
