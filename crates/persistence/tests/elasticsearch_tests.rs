@@ -675,17 +675,46 @@ mod es_integration {
 
     static SHARED_ES: OnceCell<SharedEs> = OnceCell::const_new();
 
+    /// Startup budget for one Elasticsearch container start attempt. See the
+    /// matching constant in `s3_es_tests.rs`: 120s was not enough on the
+    /// loaded CI Docker host (run 33636603224).
+    const ES_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// How many times to try starting the ES container before giving up.
+    const ES_START_ATTEMPTS: usize = 2;
+
+    /// Starts the shared Elasticsearch container, retrying once on a startup
+    /// failure so a slow host does not fail the whole suite.
+    async fn start_es_container() -> testcontainers::ContainerAsync<ElasticSearch> {
+        let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+        let mut last_err = None;
+        for attempt in 1..=ES_START_ATTEMPTS {
+            match ElasticSearch::default()
+                .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
+                .with_label("github.run_id", &run_id)
+                .with_startup_timeout(ES_STARTUP_TIMEOUT)
+                .start()
+                .await
+            {
+                Ok(container) => return container,
+                Err(err) => {
+                    eprintln!(
+                        "Elasticsearch container start attempt {attempt}/{ES_START_ATTEMPTS} failed: {err}"
+                    );
+                    last_err = Some(err);
+                }
+            }
+        }
+        panic!(
+            "failed to start Elasticsearch container after {ES_START_ATTEMPTS} attempts: {:?}",
+            last_err.expect("at least one attempt ran")
+        );
+    }
+
     async fn shared_es() -> &'static SharedEs {
         SHARED_ES
             .get_or_init(|| async {
-                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = ElasticSearch::default()
-                    .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
-                    .with_label("github.run_id", &run_id)
-                    .with_startup_timeout(std::time::Duration::from_secs(120))
-                    .start()
-                    .await
-                    .expect("Failed to start Elasticsearch container");
+                let container = start_es_container().await;
 
                 let port = container
                     .get_host_port_ipv4(9200)
