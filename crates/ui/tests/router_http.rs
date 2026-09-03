@@ -409,6 +409,51 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
     assert_eq!(body_text(response).await, "fhir handled");
 }
 
+/// #896: the bare root redirects a browser to the UI home.
+#[tokio::test]
+async fn root_redirects_to_ui() {
+    let response = app()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok()),
+        Some("/ui")
+    );
+}
+
+/// #896: owning `GET /` for the redirect must not shadow `POST /` — the FHIR
+/// batch/transaction endpoint on the same path still reaches the fallback.
+#[tokio::test]
+async fn root_post_still_reaches_the_fhir_batch_handler() {
+    let fhir_app = Router::new().route("/", axum::routing::post(|| async { "batch handled" }));
+    let response = helios_ui::mount_with_conformance_source(
+        fhir_app,
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+    .oneshot(Request::post("/").body(Body::empty()).unwrap())
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "batch handled");
+}
+
 /// #653: the CapabilityStatement page renders the live /metadata answer —
 /// summary, safe external documentation links, semantic interaction tags, the
 /// progressively enhanced resource filter, and bounded raw JSON shell. Without
