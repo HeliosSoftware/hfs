@@ -46,6 +46,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::raw_fold::RawFold;
+use crate::raw_json_fragment::cm_translate_fragment_url;
 use crate::upstream::{
     CmBrowserFilters, CmBrowserPage, ConceptMapSummary, OpFailure, OutcomeView, TranslateDirection,
     TranslateParams, TranslateResult, UpstreamError,
@@ -574,12 +575,22 @@ async fn translate_run(
         state.upstream.cm_translate_instance(&id, &params).await
     };
     let view = match translate_result {
-        Ok(result) => TranslateResultView {
-            raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
-            direction,
-            result: Some(result),
-            outcome: None,
-            degraded_reason: None,
+        Ok(result) => {
+            // Build fragment URL for incremental loading (#898)
+            let fragment_url = if !canonical.is_empty() {
+                Some(cm_translate_fragment_url(&canonical, &params, state.fhir_version))
+            } else {
+                None
+            };
+            let mut raw = RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
+            raw.response_fragment_url = fragment_url;
+            TranslateResultView {
+                raw,
+                direction,
+                result: Some(result),
+                outcome: None,
+                degraded_reason: None,
+            }
         },
         Err(err) => TranslateResultView::from_error(direction, &err),
     };

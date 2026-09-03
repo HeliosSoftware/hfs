@@ -33,6 +33,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::raw_fold::RawFold;
+use crate::raw_json_fragment::vs_expand_fragment_url;
 use crate::upstream::{
     ExpandParams, ExpansionResult, HTS_UI_MAX_EXPANSION_SIZE_HINT, OpFailure, OutcomeView,
     UpstreamError, ValueSetSummary, VsBrowserFilters, VsBrowserPage,
@@ -564,13 +565,23 @@ async fn expand_run(
         state.upstream.vs_expand_instance(&id, &params).await
     };
     let view = match expand_result {
-        Ok(result) => ExpandResultView {
-            raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
-            tree_mode,
-            threshold: params.threshold,
-            result: Some(result),
-            outcome: None,
-            degraded_reason: None,
+        Ok(result) => {
+            // Build fragment URL for incremental loading (#898)
+            let fragment_url = if !canonical.is_empty() {
+                Some(vs_expand_fragment_url(&canonical, &params, tree_mode, state.fhir_version))
+            } else {
+                None
+            };
+            let mut raw = RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
+            raw.response_fragment_url = fragment_url;
+            ExpandResultView {
+                raw,
+                tree_mode,
+                threshold: params.threshold,
+                result: Some(result),
+                outcome: None,
+                degraded_reason: None,
+            }
         },
         Err(err) => {
             let mut v = ExpandResultView::from_error(&err);

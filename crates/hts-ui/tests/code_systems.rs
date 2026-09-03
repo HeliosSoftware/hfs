@@ -845,15 +845,23 @@ async fn raw_fold_reads_as_a_control_and_highlights_both_payloads() {
         "`.field__label` on a summary is what removed the disclosure marker",
     );
 
-    // 2. Both payloads go through the shared highlighted JSON view.
+    // 2. Request body goes through the shared highlighted JSON view;
+    //    response body uses incremental loading (#898) when a fragment URL
+    //    is available.
     assert_eq!(
         html.matches(r#"class="json-view""#).count(),
-        2,
-        "request and response must each render a JSON view; got:\n{html}",
+        1,
+        "request must render a JSON view inline; got:\n{html}",
     );
     assert!(
         html.contains(r#"class="jt--key""#),
         "tokens must be coloured"
+    );
+    // Verify incremental loading attributes are present for response body
+    assert!(
+        html.contains("data-capability-json-body")
+            && html.contains("data-fragment-url"),
+        "response body must use incremental loading pattern; got:\n{html}",
     );
 
     // 3. The request body is shown at all — the heading has promised it

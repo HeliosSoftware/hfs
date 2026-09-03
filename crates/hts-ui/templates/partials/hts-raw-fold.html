@@ -8,21 +8,56 @@
   visually primary.
 
   #898: Updated to use the card-shaped `json-fold` pattern matching the
-  CapabilityStatement raw fold. Request body stays inline (small Parameters
-  resource); response body keeps inline rendering for now — incremental
-  loading for workbench responses would require fragment endpoints that
-  re-issue each operation type, deferred to a follow-up.
+  CapabilityStatement raw fold. When `response_fragment_url` is set, the
+  response body uses incremental JSON loading via the same htmx-driven
+  pattern as capability-raw-card.html. Request body stays inline (small
+  Parameters resource).
 
   The fold uses `data-json-fold-root` so it participates in the shared
-  `capability-json.js` mechanics (sibling collapse, aria-busy, etc.) even
-  though it renders content inline rather than fetching fragments.
+  `capability-json.js` mechanics (sibling collapse, aria-busy, etc.).
 -#}
 {% if !view.raw.is_empty() %}
-<details class="card json-fold" id="workbench-json-fold" data-json-fold-root>
+<details class="card json-fold" id="workbench-json-fold" data-json-fold-root{% if view.raw.response_fragment_url.is_some() %} data-capability-json-node{% endif %}>
   <summary class="card-head">
     <h3>{{ chrome.i18n.t("hts-workbench-raw-response") }}</h3>
     <span class="icon">{% include "icons/chevron-down.svg" %}</span>
   </summary>
+  {#- When fragment_url is set, use incremental loading for response body -#}
+  {% match view.raw.response_fragment_url %}
+  {% when Some with (fragment_url) %}
+  <div class="card__body json-fold-body"
+       data-capability-json-body
+       data-loading-text="{{ chrome.i18n.t("cap-raw-loading") }}"
+       data-error-text="{{ chrome.i18n.t("cap-json-load-error") }}"
+       data-fragment-url="{{ fragment_url }}">
+    {#- URL and request body shown inline before the response loads -#}
+    {% if !view.raw.request_url.is_empty() %}
+    <div class="kv-grid" style="margin-bottom:14px">
+      <div class="detail__field detail__field--wide">
+        <span>{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
+        <code>{{ view.raw.request_url }}</code>
+      </div>
+    </div>
+    {% endif %}
+    {% if !view.raw.request_body.is_empty() %}
+    <div class="detail__field detail__field--wide" style="margin-bottom:14px">
+      <span>{{ chrome.i18n.t("hts-workbench-request-body") }}</span>
+      {% if !view.raw.request_json.is_empty() %}{{ view.raw.request_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw.request_body }}</pre>{% endif %}
+    </div>
+    {% endif %}
+    {#- No-JS fallback link and loading indicator -#}
+    {% match view.raw.raw_url %}
+    {% when Some with (raw_url) %}
+    <a class="btn" href="{{ raw_url }}#workbench-json-fold">{{ chrome.i18n.t("cap-raw-load") }}</a>
+    {% when None %}
+    {% endmatch %}
+    <p class="busy-status htmx-indicator json-fold-loading" role="status">
+      <span class="spinner" aria-hidden="true"></span>
+      {{ chrome.i18n.t("cap-raw-loading") }}
+    </p>
+  </div>
+  {% when None %}
+  {#- Fallback: inline rendering (legacy or no fragment endpoint) -#}
   <div class="card__body json-fold-body">
     {% if !view.raw.request_url.is_empty() %}
     <div class="kv-grid" style="margin-bottom:14px">
@@ -45,5 +80,6 @@
     </div>
     {% endif %}
   </div>
+  {% endmatch %}
 </details>
 {% endif %}

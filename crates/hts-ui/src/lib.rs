@@ -169,6 +169,7 @@ pub fn router(state: Arc<HtsUiState>) -> Router {
         .merge(import::routes())
         .merge(capability::routes())
         .merge(raw_json_fragment::concept_fragment_routes())
+        .merge(raw_json_fragment::workbench_fragment_routes())
         .nest_service("/hts/assets", ServeEmbed::<Assets>::new())
         .with_state(state)
         .layer(axum::middleware::from_fn(i18n::negotiate_locale))

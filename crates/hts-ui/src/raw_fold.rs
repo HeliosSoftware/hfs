@@ -53,6 +53,13 @@ pub struct RawFold {
     /// locale.
     pub request_json: String,
     pub response_json: String,
+    /// When set, the response body uses incremental JSON loading (#898) via
+    /// this fragment endpoint URL instead of rendering inline. The URL should
+    /// include all parameters needed to re-issue the operation.
+    pub response_fragment_url: Option<String>,
+    /// The raw URL for the no-JS fallback link (`?raw=1`). When set, the fold
+    /// shows an "Open plain JSON" link that bypasses JavaScript.
+    pub raw_url: Option<String>,
 }
 
 impl RawFold {

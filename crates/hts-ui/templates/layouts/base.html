@@ -11,9 +11,6 @@
   <script src="/ui/hts/assets/theme.js"></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/hts/assets/htmx.min.js" defer></script>
-  <!-- Folding for the workbench raw request/response view (#803). Fully
-       delegated off `document`, so htmx-swapped results need no re-init. -->
-  <script src="/ui/hts/assets/json-view.js" defer></script>
 </head>
 <body class="{% block body_class %}{% endblock %}">
   <aside class="sidebar" id="sidebar">
@@ -155,5 +152,9 @@
     include is both correct and the parity-preserving placement.
   -#}
   <script src="/ui/hts/assets/json-view.js" defer></script>
+  {#- #898: Incremental JSON fold rendering for raw response folds. Listens to
+    toggle events on details[data-capability-json-node] and fetches bounded
+    JSON fragments via htmx. Must load after htmx. -#}
+  <script src="/ui/hts/assets/capability-json.js" defer></script>
 </body>
 </html>

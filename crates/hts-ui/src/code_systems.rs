@@ -30,6 +30,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::raw_fold::RawFold;
+use crate::raw_json_fragment::{cs_lookup_fragment_url, cs_subsumes_fragment_url, cs_validate_fragment_url};
 use crate::upstream::{
     CodeSystemSummary, CsBrowserFilters, CsBrowserPage, LookupParams, LookupResult, OpFailure,
     OutcomeView, SubsumesParams, SubsumesResult, UpstreamError, ValidateCodeParams,
@@ -602,6 +603,8 @@ async fn lookup_run(
             ..WorkbenchResultView::empty(CsTab::Lookup)
         }
     } else {
+        // Clone params for the fragment URL builder before the upstream call consumes them
+        let params_for_fragment = params.clone();
         let result = if !canonical.is_empty() {
             state
                 .upstream
@@ -611,15 +614,25 @@ async fn lookup_run(
             state.upstream.cs_lookup(&id, params).await
         };
         match result {
-            Ok(result) => WorkbenchResultView {
-                op: CsTab::Lookup,
-                mode: ValidateInputMode::default(),
-                raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
-                lookup: Some(result),
-                validate: None,
-                subsumes: None,
-                outcome: None,
-                degraded_reason: None,
+            Ok(result) => {
+                // Build fragment URL for incremental loading (#898)
+                let fragment_url = if !canonical.is_empty() {
+                    Some(cs_lookup_fragment_url(&canonical, &params_for_fragment, state.fhir_version))
+                } else {
+                    None
+                };
+                let mut raw = RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
+                raw.response_fragment_url = fragment_url;
+                WorkbenchResultView {
+                    op: CsTab::Lookup,
+                    mode: ValidateInputMode::default(),
+                    raw,
+                    lookup: Some(result),
+                    validate: None,
+                    subsumes: None,
+                    outcome: None,
+                    degraded_reason: None,
+                }
             },
             Err(err) => WorkbenchResultView::from_error(CsTab::Lookup, &err),
         }
@@ -686,16 +699,24 @@ async fn validate_run(
             ..WorkbenchResultView::empty(CsTab::Validate)
         }
     } else {
+        // Clone params for the fragment URL builder before the upstream call consumes them
+        let params_for_fragment = params.clone();
         match state.upstream.cs_validate_code(&canonical, params).await {
-            Ok(result) => WorkbenchResultView {
-                op: CsTab::Validate,
-                mode: submitted_mode,
-                raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
-                lookup: None,
-                validate: Some(result),
-                subsumes: None,
-                outcome: None,
-                degraded_reason: None,
+            Ok(result) => {
+                // Build fragment URL for incremental loading (#898)
+                let fragment_url = Some(cs_validate_fragment_url(&canonical, &params_for_fragment, state.fhir_version));
+                let mut raw = RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
+                raw.response_fragment_url = fragment_url;
+                WorkbenchResultView {
+                    op: CsTab::Validate,
+                    mode: submitted_mode,
+                    raw,
+                    lookup: None,
+                    validate: Some(result),
+                    subsumes: None,
+                    outcome: None,
+                    degraded_reason: None,
+                }
             },
             Err(err) => {
                 let mut view = WorkbenchResultView::from_error(CsTab::Validate, &err);
@@ -743,16 +764,24 @@ async fn subsumes_run(
             ..WorkbenchResultView::empty(CsTab::Subsumes)
         }
     } else {
+        // Clone params for the fragment URL builder before the upstream call consumes them
+        let params_for_fragment = params.clone();
         match state.upstream.cs_subsumes(&canonical, params).await {
-            Ok(result) => WorkbenchResultView {
-                op: CsTab::Subsumes,
-                mode: ValidateInputMode::default(),
-                raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
-                lookup: None,
-                validate: None,
-                subsumes: Some(result),
-                outcome: None,
-                degraded_reason: None,
+            Ok(result) => {
+                // Build fragment URL for incremental loading (#898)
+                let fragment_url = Some(cs_subsumes_fragment_url(&canonical, &params_for_fragment, state.fhir_version));
+                let mut raw = RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
+                raw.response_fragment_url = fragment_url;
+                WorkbenchResultView {
+                    op: CsTab::Subsumes,
+                    mode: ValidateInputMode::default(),
+                    raw,
+                    lookup: None,
+                    validate: None,
+                    subsumes: Some(result),
+                    outcome: None,
+                    degraded_reason: None,
+                }
             },
             Err(err) => WorkbenchResultView::from_error(CsTab::Subsumes, &err),
         }
