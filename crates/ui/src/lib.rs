@@ -707,14 +707,14 @@ struct SearchPage {
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
-    /// This request's resolved rail selection (rail_state RF1): explicit
+    /// This request's resolved rail selection (`rail_state`): explicit
     /// `?type=` when given, else the stored `rails.search.last` when it still
     /// resolves, else `Patient`. Exposed as `data-selected-type` so
     /// `saved-queries.js` never falls back to a hardcoded default on initial
-    /// load or `popstate` (RF5) — the same contract `ResourcesPage` already
+    /// load or `popstate` — the same contract `ResourcesPage` already
     /// carries.
     selected_type: String,
-    /// The "Recently used" group's rows (RF6), server-rendered by
+    /// The "Recently used" group's rows, server-rendered by
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
@@ -752,7 +752,7 @@ struct ResourcesPage {
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
-    /// The "Recently used" group's rows (RF6), server-rendered by
+    /// The "Recently used" group's rows, server-rendered by
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
@@ -794,7 +794,7 @@ struct QueriesPage {
     /// This request's resolved rail selection — see `SearchPage`'s field of
     /// the same name.
     selected_type: String,
-    /// The "Recently used" group's rows (RF6), server-rendered by
+    /// The "Recently used" group's rows, server-rendered by
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
@@ -1237,7 +1237,8 @@ pub fn mount_with_conformance_source_and_runtime(
             "/ui/sql/view-definitions/lint",
             axum::routing::post(sql_view_definitions_lint),
         )
-        // #752 ticket 01: the playground's live preview fragment.
+        // The playground's live preview fragment (#752, generalized to all
+        // three SQL on FHIR pages in #839).
         .route(
             "/ui/sql/view-definitions/run",
             axum::routing::post(sql_view_definitions_run),
@@ -1246,7 +1247,9 @@ pub fn mount_with_conformance_source_and_runtime(
             "/ui/sql/queries",
             get(sql_queries_page).post(sql_queries_save),
         )
+        .route("/ui/sql/queries/run", axum::routing::post(sql_queries_run))
         .route("/ui/sql/views", get(sql_views_page).post(sql_views_save))
+        .route("/ui/sql/views/run", axum::routing::post(sql_views_run))
         // Active SQL Exports (#833): list-first, mirroring Bulk Export's
         // `/ui/bulk-export` + `/ui/bulk-export/new` shape.
         .route(
@@ -1679,10 +1682,10 @@ fn build_rail_entries(
         .collect()
 }
 
-/// RF1.2/RF1.3 for a type rail (Resources, Search, Saved Queries): the
-/// stored `last` when it still names one of `resource_types`, else
-/// `fallback`. Only consulted when the request carried no explicit selection
-/// at all — an explicit one always wins outright, valid or not (see
+/// For a type rail (Resources, Search, Saved Queries): the stored `last`
+/// when it still names one of `resource_types`, else `fallback`. Only
+/// consulted when the request carried no explicit selection at all — an
+/// explicit one always wins outright, valid or not (see
 /// `resources_query_context`'s doc for why Resources needs its own explicit
 /// resolution).
 fn resolve_stored_type(last: Option<&str>, resource_types: &[String], fallback: &str) -> String {
@@ -1691,13 +1694,13 @@ fn resolve_stored_type(last: Option<&str>, resource_types: &[String], fallback: 
         .to_string()
 }
 
-/// RF3/RF4: records an explicit, resolving type selection as this page's
-/// rail state, persisting only when [`rail_state::RailState::select`] says
-/// something actually changed (RNF2). Returns `rail` unchanged when
-/// `explicit` is absent or does not name a real type — an invalid explicit
-/// choice still renders (RF1.1), it is simply never remembered (RF3) — so a
-/// caller can always render this request's "Recently used" group from the
-/// returned state, whether or not a write just landed.
+/// Records an explicit, resolving type selection as this page's rail state,
+/// persisting only when [`rail_state::RailState::select`] says something
+/// actually changed. Returns `rail` unchanged when `explicit` is absent or
+/// does not name a real type — an invalid explicit choice still renders, it
+/// is simply never remembered — so a caller can always render this
+/// request's "Recently used" group from the returned state, whether or not
+/// a write just landed.
 async fn record_type_selection(
     state: &WebState,
     user_key: &str,
@@ -1719,12 +1722,12 @@ async fn record_type_selection(
     }
 }
 
-/// RF6: the "Recently used" group's rows for a type rail, resolved against
-/// this render's own live entries so label/count/href/current always match
-/// what the scrollable list already shows. An id no longer valid for the
+/// The "Recently used" group's rows for a type rail, resolved against this
+/// render's own live entries so label/count/href/current always match what
+/// the scrollable list already shows. An id no longer valid for the
 /// request's tenant/version (absent from `entries`) is hidden, never pruned
-/// — RF1 already lets a stale `last` fall back to the page default in
-/// silence, and a filtered render costs nothing.
+/// — a stale `last` already falls back to the page default in silence, and
+/// a filtered render costs nothing.
 fn resolve_type_recents(
     rail: &rail_state::RailState,
     entries: &[RailEntry],
@@ -1749,14 +1752,14 @@ fn resolve_type_recents(
     rail.resolve_recents(&live, |id| format!("{base}?type={id}"), Some(is_valid))
 }
 
-/// RF2 for a SQL rail (View Definitions, SQL Queries, SQL Views): records an
+/// For a SQL rail (View Definitions, SQL Queries, SQL Views): records an
 /// explicit, resolving selection as this page's rail state — `select` with
 /// the resource's own `{id, name, meta}` snapshot `entry`, since the SQL
 /// rails are server-paged/filtered (#741) and cannot rely on the live rail
 /// always holding a recent the way a type rail does. Persists only when
-/// [`rail_state::RailState::select`] says something actually changed
-/// (RNF2). The counterpart to [`record_type_selection`] for the three pages
-/// that carry a snapshot instead of a bare id.
+/// [`rail_state::RailState::select`] says something actually changed. The
+/// counterpart to [`record_type_selection`] for the three pages that carry
+/// a snapshot instead of a bare id.
 async fn record_snapshot_selection(
     state: &WebState,
     user_key: &str,
@@ -1774,11 +1777,11 @@ async fn record_snapshot_selection(
     }
 }
 
-/// RF3 for a SQL rail: prunes an explicit selection that did not resolve (a
+/// For a SQL rail: prunes an explicit selection that did not resolve (a
 /// deleted or mistyped id) from the stored registry, persisting only when
-/// the id was actually recorded (RNF2 — [`rail_state::RailState::prune`]
-/// already reports the no-op case). The request itself keeps its current
-/// "no selection" render either way; this only cleans the record so a later
+/// the id was actually recorded ([`rail_state::RailState::prune`] already
+/// reports the no-op case). The request itself keeps its current "no
+/// selection" render either way; this only cleans the record so a later
 /// visit does not keep resolving the same id to a resource that is gone.
 async fn prune_stale_selection(
     state: &WebState,
@@ -1930,9 +1933,9 @@ async fn resources(
     // `url` is the builder's actual query, so it wins over the convenience
     // `type` bookmark. Parse it here too: Create must be safe before the
     // deferred client script hydrates the page. `explicit_type` is `None`
-    // only when neither `url` nor `type` named anything at all — RF1.1 always
-    // wins outright once present, invalid or not, so only its absence falls
-    // through to the stored/fallback resolution below.
+    // only when neither `url` nor `type` named anything at all — an explicit
+    // selection always wins outright once present, invalid or not, so only
+    // its absence falls through to the stored/fallback resolution below.
     let (explicit_type, url_from_query) = resources_query_context(&query);
     let rail = record_type_selection(
         &state,
@@ -2045,9 +2048,9 @@ struct ResourcesQuery {
     url: Option<String>,
 }
 
-/// Resolves the Resources page's explicit RF1.1 selection and no-JS builder
-/// prefill from the query string, ahead of RF1.2/RF1.3's stored/fallback
-/// resolution.
+/// Resolves the Resources page's explicit selection and no-JS builder
+/// prefill from the query string, ahead of the stored/fallback resolution
+/// below.
 ///
 /// `?url=` wins outright when present — the builder's actual query, so it
 /// beats the convenience `?type=` bookmark (#605) — even when no type can be
@@ -2058,9 +2061,9 @@ struct ResourcesQuery {
 /// it names no real resource type — `record_type_selection` is what decides
 /// whether an explicit choice is remembered, never whether it renders.
 ///
-/// Returns `(None, None)` only when neither is present at all, letting
-/// RF1.2/RF1.3 resolve the selection and synthesize `/{selected_type}` as the
-/// builder prefill.
+/// Returns `(None, None)` only when neither is present at all, letting the
+/// stored/fallback resolution below resolve the selection and synthesize
+/// `/{selected_type}` as the builder prefill.
 fn resources_query_context(query: &ResourcesQuery) -> (Option<String>, Option<String>) {
     if let Some(raw_url) = &query.url {
         let visible = raw_url
@@ -2151,8 +2154,8 @@ async fn query_params_catalog(
 ///
 /// `base` is left as the raw, three-state `Option<String>` Serde gives it —
 /// absent, present-and-empty, present-and-named all mean something different
-/// to RF1/RF2 (see [`resolve_sp_base`]) — rather than collapsing "absent" and
-/// "explicit all types" into one `None` the way `main` used to.
+/// (see [`resolve_sp_base`]) — rather than collapsing "absent" and "explicit
+/// all types" into one `None` the way `main` used to.
 #[derive(Deserialize, Default)]
 struct SearchParametersQuery {
     version: Option<String>,
@@ -2168,16 +2171,16 @@ struct SearchParametersQuery {
     refresh: Option<String>,
 }
 
-/// RF1 + RF3 for Search Parameters' `base`, whose one exception (RF2) is that
-/// "All types" is itself an explicit, persistable state
+/// Resolves Search Parameters' `base`, whose one twist is that "All types"
+/// is itself an explicit, persistable state
 /// ([`rail_state::RailState::select_all`], `last: ""`), not merely the
 /// absence of a selection:
 ///
 /// - `?base=` present and empty is explicit "All types".
 /// - `?base=<name>` present is explicit, whether or not `<name>` is one of
-///   `bases` — resolving only decides whether it is written (RF3), never
-///   whether it renders (RF1.1 always wins, as `build_view` already did for
-///   an unknown base before this ticket).
+///   `bases` — resolving only decides whether it is written, never whether
+///   it renders (an explicit selection always wins, as `build_view` already
+///   did for an unknown base before this).
 /// - `?base=` absent falls back to the stored `last` when it still resolves
 ///   (including a stored "All types"), else the page's own fallback, "All
 ///   types" — neither is written, since nothing was explicitly asked.
@@ -2386,14 +2389,15 @@ struct SqlViewDefinitionsPage {
     /// `?vd=new`: the JSON below is the starter document, not a stored view.
     is_new: bool,
     /// The `$sql-run` preview card and its failure notice, nested as its own
-    /// template (#752 ticket 01, RF7) so `partials/sql_run_results.html`'s
-    /// markup exists in exactly one place, shared with the `/run` fragment
-    /// endpoint (`sql_view_definitions_run`). `fragment: false` here — the
+    /// template (#752) so `partials/sql_run_results.html`'s markup exists in
+    /// exactly one place, shared with the `/run` fragment endpoint
+    /// (`sql_view_definitions_run`) and, since #839, with the same partial
+    /// on the SQL Queries and SQL Views pages. `fragment: false` here — the
     /// page's own render has nothing to swap into.
     run_results: RunResultsPartial,
     save_error: Option<String>,
     saved: bool,
-    /// RF4/RF6: the "Recently used" group's own rows.
+    /// The "Recently used" group's own rows.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
     /// carried to the template so `partials/rail_recent.html`'s clones can
@@ -2410,42 +2414,78 @@ struct SelectedVd {
     json: String,
 }
 
-/// The `$sql-run` preview's three renderable shapes (#752 ticket 01, RF4/
-/// RF5–RF6/RF7). A tuple enum rather than parallel `Option`s so a table can
-/// never appear alongside a failure message, and the page's own "nothing has
-/// run yet" state is distinct from both — the invalid combinations RF4–RF7
-/// describe simply have no constructor.
+/// The `$sql-run` preview's three renderable shapes (#752, generalized in
+/// #839). A tuple enum rather than parallel `Option`s so a table can never
+/// appear alongside a failure message, and the page's own "nothing has run
+/// yet" state is distinct from both — the invalid combinations simply have
+/// no constructor.
 enum RunResultsState {
-    /// RF4: a successful run — its table, plus how long the `$sql-run` call
-    /// took in whole milliseconds.
+    /// A successful run — its table, plus how long the `$sql-run` call took
+    /// in whole milliseconds.
     Success(sql_views::RunTable, u64),
-    /// RF5/RF6: a run or parse failure, with the message rendered next to
-    /// `vd-run-failed`.
-    Failure(String),
-    /// RF7: the page's own render before anything has run server-side — no
-    /// `?saved=1`, or the current selection has no preview yet. Renders the
-    /// notice region's own client-driven initial-load request (#752 ticket
-    /// 02, RF4). Never produced by the `/run` fragment endpoint, which
-    /// always ends in `Success` or `Failure`.
+    /// A run or parse failure, with the message rendered next to the
+    /// surface's own `failed_key`, and — when the message carries
+    /// sqlparser's own `Line: N` marker — the 1-based line number the
+    /// editor tints (#839, [`sql_views::extract_error_line`]).
+    Failure(String, Option<u32>),
+    /// The page's own render before anything has run server-side — no
+    /// `?saved=1`/`?lib=…&saved=1`, or the current selection has no preview
+    /// yet. Renders the notice region's own client-driven initial-load
+    /// request. Never produced by a `/run` fragment endpoint, which always
+    /// ends in `Success` or `Failure`.
     Empty,
 }
 
-/// The `$sql-run` preview card and its failure notice (#752 ticket 01, RF7):
-/// `partials/sql_run_results.html`'s markup is written once and rendered by
-/// two callers — nested as a template field of [`SqlViewDefinitionsPage`]
-/// for the page's own initial render (`{{ run_results.render()?|safe }}` in
-/// `sql-view-definitions.html`, `fragment: false`), and directly as the
-/// whole response of [`sql_view_definitions_run`] (`fragment: true`,
-/// RF4–RF6). `fragment` only toggles the `hx-swap-oob` attributes and
-/// whether the `Empty` arm's own load trigger applies (#752 ticket 02); the
-/// table markup itself lives solely in the template's `Success` arm.
+/// The `$sql-run` preview card and its failure notice (#752, generalized to
+/// share one partial across View Definitions, SQL Queries, and SQL Views in
+/// #839): `partials/sql_run_results.html`'s markup is written once and
+/// rendered by two kinds of callers per page — nested as a template field
+/// for the page's own initial render (`{{ run_results.render()?|safe }}`,
+/// `fragment: false`), and directly as the whole response of that page's own
+/// `POST …/run` fragment endpoint (`fragment: true`). `fragment` only
+/// toggles the `hx-swap-oob` attributes and whether the `Empty` arm's own
+/// load trigger applies; the table markup itself lives solely in the
+/// template's `Success` arm.
+///
+/// The remaining fields are the "surface" each caller supplies (#839) so the
+/// partial itself never hardcodes one page's ids or i18n keys: every field
+/// below but `i18n`/`fragment`/`state` only names where this render's
+/// fragment endpoint, form, and i18n keys live — never resource data.
 #[derive(Template)]
 #[template(path = "partials/sql_run_results.html")]
 struct RunResultsPartial {
     i18n: I18n,
     fragment: bool,
+    /// The surface's own `POST …/run` fragment endpoint — the `Empty` arm's
+    /// `hx-post` load trigger targets it (the surface's own textarea, wired
+    /// outside this partial, posts to the identical URL on every edit).
+    run_href: &'static str,
+    /// The id of the `<form>` the surface's editable fields live in. The
+    /// `Empty` arm's shell sits outside that form, so it reaches back in via
+    /// `hx-include="#{form_id}"` for its own initial-load request.
+    form_id: &'static str,
+    /// The results card's `<h3>` key.
+    heading_key: &'static str,
+    /// The failure notice's message-prefix key.
+    failed_key: &'static str,
+    /// `Some` renders an "Export as files" action beside the meta on a
+    /// successful run; `None` renders nothing (#839). Only SQL Queries
+    /// offers it, and only once the running document has a saved Library id.
+    export_href: Option<String>,
     state: RunResultsState,
 }
+
+/// `partials/sql_run_results.html`'s surface descriptor for the View
+/// Definitions playground — its `POST …/run` endpoint and the id of its one
+/// editable form (#839). View Definitions has no Export action, so its
+/// `export_href` is always `None`.
+const VD_RUN_HREF: &str = "/ui/sql/view-definitions/run";
+const VD_EDITOR_FORM_ID: &str = "vd-editor-form";
+/// The results heading and failure-prefix keys the View Definitions surface
+/// renders through the partial — unchanged text, now passed explicitly
+/// instead of hardcoded inside `partials/sql_run_results.html` (#839).
+const VD_RESULTS_HEADING_KEY: &str = "vd-results-heading";
+const VD_RUN_FAILED_KEY: &str = "vd-run-failed";
 
 #[derive(Deserialize, Default)]
 struct SqlVdQuery {
@@ -2479,10 +2519,10 @@ fn shape_vd(vd: &serde_json::Value) -> (String, String, String) {
 /// Resolves one candidate ViewDefinition id against this render's own page
 /// of the server-paged rail search (#741) or, when it is off that page (a
 /// different page, or a filter that excludes it), a direct read by id — the
-/// same fallback the explicit `?vd=` selection has always used (RF1.1), now
-/// shared with a stored `last` id that is off the visible page too (RF1.2),
-/// and with the fallback candidate the page falls back to when neither an
-/// explicit nor a stored selection resolves (RF1.3).
+/// same fallback the explicit `?vd=` selection has always used, now shared
+/// with a stored `last` id that is off the visible page too, and with the
+/// fallback candidate the page falls back to when neither an explicit nor a
+/// stored selection resolves.
 async fn resolve_vd_by_id(
     state: &WebState,
     rv: helios_fhir::FhirVersion,
@@ -2512,12 +2552,12 @@ async fn resolve_vd_by_id(
     }
 }
 
-/// RF6 for View Definitions: the "Recently used" group's rows, resolved
-/// against this render's own page of the server-paged rail search so
-/// label/meta/href/current match what the list already shows. RF4's "the
-/// group is never itself filtered by `?filter=`" falls out for free: an id
-/// the current page/filter excludes is simply absent from `summaries` (and
-/// so from `live`), so [`rail_state::RailState::resolve_recents`] renders it
+/// For View Definitions: the "Recently used" group's rows, resolved against
+/// this render's own page of the server-paged rail search so
+/// label/meta/href/current match what the list already shows. "The group
+/// is never itself filtered by `?filter=`" falls out for free: an id the
+/// current page/filter excludes is simply absent from `summaries` (and so
+/// from `live`), so [`rail_state::RailState::resolve_recents`] renders it
 /// from its stored `{name, meta}` snapshot instead.
 fn resolve_vd_recents(
     rail: &rail_state::RailState,
@@ -2605,7 +2645,7 @@ async fn sql_view_definitions_page(
     let rail_before = settings.rail(rail_state::RailPage::ViewDefinitions, &rt.id);
     let is_new = query.vd.as_deref() == Some("new");
     let (selected, selected_value, rail) = if is_new {
-        // "Create New" is never a selection (RF1's `?vd=new` exception):
+        // "Create New" is never a selection (the `?vd=new` exception):
         // nothing here reads or writes `rails.viewDefinitions`.
         (
             Some(SelectedVd {
@@ -2617,7 +2657,7 @@ async fn sql_view_definitions_page(
             rail_before,
         )
     } else if let Some(explicit_id) = query.vd.clone() {
-        // RF1.1: an explicit `?vd=` always wins, resolved or not.
+        // An explicit `?vd=` always wins, resolved or not.
         match resolve_vd_by_id(&state, rv.0, &rt.id, &explicit_id, &mut page_resources).await {
             Some(vd) => {
                 let (id, name, json) = shape_vd(&vd);
@@ -2638,7 +2678,7 @@ async fn sql_view_definitions_page(
                 (Some(SelectedVd { id, name, json }), Some(vd), rail)
             }
             None => {
-                // RF3: a stale or mistyped explicit id is pruned from the
+                // A stale or mistyped explicit id is pruned from the
                 // registry; the page itself keeps its current "no selection"
                 // render either way.
                 let rail = prune_stale_selection(
@@ -2654,10 +2694,9 @@ async fn sql_view_definitions_page(
             }
         }
     } else {
-        // No explicit selection: try the stored `last` (RF1.2), falling
-        // back to the rail's first visible entry (RF1.3, "comportamiento
-        // actual") when there is none or it no longer resolves — both
-        // silently, per RF1's "en silencio" clause: no write either way.
+        // No explicit selection: try the stored `last`, falling back to
+        // the rail's first visible entry when there is none or it no
+        // longer resolves — both silently: no write either way.
         let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
         let mut resolved = match stored_id.as_deref() {
             Some(id) => resolve_vd_by_id(&state, rv.0, &rt.id, id, &mut page_resources).await,
@@ -2682,17 +2721,21 @@ async fn sql_view_definitions_page(
     let recent_entries =
         resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));
 
-    // #752 ticket 02, RF6: `?saved=1` (Save's own redirect) runs the just-
-    // stored definition through $sql-run once, server-side, so the nojs path
-    // shows results without a client request. Every other render's own state
-    // is `Empty` (RF7) — the empty notice this produces is what carries
-    // ticket 02's client-driven initial-load request (RF4), covering both an
-    // ordinary `?vd=` navigation and `?vd=new`'s starter document.
+    // `?saved=1` (Save's own redirect) runs the just-stored definition
+    // through $sql-run once, server-side, so the nojs path shows results
+    // without a client request. Every other render's own state is `Empty`
+    // — the empty notice this produces is what carries the client-driven
+    // initial-load request, covering both an ordinary `?vd=` navigation and
+    // `?vd=new`'s starter document (#752, generalized to the Library-backed
+    // pages in #839).
     let i18n = I18n::new(locale);
     let run_state = match (&selected_value, query.saved.as_deref() == Some("1")) {
-        (Some(vd), true) => match run_view_preview(&state, vd, rv.0, &rt.id).await {
+        (Some(vd), true) => match run_sql_preview(&state, vd, rv.0, &rt.id).await {
             Ok((table, ms)) => RunResultsState::Success(table, ms),
-            Err(error) => RunResultsState::Failure(error),
+            Err(error) => {
+                let line = sql_views::extract_error_line(&error);
+                RunResultsState::Failure(error, line)
+            }
         },
         _ => RunResultsState::Empty,
     };
@@ -2711,6 +2754,11 @@ async fn sql_view_definitions_page(
         run_results: RunResultsPartial {
             i18n,
             fragment: false,
+            run_href: VD_RUN_HREF,
+            form_id: VD_EDITOR_FORM_ID,
+            heading_key: VD_RESULTS_HEADING_KEY,
+            failed_key: VD_RUN_FAILED_KEY,
+            export_href: None,
             state: run_state,
         },
         save_error: None,
@@ -2722,26 +2770,31 @@ async fn sql_view_definitions_page(
 }
 
 /// Runs `$sql-run` for a preview and times the call in whole milliseconds —
-/// shared by the page's own `?saved=1` render (#752 ticket 02, RF6) and the
-/// `/run` fragment endpoint (#752 ticket 01) so the row cap and the
-/// `{ $rows } rows · { $ms } ms` meta can never drift between the two
-/// callers. NF2: never logs `view_definition` itself — a ViewDefinition's
-/// `constant[]` can carry PHI.
-async fn run_view_preview(
+/// shared by every SQL on FHIR playground's own `?…saved=1` render and its
+/// `POST …/run` fragment endpoint (View Definitions since #752; SQL Queries
+/// and SQL Views since #839) so the row cap and the `{ $rows } rows ·
+/// { $ms } ms` meta can never drift between callers. `resource` is a
+/// ViewDefinition or a Library — `$sql-run` and [`sql_views::build_table`]
+/// only need it to carry a `select`, which a Library's SQL-only content does
+/// not, so its table is simply every column the query's own rows returned
+/// (see `build_table`'s own doc comment). NF2: never logs `resource` itself
+/// — a ViewDefinition's `constant[]` or a Library's embedded SQL can carry
+/// PHI.
+async fn run_sql_preview(
     state: &WebState,
-    view_definition: &serde_json::Value,
+    resource: &serde_json::Value,
     version: helios_fhir::FhirVersion,
     tenant: &str,
 ) -> Result<(sql_views::RunTable, u64), String> {
     let start = std::time::Instant::now();
     let rows = state
         .conformance
-        .sql_run(view_definition, sql_views::RUN_LIMIT, version, tenant)
+        .sql_run(resource, sql_views::RUN_LIMIT, version, tenant)
         .await?;
     // `Instant::elapsed` millis fits `u64` for anything short of 584 million
     // years; `unwrap_or(u64::MAX)` is just a total function, never reachable.
     let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    Ok((sql_views::build_table(view_definition, &rows), ms))
+    Ok((sql_views::build_table(resource, &rows), ms))
 }
 
 #[derive(Deserialize)]
@@ -2783,14 +2836,19 @@ async fn sql_view_definitions_save(
             }),
             is_new,
             // A form-validation error re-renders in place: nothing has run
-            // server-side, so this render's own results are `Empty` (RF7) —
-            // same as any other render with no `?saved=1`. The submitted
-            // text is still whatever the user typed (kept, not lost), so
-            // the `Empty` arm's own load trigger (#752 ticket 02, RF4) runs
-            // that same text through the live preview once the page opens.
+            // server-side, so this render's own results are `Empty` — same
+            // as any other render with no `?saved=1`. The submitted text is
+            // still whatever the user typed (kept, not lost), so the
+            // `Empty` arm's own load trigger runs that same text through the
+            // live preview once the page opens.
             run_results: RunResultsPartial {
                 i18n: I18n::new(locale),
                 fragment: false,
+                run_href: VD_RUN_HREF,
+                form_id: VD_EDITOR_FORM_ID,
+                heading_key: VD_RESULTS_HEADING_KEY,
+                failed_key: VD_RUN_FAILED_KEY,
+                export_href: None,
                 state: RunResultsState::Empty,
             },
             save_error: Some(save_error),
@@ -2868,29 +2926,28 @@ async fn sql_view_definitions_save(
 #[derive(Deserialize)]
 struct SqlVdRunForm {
     /// The editor's full text, exactly as posted — never reformatted or
-    /// re-serialized before either parsing it (RF6) or handing it to
-    /// `$sql-run` (RF3/NF5): the editor is the source of truth.
+    /// re-serialized before either parsing it or handing it to `$sql-run`:
+    /// the editor is the source of truth.
     json: String,
 }
 
-/// `POST /ui/sql/view-definitions/run` (#752 ticket 01): the playground's
-/// live preview fragment. Unlike the page's own `?saved=1` render, this
-/// always runs the editor's *posted* text — saved or not — through the same
-/// [`run_view_preview`] helper, and renders `partials/sql_run_results.html`
-/// in fragment mode (RF4–RF6) instead of a full page. Ticket 02 wires it to
-/// the editor's textarea (`input changed delay:500ms`) and, via the results
-/// region's own empty shell, to the page's `load` event — see
+/// `POST /ui/sql/view-definitions/run` (#752): the playground's live
+/// preview fragment. Unlike the page's own `?saved=1` render, this always
+/// runs the editor's *posted* text — saved or not — through the same
+/// [`run_sql_preview`] helper, and renders `partials/sql_run_results.html`
+/// in fragment mode instead of a full page. The editor's textarea posts to
+/// it on `input changed delay:500ms`, and the results region's own empty
+/// shell reposts to it on the page's `load` event — see
 /// `templates/partials/sql_run_results.html`'s header comment.
 ///
 /// Always answers `200` except for a malformed request body — a missing
 /// `json` field, which `axum::Form`'s own rejection turns into a `4xx`
-/// before this handler runs (RF2 — `422 Unprocessable Entity` in practice
-/// for a `POST` body deserialize failure, not `400`; either way a real
-/// error status, not this endpoint's `2xx` fragment contract). NF3: htmx
-/// does not swap `4xx`/`5xx` responses by default, so a run failure or
-/// invalid JSON must not surface as an HTTP error — both render RF5/RF6's
-/// notice-only fragment instead, leaving the client's previous results
-/// table untouched.
+/// before this handler runs (`422 Unprocessable Entity` in practice for a
+/// `POST` body deserialize failure, not `400`; either way a real error
+/// status, not this endpoint's `2xx` fragment contract). NF3: htmx does not
+/// swap `4xx`/`5xx` responses by default, so a run failure or invalid JSON
+/// must not surface as an HTTP error — both render the notice-only fragment
+/// instead, leaving the client's previous results table untouched.
 async fn sql_view_definitions_run(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -2899,31 +2956,42 @@ async fn sql_view_definitions_run(
     axum::Form(form): axum::Form<SqlVdRunForm>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    // RF6: a JSON parse failure never reaches $sql-run. NF2: never log
+    let respond = |run_state: RunResultsState| {
+        render(RunResultsPartial {
+            i18n,
+            fragment: true,
+            run_href: VD_RUN_HREF,
+            form_id: VD_EDITOR_FORM_ID,
+            heading_key: VD_RESULTS_HEADING_KEY,
+            failed_key: VD_RUN_FAILED_KEY,
+            export_href: None,
+            state: run_state,
+        })
+    };
+
+    // A JSON parse failure never reaches $sql-run. NF2: never log
     // `form.json` itself — a ViewDefinition's `constant[]` can carry PHI.
     let view_definition: serde_json::Value = match serde_json::from_str(form.json.trim()) {
         Ok(value) => value,
         Err(error) => {
-            return render(RunResultsPartial {
-                i18n,
-                fragment: true,
-                state: RunResultsState::Failure(format!("invalid JSON: {error}")),
-            });
+            return respond(RunResultsState::Failure(
+                format!("invalid JSON: {error}"),
+                None,
+            ));
         }
     };
 
-    let run_state = match run_view_preview(&state, &view_definition, rv.0, &rt.id).await {
+    let run_state = match run_sql_preview(&state, &view_definition, rv.0, &rt.id).await {
         Ok((table, ms)) => {
             tracing::debug!(rows = table.rows.len(), ms, "ran a ViewDefinition preview");
             RunResultsState::Success(table, ms)
         }
-        Err(error) => RunResultsState::Failure(error),
+        Err(error) => {
+            let line = sql_views::extract_error_line(&error);
+            RunResultsState::Failure(error, line)
+        }
     };
-    render(RunResultsPartial {
-        i18n,
-        fragment: true,
-        state: run_state,
-    })
+    respond(run_state)
 }
 
 /// #753 (evaluation POC, not merged upstream): structural +
@@ -2965,10 +3033,18 @@ async fn sql_view_definitions_lint(body: Bytes) -> Response {
 
 /// What tells the SQL Queries workspace apart from SQL Views: both edit and
 /// run `Library` resources, differing only in the `LibraryTypesCodes` code,
-/// their route, their labels, and — the page key each writes/reads its own
-/// `rails.<page>` record under (RF1's "sqlQueries / sqlViews son distintas y
-/// no se contaminan entre sí"), never hardcoded in the shared handler or
-/// template.
+/// their route, their labels, the page key each writes/reads its own
+/// `rails.<page>` record under (SQL Queries and SQL Views never contaminate
+/// each other's rail state), and everything else that sets the two apart in
+/// the editor-first layout the shared template renders (#839) — an SVG
+/// icon, a type chip, and the per-type copy for the rail's empty state, the
+/// editor and results headings, the failure notice's prefix, the filter
+/// placeholder, and the "no Library yet" empty state. None of it is ever
+/// hardcoded in the shared handler or template — a template reads only
+/// fields off this table, never an `if` comparing `code` against a string.
+///
+/// Every field below names a distinct per-kind i18n key or asset — never a
+/// shared one a template branches on with `if code == "..."` (NF5).
 struct LibraryKind {
     code: &'static str,
     base_href: &'static str,
@@ -2978,6 +3054,39 @@ struct LibraryKind {
     new_title_key: &'static str,
     all_heading_key: &'static str,
     page: rail_state::RailPage,
+    /// The filter rail search box's placeholder.
+    filter_placeholder_key: &'static str,
+    /// The rail's "no Libraries of this kind" text, under the "All …" group
+    /// heading.
+    rail_empty_key: &'static str,
+    /// The SQL editor card's `<h3>` heading.
+    editor_heading_key: &'static str,
+    /// The `$sql-run` preview card's `<h3>` heading, read into
+    /// [`RunResultsPartial::heading_key`].
+    results_heading_key: &'static str,
+    /// The failure notice's message-prefix key, read into
+    /// [`RunResultsPartial::failed_key`].
+    failed_key: &'static str,
+    /// The "no selection" empty state's card heading and lede, shown when
+    /// the store holds no Library of this kind and none is being created.
+    empty_title_key: &'static str,
+    empty_lede_key: &'static str,
+    /// The title row's `.tag--type` chip text (#839) — its own key, distinct
+    /// from `title_key`: the chip names one document's type ("SQL Query"),
+    /// the page head above the rail names the collection ("SQL Queries").
+    chip_key: &'static str,
+    /// The title row's embedded type icon (#839). `include_str!`, not
+    /// `{% include %}`, because Askama cannot include a template at a path
+    /// chosen at render time.
+    icon_svg: &'static str,
+    /// This kind's `POST …/run` fragment endpoint — the SQL textarea's own
+    /// `hx-post` target and, via [`RunResultsPartial::run_href`], the
+    /// results region's own initial-load repost target.
+    run_href: &'static str,
+    /// Whether this kind's results card offers an "Export as files" action
+    /// (SQL Queries only — a SQL View has no `subject=Library/{id}` export
+    /// shape of its own).
+    offers_export: bool,
 }
 
 const SQL_QUERY_KIND: LibraryKind = LibraryKind {
@@ -2989,6 +3098,17 @@ const SQL_QUERY_KIND: LibraryKind = LibraryKind {
     new_title_key: "sql-queries-new-title",
     all_heading_key: "sql-queries-rail-all-heading",
     page: rail_state::RailPage::SqlQueries,
+    filter_placeholder_key: "sql-queries-filter",
+    rail_empty_key: "sql-queries-rail-empty",
+    editor_heading_key: "sql-queries-editor-heading",
+    results_heading_key: "sql-queries-results-heading",
+    failed_key: "sql-queries-run-failed",
+    empty_title_key: "sql-queries-empty-title",
+    empty_lede_key: "sql-queries-empty-lede",
+    chip_key: "sql-queries-chip",
+    icon_svg: include_str!("../templates/icons/code.svg"),
+    run_href: "/ui/sql/queries/run",
+    offers_export: true,
 };
 
 const SQL_VIEW_KIND: LibraryKind = LibraryKind {
@@ -3000,7 +3120,48 @@ const SQL_VIEW_KIND: LibraryKind = LibraryKind {
     new_title_key: "sql-views-new-title",
     all_heading_key: "sql-views-rail-all-heading",
     page: rail_state::RailPage::SqlViews,
+    filter_placeholder_key: "sql-views-filter",
+    rail_empty_key: "sql-views-rail-empty",
+    editor_heading_key: "sql-views-editor-heading",
+    results_heading_key: "sql-views-results-heading",
+    failed_key: "sql-views-run-failed",
+    empty_title_key: "sql-views-empty-title",
+    empty_lede_key: "sql-views-empty-lede",
+    chip_key: "sql-views-chip",
+    icon_svg: include_str!("../templates/icons/layers-platforms.svg"),
+    run_href: "/ui/sql/views/run",
+    offers_export: false,
 };
+
+/// The Library-backed pages' one editable form's id — matches
+/// `#lib-editor-form` in `pages/sql-library.html`. Shared by both kinds
+/// (unlike `LibraryKind::run_href`, which differs per kind): the `/run`
+/// fragment's `Empty` shell reads it via `hx-include` ([`RunResultsPartial::
+/// form_id`]).
+const LIB_EDITOR_FORM_ID: &str = "lib-editor-form";
+
+/// The "Export as files" action's `href` for a Library of `kind` with the
+/// given `id` (empty for an unsaved document) — `Some` only for a kind that
+/// offers Export (SQL Queries) with a saved, non-empty id (#839); `None`
+/// otherwise, which the results partial renders as nothing.
+fn export_href(kind: &LibraryKind, id: &str) -> Option<String> {
+    (kind.offers_export && !id.is_empty())
+        .then(|| format!("/ui/sql/export/new?subject=Library/{id}"))
+}
+
+/// The title row's status chip class (#839): `active`/`draft`/`retired` for
+/// those exact FHIR publication-status codes, `unknown` — one of the same
+/// four `.tag--*` classes `app.css` already defines — for anything else,
+/// including an absent status. The chip's own text is always `status`
+/// verbatim (possibly empty), never replaced by this class.
+fn status_tag_class(status: &str) -> &'static str {
+    match status {
+        "active" => "active",
+        "draft" => "draft",
+        "retired" => "retired",
+        _ => "unknown",
+    }
+}
 
 /// The SQL Queries / SQL Views workspace (#649): the same shape as View
 /// Definitions — rail, editor, `$sql-run` preview — over `Library` resources
@@ -3013,20 +3174,40 @@ struct SqlLibraryPage {
     i18n: I18n,
     active_page: &'static str,
     base_href: &'static str,
+    /// This kind's `POST …/run` fragment endpoint (`kind.run_href`), read by
+    /// the SQL textarea's own `hx-post` (#839).
+    run_href: &'static str,
     title_key: &'static str,
     lede_key: &'static str,
     new_title_key: &'static str,
     all_heading_key: &'static str,
+    /// The filter rail search box's placeholder key (`kind.filter_placeholder_key`).
+    filter_placeholder_key: &'static str,
+    /// The rail's own "no Libraries of this kind" key (`kind.rail_empty_key`).
+    rail_empty_key: &'static str,
+    /// The SQL editor card's heading key (`kind.editor_heading_key`).
+    editor_heading_key: &'static str,
+    /// The "no selection" empty state's heading and lede keys
+    /// (`kind.empty_title_key`/`kind.empty_lede_key`).
+    empty_title_key: &'static str,
+    empty_lede_key: &'static str,
+    /// The title row's `.tag--type` chip text key (`kind.chip_key`) and
+    /// embedded type icon (`kind.icon_svg`), both from #839.
+    chip_key: &'static str,
+    icon_svg: &'static str,
     rail: Vec<sql_libraries::LibSummary>,
     filter: String,
     degraded: Option<String>,
     selected: Option<SelectedLib>,
     is_new: bool,
-    results: Option<sql_views::RunTable>,
-    run_error: Option<String>,
+    /// The `$sql-run` preview card and its failure notice, nested as its own
+    /// template (#839) so `partials/sql_run_results.html`'s markup — shared
+    /// with View Definitions — stays in exactly one place. `fragment: false`
+    /// here — the page's own render has nothing to swap into.
+    run_results: RunResultsPartial,
     save_error: Option<String>,
     saved: bool,
-    /// RF4/RF6: the "Recently used" group's own rows.
+    /// The "Recently used" group's own rows.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`kind.page.key()`), carried
     /// to the template so `partials/rail_recent.html`'s clones can name it
@@ -3042,13 +3223,21 @@ struct SelectedLib {
     name: String,
     json: String,
     sql: String,
+    /// The resource's own `status`, verbatim — the title row's status chip
+    /// text (#839), possibly empty when the resource carries none.
+    status: String,
+    /// The `.tag--{status_class}` chip class [`status_tag_class`] derives
+    /// from `status` — `unknown` for anything but `active`/`draft`/`retired`.
+    status_class: &'static str,
 }
 
 #[derive(Deserialize, Default)]
 struct SqlLibQuery {
     lib: Option<String>,
     filter: Option<String>,
-    run: Option<String>,
+    /// `?saved=1` (Save's own redirect): renders the just-saved Library's
+    /// `$sql-run` results server-side. There is no `?run=1` — the live
+    /// preview is progressive enhancement over `POST …/run` (#839).
     saved: Option<String>,
 }
 
@@ -3070,13 +3259,12 @@ fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
     (id, name, json, sql)
 }
 
-/// Resolves one candidate Library id, requiring it to carry `code` — RF1.2's
-/// "si está en la colección cargada de esa clase": a stored `last` or the
-/// rail's own fallback candidate must belong to this page's kind, never
-/// resolve to a Library of the other one. Deliberately stricter than the
-/// explicit `?lib=` lookup in [`sql_library_page`] below, which — as #649
-/// always has — trusts whatever id the URL names outright; narrowing that
-/// one too is a pre-existing behavior this ticket leaves alone.
+/// Resolves one candidate Library id, requiring it to carry `code`: a stored
+/// `last` or the rail's own fallback candidate must belong to this page's
+/// kind, never resolve to a Library of the other one. Deliberately stricter
+/// than the explicit `?lib=` lookup in [`sql_library_page`] below, which —
+/// as #649 always has — trusts whatever id the URL names outright;
+/// narrowing that one too is a pre-existing behavior left alone here.
 fn resolve_lib_of_kind(
     id: &str,
     code: &str,
@@ -3089,12 +3277,12 @@ fn resolve_lib_of_kind(
     Some(libraries.swap_remove(i))
 }
 
-/// RF6 for the Library-backed rails (SQL Queries, SQL Views): the "Recently
+/// For the Library-backed rails (SQL Queries, SQL Views): the "Recently
 /// used" group's rows, resolved against this render's own (kind- and
 /// search-box-filtered) rail list so label/meta/href/current match what the
-/// list already shows. RF4's "the group is never itself filtered by
-/// `?filter=`" falls out for free: an id the current filter excludes is
-/// simply absent from `summaries` (and so from `live`), so
+/// list already shows. "The group is never itself filtered by `?filter=`"
+/// falls out for free: an id the current filter excludes is simply absent
+/// from `summaries` (and so from `live`), so
 /// [`rail_state::RailState::resolve_recents`] renders it from its stored
 /// `{name, meta}` snapshot instead.
 fn resolve_lib_recents(
@@ -3150,7 +3338,7 @@ async fn sql_library_page(
     let rail_before = settings.rail(kind.page, &rt.id);
     let is_new = query.lib.as_deref() == Some("new");
     let (selected, selected_value, rail) = if is_new {
-        // "Create New" is never a selection (RF1's `?lib=new` exception):
+        // "Create New" is never a selection (the `?lib=new` exception):
         // nothing here reads or writes `rails.<page>`.
         (
             Some(SelectedLib {
@@ -3158,22 +3346,22 @@ async fn sql_library_page(
                 name: String::new(),
                 json: sql_libraries::starter_library(kind.code),
                 sql: sql_libraries::STARTER_SQL.to_string(),
+                status: sql_libraries::STARTER_STATUS.to_string(),
+                status_class: status_tag_class(sql_libraries::STARTER_STATUS),
             }),
             None,
             rail_before,
         )
     } else if let Some(explicit_id) = query.lib.clone() {
-        // RF1.1: an explicit `?lib=` always wins, resolved or not.
+        // An explicit `?lib=` always wins, resolved or not.
         let found = libraries
             .iter()
             .position(|l| l.get("id").and_then(serde_json::Value::as_str) == Some(&explicit_id));
         match found.map(|i| libraries.swap_remove(i)) {
             Some(lib) => {
                 let (id, name, json, sql) = shape_lib(&lib);
-                let meta = lib
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
+                let status = sql_libraries::extract_status(&lib);
+                let meta = (!status.is_empty()).then(|| status.clone());
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
                 let rail = record_snapshot_selection(
                     &state,
@@ -3190,13 +3378,15 @@ async fn sql_library_page(
                         name,
                         json,
                         sql,
+                        status_class: status_tag_class(&status),
+                        status,
                     }),
                     Some(lib),
                     rail,
                 )
             }
             None => {
-                // RF3: a stale or mistyped explicit id is pruned from the
+                // A stale or mistyped explicit id is pruned from the
                 // registry; the page itself keeps its current "no selection"
                 // render either way.
                 let rail = prune_stale_selection(
@@ -3212,10 +3402,9 @@ async fn sql_library_page(
             }
         }
     } else {
-        // No explicit selection: try the stored `last` (RF1.2), falling
-        // back to the rail's first visible entry (RF1.3, "comportamiento
-        // actual") when there is none or it no longer resolves — both
-        // silently, per RF1's "en silencio" clause: no write either way.
+        // No explicit selection: try the stored `last`, falling back to
+        // the rail's first visible entry when there is none or it no
+        // longer resolves — both silently: no write either way.
         let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
         let mut resolved =
             stored_id.and_then(|id| resolve_lib_of_kind(&id, kind.code, &mut libraries));
@@ -3227,12 +3416,15 @@ async fn sql_library_page(
         match resolved {
             Some(lib) => {
                 let (id, name, json, sql) = shape_lib(&lib);
+                let status = sql_libraries::extract_status(&lib);
                 (
                     Some(SelectedLib {
                         id,
                         name,
                         json,
                         sql,
+                        status_class: status_tag_class(&status),
+                        status,
                     }),
                     Some(lib),
                     rail_before,
@@ -3249,30 +3441,60 @@ async fn sql_library_page(
         selected.as_ref().map(|s| s.id.as_str()),
     );
 
-    let (results, run_error) = match (&selected_value, query.run.as_deref() == Some("1")) {
-        (Some(lib), true) => match state.conformance.sql_run(lib, 50, rv.0, &rt.id).await {
-            Ok(rows) => (Some(sql_views::build_table(lib, &rows)), None),
-            Err(error) => (None, Some(error)),
+    // `?saved=1` (Save's own redirect) runs the just-stored Library through
+    // $sql-run once, server-side, so the nojs path shows results without a
+    // client request. Every other render's own state is `Empty` — the empty
+    // notice this produces is what carries the client-driven initial-load
+    // request, covering both an ordinary `?lib=` navigation and `?lib=new`'s
+    // starter document (#839, mirroring View Definitions' own `?vd=…&saved=
+    // 1` handling in `sql_view_definitions_page`).
+    let i18n = I18n::new(locale);
+    // Owned, not borrowed: `selected` itself moves into the response below,
+    // in the same expression that still needs this id for `export_href`.
+    let selected_id = selected.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+    let run_state = match (&selected_value, query.saved.as_deref() == Some("1")) {
+        (Some(lib), true) => match run_sql_preview(&state, lib, rv.0, &rt.id).await {
+            Ok((table, ms)) => RunResultsState::Success(table, ms),
+            Err(error) => {
+                let line = sql_views::extract_error_line(&error);
+                RunResultsState::Failure(error, line)
+            }
         },
-        _ => (None, None),
+        _ => RunResultsState::Empty,
     };
 
     render(SqlLibraryPage {
         status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: kind.active_page,
         base_href: kind.base_href,
+        run_href: kind.run_href,
         title_key: kind.title_key,
         lede_key: kind.lede_key,
         new_title_key: kind.new_title_key,
         all_heading_key: kind.all_heading_key,
+        filter_placeholder_key: kind.filter_placeholder_key,
+        rail_empty_key: kind.rail_empty_key,
+        editor_heading_key: kind.editor_heading_key,
+        empty_title_key: kind.empty_title_key,
+        empty_lede_key: kind.empty_lede_key,
+        chip_key: kind.chip_key,
+        icon_svg: kind.icon_svg,
         rail: summaries,
         filter,
         degraded,
         selected,
         is_new,
-        results,
-        run_error,
+        run_results: RunResultsPartial {
+            i18n,
+            fragment: false,
+            run_href: kind.run_href,
+            form_id: LIB_EDITOR_FORM_ID,
+            heading_key: kind.results_heading_key,
+            failed_key: kind.failed_key,
+            export_href: export_href(kind, &selected_id),
+            state: run_state,
+        },
         save_error: None,
         saved: query.saved.as_deref() == Some("1"),
         recent_entries,
@@ -3301,16 +3523,33 @@ async fn sql_library_save(
     form: SqlLibSaveForm,
     kind: &LibraryKind,
 ) -> Response {
-    let error_page =
-        |save_error: String, json: String, sql: String, is_new: bool, id: String| SqlLibraryPage {
+    let error_page = |save_error: String,
+                      json: String,
+                      sql: String,
+                      is_new: bool,
+                      id: String,
+                      status: String| {
+        // Computed before `id` moves into `SelectedLib` below.
+        let export_href = export_href(kind, &id);
+        let status_class = status_tag_class(&status);
+        let i18n = I18n::new(locale);
+        SqlLibraryPage {
             status: current_status(&state, rv.0, &rt),
-            i18n: I18n::new(locale),
+            i18n,
             active_page: kind.active_page,
             base_href: kind.base_href,
+            run_href: kind.run_href,
             title_key: kind.title_key,
             lede_key: kind.lede_key,
             new_title_key: kind.new_title_key,
             all_heading_key: kind.all_heading_key,
+            filter_placeholder_key: kind.filter_placeholder_key,
+            rail_empty_key: kind.rail_empty_key,
+            editor_heading_key: kind.editor_heading_key,
+            empty_title_key: kind.empty_title_key,
+            empty_lede_key: kind.empty_lede_key,
+            chip_key: kind.chip_key,
+            icon_svg: kind.icon_svg,
             rail: Vec::new(),
             filter: String::new(),
             degraded: None,
@@ -3319,10 +3558,26 @@ async fn sql_library_save(
                 id,
                 json,
                 sql,
+                status,
+                status_class,
             }),
             is_new,
-            results: None,
-            run_error: None,
+            // A form-validation error re-renders in place: nothing has run
+            // server-side, so this render's own results are `Empty` — same
+            // as any other render with no `?saved=1`. The submitted text is
+            // still whatever the user typed (kept, not lost), so the
+            // `Empty` arm's own load trigger runs that same text through the
+            // live preview once the page opens.
+            run_results: RunResultsPartial {
+                i18n,
+                fragment: false,
+                run_href: kind.run_href,
+                form_id: LIB_EDITOR_FORM_ID,
+                heading_key: kind.results_heading_key,
+                failed_key: kind.failed_key,
+                export_href,
+                state: RunResultsState::Empty,
+            },
             save_error: Some(save_error),
             saved: false,
             // A form-validation error re-renders in place, not a navigation —
@@ -3330,18 +3585,22 @@ async fn sql_library_save(
             recent_entries: Vec::new(),
             rail_page: kind.page.key(),
             max_recent: rail_state::MAX_RECENT,
-        };
+        }
+    };
 
     let duplicate = form.action == "duplicate";
     let mut resource: serde_json::Value = match serde_json::from_str(form.json.trim()) {
         Ok(value) => value,
         Err(e) => {
+            // No parsed resource to read a status off of — the JSON itself
+            // never parsed, so the re-rendered chip is empty (`unknown`).
             return render(error_page(
                 format!("invalid JSON: {e}"),
                 form.json,
                 form.sql,
                 form.id.is_empty(),
                 form.id,
+                String::new(),
             ));
         }
     };
@@ -3350,15 +3609,20 @@ async fn sql_library_save(
         .and_then(serde_json::Value::as_str)
         != Some("Library")
     {
+        let status = sql_libraries::extract_status(&resource);
         return render(error_page(
             "the document must have resourceType \"Library\"".to_string(),
             form.json,
             form.sql,
             form.id.is_empty(),
             form.id,
+            status,
         ));
     }
     sql_libraries::embed_sql(&mut resource, &form.sql);
+    // Read before `resource` moves into `save_resource` below — only the
+    // save-failure branch needs it, but the value must be captured here.
+    let status = sql_libraries::extract_status(&resource);
 
     let id = if duplicate || form.id.is_empty() {
         if let Some(map) = resource.as_object_mut() {
@@ -3395,8 +3659,100 @@ async fn sql_library_save(
             form.sql,
             id.is_none(),
             form.id,
+            status,
         )),
     }
+}
+
+#[derive(Deserialize)]
+struct SqlLibRunForm {
+    /// The Library id the posted document was opened from, empty for an
+    /// unsaved one — only ever used to gate the Export action's `href`
+    /// (#839); a stored Library is never read back through it, so a
+    /// mismatched or nonexistent id changes nothing about what runs.
+    #[serde(default)]
+    id: String,
+    /// The editor's full text, exactly as posted — never reformatted or
+    /// re-serialized before either parsing it or embedding `sql` into it.
+    json: String,
+    /// The SQL pane's exact posted text, embedded into `json`'s
+    /// `application/sql` attachment the same way Save does
+    /// ([`sql_libraries::embed_sql`]).
+    #[serde(default)]
+    sql: String,
+}
+
+/// `POST /ui/sql/queries/run` and `POST /ui/sql/views/run` (#839): the
+/// Library-backed playgrounds' live preview fragment, the same shape
+/// [`sql_view_definitions_run`] gives View Definitions. Always runs the
+/// *posted* `json`/`sql` — saved or not, and never a lookup of `id` against
+/// storage — through `$sql-run`, embedding `sql` into `json` first
+/// exactly as Save does. Renders `partials/sql_run_results.html` in
+/// fragment mode; see that endpoint's own doc comment for the shared `200`-
+/// except-for-a-malformed-body contract.
+async fn sql_library_run(
+    state: WebState,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    form: SqlLibRunForm,
+    kind: &LibraryKind,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let export_href = export_href(kind, &form.id);
+    let respond = |run_state: RunResultsState| {
+        render(RunResultsPartial {
+            i18n,
+            fragment: true,
+            run_href: kind.run_href,
+            form_id: LIB_EDITOR_FORM_ID,
+            heading_key: kind.results_heading_key,
+            failed_key: kind.failed_key,
+            export_href: export_href.clone(),
+            state: run_state,
+        })
+    };
+
+    // A JSON parse failure never reaches $sql-run. NF1: never log
+    // `form.json`/`form.sql` themselves — a Library's embedded SQL or JSON
+    // body can carry PHI.
+    let mut resource: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return respond(RunResultsState::Failure(
+                format!("invalid JSON: {error}"),
+                None,
+            ));
+        }
+    };
+    if resource
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        != Some("Library")
+    {
+        return respond(RunResultsState::Failure(
+            "the document must have resourceType \"Library\"".to_string(),
+            None,
+        ));
+    }
+    sql_libraries::embed_sql(&mut resource, &form.sql);
+
+    let run_state = match run_sql_preview(&state, &resource, rv.0, &rt.id).await {
+        Ok((table, ms)) => {
+            tracing::debug!(
+                rows = table.rows.len(),
+                ms,
+                kind = kind.code,
+                "ran a Library preview"
+            );
+            RunResultsState::Success(table, ms)
+        }
+        Err(error) => {
+            let line = sql_views::extract_error_line(&error);
+            RunResultsState::Failure(error, line)
+        }
+    };
+    respond(run_state)
 }
 
 async fn sql_queries_page(
@@ -3420,6 +3776,16 @@ async fn sql_queries_save(
     sql_library_save(state, locale, rv, rt, form, &SQL_QUERY_KIND).await
 }
 
+async fn sql_queries_run(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlLibRunForm>,
+) -> Response {
+    sql_library_run(state, locale, rv, rt, form, &SQL_QUERY_KIND).await
+}
+
 async fn sql_views_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -3439,6 +3805,16 @@ async fn sql_views_save(
     axum::Form(form): axum::Form<SqlLibSaveForm>,
 ) -> Response {
     sql_library_save(state, locale, rv, rt, form, &SQL_VIEW_KIND).await
+}
+
+async fn sql_views_run(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlLibRunForm>,
+) -> Response {
+    sql_library_run(state, locale, rv, rt, form, &SQL_VIEW_KIND).await
 }
 
 /// The Files page (#649): a finished job's completion manifest — one row per
@@ -3728,17 +4104,17 @@ async fn capability_page(
 
 /// Compartment viewer & tester page.
 ///
-/// RF1/RF2 of the compartments-restore ticket: `def` is resolved *before*
-/// `CmpQuery` is built, reusing the same [`record_type_selection`] the type
-/// rails already write through — its "explicit wins outright, invalid or
-/// not; otherwise the stored `last` only if it still names a real choice"
-/// contract is exactly what Compartments needs, with `defs`' codes standing
-/// in for `resource_types`. That keeps [`compartments::build_view`] pure and
-/// untouched: it still owns the `Patient` → first fallback chain, so an
-/// unresolvable explicit code or a stale `last` both fall through to it in
-/// silence, with nothing written. Compartments has no "Recently used" group
-/// (the epic: 4-5 definitions would make one noise), so `rail` is otherwise
-/// only read to resolve `def` — never rendered.
+/// `def` is resolved *before* `CmpQuery` is built, reusing the same
+/// [`record_type_selection`] the type rails already write through — its
+/// "explicit wins outright, invalid or not; otherwise the stored `last`
+/// only if it still names a real choice" contract is exactly what
+/// Compartments needs, with `defs`' codes standing in for `resource_types`.
+/// That keeps [`compartments::build_view`] pure and untouched: it still
+/// owns the `Patient` → first fallback chain, so an unresolvable explicit
+/// code or a stale `last` both fall through to it in silence, with nothing
+/// written. Compartments has no "Recently used" group (only 4-5
+/// definitions, which would make one noise), so `rail` is otherwise only
+/// read to resolve `def` — never rendered.
 async fn compartments_page(
     State(state): State<WebState>,
     locale: RequestLocale,

@@ -790,10 +790,10 @@ sql-vd-title = View Definitions
 sql-vd-lede = Author and manage the ViewDefinitions that SQL on FHIR runs flatten resources with.
 
 sql-queries-title = SQL Queries
-sql-queries-lede = Run SQL on FHIR queries against this server.
+sql-queries-lede = Ad-hoc SQL over the flat tables your view definitions produce. Results refresh as you type.
 
 sql-views-title = SQL Views
-sql-views-lede = Reusable SQL views layered over ViewDefinitions.
+sql-views-lede = Named views other queries and exports select from. Define the SQL once; the columns it produces become a table everyone else can use.
 
 sql-export-title = SQL Export
 sql-export-lede = Long-running SQL on FHIR export jobs.
@@ -814,7 +814,6 @@ vd-none = No view definitions yet.
 vd-empty-lede = Create your first ViewDefinition with Create New.
 vd-degraded = The view definition list could not be loaded.
 vd-saved = Saved.
-vd-run = Run
 vd-run-failed = Could not run the view.
 vd-save = Save
 vd-duplicate = Duplicate
@@ -825,27 +824,52 @@ vd-json-heading = Definition (JSON)
 vd-run-hint = Runs as you type — results follow the current definition, saved or not
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
-# #752 ticket 01: the $sql-run preview's row/duration meta, shared by the
-# page's own render and the `/run` fragment endpoint.
+# #752: the $sql-run preview's row/duration meta, shared by the page's own
+# render and the `/run` fragment endpoint.
 vd-results-meta = { $rows } rows · { $ms } ms
-# #752 ticket 01: the results meta after a failed run — the previous table
-# stays on screen, relabelled.
+# #752: the results meta after a failed run — the previous table stays on
+# screen, relabelled.
 vd-results-stale = last successful run
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next
 
-## SQL Queries / SQL Views workspaces (#649)
+## $sql-run results partial (#752): shared by the View Definitions, SQL
+## Queries, and SQL Views playgrounds (#839).
+
+sql-run-export = Export as files
+
+## SQL Queries / SQL Views workspaces (#649, editor-first layout #839)
 
 sql-queries-new-title = New SQL Query
 sql-views-new-title = New SQL View
 sql-queries-rail-all-heading = All SQL Queries
 sql-views-rail-all-heading = All SQL Views
-lib-filter = Filter libraries
-lib-none = No libraries yet.
-lib-empty-lede = Create your first library with Create New.
+# The title row's `.tag--type` chip (#839) — one document's type, singular,
+# distinct from the *-title keys above (the collection's own plural name).
+sql-queries-chip = SQL Query
+sql-views-chip = SQL View
+sql-queries-filter = Filter queries
+sql-views-filter = Filter views
+sql-queries-rail-empty = No queries yet.
+sql-views-rail-empty = No views yet.
+sql-queries-empty-title = No SQL queries yet
+sql-views-empty-title = No SQL views yet
+sql-queries-empty-lede = Write your first query with Create New. It runs against the flat tables of every active view definition.
+sql-views-empty-lede = Define your first view with Create New. Its columns become a table other queries and exports can select from.
+sql-queries-editor-heading = SQL
+sql-views-editor-heading = View definition (SQL)
+sql-queries-results-heading = Results
+sql-views-results-heading = Preview
+sql-queries-run-failed = Could not run the query.
+sql-views-run-failed = Could not run the view.
 lib-degraded = The library list could not be loaded.
-lib-sql-heading = SQL
+# The SQL card's "runs as you type" legend (#839) — shared verbatim by SQL
+# Queries and SQL Views, unlike the headings/failure prefix above.
+lib-run-hint = Runs as you type — results follow the current SQL, saved or not
+# The title row's secondary link to the full resource (#839; #840 replaces
+# this with a Details card).
+lib-edit-json = Edit as JSON
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
 

@@ -93,10 +93,10 @@ test("the Resources type rail navigates via plain links with no JavaScript", asy
   await expect(item).toHaveAttribute("aria-current", "true");
 });
 
-// "Tests esperados" #15 (RF8): a rail click is a real navigation with no
-// JavaScript at all, so the server itself records the selection (RF3) — and
-// the "Recently used" group, entirely server-rendered (RF6), shows it on the
-// very next load without any client script populating it.
+// A rail click is a real navigation with no
+// JavaScript at all, so the server itself records the selection — and the
+// "Recently used" group, entirely server-rendered, shows it on the very
+// next load without any client script populating it.
 test("a Resources rail click without JavaScript is remembered in the recently-used group", async ({
   page,
 }) => {
@@ -112,12 +112,12 @@ test("a Resources rail click without JavaScript is remembered in the recently-us
   await expect(recentGroup.locator("[data-type='Observation']")).toBeVisible();
 });
 
-// "Tests esperados" #6 (#754/#755 ticket 04): a Compartments rail click is a
-// real navigation with no JavaScript at all — there is no "Recently used"
-// group here (only 4-5 definitions), just `rails.compartments.last` — so the
-// server itself records the selection (RF2), and a later plain arrival with
-// no `?def=` at all restores it (RF1), the same route the nojs sweep above
-// already proved is navigable.
+// A Compartments rail click (#754/#755) is a real
+// navigation with no JavaScript at all — there is no "Recently used" group
+// here (only 4-5 definitions), just `rails.compartments.last` — so the
+// server itself records the selection, and a later plain arrival with no
+// `?def=` at all restores it, the same route the nojs sweep above already
+// proved is navigable.
 test("a Compartments rail click without JavaScript is remembered on a later plain arrival", async ({
   page,
   compartments,
@@ -131,10 +131,10 @@ test("a Compartments rail click without JavaScript is remembered on a later plai
   await expect(compartments.railItem("Encounter")).toHaveAttribute("aria-current", "true");
 });
 
-// "Tests esperados" #12 (#754/#755 ticket 03): the three SQL rails (View
-// Definitions, SQL Queries, SQL Views) render their rail and "Recently used"
-// group entirely server-side, and a rail click is a real navigation the
-// server itself records — no client script required either way.
+// The three SQL rails (#754/#755) — View Definitions,
+// SQL Queries, SQL Views — render their rail and "Recently used" group
+// entirely server-side, and a rail click is a real navigation the server
+// itself records — no client script required either way.
 const SQL_RAILS = [
   { path: "/ui/sql/view-definitions", list: "vd-rail-list", recent: "vd-rail-recent", param: "vd" },
   { path: "/ui/sql/queries", list: "lib-rail-list", recent: "lib-rail-recent", param: "lib" },
@@ -465,11 +465,34 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
 // #838: sql-editor.js never loads (this project runs with
 // javaScriptEnabled: false), so the SQL pane stays the plain textarea it
 // is today — visible, holding the decoded SQL, editable, and saved by a
-// real form POST.
-test("the SQL Queries pane is a plain textarea and Save persists without JavaScript", async ({
+// real form POST. #839: there is no Run link at all, and Save's own
+// redirect runs the saved SQL server-side, so the results table appears
+// with no client-side request.
+test("the SQL Queries pane is a plain textarea and Save shows the saved SQL's results without JavaScript", async ({
   page,
   request,
 }) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "NojsSqlE2E" }],
+  });
+  const canonical = `http://example.org/ViewDefinition/nojs-sql-${Date.now()}`;
+  await createResource(request, "ViewDefinition", {
+    name: "nojs_sql_source",
+    url: canonical,
+    status: "active",
+    resource: "Patient",
+    where: [{ path: "name.family = 'NojsSqlE2E'" }],
+    select: [
+      {
+        column: [
+          { name: "id", path: "getResourceKey()" },
+          { name: "family", path: "name.family.first()" },
+        ],
+      },
+    ],
+  });
+  await waitSearchable(request, "Patient", patientId);
+
   const sql = "SELECT id FROM v";
   const libId = await createResource(request, "Library", {
     name: `nojs_sql_query_${Date.now()}`,
@@ -482,6 +505,7 @@ test("the SQL Queries pane is a plain textarea and Save persists without JavaScr
         },
       ],
     },
+    relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
     content: [{ contentType: "application/sql", data: Buffer.from(sql).toString("base64") }],
   });
   await waitSearchable(request, "Library", libId);
@@ -492,12 +516,15 @@ test("the SQL Queries pane is a plain textarea and Save persists without JavaScr
   await expect(textarea).toHaveValue(sql);
   // No editor script ran, so no CodeMirror wrapper was inserted.
   await expect(page.locator(".sql-editor")).toHaveCount(0);
+  await expect(page.locator("a[href*='run=1']")).toHaveCount(0);
 
-  const updated = "SELECT name FROM v";
+  const updated = "SELECT family FROM v";
   await textarea.fill(updated);
   await page.locator("button[name='action'][value='save']").click();
   await expect(page).toHaveURL(/saved=1/);
   await expect(page.locator("textarea[name='sql']")).toHaveValue(updated);
+  await expect(page.locator("#run-results .data-table")).toBeVisible();
+  await expect(page.locator("#run-results .data-table th", { hasText: "family" })).toBeVisible();
 });
 
 test("Bulk Export accepts comma- and newline-separated Patient IDs without JavaScript", async ({
