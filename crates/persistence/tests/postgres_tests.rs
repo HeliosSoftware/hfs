@@ -715,17 +715,27 @@ mod query_builder_tests {
 
     #[test]
     fn test_prefix_operators() {
-        // Test all prefix-to-operator mappings by using date search
-        let prefixes_and_ops = vec![
-            (SearchPrefix::Eq, "="),
-            (SearchPrefix::Ne, "!="),
-            (SearchPrefix::Gt, ">"),
-            (SearchPrefix::Lt, "<"),
-            (SearchPrefix::Ge, ">="),
-            (SearchPrefix::Le, "<="),
+        // Day-precision prefixes compare against the value's [day, day+1)
+        // range (#871), matching the date-parameter semantics from #463: eq
+        // must mean "inside the named day", gt must exclude it entirely.
+        let cases = vec![
+            (
+                SearchPrefix::Eq,
+                "last_updated >= $1 AND last_updated < $2",
+                2,
+            ),
+            (
+                SearchPrefix::Ne,
+                "(last_updated < $1 OR last_updated >= $2)",
+                2,
+            ),
+            (SearchPrefix::Gt, "last_updated >= $1", 1),
+            (SearchPrefix::Lt, "last_updated < $1", 1),
+            (SearchPrefix::Ge, "last_updated >= $1", 1),
+            (SearchPrefix::Le, "last_updated < $1", 1),
         ];
 
-        for (prefix, expected_op) in prefixes_and_ops {
+        for (prefix, expected_sql, expected_params) in cases {
             let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
                 name: "_lastUpdated".to_string(),
                 param_type: SearchParamType::Date,
@@ -739,15 +749,37 @@ mod query_builder_tests {
             assert!(result.is_some(), "Failed for prefix {:?}", prefix);
             let fragment = result.unwrap();
             assert!(
-                fragment
-                    .sql
-                    .contains(&format!("last_updated {} $", expected_op)),
-                "Expected operator '{}' for prefix {:?}, got SQL: {}",
-                expected_op,
+                fragment.sql.contains(expected_sql),
+                "Expected '{}' for prefix {:?}, got SQL: {}",
+                expected_sql,
                 prefix,
                 fragment.sql
             );
+            assert_eq!(
+                fragment.params.len(),
+                expected_params,
+                "param count for prefix {:?}",
+                prefix
+            );
         }
+
+        // A full-precision instant is a degenerate range and falls back to
+        // scalar comparison.
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "2024-01-01T10:00:00Z")],
+            chain: vec![],
+            components: vec![],
+        });
+        let fragment = PostgresQueryBuilder::build_search_query(&query, 0)
+            .expect("full-precision instant must build");
+        assert!(
+            fragment.sql.contains("last_updated > $1"),
+            "full-precision gt must stay scalar, got SQL: {}",
+            fragment.sql
+        );
     }
 }
 
@@ -6003,6 +6035,46 @@ mod postgres_integration {
             "expected a backend error from an unmigrated database, got {create:?}"
         );
     }
+    /// Claims manifests in a loop until the lease for `target` comes back,
+    /// holding any other lease it picks up along the way (so the loop cannot
+    /// re-claim the same foreign manifest) and returning those to the queue
+    /// once the target is held. Robust to concurrent tests sharing the
+    /// testcontainers PostgreSQL instance — the submit-side twin of
+    /// `claim_specific` for exports.
+    async fn claim_specific_manifest(
+        backend: &PostgresBackend,
+        worker_id: &helios_persistence::core::WorkerId,
+        submission_id: &helios_persistence::core::SubmissionId,
+        target_manifest_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> helios_persistence::core::ManifestLease {
+        use helios_persistence::core::SubmitClaimStrategy;
+
+        let mut held = Vec::new();
+        let mut found = None;
+        for _ in 0..100 {
+            match backend
+                .claim_next_manifest(worker_id, lease_duration)
+                .await
+                .unwrap()
+            {
+                Some(lease)
+                    if lease.submission_id == *submission_id
+                        && lease.manifest_id == target_manifest_id =>
+                {
+                    found = Some(lease);
+                    break;
+                }
+                Some(other) => held.push(other),
+                None => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        for other in held {
+            let _ = SubmitClaimStrategy::release(backend, other).await;
+        }
+        found.expect("never claimed the expected manifest")
+    }
+
     /// The `import` / `metadata` kickoff directives must survive the PostgreSQL
     /// round-trip and reach the worker, and `merge` must actually merge.
     ///
@@ -6014,8 +6086,7 @@ mod postgres_integration {
     async fn postgres_bulk_submit_import_directives_round_trip() {
         use helios_persistence::core::{
             BulkProcessingOptions, BulkSubmitProvider, IMPORT_MODE_PARAMETER_URL, ImportMode,
-            ManifestFetchParams, NdjsonEntry, SubmissionId, SubmitClaimStrategy,
-            SubmitWorkerStorage,
+            ManifestFetchParams, NdjsonEntry, SubmissionId, SubmitWorkerStorage,
         };
 
         let backend = create_backend().await;
@@ -6047,15 +6118,25 @@ mod postgres_integration {
             .await
             .unwrap();
 
-        // Claim the manifest the way the worker does, then read its view back.
-        let lease = backend
-            .claim_next_manifest(
-                &helios_persistence::core::WorkerId::new("pg-import-worker"),
-                std::time::Duration::from_secs(60),
-            )
-            .await
-            .unwrap()
-            .expect("claimable manifest");
+        // Claim *this* manifest the way the worker does, then read its view
+        // back. The claim queue is cross-tenant and ordered by `added_at`, and
+        // the test binary shares one container database, so a plain
+        // `claim_next_manifest` can hand back another test's manifest — and
+        // an unleased `processing` manifest (the synchronous `process_entries`
+        // path leaves one behind) is reclaimable, so "move it out of pending"
+        // elsewhere is no defence. Loop until ours comes back, returning
+        // anything else to the queue.
+        let lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "pg-import-worker-{}",
+                uuid::Uuid::new_v4()
+            )),
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
         let view = backend.get_manifest_for_worker(&lease).await.unwrap();
         assert_eq!(view.import_directives, directives);
         assert_eq!(view.metadata, metadata);
@@ -6131,10 +6212,11 @@ mod postgres_integration {
             .add_manifest(&tenant, &sub_id, Some("https://provider/b.json"), None)
             .await
             .unwrap();
-        // Move the manifest out of `pending` right away: the test binary
-        // shares one container database, and a concurrently running test that
-        // calls claim_next_manifest would otherwise claim this one (the claim
-        // queue is cross-tenant by design).
+        // Mark the manifest `processing` right away. Note this is not a
+        // defence against other tests' `claim_next_manifest` calls — an
+        // unleased `processing` manifest is reclaimable, so a claimant may
+        // still pick this one up transiently — which is why claiming tests use
+        // `claim_specific_manifest` and hand foreign manifests back.
         backend
             .process_entries(
                 &tenant,
