@@ -1203,19 +1203,30 @@ impl SqliteBackend {
     ) -> StorageResult<()> {
         use super::search::fts::extract_searchable_content;
 
+        let content = extract_searchable_content(resource);
+        self.write_fts_content(conn, tenant_id, resource_type, resource_id, &content)
+    }
+
+    /// Writes pre-extracted full-text content — the write half of
+    /// [`Self::index_fts_content`], so a batched reindex can extract off the
+    /// write connection.
+    fn write_fts_content(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        content: &super::search::fts::SearchableContent,
+    ) -> StorageResult<()> {
         if !fts_table_exists(conn)? {
             // FTS5 not available - skip silently
             return Ok(());
         }
 
-        // Extract searchable content
-        let content = extract_searchable_content(resource);
-
         if content.is_empty() {
             return Ok(());
         }
 
-        // Insert into FTS table
         conn.execute(
             "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -3640,49 +3651,101 @@ impl ReindexSource for SqliteBackend {
     }
 }
 
+/// One resource's search data, extracted ahead of the write transaction so a
+/// page's extraction — FHIRPath evaluation plus FTS tokenization, the
+/// dominant reindex cost — can run on every core while the single SQLite
+/// writer stays serial.
+struct PreExtracted {
+    values: StorageResult<Vec<ExtractedValue>>,
+    contained: Vec<crate::search::extractor::ContainedExtraction>,
+    fts: super::search::fts::SearchableContent,
+}
+
 // ReindexTarget: SQLite keeps search entries in its own `search_index`
 // table, so it is also a writer and can reindex itself standalone.
 impl SqliteBackend {
-    /// Writes one resource's search entries — dynamic extraction, contained
-    /// resources, and the FTS row — on the caller's connection, so a batched
-    /// reindex can put a whole page inside one transaction.
-    fn write_search_entries_on(
+    /// Extracts one resource's search data without touching a connection.
+    fn extract_for_reindex(&self, tenant_id: &str, resource: &StoredResource) -> PreExtracted {
+        let extractor = self.tenant_extractor(tenant_id);
+        let content = resource.content();
+        PreExtracted {
+            values: extractor
+                .extract(content, resource.resource_type())
+                .map_err(|e| {
+                    internal_error(format!("Search parameter extraction failed: {}", e))
+                }),
+            contained: extractor.extract_contained(content),
+            fts: super::search::fts::extract_searchable_content(content),
+        }
+    }
+
+    /// Extracts a page of resources across the available cores. One core is
+    /// left for the rest of the process; small pages extract inline.
+    fn extract_page_parallel(
+        &self,
+        tenant_id: &str,
+        resources: &[StoredResource],
+    ) -> Vec<PreExtracted> {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1))
+            .unwrap_or(1)
+            .clamp(1, resources.len().max(1));
+        if workers <= 1 || resources.len() < 8 {
+            return resources
+                .iter()
+                .map(|r| self.extract_for_reindex(tenant_id, r))
+                .collect();
+        }
+
+        let mut out: Vec<Option<PreExtracted>> = Vec::new();
+        out.resize_with(resources.len(), || None);
+        let chunk = resources.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (res_chunk, out_chunk) in resources.chunks(chunk).zip(out.chunks_mut(chunk)) {
+                scope.spawn(move || {
+                    for (resource, slot) in res_chunk.iter().zip(out_chunk.iter_mut()) {
+                        *slot = Some(self.extract_for_reindex(tenant_id, resource));
+                    }
+                });
+            }
+        });
+        out.into_iter()
+            .map(|pre| pre.expect("every chunk is filled by its scoped thread"))
+            .collect()
+    }
+
+    /// Writes one resource's pre-extracted search entries — index rows,
+    /// contained rows, and the FTS row — on the caller's connection.
+    fn write_pre_extracted_on(
         &self,
         conn: &rusqlite::Connection,
-        tenant: &TenantContext,
+        tenant_id: &str,
         resource: &StoredResource,
+        pre: PreExtracted,
     ) -> StorageResult<usize> {
         let resource_type = resource.resource_type();
         let resource_id = resource.id();
-        let content = resource.content();
 
-        // Use the dynamic extraction over the tenant's registry
-        let values = self
-            .tenant_extractor(tenant.tenant_id().as_str())
-            .extract(content, resource_type)
-            .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
-
+        let values = pre.values?;
         let mut count = 0;
-        for value in values {
-            self.write_index_entry(
-                conn,
-                tenant.tenant_id().as_str(),
-                resource_type,
-                resource_id,
-                &value,
-            )?;
+        for value in &values {
+            self.write_index_entry(conn, tenant_id, resource_type, resource_id, value)?;
             count += 1;
         }
 
-        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
-        // search entries.
-        count += self.index_contained_resources(
-            conn,
-            tenant.tenant_id().as_str(),
-            resource_type,
-            resource_id,
-            content,
-        )?;
+        // `_contained` search entries.
+        for contained in &pre.contained {
+            for value in &contained.values {
+                self.write_contained_index_entry(
+                    conn,
+                    tenant_id,
+                    (resource_type, resource_id),
+                    (&contained.contained_type, &contained.local_id),
+                    value,
+                )?;
+                count += 1;
+            }
+        }
 
         // Rebuild the full-text row as well. Without this, `$reindex` was a
         // *destructive* operation for `_text`/`_content`: `run_reindex` deletes
@@ -3697,17 +3760,25 @@ impl SqliteBackend {
         //
         // Safe against duplicates because every caller deletes the resource's
         // search entries (FTS row included) immediately before this, and
-        // SQLite's `index_fts_content` is a bare INSERT with no delete-first.
+        // SQLite's `write_fts_content` is a bare INSERT with no delete-first.
         // If that ordering ever changes, this must become delete-then-insert.
-        self.index_fts_content(
-            conn,
-            tenant.tenant_id().as_str(),
-            resource_type,
-            resource_id,
-            content,
-        )?;
+        self.write_fts_content(conn, tenant_id, resource_type, resource_id, &pre.fts)?;
 
         Ok(count)
+    }
+
+    /// Writes one resource's search entries — dynamic extraction, contained
+    /// resources, and the FTS row — on the caller's connection, so a batched
+    /// reindex can put a whole page inside one transaction.
+    fn write_search_entries_on(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pre = self.extract_for_reindex(tenant_id, resource);
+        self.write_pre_extracted_on(conn, tenant_id, resource, pre)
     }
 }
 
@@ -3743,11 +3814,18 @@ impl ReindexTarget for SqliteBackend {
     /// reindex-side counterpart of the #815 batch ingest. Per-resource
     /// autocommit made the fast-load rebuild (#903) run at ~50-100
     /// resources/s, giving back most of what the deferred ingest won.
+    ///
+    /// Extraction runs across the available cores before the transaction
+    /// opens: it is pure CPU, dominates the rebuild cost, and needs no
+    /// connection — only the row writes stay on SQLite's single writer.
     async fn write_search_entries_page(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
     ) -> Vec<StorageResult<usize>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pre_extracted = self.extract_page_parallel(tenant_id, resources);
+
         let conn = match self.get_connection() {
             Ok(conn) => conn,
             Err(e) => {
@@ -3765,12 +3843,11 @@ impl ReindexTarget for SqliteBackend {
                 .map(|_| Err(internal_error(msg.clone())))
                 .collect();
         }
-        let tenant_id = tenant.tenant_id().as_str();
         let mut results: Vec<StorageResult<usize>> = Vec::with_capacity(resources.len());
-        for resource in resources {
+        for (resource, pre) in resources.iter().zip(pre_extracted) {
             let outcome = self
                 .delete_search_index(&conn, tenant_id, resource.resource_type(), resource.id())
-                .and_then(|_| self.write_search_entries_on(&conn, tenant, resource));
+                .and_then(|_| self.write_pre_extracted_on(&conn, tenant_id, resource, pre));
             results.push(outcome);
         }
         if let Err(e) = conn.execute("COMMIT", []) {
