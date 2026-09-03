@@ -22,6 +22,10 @@ pub(crate) struct VdSummary {
     pub name: String,
     /// The FHIR resource type the view flattens (`ViewDefinition.resource`).
     pub resource: String,
+    /// `ViewDefinition.status` (`draft` | `active` | `retired` | `unknown`),
+    /// empty when absent. Added for the SQL Export builder's Status column
+    /// (#834) — the rail itself does not display it.
+    pub status: String,
 }
 
 /// Summarizes fetched ViewDefinitions into rail entries, sorted by name.
@@ -42,7 +46,17 @@ pub(crate) fn summarize(resources: &[Value]) -> Vec<VdSummary> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            Some(VdSummary { id, name, resource })
+            let status = vd
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(VdSummary {
+                id,
+                name,
+                resource,
+                status,
+            })
         })
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));

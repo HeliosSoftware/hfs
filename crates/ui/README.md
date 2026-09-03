@@ -555,11 +555,13 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/status` | GET | System-status read path; the fragment-vs-full-page reference |
 | `/ui/version` | POST | Persists the sidebar FHIR-version choice (#343) and redirects back |
 | `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector (#344), options loaded lazily |
-| `/ui/sql/export` | GET/POST | Active SQL Exports — the user's `$sql-export` jobs as cards, most recent first (#833); POST resolves the checked subjects and kicks off the job |
-| `/ui/sql/export/new` | GET | SQL Export builder — pick stored ViewDefinitions/Libraries and an output format |
+| `/ui/sql/export` | GET/POST | Active SQL Exports — the user's `$sql-export` jobs as cards, most recent first (#833); POST resolves the checked subjects and kicks off the job, optionally naming it |
+| `/ui/sql/export/new` | GET | SQL Export builder (#834) — an optional name, a single filterable table of stored ViewDefinitions/Libraries with their status, and an output format; `?subject=` (repeatable) pre-checks matching rows |
+| `/ui/sql/export/{id}` | GET | A job's own permalink (#835): header with the contextual action/status/overflow, a failure notice when `failed`, the Job card, and the Output files table — reading the notebook's own persisted record, not the server |
+| `/ui/sql/export/{id}/detail` | GET | htmx fragment of the page above (`#job-detail`), polled every 5s while the job is `in-progress`; `404` with no body for an id this user/tenant does not own |
 | `/ui/sql/export/{id}/card` | GET | htmx fragment: one job's card, polling `$sql-export` status while the job is in progress |
 | `/ui/sql/export/{id}/cancel`, `/retry`, `/rerun`, `/remove` | POST | Per-job actions: cancel an in-progress job, resubmit a failed or terminal job as a new record, or drop a terminal job's record from the list |
-| `/ui/sql/files` | GET | Completion-manifest lookup by job id — *legacy job-id form, superseded by a card's own "View files" link until #835 folds it into the list* |
+| `/ui/sql/files` | GET | `301` → `/ui/sql/export` (the job-id form was replaced by the job page, #835) |
 | `/ui/assets/*` | GET | Embedded htmx, CSS, JS, fonts, logo |
 
 The router's `fallback_service` is the FHIR app, so anything not under `/ui`
@@ -591,7 +593,10 @@ falls through to the normal REST surface.
   `byTenant.<tenant>.bulkExport.jobs` and `byTenant.<tenant>.sqlExport.jobs` —
   one member per job, keyed by a locally-generated id, written with the same
   optimistic-locking (`If-Match`) read-modify-write every other settings write
-  uses.
+  uses. A SQL Export job optionally carries the builder's trimmed `name`
+  (#834); empty is omitted, and the card falls back to the subjects' own
+  names. `name` is a label for this notebook only — it is never sent to
+  `$sql-export` itself.
 - **SQL Export's self-calls carry the caller's own identity.** `$sql-export`
   kick-off, status polling, cancel, and the completion manifest all go through
   `ConformanceSource`'s four `$sql-export` methods with a `Caller`: the
@@ -604,6 +609,18 @@ falls through to the normal REST surface.
   this UI — never appear on the list**, and a job the server has since reaped
   or restarted away from shows as `cancelled` with an explanatory reason
   rather than as an error.
+- **A job's detail page (`/ui/sql/export/{id}`, #835) reads the notebook's own
+  `outputs`, never the server.** The completion manifest is copied into the
+  record the moment a poll sees the job go `Done` (module docs of
+  `sql_export.rs`), so the detail page's Output files table survives the
+  reaper and a server restart the same way the list does — the one exception
+  being the download links themselves, which expire with whatever the storage
+  backend's presigned-URL TTL is. Only a job still `in-progress` triggers a
+  poll: one when the page (or its htmx fragment) renders, exactly like the
+  list. An id belonging to another user or tenant is a `404` rendered by the
+  shared `pages/not-found.html`/`render_not_found` helper (`crates/ui/src/
+  lib.rs`), indistinguishable from an unknown id — reusable by any future
+  route that needs the same "not found, and not why" shape.
 
 ### Internationalization
 

@@ -190,3 +190,33 @@ export async function waitSearchable(
     await new Promise((r) => setTimeout(r, 250));
   }
 }
+
+/**
+ * Seeds a `Library` sql-query subject depending on `canonical` (an
+ * already-created ViewDefinition's own `url`), aliased "v" in its SQL — the
+ * same shape `sql-libraries.spec.ts` uses for a genuinely runnable SQLQuery
+ * Library. `sql` defaults to a query that always succeeds; the chromium and
+ * `nojs` SQL Export job-detail specs both pass a deliberately broken one to
+ * seed a `failed` job.
+ */
+export async function createSqlQueryLibrary(
+  request: APIRequestContext,
+  name: string,
+  canonical: string,
+  sql = "SELECT COUNT(*) AS n FROM v",
+): Promise<string> {
+  return createResource(request, "Library", {
+    name,
+    status: "active",
+    type: {
+      coding: [
+        {
+          system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+          code: "sql-query",
+        },
+      ],
+    },
+    relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+    content: [{ contentType: "application/sql", data: Buffer.from(sql).toString("base64") }],
+  });
+}

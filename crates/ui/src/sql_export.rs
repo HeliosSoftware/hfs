@@ -79,12 +79,12 @@ use serde_json::{Value, json};
 use crate::i18n::{I18n, RequestLocale};
 use crate::{
     Caller, RequestTenant, RequestVersion, SqlExportStatus, Status, WebState, current_status,
-    render, settings_user_key,
+    render, render_not_found, settings_user_key,
 };
 
 // ---------------------------------------------------------------------------
 // Completion-manifest view models (#649): shaping `$sql-export`'s finished
-// `Parameters` for the Files page and for a job's persisted `outputs`.
+// `Parameters` into a job's persisted `outputs`.
 // ---------------------------------------------------------------------------
 
 /// One `output` entry of the manifest: a subject's name and its download
@@ -155,23 +155,6 @@ fn same_origin_location(location: &str) -> String {
     }
 }
 
-/// A top-level manifest parameter's primitive value, whichever `value[x]` it
-/// carries.
-pub(crate) fn manifest_value(manifest: &Value, name: &str) -> Option<String> {
-    manifest
-        .get("parameter")?
-        .as_array()?
-        .iter()
-        .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
-        .and_then(|p| {
-            ["valueString", "valueCode", "valueUri", "valueInstant"]
-                .iter()
-                .find_map(|k| p.get(*k).and_then(Value::as_str))
-                .map(String::from)
-                .or_else(|| p.get("valueInteger").map(|v| v.to_string()))
-        })
-}
-
 // ---------------------------------------------------------------------------
 // Job model & store (#833)
 // ---------------------------------------------------------------------------
@@ -217,9 +200,10 @@ pub struct ExportJob {
     /// kick-off still leaves a `failed` card).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub job_id: String,
-    /// Optional user-supplied name; the form does not collect one yet (#834),
-    /// so this stays empty until then and the card falls back to the
-    /// subjects' names.
+    /// Optional user-supplied name (#834): trimmed by the builder before
+    /// storage, so an empty submission leaves this empty and the card falls
+    /// back to the subjects' names — see [`card_name`]. Never sent to
+    /// `$sql-export` itself; it is purely this notebook's own label.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -626,17 +610,22 @@ async fn refresh_in_progress_jobs(
 // Subjects (#649): the stored ViewDefinitions/Libraries the form offers
 // ---------------------------------------------------------------------------
 
-/// One checkbox row of the export form: a runnable subject the store holds.
+/// One row of the export form's subjects table: a runnable subject the store
+/// holds.
 pub(crate) struct ExportSubject {
     /// `ViewDefinition/{id}` or `Library/{id}` — the `subjectReference`.
     pub(crate) reference: String,
     pub(crate) name: String,
-    /// Display label for the form's kind chip ("ViewDefinition", "SQL
-    /// Query", "SQL View") — the restyle is #834, unchanged here.
+    /// Display label for the table's kind tag ("ViewDefinition", "SQL
+    /// Query", "SQL View").
     pub(crate) kind_label: &'static str,
-    /// The stable code a job's [`JobSubject::kind`] stores; translated back
-    /// through i18n when a card's meta line summarizes it.
+    /// The stable code a job's [`JobSubject::kind`] stores, and the table
+    /// row's `data-kind` (#834); translated back through i18n when a card's
+    /// meta line summarizes it.
     pub(crate) kind_code: &'static str,
+    /// `ViewDefinition.status` / `Library.status` — `draft`, `active`,
+    /// `retired`, `unknown`, or empty when the resource carries none (#834).
+    pub(crate) status: String,
 }
 
 /// The stored subjects `$sql-export` can run: every ViewDefinition, and every
@@ -661,6 +650,7 @@ async fn export_subjects(
                     name: e.name,
                     kind_label: "ViewDefinition",
                     kind_code: "view-definition",
+                    status: e.status,
                 });
             }
         }
@@ -678,6 +668,7 @@ async fn export_subjects(
                         name: e.name,
                         kind_label,
                         kind_code,
+                        status: e.status,
                     });
                 }
             }
@@ -914,16 +905,95 @@ fn urlencode(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-/// The SQL Export builder (#833, formerly the whole `/ui/sql/export` page):
-/// pick stored subjects, choose a format, submit. Its restyle is #834 — this
-/// keeps the existing form markup, just moved off the list route.
+/// One row of the builder's subjects table: a subject plus whether this
+/// render should show it pre-checked — a `?subject=` prefill, or the
+/// selection a rejected submission sent back for the user to correct —
+/// computed once in [`subject_rows`] so the template only ever reads a plain
+/// `bool`.
+struct SubjectRow {
+    reference: String,
+    name: String,
+    kind_label: &'static str,
+    kind_code: &'static str,
+    /// A missing status renders as an em dash, decided here rather than in
+    /// the template so the fallback lives in exactly one place.
+    status: String,
+    checked: bool,
+}
+
+/// `status`, or an em dash when the resource carries none.
+fn status_display(status: &str) -> String {
+    if status.is_empty() {
+        "—".to_string()
+    } else {
+        status.to_string()
+    }
+}
+
+/// Pairs `subjects` with `checked`, and counts how many ended up checked —
+/// the "n of m selected" hint's `n`. A `selected` reference that matches no
+/// current subject (an unknown `?subject=`, or a resubmitted reference the
+/// store no longer has) simply checks nothing rather than erroring — unknown
+/// references are ignored in silence.
+fn subject_rows(subjects: Vec<ExportSubject>, selected: &[String]) -> (Vec<SubjectRow>, usize) {
+    let rows: Vec<SubjectRow> = subjects
+        .into_iter()
+        .map(|s| {
+            let checked = selected.contains(&s.reference);
+            SubjectRow {
+                reference: s.reference,
+                name: s.name,
+                kind_label: s.kind_label,
+                kind_code: s.kind_code,
+                status: status_display(&s.status),
+                checked,
+            }
+        })
+        .collect();
+    let selected_count = rows.iter().filter(|row| row.checked).count();
+    (rows, selected_count)
+}
+
+/// The builder's conserved form state across a re-render: a `?subject=`
+/// prefill on a fresh `GET`, or — after a rejected `POST` — the
+/// `name`/`format`/selection the submission itself carried, so the user
+/// never has to redo the parts that were fine. Defaults to a bare `GET /new`
+/// with no prefill: no name, NDJSON (the default output format), nothing
+/// checked.
+struct NewFormState {
+    name: String,
+    format: String,
+    selected: Vec<String>,
+}
+
+impl Default for NewFormState {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            format: "ndjson".to_string(),
+            selected: Vec::new(),
+        }
+    }
+}
+
+/// The SQL Export builder (#833, #834): pick stored subjects from a single
+/// filterable table, choose an output format, submit — the create-form half
+/// of the workspace's two doors, in Bulk Export's own visual language.
 #[derive(Template)]
 #[template(path = "pages/sql-export-new.html")]
 struct ExportNewPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    subjects: Vec<ExportSubject>,
+    /// Empty renders the "nothing to export yet" card instead of the form —
+    /// unless `degraded` is set too, in which case neither the form nor that
+    /// card renders, only the notice (an empty result here could just be the
+    /// fetch failure, not an actually-empty store).
+    subjects: Vec<SubjectRow>,
+    total: usize,
+    selected_count: usize,
+    name: String,
+    format: String,
     degraded: Option<String>,
     start_error: Option<String>,
 }
@@ -998,29 +1068,64 @@ pub(crate) async fn list(
     })
 }
 
-/// `GET /ui/sql/export/new` — the export builder.
+/// `GET /ui/sql/export/new` — the export builder. `subject` may repeat
+/// (`?subject=ViewDefinition/x&subject=Library/y`, prefilling the table's
+/// checkboxes), which `Query<T>` cannot express, so the raw query string is
+/// parsed by hand the same way [`start`] parses its body.
 pub(crate) async fn new_page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
-    render_new_page(&state, locale, rv.0, &rt, None).await
+    let selected = query
+        .as_deref()
+        .map(|raw| {
+            form_urlencoded::parse(raw.as_bytes())
+                .filter(|(key, _)| key == "subject")
+                .map(|(_, value)| value.into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    render_new_page(
+        &state,
+        locale,
+        rv.0,
+        &rt,
+        None,
+        NewFormState {
+            selected,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
+/// Shared render tail of [`new_page`] and every re-render [`start`] falls
+/// back to: fetches the current subjects, pairs them with `form`'s selection,
+/// and renders the builder — or its empty/degraded states, both decided in
+/// the template from `subjects`/`degraded`.
 async fn render_new_page(
     state: &WebState,
     locale: RequestLocale,
     version: helios_fhir::FhirVersion,
     rt: &RequestTenant,
     start_error: Option<String>,
+    form: NewFormState,
 ) -> Response {
     let (subjects, degraded) = export_subjects(state, version, &rt.id).await;
+    let total = subjects.len();
+    let (rows, selected_count) = subject_rows(subjects, &form.selected);
     render(ExportNewPage {
         status: current_status(state, version, rt),
         i18n: I18n::new(locale),
         active_page: "sql-export",
-        subjects,
+        subjects: rows,
+        total,
+        selected_count,
+        name: form.name,
+        format: form.format,
         degraded,
         start_error,
     })
@@ -1040,15 +1145,21 @@ pub(crate) async fn start(
     axum::extract::RawForm(body): axum::extract::RawForm,
 ) -> Response {
     let i18n = I18n::new(locale);
+    let mut name = String::new();
     let mut format = "ndjson".to_string();
     let mut refs: Vec<String> = Vec::new();
     for (key, value) in form_urlencoded::parse(&body) {
         match key.as_ref() {
+            "name" => name = value.into_owned(),
             "subject" => refs.push(value.into_owned()),
             "format" => format = value.into_owned(),
             _ => {}
         }
     }
+    // Trimmed once, up front — an empty result is never stored (the job's
+    // `name` serialization already skips an empty string), and every
+    // re-render below echoes back the exact same trimmed value.
+    let name = name.trim().to_string();
     if refs.is_empty() {
         return render_new_page(
             &state,
@@ -1056,6 +1167,11 @@ pub(crate) async fn start(
             rv.0,
             &rt,
             Some(i18n.t("sql-export-select-subject")),
+            NewFormState {
+                name: name.clone(),
+                format: format.clone(),
+                selected: refs.clone(),
+            },
         )
         .await;
     }
@@ -1067,7 +1183,19 @@ pub(crate) async fn start(
     // rather than trusting the submitted names/kinds blindly.
     let (available_subjects, degraded) = export_subjects(&state, rv.0, &rt.id).await;
     if let Some(message) = degraded {
-        return render_new_page(&state, locale, rv.0, &rt, Some(message)).await;
+        return render_new_page(
+            &state,
+            locale,
+            rv.0,
+            &rt,
+            Some(message),
+            NewFormState {
+                name: name.clone(),
+                format: format.clone(),
+                selected: refs.clone(),
+            },
+        )
+        .await;
     }
     let mut subjects = Vec::with_capacity(refs.len());
     for reference in &refs {
@@ -1081,6 +1209,11 @@ pub(crate) async fn start(
                 rv.0,
                 &rt,
                 Some(i18n.t("sql-export-unknown-subject")),
+                NewFormState {
+                    name: name.clone(),
+                    format: format.clone(),
+                    selected: refs.clone(),
+                },
             )
             .await;
         };
@@ -1093,6 +1226,7 @@ pub(crate) async fn start(
 
     let caller = Caller::from_request(&headers, &rt.id);
     let mut job = ExportJob {
+        name,
         subjects,
         format,
         status: "in-progress".to_string(),
@@ -1328,18 +1462,436 @@ pub(crate) async fn card(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Job detail (#835): GET /ui/sql/export/{id} and its htmx fragment
+// ---------------------------------------------------------------------------
+
+/// A job's `kind` code's display label ("ViewDefinition", "SQL Query", "SQL
+/// View") — the same literal English labels [`export_subjects`] assigns a
+/// live [`ExportSubject`], applied here to a stored [`JobSubject::kind`]
+/// instead. Empty for a code this build no longer recognizes, rather than a
+/// guess.
+fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        "view-definition" => "ViewDefinition",
+        "sql-query" => "SQL Query",
+        "sql-view" => "SQL View",
+        _ => "",
+    }
+}
+
+/// One `.tag.tag--type` pill: a subject's kind and display name. Shared by
+/// the Job card's Subjects field (every subject in the record) and an Output
+/// row's resolved Subject column (at most one, by name match).
+struct SubjectTag {
+    kind_label: &'static str,
+    name: String,
+}
+
+/// One download link in an Output row's Files column: the label shown next
+/// to the download icon, and the `href` — already same-origin (#833).
+struct FileLink {
+    label: String,
+    href: String,
+}
+
+/// One row of the Output files table: the manifest's own output `name`, the
+/// subject it resolved back to (or `None` — an em dash, when no subject's
+/// disambiguated output name matches), and one [`FileLink`] per shard.
+struct OutputRow {
+    name: String,
+    subject: Option<SubjectTag>,
+    files: Vec<FileLink>,
+}
+
+/// `YYYY-MM-DD HH:MM UTC`, unconditionally — the header lede's own format.
+/// Unlike the list card's [`format_hour`], the date is never dropped even
+/// when `stamp` falls on today: a job's permalink is read long after "today"
+/// has passed. Empty when `stamp` does not parse.
+fn format_timestamp_minutes(stamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .map(|parsed| {
+            parsed
+                .with_timezone(&Utc)
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// `YYYY-MM-DD HH:MM:SS UTC` — the Job card's Started field, the one place
+/// seconds are shown. Empty when `stamp` does not parse.
+fn format_timestamp_seconds(stamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .map(|parsed| {
+            parsed
+                .with_timezone(&Utc)
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// The subject `output_name` came from, found by running
+/// [`subject_output_names`]'s own disambiguation backwards: the manifest
+/// carries no subject association at all, and the server runs views before
+/// queries, so a job's `outputs` do not land in submission order — matching
+/// by output name is the only association available.
+fn resolve_output_subject(job: &ExportJob, output_name: &str) -> Option<SubjectTag> {
+    subject_output_names(&job.subjects)
+        .iter()
+        .zip(&job.subjects)
+        .find(|(name, _)| name.as_str() == output_name)
+        .map(|(_, subject)| SubjectTag {
+            kind_label: kind_label(&subject.kind),
+            name: subject.name.clone(),
+        })
+}
+
+/// `location`'s last path segment, query dropped — the label shown next to
+/// each download link. Falls back to the translated "File n" (`n` 1-based
+/// within the output's own shards) when nothing usable can be derived (an
+/// empty path, or a location ending in `/`).
+fn file_label(i18n: &I18n, location: &str, n: usize) -> String {
+    let without_query = location.split('?').next().unwrap_or(location);
+    match without_query.rsplit('/').next() {
+        Some(segment) if !segment.is_empty() => segment.to_string(),
+        _ => i18n.t_arg("sql-export-file-fallback", "n", n.to_string()),
+    }
+}
+
+/// Every row of the Output files table, in the record's own `outputs`
+/// order — the manifest order [`poll_job`] persisted, not submission order.
+fn build_output_rows(i18n: &I18n, job: &ExportJob) -> Vec<OutputRow> {
+    job.outputs
+        .iter()
+        .map(|output| OutputRow {
+            name: output.name.clone(),
+            subject: resolve_output_subject(job, &output.name),
+            files: output
+                .locations
+                .iter()
+                .enumerate()
+                .map(|(index, location)| FileLink {
+                    label: file_label(i18n, location, index + 1),
+                    href: location.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// A `failed` job's notice: the server's own error message either names a
+/// subject this UI can point to, or does not — a generic failure never
+/// invents a cause.
+enum FailureNotice {
+    /// `error` contained `view '<name>'`/`query '<name>'` and `<name>`
+    /// matched one of the job's disambiguated output names: the subject's
+    /// name, and the remainder of the message after `'<name>': `.
+    Subject(String, String),
+    /// No match — a kick-off failure, or a message this UI does not
+    /// recognize. The raw error, untouched.
+    Generic(String),
+}
+
+/// Parses `error` for the server's own `view '<name>'` / `query '<name>'`
+/// pattern (whichever occurs first) and checks `<name>` against `subjects`'
+/// disambiguated output names ([`subject_output_names`]) — a match returns
+/// the name and everything after `'<name>': `; anything else (no pattern, or
+/// a name matching no known subject) returns `None` so the caller falls back
+/// to the raw message.
+fn failed_subject(error: &str, subjects: &[JobSubject]) -> Option<(String, String)> {
+    let (marker_at, marker) = ["view '", "query '"]
+        .iter()
+        .filter_map(|marker| error.find(marker).map(|at| (at, *marker)))
+        .min_by_key(|(at, _)| *at)?;
+    let after_marker = &error[marker_at + marker.len()..];
+    let name_end = after_marker.find('\'')?;
+    let name = &after_marker[..name_end];
+    let after_name = &after_marker[name_end + 1..];
+    let rest = after_name.strip_prefix(": ").unwrap_or(after_name);
+    subject_output_names(subjects)
+        .iter()
+        .any(|output_name| output_name == name)
+        .then(|| (name.to_string(), rest.to_string()))
+}
+
+/// [`FailureNotice`] for `job`, `None` outside `failed`.
+fn failure_notice(job: &ExportJob) -> Option<FailureNotice> {
+    if job.status != "failed" {
+        return None;
+    }
+    Some(match failed_subject(&job.error, &job.subjects) {
+        Some((name, rest)) => FailureNotice::Subject(name, rest),
+        None => FailureNotice::Generic(job.error.clone()),
+    })
+}
+
+/// The Job card's Duration field: the elapsed time in a terminal state, or
+/// the same progress-or-waiting text the header lede shows while
+/// `in-progress`.
+fn duration_label(i18n: &I18n, job: &ExportJob) -> String {
+    if job.status == "in-progress" {
+        if job.progress.is_empty() {
+            i18n.t("sql-export-progress-waiting")
+        } else {
+            job.progress.clone()
+        }
+    } else {
+        elapsed(job)
+    }
+}
+
+/// The header's `.page-head__lede`: worded differently per status, unlike
+/// the list card's single shared [`job_meta`] line.
+fn detail_lede(i18n: &I18n, job: &ExportJob) -> String {
+    let format = format_label(i18n, &job.format);
+    match job.status.as_str() {
+        "complete" => {
+            let mut lede = format!(
+                "{} {}",
+                i18n.t("sql-export-detail-finished"),
+                format_timestamp_minutes(&job.finished_at)
+            );
+            let elapsed = elapsed(job);
+            if !elapsed.is_empty() {
+                lede.push_str(&format!(" · {elapsed}"));
+            }
+            lede.push_str(&format!(" · {format}"));
+            lede
+        }
+        "failed" => {
+            let mut lede = format!(
+                "{} {}",
+                i18n.t("sql-export-detail-failed"),
+                format_timestamp_minutes(&job.finished_at)
+            );
+            let elapsed = elapsed(job);
+            if !elapsed.is_empty() {
+                lede.push_str(&format!(
+                    " · {} {elapsed}",
+                    i18n.t("sql-export-detail-after")
+                ));
+            }
+            lede.push_str(&format!(" · {format}"));
+            lede
+        }
+        "cancelled" => {
+            let mut lede = format!(
+                "{} {}",
+                i18n.t("sql-export-detail-cancelled"),
+                format_timestamp_minutes(&job.finished_at)
+            );
+            lede.push_str(&format!(" · {format}"));
+            if !job.error.is_empty() {
+                lede.push_str(&format!(" · {}", job.error));
+            }
+            lede
+        }
+        // in-progress, and defensively any other/unknown value.
+        _ => {
+            let progress = if job.progress.is_empty() {
+                i18n.t("sql-export-progress-waiting")
+            } else {
+                job.progress.clone()
+            };
+            let mut lede = format!(
+                "{} {} · {progress} · {format}",
+                i18n.t("sql-export-detail-started"),
+                format_timestamp_minutes(&job.started_at)
+            );
+            if !job.poll_error.is_empty() {
+                lede.push_str(&format!(
+                    " · {}: {}",
+                    i18n.t("sql-export-status-unavailable"),
+                    job.poll_error
+                ));
+            }
+            lede
+        }
+    }
+}
+
+/// The `/ui/sql/export/{id}` job detail's view model (#835): everything that
+/// varies with the job's status, built once by [`build_job_detail`] over
+/// [`ExportJob`] + i18n so neither template branches on raw job fields
+/// beyond `status` itself (which action/overflow/polling markup applies).
+struct JobDetail {
+    id: String,
+    name: String,
+    status: String,
+    status_label: String,
+    lede: String,
+    warning: Option<FailureNotice>,
+    /// Only meaningful — and only rendered — while `status` is
+    /// `in-progress`.
+    progress_pct: String,
+    job_id: String,
+    format_label: String,
+    started_label: String,
+    duration_label: String,
+    subjects: Vec<SubjectTag>,
+    outputs: Vec<OutputRow>,
+    /// The toolbar's file count: the sum of every output's `locations`, not
+    /// the number of output rows.
+    output_count: usize,
+}
+
+fn build_job_detail(i18n: &I18n, id: &str, job: &ExportJob) -> JobDetail {
+    JobDetail {
+        id: id.to_string(),
+        name: card_name(job),
+        status: job.status.clone(),
+        status_label: status_label(i18n, &job.status),
+        lede: detail_lede(i18n, job),
+        warning: failure_notice(job),
+        progress_pct: progress_pct(&job.status, &job.progress),
+        job_id: job.job_id.clone(),
+        format_label: format_label(i18n, &job.format),
+        started_label: format_timestamp_seconds(&job.started_at),
+        duration_label: duration_label(i18n, job),
+        subjects: job
+            .subjects
+            .iter()
+            .map(|subject| SubjectTag {
+                kind_label: kind_label(&subject.kind),
+                name: subject.name.clone(),
+            })
+            .collect(),
+        output_count: job.outputs.iter().map(|o| o.locations.len()).sum(),
+        outputs: build_output_rows(i18n, job),
+    }
+}
+
+/// The job detail's status-dependent region (#835): the header (back link,
+/// name, lede, contextual action, status chip, overflow), the failure
+/// notice, the progress bar, and the Job/Output files cards — written once
+/// here and rendered by two callers, the same way
+/// `partials/sql_run_results.html`/`RunResultsPartial` already share their
+/// own markup between a page and its own htmx endpoint:
+///
+/// - Nested as a template field of [`DetailPage`] for `GET
+///   /ui/sql/export/{id}`'s own render.
+/// - Directly as the whole response of [`detail_fragment`] (`GET
+///   /ui/sql/export/{id}/detail`), which this same element's own
+///   `hx-get`/`hx-trigger="every 5s"` calls back into while the job stays
+///   `in-progress` — a terminal job's `#job-detail` carries neither
+///   attribute, so polling stops itself the moment the swap that lands the
+///   terminal state runs.
+#[derive(Template)]
+#[template(path = "partials/sql_export_detail.html")]
+struct JobDetailFragment {
+    i18n: I18n,
+    detail: JobDetail,
+}
+
+/// `GET /ui/sql/export/{id}` (#835): the job's own permalink, in the full
+/// shell.
+#[derive(Template)]
+#[template(path = "pages/sql-export-detail.html")]
+struct DetailPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    fragment: JobDetailFragment,
+}
+
+/// Loads `id`'s record for the request's user/tenant, polling it once and
+/// persisting the transition with the same CAS [`card`] uses if it is still
+/// `in-progress` — the shared body of [`detail_page`] and
+/// [`detail_fragment`]. `None` when `id` names nothing this user/tenant
+/// owns — never distinguished from "does not exist", so a foreign id reads
+/// exactly like an unknown one.
+async fn load_detail(
+    state: &WebState,
+    i18n: &I18n,
+    tenant: &str,
+    principal: Option<&helios_auth::Principal>,
+    headers: &HeaderMap,
+    id: &str,
+) -> Option<JobDetail> {
+    let user_key = settings_user_key(principal);
+    let snapshot = load_jobs(state, &user_key, tenant).await;
+    let original = snapshot.jobs.get(id)?;
+    let mut job = parse_job(original);
+    if job.status == "in-progress" {
+        let caller = Caller::from_request(headers, tenant);
+        poll_job(state, &mut job, &caller, i18n).await;
+        let _ = store_job_conditionally(
+            state,
+            &user_key,
+            tenant,
+            id,
+            &job,
+            snapshot.version,
+            MemberExpectation::Unchanged(original),
+        )
+        .await;
+    }
+    Some(build_job_detail(i18n, id, &job))
+}
+
+/// `GET /ui/sql/export/{id}` — the job's own permalink inside the full
+/// shell. Renders a `404` inside the shell when `id` names nothing this
+/// user/tenant owns, or there is no settings store to look it up in —
+/// indistinguishable from a foreign id or an unknown one.
+pub(crate) async fn detail_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let status = current_status(&state, rv.0, &rt);
+    match load_detail(&state, &i18n, &rt.id, principal.as_deref(), &headers, &id).await {
+        Some(detail) => render(DetailPage {
+            status,
+            i18n,
+            active_page: "sql-export",
+            fragment: JobDetailFragment { i18n, detail },
+        }),
+        None => render_not_found(
+            status,
+            i18n,
+            "sql-export",
+            "/ui/sql/export",
+            i18n.t("sql-export-active-title"),
+        ),
+    }
+}
+
+/// `GET /ui/sql/export/{id}/detail` — the same `#job-detail` content
+/// [`detail_page`] renders, without the shell: htmx's own 5s refresh while
+/// the job stays `in-progress`. `404` with no body for an id this
+/// user/tenant does not own, matching [`card`].
+pub(crate) async fn detail_fragment(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    match load_detail(&state, &i18n, &rt.id, principal.as_deref(), &headers, &id).await {
+        Some(detail) => render(JobDetailFragment { i18n, detail }),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn outputs_and_values_read_the_manifest_shape() {
+    fn manifest_outputs_reads_the_manifest_shape() {
         let manifest = json!({
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "exportId", "valueString": "job-1"},
-                {"name": "_format", "valueCode": "csv"},
-                {"name": "exportDuration", "valueInteger": 4},
                 {"name": "output", "part": [
                     {"name": "name", "valueString": "patients"},
                     {"name": "location", "valueUri": "http://s/export/job-1/patients-0.csv"},
@@ -1364,12 +1916,6 @@ mod tests {
             ]
         );
         assert_eq!(outputs[1].locations, ["/export/job-1/obs-0.csv"]);
-        assert_eq!(manifest_value(&manifest, "_format").as_deref(), Some("csv"));
-        assert_eq!(
-            manifest_value(&manifest, "exportDuration").as_deref(),
-            Some("4")
-        );
-        assert_eq!(manifest_value(&manifest, "missing"), None);
     }
 
     #[test]
@@ -1480,5 +2026,179 @@ mod tests {
         assert_eq!(value["outputs"], Value::Null);
         assert_eq!(value["status"], "in-progress");
         assert_eq!(value["format"], "csv");
+    }
+
+    // -----------------------------------------------------------------------
+    // Job detail (#835)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn failed_subject_names_the_matching_subject_and_returns_the_remainder() {
+        let subjects = vec![subject("v03_counts", "sql-query")];
+        let (name, rest) = failed_subject(
+            "Export job 'x' failed: query 'v03_counts': column \"ward\" does not exist",
+            &subjects,
+        )
+        .expect("the query pattern names a known subject");
+        assert_eq!(name, "v03_counts");
+        assert_eq!(rest, "column \"ward\" does not exist");
+    }
+
+    #[test]
+    fn failed_subject_also_recognizes_the_view_marker_and_picks_the_earliest_match() {
+        let subjects = vec![subject("patients_flat", "view-definition")];
+        let (name, rest) = failed_subject(
+            "Export job 'x' failed: view 'patients_flat': invalid FHIRPath expression",
+            &subjects,
+        )
+        .expect("the view pattern names a known subject");
+        assert_eq!(name, "patients_flat");
+        assert_eq!(rest, "invalid FHIRPath expression");
+    }
+
+    #[test]
+    fn failed_subject_is_none_when_the_name_matches_no_subject_or_the_pattern_is_absent() {
+        let subjects = vec![subject("patients_flat", "view-definition")];
+        // The pattern is present, but names something this job never ran.
+        assert!(
+            failed_subject(
+                "Export job 'x' failed: query 'unrelated_view': boom",
+                &subjects
+            )
+            .is_none()
+        );
+        // No kick-off ever reaches a view/query — a plain transport failure.
+        assert!(failed_subject("connection refused", &subjects).is_none());
+    }
+
+    #[test]
+    fn resolve_output_subject_matches_by_disambiguated_output_name() {
+        let job = ExportJob {
+            subjects: vec![
+                subject("patients_flat", "view-definition"),
+                subject("patients_flat", "sql-query"),
+            ],
+            ..Default::default()
+        };
+        // `patients_flat-2` is the second occurrence's disambiguated name
+        // (subject_output_names), not a subject's own stored name.
+        let resolved = resolve_output_subject(&job, "patients_flat-2").expect("a match");
+        assert_eq!(resolved.kind_label, "SQL Query");
+        assert_eq!(resolved.name, "patients_flat");
+        assert!(resolve_output_subject(&job, "no_such_output").is_none());
+    }
+
+    #[test]
+    fn file_label_uses_the_last_path_segment_without_the_query_and_falls_back_to_file_n() {
+        let i18n = I18n::from_tag("en").unwrap();
+        assert_eq!(
+            file_label(&i18n, "/export/job-1/patients-0.csv?sig=abc", 1),
+            "patients-0.csv"
+        );
+        assert_eq!(file_label(&i18n, "/export/job-1/", 3), "File 3");
+        assert_eq!(file_label(&i18n, "", 1), "File 1");
+    }
+
+    #[test]
+    fn build_output_rows_resolves_subjects_regardless_of_manifest_order() {
+        let job = ExportJob {
+            subjects: vec![
+                subject("patients", "view-definition"),
+                subject("encounters", "sql-query"),
+            ],
+            outputs: vec![
+                // The manifest lists `encounters` before `patients` — the
+                // server runs queries after views but that is not what
+                // determined this order; the resolution must not assume
+                // submission order either.
+                JobOutput {
+                    name: "encounters".to_string(),
+                    locations: vec!["/export/job-1/encounters-0.csv".to_string()],
+                },
+                JobOutput {
+                    name: "patients".to_string(),
+                    locations: vec![
+                        "/export/job-1/patients-0.csv".to_string(),
+                        "/export/job-1/patients-1.csv".to_string(),
+                    ],
+                },
+            ],
+            ..Default::default()
+        };
+        let i18n = I18n::from_tag("en").unwrap();
+        let rows = build_output_rows(&i18n, &job);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "encounters");
+        assert_eq!(rows[0].subject.as_ref().unwrap().kind_label, "SQL Query");
+        assert_eq!(rows[0].files.len(), 1);
+        assert_eq!(rows[1].name, "patients");
+        assert_eq!(
+            rows[1].subject.as_ref().unwrap().kind_label,
+            "ViewDefinition"
+        );
+        assert_eq!(rows[1].files.len(), 2);
+        assert_eq!(rows[1].files[0].label, "patients-0.csv");
+        assert_eq!(rows[1].files[1].label, "patients-1.csv");
+    }
+
+    #[test]
+    fn detail_lede_reads_differently_per_status() {
+        let i18n = I18n::from_tag("en").unwrap();
+        let mut job = ExportJob {
+            format: "parquet".to_string(),
+            started_at: "2026-09-01T09:00:00Z".to_string(),
+            finished_at: "2026-09-01T09:05:08Z".to_string(),
+            ..Default::default()
+        };
+
+        job.status = "complete".to_string();
+        assert_eq!(
+            detail_lede(&i18n, &job),
+            "Finished 2026-09-01 09:05 UTC · 5m 08s · Parquet"
+        );
+
+        job.status = "failed".to_string();
+        assert_eq!(
+            detail_lede(&i18n, &job),
+            "Failed 2026-09-01 09:05 UTC · after 5m 08s · Parquet"
+        );
+
+        job.status = "cancelled".to_string();
+        job.error = "the server no longer knows this job".to_string();
+        assert_eq!(
+            detail_lede(&i18n, &job),
+            "Cancelled 2026-09-01 09:05 UTC · Parquet · the server no longer knows this job"
+        );
+
+        job.status = "in-progress".to_string();
+        job.error.clear();
+        job.progress = "40%".to_string();
+        assert_eq!(
+            detail_lede(&i18n, &job),
+            "Started 2026-09-01 09:00 UTC · 40% · Parquet"
+        );
+
+        job.progress.clear();
+        job.poll_error = "status poll answered 401".to_string();
+        assert_eq!(
+            detail_lede(&i18n, &job),
+            "Started 2026-09-01 09:00 UTC · Waiting for the first status report… · Parquet · status unavailable: status poll answered 401"
+        );
+    }
+
+    #[test]
+    fn failure_notice_is_none_outside_failed() {
+        let mut job = ExportJob {
+            status: "in-progress".to_string(),
+            error: "query 'v03_counts': boom".to_string(),
+            subjects: vec![subject("v03_counts", "sql-query")],
+            ..Default::default()
+        };
+        assert!(failure_notice(&job).is_none());
+        job.status = "failed".to_string();
+        assert!(matches!(
+            failure_notice(&job),
+            Some(FailureNotice::Subject(name, _)) if name == "v03_counts"
+        ));
     }
 }

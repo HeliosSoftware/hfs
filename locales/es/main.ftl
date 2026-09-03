@@ -84,6 +84,13 @@ error-not-found = No se encontró el recurso solicitado.
 error-unauthorized = No está autorizado para realizar esta acción.
 error-generic = Algo salió mal. Vuelva a intentarlo.
 
+## Página genérica de "no encontrado" (#835): un 404 de página completa dentro
+## del shell, distinta de error-not-found (texto de OperationOutcome para
+## respuestas de la API).
+
+not-found-title = No encontrado
+not-found-text = Esta página no existe, o no está disponible para usted.
+
 ## Estructura del panel (Figma «Dashboard V1.1»)
 
 nav-section-work = Trabajo
@@ -104,7 +111,6 @@ nav-sql-view-definitions = Definiciones de vistas
 nav-sql-queries = Consultas SQL
 nav-sql-views = Vistas SQL
 nav-sql-export = Exportación SQL
-nav-sql-files = Archivos
 nav-capability-conformance = Capacidad y conformidad
 nav-search-parameters = Parámetros de búsqueda
 nav-subscriptions = Suscripciones
@@ -806,11 +812,8 @@ sql-views-title = Vistas SQL
 sql-views-lede = Vistas con nombre que otras consultas y exportaciones pueden seleccionar. Define el SQL una vez; las columnas que produce se convierten en una tabla que cualquiera puede usar.
 
 sql-export-title = Exportación SQL
-sql-export-lede = Trabajos de exportación SQL on FHIR de larga duración.
+sql-export-lede = Ejecuta ViewDefinitions, consultas SQL y vistas SQL almacenadas como un trabajo $sql-export de larga duración y descarga los archivos de salida.
 sql-export-active-title = Exportaciones SQL
-
-sql-files-title = Archivos
-sql-files-lede = Manifiestos y archivos de salida producidos por las exportaciones SQL.
 
 ## Espacio de definiciones de vistas (#649)
 
@@ -873,14 +876,34 @@ lib-edit-json = Editar como JSON
 lib-delete-confirm = ¿Eliminar «{ $name }»? Esta acción no se puede deshacer.
 lib-delete-failed = No se pudo eliminar la biblioteca.
 
-## Páginas de exportación SQL y archivos (#649, #833)
+## Páginas de exportación SQL (#649, #833)
 
 export-start-failed = No se pudo iniciar la exportación.
-export-job-id = Id del trabajo
-export-new-heading = Nueva exportación
-export-no-subjects = Nada que exportar todavía: crea primero una ViewDefinition.
 export-format = Formato de salida
 export-start = Iniciar exportación
+
+## Formulario de creación del generador de exportaciones SQL (#834)
+
+sql-export-name-placeholder = Archivos planos mensuales de pacientes
+sql-export-subjects-legend = ¿Qué vas a exportar?
+sql-export-subjects-heading = Elementos
+sql-export-filter-all = Todos
+sql-export-filter-view-definitions = ViewDefinitions
+sql-export-filter-queries = Consultas
+sql-export-filter-views = Vistas
+sql-export-filter-subjects = Filtrar elementos
+sql-export-select-all = Seleccionar todo
+sql-export-col-subject = Elemento
+sql-export-col-kind = Tipo
+sql-export-col-status = Estado
+sql-export-selected-count = { $selected } de { $total } seleccionados
+sql-export-format-ndjson-hint = Un objeto JSON por fila. Se transmite bien hacia otras canalizaciones.
+sql-export-format-csv-hint = Fila de encabezado más una línea por fila. Se abre en cualquier hoja de cálculo.
+sql-export-format-json-hint = Un único arreglo JSON por salida. El más fácil de inspeccionar a mano.
+sql-export-format-parquet-hint = Columnar y tipado. El mejor para motores de análisis.
+sql-export-empty-heading = Aún no hay nada que exportar
+sql-export-empty-body = Cada ViewDefinition, consulta SQL y vista SQL almacenada aparece aquí como un elemento exportable. Crea uno primero.
+sql-export-filter-empty = Ningún elemento coincide
 
 ## Lista de exportaciones SQL activas y tarjetas de trabajo (#833)
 
@@ -934,14 +957,28 @@ sql-export-files-count = { $count ->
     [one] { $count } archivo
    *[other] { $count } archivos
 }
-files-job-heading = Trabajo de exportación
-files-load = Cargar manifiesto
-files-error = No se pudo cargar el manifiesto.
-files-outputs-heading = Salidas
-files-col-output = Salida
-files-col-downloads = Descargas
-files-shard = Archivo { $n }
-files-empty = El trabajo no produjo archivos de salida.
+
+## Página de detalle del trabajo (#835)
+
+sql-export-detail-finished = Finalizada
+sql-export-detail-failed = Fallida
+sql-export-detail-cancelled = Cancelada
+sql-export-detail-started = Iniciada
+sql-export-detail-after = luego de
+sql-export-failure-subject = La exportación se detuvo en el elemento
+sql-export-failure-generic = La exportación falló:
+sql-export-detail-job-heading = Trabajo
+sql-export-detail-field-job-id = Id del trabajo
+sql-export-detail-field-format = Formato
+sql-export-detail-field-started = Iniciado
+sql-export-detail-field-duration = Duración
+sql-export-detail-field-subjects = Elementos
+sql-export-detail-outputs-heading = Archivos de salida
+sql-export-detail-col-output = Salida
+sql-export-detail-col-subject = Elemento
+sql-export-detail-col-files = Archivos
+sql-export-detail-outputs-empty = El trabajo no produjo archivos de salida.
+sql-export-file-fallback = Archivo { $n }
 
 ## UI administrativa de HTS (crates/hts-ui) — stubs de Phase 1
 ##

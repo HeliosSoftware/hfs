@@ -30,6 +30,23 @@ fn view_definition(id: &str, name: &str) -> serde_json::Value {
     serde_json::json!({"resourceType": "ViewDefinition", "id": id, "name": name, "resource": "Patient"})
 }
 
+fn view_definition_with_status(id: &str, name: &str, status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "ViewDefinition", "id": id, "name": name, "resource": "Patient",
+        "status": status,
+    })
+}
+
+const LIBRARY_TYPES_SYSTEM: &str =
+    "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+
+fn library(id: &str, name: &str, code: &str, status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "Library", "id": id, "name": name, "status": status,
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": code}]},
+    })
+}
+
 /// Reads `X-Test-User` and injects a matching `Principal`, so a request can
 /// exercise a specific authenticated settings key without standing up real
 /// auth — the same pattern `bulk_export_http.rs` uses.
@@ -282,6 +299,167 @@ async fn empty_list_shows_a_notice_and_new_offers_subjects_with_their_kind() {
     assert!(html.contains(">ViewDefinition<"));
 }
 
+/// The full builder structure (#834): the back link to the list, the
+/// optional name field, one table row per subject carrying its kind tag,
+/// `data-kind`, and status, the four format radios with NDJSON checked by
+/// default, a single submit control, the table's filter/switch/select-all
+/// tools rendered `hidden`, and the "n of m selected" hint reflecting that
+/// nothing is checked yet.
+#[tokio::test]
+async fn new_page_renders_the_builder_structure() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![
+                view_definition_with_status("vd1", "patients_flat", "active"),
+                view_definition_with_status("vd2", "encounters_flat", "draft"),
+            ],
+        )
+        .with(
+            "Library",
+            FhirVersion::R4,
+            vec![library("q1", "patient_counts", "sql-query", "active")],
+        );
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    // Back link to the list, sharing the list page's own title.
+    assert!(html.contains(r#"<a class="back-link" href="/ui/sql/export">"#));
+    assert!(html.contains(">SQL Exports<"));
+
+    // The name field: present, optional (no `required`).
+    assert!(html.contains(r#"<input class="field__input" type="text" name="name""#));
+    assert!(!html.contains(r#"name="name" required"#));
+
+    // One row per subject — ViewDefinitions then SQL Queries, each group
+    // name-sorted — each carrying its kind tag, `data-kind`, and status.
+    assert!(html.contains(r#"data-kind="view-definition" data-name="encounters_flat""#));
+    assert!(html.contains(r#"data-kind="view-definition" data-name="patients_flat""#));
+    assert!(html.contains(r#"data-kind="sql-query" data-name="patient_counts""#));
+    assert!(html.contains(">ViewDefinition<"));
+    assert!(html.contains(">SQL Query<"));
+    assert!(html.contains(">active<"));
+    assert!(html.contains(">draft<"));
+
+    // Format radios: four, NDJSON checked, nothing else.
+    assert_eq!(html.matches(r#"name="format""#).count(), 4);
+    assert!(html.contains(r#"value="ndjson" checked"#));
+    assert!(!html.contains(r#"value="csv" checked"#));
+    assert!(!html.contains(r#"value="json" checked"#));
+    assert!(!html.contains(r#"value="parquet" checked"#));
+
+    // Exactly one Start Export control, wired to the builder's own form
+    // (the shared shell's sidebar renders its own unrelated submit buttons,
+    // one per enabled FHIR version, so this checks the specific control
+    // rather than every `type="submit"` on the page).
+    assert!(
+        html.contains(r#"<form method="post" action="/ui/sql/export" class="bulk-export-form">"#)
+    );
+    assert_eq!(html.matches("Start Export").count(), 1);
+
+    // The table's tools and the header select-all render, but stay hidden
+    // and inert until a later enhancement reveals them.
+    assert!(html.contains(r#"class="card-head__tools card-head__tools--subjects" hidden"#));
+    assert!(html.contains(r#"aria-label="Select all" hidden"#));
+    assert_eq!(html.matches(r#"class="seg__btn""#).count(), 4);
+    assert!(html.contains(r#"type="search""#));
+    assert!(html.contains(r#"aria-label="Filter subjects""#));
+
+    // Nothing marked yet: "0 of 3 selected".
+    assert!(html.contains("0 of 3 selected"));
+}
+
+#[tokio::test]
+async fn prefill_checks_matching_subjects_and_silently_ignores_unknown_ones() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![
+                view_definition("vd1", "patients"),
+                view_definition("vd2", "encounters"),
+            ],
+        )
+        .with(
+            "Library",
+            FhirVersion::R4,
+            vec![library("q1", "counts", "sql-query", "active")],
+        );
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get(
+            "/ui/sql/export/new?subject=ViewDefinition%2Fvd1&subject=Library%2Fq1&subject=Library%2Fnope",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="ViewDefinition/vd1" aria-label="patients" checked"#));
+    assert!(html.contains(r#"value="Library/q1" aria-label="counts" checked"#));
+    assert!(html.contains(r#"value="ViewDefinition/vd2" aria-label="encounters">"#));
+    assert!(!html.contains("Library/nope"));
+    assert!(html.contains("2 of 3 selected"));
+
+    // No `?subject=` at all renders exactly like a bare `GET /new`.
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("0 of 3 selected"));
+}
+
+#[tokio::test]
+async fn an_empty_store_offers_the_two_creation_links_but_a_degraded_fetch_does_not() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Nothing to export yet"));
+    assert!(html.contains(r#"href="/ui/sql/view-definitions?vd=new""#));
+    assert!(html.contains(r#"href="/ui/sql/queries?lib=new""#));
+    // No builder form at all — not the name field, not a format, not Start
+    // Export. (The page's shared shell renders its own, unrelated `<form>`
+    // for the sidebar's FHIR-version switcher, so this checks the specific
+    // markup the builder itself would own rather than a blanket "<form".)
+    assert!(!html.contains(r#"action="/ui/sql/export""#));
+    assert!(!html.contains(r#"name="format""#));
+    assert!(!html.contains("Start Export"));
+
+    // A fetch failure with nothing loaded is not the same as an empty store:
+    // the "Nothing to export yet" card would be a false claim, so only the
+    // degraded notice renders.
+    let degraded = StaticConformanceSource::empty().with_fetch_error(
+        "ViewDefinition",
+        FhirVersion::R4,
+        "boom",
+    );
+    let response = app_with_settings(None, degraded)
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("could not be loaded"));
+    assert!(!html.contains("Nothing to export yet"));
+    assert!(!html.contains(r#"action="/ui/sql/export""#));
+}
+
 #[tokio::test]
 async fn starting_without_a_subject_rerenders_the_builder_with_an_error() {
     let backend = backend_with_schema().await;
@@ -294,11 +472,15 @@ async fn starting_without_a_subject_rerenders_the_builder_with_an_error() {
 
     let response = app
         .clone()
-        .oneshot(post_form("/ui/sql/export", "format=csv"))
+        .oneshot(post_form("/ui/sql/export", "name=My+export&format=csv"))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(body_text(response).await.contains("at least one subject"));
+    let html = body_text(response).await;
+    assert!(html.contains("at least one subject"));
+    // The name and format the submission carried are conserved.
+    assert!(html.contains(r#"value="My export""#));
+    assert!(html.contains(r#"value="csv" checked"#));
     assert!(
         source.export_calls().is_empty(),
         "no kick-off without a subject"
@@ -319,13 +501,17 @@ async fn an_unknown_subject_reference_rerenders_the_builder_without_a_kickoff() 
         .clone()
         .oneshot(post_form(
             "/ui/sql/export",
-            "subject=ViewDefinition%2Fgone&format=csv",
+            "name=x&subject=ViewDefinition%2Fvd1&subject=ViewDefinition%2Fgone&format=json",
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("no longer available"));
+    // The name, format, and every still-valid reference are conserved.
+    assert!(html.contains(r#"value="x""#));
+    assert!(html.contains(r#"value="json" checked"#));
+    assert!(html.contains(r#"value="ViewDefinition/vd1" aria-label="patients" checked"#));
     assert!(
         source.export_calls().is_empty(),
         "an unresolved subject must not reach $sql-export"
@@ -434,7 +620,11 @@ async fn a_kickoff_that_cannot_be_stored_still_surfaces_a_visible_notice() {
     let html = body_text(response).await;
     assert!(html.contains("could not be added to this list"));
     assert!(html.contains(">static-job<"));
-    assert!(html.contains(r#"href="/ui/sql/files?job=static-job""#));
+    // #835: no notebook entry means no detail page to link to (the record
+    // never got written) — Copy job id, server-rendered hidden like every
+    // other one, is all the notice offers.
+    assert!(html.contains(r#"data-copy-job-id="static-job""#));
+    assert!(!html.contains("/ui/sql/files"));
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +680,9 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    assert!(html.contains(r#"href="/ui/sql/files?job=job-1""#));
+    // #835: View files now links to the job's own detail page (its local
+    // id), not the retired Files lookup (the server's job id).
+    assert!(html.contains(r#"href="/ui/sql/export/job-a""#));
     assert!(!html.contains("hx-get"), "a terminal card must not poll");
     assert!(html.contains("1 file"));
 
@@ -599,7 +791,7 @@ async fn the_list_page_transitions_a_job_without_htmx() {
     let response = app.clone().oneshot(get("/ui/sql/export")).await.unwrap();
     let html = body_text(response).await;
     assert!(html.contains(">Complete<"));
-    assert!(html.contains(r#"href="/ui/sql/files?job=job-1""#));
+    assert!(html.contains(r#"href="/ui/sql/export/job-a""#));
 
     let stored = backend.get_settings("l2:").await.unwrap().unwrap();
     assert_eq!(
@@ -1032,6 +1224,356 @@ async fn every_action_on_an_unknown_id_is_a_silent_no_op() {
     assert!(source.export_calls().is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// Job detail (#835): GET /ui/sql/export/{id} and its htmx fragment
+// ---------------------------------------------------------------------------
+
+/// A `complete` job with two outputs — one of them two shards — and subjects
+/// of two kinds, ready to seed for the detail page tests below. The
+/// `outputs` order deliberately does not match the `subjects` order, so
+/// resolving each row back to its subject by name (not position) actually
+/// gets exercised.
+fn complete_job_with_two_outputs(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "name": "Monthly flat files",
+        "subjects": [
+            {"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"},
+            {"name": "encounter_counts", "reference": "Library/lib1", "kind": "sql-query"},
+        ],
+        "format": "parquet",
+        "status": "complete",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:08Z",
+        "outputs": [
+            {"name": "encounter_counts", "locations": ["/export/job-1/encounter_counts-0.parquet"]},
+            {"name": "patients", "locations": [
+                "/export/job-1/patients-0.parquet",
+                "/export/job-1/patients-1.parquet"
+            ]},
+        ],
+    })
+}
+
+/// A `failed` job whose error names one of its own subjects via the
+/// server's `query '<name>': …` pattern.
+fn failed_job_naming_a_subject(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "v03_counts", "reference": "Library/lib1", "kind": "sql-query"}],
+        "format": "csv",
+        "status": "failed",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:02:00Z",
+        "error": "Export job 'x' failed: query 'v03_counts': column \"ward\" does not exist",
+    })
+}
+
+/// A `failed` job whose error matches no known pattern (a kick-off failure,
+/// or a message this UI does not recognize) — the generic notice fallback.
+fn failed_job_with_unmatched_error(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "failed",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:02:00Z",
+        "error": "connection refused",
+    })
+}
+
+/// A `cancelled` job carrying the reaper's own reason (#833's
+/// `sql-export-cancelled-reason`).
+fn cancelled_job_with_reason(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "cancelled",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:00Z",
+        "error": "the server no longer knows this job",
+    })
+}
+
+/// A `failed` job whose kick-off never got a server job id at all: the Job
+/// id field falls back to an em dash, and Copy job id never renders.
+fn kickoff_failed_job() -> serde_json::Value {
+    serde_json::json!({
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "failed",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:00:01Z",
+        "error": "the export could not be started",
+    })
+}
+
+#[tokio::test]
+async fn detail_page_renders_a_complete_job_with_resolved_outputs() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        complete_job_with_two_outputs("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    // Header: name, lede, chip, Run again (not Retry).
+    assert!(html.contains(">Monthly flat files<"));
+    assert!(html.contains("Finished 2026-01-01 09:05 UTC · 5m 08s · Parquet"));
+    assert!(html.contains(">Complete<"));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/rerun""#));
+    assert!(!html.contains(r#"action="/ui/sql/export/job-a/retry""#));
+    assert!(!html.contains(r#"action="/ui/sql/export/job-a/cancel""#));
+
+    // No progress bar in a terminal state, and no more polling.
+    assert!(!html.contains("progress--in-progress"));
+    assert!(!html.contains("hx-get"));
+
+    // The Job card: id in <code>, format, started (with seconds), duration,
+    // and both subjects as pills.
+    assert!(html.contains("<code>job-1</code>"));
+    assert!(html.contains(">2026-01-01 09:00:00 UTC<"));
+    assert!(html.contains(">5m 08s<"));
+    assert!(html.contains(r#"<span class="tag tag--type">ViewDefinition</span> patients"#));
+    assert!(html.contains(r#"<span class="tag tag--type">SQL Query</span> encounter_counts"#));
+
+    // The Output files table: 3 downloads total, in the record's own
+    // `outputs` order — encounter_counts first, even though it is the
+    // *second* subject submitted — each row resolved to its subject by
+    // output name rather than by manifest position (build_output_rows_*
+    // unit tests exercise that resolution directly).
+    assert!(html.contains(">3<"));
+    assert!(html.contains("patients-0.parquet"));
+    assert!(html.contains("patients-1.parquet"));
+    assert!(html.contains("encounter_counts-0.parquet"));
+    let encounter_output_at = html.find("<td>encounter_counts</td>").expect("output row");
+    let patients_output_at = html.find("<td>patients</td>").expect("output row");
+    assert!(
+        encounter_output_at < patients_output_at,
+        "outputs render in the record's own persisted order, not submission order"
+    );
+    let encounter_subject_at = html[encounter_output_at..]
+        .find(r#"<span class="tag tag--type">SQL Query</span> encounter_counts"#)
+        .expect("the encounter_counts row resolves to its own sql-query subject");
+    assert!(
+        encounter_output_at + encounter_subject_at < patients_output_at,
+        "the resolved subject pill belongs to the encounter_counts row, not a later one"
+    );
+}
+
+#[tokio::test]
+async fn detail_page_names_the_failed_subject_when_the_error_matches_a_known_pattern() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        failed_job_naming_a_subject("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains("The export stopped on subject"));
+    assert!(html.contains("<strong>v03_counts</strong>"));
+    assert!(html.contains("does not exist"));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/retry""#));
+    assert!(html.contains(r#"<button type="submit" class="btn btn--primary">"#));
+    // A failed job never has files: the empty-state row, and a 0 count.
+    assert!(html.contains(">0<"));
+    assert!(html.contains(r#"<tr class="data-table__empty">"#));
+}
+
+#[tokio::test]
+async fn detail_page_falls_back_to_the_generic_notice_when_the_error_matches_no_pattern() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        failed_job_with_unmatched_error("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    let html = body_text(response).await;
+
+    assert!(html.contains("The export failed:"));
+    assert!(html.contains("connection refused"));
+    assert!(!html.contains("stopped on subject"));
+}
+
+#[tokio::test]
+async fn detail_page_shows_the_reaper_reason_on_a_cancelled_job() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        cancelled_job_with_reason("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    let html = body_text(response).await;
+
+    assert!(
+        html.contains("Cancelled 2026-01-01 09:05 UTC · CSV · the server no longer knows this job")
+    );
+    assert!(html.contains(">Cancelled<"));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/rerun""#));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/remove""#));
+}
+
+/// The page's own render polls an in-progress job exactly once and persists
+/// it, same as the list; the `/detail` fragment is the endpoint htmx's own
+/// 5s refresh calls back into, and its poll is what eventually
+/// carries the job to a terminal state and stops the polling.
+#[tokio::test]
+async fn detail_page_shows_progress_in_progress_and_the_fragment_completes_it() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+
+    let running_app = app(
+        &backend,
+        StaticConformanceSource::empty()
+            .with_export_status(SqlExportStatus::Running(Some("40%".to_string()))),
+    );
+    let response = running_app
+        .oneshot(get("/ui/sql/export/job-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">In progress<"));
+    assert!(html.contains(r#"aria-valuenow="40""#));
+    assert!(html.contains(r#"hx-get="/ui/sql/export/job-a/detail""#));
+    assert!(html.contains("every 5s"));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/cancel""#));
+    assert!(html.contains(r#"<details class="menu" hidden>"#));
+
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "output", "part": [
+            {"name": "name", "valueString": "patients"},
+            {"name": "location", "valueUri": "http://s/export/job-1/patients-0.csv"},
+        ]}]
+    });
+    let done_app = app(
+        &backend,
+        StaticConformanceSource::empty()
+            .with_export_status(SqlExportStatus::Done)
+            .with_export_manifest(Ok(manifest)),
+    );
+    let response = done_app
+        .oneshot(get("/ui/sql/export/job-a/detail"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">Complete<"));
+    assert!(
+        !html.contains("hx-get"),
+        "a terminal fragment must not poll"
+    );
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    assert_eq!(
+        stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"]["status"],
+        "complete"
+    );
+}
+
+#[tokio::test]
+async fn detail_page_shows_an_em_dash_and_no_copy_button_without_a_kickoff_job_id() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", kickoff_failed_job()).await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">Failed<"));
+    assert!(!html.contains("data-copy-job-id"));
+    assert!(html.contains("<div>—</div>"));
+}
+
+/// An unknown id, another user's, and another tenant's are all a `404`
+/// inside the full shell — never distinguished from each other, and never
+/// leaking the id or the reason.
+#[tokio::test]
+async fn sql_export_detail_page_isolates_jobs_by_tenant_and_user_with_a_404_inside_the_shell() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "other-tenant",
+        "other-tenant-job",
+        complete_job("job-x"),
+    )
+    .await;
+    seed_job_for_user(
+        &backend,
+        "u2:4:test:owner",
+        "default",
+        "owners-job",
+        complete_job("job-y"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    for path in [
+        "/ui/sql/export/does-not-exist",
+        "/ui/sql/export/other-tenant-job",
+        "/ui/sql/export/owners-job",
+    ] {
+        let response = app.clone().oneshot(get(path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        let html = body_text(response).await;
+        assert!(html.contains(">Not found<"), "{path}");
+        // The full shell renders — the sidebar nav is present.
+        assert!(html.contains(r#"class="nav">"#), "{path}");
+        assert!(
+            html.contains(r#"<a class="btn" href="/ui/sql/export">SQL Exports</a>"#),
+            "{path}"
+        );
+    }
+
+    // The fragment endpoint answers a bare 404, no body, matching `/card`.
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/owners-job/detail"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// `/ui/sql/export/new` is a literal segment: it must keep serving the
+/// builder rather than being captured by the `{id}` detail route.
+#[tokio::test]
+async fn new_route_still_serves_the_builder_not_the_detail_route() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains("Not found"));
+}
+
 /// The contextual action and the overflow's items follow the status
 /// exactly, and Copy job id is always server-rendered `hidden` — an
 /// in-progress card's overflow, which would otherwise hold nothing but
@@ -1061,7 +1603,9 @@ async fn card_shows_the_right_contextual_action_and_overflow_items_per_status() 
     // complete: View files contextual, overflow = Run again, Copy job id,
     // Remove from list, and the overflow itself is not hidden.
     let html = card_html(complete_job("job-1")).await;
-    assert!(html.contains(r#"href="/ui/sql/files?job=job-1""#));
+    // #835: the card's own title also links to the detail page.
+    assert!(html.contains(r#"<h2 class="job-card__name"><a href="/ui/sql/export/job-a">"#));
+    assert!(html.contains(r#"href="/ui/sql/export/job-a""#));
     assert!(html.contains(r#"action="/ui/sql/export/job-a/rerun""#));
     assert!(html.contains(r#"action="/ui/sql/export/job-a/remove""#));
     assert!(html.contains(r#"data-copy-job-id="job-1""#));
