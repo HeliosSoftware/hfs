@@ -32,9 +32,10 @@ use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
+use crate::raw_fold::RawFold;
 use crate::upstream::{
-    ExpandParams, ExpansionResult, HTS_UI_MAX_EXPANSION_SIZE_HINT, OutcomeView, UpstreamError,
-    ValueSetSummary, VsBrowserFilters, VsBrowserPage,
+    ExpandParams, ExpansionResult, HTS_UI_MAX_EXPANSION_SIZE_HINT, OpFailure, OutcomeView,
+    UpstreamError, ValueSetSummary, VsBrowserFilters, VsBrowserPage,
 };
 use crate::{Chrome, HtsUiState};
 
@@ -433,8 +434,8 @@ struct ExpandResultTemplate<'a> {
 /// operation demands the cross-slice refactor.
 #[derive(Clone, Debug)]
 pub struct ExpandResultView {
-    pub request_url: String,
-    pub raw_body: String,
+    /// What went over the wire, for the "Raw request and response" fold.
+    pub raw: RawFold,
     pub result: Option<ExpansionResult>,
     pub outcome: Option<OutcomeView>,
     pub degraded_reason: Option<&'static str>,
@@ -449,8 +450,7 @@ pub struct ExpandResultView {
 impl ExpandResultView {
     fn empty() -> Self {
         Self {
-            request_url: String::new(),
-            raw_body: String::new(),
+            raw: RawFold::default(),
             result: None,
             outcome: None,
             degraded_reason: None,
@@ -459,10 +459,13 @@ impl ExpandResultView {
         }
     }
 
-    fn from_error(request_url: String, err: &UpstreamError) -> Self {
+    /// The view for a failed call. The exchange the proxy kept rides along, so
+    /// the raw fold shows the payload of the failure rather than going blank
+    /// on it (#803).
+    fn from_error(failure: &OpFailure) -> Self {
         let mut view = Self::empty();
-        view.request_url = request_url;
-        match err {
+        view.raw = RawFold::from_exchange(&failure.exchange);
+        match &failure.error {
             UpstreamError::Outcome { outcome, .. } => view.outcome = Some((**outcome).clone()),
             UpstreamError::NotFound { .. } => {
                 view.outcome = Some(OutcomeView {
@@ -486,7 +489,7 @@ impl ExpandResultView {
             UpstreamError::Connect { .. }
             | UpstreamError::Timeout { .. }
             | UpstreamError::ClientBuild { .. } => {
-                view.degraded_reason = Some(err.degraded_reason());
+                view.degraded_reason = Some(failure.error.degraded_reason());
             }
             UpstreamError::Decode { message, .. } => {
                 view.outcome = Some(OutcomeView::invalid_input(message.clone()));
@@ -562,8 +565,7 @@ async fn expand_run(
     };
     let view = match expand_result {
         Ok(result) => ExpandResultView {
-            request_url: result.request_url.clone(),
-            raw_body: result.raw_body.clone(),
+            raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
             tree_mode,
             threshold: params.threshold,
             result: Some(result),
@@ -571,12 +573,7 @@ async fn expand_run(
             degraded_reason: None,
         },
         Err(err) => {
-            let request_url = if !canonical.is_empty() {
-                format!("{}/ValueSet/$expand", state.upstream.base_url())
-            } else {
-                format!("{}/ValueSet/{}/$expand", state.upstream.base_url(), id)
-            };
-            let mut v = ExpandResultView::from_error(request_url, &err);
+            let mut v = ExpandResultView::from_error(&err);
             v.tree_mode = tree_mode;
             v.threshold = params.threshold;
             v
@@ -589,9 +586,12 @@ async fn respond_workbench<'a>(
     state: &HtsUiState,
     chrome: Chrome<'a>,
     id: String,
-    view: ExpandResultView,
+    mut view: ExpandResultView,
     is_htmx: bool,
 ) -> Response {
+    // Both response shapes render the same raw fold, so the payloads are
+    // highlighted once, here, where the request locale is in hand.
+    view.raw.highlight(&chrome.i18n);
     if is_htmx {
         return render(
             ExpandResultTemplate {

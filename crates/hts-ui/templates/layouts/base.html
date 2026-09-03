@@ -11,6 +11,9 @@
   <script src="/ui/hts/assets/theme.js"></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/hts/assets/htmx.min.js" defer></script>
+  <!-- Folding for the workbench raw request/response view (#803). Fully
+       delegated off `document`, so htmx-swapped results need no re-init. -->
+  <script src="/ui/hts/assets/json-view.js" defer></script>
 </head>
 <body class="{% block body_class %}{% endblock %}">
   <aside class="sidebar" id="sidebar">

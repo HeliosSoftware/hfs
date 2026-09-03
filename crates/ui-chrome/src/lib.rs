@@ -44,7 +44,8 @@
 //!
 //! CSS. `crates/ui/assets/app.css` is already shared byte-for-byte by
 //! `crates/hts-ui/src/lib.rs` embedding `../ui/assets` directly, and lifting
-//! it into a neutral crate is gated on #543.
+//! it into a neutral crate is gated on #543. The same goes for
+//! `json-view.js`, which drives the folding for both products from that embed.
 //!
 //! # Usage
 //!
@@ -86,9 +87,11 @@ pub mod capability;
 pub mod capability_json;
 
 /// A foldable, line-numbered, syntax-highlighted JSON view (#264, #808).
-/// [`capability_json`] builds on this; HFS's Resource Editor, Batch, and
-/// Resources pages also render a [`json_view::JsonLine`] vector through
-/// their own copy of the partial this engine feeds.
+/// [`capability_json`] builds on this, and the HTS workbench's raw
+/// request/response fold renders it through [`json_view::render`] (#803);
+/// HFS's Resource Editor, Batch, and Resources pages also render a
+/// [`json_view::JsonLine`] vector through their own copy of the partial this
+/// engine feeds.
 pub mod json_view;
 
 /// The localisation surface the shared chrome needs from its host.
@@ -112,8 +115,9 @@ pub trait ChromeLabels {
     ///
     /// The keys the chrome asks for are `user-menu-label`, `user-anonymous`,
     /// `user-local-hint`, `language-label`, `language-en`, `language-es`,
-    /// `language-de`, and `user-logout`. A consumer missing any of them will
-    /// render whatever its bundle's fallback produces.
+    /// `language-de`, and `user-logout`, plus `json-view-toggle-fold` for
+    /// [`json_view::render`]. A consumer missing any of them will render
+    /// whatever its bundle's fallback produces.
     ///
     /// The returned text is HTML-escaped by the template. Do not pre-escape it,
     /// and do not return markup expecting it to render as markup.

@@ -14,6 +14,7 @@ import { TenantsPage } from "./tenants";
 import { BulkImportPage } from "./bulk-import";
 import { BulkExportPage } from "./bulk-export";
 import { CapabilityStatementPage } from "./capability-statement";
+import { SqlExportPage } from "./sql-export";
 
 type Fixtures = {
   chrome: AppChrome;
@@ -28,6 +29,7 @@ type Fixtures = {
   bulkImport: BulkImportPage;
   bulkExport: BulkExportPage;
   capabilityStatement: CapabilityStatementPage;
+  sqlExport: SqlExportPage;
 };
 
 export const test = base.extend<Fixtures>({
@@ -81,6 +83,7 @@ export const test = base.extend<Fixtures>({
   bulkImport: async ({ page }, use) => use(new BulkImportPage(page)),
   bulkExport: async ({ page }, use) => use(new BulkExportPage(page)),
   capabilityStatement: async ({ page }, use) => use(new CapabilityStatementPage(page)),
+  sqlExport: async ({ page }, use) => use(new SqlExportPage(page)),
 });
 
 export { expect };

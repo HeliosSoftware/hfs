@@ -5191,9 +5191,10 @@ mod postgres_integration {
     // Bulk Export — Phase 2 multi-instance job state on Postgres.
     // ========================================================================
 
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use helios_persistence::core::bulk_export::{
-        BulkExportStorage, ExportRequest, ExportStatus, StartExportInput, TypeExportProgress,
+        BulkExportStorage, ExportDataProvider, ExportRequest, ExportStatus, PatientExportProvider,
+        StartExportInput, TypeExportProgress,
     };
     use helios_persistence::core::bulk_export_worker::{
         ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId,
@@ -5281,6 +5282,152 @@ mod postgres_integration {
 
         let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
         assert_eq!(progress.status, ExportStatus::Complete);
+    }
+
+    /// Pins a stored resource's `last_updated` so a window test does not depend
+    /// on wall-clock timing.
+    async fn pin_last_updated(backend: &PostgresBackend, id: &str, at: DateTime<Utc>) {
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "UPDATE resources SET last_updated = $1 WHERE id = $2",
+                &[&at, &id],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn seed_patient_at(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        at: DateTime<Utc>,
+    ) -> String {
+        let stored = backend
+            .create(
+                tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = stored.id().to_string();
+        pin_last_updated(backend, &id, at).await;
+        id
+    }
+
+    fn instant(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// `_until` excludes a resource modified after the bound, and the count
+    /// agrees with what the fetch emits.
+    #[tokio::test]
+    async fn postgres_integration_export_until_bounds_count_and_fetch() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-until");
+
+        let early = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let _late = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+        let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+
+        let count = backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap();
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1, "count must apply the upper bound");
+        assert_eq!(batch.lines.len(), 1, "fetch must apply the upper bound");
+        assert_eq!(
+            count as usize,
+            batch.lines.len(),
+            "count and fetch must agree about the window"
+        );
+        assert!(batch.lines[0].contains(&early));
+    }
+
+    /// The bound is inclusive, matching S3.
+    #[tokio::test]
+    async fn postgres_integration_export_until_is_inclusive() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-until-incl");
+
+        seed_patient_at(&backend, &tenant, instant("2026-02-01T00:00:00Z")).await;
+
+        let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "a resource exactly on the bound is included"
+        );
+    }
+
+    /// `_since` and `_until` together bound the window at both ends.
+    #[tokio::test]
+    async fn postgres_integration_export_since_and_until_bound_the_window() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-window");
+
+        let _before = seed_patient_at(&backend, &tenant, instant("2025-12-01T00:00:00Z")).await;
+        let inside = seed_patient_at(&backend, &tenant, instant("2026-01-15T00:00:00Z")).await;
+        let _after = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+        let request = ExportRequest::system()
+            .with_since(instant("2026-01-01T00:00:00Z"))
+            .with_until(instant("2026-02-01T00:00:00Z"));
+
+        let count = backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap();
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(batch.lines.len(), 1);
+        assert!(batch.lines[0].contains(&inside));
+    }
+
+    /// The patient-compartment path applies the bound too — it builds its own
+    /// query, separate from `fetch_export_batch`.
+    #[tokio::test]
+    async fn postgres_integration_export_until_bounds_patient_compartment() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-compartment");
+
+        let early = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let late = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+        let request = ExportRequest::patient().with_until(instant("2026-02-01T00:00:00Z"));
+        let ids = vec![early.clone(), late.clone()];
+
+        let batch = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &ids, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "the compartment fetch applies the upper bound"
+        );
+        assert!(batch.lines[0].contains(&early));
     }
 
     #[tokio::test]
@@ -5915,6 +6062,136 @@ mod postgres_integration {
             stored.content()["gender"],
             json!("female"),
             "merge must retain elements the submission omitted"
+        );
+    }
+
+    /// #872: the batched ingest commits entry writes, rollback records, and
+    /// per-line receipts together, and a failing entry is contained to its
+    /// savepoint — on Postgres a failed statement aborts the transaction, so
+    /// without the savepoint one bad entry would poison the whole batch.
+    #[tokio::test]
+    async fn postgres_bulk_submit_batch_commits_bookkeeping_and_contains_errors() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
+            SubmissionId,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_batch");
+        let sub_id = SubmissionId::generate("pg-batch-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/b.json"), None)
+            .await
+            .unwrap();
+        // Move the manifest out of `pending` right away: the test binary
+        // shares one container database, and a concurrently running test that
+        // calls claim_next_manifest would otherwise claim this one (the claim
+        // queue is cross-tenant by design).
+        backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                Vec::new(),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        // An existing resource for the update path, and a soft-deleted id
+        // whose create fails with AlreadyExists inside the batch.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-upd","name":[{"family":"Old"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-gone"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", "pg-batch-gone")
+            .await
+            .unwrap();
+
+        let entries = vec![
+            NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-new","name":[{"family":"BatchNew"}]}),
+            ),
+            NdjsonEntry::new(
+                2,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-gone"}),
+            ),
+            NdjsonEntry::new(
+                3,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-upd","name":[{"family":"BatchUpd"}]}),
+            ),
+        ];
+        let results = backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                entries,
+                &BulkProcessingOptions::new().with_file_url("https://provider/p.ndjson"),
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].is_success() && results[0].created);
+        assert!(
+            results[1].is_error(),
+            "the soft-deleted id must fail its entry, got {:?}",
+            results[1]
+        );
+        assert!(results[2].is_success() && !results[2].created);
+
+        // The failed entry did not poison the batch: both writes committed,
+        // together with their receipts and rollback records.
+        assert!(
+            backend
+                .read(&tenant, "Patient", "pg-batch-new")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let updated = backend
+            .read(&tenant, "Patient", "pg-batch-upd")
+            .await
+            .unwrap()
+            .expect("updated patient");
+        assert_eq!(updated.content()["name"], json!([{"family":"BatchUpd"}]));
+
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.success, 2);
+        assert_eq!(counts.processing_error, 1);
+
+        let changes = backend.list_changes(&tenant, &sub_id, 10, 0).await.unwrap();
+        assert_eq!(
+            changes.len(),
+            2,
+            "one rollback record per successful write, none for the failed entry"
         );
     }
 

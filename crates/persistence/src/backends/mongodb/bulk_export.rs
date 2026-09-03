@@ -35,6 +35,26 @@ fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
     BsonDateTime::from_millis(dt.timestamp_millis())
 }
 
+/// The `last_updated` range an export request asks for, or `None` when it is
+/// unbounded.
+///
+/// Both bounds are inclusive, matching the S3 backend's
+/// `last_modified() < since` / `> until` skips.
+///
+/// The two bounds must share one document: `last_updated` is a single key, so a
+/// second `filter.insert("last_updated", ...)` would REPLACE the first rather
+/// than narrow it, silently dropping whichever bound was written first.
+fn last_updated_range(request: &ExportRequest) -> Option<Document> {
+    let mut range = Document::new();
+    if let Some(since) = request.since {
+        range.insert("$gte", chrono_to_bson(since));
+    }
+    if let Some(until) = request.until {
+        range.insert("$lte", chrono_to_bson(until));
+    }
+    (!range.is_empty()).then_some(range)
+}
+
 fn bson_to_chrono(dt: &BsonDateTime) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap_or_else(Utc::now)
 }
@@ -166,8 +186,8 @@ impl ExportDataProvider for MongoBackend {
             "resource_type": resource_type,
             "is_deleted": false,
         };
-        if let Some(since) = request.since {
-            filter.insert("last_updated", doc! { "$gte": chrono_to_bson(since) });
+        if let Some(range) = last_updated_range(request) {
+            filter.insert("last_updated", range);
         }
 
         resources
@@ -193,8 +213,8 @@ impl ExportDataProvider for MongoBackend {
             "resource_type": resource_type,
             "is_deleted": false,
         };
-        if let Some(since) = request.since {
-            filter.insert("last_updated", doc! { "$gte": chrono_to_bson(since) });
+        if let Some(range) = last_updated_range(request) {
+            filter.insert("last_updated", range);
         }
         if let Some((cur_dt, cur_id)) = cursor.and_then(parse_cursor) {
             filter.insert(
@@ -241,6 +261,12 @@ impl PatientExportProvider for MongoBackend {
             "resource_type": "Patient",
             "is_deleted": false,
         };
+        // `_since` only, deliberately: this selects WHICH patients are in scope,
+        // not which of their resources are exported. Bounding it above by
+        // `_until` would drop a patient whose own record was touched after the
+        // window and take their in-window compartment resources with them. The
+        // Patient resource itself is still bounded, by the compartment fetch.
+        // S3 makes the same distinction (`backends/s3/bulk_export.rs:216`).
         if let Some(since) = request.since {
             filter.insert("last_updated", doc! { "$gte": chrono_to_bson(since) });
         }
@@ -296,8 +322,8 @@ impl PatientExportProvider for MongoBackend {
                 "is_deleted": false,
                 "id": { "$in": patient_ids.to_vec() },
             };
-            if let Some(since) = request.since {
-                filter.insert("last_updated", doc! { "$gte": chrono_to_bson(since) });
+            if let Some(range) = last_updated_range(request) {
+                filter.insert("last_updated", range);
             }
             if let Some((cur_dt, cur_id)) = cursor.and_then(parse_cursor) {
                 filter.insert(
@@ -338,8 +364,8 @@ impl PatientExportProvider for MongoBackend {
                 doc! { "data.patient.reference": { "$in": &refs } },
             ],
         };
-        if let Some(since) = request.since {
-            filter.insert("last_updated", doc! { "$gte": chrono_to_bson(since) });
+        if let Some(range) = last_updated_range(request) {
+            filter.insert("last_updated", range);
         }
         if let Some((cur_dt, cur_id)) = cursor.and_then(parse_cursor) {
             // Combine compartment-match $or with cursor keyset $or via $and.

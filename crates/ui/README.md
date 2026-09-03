@@ -22,8 +22,9 @@ thin.
 npm dependency, and no build step for the browser code, with one narrow,
 documented exception** (see "Assets: vendored & embedded" below). Two
 third-party scripts are vendored: htmx, and — as a prebuilt, never-built-here
-bundle — CodeMirror 6, for the ViewDefinition editor (#753). Everything else
-under `assets/` is hand-written vanilla JS in an IIFE. Do not introduce a
+bundle — CodeMirror 6, mounted over the ViewDefinition JSON editor (#753) and
+the SQL Queries/SQL Views editor panes (#838). Everything else under
+`assets/` is hand-written vanilla JS in an IIFE. Do not introduce a
 framework.
 
 Why, over a SPA + JSON API:
@@ -108,16 +109,38 @@ in the style every other asset in this crate uses. For that narrow case:
 > the resulting bundle is never loaded from a CDN; and the bundle ships with its license
 > banner intact.
 
-CodeMirror 6 is the first, and so far only, case this applies to (#753):
-[`crates/ui/vendor/codemirror/`](vendor/codemirror/README.md) is the vendoring
-ritual (pinned npm dependencies, a committed lockfile, a rollup + terser recipe
-run by hand, never by `cargo build` or CI); its one output,
-[`assets/vendor/codemirror.bundle.js`](assets/vendor/codemirror.bundle.js), is
-the vendored bundle itself — embedded and served exactly like every other
+CodeMirror 6 is the first, and so far only, case this applies to (#753,
+extended by #838): [`crates/ui/vendor/codemirror/`](vendor/codemirror/README.md)
+is the vendoring ritual (pinned npm dependencies, a committed lockfile, a
+rollup + terser recipe run by hand, never by `cargo build` or CI); its one
+output, [`assets/vendor/codemirror.bundle.js`](assets/vendor/codemirror.bundle.js),
+is the vendored bundle itself — embedded and served exactly like every other
 asset in this crate (above), nothing bundler-specific about how it ships. It
-backs the ViewDefinition editor on `/ui/sql/view-definitions`; see
+backs the ViewDefinition JSON editor on `/ui/sql/view-definitions` and the SQL
+pane editors on `/ui/sql/queries` and `/ui/sql/views`; see
 [`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
-for the full evaluation this amendment is drawn from.
+for the full evaluation this amendment is drawn from. The editor talks to two
+JSON-in-HTML-fragment-out endpoints on that page: `POST …/lint` (#753 ticket
+03), the CodeMirror linter's structural + FHIRPath-syntax check, and `POST
+…/run` (#752 ticket 01), which runs the editor's own posted text — saved or
+not — through `$sql-run` and answers with `partials/sql_run_results.html`,
+the same results-card partial the page's own initial render nests as a
+template field. `/run` always answers `200` (htmx does not swap `4xx`/`5xx`
+by default) except for a malformed request body.
+
+That page is a playground, not a Run button (#752 ticket 02): the editor card
+is always open (no fold, no separate "Run" action), and the results region
+below it wires straight to `/run` with plain `hx-*` attributes — no JavaScript
+beyond what already ships. The results region's own empty shell fires one
+`hx-trigger="load"` request when the page opens with nothing to show yet
+(a fresh selection, or `?vd=new`'s starter document), and the editor's
+`textarea` reposts on `hx-trigger="input changed delay:500ms"` as it changes —
+CodeMirror's mount already dispatches `input` on every edit, so this needs no
+mount-specific wiring. A failed run leaves the editor's text untouched and the
+last successful table on screen, relabelled "last successful run" via an
+out-of-band swap of just its meta. With JavaScript disabled there is no live
+preview at all: Save's own redirect (`?vd=<id>&saved=1`) is what renders the
+just-stored definition's results, server-side, once.
 
 ### Client-side scripts
 
@@ -126,8 +149,9 @@ Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
 is used across workspaces — `busy.js` ahead of every page script (defer runs in
 document order) because page scripts call into it. `theme.js` loads **without
 `defer`**, before first paint, to avoid a flash of the wrong theme. `busy.js`
-is the crate's one exported global (`window.hfsBusy`): unlike the closed IIFEs
-it exists to be called by the others.
+exports `window.hfsBusy`; the CodeMirror stack (below) exports two more
+globals for the same reason — code that exists to be called by other scripts,
+not just a closed IIFE.
 
 | Asset | Owns |
 |---|---|
@@ -140,10 +164,14 @@ it exists to be called by the others.
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
 | `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
+| `sql-export.js` | "Copy job id" on Active SQL Exports job cards — reveals the button only when the Clipboard API is available, writes the id, shows "Copied" |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
 | `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
 | `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
+| `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)`, exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of |
+| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838) |
+| `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, no fold or lint yet (#838) |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.
@@ -442,6 +470,11 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/status` | GET | System-status read path; the fragment-vs-full-page reference |
 | `/ui/version` | POST | Persists the sidebar FHIR-version choice (#343) and redirects back |
 | `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector (#344), options loaded lazily |
+| `/ui/sql/export` | GET/POST | Active SQL Exports — the user's `$sql-export` jobs as cards, most recent first (#833); POST resolves the checked subjects and kicks off the job |
+| `/ui/sql/export/new` | GET | SQL Export builder — pick stored ViewDefinitions/Libraries and an output format |
+| `/ui/sql/export/{id}/card` | GET | htmx fragment: one job's card, polling `$sql-export` status while the job is in progress |
+| `/ui/sql/export/{id}/cancel`, `/retry`, `/rerun`, `/remove` | POST | Per-job actions: cancel an in-progress job, resubmit a failed or terminal job as a new record, or drop a terminal job's record from the list |
+| `/ui/sql/files` | GET | Completion-manifest lookup by job id — *legacy job-id form, superseded by a card's own "View files" link until #835 folds it into the list* |
 | `/ui/assets/*` | GET | Embedded htmx, CSS, JS, fonts, logo |
 
 The router's `fallback_service` is the FHIR app, so anything not under `/ui`
@@ -468,7 +501,24 @@ falls through to the normal REST surface.
   purge can reach them. The server renders the "Recently used" group from
   `recent` on every rail but Compartments — its 4-5 definitions make a group
   noise, so it remembers only `last`; with no settings store configured, there
-  is nothing to render and every rail opens on its page default instead.
+  is nothing to render and every rail opens on its page default instead. The
+  async export workspaces' job lists live there too —
+  `byTenant.<tenant>.bulkExport.jobs` and `byTenant.<tenant>.sqlExport.jobs` —
+  one member per job, keyed by a locally-generated id, written with the same
+  optimistic-locking (`If-Match`) read-modify-write every other settings write
+  uses.
+- **SQL Export's self-calls carry the caller's own identity.** `$sql-export`
+  kick-off, status polling, cancel, and the completion manifest all go through
+  `ConformanceSource`'s four `$sql-export` methods with a `Caller`: the
+  browser's own `Authorization` bearer when the request carried one, the
+  configured outbound credential (`HFS_OUTBOUND_BEARER_TOKEN`) otherwise — so
+  an async export is attributable to the person who started it, not a service
+  account. Because the Active SQL Exports list is the browser's own notebook
+  rather than server state (the one `$sql-export` job controller is in-memory,
+  ownerless, and reaped after 24h), **jobs started through the API — outside
+  this UI — never appear on the list**, and a job the server has since reaped
+  or restarted away from shows as `cancelled` with an explanatory reason
+  rather than as an error.
 
 ### Internationalization
 

@@ -2,6 +2,11 @@
 // referenced by the browser + workbench specs. Runs AFTER boot.mjs makes
 // /ui/hts respond 200 and BEFORE any test executes.
 //
+// A .ts file on purpose: Playwright loads globalSetup through its own CJS
+// transpiler, and handing it an .mjs module hangs the runner on Node >= 23
+// (require(esm) collides with the transpile hook) — the run stalls forever
+// right after "WebServer available" with zero output.
+//
 // These fixtures are not required at server boot: boot.mjs deliberately
 // keeps the SQLite empty and this
 // script is the e2e harness that populates it via the well-known

@@ -145,6 +145,22 @@
   --fp-literal: #0b6e99;
   --fp-constant: #b1460a;
   --fp-comment: #5b6472;
+  /* SQL token palette (#838, sql-editor.js): declared with its own
+     names rather than reusing --json-* / --fp-* directly, so the SQL editor
+     never depends on another editor's palette even where the hex values
+     happen to match today. Each clears 4.5:1 on --input-bg below; keyword
+     (purple) and variable (teal) are deliberately different hues from each
+     other and from --text, so a `:ward`-style bind parameter never reads as
+     "just another keyword". */
+  --sql-keyword: #9a3aa0;
+  --sql-type: #0a5f96;
+  --sql-string: #137333;
+  --sql-number: #b4232d;
+  --sql-operator: #4b5563;
+  --sql-variable: #0f6f66;
+  --sql-comment: #5b6472;
+  --sql-punct: #6a6a6a;
+  --sql-literal: #8a5a00;
   /* Destructive text clears 7:1 on the light card surface; the soft hover
      fill keeps 5.8:1 contrast with the same foreground. */
   --danger: #a61b12;
@@ -157,6 +173,18 @@
   --warn: #8a5a00;
   --warn-soft: #fdf2dd;
   --danger-soft: #f0dfde;
+  /* Neutral pair for the cancelled state (#833 gate-fix, FALLA 3): the same
+     shape as the ok/warn/danger soft pairs above, but genuinely gray so
+     "Cancelled" never reads as an accent-tinted (blue) or danger (red)
+     status. */
+  --muted-soft: #e9e9e9;
+  /* Text on --muted-soft (PR #887 CI a11y fix): --muted itself only clears
+     4.455:1 against --muted-soft, just under the 4.5:1 axe requires. Same
+     move as --accent-text above — a dedicated, darker-on-light /
+     lighter-on-dark shade for text sitting on the soft tint, not a change to
+     --muted (which stays as every other muted body-text use already relies
+     on it). Clears 6.4:1 here. */
+  --muted-text: #525252;
   /* Menu panel input */
   --input-bg: #f5f5f5;
   /* Pill scrollbars: thin bar, fully-rounded track and thumb. */
@@ -201,6 +229,17 @@
   --fp-literal: #79c0ff;
   --fp-constant: #ffa657;
   --fp-comment: #9198a1;
+  /* SQL token palette, dark cast — see the light block for why these are
+     distinct from --json-* / --fp-*. */
+  --sql-keyword: #e2a8ff;
+  --sql-type: #7cc9ff;
+  --sql-string: #7ee787;
+  --sql-number: #ff7b72;
+  --sql-operator: #9aa7b5;
+  --sql-variable: #5eead4;
+  --sql-comment: #9198a1;
+  --sql-punct: #a0a0a0;
+  --sql-literal: #e3b341;
   /* Theme-specific destructive pair: 7.6:1 on the card and 5.6:1 on soft. */
   --danger: #ff9a90;
   --ok: #7fd8a5;
@@ -208,6 +247,10 @@
   --warn: #e8c07a;
   --warn-soft: #2f2410;
   --danger-soft: #453534;
+  --muted-soft: #333333;
+  /* Opposite move from the light theme (lighter, not darker) — see the
+     light block. Clears 5.8:1 against --muted-soft here. */
+  --muted-text: #b0b0b0;
   /* Same value as light for now (#681) — the point to adjust from if flat
      black at 45% is later found to read too heavy/light over the dark bg. */
   --scrim: rgb(0 0 0 / 45%);
@@ -1454,6 +1497,15 @@ textarea.field__input {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+.field__input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.field__input[aria-invalid="true"]:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
 /* The native dropdown arrow hugs the border regardless of padding, so draw
    our own chevron with the same inset the text gets. The muted gray reads on
    both themes. */
@@ -2456,6 +2508,45 @@ select.field__input {
   border: 1px solid var(--warn);
 }
 
+/* The HTS OperationOutcome box (`crates/hts-ui/templates/partials/
+   hts-outcome.html`, #805). It is a `.notice` whose body is a stack of
+   `<p>` rows, which the primitive alone cannot spell: HFS's own notices
+   put bare text in the box, so `.notice` carries no paragraph reset and
+   the UA's `margin: 1em 0` pushed the first line ~13px below a box padded
+   for 10px. Scope the rhythm here rather than touching `.notice`, which is
+   shared with every HFS warning surface. */
+.hts-outcome > * {
+  margin: 0;
+}
+
+.hts-outcome > * + * {
+  margin-top: 6px;
+}
+
+/* The box follows result content — the `$validate-code` field grid is
+   pinned flush on the assumption it is the panel's last child. The margin
+   collapses against a preceding notice's 16px, so stacked warnings stay
+   16px apart rather than 30. */
+.hts-outcome:not(:first-child) {
+  margin-top: 14px;
+}
+
+/* Last child of a `.panel` / `.card`: the container's 18px padding is the
+   gap, and the primitive's 16px on top of it reads as a doubled band. */
+.hts-outcome:last-child {
+  margin-bottom: 0;
+}
+
+/* FHIRPath locations. Previously borrowed `.filter-rail__list`, the
+   scrolling type-rail container, which indented them 40px (its rules never
+   touch the UA list padding) inside a needless scroll region. */
+.hts-outcome__locations {
+  display: grid;
+  gap: 2px;
+  padding-left: 0;
+  list-style: none;
+}
+
 /* 280px matches .nav-panel and .queries-layout's rail column (#603 follow-up):
    one rail width across Resources, Search, Saved Queries, and Search
    Parameters. */
@@ -2848,6 +2939,18 @@ details.json-fold[open] > summary .icon {
   font-variant-numeric: tabular-nums;
 }
 
+/* A native radio/checkbox carries a UA margin that .chip's
+   align-items: center centers by margin box, not visible box — the
+   control lands a couple of px below the chip's vertical center (#804).
+   Same reset .choice-card already applies to its radios. */
+.chip input[type="radio"],
+.chip input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
 /* Data table */
 
 .table-wrap {
@@ -3115,8 +3218,8 @@ details.json-fold[open] > summary .icon {
 }
 
 .tag--cancelled {
-  background: var(--accent-soft);
-  color: var(--muted);
+  background: var(--muted-soft);
+  color: var(--muted-text);
 }
 
 .subs-sort summary.btn {
@@ -3226,6 +3329,16 @@ details.json-fold[open] > summary .icon {
   margin: 14px 0;
 }
 
+/* #806: the HTS folds adopting this pattern sit directly in a `.panel`,
+   usually as the card's only child. `.panel`'s own 18px padding already
+   spaces them, and a panel is a plain block — so the margin above cannot
+   collapse into anything and would simply make every collapsed card 28px
+   taller. The dialog folds this pattern was written for are not in a
+   `.panel`, so they keep the default. */
+.panel > .disclosure {
+  margin: 0;
+}
+
 .disclosure__summary {
   display: inline-flex;
   align-items: center;
@@ -3319,6 +3432,22 @@ details.json-fold[open] > summary .icon {
 }
 
 .bulk-export-form:has(input[name="scope"][value="group"]:checked) .field--group-id {
+  display: block;
+}
+
+/* HTS CodeSystem $validate-code: show only the fields for the selected
+   input mode (#804), same CSS-only reveal idiom as the Bulk Export scope
+   field above. Browsers without :has() keep both halves visible — today's
+   (buggy) fallback behavior. */
+#hts-workbench-input .validate-mode-panel--coding {
+  display: none;
+}
+
+#hts-workbench-input:has(input[name="mode"][value="coding"]:checked) .validate-mode-panel--code {
+  display: none;
+}
+
+#hts-workbench-input:has(input[name="mode"][value="coding"]:checked) .validate-mode-panel--coding {
   display: block;
 }
 
@@ -5891,7 +6020,11 @@ details.json-fold[open] > summary .icon {
   color: var(--muted);
 }
 
-/* ---- Exports job cards (#735, #795) ---------------------------------- */
+/* ---- Exports builder and job cards (#735, #795, #832) ---------------- */
+
+[data-bulk-export-name-heading] {
+  overflow-wrap: anywhere;
+}
 
 .job-card {
   padding: 14px;
@@ -5905,10 +6038,12 @@ details.json-fold[open] > summary .icon {
 }
 
 .job-card__name {
+  min-width: 0;
   margin: 0;
   font-size: 15px;
   font-weight: 600;
   color: var(--text-strong);
+  overflow-wrap: anywhere;
 }
 
 .job-card__actions {
@@ -5969,9 +6104,12 @@ details.json-fold[open] > summary .icon {
   background: var(--ok);
 }
 
-.progress--failed .progress__bar,
-.progress--cancelled .progress__bar {
+.progress--failed .progress__bar {
   background: var(--danger);
+}
+
+.progress--cancelled .progress__bar {
+  background: var(--muted);
 }
 
 .job-card__meta {
@@ -6091,74 +6229,74 @@ body.app-shell .pane {
 }
 
 /* ---------------------------------------------------------------------------
-   ViewDefinition editor mount (#753 evaluation POC, tickets 02 + 03):
-   CodeMirror 6 chrome — sizing, focus, tokens, and (ticket 03) the async
-   server lint's underline/gutter/tooltip colors — for the `.vd-editor`
-   wrapper vd-editor.js inserts before the JSON fold's textarea. Deliberately
-   OUTSIDE the `tokens, base, components,
-   pages` layer system above: CodeMirror mounts its own `<style>` via
-   `StyleModule.mount` at runtime, and that stylesheet is unlayered. Per the
-   CSS Cascade Layers spec, *any* unlayered declaration always beats *every*
-   layered one, regardless of selector specificity — so a `.cm-editor`
-   override written inside `@layer components` would silently lose to
-   CodeMirror's own defaults no matter how many classes it stacked. Living
-   here, unlayered, is what lets these rules actually override the library's
-   baseTheme (the focus outline in particular) without `!important`, which
-   the rest of this file deliberately avoids (see the `.kv-grid--flush`
-   comment above). Only the CodeMirror-facing rules need this; everything
-   about `.vd-editor__source--mounted` (the hidden textarea) is ordinary
-   layout, but it lives in this same unlayered block for one clear read.
+   Shared CodeMirror 6 chrome (#838, generalized out of #753's
+   original ViewDefinition-only rules): the wrapper layout, focus treatment,
+   and the async server lint's underline/gutter/tooltip colors
+   that every CodeMirror mount in this crate shares, for the `.code-editor`
+   wrapper `code-editor.js`'s `HfsCodeEditor.mount` inserts before the
+   source textarea it replaces. Deliberately OUTSIDE the `tokens, base,
+   components, pages` layer system above: CodeMirror mounts its own
+   `<style>` via `StyleModule.mount` at runtime, and that stylesheet is
+   unlayered. Per the CSS Cascade Layers spec, *any* unlayered declaration
+   always beats *every* layered one, regardless of selector specificity — so
+   a `.cm-editor` override written inside `@layer components` would silently
+   lose to CodeMirror's own defaults no matter how many classes it stacked.
+   Living here, unlayered, is what lets these rules actually override the
+   library's baseTheme (the focus outline in particular) without
+   `!important`, which the rest of this file deliberately avoids (see the
+   `.kv-grid--flush` comment above). Only the CodeMirror-facing rules need
+   this; everything about `.code-editor__source--mounted` (the hidden
+   textarea) is ordinary layout, but it lives in this same unlayered block
+   for one clear read.
 
-   Sizing is on `.cm-editor` itself, not the `.vd-editor` wrapper: CodeMirror
-   already makes it a flex column with no explicit height, so a plain
-   min-height/max-height there is enough for `.cm-scroller`'s `height: 100%`
-   to resolve once content forces the max-height clamp, giving RF7's "min
-   320px, max ~70vh, scrolls internally" without measuring anything in JS.
-   --------------------------------------------------------------------------- */
+   What is deliberately NOT here: sizing (min/max-height) and token colors.
+   Those are per editor — `.vd-editor` below sets its own heights and
+   `.cmt-json-*`/`.cmt-fp-*` colors; `.sql-editor` does the
+   same for its own tokens — because different editors in this crate need
+   different heights and color palettes even though they share every other
+   rule below. */
 
-.vd-editor {
+.code-editor {
   width: 100%;
 }
 
-.vd-editor .cm-editor {
-  min-height: 320px;
-  max-height: 70vh;
+.code-editor .cm-editor {
   border: 1px solid var(--surface-border);
   border-radius: 10px;
   background: var(--input-bg, var(--surface));
 }
 
-.vd-editor .cm-editor.cm-focused {
+.code-editor .cm-editor.cm-focused {
   /* Same focus treatment as .json-editor:focus, the textarea this replaces. */
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
-.vd-editor .cm-scroller {
+.code-editor .cm-scroller {
   overflow: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.5;
 }
 
-.vd-editor .cm-content {
+.code-editor .cm-content {
   color: var(--text);
   padding: 12px 0;
 }
 
-.vd-editor .cm-gutters {
+.code-editor .cm-gutters {
   background: transparent;
   color: var(--muted);
   border-right: 1px solid var(--surface-border);
 }
 
-.vd-editor .cm-activeLine,
-.vd-editor .cm-activeLineGutter {
+.code-editor .cm-activeLine,
+.code-editor .cm-activeLineGutter {
   background: var(--accent-soft);
 }
 
-.vd-editor .cm-selectionBackground {
+.code-editor .cm-selectionBackground {
   background: var(--accent-soft);
 }
 
@@ -6167,11 +6305,11 @@ body.app-shell .pane {
    comment below), invisible over a dark `--input-bg`. Tying it to the
    theme's own text color keeps it visible, and exactly matching, in both
    themes without depending on CodeMirror's internal light/dark state. */
-.vd-editor .cm-cursor {
+.code-editor .cm-cursor {
   border-left-color: var(--text);
 }
 
-.vd-editor .cm-matchingBracket {
+.code-editor .cm-matchingBracket {
   background: var(--accent-soft);
   outline: 1px solid var(--accent);
   border-radius: 2px;
@@ -6185,13 +6323,156 @@ body.app-shell .pane {
    unthemed (fires regardless of light/dark), ignoring this app's palette
    entirely, and redundant once a lint diagnostic already covers the same
    span with its own (themed) underline. Cleared rather than recolored: the
-   squiggle alone (pure text-decoration, RF9) already reads as the single,
+   squiggle alone (pure text-decoration) already reads as the single,
    clean "VSCode-like" error indicator. Selector matches CM6's own
    `.cm-editor.cm-focused .cm-nonmatchingBracket` compound one extra class
-   over - a plain `.vd-editor .cm-nonmatchingBracket` ties CM6's specificity
-   and loses, since its <style> mounts (and so cascades) after this sheet. */
-.vd-editor .cm-editor.cm-focused .cm-nonmatchingBracket {
+   over - a plain `.code-editor .cm-nonmatchingBracket` ties CM6's
+   specificity and loses, since its <style> mounts (and so cascades) after
+   this sheet. */
+.code-editor .cm-editor.cm-focused .cm-nonmatchingBracket {
   background-color: transparent;
+}
+
+/* Lint hover tooltip chrome (#753 gate-fixes): @codemirror/lint's own
+   `.cm-tooltip` styling only exists under an internal `&light`/`&dark`
+   state — set once, globally, from whether any loaded theme extension
+   opted into `EditorView.darkTheme`, which no mount in this crate ever
+   does (the browser only knows syntax, not which app theme is active).
+   CodeMirror therefore always renders its `&light` variant, a hardcoded
+   `#f5f5f5`/`#bbb` box, while the tooltip's *text* still inherits this
+   page's real `--text` — white-on-`#f5f5f5` in dark, and a box that
+   matches neither surface in light. Recolored here as an ordinary app
+   popover instead: the same surface/border/radius/shadow recipe
+   `.menu__panel` already uses, so it reads as this UI's own chrome, not a
+   library default. (The bottom `cm-panel-lint` diagnostics panel is left
+   alone: nothing in the ViewDefinition editor's keymap can open it — no
+   `lintKeymap` is wired in `vd-editor.js` — so it is unreachable, not just
+   unstyled.) */
+.code-editor .cm-tooltip {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  box-shadow: var(--surface-shadow);
+  overflow: hidden;
+}
+
+.code-editor .cm-tooltip-lint {
+  max-width: 360px;
+  /* Vertical breathing room so a single-row diagnostic (the common case)
+     does not span the tooltip's full height and collide with its rounded
+     top/bottom-left corners - see the .cm-diagnostic-error comment below
+     for what that collision looked like. */
+  padding: 4px 0;
+}
+
+/* CM6's own `.cm-diagnostic` base sets `marginLeft: -1px` so a diagnostic's
+   severity bar sits flush against the tooltip's 1px border - fine against
+   CM6's original square-cornered box, but combined with the rounded,
+   clipped popover above it pushed the bar's square corners past the curve,
+   rendering as an oddly clipped (and, at the anti-aliased edge, washed-out)
+   pill instead of a clean accent bar (gate feedback). Zeroing the margin
+   keeps the bar fully inside the rounded box instead of flush with its edge. */
+.code-editor .cm-diagnostic {
+  margin-left: 0;
+}
+
+/* Server lint presentation (#753): the underline, gutter
+   marker, and tooltip/panel border CM6's own @codemirror/lint baseTheme
+   bakes fixed reds/oranges into (an inline SVG data URI for the underline
+   and the gutter dot, which cannot reference a CSS variable) are redrawn
+   here with --danger/--warn so both severities theme correctly in light and
+   dark. Nothing here blocks Save — diagnostics stay purely informational. */
+.code-editor .cm-lintRange-error {
+  background-image: none;
+  text-decoration: underline wavy var(--danger);
+}
+
+.code-editor .cm-lintRange-warning {
+  background-image: none;
+  text-decoration: underline wavy var(--warn);
+}
+
+.code-editor .cm-gutter-lint .cm-lint-marker {
+  width: 8px;
+  height: 8px;
+  margin: 0.5em auto 0;
+  border-radius: 50%;
+}
+
+.code-editor .cm-lint-marker-error {
+  background: var(--danger);
+}
+
+.code-editor .cm-lint-marker-warning {
+  background: var(--warn);
+}
+
+.code-editor .cm-diagnostic-error,
+.code-editor .cm-diagnostic-warning {
+  /* CM6's own base is a 5px bar - thinned to a subtle accent stripe
+     (VSCode's own hover card uses a similarly thin severity rule), not a
+     block. */
+  border-left-width: 3px;
+}
+
+.code-editor .cm-diagnostic-error {
+  border-left-color: var(--danger);
+}
+
+.code-editor .cm-diagnostic-warning {
+  border-left-color: var(--warn);
+}
+
+/* jsonParseLinter()'s local syntax pass reports a single point, not a range,
+   so CM6 renders it as a small triangle (.cm-lintPoint) rather than an
+   underline — same --danger/--warn recoloring, different selector. */
+.code-editor .cm-lintPoint::after {
+  border-bottom-color: var(--danger);
+}
+
+.code-editor .cm-lintPoint-warning::after {
+  border-bottom-color: var(--warn);
+}
+
+/* The textarea code-editor.js mounts over: present for the form (its
+   `name` attribute still submits), hidden from sight and the accessibility
+   tree so it does not shadow the editor's own role="textbox" (CM6's
+   default) landmark. */
+.code-editor__source--mounted {
+  display: none;
+}
+
+/* ---------------------------------------------------------------------------
+   ViewDefinition editor (#753, generalized in #838): only what is specific to
+   this editor now lives here — its heights and its two token palettes
+   (JSON, FHIRPath). Everything CodeMirror-generic moved to `.code-editor`
+   above.
+
+   Sizing is on `.cm-editor` itself, not the `.vd-editor` wrapper: CodeMirror
+   already makes it a flex column with no explicit height, so a plain
+   min-height/max-height there is enough for `.cm-scroller`'s `height: 100%`
+   to resolve once content forces the max-height clamp, giving the
+   "min 320px, max ~70vh, scrolls internally" shape (#753) without
+   measuring anything in JS.
+   --------------------------------------------------------------------------- */
+
+.vd-editor .cm-editor {
+  min-height: 320px;
+  max-height: 70vh;
+}
+
+/* RF8 (#752 ticket 02): the plain `<textarea>` fallback's own height — the
+   same "min 320px, max ~70vh, scroll internally" cotas `.cm-editor` gets
+   above, so nojs and the pre-mount flash match the mounted editor's
+   footprint instead of the old fixed `rows="18"`. Scoped to this page's
+   form rather than `.json-editor` itself, which `sql-library.html` still
+   uses with its original sizing (#839 will give that page the same
+   treatment separately). */
+#vd-editor-form textarea.json-editor {
+  min-height: 320px;
+  max-height: 70vh;
+  overflow-y: auto;
 }
 
 /* JSON token colors — the same variables the Resource Editor's raw JSON
@@ -6215,110 +6496,29 @@ body.app-shell .pane {
 .vd-editor .cmt-fp-constant { color: var(--fp-constant); font-weight: 600; }
 .vd-editor .cmt-fp-comment { color: var(--fp-comment); font-style: italic; }
 
-/* Lint hover tooltip chrome (#753 gate-fixes): @codemirror/lint's own
-   `.cm-tooltip` styling only exists under an internal `&light`/`&dark`
-   state — set once, globally, from whether any loaded theme extension
-   opted into `EditorView.darkTheme`, which this mount never does (§4 of the
-   evaluation doc: the browser only knows syntax, not which app theme is
-   active). CodeMirror therefore always renders its `&light` variant, a
-   hardcoded `#f5f5f5`/`#bbb` box, while the tooltip's *text* still inherits
-   this page's real `--text` — white-on-`#f5f5f5` in dark, and a box that
-   matches neither surface in light. Recolored here as an ordinary app
-   popover instead: the same surface/border/radius/shadow recipe
-   `.menu__panel` already uses, so it reads as this UI's own chrome, not a
-   library default. (The bottom `cm-panel-lint` diagnostics panel is left
-   alone: nothing in this POC's keymap can open it — no `lintKeymap` is
-   wired in `vd-editor.js` — so it is unreachable, not just unstyled.) */
-.vd-editor .cm-tooltip {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--surface-border);
-  border-radius: 10px;
-  box-shadow: var(--surface-shadow);
-  overflow: hidden;
+/* ---------------------------------------------------------------------------
+   SQL editor (#838, sql-editor.js): mounted over the SQL pane's
+   `<textarea name="sql">` on /ui/sql/queries and /ui/sql/views. Same
+   min-height-grows / max-height-scrolls shape as .vd-editor above, just
+   shorter — the SQL pane is a single query, not a full ViewDefinition
+   document — and one token palette instead of two (no injected language). */
+
+.sql-editor .cm-editor {
+  min-height: 180px;
+  max-height: 60vh;
 }
 
-.vd-editor .cm-tooltip-lint {
-  max-width: 360px;
-  /* Vertical breathing room so a single-row diagnostic (the common case)
-     does not span the tooltip's full height and collide with its rounded
-     top/bottom-left corners - see the .cm-diagnostic-error comment below
-     for what that collision looked like. */
-  padding: 4px 0;
-}
-
-/* CM6's own `.cm-diagnostic` base sets `marginLeft: -1px` so a diagnostic's
-   severity bar sits flush against the tooltip's 1px border - fine against
-   CM6's original square-cornered box, but combined with the rounded,
-   clipped popover above it pushed the bar's square corners past the curve,
-   rendering as an oddly clipped (and, at the anti-aliased edge, washed-out)
-   pill instead of a clean accent bar (gate feedback). Zeroing the margin
-   keeps the bar fully inside the rounded box instead of flush with its edge. */
-.vd-editor .cm-diagnostic {
-  margin-left: 0;
-}
-
-/* Server lint presentation (#753 ticket 03, RF9): the underline, gutter
-   marker, and tooltip/panel border CM6's own @codemirror/lint baseTheme
-   bakes fixed reds/oranges into (an inline SVG data URI for the underline
-   and the gutter dot, which cannot reference a CSS variable) are redrawn
-   here with --danger/--warn so both severities theme correctly in light and
-   dark. Nothing here blocks Save — diagnostics stay purely informational. */
-.vd-editor .cm-lintRange-error {
-  background-image: none;
-  text-decoration: underline wavy var(--danger);
-}
-
-.vd-editor .cm-lintRange-warning {
-  background-image: none;
-  text-decoration: underline wavy var(--warn);
-}
-
-.vd-editor .cm-gutter-lint .cm-lint-marker {
-  width: 8px;
-  height: 8px;
-  margin: 0.5em auto 0;
-  border-radius: 50%;
-}
-
-.vd-editor .cm-lint-marker-error {
-  background: var(--danger);
-}
-
-.vd-editor .cm-lint-marker-warning {
-  background: var(--warn);
-}
-
-.vd-editor .cm-diagnostic-error,
-.vd-editor .cm-diagnostic-warning {
-  /* CM6's own base is a 5px bar - thinned to a subtle accent stripe
-     (VSCode's own hover card uses a similarly thin severity rule), not a
-     block. */
-  border-left-width: 3px;
-}
-
-.vd-editor .cm-diagnostic-error {
-  border-left-color: var(--danger);
-}
-
-.vd-editor .cm-diagnostic-warning {
-  border-left-color: var(--warn);
-}
-
-/* jsonParseLinter() (RF7's local pass) reports a single point, not a range,
-   so CM6 renders it as a small triangle (.cm-lintPoint) rather than an
-   underline — same --danger/--warn recoloring, different selector. */
-.vd-editor .cm-lintPoint::after {
-  border-bottom-color: var(--danger);
-}
-
-.vd-editor .cm-lintPoint-warning::after {
-  border-bottom-color: var(--warn);
-}
-
-/* The textarea vd-editor.js mounts over: present for the form (name="json"
-   still submits), hidden from sight and the accessibility tree so it does
-   not shadow the editor's own role="textbox" (CM6's default) landmark. */
-.vd-editor__source--mounted {
-  display: none;
-}
+/* SQL token colors — one class per @codemirror/lang-sql tag group this
+   editor assigns (sql-editor.js has the full tag -> class mapping and why
+   Identifier/Builtin are left uncolored). Keywords and boolean/null
+   literals read as bold, matching the JSON/FHIRPath editor's own weight
+   convention for "reserved word" tokens; comments read as italic. */
+.sql-editor .cmt-sql-keyword { color: var(--sql-keyword); font-weight: 600; }
+.sql-editor .cmt-sql-type { color: var(--sql-type); }
+.sql-editor .cmt-sql-string { color: var(--sql-string); }
+.sql-editor .cmt-sql-number { color: var(--sql-number); }
+.sql-editor .cmt-sql-operator { color: var(--sql-operator); }
+.sql-editor .cmt-sql-variable { color: var(--sql-variable); }
+.sql-editor .cmt-sql-comment { color: var(--sql-comment); font-style: italic; }
+.sql-editor .cmt-sql-punct { color: var(--sql-punct); }
+.sql-editor .cmt-sql-literal { color: var(--sql-literal); font-weight: 600; }

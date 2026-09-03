@@ -235,11 +235,16 @@ impl MongoBackend {
         let loader_cache = stored_by_tenant.clone();
         let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
             move |tenant_id: &str| {
-                loader_cache
-                    .read()
-                    .get(tenant_id)
-                    .cloned()
-                    .unwrap_or_default()
+                // A HashMap lookup cannot fail the way a live query can — a
+                // missing entry legitimately means "no stored params yet",
+                // not "load failed" — so this always reports success (#787).
+                Some(
+                    loader_cache
+                        .read()
+                        .get(tenant_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
             },
         )));
         Self::initialize_search_registry(registries.base(), &config);
@@ -519,7 +524,15 @@ impl MongoBackend {
     }
 
     /// Returns the configured MongoDB database handle.
-    pub(crate) async fn get_database(&self) -> StorageResult<Database> {
+    ///
+    /// `#[doc(hidden)] pub` rather than `pub(crate)` only so the out-of-crate
+    /// bulk-export window tests (`tests/mongodb_tests.rs`) can pin a stored
+    /// resource's `last_updated` and assert on `_since`/`_until` without
+    /// depending on wall-clock timing. It hands out a raw database handle that
+    /// bypasses tenant scoping, so it is not stable API — workspace callers
+    /// should use the `ResourceStorage`/`SearchProvider` methods instead.
+    #[doc(hidden)]
+    pub async fn get_database(&self) -> StorageResult<Database> {
         let client = self.get_client().await?;
         Ok(client.database(&self.config.database_name))
     }

@@ -271,6 +271,9 @@ test("Bulk Export can narrow through a conflicting native form without JavaScrip
   bulkExport,
 }) => {
   await page.goto("/ui/bulk-export/new");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
+  await bulkExport.nameInput.fill("No-JS All Resources");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
 
   await expect(bulkExport.allResources).toBeChecked();
   await expect(bulkExport.typeCheckboxes).not.toHaveCount(0);
@@ -308,6 +311,7 @@ test("Bulk Export submits an exact custom instant without JavaScript", async ({
   bulkExport,
 }) => {
   await page.goto("/ui/bulk-export/new");
+  await bulkExport.nameInput.fill("No-JS custom instant");
 
   const instant = "2026-08-01T00:00:00Z";
   await bulkExport.sincePreset.selectOption("custom");
@@ -328,6 +332,81 @@ test("Bulk Export submits an exact custom instant without JavaScript", async ({
   const params = new URLSearchParams(request.postData() ?? "");
   expect(params.get("since_preset")).toBe("custom");
   expect(params.get("since_custom")).toBe(instant);
+});
+
+test("Bulk Export shows both invalid fields and Clear starts fresh without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.goto("/ui/bulk-export/new");
+  await expect(bulkExport.form).toHaveAttribute("novalidate", "");
+  await bulkExport.nameInput.fill("   ");
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientFallback.fill("Patient/p-104, Patient/p-205");
+  await bulkExport.allResources.uncheck();
+  await bulkExport.typeCheckbox("Patient").check();
+  await bulkExport.form.locator('input[name="elements"]').fill("id,meta");
+  await bulkExport.form
+    .locator('input[name="type_filter"]')
+    .fill("Patient?active=true");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("not-an-instant");
+
+  const submitted = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/ui/bulk-export") &&
+      response.request().method() === "POST",
+  );
+  await bulkExport.startButton.click();
+  expect((await submitted).status()).toBe(400);
+
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(bulkExport.nameInput).toHaveValue("   ");
+  await expect(bulkExport.nameInput).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.nameInput).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-name-error",
+  );
+  await expect(bulkExport.nameError).toHaveText("Enter a name for this export.");
+  await expect(bulkExport.nameInput).toBeFocused();
+  await expect(bulkExport.scopeRadio("patient")).toBeChecked();
+  await expect(bulkExport.patientFallback).toHaveValue("Patient/p-104, Patient/p-205");
+  await expect(bulkExport.allResources).not.toBeChecked();
+  await expect(bulkExport.typeCheckbox("Patient")).toBeChecked();
+  await expect(bulkExport.form.locator('input[name="elements"]')).toHaveValue("id,meta");
+  await expect(bulkExport.form.locator('input[name="type_filter"]')).toHaveValue(
+    "Patient?active=true",
+  );
+  await expect(bulkExport.sincePreset).toHaveValue("custom");
+  await expect(bulkExport.sinceCustom).toHaveValue("not-an-instant");
+  await expect(bulkExport.sinceCustom).toBeEnabled();
+  await expect(bulkExport.sinceCustom).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.sinceCustom).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-since-custom-error",
+  );
+  await expect(bulkExport.sinceCustomError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+
+  await bulkExport.clearLink.click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export\/new$/);
+  await expect(bulkExport.nameInput).toHaveValue("");
+  await expect(bulkExport.scopeRadio("system")).toBeChecked();
+  await expect(bulkExport.patientFallback).toHaveValue("");
+  await expect(bulkExport.allResources).toBeChecked();
+  expect(
+    await bulkExport.typeCheckboxes.evaluateAll((types) =>
+      types.every(
+        (type) => !(type as HTMLInputElement).checked && !(type as HTMLInputElement).disabled,
+      ),
+    ),
+  ).toBe(true);
+  await expect(bulkExport.sincePreset).toHaveValue("");
+  await expect(bulkExport.sinceCustom).toHaveValue("");
+  await expect(bulkExport.sinceCustom).toBeEnabled();
+  await expect(bulkExport.nameError).toBeHidden();
+  await expect(bulkExport.sinceCustomError).toBeHidden();
 });
 
 test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
@@ -355,12 +434,13 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   expect(await startExport.getAttribute("aria-busy")).toBeNull();
 
   const exportName = `no-js-export-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  await form.locator('input[name="name"]').fill(exportName);
+  await form.locator('input[name="name"]').fill(`  ${exportName}  `);
   await form.locator('input[name="scope"][value="system"]').check();
   await startExport.click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
   let card = page.locator(".job-card").filter({ hasText: exportName });
   await expect(card).toBeVisible();
+  await expect(card.locator(".job-card__name")).toHaveText(exportName);
 
   await card.getByRole("button", { name: "Cancel" }).click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
@@ -382,15 +462,58 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
 });
 
+// #838: sql-editor.js never loads (this project runs with
+// javaScriptEnabled: false), so the SQL pane stays the plain textarea it
+// is today — visible, holding the decoded SQL, editable, and saved by a
+// real form POST.
+test("the SQL Queries pane is a plain textarea and Save persists without JavaScript", async ({
+  page,
+  request,
+}) => {
+  const sql = "SELECT id FROM v";
+  const libId = await createResource(request, "Library", {
+    name: `nojs_sql_query_${Date.now()}`,
+    status: "active",
+    type: {
+      coding: [
+        {
+          system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+          code: "sql-query",
+        },
+      ],
+    },
+    content: [{ contentType: "application/sql", data: Buffer.from(sql).toString("base64") }],
+  });
+  await waitSearchable(request, "Library", libId);
+
+  await page.goto(`/ui/sql/queries?lib=${libId}`);
+  const textarea = page.locator("textarea[name='sql']");
+  await expect(textarea).toBeVisible();
+  await expect(textarea).toHaveValue(sql);
+  // No editor script ran, so no CodeMirror wrapper was inserted.
+  await expect(page.locator(".sql-editor")).toHaveCount(0);
+
+  const updated = "SELECT name FROM v";
+  await textarea.fill(updated);
+  await page.locator("button[name='action'][value='save']").click();
+  await expect(page).toHaveURL(/saved=1/);
+  await expect(page.locator("textarea[name='sql']")).toHaveValue(updated);
+});
+
 test("Bulk Export accepts comma- and newline-separated Patient IDs without JavaScript", async ({
   page,
   bulkExport,
 }) => {
   await page.goto("/ui/bulk-export/new");
+  await bulkExport.nameInput.fill("No-JS patient IDs");
   await bulkExport.scopeRadio("patient").check();
 
   await expect(bulkExport.patientFallback).toBeVisible();
   await expect(bulkExport.patientFallback).toBeEnabled();
+  await expect(bulkExport.patientFallback).toHaveAttribute("placeholder", "Patient FHIR IDs");
+  await expect(page.locator("#bulk-export-patients-fallback-hint")).toContainText(
+    "separated by commas or new lines",
+  );
   const patientRefs = "Patient/p-104, Patient/p-205\nPatient/p-306";
   await bulkExport.patientFallback.fill(patientRefs);
 

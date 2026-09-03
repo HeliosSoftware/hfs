@@ -295,6 +295,8 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | ES index name prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | *(none)* | ES basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | ES basic auth password |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
+| `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
 
 **PostgreSQL** (used to assemble a connection when `HFS_DATABASE_URL` is not set)
 

@@ -351,6 +351,46 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             content_length,
         ))
     }
+
+    async fn file_size(
+        &self,
+        url: &str,
+        request_headers: &[(String, String)],
+        requires_access_token: bool,
+        oauth_metadata_urls: &[String],
+    ) -> StorageResult<Option<u64>> {
+        // Identity encoding on purpose: a gzip Content-Length would be the
+        // compressed size, and the ingestion counts decompressed bytes.
+        let mut rb = self.client.head(url);
+        if requires_access_token {
+            let Some(provider) = &self.token_provider else {
+                return Ok(None);
+            };
+            let Some(token) = provider
+                .token(oauth_metadata_urls, &self.outbound_scope)
+                .await
+            else {
+                return Ok(None);
+            };
+            rb = rb.bearer_auth(token);
+        }
+        for (name, value) in request_headers {
+            rb = rb.header(name.as_str(), value.as_str());
+        }
+        // Strictly best-effort: providers without HEAD support (405, 4xx/5xx,
+        // network refusal) degrade to lazy per-file accumulation, never to an
+        // error. The size comes from the Content-Length *header* — a HEAD
+        // response has no payload, so `Response::content_length()` (the body
+        // size hint) reports 0 regardless of what the header advertises.
+        match rb.send().await {
+            Ok(resp) if resp.status().is_success() => Ok(resp
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())),
+            _ => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]

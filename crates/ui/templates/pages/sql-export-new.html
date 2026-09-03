@@ -1,0 +1,59 @@
+{% extends "layouts/base.html" %}
+
+{#
+  SQL Export builder (#833, #649): pick stored subjects, submit one
+  $sql-export job. The kick-off redirects to the Active SQL Exports list
+  (/ui/sql/export), which is the feedback — this page holds no job state of
+  its own. Submission is a plain form, so it works without JavaScript. The
+  restyle of this form is #834.
+#}
+
+{% block title %}{{ i18n.t("sql-export-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("sql-export-title") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("sql-export-lede") }}</p>
+</section>
+
+{% if let Some(message) = degraded %}
+<p class="notice notice--warn">{{ i18n.t("lib-degraded") }} {{ message }}</p>
+{% endif %}
+{% if let Some(error) = start_error %}
+<p class="notice notice--warn">{{ i18n.t("export-start-failed") }} {{ error }}</p>
+{% endif %}
+
+<section class="card">
+  <div class="card-head">
+    <h3>{{ i18n.t("export-new-heading") }}</h3>
+  </div>
+  {% if subjects.is_empty() %}
+  <div class="card__body"><p class="page-head__lede">{{ i18n.t("export-no-subjects") }}</p></div>
+  {% else %}
+  <form method="post" action="/ui/sql/export" class="card__body detail-stack">
+    {% for s in subjects %}
+    <div class="detail__field">
+      <span><label><input type="checkbox" name="subject" value="{{ s.reference }}"> {{ s.name }}</label></span>
+      <div><span class="tag">{{ s.kind_label }}</span></div>
+    </div>
+    {% endfor %}
+    <div class="detail__field">
+      <span><label for="export-format">{{ i18n.t("export-format") }}</label></span>
+      <div>
+        <select id="export-format" name="format" class="field__input">
+          <option value="ndjson">ndjson</option>
+          <option value="csv">csv</option>
+          <option value="json">json</option>
+          <option value="parquet">parquet</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button type="submit" class="btn btn--primary">{{ i18n.t("export-start") }}</button>
+    </div>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}
