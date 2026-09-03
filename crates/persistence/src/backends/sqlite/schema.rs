@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 18;
+pub const SCHEMA_VERSION: i32 = 19;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -201,6 +201,7 @@ fn create_indexes(conn: &Connection) -> StorageResult<()> {
         // Resources table indexes
         "CREATE INDEX IF NOT EXISTS idx_resources_type ON resources(tenant_id, resource_type)",
         "CREATE INDEX IF NOT EXISTS idx_resources_updated ON resources(tenant_id, last_updated)",
+        "CREATE INDEX IF NOT EXISTS idx_resources_reindex ON resources(tenant_id, resource_type, last_updated, id)",
         // History table indexes
         "CREATE INDEX IF NOT EXISTS idx_history_resource ON resource_history(tenant_id, resource_type, id)",
         "CREATE INDEX IF NOT EXISTS idx_history_updated ON resource_history(tenant_id, last_updated)",
@@ -299,6 +300,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             15 => migrate_v15_to_v16(conn)?,
             16 => migrate_v16_to_v17(conn)?,
             17 => migrate_v17_to_v18(conn)?,
+            18 => migrate_v18_to_v19(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1422,6 +1424,21 @@ fn migrate_v17_to_v18(conn: &Connection) -> StorageResult<()> {
                 .map_err(|e| migration_err(format!("add manifest byte columns: {e}")))?;
         }
     }
+    Ok(())
+}
+
+/// v19: keyset-pagination index for reindex page fetches.
+///
+/// fetch_resources_page orders by (last_updated, id) within a
+/// (tenant_id, resource_type) — with no covering index every page pays a
+/// sort of the whole type, which turns a 5.7M-row Observation reindex
+/// quadratic (#903).
+fn migrate_v18_to_v19(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_resources_reindex          ON resources(tenant_id, resource_type, last_updated, id)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create idx_resources_reindex: {e}")))?;
     Ok(())
 }
 

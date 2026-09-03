@@ -379,6 +379,15 @@ impl<T> BulkSubmitJobStore for T where
 {
 }
 
+/// Rebuilds deferred search indexes once a manifest finishes ingesting
+/// (bulk fast-load, #903). Implemented over the reindex machinery by the
+/// server wiring; fire-and-forget from the worker's perspective.
+#[async_trait]
+pub trait DeferredReindexHook: Send + Sync {
+    /// Kicks a reindex of the given resource types for the tenant.
+    async fn reindex_types(&self, tenant: &TenantContext, resource_types: Vec<String>);
+}
+
 /// The default in-process submit worker.
 ///
 /// Binds a [`BulkSubmitJobStore`] (job state + claim + worker storage + ingestion
@@ -392,6 +401,11 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     output: Arc<Os>,
     #[allow(dead_code)]
     worker_id: WorkerId,
+    /// Bulk fast-load (#903): ingest without search indexing, then reindex.
+    defer_indexing: bool,
+    /// Rebuilds the deferred indexes after each finished manifest. Without a
+    /// hook, deferred mode still ingests and logs that $reindex is owed.
+    reindex_hook: Option<Arc<dyn DeferredReindexHook>>,
 }
 
 /// A pass-through [`AsyncBufRead`] that adds every consumed byte to a shared
@@ -529,7 +543,21 @@ where
             fetcher,
             output,
             worker_id,
+            defer_indexing: false,
+            reindex_hook: None,
         }
+    }
+
+    /// Enables bulk fast-load: entries ingest without search-index/FTS
+    /// writes, and the hook (when set) rebuilds them per finished manifest.
+    pub fn with_deferred_indexing(
+        mut self,
+        defer: bool,
+        hook: Option<Arc<dyn DeferredReindexHook>>,
+    ) -> Self {
+        self.defer_indexing = defer;
+        self.reindex_hook = hook;
+        self
     }
 
     /// Drives a single claimed manifest to a terminal state.
@@ -592,6 +620,7 @@ where
         let progress = ByteProgress::default();
         let opts = BulkProcessingOptions::new()
             .with_import_mode(import_mode)
+            .with_defer_indexing(self.defer_indexing)
             .with_byte_progress(progress.clone());
         let mut processed: u64 = 0;
         let mut failed: u64 = 0;
@@ -780,6 +809,38 @@ where
         // 4. Mark the manifest complete.
         if let Err(LeaseError::Storage(e)) = self.jobs.finish_manifest(&lease).await {
             return Err(e);
+        }
+
+        // 5. Fast-load (#903): the manifest ingested without search indexing —
+        // rebuild the indexes for its resource types now. Fire-and-forget:
+        // the manifest is already terminal, and the hook drives the same
+        // machinery $reindex does.
+        if self.defer_indexing {
+            let mut types: Vec<String> = manifest
+                .output
+                .iter()
+                .filter_map(|f| f.resource_type.clone())
+                .collect();
+            types.sort();
+            types.dedup();
+            match (&self.reindex_hook, types.is_empty()) {
+                (Some(hook), false) => {
+                    tracing::info!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        types = ?types,
+                        "bulk fast-load: rebuilding deferred search indexes"
+                    );
+                    hook.reindex_types(&lease.tenant, types).await;
+                }
+                _ => {
+                    tracing::warn!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        "bulk fast-load ingested without indexing and no reindex \n                         hook is wired — run $reindex to make the data searchable"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1142,6 +1203,18 @@ mod tests {
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
     use std::time::Duration as StdDuration;
 
+    /// Captures the deferred-reindex callbacks the worker fires.
+    struct MockReindexHook {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl DeferredReindexHook for MockReindexHook {
+        async fn reindex_types(&self, _tenant: &TenantContext, resource_types: Vec<String>) {
+            self.calls.lock().unwrap().push(resource_types);
+        }
+    }
+
     /// A fetcher that returns a fixed manifest and serves NDJSON from memory.
     struct MockFetcher {
         files: std::collections::HashMap<String, Vec<u8>>,
@@ -1272,6 +1345,153 @@ mod tests {
         // Byte progress reached the file's full advertised size.
         assert_eq!(manifests[0].bytes_total, ndjson.len() as u64);
         assert_eq!(manifests[0].bytes_processed, ndjson.len() as u64);
+    }
+
+    /// #903 fast-load: deferred ingestion stores readable resources that are
+    /// invisible to search, fires the reindex hook with the manifest's types,
+    /// and the real reindex machinery then makes them searchable.
+    #[tokio::test]
+    async fn test_deferred_indexing_defers_search_and_fires_the_hook() {
+        use crate::search::{ReindexOnFinish, ReindexOperation};
+        use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+
+        // A data dir gives the tenant a real SearchParameter registry — the
+        // reindex half of this test extracts through it.
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap();
+        let backend = Arc::new(
+            SqliteBackend::with_config(
+                ":memory:",
+                crate::backends::sqlite::SqliteBackendConfig {
+                    data_dir: Some(data_dir),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ndjson = "{\"resourceType\":\"Patient\",\"id\":\"defer-1\",\"name\":[{\"family\":\"Deferred\"}]}\n";
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/patient.ndjson".to_string(),
+            ndjson.as_bytes().to_vec(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: "http://provider/patient.ndjson".to_string(),
+                    count: Some(1),
+                }],
+                deleted: vec![],
+            },
+        });
+
+        let hook = Arc::new(MockReindexHook {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("defer-worker"),
+        )
+        .with_deferred_indexing(true, Some(hook.clone()));
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("defer-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        // Readable immediately…
+        assert!(
+            backend
+                .read(&tenant, "Patient", "defer-1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // …but invisible to search: the index writes were deferred.
+        let by_name = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "family".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Deferred")],
+            chain: vec![],
+            components: vec![],
+        });
+        use crate::core::search::SearchProvider;
+        let found = backend.search(&tenant, &by_name).await.unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            0,
+            "deferred ingest must not index"
+        );
+
+        // The hook received the manifest's resource types.
+        assert_eq!(
+            hook.calls.lock().unwrap().clone(),
+            vec![vec!["Patient".to_string()]]
+        );
+
+        // The real hook + reindex machinery restores searchability.
+        let op = Arc::new(ReindexOperation::new(
+            backend.clone(),
+            backend.tenant_registries().clone(),
+        ));
+        let real_hook = ReindexOnFinish::new(op);
+        DeferredReindexHook::reindex_types(&real_hook, &tenant, vec!["Patient".to_string()]).await;
+        // The reindex runs as a spawned background job — poll briefly.
+        let mut visible = false;
+        for _ in 0..50 {
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+            if backend
+                .search(&tenant, &by_name)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .len()
+                == 1
+            {
+                visible = true;
+                break;
+            }
+        }
+        assert!(
+            visible,
+            "reindex must make the deferred resources searchable"
+        );
     }
 
     /// #874: with every file's size known up front, the byte denominator is
