@@ -62,15 +62,30 @@
       </div>
     </div>
 
-    <div class="field">
-      <label class="field__label" for="hts-import-file">
-        {{ chrome.i18n.t("hts-import-bundle-file-label") }}
-      </label>
+    {#-
+      File source: a drop zone that accepts dragged JSON files or a click to
+      browse, mirroring the Batch page's `.batch-drop` affordance. The hidden
+      `<input type="file">` is the no-JS fallback — it must remain in the DOM
+      so the native form still works without script. `assets/import.js` wires
+      the drop zone to FileReader.readAsText() and populates `#hts-import-bundle`.
+      Data attributes carry i18n strings for JS-driven messages.
+    -#}
+    <div class="field"
+         id="hts-import-file-field"
+         data-msg-reading="{{ chrome.i18n.t("hts-import-reading") }}"
+         data-msg-read-failed="{{ chrome.i18n.t("hts-import-read-failed") }}"
+         data-msg-too-large="{{ chrome.i18n.t("hts-import-file-too-large") }}">
+      <span class="field__label">{{ chrome.i18n.t("hts-import-bundle-file-label") }}</span>
+      <button type="button" class="batch-drop" id="hts-import-drop">
+        <strong>{{ chrome.i18n.t("hts-import-drop-hint") }}</strong>
+        <span>{{ chrome.i18n.t("hts-import-drop-browse") }}</span>
+      </button>
       <input id="hts-import-file"
-             class="field__input"
-             name="bundle_file"
              type="file"
-             accept="application/json,application/fhir+json,.json">
+             name="bundle_file"
+             accept="application/json,application/fhir+json,.json"
+             hidden>
+      <p class="alert" id="hts-import-file-error" role="alert" hidden></p>
       <span class="field__hint">{{ chrome.i18n.t("hts-import-file-hint") }}</span>
     </div>
 

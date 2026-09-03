@@ -1356,8 +1356,8 @@ hts-vs-expand-total = total { $n }
 ## live under `hts-import-*`; `hts-nav-import` above is the sidebar
 ## label reused from the Phase 1 stub set.
 
-hts-import-title = Import terminology
-hts-import-heading = Import terminology
+hts-import-title = Import Terminology
+hts-import-heading = Import Terminology
 hts-import-help = Submit a FHIR JSON Bundle. HTS accepts CodeSystem, ValueSet, and ConceptMap resources in one POST.
 hts-import-source-legend = Source
 hts-import-source-paste = Paste JSON
@@ -1392,6 +1392,11 @@ hts-import-step-source = Choose source
 hts-import-step-review = Review
 hts-import-step-result = Result
 hts-import-file-hint = JSON only. The file is read in your browser and copied into the Bundle field below; nothing is sent until you submit.
+hts-import-drop-hint = Drop a bundle JSON file here
+hts-import-drop-browse = or click to browse
+hts-import-reading = Reading file…
+hts-import-read-failed = The file could not be read.
+hts-import-file-too-large = File exceeds the ~7.5 MiB limit for urlencoded submission.
 hts-import-bundle-hint = The Bundle is posted to POST /import on the terminology server. Existing resources are matched on url + version.
 hts-import-review-target = Target server
 hts-import-review-request = Request
