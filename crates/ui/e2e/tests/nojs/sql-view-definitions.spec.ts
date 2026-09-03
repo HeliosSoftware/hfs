@@ -1,11 +1,11 @@
 import { expect, test } from "../../pages/fixtures";
 import { createResource, waitSearchable } from "../../pages/api";
 
-// #752 ticket 02, RF6: with JavaScript disabled the ViewDefinitions
-// playground has no live preview at all — htmx, vd-editor.js, and the
-// CodeMirror bundle are all inert here — only Save's own `?saved=1`
-// redirect (a plain form POST followed by a plain GET) fills the results
-// region, running the just-stored definition through $sql-run server-side.
+// #752: with JavaScript disabled the ViewDefinitions playground has no live
+// preview at all — htmx, vd-editor.js, and the CodeMirror bundle are all
+// inert here — only Save's own `?saved=1` redirect (a plain form POST
+// followed by a plain GET) fills the results region, running the
+// just-stored definition through $sql-run server-side.
 test("with JavaScript disabled, the results region only fills after Save", async ({
   page,
   request,
@@ -27,7 +27,7 @@ test("with JavaScript disabled, the results region only fills after Save", async
 
   await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
   // The editor is a plain, visible textarea — no CodeMirror bundle mounted,
-  // no Run button (RF1 removed it), and nothing has run yet server-side.
+  // no Run button (removed), and nothing has run yet server-side.
   const editor = page.locator("textarea[name='json']");
   await expect(editor).toBeVisible();
   await expect(editor).toContainText("e2e_nojs_playground");

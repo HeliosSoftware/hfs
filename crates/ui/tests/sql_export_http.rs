@@ -111,7 +111,7 @@ fn app(backend: &Arc<SqliteBackend>, source: StaticConformanceSource) -> Router 
 /// A [`SettingsStore`] whose reads delegate to a real backend but whose
 /// `patch_settings` always fails — simulating the settings-document write
 /// that `sql_export::start` performs right after a successful kick-off
-/// (#833 ticket 02 validation, observation 2).
+/// (#833).
 struct FailingPatchSettingsStore(Arc<SqliteBackend>);
 
 #[async_trait::async_trait]
@@ -532,8 +532,8 @@ async fn starting_an_export_stores_an_in_progress_record_and_the_list_polls_its_
             FhirVersion::R4,
             vec![view_definition("vd1", "patients")],
         )
-        // Keeps RF16's list-page poll from moving the job past in-progress,
-        // so this test can focus on the kick-off record and the card shape.
+        // Keeps the list-page poll from moving the job past in-progress, so
+        // this test can focus on the kick-off record and the card shape.
         .with_export_status(SqlExportStatus::Running(None));
     let app = app(&backend, source);
 
@@ -579,10 +579,10 @@ async fn starting_an_export_stores_an_in_progress_record_and_the_list_polls_its_
     assert!(html.contains("1 running"));
 }
 
-/// #833 ticket 02 validation, observation 2: a successful kick-off whose
-/// settings-store write then fails must not vanish silently — the redirect
-/// carries the server's job id, and the list shows a visible notice with a
-/// way to still reach Files, instead of just a `tracing::error!` no one sees.
+/// #833: a successful kick-off whose settings-store write then fails must
+/// not vanish silently — the redirect carries the server's job id, and the
+/// list shows a visible notice with a way to still reach Files, instead of
+/// just a `tracing::error!` no one sees.
 #[tokio::test]
 async fn a_kickoff_that_cannot_be_stored_still_surfaces_a_visible_notice() {
     let backend = backend_with_schema().await;
@@ -628,7 +628,7 @@ async fn a_kickoff_that_cannot_be_stored_still_surfaces_a_visible_notice() {
 }
 
 // ---------------------------------------------------------------------------
-// The poll state machine (RF12–RF16), exercised on directly-seeded jobs
+// The poll state machine, exercised on directly-seeded jobs
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -691,8 +691,8 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
     assert_eq!(job["status"], "complete");
     assert_eq!(
         job["outputs"],
-        // FALLA 2 gate-fix: the manifest's absolute location is persisted as
-        // a same-origin path.
+        // The manifest's absolute location is persisted as a same-origin
+        // path (#833).
         serde_json::json!([{"name": "patients", "locations": ["/export/job-1/patients-0.csv"]}])
     );
     assert!(!job["finishedAt"].as_str().unwrap_or_default().is_empty());
@@ -769,9 +769,9 @@ async fn an_unavailable_poll_keeps_the_job_in_progress_and_still_polls() {
     assert_eq!(job["pollError"], "status poll answered 401");
 }
 
-/// RF16: the list page itself polls an in-progress job before rendering, not
-/// just the card's own htmx fragment — a plain reload without JavaScript
-/// must see a server-side completion.
+/// The list page itself polls an in-progress job before rendering, not just
+/// the card's own htmx fragment — a plain reload without JavaScript must
+/// see a server-side completion.
 #[tokio::test]
 async fn the_list_page_transitions_a_job_without_htmx() {
     let backend = backend_with_schema().await;
@@ -883,8 +883,8 @@ async fn no_settings_store_reports_unavailable_without_a_new_button() {
     assert!(!html.contains(r#"href="/ui/sql/export/new""#));
     assert!(!html.contains("No SQL exports yet"));
 
-    // The builder still works without a settings store (RF9) — only the
-    // list's tracking is degraded.
+    // The builder still works without a settings store — only the list's
+    // tracking is degraded.
     let response = app
         .clone()
         .oneshot(get("/ui/sql/export/new"))
@@ -894,8 +894,8 @@ async fn no_settings_store_reports_unavailable_without_a_new_button() {
 }
 
 // ---------------------------------------------------------------------------
-// Gate-fix FALLA 1: $sql-export receives the subject's display name, not the
-// id segment of its reference (#833 manual gate, 2026-09-02)
+// $sql-export receives the subject's display name, not the id segment of
+// its reference (#833)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -946,7 +946,7 @@ async fn starting_an_export_submits_display_names_disambiguating_duplicates() {
 }
 
 // ---------------------------------------------------------------------------
-// Job actions: Cancel, Retry, Run again, Remove from list (#833 ticket 03)
+// Job actions: Cancel, Retry, Run again, Remove from list (#833)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1574,10 +1574,10 @@ async fn new_route_still_serves_the_builder_not_the_detail_route() {
     assert!(!html.contains("Not found"));
 }
 
-/// RF6/RF7: the contextual action and the overflow's items follow the
-/// status exactly, and Copy job id is always server-rendered `hidden`
-/// (RF8) — an in-progress card's overflow, which would otherwise hold
-/// nothing but that hidden button, starts hidden itself (RNF1).
+/// The contextual action and the overflow's items follow the status
+/// exactly, and Copy job id is always server-rendered `hidden` — an
+/// in-progress card's overflow, which would otherwise hold nothing but
+/// that hidden button, starts hidden itself.
 #[tokio::test]
 async fn card_shows_the_right_contextual_action_and_overflow_items_per_status() {
     async fn card_html(seed: serde_json::Value) -> String {

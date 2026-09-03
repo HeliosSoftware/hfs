@@ -39,8 +39,8 @@ test("selecting a row opens its detail", async ({ page, searchParameters }) => {
   await expect(searchParameters.detailTitle).toBeVisible();
 });
 
-// #754/#755 (RF1/RF2/RF3): the server remembers a chosen base type, and
-// "All types" is its own explicit, remembered state — never masked by a real
+// #754/#755: the server remembers a chosen base type, and "All types" is
+// its own explicit, remembered state — never masked by a real
 // type recorded earlier — reachable in one click no matter what.
 test("a chosen type and All types both survive leaving the page and coming back", async ({
   page,
@@ -65,7 +65,7 @@ test("a chosen type and All types both survive leaving the page and coming back"
 
   await searchParameters.allTypesLink.click();
   await page.waitForURL((url) => url.searchParams.get("base") === "");
-  expect(base()).toBe(""); // explicit "All types" marker (RF2), not omitted
+  expect(base()).toBe(""); // explicit "All types" marker, not omitted
   await expect(searchParameters.allTypesLink).toHaveAttribute("aria-current", "true");
 
   await chrome.navLink("/ui/resources").click();
@@ -81,7 +81,7 @@ test("a chosen type and All types both survive leaving the page and coming back"
   );
 });
 
-// RF6: the group is present-but-hidden until a base is picked, then shows it
+// The group is present-but-hidden until a base is picked, then shows it
 // with a live, current-marked entry — all server-rendered, no reload needed
 // since the base link is itself a real navigation (hx-boost).
 test("the recently-used group appears after a pick and marks it current", async ({

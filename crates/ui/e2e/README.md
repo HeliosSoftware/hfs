@@ -17,8 +17,8 @@ fixtures (`async ({ resources, history }) => …`); `pages/api.ts` seeds resourc
 over the REST API for state-dependent tests.
 
 Most projects share one server and one user (`l2:`, the default when auth is
-disabled) across every test. The server-side rail state introduced by the
-754/755 epic — "recently used" + "last selected" per page, stored in `rails`
+disabled) across every test. The server-side rail state introduced by
+#754/#755 — "recently used" + "last selected" per page, stored in `rails`
 under `/_user/settings` — is therefore per-*user*, not per-test: without a
 reset, a selection recorded by one test would still be there for the next one
 to restore from. `pages/fixtures.ts`'s `page` fixture resets `rails` (a merge

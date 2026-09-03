@@ -846,9 +846,9 @@ fn extract_bundle_resources(bundle: &Value) -> Vec<Value> {
 /// One `$sql-export` operation as [`StaticConformanceSource`] received it —
 /// which method, the [`Caller`] it was called with (#833), and — for
 /// `"start"` only — the `(output name, reference)` subjects submitted, so a
-/// test can assert on the output names a kick-off actually sent (#833
-/// gate-fix, FALLA 1) without standing up a real server. Empty for every
-/// other operation, which does not carry subjects.
+/// test can assert on the output names a kick-off actually sent (#833)
+/// without standing up a real server. Empty for every other operation,
+/// which does not carry subjects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedExportCall {
     /// `"start"`, `"status"`, `"cancel"`, or `"manifest"`.

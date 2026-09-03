@@ -24,8 +24,8 @@ import {
 // so there is no reliable way to observe it in-progress, let alone catch it
 // with Cancel. Padding the job with this many trivial subjects (a single
 // self-search round trip apiece) buys a window measured in seconds, long
-// enough for a real interaction, without ever waiting on a fixed clock
-// (RNF3): every wait below still polls actual DOM/network state.
+// enough for a real interaction, without ever waiting on a fixed clock:
+// every wait below still polls actual DOM/network state.
 const PADDING_SUBJECTS = 200;
 
 // Every padding `ViewDefinition` the test below seeds gets its id pushed
@@ -107,7 +107,7 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
 
   // The overflow would hold nothing but the JS-only Copy job id button while
   // in-progress, so the whole `<details>` starts (and, with no script to
-  // reveal it, stays) hidden — never a dead "…" control (RNF1 of ticket 03).
+  // reveal it, stays) hidden — never a dead "…" control.
   const overflow = cancelledCard.locator("details.menu");
   await expect(overflow).toHaveCount(1);
   await expect(overflow).toBeHidden();

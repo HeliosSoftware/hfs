@@ -47,7 +47,7 @@
 //! document's version, so a poll that loses a race against a concurrent
 //! removal of the same job never resurrects it.
 //!
-//! # Per-job actions (#833 ticket 03)
+//! # Per-job actions (#833)
 //!
 //! Cancel, Retry, Run again, and Remove from list ([`cancel`], [`retry`],
 //! [`rerun`], [`remove`]) are `POST`-only and always redirect back to the
@@ -141,10 +141,10 @@ pub(crate) fn manifest_outputs(manifest: &Value) -> Vec<ManifestOutput> {
 /// actually talking to (a reverse proxy, or simply a different port in
 /// development) — but the UI and the FHIR API are served by the same
 /// process, so a path-only link always resolves correctly regardless of
-/// what the manifest's advertised base URL says (#833 gate-fix, FALLA 2).
-/// Left unchanged when `location` does not parse as an absolute URL (it is
-/// already a bare path, or something this UI does not understand) — never
-/// invented, never dropped.
+/// what the manifest's advertised base URL says (#833). Left unchanged when
+/// `location` does not parse as an absolute URL (it is already a bare path,
+/// or something this UI does not understand) — never invented, never
+/// dropped.
 fn same_origin_location(location: &str) -> String {
     match reqwest::Url::parse(location) {
         Ok(url) => match url.query() {
@@ -161,7 +161,7 @@ fn same_origin_location(location: &str) -> String {
 
 /// One subject in a job's `subjects` list: what the checkbox on `/new`
 /// referred to, resolved once at kick-off time against the same list `/new`
-/// offered (RF10) so the card never has to re-resolve a reference later.
+/// offered so the card never has to re-resolve a reference later.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct JobSubject {
@@ -197,7 +197,7 @@ fn job_outputs(manifest: &Value) -> Vec<JobOutput> {
 #[serde(rename_all = "camelCase")]
 pub struct ExportJob {
     /// The server's job id; empty when the kick-off never got one (a failed
-    /// kick-off still leaves a `failed` card, per RF3).
+    /// kick-off still leaves a `failed` card).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub job_id: String,
     /// Optional user-supplied name (#834): trimmed by the builder before
@@ -285,7 +285,7 @@ fn optional_string(value: &str) -> Value {
 }
 
 /// An explicit merge value for every job field. Nulls clear fields left
-/// behind by an earlier lifecycle state (RF6), so one CAS patch is enough.
+/// behind by an earlier lifecycle state, so one CAS patch is enough.
 fn job_merge_value(job: &ExportJob) -> Value {
     json!({
         "jobId": optional_string(&job.job_id),
@@ -350,15 +350,15 @@ impl MemberExpectation<'_> {
     }
 }
 
-/// Same bound Bulk Export's job store retries a lost CAS with (#833's design
-/// explicitly follows that store — see the epic notes).
+/// Same bound Bulk Export's job store retries a lost CAS with — this store's
+/// design explicitly follows that one (#833).
 const SETTINGS_CAS_ATTEMPTS: usize = 3;
 
 /// Stores `job` under `id`, retrying a lost optimistic-locking race up to
 /// [`SETTINGS_CAS_ATTEMPTS`] times by reloading the document and checking
 /// `expectation` still holds. If the member was concurrently removed (or, for
 /// a fresh job, concurrently created), this gives up rather than recreating
-/// or clobbering it — the same rule Bulk Export's store applies (RF7).
+/// or clobbering it — the same rule Bulk Export's store applies.
 async fn store_job_conditionally(
     state: &WebState,
     user_key: &str,
@@ -387,7 +387,7 @@ async fn store_job_conditionally(
 }
 
 /// Deletes one job member via a `null` merge patch — the same removal idiom
-/// [`store_job`] uses for writes, applied to [`remove`] (RF4).
+/// [`store_job`] uses for writes, applied to [`remove`].
 async fn remove_job(
     state: &WebState,
     user_key: &str,
@@ -409,8 +409,8 @@ async fn remove_job(
 /// Removes `id`, retrying a lost CAS like [`store_job_conditionally`] up to
 /// [`SETTINGS_CAS_ATTEMPTS`] times. Gives up rather than deleting whatever
 /// the member concurrently became if it no longer matches
-/// `expected_member` (RF5) — a stale Remove must not erase a job a
-/// concurrent poll just updated.
+/// `expected_member` — a stale Remove must not erase a job a concurrent poll
+/// just updated.
 async fn remove_job_conditionally(
     state: &WebState,
     user_key: &str,
@@ -438,8 +438,8 @@ async fn remove_job_conditionally(
 }
 
 /// `complete` | `failed` | `cancelled` — every state `$sql-export` treats as
-/// finished. Rerun (RF3) and Remove (RF4) admit any of these; Retry (RF2)
-/// narrows this further to `failed` only.
+/// finished. Rerun and Remove admit any of these; Retry narrows this further
+/// to `failed` only.
 fn terminal_status(status: &str) -> bool {
     matches!(status, "complete" | "failed" | "cancelled")
 }
@@ -462,7 +462,7 @@ fn parse_job(value: &Value) -> ExportJob {
 /// ViewDefinitions/Libraries can share a `name`) are disambiguated with a
 /// `-2`, `-3`, ... suffix on the second and later occurrences, since the
 /// manifest's output name doubles as a downloaded shard's file name and the
-/// server does not deduplicate it for us (#833 gate-fix, FALLA 1).
+/// server does not deduplicate it for us (#833).
 fn subject_output_names(subjects: &[JobSubject]) -> Vec<String> {
     let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     subjects
@@ -480,15 +480,15 @@ fn subject_output_names(subjects: &[JobSubject]) -> Vec<String> {
 }
 
 /// Submits the job's subjects to `$sql-export`. On success, records the
-/// server's job id; on failure, the job becomes `failed` on the spot (RF3) —
-/// the caller still stores and redirects to the list, which is the feedback.
+/// server's job id; on failure, the job becomes `failed` on the spot — the
+/// caller still stores and redirects to the list, which is the feedback.
 async fn kickoff(state: &WebState, job: &mut ExportJob, caller: &Caller) {
-    // The output name is the subject's display name (RF19/RF20's card
-    // already shows the same name) rather than the reference's id segment
-    // (#833 gate-fix, FALLA 1): the manifest's output name is what Files
-    // shows and what a downloaded shard is named after, and a UUID id is
-    // meaningless there. subject_output_names() disambiguates two subjects
-    // that happen to share a display name.
+    // The output name is the subject's display name (the card already shows
+    // the same name) rather than the reference's id segment (#833): the
+    // manifest's output name is what Files shows and what a downloaded shard
+    // is named after, and a UUID id is meaningless there.
+    // subject_output_names() disambiguates two subjects that happen to share
+    // a display name.
     let names = subject_output_names(&job.subjects);
     let subjects: Vec<(String, String)> = job
         .subjects
@@ -511,7 +511,7 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, caller: &Caller) {
 }
 
 /// One status poll, applying exactly one of the transitions the module docs
-/// table describes. Never called more than once per job per request (RNF1).
+/// table describes. Never called more than once per job per request.
 async fn poll_job(state: &WebState, job: &mut ExportJob, caller: &Caller, i18n: &I18n) {
     match state
         .conformance
@@ -557,7 +557,7 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, caller: &Caller, i18n: 
     }
 }
 
-/// Polls every `in-progress` job in `snapshot` once (RF16) and persists each
+/// Polls every `in-progress` job in `snapshot` once and persists each
 /// transition, threading the settings document's version forward from write
 /// to write so a request that refreshes several jobs does not manufacture a
 /// spurious CAS conflict against its own earlier write.
@@ -630,7 +630,7 @@ pub(crate) struct ExportSubject {
 
 /// The stored subjects `$sql-export` can run: every ViewDefinition, and every
 /// Library carrying a SQL on FHIR kind. Shared by `/new` (offering the
-/// checkboxes) and the kick-off handler (resolving what was checked, RF10).
+/// checkboxes) and the kick-off handler (resolving what was checked).
 async fn export_subjects(
     state: &WebState,
     version: helios_fhir::FhirVersion,
@@ -690,7 +690,7 @@ struct JobCard {
     /// `0`–`100` for the progress track: terminal states fill the bar,
     /// in-progress parses the percentage out of the last `X-Progress`.
     progress_pct: String,
-    /// The single `.job-card__meta` line, already fully localized (RF20).
+    /// The single `.job-card__meta` line, already fully localized.
     meta: String,
     /// The server's job id — the "View files" link's `?job=` (empty when the
     /// kick-off never got one, in which case the card never reaches
@@ -724,7 +724,7 @@ fn progress_pct(status: &str, progress: &str) -> String {
 }
 
 /// The job's name if it has one, else its subjects' names joined by ` · `
-/// (at most 3, then ` +N`) — RF19.
+/// (at most 3, then ` +N`).
 fn card_name(job: &ExportJob) -> String {
     if !job.name.is_empty() {
         return job.name.clone();
@@ -754,7 +754,7 @@ fn elapsed(job: &ExportJob) -> String {
 }
 
 /// `HH:MM UTC` when `stamp` falls on today (UTC); `YYYY-MM-DD HH:MM UTC`
-/// otherwise (RF20). Empty when `stamp` does not parse.
+/// otherwise. Empty when `stamp` does not parse.
 fn format_hour(stamp: &str) -> String {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(stamp) else {
         return String::new();
@@ -777,9 +777,8 @@ fn format_label(i18n: &I18n, format: &str) -> String {
     }
 }
 
-/// `"6 subjects (4 ViewDefinitions · 1 SQL Query · 1 SQL View)"` (RF20):
-/// only the kinds actually present, in a fixed order, every count Fluent-
-/// pluralized.
+/// `"6 subjects (4 ViewDefinitions · 1 SQL Query · 1 SQL View)"`: only the
+/// kinds actually present, in a fixed order, every count Fluent-pluralized.
 fn subjects_summary(i18n: &I18n, subjects: &[JobSubject]) -> String {
     let (mut view_definitions, mut sql_queries, mut sql_views) = (0i64, 0i64, 0i64);
     for subject in subjects {
@@ -808,8 +807,8 @@ fn subjects_summary(i18n: &I18n, subjects: &[JobSubject]) -> String {
     }
 }
 
-/// The single `.job-card__meta` line (RF20): the subjects/format summary is
-/// common to every status, the rest of the line varies.
+/// The single `.job-card__meta` line: the subjects/format summary is common
+/// to every status, the rest of the line varies.
 fn job_meta(i18n: &I18n, job: &ExportJob) -> String {
     let subjects = subjects_summary(i18n, &job.subjects);
     let format = format_label(i18n, &job.format);
@@ -880,7 +879,7 @@ fn job_card(i18n: &I18n, id: &str, job: &ExportJob) -> JobCard {
 
 /// The Active SQL Exports page (#833): the user's `$sql-export` jobs as
 /// cards, most recent first. The entry point of the SQL Export workspace —
-/// the builder moved to `/new` (RF1/RF2).
+/// the builder moved to `/new`.
 #[derive(Template)]
 #[template(path = "pages/sql-export.html")]
 struct ExportListPage {
@@ -894,7 +893,7 @@ struct ExportListPage {
     /// The just-kicked-off job's server id, carried through the `start`
     /// redirect when the kick-off succeeded but this UI's own settings-store
     /// write to record it failed (see [`start`]) — otherwise `None`, per the
-    /// epic's "no flash on success" rule (#833).
+    /// "no flash on success" rule (#833).
     store_error: Option<String>,
 }
 
@@ -1012,8 +1011,7 @@ struct JobCardFragment {
 
 /// Query the list route accepts. `job` is the pre-#833 single-job tracking
 /// param — deserialized so an old bookmark or link does not 400, then
-/// ignored (RF1). `store-error` is this ticket's own signal, set only by
-/// [`start`]'s redirect.
+/// ignored. `store-error` is set only by [`start`]'s redirect.
 #[derive(Deserialize, Default)]
 pub(crate) struct ExportListQuery {
     #[allow(dead_code)]
@@ -1023,8 +1021,8 @@ pub(crate) struct ExportListQuery {
 }
 
 /// `GET /ui/sql/export` — the job list (#833). Polls every `in-progress` job
-/// once before rendering (RF16), so a plain reload without JavaScript stays
-/// current; a legacy `?job=` is accepted by the router but ignored (RF1).
+/// once before rendering, so a plain reload without JavaScript stays
+/// current; a legacy `?job=` is accepted by the router but ignored.
 pub(crate) async fn list(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -1284,8 +1282,8 @@ async fn store_new_job(state: &WebState, user_key: &str, tenant: &str, job: Expo
 
 /// Builds a fresh `in-progress` job that copies `source`'s
 /// `name`/`subjects`/`format`, kicks it off under `caller`, and stores it as
-/// a brand-new record via [`store_new_job`] — the arranque [`retry`] and
-/// [`rerun`] share (RF2/RF3): `source` itself is never written back to.
+/// a brand-new record via [`store_new_job`] — the resubmission [`retry`] and
+/// [`rerun`] share: `source` itself is never written back to.
 async fn resubmit(
     state: &WebState,
     user_key: &str,
@@ -1307,8 +1305,8 @@ async fn resubmit(
 
 /// Shared tail of [`retry`] and [`rerun`]: loads the record `id` names,
 /// checks `eligible` against its current status — a no-op redirect when it
-/// is not (RF2/RF3) or when `id` names nothing this user/tenant owns — and,
-/// when eligible, hands it to [`resubmit`]. The original record is read-only
+/// is not, or when `id` names nothing this user/tenant owns — and, when
+/// eligible, hands it to [`resubmit`]. The original record is read-only
 /// throughout; only a brand-new record is ever written.
 async fn retry_or_rerun(
     state: &WebState,
@@ -1330,8 +1328,8 @@ async fn retry_or_rerun(
     resubmit(state, &user_key, tenant, &caller, &original).await
 }
 
-/// `POST /ui/sql/export/{id}/cancel` — RF1: eligible only from
-/// `in-progress`. Asks the server to cancel the job under the request's
+/// `POST /ui/sql/export/{id}/cancel` — eligible only from `in-progress`.
+/// Asks the server to cancel the job under the request's
 /// [`Caller`]; whatever it answers (a `404` included — the job may already
 /// be reaped), the record becomes `cancelled` locally with a clean slate
 /// (`progress`/`error` cleared, since this is a cancellation the user asked
@@ -1374,8 +1372,8 @@ pub(crate) async fn cancel(
     Redirect::to("/ui/sql/export").into_response()
 }
 
-/// `POST /ui/sql/export/{id}/retry` — RF2: eligible only from `failed`. See
-/// [`retry_or_rerun`]/[`resubmit`] for the shared arranque; the original
+/// `POST /ui/sql/export/{id}/retry` — eligible only from `failed`. See
+/// [`retry_or_rerun`]/[`resubmit`] for the shared resubmission; the original
 /// failed record is left untouched.
 pub(crate) async fn retry(
     State(state): State<WebState>,
@@ -1390,10 +1388,10 @@ pub(crate) async fn retry(
     .await
 }
 
-/// `POST /ui/sql/export/{id}/rerun` — RF3: eligible from any terminal state
+/// `POST /ui/sql/export/{id}/rerun` — eligible from any terminal state
 /// ([`terminal_status`]: `complete`, `failed`, `cancelled`). Otherwise
 /// identical to [`retry`]; only the eligible source states differ, matching
-/// which cards' overflow offers "Run again" (RF7).
+/// which cards' overflow offers "Run again".
 pub(crate) async fn rerun(
     State(state): State<WebState>,
     rt: RequestTenant,
@@ -1404,8 +1402,8 @@ pub(crate) async fn rerun(
     retry_or_rerun(&state, &rt.id, principal, &headers, &id, terminal_status).await
 }
 
-/// `POST /ui/sql/export/{id}/remove` — RF4: eligible only from a terminal
-/// state ([`terminal_status`]); an `in-progress` job cannot be removed from
+/// `POST /ui/sql/export/{id}/remove` — eligible only from a terminal state
+/// ([`terminal_status`]); an `in-progress` job cannot be removed from
 /// the list (Cancel it first). Deletes exactly the local record — the
 /// server is never called, since a finished job's outputs are the reaper's
 /// to reclaim, not this UI's.
@@ -1427,8 +1425,8 @@ pub(crate) async fn remove(
     Redirect::to("/ui/sql/export").into_response()
 }
 
-/// `GET /ui/sql/export/{id}/card` — one poll, then the refreshed card (RF4).
-/// 404 for an id this user/tenant does not own.
+/// `GET /ui/sql/export/{id}/card` — one poll, then the refreshed card. 404
+/// for an id this user/tenant does not own.
 pub(crate) async fn card(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -1908,8 +1906,8 @@ mod tests {
         let outputs = manifest_outputs(&manifest);
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].name, "patients");
-        // Locations come back rewritten to same-origin paths (FALLA 2) —
-        // exercised on its own terms by same_origin_location's tests below.
+        // Locations come back rewritten to same-origin paths — exercised on
+        // its own terms by same_origin_location's tests below.
         assert_eq!(
             outputs[0].locations,
             [

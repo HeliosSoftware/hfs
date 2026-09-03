@@ -1218,15 +1218,10 @@ impl PatientExportProvider for PostgresBackend {
                 Box::new(resource_type.to_string()),
                 Box::new(patient_ids.to_vec()),
             ];
-            // Upper bound only. This branch has never applied `_since` either —
-            // that gap is #658, which replaces both of these with
-            // `push_export_window`.
-            let mut param_idx = 4;
-            if let Some(until) = request.until {
-                sql.push_str(&format!(" AND last_updated <= ${}", param_idx));
-                params.push(Box::new(until));
-                param_idx += 1;
-            }
+            // Same `_since` / `_until` window as the non-Patient branch below.
+            // Bound before the cursor clause so it does not consume the
+            // placeholders the cursor needs.
+            let param_idx = push_export_window(&mut sql, &mut params, request, 4);
 
             if let Some(cursor) = cursor {
                 let parts: Vec<&str> = cursor.splitn(2, '|').collect();
