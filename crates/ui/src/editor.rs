@@ -114,6 +114,50 @@ pub struct AddOption {
     pub slice: String,
 }
 
+/// Which explanatory legend the guided-form card shows beneath its "checked
+/// as you type" heading (#843, #840). This is a property of the *host*, not
+/// necessarily of the document's own `resourceType`: a `Library` edited as
+/// SQL Query/SQL View content wants its own legend — Save there gates only
+/// the SQL on FHIR Library type and the SQL attachment, not the generic
+/// "constraints and terminology" the Resource Editor's own second line
+/// promises — even though `resourceType` alone would derive [`Legend::Resource`].
+///
+/// [`Legend::resolve`] is where a request's `legend` override and a
+/// document's `resourceType` are reconciled into one of these; nothing else
+/// in the crate constructs a variant from raw input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Legend {
+    /// The Resource Editor's own two lines: "checked as you type" and
+    /// "checked on save", named `editor-legend-live`/`editor-legend-save`.
+    Resource,
+    /// View Definitions' single line (#843): Save stays permissive there
+    /// (`HFS_VALIDATION_MODE` off by default), so "checked on save" would
+    /// promise a pass the page never runs.
+    ViewDefinition,
+    /// SQL Query / SQL View's two lines (#840): "checked on save" names what
+    /// actually gates Save there — the Library type coding and the SQL
+    /// attachment — instead of the constraints/terminology promise
+    /// [`Legend::Resource`]'s second line makes.
+    SqlLibrary,
+}
+
+impl Legend {
+    /// Resolves the `legend` request parameter against `resource_type`: an
+    /// explicit, recognized override (`resource`, `view-definition`,
+    /// `sql-library`) always wins; an absent, empty, or unrecognized one
+    /// derives exactly as before this parameter existed — `ViewDefinition`
+    /// derives [`Legend::ViewDefinition`], anything else [`Legend::Resource`].
+    fn resolve(requested: &str, resource_type: &str) -> Self {
+        match requested {
+            "resource" => Legend::Resource,
+            "view-definition" => Legend::ViewDefinition,
+            "sql-library" => Legend::SqlLibrary,
+            _ if resource_type == "ViewDefinition" => Legend::ViewDefinition,
+            _ => Legend::Resource,
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "pages/editor.html")]
 pub struct EditorPage {
@@ -155,12 +199,11 @@ pub struct EditorBody {
     /// Whether the root add-picker opens by itself — a document with no
     /// elements gives the user nothing else to act on (#547).
     pub auto_open_add: bool,
-    /// `resourceType == "ViewDefinition"` (#843): selects the ViewDefinition
-    /// legend (`vd-form-legend-live` only, no "checked on save" line — Save
-    /// stays permissive there) in place of the Resource Editor's own two-line
-    /// legend. `rows`/`orphan_errors` already carry the SOF-only lint
-    /// diagnostics when this is set; see [`analyze`].
-    pub is_view_definition: bool,
+    /// Which legend the guided-form card shows (#843, #840) — see [`Legend`].
+    /// `rows`/`orphan_errors` still carry the SOF-only lint diagnostics
+    /// whenever `resource_type == "ViewDefinition"`, independently of this;
+    /// see [`analyze`].
+    pub legend: Legend,
     /// Whether the guided-form card (via `partials/editor-form-pane.html`,
     /// shared with [`EditorFormPane`]) needs `needs-js` on its own root
     /// element — true only for a host that renders this card inline,
@@ -191,7 +234,8 @@ pub struct EditorFormPane {
     pub parse_error: Option<String>,
     pub focus_path: String,
     pub auto_open_add: bool,
-    pub is_view_definition: bool,
+    /// Which legend the guided-form card shows (#843, #840) — see [`Legend`].
+    pub legend: Legend,
     /// Whether this pane's card carries `needs-js` (#843) — true only when
     /// the View Definitions page built this directly
     /// (`crate::render_vd_form_pane`, `crate::invalid_vd_form_pane`) for its
@@ -239,6 +283,19 @@ pub struct EditorForm {
     /// every keystroke. Absent or empty behaves exactly as today.
     #[serde(default)]
     pub pane: String,
+    /// Comma-separated first-level element names this host does not show or
+    /// let this endpoint mutate (#840) — spaces around each name are
+    /// ignored. `content` for a `Library` edited as SQL Query/SQL View
+    /// content, say, whose SQL attachment lives in its own card. Absent or
+    /// empty behaves exactly as today: nothing hidden. See [`parse_hidden`].
+    #[serde(default)]
+    pub hidden: String,
+    /// Which legend the guided-form card shows (#843, #840) — `resource`,
+    /// `view-definition`, or `sql-library`. Absent, empty, or unrecognized
+    /// derives from `resourceType` exactly as before this parameter existed.
+    /// See [`Legend::resolve`].
+    #[serde(default)]
+    pub legend: String,
 }
 
 /// The editor shell. The resource itself is fetched by the browser from the
@@ -276,12 +333,20 @@ pub async fn render_body(
     // #843: `pane=form` swaps only the guided-form fragment; empty or absent
     // is the full body, unchanged.
     let form_pane_only = form.pane == "form";
+    // #840: parsed once and threaded through both the mutation and the
+    // render — `apply` and `analyze` must agree on exactly which top-level
+    // names are hidden, or a row could survive a mutation `apply` silently
+    // dropped (or vice versa).
+    let hidden = parse_hidden(&form.hidden);
 
     let mut document: Value = match serde_json::from_str(&form.doc) {
         Ok(value) => value,
         Err(error) => {
             // A malformed document is the source view's fault, and the user is
-            // mid-keystroke. Say what is wrong and keep their text.
+            // mid-keystroke. Say what is wrong and keep their text. The
+            // document has no `resourceType` to derive a legend from, so
+            // only an explicit override (#840) changes it from the default.
+            let legend = Legend::resolve(&form.legend, "");
             return if form_pane_only {
                 render(EditorFormPane {
                     i18n,
@@ -293,7 +358,7 @@ pub async fn render_body(
                     parse_error: Some(error.to_string()),
                     focus_path: String::new(),
                     auto_open_add: false,
-                    is_view_definition: false,
+                    legend,
                     needs_js: false,
                 })
             } else {
@@ -310,7 +375,7 @@ pub async fn render_body(
                     parse_error: Some(error.to_string()),
                     focus_path: String::new(),
                     auto_open_add: false,
-                    is_view_definition: false,
+                    legend,
                     needs_js: false,
                 })
             };
@@ -323,7 +388,7 @@ pub async fn render_body(
         .unwrap_or("Patient")
         .to_string();
 
-    let created = apply(&*registry, &resource_type, &mut document, &form);
+    let created = apply(&*registry, &resource_type, &mut document, &form, &hidden);
 
     if form_pane_only {
         render(build_form_pane(
@@ -334,6 +399,8 @@ pub async fn render_body(
             document,
             created,
             false, // #843: this HTTP endpoint never renders needs-js — see EditorFormPane::needs_js
+            &hidden,
+            &form.legend,
         ))
     } else {
         render(build_body(
@@ -344,18 +411,56 @@ pub async fn render_body(
             document,
             None,
             created,
+            &hidden,
+            &form.legend,
         ))
     }
 }
 
-/// Applies one mutation to the document.
+/// Parses `hidden` (#840): a comma-separated list of first-level element
+/// names, spaces around each one ignored, empty entries dropped — so
+/// `"content"`, `"content,meta"`, and `" content , meta "` all parse to the
+/// same names. An absent or empty input parses to an empty list, which
+/// [`apply`], [`build_rows`], and the root row's `addable` list all treat as
+/// "nothing hidden" — today's behavior, unchanged.
+fn parse_hidden(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `path` descends from a hidden top-level element (#840): `hidden`
+/// only ever names first-level elements, so a path is hidden exactly when
+/// its first step is one of them — `content`, `content.0`, and
+/// `content.0.contentType` are all hidden under `hidden = ["content"]`;
+/// `status` is not.
+fn path_is_hidden(path: &[Step], hidden: &[String]) -> bool {
+    matches!(path.first(), Some(Step::Field(name)) if hidden.iter().any(|h| h == name))
+}
+
+/// Applies one mutation to the document. A mutation targeting a hidden
+/// branch (#840) — any op whose `path` descends from a hidden name, or a
+/// root `add` naming one directly — is a silent no-op: the document comes
+/// back unchanged, with no error. Nothing this crate renders can post such a
+/// request (a hidden name has no row and is never offered under "+ Add"),
+/// but the guard makes the guarantee explicit rather than resting on that
+/// alone.
 fn apply(
     resolver: &dyn helios_fhir_validator::SchemaResolver,
     resource_type: &str,
     document: &mut Value,
     form: &EditorForm,
+    hidden: &[String],
 ) -> Option<editor::Path> {
     let path = editor::path_from_string(&form.path);
+
+    let mutates_hidden = path_is_hidden(&path, hidden)
+        || (path.is_empty() && form.op == "add" && hidden.iter().any(|h| h == &form.name));
+    if mutates_hidden {
+        return None;
+    }
 
     match form.op.as_str() {
         "add" if !form.slice.is_empty() => {
@@ -443,18 +548,29 @@ struct FormAnalysis {
     orphan_errors: Vec<String>,
     focus_path: String,
     auto_open_add: bool,
-    is_view_definition: bool,
+    legend: Legend,
 }
 
 /// Validates and flattens `document` into [`FormAnalysis`]. Shared by
 /// [`build_body`] and [`build_form_pane`] — the full body and the
 /// `pane=form` fragment are two views onto exactly this one pass.
+///
+/// `hidden` (#840) excludes rows and root `addable` options whose first path
+/// segment names a first-level element the host does not show; `legend`
+/// resolves against `resource_type` via [`Legend::resolve`]. Neither changes
+/// which diagnostics are computed — a document's issues (including the
+/// SOF-only lint below, still keyed on `resource_type` alone) are the same
+/// regardless of what the host chooses to hide or how it labels the legend;
+/// `hidden` only keeps them off a row that does not exist, which is exactly
+/// what sends them to `orphan_errors` instead (see `claimed` below).
 fn analyze(
     registry: &Arc<helios_fhir_validator::SchemaRegistry>,
     version: helios_fhir::FhirVersion,
     resource_type: &str,
     document: &Value,
     created: Option<editor::Path>,
+    hidden: &[String],
+    legend: &str,
 ) -> FormAnalysis {
     // The cheap pass, on every mutation. Pure, no I/O — this is what makes
     // continuous validation affordable at all.
@@ -525,6 +641,7 @@ fn analyze(
             resource_type,
             document,
             errors: &by_path,
+            hidden,
         },
         &[],
         0,
@@ -572,7 +689,7 @@ fn analyze(
             .map(|path| editor::path_to_string(&path))
             .unwrap_or_default(),
         auto_open_add,
-        is_view_definition,
+        legend: Legend::resolve(legend, resource_type),
     }
 }
 
@@ -582,6 +699,12 @@ fn analyze(
 /// Editor — this struct's only renderer — fills `#editor-body` from
 /// `editor.js`'s own client-side fetch, so a card marked `needs-js` here
 /// would have no page to reveal it (#843).
+///
+/// `hidden` and `legend` (#840) pass straight through to [`analyze`] — see
+/// its own doc comment for what each does. Today's only caller
+/// (`render_body`) passes them from the request; nothing else in the crate
+/// calls this with anything but the request's own values.
+#[allow(clippy::too_many_arguments)]
 fn build_body(
     i18n: I18n,
     registry: Arc<helios_fhir_validator::SchemaRegistry>,
@@ -590,8 +713,18 @@ fn build_body(
     document: Value,
     parse_error: Option<String>,
     created: Option<editor::Path>,
+    hidden: &[String],
+    legend: &str,
 ) -> EditorBody {
-    let analysis = analyze(&registry, version, &resource_type, &document, created);
+    let analysis = analyze(
+        &registry,
+        version,
+        &resource_type,
+        &document,
+        created,
+        hidden,
+        legend,
+    );
     EditorBody {
         i18n,
         json_lines: crate::json_view::lines(&document),
@@ -605,7 +738,7 @@ fn build_body(
         parse_error,
         focus_path: analysis.focus_path,
         auto_open_add: analysis.auto_open_add,
-        is_view_definition: analysis.is_view_definition,
+        legend: analysis.legend,
         needs_js: false,
     }
 }
@@ -619,7 +752,17 @@ fn build_body(
 /// `crate::sql_view_definitions_save`) calls this directly, `needs_js: true`,
 /// to render the guided-form card inline, server-side, on the page's own
 /// first paint — there is no HTTP round trip to make for a document this
-/// render already has parsed.
+/// render already has parsed. `hidden` and `legend` (#840) exist so a future
+/// caller in the same position — a Library's Details panel, whose SQL
+/// attachment lives in its own card — can render inline on its own first
+/// paint too, passing `hidden: &["content".to_string()]` and
+/// `legend: "sql-library"` instead of the empty defaults below.
+///
+/// `hidden` and `legend` (#840) pass straight through to [`analyze`]. A
+/// caller with nothing to hide and no legend override — every caller today
+/// except the Libraries pages — passes `&[]` and `""`, which derives the
+/// legend from `resource_type` exactly as before this parameter existed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_form_pane(
     i18n: I18n,
     registry: Arc<helios_fhir_validator::SchemaRegistry>,
@@ -628,8 +771,18 @@ pub(crate) fn build_form_pane(
     document: Value,
     created: Option<editor::Path>,
     needs_js: bool,
+    hidden: &[String],
+    legend: &str,
 ) -> EditorFormPane {
-    let analysis = analyze(&registry, version, &resource_type, &document, created);
+    let analysis = analyze(
+        &registry,
+        version,
+        &resource_type,
+        &document,
+        created,
+        hidden,
+        legend,
+    );
     EditorFormPane {
         i18n,
         document: analysis.document,
@@ -640,7 +793,7 @@ pub(crate) fn build_form_pane(
         parse_error: None,
         focus_path: analysis.focus_path,
         auto_open_add: analysis.auto_open_add,
-        is_view_definition: analysis.is_view_definition,
+        legend: analysis.legend,
         needs_js,
     }
 }
@@ -683,6 +836,11 @@ struct RowCtx<'a> {
     resource_type: &'a str,
     document: &'a Value,
     errors: &'a HashMap<String, Vec<String>>,
+    /// First-level element names the host does not show (#840) — see
+    /// [`analyze`]'s own doc comment. Only ever filters the root row: a
+    /// hidden name's children are never visited in the first place, so
+    /// there is nothing left to filter once the walk is past the root.
+    hidden: &'a [String],
 }
 
 /// Walks the document, emitting one row per node, depth-first, in spec order.
@@ -693,6 +851,7 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
         resource_type,
         document,
         errors,
+        hidden,
     } = *ctx;
     let key = editor::path_to_string(path);
     let node = match editor::node_at(document, path) {
@@ -713,6 +872,26 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
 
     let children = editor::present_children(resolver, resource_type, document, path);
     let offered = editor::addable(resolver, resource_type, document, path);
+
+    // #840: `hidden` only ever names first-level elements, so it only ever
+    // filters the root row's own children (never visited, so never a row of
+    // their own) and its own "+ Add" list. A non-root row's
+    // `children`/`offered` cannot contain a hidden name in the first place,
+    // since the walk never descends into one to compute them.
+    let (children, offered) = if path.is_empty() && !hidden.is_empty() {
+        (
+            children
+                .into_iter()
+                .filter(|child| !hidden.iter().any(|name| name == &child.name))
+                .collect(),
+            offered
+                .into_iter()
+                .filter(|option| !hidden.iter().any(|name| name == &option.name))
+                .collect(),
+        )
+    } else {
+        (children, offered)
+    };
 
     let last = path.last();
     let label = match last {
@@ -968,5 +1147,248 @@ mod tests {
             dotted_path_from_pointer("/select/0~1x/name"),
             "select.0/x.name"
         );
+    }
+
+    /* #840: hidden top-level elements and the host-chosen legend. */
+
+    #[test]
+    fn parse_hidden_splits_trims_and_drops_empty_entries() {
+        assert!(parse_hidden("").is_empty());
+        assert!(parse_hidden("   ").is_empty());
+        assert_eq!(parse_hidden("content"), vec!["content".to_string()]);
+        assert_eq!(
+            parse_hidden(" content , meta "),
+            vec!["content".to_string(), "meta".to_string()]
+        );
+        assert_eq!(parse_hidden("content,,meta"), vec!["content", "meta"]);
+    }
+
+    #[test]
+    fn path_is_hidden_matches_the_first_segment_at_any_depth() {
+        let hidden = vec!["content".to_string()];
+        assert!(path_is_hidden(
+            &editor::path_from_string("content"),
+            &hidden
+        ));
+        assert!(path_is_hidden(
+            &editor::path_from_string("content.0"),
+            &hidden
+        ));
+        assert!(path_is_hidden(
+            &editor::path_from_string("content.0.contentType"),
+            &hidden
+        ));
+        assert!(!path_is_hidden(
+            &editor::path_from_string("status"),
+            &hidden
+        ));
+        // The root path itself names nothing, so it is never "hidden".
+        assert!(!path_is_hidden(&[], &hidden));
+    }
+
+    #[test]
+    fn legend_resolve_derives_from_resource_type_when_absent_or_unrecognized() {
+        assert!(matches!(
+            Legend::resolve("", "ViewDefinition"),
+            Legend::ViewDefinition
+        ));
+        assert!(matches!(Legend::resolve("", "Patient"), Legend::Resource));
+        assert!(matches!(
+            Legend::resolve("not-a-legend", "ViewDefinition"),
+            Legend::ViewDefinition
+        ));
+        assert!(matches!(
+            Legend::resolve("not-a-legend", "Library"),
+            Legend::Resource
+        ));
+    }
+
+    #[test]
+    fn legend_resolve_honors_an_explicit_override_over_derivation() {
+        assert!(matches!(
+            Legend::resolve("resource", "ViewDefinition"),
+            Legend::Resource
+        ));
+        assert!(matches!(
+            Legend::resolve("view-definition", "Patient"),
+            Legend::ViewDefinition
+        ));
+        assert!(matches!(
+            Legend::resolve("sql-library", "Patient"),
+            Legend::SqlLibrary
+        ));
+    }
+
+    /// A `Library` with two `content[]` attachments — the shape Details
+    /// (#840) hides `content` on: the SQL attachment lives in its own card,
+    /// the second attachment stands in for anything else `content` might
+    /// carry (CQL, plain text) that Details still has to leave alone.
+    fn library_with_two_attachments() -> Value {
+        serde_json::json!({
+            "resourceType": "Library",
+            "status": "draft",
+            "content": [
+                { "contentType": "application/sql", "data": "U0VMRUNUIDE=" },
+                { "contentType": "text/plain", "data": "aGVsbG8=" }
+            ]
+        })
+    }
+
+    #[test]
+    fn hidden_content_removes_its_rows_and_its_root_add_option_but_nothing_else() {
+        let registry = packs::core_registry(helios_fhir::FhirVersion::R4);
+        let document = library_with_two_attachments();
+        let hidden = vec!["content".to_string()];
+
+        let hidden_analysis = analyze(
+            &registry,
+            helios_fhir::FhirVersion::R4,
+            "Library",
+            &document,
+            None,
+            &hidden,
+            "",
+        );
+        // No row anywhere under `content` — not `content` itself, not an
+        // item, not one of an item's own fields.
+        assert!(
+            hidden_analysis
+                .rows
+                .iter()
+                .all(|row| row.path != "content" && !row.path.starts_with("content.")),
+            "rows: {:?}",
+            hidden_analysis
+                .rows
+                .iter()
+                .map(|r| &r.path)
+                .collect::<Vec<_>>()
+        );
+        // The root row no longer offers "content" under "+ Add" — as `add`
+        // or as `another` — but still offers other top-level elements.
+        let root = hidden_analysis
+            .rows
+            .iter()
+            .find(|row| row.path.is_empty())
+            .expect("root row");
+        assert!(!root.addable.iter().any(|option| option.name == "content"));
+        assert!(root.addable.iter().any(|option| option.name == "name"));
+
+        // The same document with nothing hidden lists `content`'s rows and
+        // offers it at the root — the baseline the assertions above differ
+        // from.
+        let unfiltered = analyze(
+            &registry,
+            helios_fhir::FhirVersion::R4,
+            "Library",
+            &document,
+            None,
+            &[],
+            "",
+        );
+        assert!(
+            unfiltered
+                .rows
+                .iter()
+                .any(|row| row.path == "content.0.contentType")
+        );
+        let unfiltered_root = unfiltered
+            .rows
+            .iter()
+            .find(|row| row.path.is_empty())
+            .expect("root row");
+        assert!(
+            unfiltered_root
+                .addable
+                .iter()
+                .any(|option| option.name == "content")
+        );
+    }
+
+    /// Hiding `content` never touches the document `analyze` hands back —
+    /// only which rows are built from it.
+    #[test]
+    fn hidden_content_leaves_the_returned_document_byte_for_byte_unchanged() {
+        let registry = packs::core_registry(helios_fhir::FhirVersion::R4);
+        let document = library_with_two_attachments();
+        let hidden = vec!["content".to_string()];
+
+        let hidden_analysis = analyze(
+            &registry,
+            helios_fhir::FhirVersion::R4,
+            "Library",
+            &document,
+            None,
+            &hidden,
+            "",
+        );
+        let unfiltered = analyze(
+            &registry,
+            helios_fhir::FhirVersion::R4,
+            "Library",
+            &document,
+            None,
+            &[],
+            "",
+        );
+        assert_eq!(hidden_analysis.document, unfiltered.document);
+        assert_eq!(hidden_analysis.pretty, unfiltered.pretty);
+        let round_tripped: Value = serde_json::from_str(&hidden_analysis.document).unwrap();
+        assert_eq!(round_tripped["content"], document["content"]);
+    }
+
+    /// Builds an [`EditorForm`] for one mutation, the fields
+    /// [`apply`] does not read left at their defaults.
+    fn mutation_form(doc: &Value, op: &str, path: &str, name: &str, value: &str) -> EditorForm {
+        EditorForm {
+            doc: doc.to_string(),
+            op: op.to_string(),
+            path: path.to_string(),
+            name: name.to_string(),
+            arm: String::new(),
+            url: String::new(),
+            value: value.to_string(),
+            modifier: String::new(),
+            slice: String::new(),
+            pane: String::new(),
+            hidden: String::new(),
+            legend: String::new(),
+        }
+    }
+
+    /// `remove`, `set`, a root `add` naming the hidden element, and
+    /// `extension` all no-op on a hidden branch (#840) — the document comes
+    /// back exactly as it went in, and `apply` reports nothing created.
+    #[test]
+    fn apply_ignores_every_mutation_kind_targeting_a_hidden_branch() {
+        let registry = packs::core_registry(helios_fhir::FhirVersion::R4);
+        let hidden = vec!["content".to_string()];
+        let base = library_with_two_attachments();
+
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("remove", "content.0", "", ""),
+            ("set", "content.0.url", "", "http://example.org/new"),
+            ("add", "", "content", ""),
+            ("extension", "content.0", "", ""),
+        ];
+        for (op, path, name, value) in cases {
+            let mut document = base.clone();
+            let form = mutation_form(&document, op, path, name, value);
+            let created = apply(&*registry, "Library", &mut document, &form, &hidden);
+            assert!(created.is_none(), "op={op} path={path} name={name}");
+            assert_eq!(document, base, "op={op} path={path} name={name}");
+        }
+    }
+
+    /// The hidden-branch guard is not overbroad: a mutation anywhere else
+    /// still applies exactly as it would with nothing hidden.
+    #[test]
+    fn apply_still_applies_a_mutation_outside_the_hidden_branch() {
+        let registry = packs::core_registry(helios_fhir::FhirVersion::R4);
+        let hidden = vec!["content".to_string()];
+        let mut document = library_with_two_attachments();
+
+        let form = mutation_form(&document, "set", "status", "", "retired");
+        apply(&*registry, "Library", &mut document, &form, &hidden);
+        assert_eq!(document["status"], "retired");
     }
 }
