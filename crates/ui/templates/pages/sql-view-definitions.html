@@ -9,24 +9,25 @@
   a server-side search (#741) — the search box filters by name, and plain
   previous/next links at its foot page through the rest — so it never loads
   the tenant's whole ViewDefinition collection. Above the list, a
-  server-rendered "Recently used" group (#754/#755 ticket 03) restores the
+  server-rendered "Recently used" group (#754/#755) restores the
   last-picked view on arrival and remembers up to `max_recent` more, with a
   `{id, name, meta}` snapshot so a recent still renders when it is off the
   current page or filter. Save/Duplicate are submit buttons of one plain form
   (POST back to this route); Delete rides conformance-crud.js like the other
   conformance viewers.
 
-  #752 ticket 02: there is no Run button and no fold — the editor card is
-  always open, and the results region below it
-  (`partials/sql_run_results.html`, shared with `POST …/run`, #752 ticket 01)
+  #752: there is no Run button and no fold — the editor card is always open,
+  and the results region below it (`partials/sql_run_results.html`, shared
+  with `POST /ui/sql/view-definitions/run`, and — since #839 — with SQL
+  Queries' and SQL Views' own `/run` endpoints and their identical partial)
   loads itself on arrival and refreshes 500ms after the last keystroke, via
   plain `hx-*` attributes on the textarea and on the notice region's own
   empty shell. Nojs guarantee: every one of those requests is progressive
   enhancement layered on a page that already works — with JavaScript
   disabled, the results region simply stays empty until Save, whose redirect
   (`?vd=<id>&saved=1`) renders the saved definition's results on the server
-  instead (RF6). Nothing here requires JavaScript to save, duplicate, delete,
-  or navigate the rail.
+  instead. Nothing here requires JavaScript to save, duplicate, delete, or
+  navigate the rail.
 
   #753 (evaluation POC, not merged): the editor's `<textarea name="json">` is
   what nojs, no-cdn, and every other Playwright project see; vd-editor.js
@@ -168,7 +169,7 @@
           <textarea class="json-editor" name="json" spellcheck="false"
                     hx-post="/ui/sql/view-definitions/run"
                     hx-trigger="input changed delay:500ms"
-                    hx-target="#vd-run-notice" hx-swap="outerHTML"
+                    hx-target="#run-notice" hx-swap="outerHTML"
                     aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
           <div class="form-actions">
             <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
@@ -181,12 +182,13 @@
       {% endif %}
     </div>
 
-    {#- The $sql-run preview region (#752 ticket 01/02): always renders
-        `#vd-run-notice`, and `#vd-results` once the server has something to
-        show — either `?saved=1`'s server-side run (RF6) or, still empty
-        here, the client-driven live preview the notice's own load trigger
-        kicks off (RF4). Rendered once in partials/sql_run_results.html and
-        shared verbatim with the /run fragment endpoint. -#}
+    {#- The $sql-run preview region (#752): always renders `#run-notice`,
+        and `#run-results` once the server has something to show — either
+        `?saved=1`'s server-side run or, still empty here, the client-driven
+        live preview the notice's own load trigger kicks off. Rendered once
+        in partials/sql_run_results.html and shared, with SQL Queries and
+        SQL Views, verbatim with each page's own /run fragment endpoint
+        (#839). -#}
     {{ run_results.render()?|safe }}
     {% else %}
     <section class="card">

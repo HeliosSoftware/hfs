@@ -119,28 +119,47 @@ asset in this crate (above), nothing bundler-specific about how it ships. It
 backs the ViewDefinition JSON editor on `/ui/sql/view-definitions` and the SQL
 pane editors on `/ui/sql/queries` and `/ui/sql/views`; see
 [`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
-for the full evaluation this amendment is drawn from. The editor talks to two
-JSON-in-HTML-fragment-out endpoints on that page: `POST …/lint` (#753 ticket
-03), the CodeMirror linter's structural + FHIRPath-syntax check, and `POST
-…/run` (#752 ticket 01), which runs the editor's own posted text — saved or
-not — through `$sql-run` and answers with `partials/sql_run_results.html`,
-the same results-card partial the page's own initial render nests as a
-template field. `/run` always answers `200` (htmx does not swap `4xx`/`5xx`
-by default) except for a malformed request body.
+for the full evaluation this amendment is drawn from. The ViewDefinition
+editor also talks to `POST …/lint` (#753), the CodeMirror linter's
+structural + FHIRPath-syntax check — a JSON-in-HTML-fragment-out endpoint of
+its own, unrelated to the run preview below.
 
-That page is a playground, not a Run button (#752 ticket 02): the editor card
-is always open (no fold, no separate "Run" action), and the results region
-below it wires straight to `/run` with plain `hx-*` attributes — no JavaScript
-beyond what already ships. The results region's own empty shell fires one
-`hx-trigger="load"` request when the page opens with nothing to show yet
-(a fresh selection, or `?vd=new`'s starter document), and the editor's
-`textarea` reposts on `hx-trigger="input changed delay:500ms"` as it changes —
-CodeMirror's mount already dispatches `input` on every edit, so this needs no
-mount-specific wiring. A failed run leaves the editor's text untouched and the
-last successful table on screen, relabelled "last successful run" via an
-out-of-band swap of just its meta. With JavaScript disabled there is no live
-preview at all: Save's own redirect (`?vd=<id>&saved=1`) is what renders the
-just-stored definition's results, server-side, once.
+All three SQL on FHIR playgrounds — `/ui/sql/view-definitions`,
+`/ui/sql/queries`, and `/ui/sql/views` — share one results-card partial,
+`partials/sql_run_results.html`, and one `$sql-run` preview contract (#752,
+generalized in #839): each page's own render nests the partial as a template
+field, and each has its own `POST …/run` fragment endpoint
+(`/ui/sql/view-definitions/run`, `/ui/sql/queries/run`, `/ui/sql/views/run`)
+that runs the editor's *posted* text — saved or not — through `$sql-run` and
+renders that same partial as its whole response, with `hx-swap-oob`
+attributes so only the results card and its meta move. `/run` always answers
+`200` (htmx does not swap `4xx`/`5xx` by default) except for a malformed
+request body. Each caller supplies its own surface — the fragment URL, the
+id of the form to `hx-include`, the results heading and failure-prefix i18n
+keys, and an optional "Export as files" action (SQL Queries only, once the
+Library has a saved id) — so the partial itself never branches on which page
+is rendering it.
+
+None of the three pages has a Run button: the editor card is always open,
+and the results region below it wires straight to `/run` with plain `hx-*`
+attributes — no JavaScript beyond what already ships. The results region's
+own empty shell fires one `hx-trigger="load"` request when the page opens
+with nothing to show yet (a fresh selection, or the `new` starter document),
+and the editor's `json`/`sql` textarea reposts on `hx-trigger="input changed
+delay:500ms"` as it changes — CodeMirror's mount already dispatches `input`
+on every edit, so this needs no mount-specific wiring. A failed run leaves
+the editor's text untouched and the last successful table on screen,
+relabelled "last successful run" via an out-of-band swap of just its meta;
+when the server's message names a parse error's line (sqlparser's own
+`… at Line: N, Column: M`), the notice also carries `data-error-line="N"`
+(SQLite execution errors carry no line — those notices go out without the
+attribute). On `/ui/sql/queries` and `/ui/sql/views`, `sql-editor.js` reacts
+to that same `#run-notice` swap and tints the named line in the mounted
+CodeMirror editor (`.sql-editor__error-line`, #839) — a decoration only, it
+never edits the document or touches the textarea. With JavaScript disabled
+there is no live preview at all: Save's own redirect (`?vd=<id>&saved=1` /
+`?lib=<id>&saved=1`) is what renders the just-stored resource's results,
+server-side, once.
 
 Beside the editor sits a guided-form card (#843, `.editor__grid--stretch` in
 `assets/app.css`): the two cards stretch to match each other's height, capped
@@ -228,7 +247,7 @@ not just a closed IIFE.
 | `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)`, exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of |
 | `editor-form.js` | The guided-form loop (#843), extracted from `editor.js`'s original: `[data-add]`/`[data-remove]`/`[data-extension]`/`[data-choose]`/`[data-set]`, the add-picker's typeahead, live `$expand` — driven against a caller-supplied `root` and `host` (`{ getDoc, setDoc, renderUrl? }`) instead of page ids, so it works over any document a host owns. `window.HfsEditorForm.attach(root, host)`; loaded only on `/ui/sql/view-definitions` so far — `editor.js` and the Resources modal's own copy of this loop are a follow-up migration |
 | `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838). Also builds `editor-form.js`'s host over the mounted `EditorView` (#843): a form-driven change lands as one minimal (common-prefix/common-suffix) transaction, tagged so the sync listener skips its own echo; an editor change 600ms after the last keystroke re-requests the guided-form panel alone when its canonical JSON actually moved. Falls back to the plain `<textarea>` as the host when CodeMirror never mounted. Also drives the row↔editor cross-highlight (#843): a `StateField` of line decorations for a hovered/focused row, and a debounced cursor listener that marks the row for whichever node the caret sits in |
-| `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, no fold or lint yet (#838) |
+| `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, and — after each `#run-notice` swap — tinting the line a parse failure names via `data-error-line` (#839); no fold or lint yet (#838) |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.

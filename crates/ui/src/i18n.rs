@@ -221,7 +221,7 @@ impl I18n {
     }
 
     /// Look up a message with two named placeables, e.g. the View
-    /// Definitions "run" meta (#752 ticket 01):
+    /// Definitions "run" meta (#752):
     /// `t_arg2("vd-results-meta", "rows", rows.to_string(), "ms", ms.to_string())`.
     /// `crates/hts-ui/src/i18n.rs` carries the identical method for its own
     /// catalog lookups.

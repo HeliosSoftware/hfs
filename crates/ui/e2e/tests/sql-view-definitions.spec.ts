@@ -44,8 +44,8 @@ test("a stored ViewDefinition lists, edits, and previews rows", async ({ page, r
   await expect(createNew).toHaveCSS("height", "30px");
   await expect(createNew).toHaveCSS("padding-left", "12px");
 
-  // #752 ticket 02, RF4: the preview loads itself — no click, no Run link at
-  // all — and the seeded patient's key is among the rows.
+  // #752: the preview loads itself — no click, no Run link at all — and
+  // the seeded patient's key is among the rows.
   await expect(page.locator("a[href*='run=1']")).toHaveCount(0);
   await expect(page.locator(".data-table")).toBeVisible();
   await expect(page.locator(".data-table td", { hasText: patientId }).first()).toBeVisible();
@@ -112,9 +112,9 @@ test("the CodeMirror editor syncs typed keystrokes to the hidden textarea, saves
   await expect(page.locator(".vd-editor .cm-content")).toContainText(`zcm_${stamp}_after`);
 });
 
-// #752 ticket 02: the live preview follows the editor's *current* text, in
-// or out of CodeMirror — RF4 (load), RF5 (debounced edits), RF7 (failure
-// keeps the last good table and marks its meta stale, then a fix clears it).
+// #752: the live preview follows the editor's *current* text, in or out of
+// CodeMirror — on load, on debounced edits, and on failure (which keeps the
+// last good table and marks its meta stale, then a fix clears it).
 
 test("editing the view in CodeMirror refreshes the results live, without a page reload", async ({
   page,
@@ -151,19 +151,20 @@ test("editing the view in CodeMirror refreshes the results live, without a page 
     2,
   );
 
-  // The mounted CodeMirror content — RF5's `input` events come from here.
+  // The mounted CodeMirror content — the live preview's `input` events come
+  // from here.
   const cmContent = page.locator("#vd-editor .cm-content");
   await cmContent.click();
   await page.keyboard.press("ControlOrMeta+a");
   await page.keyboard.insertText(good);
 
-  // RF5: the debounced live preview lands within ~3s, with no navigation.
+  // The debounced live preview lands within ~3s, with no navigation.
   await expect(page.locator(".data-table th")).toHaveText(["patient_key"], { timeout: 3000 });
   await expect(page).toHaveURL(new RegExp(`vd=${vdId}$`));
   await expect(cmContent).toBeFocused();
   await expect(cmContent).toContainText("patient_key");
 
-  // RF7: broken JSON reports the failure and keeps the last good table,
+  // Broken JSON reports the failure and keeps the last good table,
   // relabelled "last successful run" — the editor keeps the broken text.
   const broken = good.replace(/}\s*$/, "");
   await cmContent.click();
@@ -173,7 +174,7 @@ test("editing the view in CodeMirror refreshes the results live, without a page 
     timeout: 3000,
   });
   await expect(page.locator(".data-table th")).toHaveText(["patient_key"]);
-  await expect(page.locator("#vd-results-meta")).toHaveText("last successful run");
+  await expect(page.locator("#run-results-meta")).toHaveText("last successful run");
   await expect(cmContent).toContainText("patient_key");
 
   // Fixing the JSON clears the notice and restores a fresh `rows · ms` meta.
@@ -181,13 +182,13 @@ test("editing the view in CodeMirror refreshes the results live, without a page 
   await page.keyboard.press("ControlOrMeta+a");
   await page.keyboard.insertText(good);
   await expect(page.locator(".notice--warn")).toHaveCount(0, { timeout: 3000 });
-  await expect(page.locator("#vd-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/);
+  await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/);
 });
 
 test("?vd=new produces results on arrival, before any edit", async ({ page }) => {
   await page.goto("/ui/sql/view-definitions?vd=new");
   await expect(page.locator("textarea[name='json']")).toContainText("new_view");
-  await expect(page.locator("#vd-results")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator("#run-results")).toBeVisible({ timeout: 3000 });
   await expect(page.locator(".data-table")).toBeVisible();
 });
 
@@ -292,9 +293,9 @@ test("a selection the filter excludes from the rail still shows its own editor",
   await expect(page.locator("textarea[name='json']")).toContainText(`zsel_${stamp}_keep`);
 });
 
-// "Recently used" group (#754/#755 ticket 03, server-rendered per RF4/RF6):
-// same MRU/cap/restore/prune contract as the type rails (ticket 02), plus the
-// snapshot rule its server-paged, filtered rail needs.
+// "Recently used" group (#754/#755, server-rendered): same MRU/cap/restore/
+// prune contract as the type rails, plus the snapshot rule its
+// server-paged, filtered rail needs.
 
 test("visiting six views in order keeps the five most recent, MRU-ordered, deduplicated", async ({
   page,
@@ -344,7 +345,7 @@ test("visiting a view and returning through a plain arrival (no ?vd=) restores i
   await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
   // Leaving to another page and coming back with no `?vd=` at all — the same
   // "no explicit selection" request shape a nav click produces — restores it
-  // server-side (RF1.2), not merely through browser history.
+  // server-side, not merely through browser history.
   await page.goto("/ui/resources");
   await page.goto("/ui/sql/view-definitions");
   await expect(page.locator(`#vd-rail-list [data-type='${vdId}']`)).toHaveAttribute(
@@ -367,7 +368,7 @@ test("a filtered-out recent stays in the group; deleting the selected view falls
   await Promise.all([keepId, deleteId].map((id) => waitSearchable(request, "ViewDefinition", id)));
 
   // Select "delete" (recent[0]/last), then filter it out of the rail's own
-  // list — RF4: the group still shows it, unaffected by `?filter=`.
+  // list — the group still shows it, unaffected by `?filter=`.
   await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
   await page.goto(`/ui/sql/view-definitions?filter=${stamp}_a_keep`);
   await expect(page.locator(`#vd-rail-list [data-type='${deleteId}']`)).toHaveCount(0);
@@ -381,7 +382,7 @@ test("a filtered-out recent stays in the group; deleting the selected view falls
   await expect(page).toHaveURL(/\/ui\/sql\/view-definitions$/);
 
   // The stored `last` no longer resolves: the page falls back to the rail's
-  // first visible entry, in silence (RF1.3) — some real, non-deleted view
+  // first visible entry, in silence — some real, non-deleted view
   // (the redirect carries no `?filter=`, so which one exactly depends on the
   // shared e2e server's full ViewDefinition collection, not just this test's
   // own two) — but the group still shows the now-deleted entry from its
@@ -398,7 +399,7 @@ test("a filtered-out recent stays in the group; deleting the selected view falls
   await expect(page.locator(`#vd-rail-list [data-type='${deleteId}']`)).toHaveCount(0);
   await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toBeVisible();
 
-  // Clicking that stale recent (an explicit `?vd=`) prunes it (RF3): the page
+  // Clicking that stale recent (an explicit `?vd=`) prunes it: the page
   // lands on its no-selection render and the group no longer shows it.
   await recentGroup.locator(`[data-type='${deleteId}']`).click();
   await expect(page).toHaveURL(new RegExp(`vd=${deleteId}`));

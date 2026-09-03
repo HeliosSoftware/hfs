@@ -789,10 +789,10 @@ sql-vd-title = View-Definitionen
 sql-vd-lede = Erstelle und verwalte die ViewDefinitions, mit denen SQL on FHIR Ressourcen abflacht.
 
 sql-queries-title = SQL-Abfragen
-sql-queries-lede = Führe SQL-on-FHIR-Abfragen gegen diesen Server aus.
+sql-queries-lede = Ad-hoc-SQL über die flachen Tabellen, die deine View-Definitionen erzeugen. Die Ergebnisse aktualisieren sich während der Eingabe.
 
 sql-views-title = SQL-Views
-sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
+sql-views-lede = Benannte Views, aus denen andere Abfragen und Exporte auswählen. Definiere das SQL einmal; die erzeugten Spalten werden zu einer Tabelle, die alle nutzen können.
 
 sql-export-title = SQL-Export
 sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
@@ -813,7 +813,6 @@ vd-none = Noch keine View-Definitionen.
 vd-empty-lede = Lege mit „Neu erstellen" die erste ViewDefinition an.
 vd-degraded = Die Liste der View-Definitionen konnte nicht geladen werden.
 vd-saved = Gespeichert.
-vd-run = Ausführen
 vd-run-failed = Die View konnte nicht ausgeführt werden.
 vd-save = Speichern
 vd-duplicate = Duplizieren
@@ -830,17 +829,36 @@ vd-pagination-label = View-Definitionsseiten
 vd-page-prev = Zurück
 vd-page-next = Weiter
 
-## SQL-Abfragen- / SQL-Views-Arbeitsbereiche (#649)
+## $sql-run-Ergebnispartial (#752): gemeinsam genutzt von den Playgrounds
+## View-Definitionen, SQL-Abfragen und SQL-Views (#839).
+
+sql-run-export = Als Dateien exportieren
+
+## SQL-Abfragen- / SQL-Views-Arbeitsbereiche (#649, editor-first-Layout #839)
 
 sql-queries-new-title = Neue SQL-Abfrage
 sql-views-new-title = Neue SQL-View
 sql-queries-rail-all-heading = Alle SQL-Abfragen
 sql-views-rail-all-heading = Alle SQL-Views
-lib-filter = Bibliotheken filtern
-lib-none = Noch keine Bibliotheken.
-lib-empty-lede = Lege mit „Neu erstellen" die erste Bibliothek an.
+sql-queries-chip = SQL-Abfrage
+sql-views-chip = SQL-View
+sql-queries-filter = Abfragen filtern
+sql-views-filter = Views filtern
+sql-queries-rail-empty = Noch keine Abfragen.
+sql-views-rail-empty = Noch keine Views.
+sql-queries-empty-title = Noch keine SQL-Abfragen
+sql-views-empty-title = Noch keine SQL-Views
+sql-queries-empty-lede = Lege mit „Neu erstellen" deine erste Abfrage an. Sie läuft gegen die flachen Tabellen jeder aktiven View-Definition.
+sql-views-empty-lede = Lege mit „Neu erstellen" deinen ersten View an. Seine Spalten werden zu einer Tabelle, aus der andere Abfragen und Exporte auswählen können.
+sql-queries-editor-heading = SQL
+sql-views-editor-heading = View-Definition (SQL)
+sql-queries-results-heading = Ergebnisse
+sql-views-results-heading = Vorschau
+sql-queries-run-failed = Die Abfrage konnte nicht ausgeführt werden.
+sql-views-run-failed = Die View konnte nicht ausgeführt werden.
 lib-degraded = Die Bibliotheksliste konnte nicht geladen werden.
-lib-sql-heading = SQL
+lib-run-hint = Läuft während der Eingabe – die Ergebnisse folgen dem aktuellen SQL, gespeichert oder nicht
+lib-edit-json = Als JSON bearbeiten
 lib-delete-confirm = „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
 lib-delete-failed = Die Bibliothek konnte nicht gelöscht werden.
 

@@ -90,6 +90,7 @@
 //! - [`health`] - Health monitoring (Phase 3)
 
 pub mod analyzer;
+pub mod bulk_submit;
 pub mod config;
 pub mod cost;
 pub mod health;
@@ -102,6 +103,7 @@ pub mod sync;
 pub use analyzer::{
     QueryAnalysis, QueryAnalyzer, QueryFeature, detect_query_features, features_to_capabilities,
 };
+pub use bulk_submit::CompositeSubmitJobs;
 pub use config::{
     BackendEntry, BackendRole, CompositeConfig, CompositeConfigBuilder, ConfigError, ConfigWarning,
     CostConfig, CostWeights, HealthConfig, RetryConfig, RoutingRule, SyncConfig, SyncMode,

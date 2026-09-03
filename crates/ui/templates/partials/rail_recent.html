@@ -1,7 +1,7 @@
 <!--
-  Server-rendered "Recently used" group (#754/#755 ticket 02, RF6), shared by
-  every type rail (Resources, Search, Saved Queries, Search Parameters) and,
-  from ticket 03, the SQL rails too.
+  Server-rendered "Recently used" group (#754/#755), shared by every type
+  rail (Resources, Search, Saved Queries, Search Parameters) and the SQL
+  rails too.
 
   `entries` is already resolved against the rail's own live items
   (`rail_state::RailState::resolve_recents`), so each one has the exact same
@@ -11,18 +11,18 @@
   list renders) — CSS, the tooltip/reveal script (`resource-filter.js`), and,
   on Resources/Search/Saved Queries, `saved-queries.js`'s in-page repaint
   after a rail click, all treat a recent exactly like any other rail item.
-  `meta` (ticket 03, the SQL rails' `ViewDefinition.resource`/`Library.status`
-  column) and `count` (the type rails' live count, `partials/type_rail.html`)
-  are mutually exclusive in practice — a page's `ResolvedRailEntry`s only
-  ever populate the one its own list uses — but both render conditionally so
-  the same macro serves every rail unchanged.
+  `meta` (the SQL rails' `ViewDefinition.resource`/`Library.status` column)
+  and `count` (the type rails' live count, `partials/type_rail.html`) are
+  mutually exclusive in practice — a page's `ResolvedRailEntry`s only ever
+  populate the one its own list uses — but both render conditionally so the
+  same macro serves every rail unchanged.
 
   `rail_page` and `max_recent` are the only values a client script needs to
   write this page's own `rails.<page>` record back — the single source for
   both is `rail_state::RailPage::key`/`rail_state::MAX_RECENT`, never
   redeclared in JS. The container stays present-but-`hidden` with no entries
-  (RF9: no store configured renders the same way), so CSS never has to key
-  off its absence.
+  (no store configured renders the same way), so CSS never has to key off
+  its absence.
 -->
 {% macro group(id, rail_list_id, rail_page, max_recent, heading, entries) %}
 <div class="filter-rail__group" id="{{ id }}"

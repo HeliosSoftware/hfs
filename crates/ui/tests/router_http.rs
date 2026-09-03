@@ -1751,7 +1751,7 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     assert!(html.contains(r#"data-msg-create="Create new {type}""#));
     // The "Recently used" group (#603, server-rendered since #754/#755) is
     // present but hidden: no settings store is wired for this test's app, so
-    // there is nothing stored to show (RF9).
+    // there is nothing stored to show.
     assert!(html.contains(r#"id="type-rail-recent""#));
     assert!(html.contains(r#"data-rail-page="resources""#));
     assert!(html.contains(r#"data-max-recent="5""#));
@@ -2461,8 +2461,8 @@ async fn sql_export_new_offers_subjects_and_files_tables_the_manifest() {
         )
     );
     assert!(html.contains("patients"));
-    // #833 gate-fix FALLA 2: an absolute manifest location renders as a
-    // same-origin path, since the UI and the FHIR API share one server.
+    // #833: an absolute manifest location renders as a same-origin path,
+    // since the UI and the FHIR API share one server.
     assert!(html.contains(r#"href="/export/job-9/patients-0.csv""#));
     assert!(html.contains(">csv<"));
 }
@@ -2562,6 +2562,272 @@ async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
     assert!(html.contains("SELECT 3"));
 }
 
+/// The selected title row's `<h2 class="page-head__title page-head__title--
+/// kind">...</h2>` element, unescaped — so a test can inspect its chips and
+/// icon without also matching the rail entries or other page text that
+/// happen to repeat the same name or status.
+fn title_row_html(html: &str) -> String {
+    html_unescape(
+        html.split(r#"<h2 class="page-head__title page-head__title--kind">"#)
+            .nth(1)
+            .and_then(|s| s.split("</h2>").next())
+            .expect("a title row h2"),
+    )
+}
+
+/// #839: the title row's type icon and its two chips — `.tag--type` naming
+/// the kind ("SQL Query"/"SQL View", singular, distinct from the page
+/// head's own plural collection title) and `.tag--{status}` naming the
+/// resource's own FHIR `status` verbatim — render for both a saved
+/// selection and the `?lib=new` starter, whose chips read the starter's own
+/// fixed `draft` status. The secondary "Edit as JSON" link only appears for
+/// a saved Library, and its `href` names that Library's own `_id`. There is
+/// exactly one `<h1>` per page.
+#[tokio::test]
+async fn sql_library_title_row_carries_kind_chips_and_the_edit_as_json_link() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "retired",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = library_app(source);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert_eq!(html.matches("<h1").count(), 1);
+    let title_row = title_row_html(&html);
+    assert!(title_row.contains(r#"class="tag tag--type">SQL Query<"#));
+    assert!(title_row.contains(r#"class="tag tag--active">active<"#));
+    assert!(title_row.contains("patient_counts"));
+    assert!(html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dq1""#));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    let title_row = title_row_html(&html);
+    assert!(title_row.contains(r#"class="tag tag--type">SQL View<"#));
+    assert!(title_row.contains(r#"class="tag tag--retired">retired<"#));
+    assert!(html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dv1""#));
+
+    // `?lib=new`: the starter's own fixed `draft` status: no stored id, so
+    // no "Edit as JSON" link and no CRUD actions at all.
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    let title_row = title_row_html(&html);
+    assert!(title_row.contains(r#"class="tag tag--type">SQL Query<"#));
+    assert!(title_row.contains(r#"class="tag tag--draft">draft<"#));
+    assert!(!html.contains("url=Library"));
+    assert!(!html.contains("data-crud-delete"));
+}
+
+/// #839: the editor and results headings, and the failure notice's prefix,
+/// come from the route's own kind — never View Definitions' shared
+/// `vd-results-heading`/`vd-run-failed` SQL Queries and SQL Views used to
+/// reuse.
+#[tokio::test]
+async fn sql_library_editor_results_and_failure_copy_differ_by_kind() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let query_lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}]});
+    let view_lib = serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}]});
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![query_lib.clone()],
+        )
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let html = body_text(
+        library_app(source)
+            .oneshot(
+                Request::get("/ui/sql/queries?lib=q1&saved=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains(">SQL<"));
+    assert!(html.contains(">Results<"));
+    assert!(!html.contains(">Preview<"));
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![view_lib])
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let html = body_text(
+        library_app(source)
+            .oneshot(
+                Request::get("/ui/sql/views?lib=v1&saved=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains(">View definition (SQL)<"));
+    assert!(html.contains(">Preview<"));
+    assert!(!html.contains(">Results<"));
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![query_lib])
+        .with_sql_run(Err("boom".into()));
+    let html = body_text(
+        library_app(source)
+            .oneshot(
+                Request::get("/ui/sql/queries?lib=q1&saved=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains("Could not run the query."));
+    assert!(!html.contains("Could not run the view."));
+}
+
+/// #839: "Export as files" is the page-level results card's own action too
+/// (mirroring the `/run` fragment's own contract already proven by
+/// `sql_queries_run_previews_posted_content_and_offers_export_with_an_id`),
+/// present only for SQL Queries and only once the Library is saved — never
+/// for `?lib=new`'s unsaved starter, and never for SQL Views at all. The
+/// JSON fold, its `<details>`, and `?run=1` are gone; the resource travels
+/// as a hidden `name="json"` field instead of a visible textarea.
+#[tokio::test]
+async fn sql_library_page_offers_export_only_for_a_saved_query_and_drops_the_json_fold() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}]});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"href="/ui/sql/export/new?subject=Library/q1""#));
+    // The layout shell's own menus legitimately use `<details>` elsewhere
+    // (the tenant/version selectors) — #839 only retires the JSON fold, so
+    // this checks the fold's own class rather than every `<details>`.
+    assert!(!html.contains("json-fold"));
+    assert!(!html.contains("run=1"));
+    assert!(!html.contains(r#"<textarea class="json-editor" name="json""#));
+    assert!(html.contains(r#"<input type="hidden" name="json" value="#));
+    assert!(html_unescape(&html).contains(r#""resourceType": "Library""#));
+
+    // `?lib=new`: the starter is never saved, so Export never appears even
+    // though the kind offers it.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("subject=Library"));
+    assert!(!html.contains("Export as files"));
+
+    // SQL Views never offers Export, saved or not.
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("subject=Library"));
+    assert!(!html.contains("Export as files"));
+}
+
+/// #839: with no Library of the route's kind at all, the center column
+/// shows that kind's own empty-state title and lede (never the shared,
+/// generic `lib-none`/`lib-empty-lede` copy both kinds used to reuse) plus
+/// Create New — while the rail's own "no Libraries" text renders under the
+/// "All …" heading.
+#[tokio::test]
+async fn sql_library_empty_state_uses_the_routes_own_kind_copy() {
+    let app = library_app(helios_ui::StaticConformanceSource::empty());
+
+    let html = body_text(
+        app.clone()
+            .oneshot(Request::get("/ui/sql/queries").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains("No SQL queries yet"));
+    assert!(html.contains("Write your first query with Create New."));
+    assert!(html.contains("No queries yet."));
+    assert!(!html.contains("No SQL views yet"));
+    assert!(html.contains(r#"href="/ui/sql/queries?lib=new""#));
+
+    let html = body_text(
+        app.oneshot(Request::get("/ui/sql/views").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains("No SQL views yet"));
+    assert!(html.contains("Define your first view with Create New."));
+    assert!(html.contains("No views yet."));
+    assert!(!html.contains("No SQL queries yet"));
+    assert!(html.contains(r#"href="/ui/sql/views?lib=new""#));
+}
+
 /// `application/x-www-form-urlencoded`-encodes `s`, byte by byte, so tests
 /// can post arbitrary text (newlines, tabs, quotes, non-ASCII) without
 /// pulling in a form-encoding crate just for this.
@@ -2578,16 +2844,22 @@ fn form_encode(s: &str) -> String {
     out
 }
 
-/// The inverse of Askama's default HTML auto-escaping, so a value read back
-/// out of a rendered `<textarea>` can be compared against the exact text
-/// that was posted.
+/// The inverse of Askama's default HTML auto-escaping — numeric character
+/// references (askama's own escaper never emits named ones; the named
+/// patterns below are kept only in case a future version changes that) — so
+/// text read back out of rendered HTML can be compared against the exact
+/// string that was posted or interpolated.
 fn html_unescape(s: &str) -> String {
     s.replace("&quot;", "\"")
+        .replace("&#34;", "\"")
         .replace("&#x27;", "'")
         .replace("&#39;", "'")
         .replace("&lt;", "<")
+        .replace("&#60;", "<")
         .replace("&gt;", ">")
+        .replace("&#62;", ">")
         .replace("&amp;", "&")
+        .replace("&#38;", "&")
 }
 
 /// The exact text between the SQL pane's `<textarea name="sql" ...>` open
@@ -2679,10 +2951,331 @@ async fn sql_editor_save_roundtrips_special_characters_byte_for_byte() {
     assert_eq!(sql_textarea_value(&html), sql);
 }
 
+/// `application/x-www-form-urlencoded` body for the Library-backed `/run`
+/// fragment endpoint's `id`/`json`/`sql` fields (#839).
+fn library_run_body(id: &str, json: &Value, sql: &str) -> String {
+    form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", id)
+        .append_pair("json", &json.to_string())
+        .append_pair("sql", sql)
+        .finish()
+}
+
+fn post_run(route: &str, body: String) -> Request<Body> {
+    Request::post(route)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// #839: `POST /ui/sql/queries/run` runs the *posted* `json`/`sql` — never a
+/// stored resource, so a Library that does not exist in the source at all
+/// still previews (never a stored resource read) — through
+/// `$sql-run`, embedding `sql` into `json` exactly the way Save does, and
+/// renders the shared partial as an OOB fragment. Query offers "Export as
+/// files" once the posted `id` is non-empty; an empty `id` omits it even
+/// though the kind offers Export.
+#[tokio::test]
+async fn sql_queries_run_previews_posted_content_and_offers_export_with_an_id() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 3})]));
+    let app = library_app(source);
+    let library =
+        serde_json::json!({"resourceType": "Library", "name": "unsaved_query", "status": "draft"});
+
+    let response = app
+        .clone()
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library, "SELECT COUNT(*) AS n FROM v"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<div id="run-notice"></div>"#));
+    assert!(html.contains(r#"id="run-results""#));
+    assert!(html.contains(r#"hx-swap-oob="outerHTML""#));
+    assert!(html.contains("<th>n</th>"));
+    assert!(html.contains("<td>3</td>"));
+    let meta = text_between(
+        &html,
+        r#"id="run-results-meta" class="card-head__meta">"#,
+        "</span>",
+    );
+    assert!(meta.starts_with("1 rows"), "{meta}");
+    // The Export action rides the same card-head cluster as the meta.
+    assert!(html.contains(r#"href="/ui/sql/export/new?subject=Library/lib1""#));
+    assert!(html.contains("Export as files"));
+
+    // An empty posted `id` omits Export even for a kind that offers it.
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("", &library, "SELECT COUNT(*) AS n FROM v"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("subject=Library"));
+    assert!(!html.contains("Export as files"));
+}
+
+/// #839: `POST /ui/sql/views/run` runs the posted document the same way as
+/// Queries, but a SQL View never offers Export, with or without an id.
+#[tokio::test]
+async fn sql_views_run_previews_posted_content_and_never_offers_export() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+    let library =
+        serde_json::json!({"resourceType": "Library", "name": "unsaved_view", "status": "draft"});
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/views/run",
+            library_run_body("lib1", &library, "SELECT 1 AS n"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="run-results""#));
+    assert!(html.contains("<td>1</td>"));
+    assert!(!html.contains("subject=Library"));
+    assert!(!html.contains("Export as files"));
+}
+
+/// #839: a run failure answers `200` (htmx never swaps an error status) with
+/// the notice carrying the server's message, the meta relabelled to "last
+/// successful run" via its own OOB swap, and no `#run-results` at all — the
+/// client's previous table is left alone. Exercised on both routes.
+#[tokio::test]
+async fn library_run_reports_a_failed_run_without_a_results_card() {
+    for route in ["/ui/sql/queries/run", "/ui/sql/views/run"] {
+        let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Err("boom".into()));
+        let app = library_app(source);
+        let library = serde_json::json!({"resourceType": "Library", "status": "draft"});
+
+        let response = app
+            .oneshot(post_run(
+                route,
+                library_run_body("lib1", &library, "bad sql"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        assert!(html.contains("boom"), "{route}: {html}");
+        assert!(html.contains(r#"<div id="run-notice">"#), "{route}");
+        assert!(
+            html.contains(
+                r#"id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
+            ),
+            "{route}"
+        );
+        assert!(!html.contains(r#"id="run-results""#), "{route}");
+    }
+}
+
+/// #839: a `$sql-run` parse failure's `Line: N` marker becomes
+/// `data-error-line="N"` on the notice; a plain execution error (no marker)
+/// carries no such attribute.
+#[tokio::test]
+async fn library_run_failure_carries_the_error_line_only_when_the_message_names_one() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Err("sql parser error: … at Line: 2, Column: 8".into()));
+    let app = library_app(source);
+    let library = serde_json::json!({"resourceType": "Library", "status": "draft"});
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library, "SELEC 1"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-error-line="2""#), "{html}");
+
+    let source =
+        helios_ui::StaticConformanceSource::empty().with_sql_run(Err("no such table: v".into()));
+    let app = library_app(source);
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library, "SELECT * FROM v"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("data-error-line"), "{html}");
+}
+
+/// #839: invalid JSON never reaches `$sql-run` — the seeded rows would
+/// show up in the response if it had — and reports the parse error in the
+/// same notice-only shape as a failed run, still `200`.
+#[tokio::test]
+async fn library_run_reports_invalid_json_without_calling_sql_run() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            "id=lib1&json=%7B&sql=SELECT+1".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(!html.contains(r#"id="run-results""#));
+    assert!(!html.contains("<td>p1</td>"));
+}
+
+/// #839: a `resourceType` other than `Library` fails the same way,
+/// with the same message the save form already uses, and likewise never
+/// reaches `$sql-run`.
+#[tokio::test]
+async fn library_run_rejects_a_non_library_resource_type() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = library_app(source);
+    let wrong_type = serde_json::json!({"resourceType": "ViewDefinition", "status": "draft"});
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &wrong_type, "SELECT 1"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = html_unescape(&body_text(response).await);
+    assert!(html.contains(r#"the document must have resourceType "Library""#));
+    assert!(!html.contains("<td>p1</td>"));
+}
+
+/// #839: a body with no `json` field is the one case either `/run`
+/// endpoint answers with a genuine error status — axum's own `Form`
+/// rejection (`422 Unprocessable Entity`), not this endpoint's `2xx`
+/// fragment contract. See `view_definitions_run_without_a_json_field_is_
+/// unprocessable`'s own doc comment for why `422`, not `400`.
+#[tokio::test]
+async fn library_run_without_a_json_field_is_unprocessable() {
+    let app = library_app(helios_ui::StaticConformanceSource::empty());
+
+    let response = app
+        .oneshot(post_run("/ui/sql/queries/run", "id=lib1&sql=x".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// #839: `?lib=<id>&saved=1` (Save's own redirect) renders the
+/// just-stored Library's `$sql-run` results server-side — the nojs path.
+/// Without `saved`, the same selection's own render carries the partial's
+/// `Empty` shell instead: no table, a load-triggered repost that includes
+/// the editor form.
+#[tokio::test]
+async fn sql_queries_page_saved_redirect_runs_the_stored_library_others_stay_empty() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}]});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="run-results""#));
+    assert!(html.contains("<td>1</td>"));
+    assert!(!html.contains(r#"hx-trigger="load""#));
+
+    // No `?saved=1`: nothing has run server-side, so the notice's own empty
+    // shell carries the initial-load repost against the editor form.
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("table-card"));
+    assert!(html.contains(r#"<div id="run-results"></div>"#));
+    assert!(html.contains(r#"hx-post="/ui/sql/queries/run""#));
+    assert!(html.contains(r#"hx-trigger="load""#));
+    assert!(html.contains(r##"hx-include="#lib-editor-form""##));
+}
+
+/// #839: `?run=1` is gone — no link renders it, and posting it no
+/// longer produces a results table (the query param is not read at all).
+/// The SQL textarea instead carries the live-preview `hx-*` wiring inline.
+#[tokio::test]
+async fn sql_queries_page_drops_the_run_link_and_wires_the_textarea_to_htmx() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]}});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("run=1"));
+    assert!(html.contains(r#"hx-post="/ui/sql/queries/run""#));
+    assert!(html.contains(r#"hx-trigger="input changed delay:500ms""#));
+    assert!(html.contains(r##"hx-target="#run-notice""##));
+
+    // `?run=1` is no longer read by the handler — still no results table.
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&run=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("table-card"));
+}
+
 /// #649: the View Definitions workspace lists stored views in the rail
 /// (name-sorted, first selected), edits the selection as JSON, and offers
-/// the starter document under Create New. #752 ticket 02, RF1: there is no
-/// `?run=1` — it is no longer read by the handler and has no effect.
+/// the starter document under Create New. #752: there is no `?run=1` — it
+/// is no longer read by the handler and has no effect.
 #[tokio::test]
 async fn view_definitions_workspace_lists_edits_and_previews() {
     let vds = vec![
@@ -2731,23 +3324,23 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     // Delete goes through the shared conformance CRUD script.
     assert!(html.contains(r#"data-crud-delete"#));
     assert!(html.contains("/ui/assets/conformance-crud.js"));
-    // #752 ticket 02, RF1/RF2: no Run link, no `<details>` fold — the
-    // editor card is always open with the "Runs as you type" legend, and
-    // the results region's own empty notice is always present.
+    // #752: no Run link, no `<details>` fold — the editor card is always
+    // open with the "Runs as you type" legend, and the results region's own
+    // empty notice is always present.
     assert!(!html.contains("run=1"));
     assert!(!html.contains("json-fold"));
     assert!(html.contains("editor-legend__live"));
-    assert!(html.contains(r#"id="vd-run-notice""#));
+    assert!(html.contains(r#"id="run-notice""#));
     assert!(html.contains(r#"hx-post="/ui/sql/view-definitions/run""#));
-    // RF4: no server-side results yet, so the notice's own empty shell
-    // carries the initial-load trigger.
+    // No server-side results yet, so the notice's own empty shell carries
+    // the initial-load trigger.
     assert!(html.contains(r#"hx-trigger="load""#));
-    // RF3: no results card until something has actually run — only the
-    // empty placeholder the first live fragment's OOB swap anchors onto.
+    // No results card until something has actually run — only the empty
+    // placeholder the first live fragment's OOB swap anchors onto.
     assert!(!html.contains("table-card"));
-    assert!(html.contains(r#"<div id="vd-results"></div>"#));
+    assert!(html.contains(r#"<div id="run-results"></div>"#));
 
-    // RF1: `?run=1` is no longer read by the handler — no results card.
+    // `?run=1` is no longer read by the handler — no results card.
     let response = app
         .clone()
         .oneshot(
@@ -2773,8 +3366,8 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     let html = body_text(response).await;
     assert!(html.contains("new_view"));
     assert!(html.contains("getResourceKey()"));
-    // RF4/NF5: `?vd=new` selects the starter document, so the results
-    // region's own load trigger fires for it exactly like a stored view.
+    // `?vd=new` selects the starter document, so the results region's own
+    // load trigger fires for it exactly like a stored view.
     assert!(html.contains(r#"hx-trigger="load""#));
 }
 
@@ -2928,12 +3521,12 @@ async fn view_definitions_save_error_rerenders_the_guided_form_panel_from_the_su
     assert!(html.contains(r#"class="card editor-form needs-js""#));
 }
 
-/// #752 ticket 02, RF6: `?vd=<id>&saved=1` (Save's own redirect) renders the
-/// just-stored definition's `$sql-run` results server-side — the nojs path
-/// to the playground's live preview. The success case's results card comes
-/// with a working meta and no load trigger left behind (RF4: results
-/// already present, so the client must not ask again); the failure case
-/// shows `vd-run-failed` instead, with no results card.
+/// #752: `?vd=<id>&saved=1` (Save's own redirect) renders the just-stored
+/// definition's `$sql-run` results server-side — the nojs path to the
+/// playground's live preview. The success case's results card comes with a
+/// working meta and no load trigger left behind (results already present,
+/// so the client must not ask again); the failure case shows
+/// `vd-run-failed` instead, with no results card.
 #[tokio::test]
 async fn view_definitions_saved_redirect_renders_results_server_side() {
     let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
@@ -2958,16 +3551,16 @@ async fn view_definitions_saved_redirect_renders_results_server_side() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    assert!(html.contains(r#"id="vd-results""#));
+    assert!(html.contains(r#"id="run-results""#));
     assert!(html.contains("<th>id</th>"));
     assert!(html.contains("<td>p1</td>"));
     let meta = text_between(
         &html,
-        r#"id="vd-results-meta" class="card-head__meta">"#,
+        r#"id="run-results-meta" class="card-head__meta">"#,
         "</span>",
     );
     assert!(meta.starts_with("1 rows"), "{meta}");
-    // RF4: results already arrived server-side, so the notice must not also
+    // Results already arrived server-side, so the notice must not also
     // carry the client-driven initial-load trigger.
     assert!(!html.contains(r#"hx-trigger="load""#));
 
@@ -2987,11 +3580,11 @@ async fn view_definitions_saved_redirect_renders_results_server_side() {
     let html = body_text(response).await;
     assert!(html.contains("notice--warn"));
     assert!(html.contains("boom"));
-    // RF7: no real results card on a failed run — just the anchor placeholder
-    // a later successful edit's OOB swap needs (see the partial's own
-    // header comment for why).
+    // No real results card on a failed run — just the anchor placeholder a
+    // later successful edit's OOB swap needs (see the partial's own header
+    // comment for why).
     assert!(!html.contains("table-card"));
-    assert!(html.contains(r#"<div id="vd-results"></div>"#));
+    assert!(html.contains(r#"<div id="run-results"></div>"#));
     assert!(!html.contains(r#"hx-trigger="load""#));
 }
 
@@ -3017,9 +3610,9 @@ fn urlencoded_json_body(document: &serde_json::Value) -> String {
         .finish()
 }
 
-/// #752 ticket 01, RF4: the fragment endpoint runs the *posted* text, not a
+/// #752: the fragment endpoint runs the *posted* text, not a
 /// stored resource — the playground's whole point. The success fragment
-/// opens with an empty `#vd-run-notice`, then `#vd-results` carries its own
+/// opens with an empty `#run-notice`, then `#run-results` carries its own
 /// `hx-swap-oob`, with the view's declared column order, the canned row,
 /// and a `{ $rows } rows · { $ms } ms` meta.
 #[tokio::test]
@@ -3029,8 +3622,8 @@ async fn view_definitions_run_previews_the_posted_document_via_an_oob_fragment()
         .with_sql_run(Ok(vec![serde_json::json!({"id": "p1", "family": "Doe"})]));
     let app = view_definitions_app(source);
 
-    // Deliberately never stored (RF2/RF3: "contenido no guardado") — proves
-    // the handler ran the request body, not a resource fetched by id.
+    // Deliberately never stored — proves the handler ran the request body,
+    // not a resource fetched by id.
     let vd = serde_json::json!({
         "resourceType": "ViewDefinition",
         "name": "unsaved_view",
@@ -3058,24 +3651,24 @@ async fn view_definitions_run_previews_the_posted_document_via_an_oob_fragment()
         "text/html; charset=utf-8"
     );
     let html = body_text(response).await;
-    assert!(html.contains(r#"<div id="vd-run-notice"></div>"#));
-    assert!(html.contains(r#"id="vd-results""#));
+    assert!(html.contains(r#"<div id="run-notice"></div>"#));
+    assert!(html.contains(r#"id="run-results""#));
     assert!(html.contains(r#"hx-swap-oob="outerHTML""#));
     assert!(html.contains("<th>id</th><th>family</th>"));
     assert!(html.contains("<td>p1</td><td>Doe</td>"));
     let meta = text_between(
         &html,
-        r#"id="vd-results-meta" class="card-head__meta">"#,
+        r#"id="run-results-meta" class="card-head__meta">"#,
         "</span>",
     );
     assert!(meta.starts_with("1 rows"), "{meta}");
     assert!(meta.ends_with(" ms"), "{meta}");
 }
 
-/// #752 ticket 01, RF5: a failed run answers `200` (NF3 — htmx never swaps
+/// #752: a failed run answers `200` (NF3 — htmx never swaps
 /// an error status) with the notice carrying the server's message, the meta
 /// relabelled to "last successful run" via its own OOB swap, and no
-/// `#vd-results` at all — the client's previous table is left alone.
+/// `#run-results` at all — the client's previous table is left alone.
 #[tokio::test]
 async fn view_definitions_run_reports_a_failed_run_without_a_results_card() {
     let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Err("boom".into()));
@@ -3099,14 +3692,14 @@ async fn view_definitions_run_reports_a_failed_run_without_a_results_card() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("boom"));
-    assert!(html.contains(r#"<div id="vd-run-notice">"#));
+    assert!(html.contains(r#"<div id="run-notice">"#));
     assert!(html.contains(
-        r#"id="vd-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
+        r#"id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
     ));
-    assert!(!html.contains(r#"id="vd-results""#));
+    assert!(!html.contains(r#"id="run-results""#));
 }
 
-/// #752 ticket 01, RF6: invalid JSON never reaches `$sql-run` — the seeded
+/// #752: invalid JSON never reaches `$sql-run` — the seeded
 /// rows would show up in the response if it had — and reports the parse
 /// error in the same notice-only shape as a failed run, still `200`.
 #[tokio::test]
@@ -3128,19 +3721,20 @@ async fn view_definitions_run_reports_invalid_json_without_calling_sql_run() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("invalid JSON"));
-    assert!(!html.contains(r#"id="vd-results""#));
+    assert!(!html.contains(r#"id="run-results""#));
     assert!(!html.contains("<table"));
     assert!(!html.contains("<td>p1</td>"));
 }
 
-/// #752 ticket 01, RF2: a body with no `json` field is the one case this
-/// endpoint answers with a genuine error status — axum's own `Form`
-/// rejection, not a hand-rolled one. `422 Unprocessable Entity`, not `400`:
-/// axum's `Form` extractor reports a `POST` body it cannot deserialize (a
-/// missing field included) as `422`, reserving `400` for a query-string
-/// (`GET`) rejection or a request with the wrong content type — see
+/// #752: a body with no `json` field is the one case this endpoint answers
+/// with a genuine error status — axum's own `Form` rejection, not a
+/// hand-rolled one. `422 Unprocessable Entity`, not `400`: axum's `Form`
+/// extractor reports a `POST` body it cannot deserialize (a missing field
+/// included) as `422`, reserving `400` for a query-string (`GET`) rejection
+/// or a request with the wrong content type — see
 /// `axum::form::tests::deserialize_error_status_codes` (axum 0.8.4). Either
-/// way it is a real 4xx, not the 2xx fragment contract RF4–RF6 describe.
+/// way it is a real 4xx, not the always-`200` fragment contract every other
+/// `/run` response follows.
 #[tokio::test]
 async fn view_definitions_run_without_a_json_field_is_unprocessable() {
     let app = view_definitions_app(helios_ui::StaticConformanceSource::empty());
@@ -3158,8 +3752,8 @@ async fn view_definitions_run_without_a_json_field_is_unprocessable() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-/// #752 ticket 01, RF4: a run with no output rows still renders the results
-/// card — `data-table__empty` plus a `0 rows` meta — not the failure notice.
+/// #752: a run with no output rows still renders the results card —
+/// `data-table__empty` plus a `0 rows` meta — not the failure notice.
 #[tokio::test]
 async fn view_definitions_run_with_no_rows_renders_the_empty_state() {
     let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
@@ -3185,7 +3779,7 @@ async fn view_definitions_run_with_no_rows_renders_the_empty_state() {
     assert!(html.contains(r#"class="data-table__empty""#));
     let meta = text_between(
         &html,
-        r#"id="vd-results-meta" class="card-head__meta">"#,
+        r#"id="run-results-meta" class="card-head__meta">"#,
         "</span>",
     );
     assert!(meta.starts_with("0 rows"), "{meta}");
@@ -3443,13 +4037,33 @@ fn view_definitions_app(source: helios_ui::StaticConformanceSource) -> Router {
     )
 }
 
+/// The SQL Queries / SQL Views workspaces' own app, mirroring
+/// [`view_definitions_app`] — shared by the Library-backed `/run` fragment
+/// and page tests below (#839).
+fn library_app(source: helios_ui::StaticConformanceSource) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
 /// The `id="vd-rail-list"` (or `id="lib-rail-list"`) scrollable list's own
 /// HTML — its opening tag up to the closing `</div>` immediately after it,
 /// with no nested `<div>` in between (the list holds only `<a>` items and,
 /// when empty, a `<p>`) — so a test can assert what the paginated/filtered
 /// list shows without also matching the "Recently used" group above it,
-/// which (ticket 03) can legitimately render an id the list itself excludes
-/// (RF4: the group is never filtered).
+/// which can legitimately render an id the list itself excludes — the
+/// group is never filtered.
 fn rail_list_html<'a>(html: &'a str, list_id: &str) -> &'a str {
     let start = html
         .find(&format!(r#"id="{list_id}""#))
@@ -3592,8 +4206,8 @@ async fn view_definitions_rail_filters_by_name_case_insensitively() {
 }
 
 /// #741: a `?vd=` the current filter excludes from the rail still loads
-/// through the direct-by-id read (ticket 01) — selection is independent of
-/// what the rail happens to show.
+/// through the direct-by-id read — selection is independent of what the
+/// rail happens to show.
 #[tokio::test]
 async fn view_definitions_selection_survives_a_filter_that_excludes_it() {
     let vds = vec![
@@ -3624,9 +4238,8 @@ async fn view_definitions_selection_survives_a_filter_that_excludes_it() {
     assert!(list.contains(r#"data-type="other""#));
     assert!(!list.contains(r#"data-type="keep""#));
     // ...but the just-selected "keep" still surfaces through the "Recently
-    // used" group above it (ticket 03, RF4: the group is never itself
-    // filtered) — from its snapshot, since the filter takes it off the list
-    // this render shows.
+    // used" group above it — the group is never itself filtered — from its
+    // snapshot, since the filter takes it off the list this render shows.
     assert!(html.contains(r#"id="vd-rail-recent""#));
     // ...and the editor still holds the selected view the filter excluded.
     assert!(html.contains(r#"name="json""#));

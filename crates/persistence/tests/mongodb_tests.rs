@@ -2553,6 +2553,142 @@ async fn mongodb_integration_search_cursor_pagination_roundtrip() {
 }
 
 #[tokio::test]
+async fn mongodb_integration_search_missing_not_and_param_sort() {
+    let Some(backend) = create_backend_with_full_registry("search_missing_not_sort").await else {
+        eprintln!(
+            "Skipping mongodb_integration_search_missing_not_and_param_sort (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-missing-not-sort");
+
+    for (id, gender, birth_date) in [
+        ("patient-mns-1", Some("male"), Some("1990-05-01")),
+        ("patient-mns-2", Some("female"), Some("1975-03-20")),
+        ("patient-mns-3", None, Some("2001-11-11")),
+        ("patient-mns-4", Some("female"), None),
+    ] {
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{"family": format!("Mns-{}", id)}],
+        });
+        if let Some(gender) = gender {
+            resource["gender"] = json!(gender);
+        }
+        if let Some(birth_date) = birth_date {
+            resource["birthDate"] = json!(birth_date);
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // :missing=true — only the patient with no gender at all.
+    let missing_true = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("true")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &missing_true).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-mns-3"]);
+
+    // :missing=false — everyone with a gender value.
+    let missing_false = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("false")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &missing_false).await.unwrap();
+    let mut got = ids(&result);
+    got.sort();
+    assert_eq!(got, vec!["patient-mns-1", "patient-mns-2", "patient-mns-4"]);
+
+    // :not — excludes matches AND includes resources without the value (per spec).
+    let not_male = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("male")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &not_male).await.unwrap();
+    let mut got = ids(&result);
+    got.sort();
+    assert_eq!(got, vec!["patient-mns-2", "patient-mns-3", "patient-mns-4"]);
+
+    // _sort by an indexed date parameter, ascending; the patient without a
+    // birthDate sorts last.
+    let sorted = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)));
+    let result = backend.search(&tenant, &sorted).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec![
+            "patient-mns-2",
+            "patient-mns-1",
+            "patient-mns-3",
+            "patient-mns-4"
+        ]
+    );
+
+    // Descending; keyed resources reverse, the unkeyed one still sorts last.
+    let sorted_desc = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("-birthdate").with_param_type(Some(SearchParamType::Date)));
+    let result = backend.search(&tenant, &sorted_desc).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec![
+            "patient-mns-3",
+            "patient-mns-1",
+            "patient-mns-2",
+            "patient-mns-4"
+        ]
+    );
+
+    // Param sort composes with filters and offset pagination.
+    let mut filtered_sorted = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("false")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(2);
+    let page1 = backend.search(&tenant, &filtered_sorted).await.unwrap();
+    assert_eq!(ids(&page1), vec!["patient-mns-2", "patient-mns-1"]);
+    assert!(page1.resources.page_info.has_next);
+    assert!(page1.resources.page_info.next_cursor.is_none());
+
+    filtered_sorted.offset = Some(2);
+    let page2 = backend.search(&tenant, &filtered_sorted).await.unwrap();
+    assert_eq!(ids(&page2), vec!["patient-mns-4"]);
+    assert!(!page2.resources.page_info.has_next);
+    assert!(page2.resources.page_info.has_previous);
+}
+
+#[tokio::test]
 async fn mongodb_integration_conditional_create_exists() {
     let Some(backend) = create_backend_with_full_registry("conditional_create").await else {
         eprintln!(

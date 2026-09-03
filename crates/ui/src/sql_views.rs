@@ -100,9 +100,9 @@ fn urlencode(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-/// The `$sql-run` preview's row cap, shared by the page's own `?run=1`
-/// render and the `/run` fragment endpoint (#752 ticket 01): a navigation or
-/// keystroke preview, never an export.
+/// The `$sql-run` preview's row cap, shared by the server-side `?saved=1`
+/// render and all three `/run` fragment endpoints (#752, #839): a
+/// navigation or keystroke preview, never an export.
 pub(crate) const RUN_LIMIT: usize = 50;
 
 /// The view's output column names, in declaration order: a depth-first walk of
@@ -175,6 +175,25 @@ fn cell_text(value: Option<&Value>) -> String {
         Some(Value::String(s)) => s.clone(),
         Some(other) => other.to_string(),
     }
+}
+
+/// The 1-based line number out of a `$sql-run` failure message, when the
+/// server's message carries sqlparser's own `Line: N` marker (as in
+/// `… at Line: 2, Column: 8`, the shape a SQL *parse* failure takes — a
+/// SQLite *execution* error carries no such marker). `None` for a message
+/// with no `Line: ` marker at all, or where the text right after it is not a
+/// plain, in-range non-negative integer (#839).
+///
+/// Shared by the View Definitions, SQL Queries, and SQL Views playgrounds so
+/// the editor's own line-tinting (#839) can locate a parse error the same
+/// way regardless of which page ran it.
+pub(crate) fn extract_error_line(message: &str) -> Option<u32> {
+    let after_marker = message.split_once("Line: ")?.1;
+    let digits: String = after_marker
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// The starter document behind "Create New" — the smallest runnable view.
@@ -264,6 +283,24 @@ mod tests {
                 ("name:contains".to_string(), "Blood".to_string()),
             ],
         );
+    }
+
+    #[test]
+    fn error_line_extraction_reads_the_sqlparser_marker() {
+        assert_eq!(
+            extract_error_line("sql parser error: … at Line: 2, Column: 8"),
+            Some(2)
+        );
+        // No marker at all — a SQLite execution error, not a parse error.
+        assert_eq!(extract_error_line("no such table: v"), None);
+        // A marker whose number is out of `u32` range is still "not a
+        // plain number" as far as the tinted line goes.
+        assert_eq!(
+            extract_error_line("… at Line: 99999999999999999999, Column: 1"),
+            None
+        );
+        // A marker with nothing numeric right after it.
+        assert_eq!(extract_error_line("… at Line: , Column: 1"), None);
     }
 
     #[test]

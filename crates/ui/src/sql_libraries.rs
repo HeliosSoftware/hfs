@@ -52,16 +52,25 @@ pub(crate) fn summarize(resources: &[Value], code: &str) -> Vec<LibSummary> {
                 .and_then(Value::as_str)
                 .unwrap_or(&id)
                 .to_string();
-            let status = l
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+            let status = extract_status(l);
             Some(LibSummary { id, name, status })
         })
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
     entries
+}
+
+/// The resource's own `status`, verbatim, empty when absent — the same
+/// extraction each rail entry above already applies, and the source of the
+/// editor-first title row's own status chip (#839), which shows this text
+/// as-is even when it names no FHIR publication-status code Helios
+/// recognizes.
+pub(crate) fn extract_status(library: &Value) -> String {
+    library
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The decoded SQL of the first `application/sql` content attachment, empty
@@ -115,6 +124,11 @@ pub(crate) fn embed_sql(library: &mut Value, sql: &str) {
     }
 }
 
+/// The starter document's fixed `status` — its own constant so
+/// [`starter_library`]'s literal and the "Create New" title row's status
+/// chip (#839, [`crate::status_tag_class`]) can never drift apart.
+pub(crate) const STARTER_STATUS: &str = "draft";
+
 /// The starter document behind "Create New" for `code`. The SQL pane fills
 /// the attachment, so the starter carries the coding, one dependency slot,
 /// and an empty `application/sql` attachment to receive it.
@@ -122,7 +136,7 @@ pub(crate) fn starter_library(code: &str) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "resourceType": "Library",
         "name": if code == "sql-view" { "new_sql_view" } else { "new_sql_query" },
-        "status": "draft",
+        "status": STARTER_STATUS,
         "type": { "coding": [{ "system": LIBRARY_TYPES_SYSTEM, "code": code }] },
         "relatedArtifact": [
             { "type": "depends-on", "resource": "http://example.org/ViewDefinition/change-me", "label": "v" }
@@ -197,6 +211,16 @@ mod tests {
             let lib: Value = serde_json::from_str(&starter_library(code)).unwrap();
             assert!(has_library_code(&lib, code));
             assert_eq!(extract_sql(&lib), "");
+            // #839: the starter's own status never drifts from the constant
+            // the title row's status chip reads on `?lib=new`.
+            assert_eq!(lib["status"].as_str(), Some(STARTER_STATUS));
         }
+    }
+
+    #[test]
+    fn status_is_extracted_verbatim_and_empty_when_absent() {
+        let lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
+        assert_eq!(extract_status(&lib), "active");
+        assert_eq!(extract_status(&json!({"resourceType": "Library"})), "");
     }
 }

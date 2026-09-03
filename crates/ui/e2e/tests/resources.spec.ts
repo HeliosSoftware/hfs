@@ -75,10 +75,10 @@ test("picking a rail type updates the URL and back navigates", async ({ resource
   await expect(resources.createLabel).toHaveText("Create new Patient");
 });
 
-// "Tests esperados" #11: the server remembers the selection (RF3), so
-// leaving through the nav and returning with no `?type=` at all opens back
-// on it — not the current-request-only history entry `page.goBack()` above
-// exercises, but the actual stored `rails.resources.last`.
+// The server remembers the selection, so leaving through the nav and
+// returning with no `?type=` at all opens back on it — not the
+// current-request-only history entry `page.goBack()` above exercises, but
+// the actual stored `rails.resources.last`.
 test("picking a type and returning through the nav (no ?type=) restores it", async ({
   resources,
   chrome,
@@ -383,7 +383,7 @@ test("create eligibility follows the effective FHIR version", async ({ resources
 });
 
 // "Recently used" group (#603, server-rendered per page since #754/#755):
-// saved-queries.js repaints it in-page on every rail click (RF4, cloning the
+// saved-queries.js repaints it in-page on every rail click (cloning the
 // live list item — no reload needed to see the effect), and the server keeps
 // the authoritative `rails.resources.recent` list the group would render from
 // on a fresh load.
@@ -445,15 +445,15 @@ test("picking rail types repaints the recently-used group in MRU order, capped a
   expect(Math.abs(recentGap - allGap)).toBeLessThanOrEqual(1);
 });
 
-// The in-page repaint above happens before the server write lands
-// (RF4: "sin esperar la respuesta del servidor"); this proves the write
-// itself lands, by waiting for the settings PATCH explicitly before
-// reloading — a plain navigation right after a click races an in-flight
-// fetch, which a fresh page load would otherwise cancel.
+// The in-page repaint above happens before the server write lands, without
+// waiting for the server's response; this proves the write itself lands, by
+// waiting for the settings PATCH explicitly before reloading — a plain
+// navigation right after a click races an in-flight fetch, which a fresh
+// page load would otherwise cancel.
 test("the recently-used selection survives a reload", async ({ resources, page }) => {
-  // No explicit `?type=` on either navigation: RF3 only ever records an
-  // explicit selection, so neither the blank-slate start nor the "reload"
-  // below writes anything on its own — only the two picks in between do.
+  // No explicit `?type=` on either navigation: only an explicit selection is
+  // ever recorded, so neither the blank-slate start nor the "reload" below
+  // writes anything on its own — only the two picks in between do.
   await resources.goto();
   await resources.pickType("Encounter");
   const persisted = page.waitForResponse(
@@ -471,9 +471,9 @@ test("the recently-used selection survives a reload", async ({ resources, page }
   expect(types).toEqual(["Observation", "Encounter"]);
 });
 
-// "Tests esperados" #13: recents are per page (#603's shared-across-pages
-// model is gone) — a type picked in Resources must not surface in Search's
-// or Saved Queries' own group.
+// Recents are per page (#603's shared-across-pages model is gone) — a type
+// picked in Resources must not surface in Search's or Saved Queries' own
+// group.
 test("recents are scoped per page, not shared across Resources, Search, and Saved Queries", async ({
   resources,
   search,
@@ -606,8 +606,8 @@ test("Create new does not register a recently-used entry", async ({ resources })
   // handler (scoped to `a.filter-rail__item` inside the list or the group,
   // #754/#755) never matches it — even though the default selection
   // (Patient, unpicked) still names it in the button's label. `goto()` with
-  // no explicit `?type=` resolves to that default without recording it
-  // (RF3: only an explicit selection is ever written).
+  // no explicit `?type=` resolves to that default without recording it —
+  // only an explicit selection is ever written.
   await resources.goto();
   await resources.createButton.click();
   await resources.modal.waitOpen();

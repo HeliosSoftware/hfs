@@ -173,8 +173,8 @@
   --warn: #8a5a00;
   --warn-soft: #fdf2dd;
   --danger-soft: #f0dfde;
-  /* Neutral pair for the cancelled state (#833 gate-fix, FALLA 3): the same
-     shape as the ok/warn/danger soft pairs above, but genuinely gray so
+  /* Neutral pair for the cancelled state (#833): the same shape as the
+     ok/warn/danger soft pairs above, but genuinely gray so
      "Cancelled" never reads as an accent-tinted (blue) or danger (red)
      status. */
   --muted-soft: #e9e9e9;
@@ -2807,10 +2807,6 @@ select.field__input {
   --kv-grid-margin-bottom: 0;
 }
 
-.json-editor--short {
-  min-height: 120px;
-}
-
 .json-editor:focus {
   outline: none;
   border-color: var(--accent);
@@ -2818,7 +2814,11 @@ select.field__input {
 }
 
 /* The collapsible JSON fold's summary rides .card-head; the chevron flips
-   when the fold opens, like the app's other disclosures. */
+   when the fold opens, like the app's other disclosures. #839 retired
+   `sql-library.html`'s own `.json-fold` (the SQL pane's JSON pane), but the
+   class is still load-bearing for the CapabilityStatement raw-JSON card
+   (`crates/ui-chrome/templates/partials/capability-raw-card.html`), so the
+   rule stays. */
 details.json-fold > summary {
   cursor: pointer;
   list-style: none;
@@ -3274,6 +3274,19 @@ details.json-fold[open] > summary .icon {
 }
 
 @layer pages {
+/* SQL Queries / SQL Views title row (#839): the selected Library's type
+   icon and its two chips (type, status) sit inline with its name inside
+   `.page-head__title` — no other page nests an icon or a chip in this
+   heading class, so the flex/gap treatment `.card-head h3` already gives
+   its own inline icon is scoped here as a modifier instead of changing the
+   shared rule every other page's title also uses. */
+.page-head__title--kind {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 /* Bulk Import detail: consistent rhythm between its non-empty cards. */
 .bulk-import-section {
   margin-bottom: 16px;
@@ -6455,7 +6468,7 @@ body.app-shell .pane {
   background-color: transparent;
 }
 
-/* Lint hover tooltip chrome (#753 gate-fixes): @codemirror/lint's own
+/* Lint hover tooltip chrome (#753): @codemirror/lint's own
    `.cm-tooltip` styling only exists under an internal `&light`/`&dark`
    state — set once, globally, from whether any loaded theme extension
    opted into `EditorView.darkTheme`, which no mount in this crate ever
@@ -6600,13 +6613,13 @@ body.app-shell .pane {
   max-height: none;
 }
 
-/* RF8 (#752 ticket 02): the plain `<textarea>` fallback's own height — the
-   same "min 320px, max ~70vh, scroll internally" cotas `.cm-editor` gets
-   above, so nojs and the pre-mount flash match the mounted editor's
-   footprint instead of the old fixed `rows="18"`. Scoped to this page's
-   form rather than `.json-editor` itself, which `sql-library.html` still
-   uses with its original sizing (#839 will give that page the same
-   treatment separately). */
+/* #752: the plain `<textarea>` fallback's own height — the same
+   "min 320px, max ~70vh, scroll internally" shape `.cm-editor` gets above,
+   so nojs and the pre-mount flash match the mounted editor's footprint
+   instead of a fixed `rows` count. Scoped to this page's form rather than
+   `.json-editor` itself, which every other page keeps its own sizing for —
+   the Library-backed SQL pane below gets the identical treatment, scoped to
+   its own smaller editor's dimensions (#839). */
 #vd-editor-form textarea.json-editor {
   min-height: 320px;
   max-height: 70vh;
@@ -6656,6 +6669,18 @@ body.app-shell .pane {
   max-height: 60vh;
 }
 
+/* #839: the SQL pane's plain `<textarea>` fallback matches the mounted
+   CodeMirror editor's own min-height/max-height above — the same
+   "nojs footprint equals the mounted one" contract `#vd-editor-form
+   textarea.json-editor` gives the ViewDefinition editor, scoped here to
+   `#lib-editor-form` instead since `.json-editor` itself keeps its generic
+   sizing for every other page. */
+#lib-editor-form textarea.json-editor {
+  min-height: 180px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
 /* SQL token colors — one class per @codemirror/lang-sql tag group this
    editor assigns (sql-editor.js has the full tag -> class mapping and why
    Identifier/Builtin are left uncolored). Keywords and boolean/null
@@ -6670,3 +6695,13 @@ body.app-shell .pane {
 .sql-editor .cmt-sql-comment { color: var(--sql-comment); font-style: italic; }
 .sql-editor .cmt-sql-punct { color: var(--sql-punct); }
 .sql-editor .cmt-sql-literal { color: var(--sql-literal); font-weight: 600; }
+
+/* Failed-line tint (#839, sql-editor.js): the class its `errorLineField`
+   `StateField` decoration applies to the `.cm-line` of the 1-based line a
+   `$sql-run` parse error names (`data-error-line` on `#run-notice`'s
+   notice — SQLite execution errors carry no line and get no tint). Three
+   classes deep beats `.code-editor .cm-activeLine`'s two above, so the tint
+   still shows through when the cursor sits on the failed line. */
+.sql-editor .cm-line.sql-editor__error-line {
+  background: var(--danger-soft);
+}
