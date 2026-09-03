@@ -9,9 +9,11 @@ use serde_json::Value;
 
 use crate::error::{StorageResult, TransactionError};
 use crate::tenant::TenantContext;
-use crate::types::StoredResource;
+use crate::types::{SearchParameter, StoredResource};
 
-use super::storage::ResourceStorage;
+use super::storage::{
+    ConditionalCreateResult, ConditionalDeleteResult, ConditionalUpdateResult, ResourceStorage,
+};
 
 /// Transaction isolation levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -248,6 +250,106 @@ pub trait TransactionProvider: ResourceStorage {
     }
 }
 
+/// Conditional interactions inside an open transaction.
+///
+/// [`Transaction`] addresses resources by id. FHIR's conditional interactions
+/// address them by search criteria, and a transaction Bundle may carry them
+/// (`PUT [type]?[criteria]`, `DELETE [type]?[criteria]`, `ifNoneExist`). The
+/// backend-level [`ConditionalStorage`](super::storage::ConditionalStorage)
+/// cannot serve those: it searches and writes through the backend's own
+/// connection, outside the open transaction, so a bundle that used it would
+/// commit one entry while the rest could still roll back (#859).
+///
+/// This is a separate trait rather than a widening of [`Transaction`] — the
+/// shape design discussion #28 proposed — so a backend adopts it once it has a
+/// transaction-scoped search, instead of every implementor of the base trait
+/// being widened at once. Only [`find_matching`](Self::find_matching) is
+/// required: it is the search surface, resolving criteria against *this
+/// transaction's* view, earlier writes of the same transaction included. The
+/// three interactions are defaulted on top of it and [`Transaction`]'s
+/// id-addressed writes, answering with the same outcome enums the
+/// backend-level trait returns.
+///
+/// `criteria` is typed, not a `k=v&k=v` string: the caller has parsed and
+/// validated it with the search parser, so modifiers and chains reach the
+/// query builder intact (#861, #865). Empty criteria match nothing — matching
+/// everything would be the literal reading, but no conditional interaction
+/// means that.
+#[async_trait]
+pub trait ConditionalTransaction: Transaction {
+    /// Resolves `criteria` against `resource_type` as this transaction sees
+    /// it.
+    ///
+    /// Returns every match up to the backend's conditional match limit, so a
+    /// caller can distinguish none, one, and several.
+    async fn find_matching(
+        &mut self,
+        resource_type: &str,
+        criteria: &[SearchParameter],
+    ) -> StorageResult<Vec<StoredResource>>;
+
+    /// Conditional create: creates `resource` only when `criteria` match
+    /// nothing; one match is answered as it stands.
+    async fn create_if_none_exist(
+        &mut self,
+        resource_type: &str,
+        resource: Value,
+        criteria: &[SearchParameter],
+    ) -> StorageResult<ConditionalCreateResult> {
+        let mut matches = self.find_matching(resource_type, criteria).await?;
+        match matches.len() {
+            0 => Ok(ConditionalCreateResult::Created(
+                self.create(resource_type, resource).await?,
+            )),
+            1 => Ok(ConditionalCreateResult::Exists(matches.remove(0))),
+            n => Ok(ConditionalCreateResult::MultipleMatches(n)),
+        }
+    }
+
+    /// Conditional update with upsert: one match is updated, no match creates
+    /// `resource`, several matches are refused.
+    async fn update_conditional(
+        &mut self,
+        resource_type: &str,
+        resource: Value,
+        criteria: &[SearchParameter],
+    ) -> StorageResult<ConditionalUpdateResult> {
+        let mut matches = self.find_matching(resource_type, criteria).await?;
+        match matches.len() {
+            0 => Ok(ConditionalUpdateResult::Created(
+                self.create(resource_type, resource).await?,
+            )),
+            1 => {
+                let existing = matches.remove(0);
+                Ok(ConditionalUpdateResult::Updated(
+                    self.update(&existing, resource).await?,
+                ))
+            }
+            n => Ok(ConditionalUpdateResult::MultipleMatches(n)),
+        }
+    }
+
+    /// Conditional delete: one match is deleted, no match is not an error,
+    /// several matches are refused (this server elects
+    /// `conditionalDelete: "single"`).
+    async fn delete_conditional(
+        &mut self,
+        resource_type: &str,
+        criteria: &[SearchParameter],
+    ) -> StorageResult<ConditionalDeleteResult> {
+        let mut matches = self.find_matching(resource_type, criteria).await?;
+        match matches.len() {
+            0 => Ok(ConditionalDeleteResult::NoMatch),
+            1 => {
+                let existing = matches.remove(0);
+                self.delete(resource_type, existing.id()).await?;
+                Ok(ConditionalDeleteResult::Deleted(existing))
+            }
+            n => Ok(ConditionalDeleteResult::MultipleMatches(n)),
+        }
+    }
+}
+
 /// Entry in a FHIR transaction or batch bundle.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BundleEntry {
@@ -273,6 +375,18 @@ pub struct BundleEntry {
     /// Typically a urn:uuid: for new resources in transactions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_url: Option<String>,
+    /// Typed criteria of a `PUT [type]?[criteria]` or `DELETE [type]?[criteria]`
+    /// entry (#859); `None` for every other entry.
+    ///
+    /// Set by the caller, which percent-decodes and parses the entry URL's
+    /// query with the same parser the search endpoint uses, so modifiers,
+    /// chains and prefixes reach the backend typed rather than as a `k=v&k=v`
+    /// string it would have to re-parse (#861, #865). `url` keeps its
+    /// `[type]?[criteria]` form for audit and messages; a transaction executor
+    /// takes the type from the text before `?` and never routes such a URL
+    /// through its instance parser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criteria: Option<Vec<SearchParameter>>,
 }
 
 /// HTTP method for bundle entries.
@@ -431,6 +545,23 @@ pub trait BundleProvider: ResourceStorage {
     /// available, which is precisely what #28 prescribes for a backend without
     /// transaction support.
     fn supports_atomic_transactions(&self) -> bool;
+
+    /// Whether this provider resolves conditional interactions inside the
+    /// transaction it opens for a Bundle (#28's
+    /// `supports_conditional_in_transaction`; #859).
+    ///
+    /// Covers `PUT [type]?[criteria]`, `DELETE [type]?[criteria]` and
+    /// `ifNoneExist`. A backend whose local search index is empty because
+    /// search is offloaded to a secondary (composite SQLite/PostgreSQL +
+    /// Elasticsearch) answers `false`: its transaction-scoped search would
+    /// find nothing, and "no match" on a conditional write is a create, so
+    /// the bundle would duplicate exactly what the criteria exist to prevent.
+    /// The REST layer consults this before anything executes, so such a
+    /// bundle is declined intact with `501` rather than failing at the entry.
+    ///
+    /// Required, not defaulted, for the reason given on
+    /// [`supports_atomic_transactions`](Self::supports_atomic_transactions).
+    fn supports_conditional_in_transaction(&self) -> bool;
 
     /// Processes a transaction bundle (all-or-nothing).
     ///

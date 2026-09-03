@@ -883,6 +883,7 @@ async fn mongodb_integration_transaction_bundle_create_and_resolve_references() 
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:new-patient".to_string()),
+            criteria: None,
         },
         BundleEntry {
             method: BundleMethod::Post,
@@ -897,6 +898,7 @@ async fn mongodb_integration_transaction_bundle_create_and_resolve_references() 
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:new-observation".to_string()),
+            criteria: None,
         },
     ];
 
@@ -992,6 +994,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
             if_none_match: None,
             if_none_exist: None,
             full_url: None,
+            criteria: None,
         },
         BundleEntry {
             method: BundleMethod::Post,
@@ -1005,6 +1008,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:new-created".to_string()),
+            criteria: None,
         },
         BundleEntry {
             method: BundleMethod::Put,
@@ -1018,6 +1022,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
             if_none_match: None,
             if_none_exist: None,
             full_url: None,
+            criteria: None,
         },
     ];
 
@@ -1064,6 +1069,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
         if_none_match: None,
         if_none_exist: None,
         full_url: None,
+        criteria: None,
     }];
 
     let Some(idempotent_result) = process_transaction_or_skip(
@@ -1119,6 +1125,7 @@ async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_refere
             if_none_match: None,
             if_none_exist: Some("identifier=http://example.org/mrn|MRN-URN-1".to_string()),
             full_url: Some("urn:uuid:patient".to_string()),
+            criteria: None,
         },
         BundleEntry {
             method: BundleMethod::Post,
@@ -1133,6 +1140,7 @@ async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_refere
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:observation".to_string()),
+            criteria: None,
         },
     ];
 
@@ -1187,6 +1195,7 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
         if_none_match: None,
         if_none_exist: Some("identifier=http://example.org/mrn|MRN-TX-COND-1".to_string()),
         full_url: Some("urn:uuid:conditional-create".to_string()),
+        criteria: None,
     }];
 
     let Some(first_create) = process_transaction_or_skip(
@@ -1246,6 +1255,7 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
         if_none_match: None,
         if_none_exist: None,
         full_url: None,
+        criteria: None,
     }];
 
     let Some(good_if_match_result) = process_transaction_or_skip(
@@ -1272,6 +1282,7 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
         if_none_match: None,
         if_none_exist: None,
         full_url: None,
+        criteria: None,
     }];
 
     match backend
@@ -1338,6 +1349,7 @@ async fn mongodb_integration_transaction_bundle_rolls_back_on_failure() {
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:rollback-created".to_string()),
+            criteria: None,
         },
         BundleEntry {
             method: BundleMethod::Post,
@@ -1351,6 +1363,7 @@ async fn mongodb_integration_transaction_bundle_rolls_back_on_failure() {
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:rollback-fail".to_string()),
+            criteria: None,
         },
     ];
 

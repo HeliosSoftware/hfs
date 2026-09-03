@@ -66,6 +66,7 @@ pub fn put_entry(id: &str, family: &str, if_match: Option<&str>) -> BundleEntry 
         if_none_match: None,
         if_none_exist: None,
         full_url: None,
+        criteria: None,
     }
 }
 
@@ -79,6 +80,7 @@ pub fn delete_entry(id: &str, if_match: Option<&str>) -> BundleEntry {
         if_none_match: None,
         if_none_exist: None,
         full_url: None,
+        criteria: None,
     }
 }
 

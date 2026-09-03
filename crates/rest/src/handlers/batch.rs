@@ -2122,6 +2122,7 @@ fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), En
             if_none_match,
             if_none_exist,
             full_url: None, // Will be set later
+            criteria: None,
         },
         full_url,
     ))

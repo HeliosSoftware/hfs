@@ -9,13 +9,15 @@ use deadpool_postgres::Client;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
-use crate::core::{Transaction, TransactionOptions, TransactionProvider};
+use crate::core::{
+    ConditionalTransaction, Transaction, TransactionOptions, TransactionProvider, conditional_query,
+};
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
 };
 use crate::search::SearchParameterExtractor;
 use crate::tenant::{Operation, TenantContext};
-use crate::types::StoredResource;
+use crate::types::{SearchParameter, StoredResource};
 
 use super::PostgresBackend;
 use super::cached::{execute_cached, query_cached, query_opt_cached};
@@ -46,6 +48,10 @@ pub struct PostgresTransaction {
     active: bool,
     /// The tenant context for this transaction.
     tenant: TenantContext,
+    /// The parent backend, for the transaction-scoped search
+    /// ([`ConditionalTransaction`]) to run the backend's own search body on
+    /// this transaction's client (#859).
+    backend: PostgresBackend,
     /// Search parameter extractor for indexing resources.
     search_extractor: Arc<SearchParameterExtractor>,
     /// When true, search indexing is offloaded to a secondary backend.
@@ -126,6 +132,7 @@ impl PostgresTransaction {
     async fn new(
         client: Client,
         tenant: TenantContext,
+        backend: PostgresBackend,
         search_extractor: Arc<SearchParameterExtractor>,
         search_offloaded: bool,
         fhir_version: FhirVersion,
@@ -152,6 +159,7 @@ impl PostgresTransaction {
             client: Some(client),
             active: true,
             tenant,
+            backend,
             search_extractor,
             search_offloaded,
             fhir_version,
@@ -935,6 +943,34 @@ impl Drop for PostgresTransaction {
     }
 }
 
+/// The transaction-scoped search surface (#859).
+///
+/// Runs the backend's search body on this transaction's client, so the match
+/// set includes what earlier entries of the same bundle wrote (#511).
+/// Buffered creates are flushed first, exactly as `read` does, so they are
+/// visible too; a bundle that resolves criteria on every entry therefore
+/// forfeits create batching, which is the correct trade.
+#[async_trait]
+impl ConditionalTransaction for PostgresTransaction {
+    async fn find_matching(
+        &mut self,
+        resource_type: &str,
+        criteria: &[SearchParameter],
+    ) -> StorageResult<Vec<StoredResource>> {
+        if criteria.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = conditional_query(resource_type, criteria);
+        self.flush().await?;
+        let client = self.client()?;
+        let result = self
+            .backend
+            .search_with_client(client, &self.tenant, &query, None)
+            .await?;
+        Ok(result.resources.items)
+    }
+}
+
 #[async_trait]
 impl TransactionProvider for PostgresBackend {
     type Transaction = PostgresTransaction;
@@ -948,6 +984,7 @@ impl TransactionProvider for PostgresBackend {
         PostgresTransaction::new(
             client,
             tenant.clone(),
+            self.clone(),
             std::sync::Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
             self.is_search_offloaded(),
             options.fhir_version.unwrap_or(self.config().fhir_version),

@@ -4581,6 +4581,7 @@ mod postgres_integration {
             if_none_match: None,
             if_none_exist: Some("identifier=http://example.org/mrn|MRN-TX-COND-1".to_string()),
             full_url: Some(full_url.to_string()),
+            criteria: None,
         }
     }
 
@@ -4682,6 +4683,7 @@ mod postgres_integration {
                         if_none_match: None,
                         if_none_exist: None,
                         full_url: Some("urn:uuid:observation".to_string()),
+                        criteria: None,
                     },
                 ],
                 FhirVersion::default(),
@@ -4726,6 +4728,7 @@ mod postgres_integration {
                         if_none_match: None,
                         if_none_exist: None,
                         full_url: None,
+                        criteria: None,
                     },
                     if_none_exist_entry("Ambiguous", "urn:uuid:ambiguous"),
                 ],

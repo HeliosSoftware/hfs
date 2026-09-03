@@ -11,12 +11,14 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use serde_json::Value;
 
-use crate::core::{Transaction, TransactionOptions, TransactionProvider};
+use crate::core::{
+    ConditionalTransaction, Transaction, TransactionOptions, TransactionProvider, conditional_query,
+};
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
 };
 use crate::tenant::{Operation, TenantContext};
-use crate::types::StoredResource;
+use crate::types::{SearchParameter, StoredResource};
 
 use super::SqliteBackend;
 use super::backend::load_tenant_stored_params_with_conn;
@@ -547,6 +549,30 @@ impl Drop for SqliteTransaction {
             let conn = self.conn.lock();
             let _ = conn.execute("ROLLBACK", []);
         }
+    }
+}
+
+/// The transaction-scoped search surface (#859).
+///
+/// Runs the backend's own search body on this transaction's connection, so
+/// the match set includes what earlier entries of the same bundle wrote; the
+/// pooled-connection twin on the backend cannot see those rows under
+/// `BEGIN IMMEDIATE` (#511).
+#[async_trait]
+impl ConditionalTransaction for SqliteTransaction {
+    async fn find_matching(
+        &mut self,
+        resource_type: &str,
+        criteria: &[SearchParameter],
+    ) -> StorageResult<Vec<StoredResource>> {
+        if criteria.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = conditional_query(resource_type, criteria);
+        let backend = self.backend.clone();
+        let tenant = self.tenant.clone();
+        self.with_connection(|conn| backend.search_with_connection(conn, &tenant, &query, None))
+            .map(|result| result.resources.items)
     }
 }
 

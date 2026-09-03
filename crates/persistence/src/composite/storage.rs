@@ -672,6 +672,31 @@ impl CompositeStorage {
         fhir_version: FhirVersion,
     ) {
         for entry_result in &result.entries {
+            // A conditional delete answers 204 with no body but names what it
+            // deleted through `location` (#859); the secondaries must drop it
+            // too, or a deleted resource stays searchable there.
+            if entry_result.status == 204
+                && let Some(location) = entry_result.location.as_deref()
+            {
+                let mut segments = location.split('/').filter(|s| !s.is_empty());
+                if let (Some(resource_type), Some(resource_id)) = (segments.next(), segments.next())
+                    && let Err(e) = self
+                        .sync_to_secondaries(SyncEvent::Delete {
+                            resource_type: resource_type.to_string(),
+                            resource_id: resource_id.to_string(),
+                            tenant_id: tenant.tenant_id().clone(),
+                        })
+                        .await
+                {
+                    warn!(
+                        error = %e,
+                        resource_type = resource_type,
+                        resource_id = resource_id,
+                        "Failed to sync bundle entry delete to secondaries"
+                    );
+                }
+                continue;
+            }
             // Only sync successful mutating operations that have a resource body
             if let Some(ref resource_json) = entry_result.resource {
                 let resource_type = resource_json
@@ -1698,6 +1723,15 @@ impl BundleProvider for CompositeStorage {
         self.bundle_provider
             .as_ref()
             .is_some_and(|p| p.supports_atomic_transactions())
+    }
+
+    /// The primary's answer: it is the primary that opens the transaction,
+    /// and a primary whose search is offloaded to this composite's secondary
+    /// says so itself.
+    fn supports_conditional_in_transaction(&self) -> bool {
+        self.bundle_provider
+            .as_ref()
+            .is_some_and(|p| p.supports_conditional_in_transaction())
     }
 
     async fn process_transaction(

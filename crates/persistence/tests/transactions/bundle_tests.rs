@@ -54,6 +54,7 @@ fn if_none_exist_entry(family: &str, full_url: &str) -> BundleEntry {
         if_none_match: None,
         if_none_exist: Some("identifier=http://example.org|12345".to_string()),
         full_url: Some(full_url.to_string()),
+        criteria: None,
     }
 }
 
@@ -87,6 +88,7 @@ async fn test_bundle_create_entries() {
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:patient-1".to_string()),
+            criteria: None,
         },
         BundleEntry {
             method: BundleMethod::Post,
@@ -99,6 +101,7 @@ async fn test_bundle_create_entries() {
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:patient-2".to_string()),
+            criteria: None,
         },
     ];
 
@@ -140,6 +143,7 @@ async fn test_bundle_put_entries() {
         if_none_match: None,
         if_none_exist: None,
         full_url: Some("urn:uuid:patient-put".to_string()),
+        criteria: None,
     }];
 
     let result = backend
@@ -186,6 +190,7 @@ async fn test_bundle_delete_entries() {
         if_none_match: None,
         if_none_exist: None,
         full_url: None,
+        criteria: None,
     }];
 
     let result = backend
@@ -251,6 +256,7 @@ async fn test_bundle_mixed_operations() {
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:new-patient".to_string()),
+            criteria: None,
         },
         // UPDATE
         BundleEntry {
@@ -265,6 +271,7 @@ async fn test_bundle_mixed_operations() {
             if_none_match: None,
             if_none_exist: None,
             full_url: None,
+            criteria: None,
         },
         // DELETE
         BundleEntry {
@@ -275,6 +282,7 @@ async fn test_bundle_mixed_operations() {
             if_none_match: None,
             if_none_exist: None,
             full_url: None,
+            criteria: None,
         },
     ];
 
@@ -330,6 +338,7 @@ async fn test_bundle_internal_references() {
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:new-patient".to_string()),
+            criteria: None,
         },
         // Create observation referencing patient by urn:uuid
         BundleEntry {
@@ -345,6 +354,7 @@ async fn test_bundle_internal_references() {
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:new-observation".to_string()),
+            criteria: None,
         },
     ];
 
@@ -472,6 +482,7 @@ async fn test_bundle_if_none_exist_match_resolves_urn_references() {
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:observation".to_string()),
+            criteria: None,
         },
     ];
 
@@ -523,6 +534,7 @@ async fn test_bundle_if_none_exist_multiple_matches_rolls_back() {
             if_none_match: None,
             if_none_exist: None,
             full_url: None,
+            criteria: None,
         },
         if_none_exist_entry("Ambiguous", "urn:uuid:ambiguous"),
     ];
@@ -634,6 +646,7 @@ async fn test_bundle_conditional_update_if_match() {
         if_none_match: None,
         if_none_exist: None,
         full_url: None,
+        criteria: None,
     }];
 
     let result = backend
@@ -683,6 +696,7 @@ async fn test_bundle_if_match_failure() {
         if_none_match: None,
         if_none_exist: None,
         full_url: None,
+        criteria: None,
     }];
 
     let result = backend
@@ -719,6 +733,7 @@ async fn test_bundle_atomicity() {
             if_none_match: None,
             if_none_exist: None,
             full_url: Some("urn:uuid:valid".to_string()),
+            criteria: None,
         },
         // Invalid - delete non-existent
         BundleEntry {
@@ -729,6 +744,7 @@ async fn test_bundle_atomicity() {
             if_none_match: None,
             if_none_exist: None,
             full_url: None,
+            criteria: None,
         },
     ];
 
@@ -781,6 +797,7 @@ async fn test_bundle_single_entry() {
         if_none_match: None,
         if_none_exist: None,
         full_url: Some("urn:uuid:single".to_string()),
+        criteria: None,
     }];
 
     let result = backend
@@ -810,6 +827,7 @@ async fn test_bundle_tenant_isolation() {
         if_none_match: None,
         if_none_exist: None,
         full_url: Some("urn:uuid:tenant-patient".to_string()),
+        criteria: None,
     }];
 
     let result = backend

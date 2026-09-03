@@ -48,6 +48,11 @@ impl BundleProvider for S3Backend {
         false
     }
 
+    /// No transaction, so nothing to resolve inside one.
+    fn supports_conditional_in_transaction(&self) -> bool {
+        false
+    }
+
     async fn process_transaction(
         &self,
         _tenant: &TenantContext,
