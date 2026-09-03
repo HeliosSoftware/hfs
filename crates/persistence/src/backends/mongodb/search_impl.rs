@@ -233,6 +233,26 @@ impl SearchProvider for MongoBackend {
             .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
             .await?;
 
+        // Sorting by an indexed search parameter (#881): the sort key lives
+        // in the search index, not on the resource documents, so the ordered
+        // id list is computed there and the page fetched by id. Offset-paged;
+        // cursor pagination with any custom sort is already rejected above.
+        let param_sort = query
+            .sort
+            .iter()
+            .find(|d| !matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"));
+        if let Some(directive) = param_sort {
+            if query.sort.len() > 1 {
+                return Err(StorageError::Search(SearchError::QueryParseError {
+                    message: "MongoDB supports a single _sort directive when sorting by a                               search parameter"
+                        .to_string(),
+                }));
+            }
+            return self
+                .search_param_sorted(tenant, query, &db, tenant_id, matched_ids, directive)
+                .await;
+        }
+
         let filter = self.build_resource_filter(
             tenant_id,
             &query.resource_type,
@@ -677,8 +697,7 @@ impl MongoBackend {
         for param in &query.parameters {
             if matches!(
                 param.modifier,
-                Some(SearchModifier::Missing)
-                    | Some(SearchModifier::Above)
+                Some(SearchModifier::Above)
                     | Some(SearchModifier::Below)
                     | Some(SearchModifier::In)
                     | Some(SearchModifier::NotIn)
@@ -697,6 +716,223 @@ impl MongoBackend {
         Ok(())
     }
 
+    /// Search with `_sort` on an indexed parameter (#881): pages over the id
+    /// ordering computed in the search index, then fetches the page by id and
+    /// restores the order. Offset-paginated; no page cursors are issued —
+    /// cursor pagination with a custom sort is rejected at the entry point.
+    ///
+    /// `_id`/`_lastUpdated` filters still apply at the resource fetch, so a
+    /// page combining them with a parameter sort can come back short; the
+    /// ordering itself is unaffected.
+    async fn search_param_sorted(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        matched_ids: Option<HashSet<String>>,
+        directive: &crate::types::SortDirective,
+    ) -> StorageResult<SearchResult> {
+        let ordered = self
+            .param_sorted_ids(db, tenant_id, &query.resource_type, directive)
+            .await?;
+        let ordered: Vec<String> = match &matched_ids {
+            Some(set) => ordered.into_iter().filter(|id| set.contains(id)).collect(),
+            None => ordered,
+        };
+
+        let page_size = query.count.unwrap_or(100).max(1) as usize;
+        let offset = query.offset.unwrap_or(0) as usize;
+        let has_previous = offset > 0;
+        let mut page_ids: Vec<String> = ordered
+            .iter()
+            .skip(offset)
+            .take(page_size + 1)
+            .cloned()
+            .collect();
+        let has_next = page_ids.len() > page_size;
+        page_ids.truncate(page_size);
+
+        // Fetch the page's documents and restore the computed order.
+        let id_set: HashSet<String> = page_ids.iter().cloned().collect();
+        let filter = self.build_resource_filter(
+            tenant_id,
+            &query.resource_type,
+            query,
+            Some(&id_set),
+            None,
+        )?;
+        let resources_coll = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let docs = collect_documents(
+            resources_coll
+                .find(filter)
+                .await
+                .or_query_error("Failed to execute MongoDB search")?,
+        )
+        .await?;
+        let mut by_id: std::collections::HashMap<String, StoredResource> = docs
+            .into_iter()
+            .map(|doc| self.document_to_stored_resource(tenant, &query.resource_type, doc))
+            .collect::<StorageResult<Vec<_>>>()?
+            .into_iter()
+            .map(|r| (r.id().to_string(), r))
+            .collect();
+        let resources: Vec<StoredResource> =
+            page_ids.iter().filter_map(|id| by_id.remove(id)).collect();
+
+        let total = if query.total.is_some() {
+            Some(self.search_count(tenant, query).await?)
+        } else {
+            None
+        };
+        let page_info = PageInfo {
+            next_cursor: None,
+            previous_cursor: None,
+            total,
+            has_next,
+            has_previous,
+        };
+        let page = Page::new(resources, page_info);
+
+        let mut included: Vec<StoredResource> = Vec::new();
+        if !query.includes.is_empty() {
+            let forward: Vec<IncludeDirective> = query
+                .includes
+                .iter()
+                .filter(|i| i.include_type == IncludeType::Include)
+                .cloned()
+                .collect();
+            if !forward.is_empty() {
+                let resolved = self.resolve_includes(tenant, &page.items, &forward).await?;
+                Self::merge_unique(&mut included, resolved);
+            }
+            let reverse: Vec<IncludeDirective> = query
+                .includes
+                .iter()
+                .filter(|i| i.include_type == IncludeType::Revinclude)
+                .cloned()
+                .collect();
+            if !reverse.is_empty() {
+                let resolved = self
+                    .resolve_revincludes(tenant, &page.items, &reverse)
+                    .await?;
+                Self::merge_unique(&mut included, resolved);
+            }
+        }
+
+        Ok(SearchResult {
+            resources: page,
+            included,
+            total,
+            scores: Default::default(),
+        })
+    }
+
+    /// Distinct `resource_id`s in the search index matching `filter`.
+    async fn distinct_resource_ids(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        filter: Document,
+    ) -> StorageResult<HashSet<String>> {
+        Ok(search_index
+            .distinct("resource_id", filter)
+            .await
+            .or_query_error("Failed to query search_index")?
+            .into_iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect())
+    }
+
+    /// Every live resource id of the type — the universe `:missing=true` and
+    /// `:not` complement against (#881).
+    async fn all_resource_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+    ) -> StorageResult<HashSet<String>> {
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        Ok(resources
+            .distinct(
+                "id",
+                doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "is_deleted": false,
+                },
+            )
+            .await
+            .or_query_error("Failed to enumerate resource ids")?
+            .into_iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect())
+    }
+
+    /// Resource ids of the type ordered by an indexed search parameter's
+    /// value (#881): grouped per resource in the search index taking the
+    /// smallest value for ascending sorts and the largest for descending
+    /// (the SQL backends' MIN/MAX), with resources that have no value for
+    /// the parameter appended last in id order.
+    async fn param_sorted_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        directive: &crate::types::SortDirective,
+    ) -> StorageResult<Vec<String>> {
+        use crate::types::{SearchParamType as Spt, SortDirection};
+
+        let value_field = match directive.param_type {
+            Some(Spt::Date) => "value_date",
+            Some(Spt::Number) | Some(Spt::Quantity) => "value_number",
+            Some(Spt::Token) => "value_token_code",
+            Some(Spt::Reference) => "value_reference",
+            Some(Spt::Uri) => "value_uri",
+            _ => "value_string",
+        };
+        let (accumulator, order) = match directive.direction {
+            SortDirection::Ascending => ("$min", 1),
+            SortDirection::Descending => ("$max", -1),
+        };
+
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "param_name": &directive.parameter,
+                value_field: { "$ne": Bson::Null },
+            }},
+            doc! { "$group": {
+                "_id": "$resource_id",
+                "key": { accumulator: format!("${value_field}") },
+            }},
+            doc! { "$sort": { "key": order, "_id": 1 } },
+            doc! { "$project": { "_id": 1 } },
+        ];
+        let cursor = search_index
+            .aggregate(pipeline)
+            .await
+            .or_query_error("Failed to sort by search parameter")?;
+        let docs = collect_documents(cursor).await?;
+        let mut ordered: Vec<String> = docs
+            .into_iter()
+            .filter_map(|d| d.get_str("_id").ok().map(ToString::to_string))
+            .collect();
+
+        // Resources without a value for the parameter sort last.
+        let keyed: HashSet<String> = ordered.iter().cloned().collect();
+        let mut unkeyed: Vec<String> = self
+            .all_resource_ids(db, tenant_id, resource_type)
+            .await?
+            .into_iter()
+            .filter(|id| !keyed.contains(id))
+            .collect();
+        unkeyed.sort();
+        ordered.extend(unkeyed);
+        Ok(ordered)
+    }
+
     async fn matching_resource_ids(
         &self,
         db: &mongodb::Database,
@@ -712,15 +948,46 @@ impl MongoBackend {
                 continue;
             }
 
-            let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
-
-            let ids = search_index
-                .distinct("resource_id", filter)
-                .await
-                .or_query_error("Failed to query search_index")?
-                .into_iter()
-                .filter_map(|value| value.as_str().map(ToString::to_string))
-                .collect::<HashSet<_>>();
+            // `:missing` resolves from index-entry presence alone (#881),
+            // exactly like the SQL backends: `missing=false` is the set of
+            // resources with any entry for the parameter, `missing=true` its
+            // complement over the type's live resources.
+            let ids = if matches!(param.modifier, Some(SearchModifier::Missing)) {
+                let wants_missing = param
+                    .values
+                    .first()
+                    .map(|v| v.value == "true")
+                    .unwrap_or(false);
+                let with_entry = self
+                    .distinct_resource_ids(
+                        &search_index,
+                        doc! {
+                            "tenant_id": tenant_id,
+                            "resource_type": resource_type,
+                            "param_name": &param.name,
+                        },
+                    )
+                    .await?;
+                if wants_missing {
+                    let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
+                    all.difference(&with_entry).cloned().collect::<HashSet<_>>()
+                } else {
+                    with_entry
+                }
+            } else if matches!(param.modifier, Some(SearchModifier::Not)) {
+                // `:not` is the complement of the positive match, and per the
+                // spec it includes resources with no value for the parameter
+                // at all (#881).
+                let mut positive = param.clone();
+                positive.modifier = None;
+                let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+                let matching = self.distinct_resource_ids(&search_index, filter).await?;
+                let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
+                all.difference(&matching).cloned().collect::<HashSet<_>>()
+            } else {
+                let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+                self.distinct_resource_ids(&search_index, filter).await?
+            };
 
             if ids.is_empty() {
                 return Ok(Some(HashSet::new()));
@@ -1793,8 +2060,11 @@ mod query_support_tests {
     use super::*;
     use crate::backends::mongodb::MongoBackendConfig;
 
+    /// `birthdate:missing=true` carries the value `true`, which is not a
+    /// date — `:missing` must be accepted as presence-only (#881) rather
+    /// than falling through to type-specific value parsing.
     #[test]
-    fn missing_is_rejected_before_type_specific_value_parsing() {
+    fn missing_is_supported_without_type_specific_value_parsing() {
         let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
         let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
             name: "birthdate".to_string(),
@@ -1805,13 +2075,28 @@ mod query_support_tests {
             components: vec![],
         });
 
+        assert!(backend.validate_query_support(&query).is_ok());
+    }
+
+    #[test]
+    fn below_is_still_rejected() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Below),
+            values: vec![SearchValue::eq("http://example.org|abc")],
+            chain: vec![],
+            components: vec![],
+        });
+
         let error = backend.validate_query_support(&query).unwrap_err();
         assert!(matches!(
             error,
             StorageError::Search(SearchError::UnsupportedModifier {
                 ref modifier,
                 ..
-            }) if modifier == "missing"
+            }) if modifier == "below"
         ));
     }
 }
