@@ -1632,9 +1632,18 @@ mod tests {
             }
             rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             let total: f64 = rows.iter().map(|r| r.1).sum();
-            println!("--- {rt}: {} params, {:.0}µs total, top 8 ---", rows.len(), total);
+            println!(
+                "--- {rt}: {} params, {:.0}µs total, top 8 ---",
+                rows.len(),
+                total
+            );
             for (code, us) in rows.iter().take(8) {
-                println!("    {:<24} {:>8.1}µs  ({:>4.1}%)", code, us, us / total * 100.0);
+                println!(
+                    "    {:<24} {:>8.1}µs  ({:>4.1}%)",
+                    code,
+                    us,
+                    us / total * 100.0
+                );
             }
             println!();
         }
