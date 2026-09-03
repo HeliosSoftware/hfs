@@ -1773,6 +1773,13 @@ fn spawn_submit_workers(
     if defer_indexing {
         info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
     }
+    let file_concurrency = cfg.file_concurrency.max(1) as usize;
+    if file_concurrency > 1 {
+        info!(
+            file_concurrency,
+            "Bulk submit fan-out: ingesting a manifest's output files concurrently"
+        );
+    }
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let fetcher = fetcher.clone();
@@ -1781,7 +1788,8 @@ fn spawn_submit_workers(
         let worker_id = WorkerId::new(format!("hfs-submit-worker-{i}"));
         tokio::spawn(async move {
             let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
-                .with_deferred_indexing(defer_indexing, reindex_hook.clone());
+                .with_deferred_indexing(defer_indexing, reindex_hook.clone())
+                .with_file_concurrency(file_concurrency);
             loop {
                 match jobs.claim_next_manifest(&worker_id, lease).await {
                     Ok(Some(claimed)) => {
