@@ -7,28 +7,25 @@
   Kept last in every result partial so the readable summary above stays
   visually primary.
 
-  #803 changed three things here. It is the shared `.disclosure` idiom
-  (#806) — `<details class="disclosure">` with a `.disclosure__summary` and
-  an explicit chevron — because the previous `<summary class="field__label">`
-  suppressed the native disclosure marker (a `<summary>` only draws one at
-  `display: list-item`) and set no `cursor`, leaving a control that read as
-  a section label. The payloads render through the shared highlighted JSON
-  view, falling back to the old bare `.detail__code` block when the render
-  budget is exceeded or the body is not JSON. And the request body is shown
-  at all, which the heading had been promising since it was written.
+  #898: Updated to use the card-shaped `json-fold` pattern matching the
+  CapabilityStatement raw fold. Request body stays inline (small Parameters
+  resource); response body keeps inline rendering for now — incremental
+  loading for workbench responses would require fragment endpoints that
+  re-issue each operation type, deferred to a follow-up.
 
-  The fold sits directly in a `.panel` as the card's only child, so
-  `.panel > .disclosure` zeroes the pattern's default margin.
+  The fold uses `data-json-fold-root` so it participates in the shared
+  `capability-json.js` mechanics (sibling collapse, aria-busy, etc.) even
+  though it renders content inline rather than fetching fragments.
 -#}
 {% if !view.raw.is_empty() %}
-<section class="card panel">
-  <details class="disclosure">
-    <summary class="disclosure__summary">
-      <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
-      {{ chrome.i18n.t("hts-workbench-raw-response") }}
-    </summary>
+<details class="card json-fold" id="workbench-json-fold" data-json-fold-root open>
+  <summary class="card-head">
+    <h3>{{ chrome.i18n.t("hts-workbench-raw-response") }}</h3>
+    <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+  </summary>
+  <div class="card__body json-fold-body">
     {% if !view.raw.request_url.is_empty() %}
-    <div class="kv-grid" style="margin:14px 0">
+    <div class="kv-grid" style="margin-bottom:14px">
       <div class="detail__field detail__field--wide">
         <span>{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
         <code>{{ view.raw.request_url }}</code>
@@ -47,6 +44,6 @@
       {% if !view.raw.response_json.is_empty() %}{{ view.raw.response_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw.response_body }}</pre>{% endif %}
     </div>
     {% endif %}
-  </details>
-</section>
+  </div>
+</details>
 {% endif %}

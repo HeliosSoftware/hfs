@@ -1,4 +1,6 @@
-/* Incremental CapabilityStatement JSON only. Shared JSON viewers are untouched. */
+/* Incremental JSON fold rendering — shared by CapabilityStatement and raw response folds.
+   Each fold is a <details data-json-fold-root> with nested <details data-capability-json-node>
+   containers. Multiple folds on one page operate independently (#898). */
 (function () {
   "use strict";
 
@@ -62,7 +64,8 @@
   }
 
   function closeOtherBranches(details) {
-    var root = details.closest("#capability-json-fold");
+    // Find the nearest fold root (supports multiple folds per page, #898)
+    var root = details.closest("[data-json-fold-root]");
     if (!root || details === root) return;
     root.querySelectorAll("details[data-capability-json-node][open]").forEach(function (open) {
       if (open === details || open === root || open.contains(details)) return;

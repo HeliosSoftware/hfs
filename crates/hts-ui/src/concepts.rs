@@ -101,6 +101,8 @@ struct ConceptForm {
     // The language switcher hangs `?lang=` off any page; accept it silently.
     #[allow(dead_code)]
     lang: Option<String>,
+    /// No-JS fallback: `?raw=1` renders the full JSON in a plain `<pre>` (#898).
+    raw: Option<String>,
 }
 
 fn non_empty(v: Option<String>) -> Option<String> {
@@ -130,6 +132,11 @@ impl ConceptForm {
 
     fn compare(&self) -> String {
         non_empty(self.compare.clone()).unwrap_or_default()
+    }
+
+    /// True when the no-JS fallback was requested (`?raw=1`).
+    fn raw_requested(&self) -> bool {
+        self.raw.as_deref() == Some("1")
     }
 }
 
@@ -178,6 +185,10 @@ pub(crate) struct ConceptView {
     identity: Option<Result<ConceptIdentity, UpstreamError>>,
     mappings: Option<Result<ConceptMappings, UpstreamError>>,
     relations: Option<Result<SubsumptionReport, UpstreamError>>,
+    /// FHIR version for building fragment URLs (#898).
+    fhir_version: &'static str,
+    /// True when the no-JS fallback was requested (`?raw=1`) (#898).
+    raw_requested: bool,
 }
 
 /// Connection-class failures render the degraded banner; everything else
@@ -354,6 +365,40 @@ impl ConceptView {
             .and_then(|r| r.as_ref().err())
             .and_then(outcome_for)
     }
+
+    // -- JSON fold (#898) -----------------------------------------------
+
+    /// True when the no-JS fallback was requested (`?raw=1`).
+    pub(crate) fn raw_requested(&self) -> bool {
+        self.raw_requested
+    }
+
+    /// Fragment URL for the identity panel's incremental JSON fold.
+    pub(crate) fn identity_json_fragment_url(&self) -> String {
+        crate::raw_json_fragment::identity_fragment_url(&self.reference, self.fhir_version)
+    }
+
+    /// No-JS fallback URL for the identity panel's raw JSON (with `?raw=1`).
+    pub(crate) fn identity_raw_url(&self) -> String {
+        self.reference.panel_url_with("identity", &[("raw", "1")])
+    }
+
+    /// Fragment URL for the mappings panel's incremental JSON fold.
+    pub(crate) fn mappings_json_fragment_url(&self) -> String {
+        crate::raw_json_fragment::mappings_fragment_url(
+            &self.reference,
+            self.direction,
+            self.fhir_version,
+        )
+    }
+
+    /// No-JS fallback URL for the mappings panel's raw JSON (with `?raw=1`).
+    pub(crate) fn mappings_raw_url(&self) -> String {
+        self.reference.panel_url_with(
+            "mappings",
+            &[("direction", self.direction.as_str()), ("raw", "1")],
+        )
+    }
 }
 
 // ── Templates ───────────────────────────────────────────────────────────
@@ -468,6 +513,7 @@ async fn load(state: &HtsUiState, form: ConceptForm, panel: Panel) -> ConceptVie
     let direction = form.direction();
     let compare = form.compare();
     let compare_problem = comparator_problem(&compare);
+    let raw_requested = form.raw_requested();
 
     let mut view = ConceptView {
         reference,
@@ -477,6 +523,8 @@ async fn load(state: &HtsUiState, form: ConceptForm, panel: Panel) -> ConceptVie
         identity: None,
         mappings: None,
         relations: None,
+        fhir_version: state.fhir_version,
+        raw_requested,
     };
 
     // A half-typed permalink never reaches upstream: there is nothing to ask.

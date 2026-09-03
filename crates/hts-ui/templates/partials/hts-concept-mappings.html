@@ -25,6 +25,9 @@
   branch re-emits the same `id` but not the trigger, so the swap terminates.
   The `<noscript>` link points at the same standalone route, which renders a
   full page around this panel on hard navigation.
+
+  #898: Raw JSON fold uses the incremental JSON renderer (capability-json.js)
+  with card-shaped disclosure matching the CapabilityStatement raw fold.
 -#}
 {% if view.mappings_pending() %}
 <section id="hts-concept-mappings"
@@ -125,9 +128,28 @@
     {% endfor %}
     {% endif %}
 
-    <details>
-      <summary>{{ chrome.i18n.t("hts-concept-raw-response") }}</summary>
-      <pre class="detail__code">{{ mappings.raw_body }}</pre>
+    {#- Raw JSON fold with incremental loading (#898) -#}
+    <details class="card json-fold" id="mappings-json-fold" data-json-fold-root{% if view.raw_requested() %} open{% else %} data-capability-json-node{% endif %}>
+      <summary class="card-head">
+        <h3>{{ chrome.i18n.t("hts-concept-raw-response") }}</h3>
+        <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+      </summary>
+      <div class="card__body json-fold-body"{% if !view.raw_requested() %}
+           data-capability-json-body
+           data-loading-text="{{ chrome.i18n.t("json-fold-loading") }}"
+           data-error-text="{{ chrome.i18n.t("json-fold-load-error") }}"
+           data-fragment-url="{{ view.mappings_json_fragment_url() }}"{% endif %}>
+        {% if view.raw_requested() %}
+        <p class="notice">{{ chrome.i18n.t("json-fold-plain") }}</p>
+        <pre class="detail__code" tabindex="0">{{ mappings.raw_body }}</pre>
+        {% else %}
+        <a class="btn" href="{{ view.mappings_raw_url() }}#mappings-json-fold">{{ chrome.i18n.t("json-fold-open-plain") }}</a>
+        <p class="busy-status htmx-indicator json-fold-loading" role="status">
+          <span class="spinner" aria-hidden="true"></span>
+          {{ chrome.i18n.t("json-fold-loading") }}
+        </p>
+        {% endif %}
+      </div>
     </details>
   {% endif %}
 </section>

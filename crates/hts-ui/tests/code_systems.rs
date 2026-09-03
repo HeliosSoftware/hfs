@@ -832,13 +832,13 @@ async fn raw_fold_reads_as_a_control_and_highlights_both_payloads() {
     .await;
     let html = run_lookup(&base, "code=001").await;
 
-    // 1. The shared `.disclosure` idiom (#806): an explicit chevron on a
-    //    `.disclosure__summary`, which app.css gives `cursor: pointer`.
+    // 1. The card-shaped JSON fold idiom (#898): a `.card .json-fold` with
+    //    `.card-head` summary carrying a chevron icon.
     assert!(
-        html.contains(r#"<details class="disclosure">"#)
-            && html.contains(r#"<summary class="disclosure__summary">"#)
-            && html.contains(r#"<span class="icon disclosure__chevron" aria-hidden="true">"#),
-        "the fold must render the chevron idiom, not a bare summary; got:\n{html}",
+        html.contains(r#"<details class="card json-fold""#)
+            && html.contains(r#"<summary class="card-head">"#)
+            && html.contains(r#"<span class="icon">"#),
+        "the fold must render the card json-fold idiom; got:\n{html}",
     );
     assert!(
         !html.contains(r#"<summary class="field__label">"#),
@@ -890,7 +890,7 @@ async fn a_failed_lookup_still_shows_the_response_payload() {
         "the structured outcome must still render above the fold",
     );
     assert!(
-        html.contains(r#"<details class="disclosure">"#),
+        html.contains(r#"<details class="card json-fold""#),
         "a failed lookup must still render the fold; got:\n{html}",
     );
     assert!(
@@ -922,59 +922,80 @@ async fn a_submit_rejected_before_sending_renders_no_fold() {
     let html = body_text(response).await;
 
     assert!(
-        !html.contains(r#"<details class="disclosure">"#),
+        !html.contains(r#"<details class="card json-fold""#),
         "got:\n{html}"
     );
 }
 
-/// Regression guard for #806: no CodeSystem-surface fold may go back to
+/// Regression guard for #806 / #898: no CodeSystem-surface fold may go back to
 /// `<summary class="field__label">`. `.field__label` is `display: block`,
 /// which strips the native `::marker` (a `<summary>` only draws one at
 /// `display: list-item`) and sets no `cursor`, so such a fold renders as an
-/// inert grey label with no disclosure affordance at all. Folds use the
-/// shared `.disclosure` pattern, which ships its own chevron and cursor.
+/// inert grey label with no disclosure affordance at all.
+///
+/// There are two fold types in the CodeSystem surface:
+/// - Fact-set folds (`.disclosure` pattern) for collapsing CodeSystem metadata
+/// - Raw JSON folds (`.card .json-fold` pattern, #898) for raw response payloads
+///
+/// Both must ship an explicit chevron. The raw fold template must use the
+/// card-shaped json-fold pattern.
 #[test]
 fn cs_detail_folds_never_reuse_the_markerless_field_label_summary() {
-    // (template, carries a fold of its own). The workbench result includes
-    // the raw fold from `partials/hts-raw-fold.html` (#803), so the shape
-    // is asserted on the partial rather than on the includer.
-    let templates = [
+    // (template, fold type). The workbench result includes the raw fold
+    // from `partials/hts-raw-fold.html` (#803), so the shape is asserted on
+    // the partial rather than on the includer.
+    //
+    // Fold types: "disclosure" = fact-set, "json-fold" = raw JSON (#898)
+    let templates: &[(&str, &str, Option<&str>)] = &[
         (
             "pages/cs-detail.html",
             include_str!("../templates/pages/cs-detail.html"),
-            true,
+            Some("disclosure"), // fact-set fold, not raw JSON
         ),
         (
             "partials/hts-cs-workbench-result.html",
             include_str!("../templates/partials/hts-cs-workbench-result.html"),
-            false,
+            None, // includes hts-raw-fold.html, does not define its own fold
         ),
         (
             "partials/hts-raw-fold.html",
             include_str!("../templates/partials/hts-raw-fold.html"),
-            true,
+            Some("json-fold"), // raw JSON fold, must use card pattern (#898)
         ),
     ];
 
-    for (name, template, carries_fold) in templates {
+    for (name, template, fold_type) in templates {
         let body = strip_template_comments(template);
         assert!(
             !body.contains(r#"<summary class="field__label""#),
-            "{name} must fold with `.disclosure`, not a markerless \
-             `<summary class=\"field__label\">`",
+            "{name} must not use markerless `<summary class=\"field__label\">`",
         );
-        if !carries_fold {
-            continue;
+        match *fold_type {
+            Some("disclosure") => {
+                // Fact-set fold: expects `.disclosure` pattern with chevron
+                assert!(
+                    body.contains(r#"<summary class="disclosure__summary">"#),
+                    "{name} must render the shared `.disclosure__summary` fold",
+                );
+                assert!(
+                    body.contains(r#"class="icon disclosure__chevron""#),
+                    "{name}'s fold must render the explicit `.disclosure__chevron`",
+                );
+            }
+            Some("json-fold") => {
+                // Raw JSON fold: expects card `.json-fold` pattern (#898)
+                assert!(
+                    body.contains(r#"<summary class="card-head">"#),
+                    "{name} must render the card-head summary for the json-fold",
+                );
+                assert!(
+                    body.contains(r#"class="icon">"#),
+                    "{name}'s fold must render the chevron icon",
+                );
+            }
+            _ => {
+                // No fold of its own — just checking it doesn't use field__label
+            }
         }
-        // …and it must actually carry the replacement, so deleting the fold
-        // outright cannot satisfy the guard above.
-        assert!(
-            body.contains(r#"<summary class="disclosure__summary">"#),
-            "{name} must render the shared `.disclosure__summary` fold",
-        );
-        assert!(
-            body.contains(r#"class="icon disclosure__chevron""#),
-            "{name}'s fold must render the explicit `.disclosure__chevron`",
-        );
     }
 }

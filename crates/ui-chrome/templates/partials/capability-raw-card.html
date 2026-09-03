@@ -20,24 +20,26 @@
   parameters, HTS's with loaded code systems), which is exactly why the
   default path never inlines the tree: see #798 for HFS and #808 for why HTS
   no longer byte-caps a `<pre>` instead of sharing this.
+
+  #898: Uses `data-json-fold-root` and class-based selectors so multiple folds
+  can coexist on one page.
 #}
-<details class="card json-fold" id="capability-json-fold"{% if raw_requested %} open{% else %} data-capability-json-node{% endif %}>
+<details class="card json-fold" id="capability-json-fold" data-json-fold-root{% if raw_requested %} open{% else %} data-capability-json-node{% endif %}>
   <summary class="card-head">
     <h3>{{ i18n.t("cap-raw-toggle") }}</h3>
     <span class="icon">{% include "icons/chevron-down.svg" %}</span>
   </summary>
-  <div class="card__body" id="capability-json-body"{% if !raw_requested %}
+  <div class="card__body json-fold-body"{% if !raw_requested %}
        data-capability-json-body
        data-loading-text="{{ i18n.t("cap-raw-loading") }}"
        data-error-text="{{ i18n.t("cap-json-load-error") }}"
-       data-fragment-url="{{ fragment_url }}"
-       hx-indicator="#capability-json-loading"{% endif %}>
+       data-fragment-url="{{ fragment_url }}"{% endif %}>
     {% if raw_requested %}
     <p class="notice">{{ i18n.t("cap-raw-plain") }}</p>
     <pre class="detail__code">{{ raw }}</pre>
     {% else %}
     <a class="btn" href="{{ raw_url }}#capability-json-fold">{{ i18n.t("cap-raw-load") }}</a>
-    <p class="busy-status htmx-indicator" id="capability-json-loading" role="status">
+    <p class="busy-status htmx-indicator json-fold-loading" role="status">
       <span class="spinner" aria-hidden="true"></span>
       {{ i18n.t("cap-raw-loading") }}
     </p>

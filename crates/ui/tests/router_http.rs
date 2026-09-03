@@ -542,8 +542,11 @@ async fn capability_statement_page_renders_summary_and_degrades() {
     assert!(html.contains(r#"class="tag tag--excluded">delete</span>"#));
     // The ordinary page carries only a lazy shell. It neither renders nor
     // pretty-prints the large CapabilityStatement before the fold is opened.
+    // #898: The fold now uses class-based selectors (`.json-fold-body`) plus
+    // `data-json-fold-root` to support multiple folds per page.
     assert!(html.contains(r#"id="capability-json-fold""#));
-    assert!(html.contains(r#"id="capability-json-body""#));
+    assert!(html.contains(r#"class="card__body json-fold-body""#));
+    assert!(html.contains(r#"data-json-fold-root"#));
     assert!(html.contains(r#"data-fragment-url="/ui/capability-statement/json-fragment?"#));
     assert!(html.contains("/ui/capability-statement/json-fragment?"));
     assert!(html.contains("raw=1"));
@@ -568,7 +571,10 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let raw_html = body_text(response).await;
-    assert!(raw_html.contains(r#"id="capability-json-fold" open"#));
+    // #898: The fold now has `data-json-fold-root` between id and open.
+    assert!(raw_html.contains(r#"id="capability-json-fold""#));
+    assert!(raw_html.contains(r#"data-json-fold-root"#));
+    assert!(raw_html.contains(" open>"));
     assert!(raw_html.contains(r#"<pre class="detail__code">"#));
     assert!(raw_html.contains("RAW_ONLY_CAPABILITY_MARKER"));
     assert!(raw_html.contains("Plain JSON fallback"));

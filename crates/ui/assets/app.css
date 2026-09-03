@@ -1603,18 +1603,20 @@ select.field__input {
 
 /* The CapabilityStatement raw view is a real link without JavaScript. Keep its
    htmx-only progress message out of that fallback, then reveal it only while
-   htmx marks this explicit indicator as the active request indicator. */
-#capability-json-loading {
+   htmx marks this explicit indicator as the active request indicator.
+   Class-based selectors support multiple folds per page (#898). */
+.json-fold-loading {
   display: none;
 }
 
-#capability-json-loading.htmx-request {
+.json-fold-loading.htmx-request {
   display: inline-flex;
 }
 
-/* Large CapabilityStatements use a page-specific incremental tree. Only the
-   currently expanded, bounded fragments exist in the DOM. */
-#capability-json-body {
+/* Large JSON trees use an incremental, bounded rendering strategy. Only the
+   currently expanded fragments exist in the DOM. Class-based for multiple
+   folds per page (#898). */
+.json-fold-body {
   max-height: 70vh;
   overflow: auto;
   overscroll-behavior: contain;
@@ -1627,7 +1629,7 @@ select.field__input {
   line-height: 1.6;
 }
 
-#capability-json-body .capability-json-outline {
+.json-fold-body .capability-json-outline {
   max-height: none;
   overflow: visible;
 }
@@ -4410,9 +4412,9 @@ details.json-fold[open] > summary .icon {
   line-height: 1.6;
 }
 
-/* The CapabilityStatement owns the only scroll container for its incremental
-   tree. Keep bounded scalar fragments from creating nested 70vh scrollers. */
-#capability-json-body .json-view {
+/* The fold owns the only scroll container for its incremental tree. Keep
+   bounded scalar fragments from creating nested 70vh scrollers (#898). */
+.json-fold-body .json-view {
   max-height: none;
   overflow: visible;
 }

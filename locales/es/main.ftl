@@ -780,6 +780,13 @@ cap-json-page-prev = Anterior
 cap-json-page-next = Siguiente
 cap-unavailable = No se pudo obtener la CapabilityStatement del servidor — la autollamada puede necesitar un token saliente cuando la autenticación está activada.
 
+## Etiquetas genéricas de desplegable JSON (#898) — usadas por las respuestas raw en HTS-UI.
+## Las claves cap-* anteriores se mantienen específicamente para CapabilityStatement.
+json-fold-loading = Cargando JSON…
+json-fold-load-error = No se pudo cargar esta sección JSON. Colapse y vuelva a abrir para reintentar.
+json-fold-open-plain = Abrir JSON plano
+json-fold-plain = JSON plano de reserva. El resaltado se carga incrementalmente cuando JavaScript está disponible.
+
 ## Stubs de la sección SQL on FHIR (#649)
 
 
