@@ -76,6 +76,18 @@ for (const theme of THEMES) {
     const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
     expect(violations).toEqual([]);
   });
+
+  test(`expanded CapabilityStatement JSON is accessible — ${theme}`, async ({ page, chrome }) => {
+    test.setTimeout(120_000);
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/capability-statement", { waitUntil: "networkidle" });
+    const body = page.locator("#capability-json-body");
+    await page.locator("[data-capability-json-expand-all]").click();
+    await expect(body).not.toHaveAttribute("aria-busy", "true");
+    await expect(page.locator("[data-capability-json-tree] > [data-expansion-state]")).toBeVisible();
+    const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+    expect(violations).toEqual([]);
+  });
 }
 
 test("terminal export delete disclosure is accessible and viewport-bound", async ({ page }) => {

@@ -540,11 +540,15 @@ async fn capability_statement_page_renders_summary_and_degrades() {
     assert!(html.contains(r#"class="tag tag--member">read</span>"#));
     assert!(html.contains(r#"class="tag tag--config">create</span>"#));
     assert!(html.contains(r#"class="tag tag--excluded">delete</span>"#));
-    // The ordinary page carries only a lazy shell. It neither renders nor
-    // pretty-prints the large CapabilityStatement before the fold is opened.
+    // The ordinary page carries the bounded root outline immediately. It
+    // does not pretty-print the entire CapabilityStatement or need a second
+    // metadata request before the first level becomes usable.
     assert!(html.contains(r#"id="capability-json-fold""#));
     assert!(html.contains(r#"id="capability-json-body""#));
     assert!(html.contains(r#"data-fragment-url="/ui/capability-statement/json-fragment?"#));
+    assert!(html.contains(r#"data-expand-url="/ui/capability-statement/json-expand?version=R4""#));
+    assert!(html.contains(r#"data-capability-json-actions hidden"#));
+    assert!(html.contains(r#"data-capability-json-page"#));
     assert!(html.contains("/ui/capability-statement/json-fragment?"));
     assert!(html.contains("raw=1"));
     assert!(html.contains("version=R4"));
@@ -553,7 +557,7 @@ async fn capability_statement_page_renders_summary_and_degrades() {
     assert!(!html.contains(r#"id="capability-json""#));
     assert!(!html.contains(r#"class="json-line"#));
     assert!(!html.contains(r#"<pre class="detail__code">"#));
-    assert!(!html.contains("RAW_ONLY_CAPABILITY_MARKER"));
+    assert!(html.contains("RAW_ONLY_CAPABILITY_MARKER"));
 
     // An explicit raw request is the no-JavaScript fallback: plain JSON in an
     // open disclosure, never the expensive highlighted DOM.
@@ -568,7 +572,7 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let raw_html = body_text(response).await;
-    assert!(raw_html.contains(r#"id="capability-json-fold" open"#));
+    assert!(raw_html.contains(r#"<section class="card capability-raw-card""#));
     assert!(raw_html.contains(r#"<pre class="detail__code">"#));
     assert!(raw_html.contains("RAW_ONLY_CAPABILITY_MARKER"));
     assert!(raw_html.contains("Plain JSON fallback"));
@@ -576,8 +580,7 @@ async fn capability_statement_page_renders_summary_and_degrades() {
     assert!(!raw_html.contains(r#"class="json-line"#));
     assert!(!raw_html.contains(r#"data-capability-json-body""#));
 
-    // This small statement still uses the unchanged shared renderer when the
-    // bounded fragment endpoint is requested.
+    // Root fragments always keep the same first-level outline contract.
     let response = app
         .clone()
         .oneshot(
@@ -591,9 +594,9 @@ async fn capability_statement_page_renders_summary_and_degrades() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let fragment = body_text(response).await;
-    assert!(fragment.contains(r#"class="json-view" id="capability-json""#));
+    assert!(fragment.contains(r#"class="capability-json-outline""#));
     assert!(fragment.contains(r#"class="jt--key""#));
-    assert!(fragment.contains("data-fold="));
+    assert!(fragment.contains(r#"data-path="""#));
     // The real GET form remains the fallback while htmx enhances live input.
     assert!(html.contains(r#"method="get" action="/ui/capability-statement""#));
     assert!(html.contains(r#"<input type="hidden" name="version" value="R4">"#));
@@ -769,6 +772,41 @@ async fn capability_statement_large_json_is_plain_without_js_and_paged_with_htmx
     assert!(first_page.contains("offset=100"));
     assert!(!first_page.contains(">100<"));
 
+    // Expand all is one HTML POST. The parallel form state preserves the
+    // currently visible offset and the planner never follows the next page.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/capability-statement/json-expand?version=R4")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "path=&offset=0&limit=100&path=%2Fextension&offset=100&limit=100",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let expanded = body_text(response).await;
+    assert!(expanded.len() <= 1024 * 1024);
+    assert!(expanded.contains(r#"data-expansion-state="partial""#));
+    assert!(expanded.contains(r#"data-path="/extension""#));
+    assert!(expanded.contains(r#"data-offset="100""#));
+    assert!(expanded.contains("101–200 / 100001"));
+    assert!(!expanded.contains("201–300 / 100001"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/capability-statement/json-expand?version=R4")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("path=%2Fextension&offset=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
     let response = app
         .clone()
         .oneshot(
@@ -857,6 +895,7 @@ async fn capability_statement_json_fragment_degrades_when_metadata_is_unavailabl
     );
 
     let response = app
+        .clone()
         .oneshot(
             Request::get("/ui/capability-statement/json-fragment")
                 .body(Body::empty())
@@ -869,6 +908,17 @@ async fn capability_statement_json_fragment_degrades_when_metadata_is_unavailabl
         body_text(response).await,
         "CapabilityStatement is unavailable"
     );
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/capability-statement/json-expand")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("path=&offset=0&limit=100"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

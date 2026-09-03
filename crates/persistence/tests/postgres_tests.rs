@@ -829,6 +829,7 @@ mod postgres_integration {
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
     static BULK_EXPORT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+    static BULK_SUBMIT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
@@ -6089,6 +6090,9 @@ mod postgres_integration {
             ManifestFetchParams, NdjsonEntry, SubmissionId, SubmitWorkerStorage,
         };
 
+        // The worker claim queue is intentionally cross-tenant, so keep this
+        // claim isolated from the synchronous bulk-submit test below.
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
         let backend = create_backend().await;
         let tenant = create_tenant("bulk_submit_import");
         let sub_id = SubmissionId::generate("pg-import-test");
@@ -6201,6 +6205,10 @@ mod postgres_integration {
             SubmissionId,
         };
 
+        // A synchronous manifest has no worker lease. Serialize it with the
+        // worker claim test above so the cross-tenant queue cannot hand it to
+        // that test while this one is processing the batch.
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
         let backend = create_backend().await;
         let tenant = create_tenant("bulk_submit_batch");
         let sub_id = SubmissionId::generate("pg-batch-test");
@@ -6280,6 +6288,18 @@ mod postgres_integration {
             )
             .await
             .unwrap();
+
+        // `process_entries` leaves synchronous manifests in `processing`
+        // without a worker lease. Such rows remain eligible for the worker
+        // claim queue, so terminate this test submission before releasing the
+        // lock shared with the claim round-trip test.
+        assert_eq!(
+            backend
+                .abort_submission(&tenant, &sub_id, "test cleanup")
+                .await
+                .unwrap(),
+            1
+        );
 
         assert!(results[0].is_success() && results[0].created);
         assert!(

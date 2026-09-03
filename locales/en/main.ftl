@@ -785,6 +785,13 @@ cap-json-path-too-deep = maximum expansion depth reached
 cap-json-pagination-label = JSON items
 cap-json-page-prev = Previous
 cap-json-page-next = Next
+cap-json-collapse-all = Collapse all
+cap-json-expand-all = Expand all
+cap-json-expanding = Expanding visible JSON…
+cap-json-expand-complete = All JSON is expanded.
+cap-json-expand-partial = Expanded the current pages up to the safe limit. Remaining nodes stay collapsed.
+cap-json-limit-reached = The JSON display limit was reached. Collapse another branch before loading more.
+cap-json-expand-error = The JSON tree could not be expanded. The current view was kept; try again.
 cap-unavailable = The CapabilityStatement could not be fetched from the server — the self-call may need an outbound token when authentication is enabled.
 
 ## SQL on FHIR section stubs (#649)

@@ -32,9 +32,9 @@ feeds it:
 - `ChromeLabels` — the narrow i18n slice the chrome needs (`lang()`, `t(key)`).
   This crate depends on no i18n library; each product adapts its own bundle.
 - `UserIdentity` — who the menu says is signed in.
-- `capability` — the CapabilityStatement read model and the four cards both
+- `capability` — the CapabilityStatement read model and the five cards both
   products stack on their Capability & Conformance page (#808):
-  `templates/partials/capability-{summary,interactions,operations,resources}-card.html`
+  `templates/partials/capability-{summary,interactions,operations,resources,raw}-card.html`
   plus the projection behind them. More than markup, because HFS and HTS were
   each parsing the same `/metadata` document into their own `CapabilityView`
   and each fixing the result separately — HFS had version-correct
@@ -48,11 +48,19 @@ feeds it:
   HFS answers from the validator's core packs, HTS from the three types a
   terminology server serves).
 
-  What is *not* here: fetching, and the raw-statement block. HFS self-calls
-  over loopback and streams the raw document through a paginated fragment
-  endpoint; HTS proxies two upstreams, needs per-card isolation, and byte-caps
-  an inline `<pre>` because its statement grows with the code systems it
-  loads. Those differences are real, not drift.
+  The raw card also lives here. Both products render the root plus its first
+  level server-side, load an individual open branch through their own bounded
+  `json-fragment` GET route, and submit the currently visible page descriptors
+  to their own `json-expand` POST route for one aggregate Expand-all response.
+  The shared browser enhancer enforces request, row, and byte ceilings; it does
+  not follow pagination beyond the page currently in view. Collapse-all aborts
+  in-flight work and restores that initial first-level tree. Without JavaScript,
+  the initial tree remains readable and a real `raw=1` link opens plain JSON.
+
+  Fetching and route ownership remain outside this crate: HFS and HTS build the
+  same card contract from their respective CapabilityStatement sources and
+  expose product-specific endpoints. This crate owns the bounded tree model and
+  shared markup, not either server's HTTP client or router.
 
 The user-menu partial is a byte-verbatim extract of what was
 `crates/ui/templates/layouts/base.html:233-267`, so the move changed no HFS page
