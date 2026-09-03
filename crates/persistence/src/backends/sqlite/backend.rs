@@ -137,6 +137,15 @@ pub struct SqliteBackendConfig {
     /// The SQLite search_index and resource_fts tables will not be populated.
     #[serde(default)]
     pub search_offloaded: bool,
+
+    /// When set, only these search-parameter codes are indexed; all other
+    /// active parameters are skipped during ingestion and reindex. `None`
+    /// indexes every active parameter (the default). Set from
+    /// `HFS_SEARCH_INDEX_PARAMS`. The per-resource FHIRPath evaluation is the
+    /// dominant ingest cost, so this trades search coverage for a proportional
+    /// speed-up on deployments that query only a known set of parameters.
+    #[serde(skip)]
+    pub index_only_params: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 fn default_max_connections() -> u32 {
@@ -178,6 +187,7 @@ impl Default for SqliteBackendConfig {
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
+            index_only_params: None,
         }
     }
 }
@@ -473,6 +483,7 @@ impl SqliteBackend {
     /// resources.
     pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
         SearchParameterExtractor::new(self.tenant_registry(tenant_id))
+            .with_index_only(self.config.index_only_params.clone())
     }
 
     /// Configure connection settings.
@@ -507,6 +518,24 @@ impl SqliteBackend {
                     crate::error::StorageError::Backend(BackendError::Internal {
                         backend_name: "sqlite".to_string(),
                         message: format!("Failed to enable WAL mode: {}", e),
+                        source: None,
+                    })
+                })?;
+
+            // WAL + synchronous=NORMAL fsyncs the WAL only at checkpoints, not on
+            // every COMMIT. Under WAL this cannot corrupt the database and cannot
+            // lose an already-checkpointed transaction on an application crash; the
+            // only exposure is losing the last few committed transactions on an OS
+            // crash or power loss — which is why it is the standard bulk-load
+            // setting. Every bulk-submit batch commits its own IMMEDIATE
+            // transaction (#815), so at synchronous=FULL that was one fsync per
+            // ~100 resources, and the fsync — not parse or transfer — is the
+            // ingest bottleneck.
+            conn.execute("PRAGMA synchronous = NORMAL", [])
+                .map_err(|e| {
+                    crate::error::StorageError::Backend(BackendError::Internal {
+                        backend_name: "sqlite".to_string(),
+                        message: format!("Failed to set synchronous=NORMAL: {}", e),
                         source: None,
                     })
                 })?;

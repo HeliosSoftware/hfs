@@ -545,8 +545,36 @@ async fn create_postgres_backend(
     };
     backend_config.fhir_version = config.default_fhir_version;
     backend_config.data_dir = config.data_dir.clone();
+    backend_config.index_only_params = search_index_allowlist();
 
     Ok(PostgresBackend::new(backend_config).await?)
+}
+
+/// Parses `HFS_SEARCH_INDEX_PARAMS` into a search-index allowlist of parameter
+/// codes. `None` (unset or empty) indexes every active parameter and full-text
+/// content — the default. When set, only the listed parameters are indexed, and
+/// full-text (`_text`/`_content`) indexing is skipped unless the list names one
+/// of them. Evaluating every active parameter's FHIRPath and tokenizing the
+/// whole resource for FTS is the dominant per-resource ingest cost, so a
+/// deployment that queries only a known set of parameters can trade search
+/// coverage for a proportional speed-up.
+fn search_index_allowlist() -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+    let allowlist = std::env::var("HFS_SEARCH_INDEX_PARAMS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect::<std::collections::HashSet<String>>()
+        })
+        .filter(|set| !set.is_empty())
+        .map(std::sync::Arc::new);
+    if let Some(set) = &allowlist {
+        let mut codes: Vec<&String> = set.iter().collect();
+        codes.sort();
+        info!(params = ?codes, "Search indexing restricted to an allowlist (HFS_SEARCH_INDEX_PARAMS)");
+    }
+    allowlist
 }
 
 /// Creates and initializes a SQLite backend from the server configuration.
@@ -558,6 +586,7 @@ fn create_sqlite_backend(config: &ServerConfig) -> anyhow::Result<SqliteBackend>
     let backend_config = SqliteBackendConfig {
         fhir_version: config.default_fhir_version,
         data_dir: config.data_dir.clone(),
+        index_only_params: search_index_allowlist(),
         ..Default::default()
     };
 
@@ -1715,6 +1744,13 @@ fn spawn_submit_workers(
     if defer_indexing {
         info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
     }
+    let file_concurrency = cfg.file_concurrency.max(1) as usize;
+    if file_concurrency > 1 {
+        info!(
+            file_concurrency,
+            "Bulk submit fan-out: ingesting a manifest's output files concurrently"
+        );
+    }
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let fetcher = fetcher.clone();
@@ -1723,7 +1759,8 @@ fn spawn_submit_workers(
         let worker_id = WorkerId::new(format!("hfs-submit-worker-{i}"));
         tokio::spawn(async move {
             let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
-                .with_deferred_indexing(defer_indexing, reindex_hook.clone());
+                .with_deferred_indexing(defer_indexing, reindex_hook.clone())
+                .with_file_concurrency(file_concurrency);
             loop {
                 match jobs.claim_next_manifest(&worker_id, lease).await {
                     Ok(Some(claimed)) => {

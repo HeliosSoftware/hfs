@@ -614,6 +614,12 @@ pub struct BulkSubmitConfig {
     pub output_ttl_secs: u64,
     /// Maximum manifests this pod ingests concurrently.
     pub worker_concurrency: u32,
+    /// How many of a single manifest's `output` files a worker ingests at once
+    /// (fan-out). `1` keeps the historical sequential behavior. Higher values
+    /// overlap per-file fetch, parse, and write; a concurrent-writer backend
+    /// (PostgreSQL) turns this into near-linear throughput, while SQLite's
+    /// single writer caps the gain. Set with `HFS_BULK_SUBMIT_FILE_CONCURRENCY`.
+    pub file_concurrency: u32,
     /// Bulk fast-load (#903): ingest without search-index/FTS writes and
     /// rebuild them with an automatic per-type reindex when each manifest
     /// finishes. Reads and history are complete throughout; search sees a
@@ -673,6 +679,7 @@ impl Default for BulkSubmitConfig {
             file_url_ttl_secs: 3600,
             output_ttl_secs: 86400,
             worker_concurrency: 2,
+            file_concurrency: 1,
             disable_local_worker: false,
             defer_indexing: false,
             max_concurrent_per_tenant: 4,
@@ -732,6 +739,7 @@ impl BulkSubmitConfig {
             file_url_ttl_secs: env_u64("HFS_BULK_SUBMIT_FILE_URL_TTL", d.file_url_ttl_secs),
             output_ttl_secs: env_u64("HFS_BULK_SUBMIT_OUTPUT_TTL", d.output_ttl_secs),
             worker_concurrency: env_u32("HFS_BULK_SUBMIT_WORKER_CONCURRENCY", d.worker_concurrency),
+            file_concurrency: env_u32("HFS_BULK_SUBMIT_FILE_CONCURRENCY", d.file_concurrency),
             defer_indexing: env_bool("HFS_BULK_SUBMIT_DEFER_INDEXING", d.defer_indexing),
             disable_local_worker: env_bool(
                 "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",

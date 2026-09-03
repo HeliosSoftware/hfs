@@ -10,7 +10,9 @@
 //! [`BulkSubmitProvider`]: crate::core::bulk_submit::BulkSubmitProvider
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use futures::stream::StreamExt;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,7 +27,7 @@ use crate::core::bulk_submit::{
     ByteProgress, ImportMode, StreamingBulkSubmitProvider, SubmissionId,
 };
 use crate::core::bulk_submit_input::{SubmitInputFetcher, submission_output_job_id};
-use crate::error::StorageResult;
+use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
 
 /// A lease over a single pending manifest, held by exactly one worker at a time.
@@ -406,6 +408,12 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// Rebuilds the deferred indexes after each finished manifest. Without a
     /// hook, deferred mode still ingests and logs that $reindex is owed.
     reindex_hook: Option<Arc<dyn DeferredReindexHook>>,
+    /// How many of a manifest's `output` files to ingest at once (#fan-out).
+    /// `1` keeps the historical sequential behavior. Higher values overlap
+    /// per-file fetch, parse, and write, which a concurrent-writer backend
+    /// (PostgreSQL) turns into near-linear throughput; SQLite's single writer
+    /// caps the gain but still benefits from overlapped fetch and extraction.
+    file_concurrency: usize,
 }
 
 /// A pass-through [`AsyncBufRead`] that adds every consumed byte to a shared
@@ -545,7 +553,15 @@ where
             worker_id,
             defer_indexing: false,
             reindex_hook: None,
+            file_concurrency: 1,
         }
+    }
+
+    /// Sets how many of a manifest's `output` files ingest concurrently
+    /// (see [`Self::file_concurrency`]). Values below 1 are treated as 1.
+    pub fn with_file_concurrency(mut self, concurrency: usize) -> Self {
+        self.file_concurrency = concurrency.max(1);
+        self
     }
 
     /// Enables bulk fast-load: entries ingest without search-index/FTS
@@ -622,8 +638,6 @@ where
             .with_import_mode(import_mode)
             .with_defer_indexing(self.defer_indexing)
             .with_byte_progress(progress.clone());
-        let mut processed: u64 = 0;
-        let mut failed: u64 = 0;
         // Pre-size the byte denominator: every output file's advertised size
         // up front, so the percentage never recomputes against a partial
         // total — learned lazily per file, each newly opened file yanked the
@@ -665,102 +679,156 @@ where
         // Percentages need every file's size; one sizeless file (e.g. a
         // gzip-decompressed stream) poisons the total for the whole manifest
         // and the status endpoint falls back to manifest-count progress.
-        let mut totals_known = true;
+        let totals_known = AtomicBool::new(true);
         let keeper = LeaseKeeper::spawn(Arc::clone(&self.jobs), lease.clone(), progress.clone());
 
-        // 2. Ingest each output file via the existing streaming engine.
-        for file in &manifest.output {
-            if keeper.lease_lost() {
-                return Ok(());
-            }
-            let resource_type = file
-                .resource_type
-                .clone()
-                .unwrap_or_else(|| "Resource".into());
-            let (stream, file_bytes_total) = match self
-                .fetcher
-                .open_file_stream(
-                    &file.url,
-                    &view.file_request_headers,
-                    manifest.requires_access_token,
-                    &view.oauth_metadata_urls,
-                    view.file_encryption_key.as_ref(),
-                )
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    self.record_manifest_error(
-                        &lease,
-                        &manifest_url,
-                        &format!("failed to fetch file {}: {e}", file.url),
-                    )
-                    .await?;
-                    failed += 1;
-                    continue;
-                }
-            };
-            match file_bytes_total {
-                _ if presized => {}
-                Some(len) if totals_known => {
-                    progress.total.fetch_add(len, Ordering::Relaxed);
-                }
-                Some(_) => {}
-                None => {
-                    totals_known = false;
-                    progress.total.store(0, Ordering::Relaxed);
-                }
-            }
-            let stream: Box<dyn tokio::io::AsyncBufRead + Send + Unpin> =
-                Box::new(CountingReader {
-                    inner: stream,
-                    consumed: Arc::clone(&progress.consumed),
-                });
+        // 2. Ingest the `output` files. Up to `file_concurrency` at a time run
+        // concurrently (fan-out): each file's fetch, parse, and write overlaps
+        // the others', which a concurrent-writer backend turns into throughput.
+        // The manifest's files carry disjoint resource types, so their entry
+        // receipts and rollback records never collide. Counts accumulate into
+        // shared atomics; a file's own failures are recorded and counted
+        // without aborting the manifest, exactly as the sequential loop did,
+        // and only a storage error on the bookkeeping path aborts the job.
+        let processed_at = AtomicU64::new(0);
+        let failed_at = AtomicU64::new(0);
+        // Shared borrows for the concurrent per-file futures. Iterating by
+        // index keeps the map closure's argument owned (a `usize`), so the
+        // future it returns can borrow `manifest.output[i]` for the manifest's
+        // lifetime without a higher-ranked-lifetime bound the closure can't name.
+        let processed_ref = &processed_at;
+        let failed_ref = &failed_at;
+        let totals_ref = &totals_known;
+        let progress_ref = &progress;
+        let keeper_ref = &keeper;
+        let view_ref = &view;
+        let opts_ref = &opts;
+        let lease_ref = &lease;
+        let manifest_ref = &manifest;
+        let manifest_url_ref = &manifest_url;
 
-            // Per-file options: the file url is part of every entry result's
-            // identity, since line numbers restart in each file (#457).
-            let file_opts = opts.clone().with_file_url(&file.url);
-            let outcome = self
-                .jobs
-                .process_ndjson_stream(
-                    &lease.tenant,
-                    &lease.submission_id,
-                    &lease.manifest_id,
-                    &resource_type,
-                    stream,
-                    &file_opts,
-                )
-                .await;
-            match outcome {
-                Ok(result) => {
-                    processed += result.counts.success + result.counts.skipped;
-                    failed += result.counts.error_count();
+        let mut ingest = futures::stream::iter(0..manifest.output.len())
+            .map(|i| async move {
+                if keeper_ref.lease_lost() {
+                    return Ok::<(), StorageError>(());
                 }
-                Err(e) => {
-                    self.record_manifest_error(
-                        &lease,
-                        &manifest_url,
-                        &format!("failed to ingest file {}: {e}", file.url),
+                let file = &manifest_ref.output[i];
+                let resource_type = file
+                    .resource_type
+                    .clone()
+                    .unwrap_or_else(|| "Resource".into());
+                let (inner, file_bytes_total) = match self
+                    .fetcher
+                    .open_file_stream(
+                        &file.url,
+                        &view_ref.file_request_headers,
+                        manifest_ref.requires_access_token,
+                        &view_ref.oauth_metadata_urls,
+                        view_ref.file_encryption_key.as_ref(),
                     )
-                    .await?;
-                    failed += 1;
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.record_manifest_error(
+                            lease_ref,
+                            manifest_url_ref,
+                            &format!("failed to fetch file {}: {e}", file.url),
+                        )
+                        .await?;
+                        failed_ref.fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                };
+                if !presized {
+                    match file_bytes_total {
+                        Some(len) if totals_ref.load(Ordering::Relaxed) => {
+                            progress_ref.total.fetch_add(len, Ordering::Relaxed);
+                        }
+                        Some(_) => {}
+                        None => {
+                            totals_ref.store(false, Ordering::Relaxed);
+                            progress_ref.total.store(0, Ordering::Relaxed);
+                        }
+                    }
                 }
-            }
+                let stream: Box<dyn tokio::io::AsyncBufRead + Send + Unpin> =
+                    Box::new(CountingReader {
+                        inner,
+                        consumed: Arc::clone(&progress_ref.consumed),
+                    });
 
-            if let Err(LeaseError::Storage(e)) = self
-                .jobs
-                .update_manifest_progress(&lease, processed, failed, processed + failed)
-                .await
-            {
-                return Err(e);
-            }
-            let total = progress.total.load(Ordering::Relaxed);
-            if total > 0 {
-                let _ = self
+                // Per-file options: the file url is part of every entry result's
+                // identity, since line numbers restart in each file (#457).
+                let file_opts = opts_ref.clone().with_file_url(&file.url);
+                match self
                     .jobs
-                    .update_manifest_bytes(&lease, progress.consumed.load(Ordering::Relaxed), total)
-                    .await;
-            }
+                    .process_ndjson_stream(
+                        &lease_ref.tenant,
+                        &lease_ref.submission_id,
+                        &lease_ref.manifest_id,
+                        &resource_type,
+                        stream,
+                        &file_opts,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        processed_ref.fetch_add(
+                            result.counts.success + result.counts.skipped,
+                            Ordering::Relaxed,
+                        );
+                        failed_ref.fetch_add(result.counts.error_count(), Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        self.record_manifest_error(
+                            lease_ref,
+                            manifest_url_ref,
+                            &format!("failed to ingest file {}: {e}", file.url),
+                        )
+                        .await?;
+                        failed_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                let p = processed_ref.load(Ordering::Relaxed);
+                let f = failed_ref.load(Ordering::Relaxed);
+                if let Err(LeaseError::Storage(e)) = self
+                    .jobs
+                    .update_manifest_progress(lease_ref, p, f, p + f)
+                    .await
+                {
+                    return Err(e);
+                }
+                let total = progress_ref.total.load(Ordering::Relaxed);
+                if total > 0 {
+                    let _ = self
+                        .jobs
+                        .update_manifest_bytes(
+                            lease_ref,
+                            progress_ref.consumed.load(Ordering::Relaxed),
+                            total,
+                        )
+                        .await;
+                }
+                Ok(())
+            })
+            .buffer_unordered(self.file_concurrency.max(1));
+        while let Some(result) = ingest.next().await {
+            result?;
+        }
+        drop(ingest);
+        let processed = processed_at.load(Ordering::Relaxed);
+        let failed = failed_at.load(Ordering::Relaxed);
+        // Pin the final counts: with files finishing out of order, the last
+        // per-file update already carried the cumulative totals, but a closing
+        // write makes the terminal progress unambiguous.
+        if let Err(LeaseError::Storage(e)) = self
+            .jobs
+            .update_manifest_progress(&lease, processed, failed, processed + failed)
+            .await
+        {
+            return Err(e);
         }
 
         // 2b. Process `deleted` files — transaction Bundles / resource refs to remove.
@@ -1579,6 +1647,104 @@ mod tests {
                 .iter()
                 .any(|f| f.file_type == "output" && f.resource_type.as_deref() == Some("Patient"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_fan_out_ingests_every_file_of_a_multi_file_manifest() {
+        // Fan-out (file_concurrency > 1) must ingest all of a manifest's files —
+        // each carrying a distinct resource type — with the same result as the
+        // sequential path: every resource stored, and the counts complete.
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Six files of six distinct types, two resources each.
+        let types = [
+            "Patient",
+            "Observation",
+            "Condition",
+            "Encounter",
+            "Procedure",
+            "Immunization",
+        ];
+        let mut files = std::collections::HashMap::new();
+        let mut output_files = Vec::new();
+        for t in types {
+            let url = format!("http://provider/{t}.ndjson");
+            let body = format!(
+                "{{\"resourceType\":\"{t}\",\"id\":\"{t}-1\"}}\n{{\"resourceType\":\"{t}\",\"id\":\"{t}-2\"}}\n"
+            );
+            files.insert(url.clone(), body.into_bytes());
+            output_files.push(RemoteFile {
+                resource_type: Some(t.to_string()),
+                url,
+                count: None,
+            });
+        }
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: output_files,
+                deleted: vec![],
+            },
+        });
+
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("fanout-worker"),
+        )
+        .with_file_concurrency(4);
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("fanout-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        // Every resource of every type is stored.
+        for t in types {
+            let count = backend.count(&tenant, Some(t)).await.unwrap();
+            assert_eq!(count, 2, "expected 2 {t} resources after fan-out ingest");
+        }
+
+        // The manifest's terminal counts cover all 12 entries with no failures.
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].processed_entries, 12);
+        assert_eq!(manifests[0].failed_entries, 0);
+
+        // One `output` receipt per type.
+        let receipts = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
+        for t in types {
+            assert!(
+                receipts
+                    .iter()
+                    .any(|f| f.file_type == "output" && f.resource_type.as_deref() == Some(t)),
+                "missing output receipt for {t}"
+            );
+        }
     }
 
     /// A fetcher whose `fetch_manifest` always fails (unreachable / bad manifest).

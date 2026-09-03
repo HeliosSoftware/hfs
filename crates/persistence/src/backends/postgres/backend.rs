@@ -129,6 +129,16 @@ pub struct PostgresConfig {
     /// When true, search indexing is offloaded to a secondary backend.
     #[serde(default)]
     pub search_offloaded: bool,
+
+    /// When set, only these search-parameter codes are indexed; all other
+    /// active parameters are skipped during ingestion and reindex, and
+    /// full-text (`_text`/`_content`) indexing is skipped unless the set lists
+    /// `_text` or `_content`. `None` indexes every active parameter (the
+    /// default). Set from `HFS_SEARCH_INDEX_PARAMS`. The per-resource FHIRPath
+    /// evaluation and FTS tokenization are the dominant ingest cost, so this
+    /// trades search coverage for a proportional speed-up.
+    #[serde(skip)]
+    pub index_only_params: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 /// SSL mode for PostgreSQL connections.
@@ -301,6 +311,7 @@ impl Default for PostgresConfig {
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
+            index_only_params: None,
         }
     }
 }
@@ -847,6 +858,19 @@ impl PostgresBackend {
     /// A value extractor over a tenant's registry.
     pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
         SearchParameterExtractor::new(self.tenant_registry(tenant_id))
+            .with_index_only(self.config.index_only_params.clone())
+    }
+
+    /// Whether full-text (`_text`/`_content`) indexing runs. It runs by default;
+    /// a search-index allowlist that lists neither `_text` nor `_content`
+    /// suppresses it. FTS tokenization walks the whole resource on every write —
+    /// a fixed per-resource cost — so a deployment that does not use
+    /// `_text`/`_content` search can drop it.
+    pub(crate) fn should_index_fts(&self) -> bool {
+        match &self.config.index_only_params {
+            None => true,
+            Some(set) => set.contains("_text") || set.contains("_content"),
+        }
     }
 
     /// Returns the backend configuration.

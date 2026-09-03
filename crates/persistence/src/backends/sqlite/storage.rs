@@ -1185,9 +1185,23 @@ impl SqliteBackend {
         }
 
         // Index FTS content for _text and _content searches
-        self.index_fts_content(conn, tenant_id, resource_type, resource_id, resource)?;
+        if self.should_index_fts() {
+            self.index_fts_content(conn, tenant_id, resource_type, resource_id, resource)?;
+        }
 
         Ok(())
+    }
+
+    /// Whether full-text (`_text`/`_content`) indexing runs. It runs by default;
+    /// a search-index allowlist that lists neither `_text` nor `_content`
+    /// suppresses it. FTS tokenization walks the whole resource on every write —
+    /// a fixed per-resource cost independent of the parameter count — so a
+    /// deployment that does not use `_text`/`_content` search can drop it.
+    fn should_index_fts(&self) -> bool {
+        match &self.config().index_only_params {
+            None => true,
+            Some(set) => set.contains("_text") || set.contains("_content"),
+        }
     }
 
     /// Index full-text search content for _text and _content searches.
@@ -3699,13 +3713,15 @@ impl SqliteBackend {
         // search entries (FTS row included) immediately before this, and
         // SQLite's `index_fts_content` is a bare INSERT with no delete-first.
         // If that ordering ever changes, this must become delete-then-insert.
-        self.index_fts_content(
-            conn,
-            tenant.tenant_id().as_str(),
-            resource_type,
-            resource_id,
-            content,
-        )?;
+        if self.should_index_fts() {
+            self.index_fts_content(
+                conn,
+                tenant.tenant_id().as_str(),
+                resource_type,
+                resource_id,
+                content,
+            )?;
+        }
 
         Ok(count)
     }

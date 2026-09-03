@@ -1089,33 +1089,79 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
         mut reader: Box<dyn AsyncBufRead + Send + Unpin>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<StreamProcessingResult> {
+        // Reading the network stream and parsing each NDJSON line is done on a
+        // separate task so it overlaps the current batch's SQLite write instead
+        // of alternating with it on one thread. rusqlite is a blocking library:
+        // `process_entries` below holds its worker thread for the whole batch
+        // (BEGIN IMMEDIATE → inserts → COMMIT/fsync), during which the producer
+        // — on another runtime worker — reads and parses ahead into the bounded
+        // channel. Neither the fetch nor the JSON parse sits on the write's
+        // critical path any more. The channel is bounded so a slow writer
+        // backpressures the reader rather than buffering the whole file.
+        //
+        // Resume is file-level and idempotent (create-or-update by id), so this
+        // only has to preserve per-file counting and the max-errors abort — the
+        // exact consumer logic below, unchanged from the inline version.
+        enum StreamItem {
+            Entry(u64, NdjsonEntry),
+            ParseError(u64, String),
+            ReadError(String),
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamItem>(1024);
+        let producer = tokio::spawn(async move {
+            let mut reader = reader;
+            let mut line_number = 0u64;
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = tx.send(StreamItem::ReadError(e.to_string())).await;
+                        return;
+                    }
+                }
+                line_number += 1;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let item = match NdjsonEntry::parse(line_number, trimmed) {
+                    Ok(entry) => StreamItem::Entry(line_number, entry),
+                    Err(e) => StreamItem::ParseError(line_number, e.to_string()),
+                };
+                // Send error means the consumer is gone (aborted/errored): stop.
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+        });
+
         let mut result = StreamProcessingResult::new();
-        let mut line_number = 0u64;
         let mut batch = Vec::new();
 
-        loop {
-            let mut line = String::new();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| internal_error(format!("Failed to read line: {}", e)))?;
+        while let Some(item) = rx.recv().await {
+            match item {
+                StreamItem::ReadError(msg) => {
+                    producer.abort();
+                    return Err(internal_error(format!("Failed to read line: {}", msg)));
+                }
+                StreamItem::ParseError(line_number, e) => {
+                    result.lines_processed = line_number;
+                    result.counts.increment(BulkEntryOutcome::ValidationError);
 
-            if bytes_read == 0 {
-                // End of stream
-                break;
-            }
+                    if !options.continue_on_error
+                        && (options.max_errors == 0
+                            || result.counts.error_count() >= options.max_errors as u64)
+                    {
+                        producer.abort();
+                        return Ok(result.aborted(format!("Parse error: {}", e)));
+                    }
+                }
+                StreamItem::Entry(line_number, entry) => {
+                    result.lines_processed = line_number;
 
-            line_number += 1;
-            result.lines_processed = line_number;
-
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            // Parse the line
-            match NdjsonEntry::parse(line_number, line) {
-                Ok(entry) => {
                     // Validate resource type matches
                     if entry.resource_type != resource_type {
                         let error_result = BulkEntryResult::validation_error(
@@ -1136,47 +1182,39 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
                             && (options.max_errors == 0
                                 || result.counts.error_count() >= options.max_errors as u64)
                         {
+                            producer.abort();
                             return Ok(result.aborted("max errors exceeded"));
                         }
                         continue;
                     }
 
                     batch.push(entry);
-                }
-                Err(e) => {
-                    result.counts.increment(BulkEntryOutcome::ValidationError);
 
-                    if !options.continue_on_error
-                        && (options.max_errors == 0
-                            || result.counts.error_count() >= options.max_errors as u64)
-                    {
-                        return Ok(result.aborted(format!("Parse error: {}", e)));
+                    // Process batch if it's full
+                    if batch.len() >= options.batch_size as usize {
+                        let batch_results = self
+                            .process_entries(
+                                tenant,
+                                submission_id,
+                                manifest_id,
+                                std::mem::take(&mut batch),
+                                options,
+                            )
+                            .await?;
+
+                        for r in batch_results {
+                            result.counts.increment(r.outcome);
+                        }
+
+                        // Check if we need to abort
+                        if !options.continue_on_error
+                            && options.max_errors > 0
+                            && result.counts.error_count() >= options.max_errors as u64
+                        {
+                            producer.abort();
+                            return Ok(result.aborted("max errors exceeded"));
+                        }
                     }
-                }
-            }
-
-            // Process batch if it's full
-            if batch.len() >= options.batch_size as usize {
-                let batch_results = self
-                    .process_entries(
-                        tenant,
-                        submission_id,
-                        manifest_id,
-                        std::mem::take(&mut batch),
-                        options,
-                    )
-                    .await?;
-
-                for r in batch_results {
-                    result.counts.increment(r.outcome);
-                }
-
-                // Check if we need to abort
-                if !options.continue_on_error
-                    && options.max_errors > 0
-                    && result.counts.error_count() >= options.max_errors as u64
-                {
-                    return Ok(result.aborted("max errors exceeded"));
                 }
             }
         }
