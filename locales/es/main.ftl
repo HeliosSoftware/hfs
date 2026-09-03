@@ -489,6 +489,8 @@ editor-legend-live = Se comprueba al escribir: estructura, cardinalidad, binding
 editor-legend-save = Se comprueba al guardar: constraints y terminología
 vd-form-legend-live = Se comprueba al escribir: estructura, cardinalidad, bindings requeridos y sintaxis FHIRPath / reglas SQL-on-FHIR
 vd-form-invalid-chip = JSON no válido
+lib-form-legend-live = Se comprueba al escribir: estructura, cardinalidad, bindings requeridos
+lib-form-legend-save = Se comprueba al guardar: tipo de Library de SQL on FHIR y el adjunto SQL
 editor-deferred-badge = al guardar
 editor-deferred-hint = Los códigos se verifican contra el value set al guardar (y en vivo en el picker si hay servidor de terminología configurado)
 editor-must-support-hint = Must-support: se espera que los consumidores de este perfil manejen este elemento
@@ -872,9 +874,13 @@ sql-queries-run-failed = No se pudo ejecutar la consulta.
 sql-views-run-failed = No se pudo ejecutar la vista.
 lib-degraded = No se pudo cargar la lista de bibliotecas.
 lib-run-hint = Se ejecuta mientras escribes: los resultados siguen el SQL actual, esté guardado o no
-lib-edit-json = Editar como JSON
 lib-delete-confirm = ¿Eliminar «{ $name }»? Esta acción no se puede deshacer.
 lib-delete-failed = No se pudo eliminar la biblioteca.
+lib-details-heading = Detalles
+lib-details-json-heading = Library (JSON)
+lib-details-json-note = El adjunto SQL se edita en la tarjeta SQL de abajo y no forma parte de esta vista.
+lib-details-new-lede = Cámbiale el nombre y haz que relatedArtifact[0] apunte a una ViewDefinition que exista.
+lib-save-wrong-kind = El tipo de Library de SQL on FHIR debe ser «{ $code }» para guardarla aquí.
 
 ## Páginas de exportación SQL (#649, #833)
 

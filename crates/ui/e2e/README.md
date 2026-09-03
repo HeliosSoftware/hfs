@@ -51,14 +51,16 @@ actually depends on should ever fail it.
 | `tests/search-parameters.spec.ts` | registry table, htmx rail filter, facet narrowing, row → detail |
 | `tests/tenants.spec.ts` | add-tenant slide-over, htmx search filter, delete (skips if no tenant store) |
 | `tests/sql-view-definitions.spec.ts` | View Definitions playground: rail, live `$sql-run` preview (#752); the guided-form card beside the editor (#843) — add a column from the form, edit `resource` in CodeMirror and see the row (and an invalid value's error) sync back, Ctrl+Z after a form edit, the two cards' shared internally-scrolling height, and the row↔editor cross-highlight in both directions (hover a row, click a JSON line, reveal stays inside each pane's own scroll) |
-| `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) — includes `sql-view-definitions.spec.ts`'s own case: the guided-form card (#843) stays hidden and the editor works alone |
+| `tests/sql-libraries.spec.ts` | SQL Queries/SQL Views playgrounds (#839): rail split by kind, SQL pane decode/highlight/roundtrip, the live `$sql-run` preview, recents, and a parse error's tinted line — plus, since #840, the Details section's own `describe`: a guided-form edit lands in the JSON pane and Save persists the merge, an invalid value errors on its row without saving, Save fuses an edited SQL pane with an edited Details title into one Library, Ctrl+Z after a form edit, the two Details cards' shared internally-scrolling height, and the type-code Save gate (`sql-view` saved from SQL Queries, and the reverse) on both routes |
+| `tests/editor-pair.spec.ts` | The shared editor/guided-form host (`assets/editor-pair.js`, #840) — coverage of the pairing's own contract that is not tied to one page: the invalid-JSON chip still switches after a guided-form round trip has replaced the `.editor-form` card underneath it |
+| `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) — includes `sql-view-definitions.spec.ts`'s and `sql-libraries.spec.ts`'s own cases: the guided-form card (#843/#840) stays hidden and both editors work alone, and — for `sql-libraries.spec.ts` — editing both the Details and SQL textareas by hand and saving persists the merged Library |
 
-Pure-function browser modules (`assets/combobox.js`, `assets/vd-editor.js`'s
+Pure-function browser modules (`assets/combobox.js`, `assets/editor-pair.js`'s
 `minimalChange`) get a third, faster ring: plain Node tests under `unit/`,
-run with `npm run test:unit` — no browser, no server. `vd-editor.js` is wired
-UMD-style (`module.exports` under Node, auto-mounts under a real
-`document`) specifically so this stays possible without a second copy of the
-diff algorithm.
+run with `npm run test:unit` — no browser, no server. `editor-pair.js` is
+wired UMD-style (`module.exports` under Node, exposes `window.HfsEditorPair`
+under a real `document`) specifically so this stays possible without a
+second copy of the diff algorithm.
 
 ## Run it
 
