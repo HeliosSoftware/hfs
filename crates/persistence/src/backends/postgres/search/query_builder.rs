@@ -1397,9 +1397,16 @@ impl PostgresQueryBuilder {
             let mut next = current;
             let mut ok = true;
 
-            for (part, component) in parts.iter().zip(param.components.iter()) {
+            for (idx, (part, component)) in parts.iter().zip(param.components.iter()).enumerate() {
                 let cv = Self::parse_component_value(part);
-                match Self::build_composite_component(&cv, component.param_type, next, 1) {
+                // 1-based, and the same order the extractor assigns slots from.
+                let slot = (idx + 1).min(u8::MAX as usize) as u8;
+                match Self::build_composite_component_transitional(
+                    &cv,
+                    component.param_type,
+                    next,
+                    slot,
+                ) {
                     Some((sql, params)) => {
                         next += params.len();
                         staged_params.extend(params);
@@ -1492,6 +1499,66 @@ impl PostgresQueryBuilder {
         } else {
             base.to_string()
         }
+    }
+
+    /// A component predicate that matches **both** composite layouts, for use
+    /// while a database is being promoted from legacy to denormalized.
+    ///
+    /// Promotion rewrites resources one page at a time, so for the length of the
+    /// run the table holds both shapes at once and reads must still be correct
+    /// against each. For most component types the two shapes are already
+    /// indistinguishable to a read: only Token and Number have `_2` columns
+    /// (`CompositeRow::place`), so a slot-2 component of any other type writes
+    /// the base columns either way and needs nothing special.
+    ///
+    /// Token and Number in slot 2 are the exception, and getting them wrong is
+    /// silent. A promoted token+token row puts component 2 in `value_token_code_2`,
+    /// which the legacy `HAVING` never reads — so the plain legacy form stops
+    /// matching a resource the moment it is rewritten, and 24 of the 46 R4
+    /// composites pair two components of the same type. That is a false
+    /// *negative*: the resource simply disappears from composite search until
+    /// the marker flips.
+    ///
+    /// The repair is to read the `_2` column when it is populated and fall back
+    /// to the base column when it is not:
+    ///
+    /// ```sql
+    /// (code_2 = $1 OR (code_2 IS NULL AND system_2 IS NULL AND code = $2))
+    /// ```
+    ///
+    /// The `IS NULL` guard is what keeps this from introducing a false
+    /// *positive*. Simply OR-ing the two columns would let a denormalized row
+    /// satisfy a query with its components **swapped** — component 1 matching via
+    /// `_2` and component 2 via the base column — which is a different clinical
+    /// fact than the one asked for. Component 1 therefore always reads the base
+    /// columns only, and component 2 reads the base columns only on rows that
+    /// have no slot-2 payload at all, i.e. legacy rows.
+    fn build_composite_component_transitional(
+        value: &SearchValue,
+        param_type: SearchParamType,
+        offset: usize,
+        slot: u8,
+    ) -> Option<(String, Vec<SqlParam>)> {
+        // Slot 1 is the base columns under either layout.
+        if slot < 2 {
+            return Self::build_composite_component(value, param_type, offset, 1);
+        }
+        // Only Token and Number ever occupy a `_2` column.
+        let guard = match param_type {
+            SearchParamType::Token => "value_token_code_2 IS NULL AND value_token_system_2 IS NULL",
+            SearchParamType::Number => "value_number_2 IS NULL",
+            _ => return Self::build_composite_component(value, param_type, offset, 1),
+        };
+
+        let (denorm_sql, denorm_params) =
+            Self::build_composite_component(value, param_type, offset, slot)?;
+        let (legacy_sql, legacy_params) =
+            Self::build_composite_component(value, param_type, offset + denorm_params.len(), 1)?;
+
+        let sql = format!("(({denorm_sql}) OR ({guard} AND ({legacy_sql})))");
+        let mut params = denorm_params;
+        params.extend(legacy_params);
+        Some((sql, params))
     }
 
     /// Builds a single composite component as a bare column predicate (no
@@ -2296,6 +2363,99 @@ mod tests {
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
 
         assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+    }
+
+    /// A slot-2 token component must read the `_2` column **and** fall back to
+    /// the base column, so the legacy read form keeps matching a resource that
+    /// promotion has already rewritten. Without this, 24 of the 46 R4
+    /// composites silently vanish from search for the length of the run.
+    #[test]
+    fn transitional_legacy_form_reads_both_layouts_for_token_token() {
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code-value-concept".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::eq("8480-6$271649006")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".into(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "value-concept".into(),
+                },
+            ],
+        });
+
+        let frag = PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy)
+            .expect("fragment");
+
+        assert!(
+            frag.sql.contains("value_token_code_2 = $4"),
+            "component 2 must read the denormalized _2 column: {}",
+            frag.sql
+        );
+        assert!(
+            frag.sql
+                .contains("value_token_code_2 IS NULL AND value_token_system_2 IS NULL"),
+            "the fallback must be guarded on the row having no slot-2 payload: {}",
+            frag.sql
+        );
+        // Component 1 must NEVER read `_2`. If it did, a denormalized row whose
+        // components are SWAPPED would satisfy the query — a different clinical
+        // fact than the one asked for, returned as a match.
+        let having = frag.sql.split("HAVING ").nth(1).expect("a HAVING clause");
+        let comp_one_arm = having
+            .split(" AND MAX(")
+            .next()
+            .expect("component 1's MAX arm");
+        assert!(
+            !comp_one_arm.contains("_2"),
+            "component 1's HAVING arm must read only the base columns, got `{}` in: {}",
+            comp_one_arm,
+            frag.sql
+        );
+        // Still the grouped form — this is the legacy layout.
+        assert!(
+            frag.sql
+                .contains("GROUP BY resource_id, composite_group HAVING")
+        );
+    }
+
+    /// A component type with no `_2` column is identical under both layouts, so
+    /// the transitional form must not widen it — a quantity component writes
+    /// `value_quantity_value` whatever slot it occupies.
+    #[test]
+    fn transitional_legacy_form_is_unchanged_where_no_slot_2_column_exists() {
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::eq("8480-6$ge100")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".into(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".into(),
+                },
+            ],
+        });
+
+        let frag = PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy)
+            .expect("fragment");
+
+        assert!(
+            !frag.sql.contains("_2"),
+            "token+quantity needs no transitional widening: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 2, "and binds no extra parameters");
     }
 
     #[test]
