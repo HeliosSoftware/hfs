@@ -410,6 +410,25 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// A tuple of (StoredResource, created: bool) where created indicates
     /// whether a new resource was created (true) or an existing one updated (false).
+    /// Restoring a soft-deleted resource counts as created.
+    ///
+    /// # Concurrency
+    ///
+    /// Unconditional PUT is last-writer-wins: two callers racing on one id —
+    /// on one instance or across instances sharing the store — must both
+    /// succeed, with distinct versions and a complete history. Implementations
+    /// decide existence with a read, write with a version-guarded
+    /// compare-and-swap, and retry a bounded number of times when the read
+    /// went stale (`VersionConflict`, `AlreadyExists`, or `NotFound` from the
+    /// write), so none of those errors reaches the caller for a race the
+    /// caller did not ask to observe.
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Tenant` - If the tenant lacks create/update permission
+    /// * `StorageError::Validation` - If the resource content is invalid
+    /// * `StorageError::Concurrency(VersionConflict)` - Only after the bounded
+    ///   retries are exhausted under sustained contention
     async fn create_or_update(
         &self,
         tenant: &TenantContext,

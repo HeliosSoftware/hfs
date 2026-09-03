@@ -721,34 +721,60 @@ impl ResourceStorage for MongoBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        match self.read(tenant, resource_type, id).await {
-            // Update existing (preserves original FHIR version)
-            Ok(Some(current)) => {
-                let updated = self.update(tenant, &current, resource).await?;
-                Ok((updated, false))
-            }
-            // Create new with specific ID
-            Ok(None) => {
-                let mut resource = resource;
-                if let Some(obj) = resource.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.to_string()));
+        // Every branch is a check-then-act on the `read`, and every write is
+        // a compare-and-swap, so a race with another writer (on this or
+        // another instance) surfaces as a typed error that is never a
+        // legitimate answer from *this* method — it decides existence itself.
+        // Re-read and retry a bounded number of times; see the Postgres
+        // backend's `create_or_update` for the full reasoning.
+        const MAX_CAS_RETRIES: usize = 3;
+        let mut attempts = 0;
+        let mut resource = resource;
+        loop {
+            let body = if attempts < MAX_CAS_RETRIES {
+                resource.clone()
+            } else {
+                std::mem::take(&mut resource)
+            };
+
+            let result = match self.read(tenant, resource_type, id).await {
+                // Update existing (preserves original FHIR version)
+                Ok(Some(current)) => self
+                    .update(tenant, &current, body)
+                    .await
+                    .map(|updated| (updated, false)),
+                // Create new with specific ID
+                Ok(None) => {
+                    let mut body = body;
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("id".to_string(), Value::String(id.to_string()));
+                    }
+                    self.create(tenant, resource_type, body, fhir_version)
+                        .await
+                        .map(|created| (created, true))
                 }
-                let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
-                    .await?;
-                Ok((created, true))
+                // A deleted resource is brought back to life by a subsequent
+                // update (FHIR http.html#delete), continuing the existing
+                // version chain rather than being rejected with `Gone`.
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => self
+                    .restore_deleted(tenant, resource_type, id, body)
+                    .await
+                    .map(|restored| (restored, true)),
+                Err(e) => Err(e),
+            };
+
+            match result {
+                Err(
+                    StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+                    | StorageError::Resource(
+                        ResourceError::NotFound { .. } | ResourceError::AlreadyExists { .. },
+                    ),
+                ) if attempts < MAX_CAS_RETRIES => {
+                    attempts += 1;
+                    continue;
+                }
+                other => return other,
             }
-            // A deleted resource is brought back to life by a subsequent update
-            // (FHIR http.html#delete), continuing the existing version chain
-            // rather than being rejected with `Gone`.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
-                let restored = self
-                    .restore_deleted(tenant, resource_type, id, resource)
-                    .await?;
-                Ok((restored, true))
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -1654,9 +1680,11 @@ impl MongoBackend {
     /// record keeps its version, the restore gets the next one) and keeps the
     /// FHIR version the resource was originally stored under.
     ///
-    /// Returns `NotFound` if no deleted document is present — the caller has
-    /// already established one exists, so that only happens under a concurrent
-    /// write.
+    /// The write is a compare-and-swap on the tombstone's version, so a lost
+    /// race reports `VersionConflict` (with the version actually stored) and
+    /// `create_or_update` retries from a fresh read. Returns `NotFound` only
+    /// if no document is present at all — the caller has already established
+    /// a tombstone exists, so either only happens under a concurrent write.
     async fn restore_deleted(
         &self,
         tenant: &TenantContext,
@@ -1756,10 +1784,41 @@ impl MongoBackend {
         };
 
         if update_result.matched_count == 0 {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
+            // The tombstone the read observed is gone. A concurrent PUT
+            // restored it (a live document now) or restored and re-deleted it
+            // (a newer tombstone) — the same fact for the caller, so the
+            // re-read does not filter on `is_deleted`: any document is a
+            // conflict `create_or_update` retries from a fresh read; none at
+            // all is a hard delete.
+            let current_filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "id": id,
+            };
+            let actual = if let Some(active_session) = session.as_mut() {
+                resources
+                    .find_one(current_filter)
+                    .session(active_session)
+                    .await
+            } else {
+                resources.find_one(current_filter).await
+            }
+            .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+
+            return match actual {
+                Some(doc) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version: deleted_version,
+                        actual_version: doc.get_str("version_id").unwrap_or("").to_string(),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
         }
 
         let history_doc = doc! {

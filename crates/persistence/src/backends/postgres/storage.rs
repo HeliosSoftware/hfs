@@ -303,34 +303,68 @@ impl ResourceStorage for PostgresBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        match self.read(tenant, resource_type, id).await {
-            // Update existing (preserves original FHIR version)
-            Ok(Some(current)) => {
-                let updated = self.update(tenant, &current, resource).await?;
-                Ok((updated, false))
-            }
-            // Create new with specific ID
-            Ok(None) => {
-                let mut resource = resource;
-                if let Some(obj) = resource.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.to_string()));
+        // Unconditional PUT is last-writer-wins at the API surface, but every
+        // branch below is a check-then-act on the `read`: the row can be
+        // created, bumped, deleted or restored by another writer (on this or
+        // another instance) between the read and the write. Each write is a
+        // compare-and-swap, so a lost race surfaces as a typed error rather
+        // than corrupting anything — and because *this* method decides
+        // existence itself, none of those errors is a legitimate answer from
+        // it: `VersionConflict` from `update`/`restore_deleted`,
+        // `AlreadyExists` from `create`, and `NotFound` from `update` (the row
+        // was deleted underneath it) all mean "re-read and go again". A
+        // bounded number of retries absorbs the race; the last attempt's
+        // error propagates so a pathological caller cannot spin forever.
+        const MAX_CAS_RETRIES: usize = 3;
+        let mut attempts = 0;
+        let mut resource = resource;
+        loop {
+            // Each attempt consumes a body; keep a copy only while a retry is
+            // still possible so the final attempt moves rather than clones.
+            let body = if attempts < MAX_CAS_RETRIES {
+                resource.clone()
+            } else {
+                std::mem::take(&mut resource)
+            };
+
+            let result = match self.read(tenant, resource_type, id).await {
+                // Update existing (preserves original FHIR version)
+                Ok(Some(current)) => self
+                    .update(tenant, &current, body)
+                    .await
+                    .map(|updated| (updated, false)),
+                // Create new with specific ID
+                Ok(None) => {
+                    let mut body = body;
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("id".to_string(), Value::String(id.to_string()));
+                    }
+                    self.create(tenant, resource_type, body, fhir_version)
+                        .await
+                        .map(|created| (created, true))
                 }
-                let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
-                    .await?;
-                Ok((created, true))
+                // A deleted resource is brought back to life by a subsequent
+                // update (FHIR http.html#delete), continuing the existing
+                // version chain rather than being rejected with `Gone`.
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => self
+                    .restore_deleted(tenant, resource_type, id, body)
+                    .await
+                    .map(|restored| (restored, true)),
+                Err(e) => Err(e),
+            };
+
+            match result {
+                Err(
+                    StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+                    | StorageError::Resource(
+                        ResourceError::NotFound { .. } | ResourceError::AlreadyExists { .. },
+                    ),
+                ) if attempts < MAX_CAS_RETRIES => {
+                    attempts += 1;
+                    continue;
+                }
+                other => return other,
             }
-            // A deleted resource is brought back to life by a subsequent update
-            // (FHIR http.html#delete), continuing the existing version chain
-            // rather than being rejected with `Gone`.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
-                let restored = self
-                    .restore_deleted(tenant, resource_type, id, resource)
-                    .await?;
-                Ok((restored, true))
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -1088,8 +1122,23 @@ impl PostgresBackend {
     /// record keeps its version, the restore gets the next one) and keeps the
     /// FHIR version the resource was originally stored under.
     ///
-    /// Returns `NotFound` if no deleted row is present — the caller has already
-    /// established one exists, so that only happens under a concurrent write.
+    /// The write is a version-guarded compare-and-swap against the tombstone
+    /// the caller's read observed, and it lands the resource row and its
+    /// history row in one statement (one implicit transaction) — the same
+    /// shape as `update`, and for the reason `delete` spells out: a history
+    /// row computed from a stale read can collide with one a concurrent
+    /// writer already inserted. Two PUTs racing onto one tombstone used to do
+    /// exactly that — both computed the same next version, the second history
+    /// insert hit the primary key, and the live row and history disagreed on
+    /// the body. Unlike `delete`, the restore keeps its read instead of
+    /// deriving the version in SQL: the read is what lets a lost race report
+    /// a truthful `expected_version` (the contract S3's restore already has),
+    /// and `create_or_update` turns that conflict into a fresh read-and-retry.
+    ///
+    /// Returns `NotFound` if no deleted row is present and `VersionConflict`
+    /// if the tombstone moved between the read and the write — the caller has
+    /// already established a tombstone exists, so either only happens under a
+    /// concurrent write.
     async fn restore_deleted(
         &self,
         tenant: &TenantContext,
@@ -1135,13 +1184,23 @@ impl PostgresBackend {
         }
 
         let now = Utc::now();
-        let is_deleted = false;
 
-        execute_cached(
+        // The tombstone's version is the CAS guard (`$7`): the UPDATE matches
+        // only the row the read observed, still deleted and still at that
+        // version, and the history row is fed from what it returned — so both
+        // land or neither does, and a stale read can never mint a duplicate
+        // version.
+        let restored = execute_cached(
                 &client,
-                "UPDATE resources
-                 SET version_id = $1, data = $2, last_updated = $3, is_deleted = FALSE, deleted_at = NULL
-                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
+                "WITH restored AS (
+                     UPDATE resources
+                     SET version_id = $1, data = $2, last_updated = $3, is_deleted = FALSE, deleted_at = NULL
+                     WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                       AND is_deleted = TRUE AND version_id = $7
+                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version FROM restored",
                 &[
                     &new_version_str,
                     &resource,
@@ -1149,19 +1208,43 @@ impl PostgresBackend {
                     &tenant_id,
                     &resource_type,
                     &id,
+                    &deleted_version,
                 ],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
 
-        execute_cached(
-                &client,
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &new_version_str, &resource, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert restore history: {}", e)))?;
+        if restored == 0 {
+            // Zero rows: the tombstone the read observed is gone. Whether a
+            // concurrent PUT restored it (a live row now) or restored and
+            // re-deleted it (a newer tombstone) is the same fact for the
+            // caller — so, unlike `update`'s re-select, this one does not
+            // filter on `is_deleted`. Any row is a conflict the caller can
+            // retry from a fresh read; no row at all is a hard delete.
+            let actual = client
+                .query_opt(
+                    "SELECT version_id FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
+                    &[&tenant_id, &resource_type, &id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+
+            return match actual {
+                Some(row) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version: deleted_version,
+                        actual_version: row.get::<_, String>(0),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
+        }
 
         // The delete dropped the search index entries; rebuild them for the
         // resource that is live again. As in `update`, `Replace` folds the
