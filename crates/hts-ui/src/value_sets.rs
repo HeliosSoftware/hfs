@@ -568,7 +568,12 @@ async fn expand_run(
         Ok(result) => {
             // Build fragment URL for incremental loading (#898)
             let fragment_url = if !canonical.is_empty() {
-                Some(vs_expand_fragment_url(&canonical, &params, tree_mode, state.fhir_version))
+                Some(vs_expand_fragment_url(
+                    &canonical,
+                    &params,
+                    tree_mode,
+                    state.fhir_version,
+                ))
             } else {
                 None
             };
@@ -582,7 +587,7 @@ async fn expand_run(
                 outcome: None,
                 degraded_reason: None,
             }
-        },
+        }
         Err(err) => {
             let mut v = ExpandResultView::from_error(&err);
             v.tree_mode = tree_mode;

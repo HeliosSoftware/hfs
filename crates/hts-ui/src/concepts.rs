@@ -101,8 +101,6 @@ struct ConceptForm {
     // The language switcher hangs `?lang=` off any page; accept it silently.
     #[allow(dead_code)]
     lang: Option<String>,
-    /// No-JS fallback: `?raw=1` renders the full JSON in a plain `<pre>` (#898).
-    raw: Option<String>,
 }
 
 fn non_empty(v: Option<String>) -> Option<String> {
@@ -133,7 +131,6 @@ impl ConceptForm {
     fn compare(&self) -> String {
         non_empty(self.compare.clone()).unwrap_or_default()
     }
-
 }
 
 /// Pre-flight for the free-text comparator.

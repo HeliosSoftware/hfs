@@ -859,8 +859,7 @@ async fn raw_fold_reads_as_a_control_and_highlights_both_payloads() {
     );
     // Verify incremental loading attributes are present for response body
     assert!(
-        html.contains("data-capability-json-body")
-            && html.contains("data-fragment-url"),
+        html.contains("data-capability-json-body") && html.contains("data-fragment-url"),
         "response body must use incremental loading pattern; got:\n{html}",
     );
 

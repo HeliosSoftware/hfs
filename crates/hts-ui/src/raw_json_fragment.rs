@@ -35,8 +35,8 @@ use std::sync::Arc;
 use crate::HtsUiState;
 use crate::i18n::{I18n, RequestLocale};
 use crate::upstream::{
-    ConceptRef, ExpandParams, LookupParams, MappingDirection, SubsumesParams,
-    TranslateParams, ValidateCodeParams, ValidateInputMode,
+    ConceptRef, ExpandParams, LookupParams, MappingDirection, SubsumesParams, TranslateParams,
+    ValidateCodeParams, ValidateInputMode,
 };
 
 /// Concept identity (CodeSystem `$lookup`) fragment endpoint query.
@@ -239,7 +239,6 @@ const CS_LOOKUP_FRAGMENT_URL: &str = "/ui/hts/code-systems/workbench/lookup/json
 const CS_VALIDATE_FRAGMENT_URL: &str = "/ui/hts/code-systems/workbench/validate/json-fragment";
 const CS_SUBSUMES_FRAGMENT_URL: &str = "/ui/hts/code-systems/workbench/subsumes/json-fragment";
 const VS_EXPAND_FRAGMENT_URL: &str = "/ui/hts/value-sets/workbench/expand/json-fragment";
-const VS_VALIDATE_FRAGMENT_URL: &str = "/ui/hts/value-sets/workbench/validate/json-fragment";
 const CM_TRANSLATE_FRAGMENT_URL: &str = "/ui/hts/concept-maps/workbench/translate/json-fragment";
 
 // ── Workbench fragment URL builders (#898) ──────────────────────────────
@@ -248,11 +247,7 @@ const CM_TRANSLATE_FRAGMENT_URL: &str = "/ui/hts/concept-maps/workbench/translat
 ///
 /// The CodeSystem version is encoded as `csVersion` to avoid collision with
 /// the FHIR version parameter (`version=R4`).
-pub fn cs_lookup_fragment_url(
-    system: &str,
-    params: &LookupParams,
-    fhir_version: &str,
-) -> String {
+pub fn cs_lookup_fragment_url(system: &str, params: &LookupParams, fhir_version: &str) -> String {
     let endpoint = FragmentEndpoint {
         base_path: CS_LOOKUP_FRAGMENT_URL,
         version: fhir_version,
@@ -792,10 +787,7 @@ async fn vs_expand_fragment(
     let tree_mode = query.mode.as_deref() == Some("tree");
     let params = ExpandParams {
         filter: query.filter.filter(|v| !v.trim().is_empty()),
-        count: query
-            .count
-            .as_deref()
-            .and_then(|s| s.trim().parse().ok()),
+        count: query.count.as_deref().and_then(|s| s.trim().parse().ok()),
         offset: query
             .vs_offset
             .as_deref()
@@ -809,7 +801,10 @@ async fn vs_expand_fragment(
         return (axum::http::StatusCode::BAD_REQUEST, "Missing url parameter").into_response();
     }
 
-    let result = state.upstream.vs_expand_by_url(query.url.trim(), &params).await;
+    let result = state
+        .upstream
+        .vs_expand_by_url(query.url.trim(), &params)
+        .await;
 
     let document = match result {
         Ok(expand) => match serde_json::from_str::<serde_json::Value>(&expand.raw_body) {
@@ -904,4 +899,3 @@ async fn cm_translate_fragment(
         CM_TRANSLATE_FRAGMENT_URL,
     )
 }
-

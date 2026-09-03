@@ -578,7 +578,11 @@ async fn translate_run(
         Ok(result) => {
             // Build fragment URL for incremental loading (#898)
             let fragment_url = if !canonical.is_empty() {
-                Some(cm_translate_fragment_url(&canonical, &params, state.fhir_version))
+                Some(cm_translate_fragment_url(
+                    &canonical,
+                    &params,
+                    state.fhir_version,
+                ))
             } else {
                 None
             };
@@ -591,7 +595,7 @@ async fn translate_run(
                 outcome: None,
                 degraded_reason: None,
             }
-        },
+        }
         Err(err) => TranslateResultView::from_error(direction, &err),
     };
     respond_workbench(&state, chrome, id, view, is_htmx).await
