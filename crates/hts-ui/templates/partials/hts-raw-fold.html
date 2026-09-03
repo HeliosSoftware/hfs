@@ -18,7 +18,7 @@
   though it renders content inline rather than fetching fragments.
 -#}
 {% if !view.raw.is_empty() %}
-<details class="card json-fold" id="workbench-json-fold" data-json-fold-root open>
+<details class="card json-fold" id="workbench-json-fold" data-json-fold-root>
   <summary class="card-head">
     <h3>{{ chrome.i18n.t("hts-workbench-raw-response") }}</h3>
     <span class="icon">{% include "icons/chevron-down.svg" %}</span>
