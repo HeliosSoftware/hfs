@@ -2392,6 +2392,14 @@ struct SqlViewDefinitionsPage {
     selected: Option<SelectedVd>,
     /// `?vd=new`: the JSON below is the starter document, not a stored view.
     is_new: bool,
+    /// The guided-form card, alongside the JSON editor (#843): the same
+    /// `pane=form` fragment `POST /ui/editor/render` would render for
+    /// `selected`'s document, built inline instead of fetched — the page's
+    /// first paint needs it in place already, not filled in after `load`,
+    /// or the editor card would flash full-width before shrinking to
+    /// make room for it. `None` only alongside `selected: None` (no view
+    /// selected, nothing to build a form for).
+    form_pane: Option<editor::EditorFormPane>,
     /// The `$sql-run` preview card and its failure notice, nested as its own
     /// template (#752) so `partials/sql_run_results.html`'s markup exists in
     /// exactly one place, shared with the `/run` fragment endpoint
@@ -2518,6 +2526,77 @@ fn shape_vd(vd: &serde_json::Value) -> (String, String, String) {
         .to_string();
     let json = serde_json::to_string_pretty(vd).unwrap_or_default();
     (id, name, json)
+}
+
+/// Builds View Definitions' guided-form panel (#843) against an
+/// already-parsed document — the same analysis `editor::render_body`'s
+/// `pane=form` branch performs over HTTP (`editor::build_form_pane`), called
+/// directly instead: the page's own render (and the Save-error re-render)
+/// need the panel in place on first paint, not fetched after the fact.
+/// `document`'s own `resourceType` decides
+/// [`editor::EditorFormPane::is_view_definition`] exactly as `render_body`
+/// would, falling back to `"ViewDefinition"` — every caller on this page
+/// hands it a `ViewDefinition`, valid or not, except the one Save-error path
+/// where the submitted document parses but carries some other type; letting
+/// the schema registry decide what that renders as (or fails to) is exactly
+/// what `POST /ui/editor/render` already does for an arbitrary resource.
+fn render_vd_form_pane(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    document: serde_json::Value,
+) -> editor::EditorFormPane {
+    let registry = helios_fhir_validator::packs::core_registry(version);
+    let resource_type = document
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("ViewDefinition")
+        .to_string();
+    // #843: this is the View Definitions page's own inline server-side
+    // render, not the shared HTTP endpoint - the card needs `needs-js` so it
+    // stays hidden until `theme.js` marks `<html class="js">` and
+    // `vd-editor.js` wires it up.
+    editor::build_form_pane(i18n, registry, version, resource_type, document, None, true)
+}
+
+/// The guided-form panel for text that failed to parse as JSON (#843) — the
+/// Save-error path's counterpart to `editor::render_body`'s own malformed-
+/// document branch: the card still appears, with the invalid-JSON notice in
+/// place of rows, and the user's exact text untouched.
+fn invalid_vd_form_pane(i18n: I18n, text: String, parse_error: String) -> editor::EditorFormPane {
+    editor::EditorFormPane {
+        i18n,
+        rows: Vec::new(),
+        document: text.clone(),
+        pretty: text,
+        error_count: 0,
+        orphan_errors: Vec::new(),
+        parse_error: Some(parse_error),
+        focus_path: String::new(),
+        auto_open_add: false,
+        is_view_definition: false,
+        needs_js: true, // #843: the page's own inline render, always needs-js
+    }
+}
+
+/// The View Definitions page's guided-form panel for whichever document this
+/// render selected (#843): the stored view, `?vd=new`'s starter document, or
+/// `None` when there is no selection at all. Shared by the page's own GET
+/// handler and, indirectly through the same shape, the Save-error re-render.
+fn vd_form_pane_for_selection(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    is_new: bool,
+    selected_value: Option<&serde_json::Value>,
+) -> Option<editor::EditorFormPane> {
+    if is_new {
+        Some(render_vd_form_pane(
+            i18n,
+            version,
+            sql_views::starter_view_definition_value(),
+        ))
+    } else {
+        selected_value.map(|vd| render_vd_form_pane(i18n, version, vd.clone()))
+    }
 }
 
 /// Resolves one candidate ViewDefinition id against this render's own page
@@ -2743,6 +2822,9 @@ async fn sql_view_definitions_page(
         },
         _ => RunResultsState::Empty,
     };
+    // #843: the guided-form panel next to the JSON editor, built inline from
+    // whichever document `selected` already resolved above.
+    let form_pane = vd_form_pane_for_selection(i18n, rv.0, is_new, selected_value.as_ref());
 
     render(SqlViewDefinitionsPage {
         status: current_status(&state, rv.0, &rt),
@@ -2755,6 +2837,7 @@ async fn sql_view_definitions_page(
         degraded,
         selected,
         is_new,
+        form_pane,
         run_results: RunResultsPartial {
             i18n,
             fragment: false,
@@ -2823,8 +2906,20 @@ async fn sql_view_definitions_save(
     rt: RequestTenant,
     axum::Form(form): axum::Form<SqlVdSaveForm>,
 ) -> Response {
-    let error_page =
-        |save_error: String, json: String, is_new: bool, id: String| SqlViewDefinitionsPage {
+    let error_page = |save_error: String, json: String, is_new: bool, id: String| {
+        // #843: the guided-form panel keeps up with whatever the user
+        // submitted — parses it exactly like `editor::render_body` would, so
+        // a Save that failed only because of the resource's own contents
+        // (not its JSON syntax) still shows a form built from it; text that
+        // fails to parse gets the same invalid-JSON notice `render_body`'s
+        // own malformed-document branch renders.
+        let form_pane = match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(document) => render_vd_form_pane(I18n::new(locale), rv.0, document),
+            Err(parse_error) => {
+                invalid_vd_form_pane(I18n::new(locale), json.clone(), parse_error.to_string())
+            }
+        };
+        SqlViewDefinitionsPage {
             status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "sql-view-definitions",
@@ -2839,6 +2934,7 @@ async fn sql_view_definitions_save(
                 json,
             }),
             is_new,
+            form_pane: Some(form_pane),
             // A form-validation error re-renders in place: nothing has run
             // server-side, so this render's own results are `Empty` — same
             // as any other render with no `?saved=1`. The submitted text is
@@ -2862,7 +2958,8 @@ async fn sql_view_definitions_save(
             recent_entries: Vec::new(),
             rail_page: rail_state::RailPage::ViewDefinitions.key(),
             max_recent: rail_state::MAX_RECENT,
-        };
+        }
+    };
 
     let duplicate = form.action == "duplicate";
     let mut resource: serde_json::Value = match serde_json::from_str(form.json.trim()) {

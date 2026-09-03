@@ -50,7 +50,15 @@ actually depends on should ever fail it.
 | `tests/nl-search.spec.ts` | NL mode toggle; translation lands a query and never runs it; refusal; example chips (stubbed `/$nl-search`) |
 | `tests/search-parameters.spec.ts` | registry table, htmx rail filter, facet narrowing, row → detail |
 | `tests/tenants.spec.ts` | add-tenant slide-over, htmx search filter, delete (skips if no tenant store) |
-| `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) |
+| `tests/sql-view-definitions.spec.ts` | View Definitions playground: rail, live `$sql-run` preview (#752); the guided-form card beside the editor (#843) — add a column from the form, edit `resource` in CodeMirror and see the row (and an invalid value's error) sync back, Ctrl+Z after a form edit, the two cards' shared internally-scrolling height, and the row↔editor cross-highlight in both directions (hover a row, click a JSON line, reveal stays inside each pane's own scroll) |
+| `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) — includes `sql-view-definitions.spec.ts`'s own case: the guided-form card (#843) stays hidden and the editor works alone |
+
+Pure-function browser modules (`assets/combobox.js`, `assets/vd-editor.js`'s
+`minimalChange`) get a third, faster ring: plain Node tests under `unit/`,
+run with `npm run test:unit` — no browser, no server. `vd-editor.js` is wired
+UMD-style (`module.exports` under Node, auto-mounts under a real
+`document`) specifically so this stays possible without a second copy of the
+diff algorithm.
 
 ## Run it
 

@@ -9,6 +9,7 @@
 // — not a full-collection fetch.
 import { expect, test } from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
+import { Editor } from "../pages/editor";
 
 test("a stored ViewDefinition lists, edits, and previews rows", async ({ page, request }) => {
   const patientId = await createResource(request, "Patient", {
@@ -428,4 +429,331 @@ test("a long name clipped by the rail shows an accessible tooltip on keyboard fo
 
   await recentItem.blur();
   await expect(tooltip).toBeHidden();
+});
+
+// #843: the guided-form card beside the editor — server-rendered on first
+// paint (`.editor__grid--stretch`), driven by `editor-form.js` +
+// `vd-editor.js`, synced with the CodeMirror-mounted editor in both
+// directions. `Editor`, the same page object `editor-controls.spec.ts` uses
+// for the Resources modal and the standalone editor, works here unmodified:
+// `#vd-editor-grid` carries the identical `#editor-form`/`.editor-row`/
+// `.editor-add` contract, since it is the same engine (`editor::build_form_pane`).
+
+test("adding a column from the guided form lands the typed fields in the document and the live results", async ({
+  page,
+  request,
+}) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "GuidedAddE2E" }],
+  });
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_guided_add_column",
+    status: "active",
+    resource: "Patient",
+    where: [{ path: "name.family = 'GuidedAddE2E'" }],
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await waitSearchable(request, "Patient", patientId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  await expect(page.locator(".data-table th")).toHaveText(["id"]);
+
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const selectRow = ed.rowAt("select.0");
+  await selectRow.locator("summary.editor-add__toggle").click();
+  await selectRow.locator("[data-add-name='column']").click();
+
+  // The new column starts empty (`{}`) — an unset required primitive is
+  // never auto-scaffolded, the same "never render what is not there" rule
+  // the Resource Editor follows — so `name` and `path` are each their own
+  // add step on the new row before they exist as fields to fill.
+  const columnRow = ed.rowAt("select.0.column.1");
+  await expect(columnRow).toBeVisible();
+  await columnRow.locator("summary.editor-add__toggle").click();
+  await columnRow.locator("[data-add-name='name']").click();
+  const nameField = page.locator('[data-set="select.0.column.1.name"]');
+  await expect(nameField).toBeVisible();
+  await nameField.fill("family");
+  await nameField.blur();
+
+  // The add-picker itself survives the round trip (#547, editor-form.js
+  // reopens the same row's panel it was open on across the swap) — no
+  // second toggle click, which would only close it again.
+  await columnRow.locator("[data-add-name='path']").click();
+  const pathField = page.locator('[data-set="select.0.column.1.path"]');
+  await expect(pathField).toBeVisible();
+  await pathField.fill("name.family");
+  await pathField.blur();
+
+  // Structurally identical to writing {"name": "family", "path":
+  // "name.family"} by hand in that position - no extra keys, no dropped
+  // ones, whatever the freshly added item's own default shape was.
+  await expect
+    .poll(async () => ed.currentDoc())
+    .toMatchObject({
+      select: [
+        {
+          column: [
+            { name: "id", path: "getResourceKey()" },
+            { name: "family", path: "name.family" },
+          ],
+        },
+      ],
+    });
+
+  // The live results table (already wired to the textarea's `input`
+  // event, #752) picks up the new column without a page reload.
+  await expect(page.locator(".data-table th")).toHaveText(["id", "family"], { timeout: 3000 });
+  await expect(
+    page.locator(".data-table td", { hasText: "GuidedAddE2E" }).first(),
+  ).toBeVisible();
+});
+
+test("editing resource in the JSON editor updates the guided form's resource row, and an invalid value errors there without saving", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_resource_sync",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const resourceField = ed.rowAt("resource").locator("[data-set='resource']");
+  await expect(resourceField).toHaveValue("Patient");
+
+  const cmContent = page.locator("#vd-editor .cm-content");
+  const editTo = async (resource: string) => {
+    const doc = JSON.stringify(
+      {
+        resourceType: "ViewDefinition",
+        id: vdId,
+        name: "e2e_resource_sync",
+        status: "active",
+        resource,
+        select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+      },
+      null,
+      2,
+    );
+    await cmContent.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(doc);
+  };
+
+  // A valid change syncs into the row within the debounce window.
+  await editTo("Observation");
+  await expect(resourceField).toHaveValue("Observation", { timeout: 3000 });
+  await expect(ed.rowAt("resource")).not.toHaveClass(/editor-row--error/);
+
+  // An out-of-value-set resource is caught by the same required-binding
+  // check the Resource Editor already runs (#843's analyze()), anchored on
+  // this row - without ever posting a save.
+  await editTo("NotARealResourceType");
+  await expect(resourceField).toHaveValue("NotARealResourceType", { timeout: 3000 });
+  await expect(ed.rowAt("resource")).toHaveClass(/editor-row--error/);
+  await expect(ed.rowError("resource")).toBeVisible();
+});
+
+test("Ctrl+Z after a guided-form edit restores the previous JSON as one step", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_form_undo",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const textarea = page.locator("textarea[name='json']");
+  const before = await textarea.inputValue();
+
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const statusField = ed.rowAt("status").locator("[data-set='status']");
+  await statusField.fill("retired");
+  await statusField.blur();
+  await expect
+    .poll(async () => ed.currentDoc())
+    .toMatchObject({ status: "retired" });
+  const after = await textarea.inputValue();
+  expect(after).not.toBe(before);
+  expect(after).toContain("retired");
+
+  // The single form-driven transaction is one undo step - no
+  // CodeMirror focus race: click the editor first, same as every other
+  // keyboard-driven assertion in this file.
+  await page.locator("#vd-editor .cm-content").click();
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect(textarea).toHaveValue(before);
+});
+
+test("the editor and guided-form cards share one height and each scrolls inside itself", async ({
+  page,
+  request,
+}) => {
+  // Enough where clauses to make the JSON pane tall, and enough columns
+  // (each with its own row, description, and possible add-picker) to make
+  // the guided-form pane tall on its own - so neither card's height merely
+  // follows from the other's content by coincidence.
+  const where = Array.from({ length: 30 }, (_, i) => ({
+    path: `name.family = 'row_${i}'`,
+  }));
+  const columns = Array.from({ length: 30 }, (_, i) => ({
+    name: `column_${i}`,
+    path: `name.family`,
+  }));
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_stretch_grid",
+    status: "active",
+    resource: "Patient",
+    where,
+    select: [{ column: columns }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const grid = page.locator("#vd-editor-grid");
+  const cards = grid.locator("> .card");
+  await expect(cards).toHaveCount(2);
+
+  const [editorBox, formBox] = await Promise.all([
+    cards.nth(0).boundingBox(),
+    cards.nth(1).boundingBox(),
+  ]);
+  expect(editorBox).not.toBeNull();
+  expect(formBox).not.toBeNull();
+  expect(Math.abs(editorBox!.height - formBox!.height)).toBeLessThanOrEqual(1);
+
+  // Neither card's own height exceeds the 70vh cap the row itself enforces.
+  const viewportHeight = page.viewportSize()!.height;
+  expect(editorBox!.height).toBeLessThanOrEqual(viewportHeight * 0.7 + 1);
+
+  // Each scrolls inside its own content area rather than growing past the
+  // shared cap.
+  const scroller = page.locator("#vd-editor .cm-scroller");
+  const tree = page.locator("#vd-editor-grid .editor-tree");
+  await expect
+    .poll(async () => scroller.evaluate((el) => el.scrollHeight - el.clientHeight))
+    .toBeGreaterThan(0);
+  await expect
+    .poll(async () => tree.evaluate((el) => el.scrollHeight - el.clientHeight))
+    .toBeGreaterThan(0);
+
+  // The page itself never scrolls horizontally.
+  const overflowsX = await page.evaluate(
+    () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
+  );
+  expect(overflowsX).toBe(false);
+});
+
+// #843: the row<->editor cross-highlight (`vd-editor.js`) — CodeMirror line
+// decorations for a hovered/focused row, and a debounced cursor listener
+// that marks the row for whichever node the caret sits in. Both resolve a
+// node through the browser's own CodeMirror syntax tree, the same one
+// `vd-editor.js`'s lint diagnostics already walk (#753), so this only needs
+// to exercise the two directions and their reveal, not the tree walk itself.
+
+test("hovering a row highlights its node's lines in the editor, and leaving clears them", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_cross_highlight_hover",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const hitLines = page.locator("#vd-editor .cm-line--hit");
+
+  await ed.rowAt("select.0.column.0.path").hover();
+  await expect.poll(() => hitLines.count()).toBeGreaterThan(0);
+  await expect(hitLines.filter({ hasText: "path" }).first()).toBeVisible();
+
+  // Leaving the row (mouse over something outside the guided-form card)
+  // paints nothing.
+  await page.locator("h1.page-head__title").hover();
+  await expect(hitLines).toHaveCount(0);
+});
+
+test("clicking inside the editor's JSON highlights the row for that node", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_cross_highlight_click",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+
+  // Click the property key's own highlighted span — a `.cm-line` spans the
+  // editor's full width, so clicking its own bounding box's center (a
+  // locator's default) usually lands past a short line's visible text
+  // altogether. An exact match on the rendered `"resource"` key, not a
+  // substring one: `"resourceType"` would otherwise match too.
+  await page.locator("#vd-editor .cmt-json-key", { hasText: /^"resource"$/ }).click();
+  await expect(ed.rowAt("resource")).toHaveClass(/editor-row--hit/);
+
+  // The first column's own `name` field — the row for it, not for its
+  // enclosing column or select entry, since a cursor inside a property's
+  // key counts as that property. Two keys render as exactly `"name"`: the
+  // view's own top-level name (index 0) and this column's (index 1).
+  await page.locator("#vd-editor .cmt-json-key", { hasText: /^"name"$/ }).nth(1).click();
+  await expect(ed.rowAt("select.0.column.0.name")).toHaveClass(/editor-row--hit/);
+});
+
+test("hovering a deep row on a long document scrolls the editor pane, not the page, and reveals the line", async ({
+  page,
+  request,
+}) => {
+  // Enough columns that the last one's `path` field sits well below the
+  // editor's own viewport - the same shape the shared-height test above
+  // uses to force `.cm-scroller` to actually overflow.
+  const columns = Array.from({ length: 30 }, (_, i) => ({
+    name: `column_${i}`,
+    path: "name.family",
+  }));
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_cross_highlight_reveal",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: columns }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const scroller = page.locator("#vd-editor .cm-scroller");
+  const pageScrollBefore = await page.evaluate(() => window.scrollY);
+
+  await ed.rowAt("select.0.column.29.path").hover();
+  await expect.poll(() => scroller.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+
+  // The highlighted line lands inside the editor's own viewport...
+  const hit = page.locator("#vd-editor .cm-line--hit").first();
+  await expect(hit).toBeVisible();
+  const [hitBox, scrollerBox] = await Promise.all([hit.boundingBox(), scroller.boundingBox()]);
+  expect(hitBox).not.toBeNull();
+  expect(scrollerBox).not.toBeNull();
+  expect(hitBox!.y).toBeGreaterThanOrEqual(scrollerBox!.y - 1);
+  expect(hitBox!.y + hitBox!.height).toBeLessThanOrEqual(scrollerBox!.y + scrollerBox!.height + 1);
+
+  // ...and the page itself never moved.
+  expect(await page.evaluate(() => window.scrollY)).toBe(pageScrollBefore);
 });

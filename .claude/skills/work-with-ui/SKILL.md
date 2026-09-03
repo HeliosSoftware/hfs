@@ -87,17 +87,23 @@ through to the normal REST surface.
 - `assets/` — `htmx.min.js` (pinned), `app.css`, `fonts/`, `logo.png`, the
   shared `busy.js` (#679, `window.hfsBusy`), the vendored CodeMirror 6 bundle
   (`vendor/codemirror.bundle.js`, `window.HfsCodeMirror`) with its shared
-  mount helper `code-editor.js` (`window.HfsCodeEditor`, #838), and the
-  per-page scripts: `theme.js`, `editor.js`, `resources.js`,
-  `saved-queries.js`, `batch.js`, `history.js`, `nl-search.js`,
-  `resource-filter.js`, `conformance-crud.js`, `vd-editor.js` (ViewDefinition
-  editor, `/ui/sql/view-definitions`), `sql-editor.js` (SQL pane editor,
-  `/ui/sql/queries` and `/ui/sql/views`).
+  mount helper `code-editor.js` (`window.HfsCodeEditor`, #838), the shared
+  guided-form loop `editor-form.js` (`window.HfsEditorForm.attach(root,
+  host)`, #843), and the per-page scripts: `theme.js`, `editor.js`,
+  `resources.js`, `saved-queries.js`, `batch.js`, `history.js`,
+  `nl-search.js`, `resource-filter.js`, `conformance-crud.js`, `vd-editor.js`
+  (ViewDefinition editor, `/ui/sql/view-definitions` — also builds
+  `editor-form.js`'s host over its mounted `EditorView` and the row↔editor
+  cross-highlight between it and the guided-form card, #843), `sql-editor.js`
+  (SQL pane editor, `/ui/sql/queries` and `/ui/sql/views`).
 
-`theme.js` loads **without `defer`**, before first paint, to avoid a FOUC; every
-other script is `defer`. Busy/working states go through `hfsBusy` for
-fetch-driven code and `hx-disabled-elt` for htmx controls — see
-`crates/ui/README.md` § Busy states.
+`theme.js` loads **without `defer`**, before first paint, to avoid a FOUC —
+and, since #843, is what marks `<html class="js">` for `app.css`'s `.needs-js`
+utility (a card that renders inline, server-side, on a page's own first paint
+and needs a client-side loop wired to it before it shows — View Definitions'
+guided-form card, so far). Every other script is `defer`. Busy/working states
+go through `hfsBusy` for fetch-driven code and `hx-disabled-elt` for htmx
+controls — see `crates/ui/README.md` § Busy states.
 
 ## Rules of the road
 

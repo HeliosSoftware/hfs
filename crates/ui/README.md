@@ -161,6 +161,62 @@ there is no live preview at all: Save's own redirect (`?vd=<id>&saved=1` /
 `?lib=<id>&saved=1`) is what renders the just-stored resource's results,
 server-side, once.
 
+Beside the editor sits a guided-form card (#843, `.editor__grid--stretch` in
+`assets/app.css`): the two cards stretch to match each other's height, capped
+at 70vh, each scrolling inside its own content area past that. Both are one
+document — the editor's — with two views onto it: the card is built inline,
+server-side, on the page's own first paint from the same document the
+textarea shows (`editor::build_form_pane`, the `pane=form` engine `POST
+/ui/editor/render` also serves, called directly rather than fetched, so
+there is no post-`load` layout shift); a guided-form edit posts back through
+`assets/editor-form.js` (`pane=form`) and lands in the editor as one minimal
+transaction (`assets/vd-editor.js`'s `minimalChange`, a common-prefix/
+common-suffix diff) — undoable, and without moving the caret or the scroll;
+an editor change that transaction did not itself just cause is parsed
+600ms after the last keystroke and, if its canonical JSON actually moved,
+re-requests the panel alone. `editor::EditorFormPane`'s `is_view_definition`
+flag also selects this page's own single-line legend
+(`vd-form-legend-live`) in place of the Resource Editor's two-line one — Save
+here stays permissive (#752, above), so "checked on save" would be
+misleading. The per-keystroke pass that builds the card's rows is the same
+schema-driven validator the Resource Editor runs (`Validator::validate_sync`
+over the embedded core packs) — `ViewDefinition` is a resource type in every
+enabled version's pack, `select`/`column`/`where`/`constant` and their
+bindings included (`crates/fhir-validator/tests/pack_smoke.rs` exercises this
+per version, R4 through R6) — folded together with
+`helios_sof::lint::lint_view_definition`'s own SQL-on-FHIR-specific
+diagnostics a structural check alone cannot see (FHIRPath syntax, undeclared
+constants, duplicate column names, a `select` with no output, more than one
+iteration directive); see `SOF_ONLY_LINT_CODES` in `editor.rs` for exactly
+which lint codes fold in and why the rest are excluded (double-reporting what
+the validator already covers).
+
+The two cards also stay linked while you point at them: hovering or focusing
+a row paints the lines its node occupies in the editor, and moving the cursor
+in the editor (click, selection, or typing) lights the row for whichever node
+it now sits in — the same idea as the Resource Editor's own `editor-sync.js`,
+reimplemented in `vd-editor.js` because this page's JSON pane is a
+CodeMirror `EditorView`, not the server-rendered `.json-line[data-jpath]`
+markup that link is built on. Both directions resolve a node by walking the
+browser's own CodeMirror syntax tree — a row's dotted path
+(`select.0.column.0.path`) down to its node, or a cursor position up through
+its ancestors back to a dotted path — never by re-parsing the text by hand;
+a CodeMirror `StateField` of line decorations (`cm-line--hit` in `app.css`)
+carries the editor-side paint, reset the moment the document itself changes.
+Reveal stays inside each pane's own scroll container (`EditorView.
+scrollIntoView` for the editor, the same container-only scroll `editor-sync.
+js` uses for `.editor-tree`) — never the page's.
+
+**`needs-js`** (`assets/app.css`, `@layer components`): hides an element
+until `<html class="js">` — a class `theme.js` sets synchronously, before
+first paint (below) — so a page that renders a JavaScript-driven card inline,
+server-side, on its own first response (the guided-form card here) does not
+show it with no client-side loop wired to it yet. A consumer that needs a
+shown-state `display` other than the browser default supplies its own
+`html.js …` override next to its own layout rules (`.editor__grid--stretch`'s
+own `display: flex` override is the example). Reusable by any future page
+that renders `pane=form` inline the same way.
+
 ### Client-side scripts
 
 Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
@@ -174,7 +230,7 @@ not just a closed IIFE.
 
 | Asset | Owns |
 |---|---|
-| `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
+| `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle. Also marks `<html class="js">` (#843), synchronously, before first paint — the signal `.needs-js` (above) hides against |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
 | `saved-queries.js` | Saved queries, the visual search builder, the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
@@ -189,7 +245,8 @@ not just a closed IIFE.
 | `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
 | `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
 | `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)`, exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of |
-| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838) |
+| `editor-form.js` | The guided-form loop (#843), extracted from `editor.js`'s original: `[data-add]`/`[data-remove]`/`[data-extension]`/`[data-choose]`/`[data-set]`, the add-picker's typeahead, live `$expand` — driven against a caller-supplied `root` and `host` (`{ getDoc, setDoc, renderUrl? }`) instead of page ids, so it works over any document a host owns. `window.HfsEditorForm.attach(root, host)`; loaded only on `/ui/sql/view-definitions` so far — `editor.js` and the Resources modal's own copy of this loop are a follow-up migration |
+| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838). Also builds `editor-form.js`'s host over the mounted `EditorView` (#843): a form-driven change lands as one minimal (common-prefix/common-suffix) transaction, tagged so the sync listener skips its own echo; an editor change 600ms after the last keystroke re-requests the guided-form panel alone when its canonical JSON actually moved. Falls back to the plain `<textarea>` as the host when CodeMirror never mounted. Also drives the row↔editor cross-highlight (#843): a `StateField` of line decorations for a hovered/focused row, and a debounced cursor listener that marks the row for whichever node the caret sits in |
 | `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, and — after each `#run-notice` swap — tinting the line a parse failure names via `data-error-line` (#839); no fold or lint yet (#838) |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
@@ -450,6 +507,15 @@ in `e2e/tests/a11y.spec.ts`.
 - `AutoVaryLayer` emits `Vary: HX-Request` on handlers that read the header, so
   a cache never serves a fragment for a hard navigation. Being on this router
   gets you this for free; don't hand-roll the header.
+- **`needs-js`** (`assets/app.css`'s `.needs-js` utility, `@layer components`):
+  for a fragment rendered inline, server-side, on a page's own first paint
+  that needs a client-side loop wired to it before it should show — the
+  alternative to fetching it after `load`, which costs a visible layout
+  shift. Hidden until `<html class="js">`, a class `theme.js` sets
+  synchronously, before first paint, so a page whose script never runs (or
+  hasn't run yet) never shows a dead card. See "The one exception: a
+  vendored, prebuilt bundle" above (View Definitions' guided-form card) for
+  the concrete case this backs.
 
 Relevant htmx request/response headers we rely on: `HX-Request` (present on
 htmx-issued requests). See the
@@ -474,7 +540,7 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui` | GET | Dashboard — stat cards and the "FHIR resources over time" chart |
 | `/ui/resources` | GET | Resources workspace: type rail with live counts, search, edit modal |
 | `/ui/editor` | GET | Standalone schema-driven resource editor |
-| `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request |
+| `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request. `pane=form` (#843) renders only the guided-form panel — hidden state plus the card, no JSON view — for a host that keeps its own JSON editor (the View Definitions page's CodeMirror pane) |
 | `/ui/json-view/render` | POST | Renders raw `application/json` as a highlighted, foldable HTML fragment; applies no FHIR semantics and retains no payload |
 | `/ui/editor/expand` | GET | ValueSet expansion, proxied to `HFS_TERMINOLOGY_SERVER` |
 | `/ui/queries` | GET | Saved FHIR queries per resource type (#234) and the visual search builder |

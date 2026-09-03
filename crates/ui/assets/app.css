@@ -1379,6 +1379,33 @@ button.pill {
   border: 0;
 }
 
+/* Progressive-enhancement utility (#843): hides an element that only works
+   once JavaScript has actually run. `theme.js` marks `<html class="js">`
+   from `<head>`, without `defer`, before first paint — so "js" here means
+   "the earliest script ran", not "JavaScript is enabled" the way `[hidden]`
+   above means "the server or a script says so".
+
+   Generic on purpose — no page or container it needs to sit inside: the
+   reveal rule below is `html.js .needs-js`, nothing narrower, so any page
+   that renders a `.needs-js` element can rely on it regardless of what
+   wraps that element. `display: flex` is this crate's one real use so far
+   (View Definitions' guided-form card, a flex column) — a future consumer
+   needing a different shown-state display overrides it with a selector at
+   least as specific as this one (or later in the same layer), the same way
+   `.editor__grid--stretch`'s own layout rules add flex-item properties
+   (`flex`, `min-height`, ...) on top of this pair without touching
+   `display` themselves. Not `!important` like `[hidden]` above: two
+   declarations of ordinary weight, `display: none` and `display: flex`,
+   let a more specific override win normally instead of requiring every
+   future consumer to out-`!important` this utility too. */
+.needs-js {
+  display: none;
+}
+
+html.js .needs-js {
+  display: flex;
+}
+
 
 .stat-grid--5 {
   grid-template-columns: repeat(5, 1fr);
@@ -4407,6 +4434,91 @@ details.json-fold[open] > summary .icon {
   overflow: hidden;
 }
 
+/* View Definitions' editor + guided-form pairing (#843): the two cards grow
+   together, stretching to whichever is taller, capped at 70vh — beyond that,
+   each scrolls inside its own content area instead of growing the row.
+   `.editor__grid` alone (the Resource Editor's layout, above) does not do
+   this: each of its panes caps itself independently at 70vh (`.editor-tree`,
+   `.json-view`, below) with nothing requiring the two to match. A flex row
+   rather than a second grid template: hiding the guided-form card without
+   JavaScript (`needs-js`) then leaves the editor card alone to fill the
+   whole row, with no empty second track to collapse by hand. */
+.editor__grid--stretch {
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+  max-height: 70vh;
+}
+
+/* `display` lives in its own rule, scoped `:not(.needs-js)`: layer order
+   beats specificity in the cascade, so a `display` declared anywhere in
+   this `pages` layer would otherwise always win over `.needs-js`'s
+   `display: none` in the earlier `components` layer, `html.js` or not, if
+   this selector also matched the guided-form card — undoing the whole
+   point of that utility. `html.js .needs-js` (also `components`, specific
+   enough to win there) already resolves the guided-form card's own
+   `display: flex` generically; every other box-model property below is
+   identical for both cards and safe to share, since they do nothing to an
+   element `display: none` has already taken out of layout. */
+.editor__grid--stretch > .card:not(.needs-js) {
+  display: flex;
+}
+
+.editor__grid--stretch > .card,
+.editor__grid--stretch > .needs-js {
+  flex: 1 1 0;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 320px;
+  overflow: hidden;
+}
+
+/* The editor card's own scrolling area is whichever of the two the browser
+   actually mounted: CodeMirror's wrapper (`.code-editor`) normally, or the
+   plain `<textarea>` it replaces when the bundle never mounted.
+   Only `flex` lives here for the CodeMirror wrapper: the matching
+   `min-height`/`max-height` override that actually lets it grow past its
+   own 320px/70vh clamp to fill the stretch row lives beside the unlayered
+   rule it overrides, further down this file — a layered override of an
+   unlayered declaration always loses regardless of specificity (see that
+   section's own header comment), so `max-height: none` written here would
+   silently do nothing. The textarea fallback's own `flex: 1` moved down to
+   sit there too (`design-system.spec.ts`'s "no selector twice" guard does
+   not treat `@layer` as licensing a second definition of the same selector,
+   deliberately — a repeat is a repeat regardless of which cascade layer it
+   lives in) — with nothing here it would otherwise need to beat, `flex`
+   loses nothing by living unlayered alongside `max-height: none` instead of
+   splitting the one selector across two blocks. */
+.editor__grid--stretch #vd-editor-form {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.editor__grid--stretch .code-editor {
+  flex: 1;
+  min-height: 0;
+}
+
+/* The guided-form card: header, legend, and validity chip stay put; the row
+   tree (or, mid-edit, the invalid-JSON notice) becomes the scrolling area. */
+.editor__grid--stretch .editor-form .editor-tree,
+.editor__grid--stretch .editor-form .alert {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
+}
+
+/* `#editor-form` (`editor-hidden-form.html`) carries only hidden `<input>`s
+   — nothing to show — but as a bare `<form>` it is still a block box; inside
+   a stretch row it would otherwise get `align-items: stretch`'s full row
+   height as empty, gap-widening space between the two cards. */
+#editor-form {
+  display: none;
+}
+
 .card-head {
   display: flex;
   align-items: center;
@@ -6357,6 +6469,16 @@ body.app-shell .pane {
   background: var(--accent-soft);
 }
 
+/* Row -> editor cross-highlight (#843, vd-editor.js): a CodeMirror line
+   decoration (its own `cm-line` wrapper gains this class alongside), the
+   same `--accent-soft` wash `.json-line--hit`/`.editor-row--hit` below use
+   for the Resource Editor's own JSON<->form link — View Definitions' JSON
+   pane is CodeMirror, with no server-rendered `.json-line[data-jpath]` to
+   paint instead. */
+.code-editor .cm-line--hit {
+  background: var(--accent-soft);
+}
+
 /* drawSelection()'s caret defaults to a fixed black border-left (CM6's
    unthemed base — its `&dark` variant never applies here, see the tooltip
    comment below), invisible over a dark `--input-bg`. Tying it to the
@@ -6519,6 +6641,22 @@ body.app-shell .pane {
   max-height: 70vh;
 }
 
+/* Inside the guided-form pairing (#843, `.editor__grid--stretch` further up
+   this file, in the layered `pages` section): the row itself already caps
+   total height at 70vh and stretches both cards to match, so `.cm-editor`
+   becomes its wrapper's `flex: 1` scrolling area — `height: 100%` of
+   whatever the stretch pairing gives it — instead of clamping itself
+   independently. The 320px floor above is untouched — that minimum applies
+   either way. Written here, unlayered, beside the rule it overrides: a `pages`-
+   layer override of an unlayered declaration always loses regardless of
+   specificity (see this section's own header comment) — `max-height: none`
+   in `@layer pages` would silently do nothing against the `max-height: 70vh`
+   two lines up. */
+.editor__grid--stretch .code-editor .cm-editor {
+  height: 100%;
+  max-height: none;
+}
+
 /* #752: the plain `<textarea>` fallback's own height — the same
    "min 320px, max ~70vh, scroll internally" shape `.cm-editor` gets above,
    so nojs and the pre-mount flash match the mounted editor's footprint
@@ -6530,6 +6668,16 @@ body.app-shell .pane {
   min-height: 320px;
   max-height: 70vh;
   overflow-y: auto;
+}
+
+/* Same reasoning as `.cm-editor` above for `max-height`: inside the stretch
+   pairing the row supplies the 70vh cap, so this fallback's own copy of it
+   yields — its 320px floor does not. `flex: 1` rides along here too (moved
+   down from beside `.code-editor`'s own copy, further up this file) so the
+   selector is not declared a second time. */
+.editor__grid--stretch #vd-editor-form textarea.json-editor {
+  flex: 1;
+  max-height: none;
 }
 
 /* JSON token colors — the same variables the Resource Editor's raw JSON

@@ -1223,6 +1223,38 @@ async fn edit(form: &str) -> String {
     body_text(response).await
 }
 
+/// Builds a `pane=form` request body (#843): `doc` plus any extra fields
+/// (`op`, `path`, `name`, ...), form-urlencoded the way the browser would.
+fn form_pane_body(doc: &Value, extra: &[(&str, &str)]) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("doc", &doc.to_string());
+    serializer.append_pair("pane", "form");
+    for (key, value) in extra {
+        serializer.append_pair(key, value);
+    }
+    serializer.finish()
+}
+
+/// Slices out one row's own markup — from its `<div class="editor-row...`
+/// opening tag, found by the unique `data-path="{path}"` attribute every row
+/// carries, up to the next row (or the end of the fragment). `data-path` is
+/// only ever set on a row's own `<div>`, so the next occurrence reliably
+/// marks where this row's markup ends.
+fn row_html<'a>(html: &'a str, path: &str) -> &'a str {
+    let needle = format!(r#"data-path="{path}""#);
+    let attr_start = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no row rendered for path {path:?} in: {html}"));
+    let div_start = html[..attr_start]
+        .rfind(r#"<div class="editor-row"#)
+        .expect("data-path is only ever set on a row's own <div>");
+    let next_row = html[attr_start + needle.len()..]
+        .find(r#"data-path=""#)
+        .map(|offset| attr_start + needle.len() + offset)
+        .unwrap_or(html.len());
+    &html[div_start..next_row]
+}
+
 #[tokio::test]
 async fn editor_page_renders_the_shell() {
     let response = app()
@@ -1484,6 +1516,178 @@ async fn editor_keeps_the_users_text_when_the_json_is_broken() {
     assert!(html.contains("class=\"alert\""));
     // Their text is handed straight back, not discarded.
     assert!(html.contains("resourceType"));
+}
+
+/* `pane=form` (#843): the guided-form panel alone, for a host — View
+ * Definitions — that keeps its own JSON view and only wants this half
+ * re-rendered. Same endpoint, same `apply()`/`analyze()` pass as the full
+ * body above; only the response shape differs. */
+
+#[tokio::test]
+async fn editor_pane_form_renders_only_the_guided_form() {
+    let doc = serde_json::json!({ "resourceType": "Patient" });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+
+    assert!(html.contains(r#"id="editor-form""#));
+    assert!(html.contains(r#"id="editor-pretty""#));
+    // #843: this crate's own HTTP endpoint always renders needs_js: false
+    // - only the View Definitions page's inline server-side render
+    // (crate::render_vd_form_pane, which calls build_form_pane directly)
+    // passes true.
+    assert!(html.contains(r#"class="card editor-form""#));
+    assert!(!html.contains(r#"editor-form needs-js"#));
+    // Never the JSON pane's own markup - that stays in editor-body.html.
+    assert!(!html.contains(r#"class="editor__grid""#));
+    assert!(!html.contains(r#"class="card editor-json""#));
+    assert!(!html.contains(r#"id="json-view""#));
+    assert!(!html.contains(r#"id="editor-json-raw""#));
+}
+
+/// #843: the Resource Editor's full body never carries `needs-js` — the
+/// flag `editor::build_body` always leaves off (`EditorBody::needs_js`).
+/// Guards the regression this ticket's own review caught: an earlier
+/// revision put `needs-js` on the shared partial unconditionally, which
+/// left the guided-form card permanently `display: none` on this page (its
+/// `.editor__grid` has no `.editor__grid--stretch` to reveal it under).
+#[tokio::test]
+async fn editor_full_body_never_carries_needs_js() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+
+    assert!(html.contains(r#"class="card editor-form""#));
+    assert!(!html.contains(r#"editor-form needs-js"#));
+    assert!(!html.contains(r#"data-msg-invalid-json="#));
+}
+
+#[tokio::test]
+async fn editor_pane_form_applies_mutations_like_the_full_body() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "draft",
+        "resource": "Patient"
+    });
+    let html = edit(&form_pane_body(
+        &doc,
+        &[("op", "add"), ("path", ""), ("name", "select")],
+    ))
+    .await;
+    // The mutation landed: a `select` array with one item, and the client
+    // told which node to focus.
+    assert!(html.contains(r#"data-focus="select.0""#));
+    assert!(html.contains(r#"data-path="select.0""#));
+    // `#editor-doc` carries the result of applying the operation, HTML-escaped.
+    assert!(html.contains("&#34;select&#34;"));
+}
+
+/// #843: `select.0.column.0.path` fails to parse as FHIRPath — a check the
+/// generic validator cannot do (it doesn't know FHIRPath), so it comes
+/// entirely from `helios_sof::lint::lint_view_definition`, anchored onto the
+/// row through the same pointer-to-dotted-path conversion the unit tests in
+/// `editor.rs` cover directly.
+#[tokio::test]
+async fn editor_pane_form_anchors_a_sof_lint_error_on_its_row() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "draft",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "name.where(" }] }]
+    });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+
+    let row = row_html(&html, "select.0.column.0.path");
+    assert!(row.contains("editor-row--error"), "row: {row}");
+    assert!(row.contains("editor-row__error"), "row: {row}");
+
+    let count: usize = html
+        .split("data-error-count=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .and_then(|n| n.parse().ok())
+        .expect("data-error-count present");
+    assert!(count >= 1, "data-error-count: {count}");
+}
+
+/// A `status` outside the required `publication-status` binding is the
+/// generic validator's own job; the lint's structural codes are excluded
+/// from what gets appended (`SOF_ONLY_LINT_CODES`), so the row carries the
+/// validator's message exactly once — never a duplicate.
+#[tokio::test]
+async fn editor_pane_form_does_not_duplicate_the_validators_own_binding_error() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "bogus",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }]
+    });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+
+    let row = row_html(&html, "status");
+    assert!(row.contains("editor-row--error"), "row: {row}");
+    assert_eq!(
+        row.matches("editor-row__error").count(),
+        1,
+        "exactly one error message, no lint duplicate: {row}"
+    );
+
+    // #843: the `.editor-validity` chip's count is Fluent's own plural
+    // selector, not a formatted string — passing `usize` (not
+    // `usize::to_string()`) into `i18n.t_arg` is what lets Fluent's
+    // `{ $count -> [one] ... *[other] ... }` actually select `[one]` for
+    // exactly one issue, instead of always falling through to `[other]`.
+    assert!(html.contains("1 issue"), "{html}");
+    assert!(!html.contains("1 issues"), "{html}");
+}
+
+/// A missing `select` has no row of its own (the key is absent from the
+/// document), so the validator's "required" issue is an orphan — and the
+/// lint's own structural copy of the same rule is excluded, so it appears
+/// exactly once, not twice.
+#[tokio::test]
+async fn editor_pane_form_reports_a_missing_select_once() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "draft",
+        "resource": "Patient"
+    });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+
+    assert_eq!(html.matches("select is required").count(), 1, "{html}");
+}
+
+/// ViewDefinition's own single-line legend (#843): only the "checked as
+/// you type" line, never "checked on save" — Save stays permissive there.
+/// Any other `resourceType` keeps the Resource Editor's own two-line legend.
+#[tokio::test]
+async fn editor_pane_form_view_definition_gets_its_own_legend() {
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "draft",
+        "resource": "Patient"
+    });
+    let html = edit(&form_pane_body(&vd, &[])).await;
+    assert!(html.contains("editor-legend__live"));
+    assert!(!html.contains("editor-legend__save"));
+    // The ViewDefinition-specific key, not the Resource Editor's generic one.
+    assert!(html.contains("FHIRPath syntax"));
+
+    let patient = serde_json::json!({ "resourceType": "Patient" });
+    let html = edit(&form_pane_body(&patient, &[])).await;
+    assert!(html.contains("editor-legend__live"));
+    assert!(html.contains("editor-legend__save"));
+    assert!(!html.contains("FHIRPath syntax"));
+}
+
+/// #843: a `doc` that fails to parse still returns 200 (asserted inside
+/// `edit`) with `#editor-form` and the invalid-JSON notice in place of rows —
+/// never an HTTP error, and the user's text is untouched.
+#[tokio::test]
+async fn editor_pane_form_keeps_the_users_text_when_the_json_is_broken() {
+    let html = edit("doc=%7B%22resourceType%22%3A&pane=form").await;
+
+    assert!(html.contains(r#"id="editor-form""#));
+    assert!(html.contains("class=\"alert\""));
+    assert!(html.contains("resourceType"));
+    assert!(!html.contains("editor-row"));
+    assert!(!html.contains(r#"class="editor__grid""#));
 }
 
 /* History & Versions (#236). The diff is computed server-side; these post two
@@ -3215,6 +3419,156 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     // `?vd=new` selects the starter document, so the results region's own
     // load trigger fires for it exactly like a stored view.
     assert!(html.contains(r#"hx-trigger="load""#));
+}
+
+/// #843: the JSON editor and the guided form share one stretched grid row,
+/// and the guided form's card renders server-side on the page's own first
+/// paint — built from the same starter document `?vd=new` seeds into the
+/// textarea — with `needs-js` so it stays hidden without JavaScript until
+/// `vd-editor.js` wires it up.
+#[tokio::test]
+async fn view_definitions_page_renders_the_stretch_grid_and_the_guided_form_inline() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"id="vd-editor-grid""#));
+    assert!(html.contains(r#"class="editor__grid editor__grid--stretch""#));
+    // The guided-form card, hidden without JavaScript — built inline, never
+    // fetched, so it is present on this very response.
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+    // The starter document's `resource: "Patient"` row, flattened by the
+    // same engine the `pane=form` tests above exercise directly.
+    let row = row_html(&html, "resource");
+    assert!(row.contains(r#"data-set="resource""#), "row: {row}");
+    assert!(row.contains(r#"value="Patient""#), "row: {row}");
+    // The JSON editor's own textarea, unchanged (same form, same name).
+    assert!(html.contains(r#"<textarea class="json-editor" name="json""#));
+
+    // The three scripts the guided-form loop needs, in the order it needs
+    // them: the CodeMirror bundle and its mount helper (already asserted
+    // together elsewhere) must load before editor-form.js, which must load
+    // before vd-editor.js — each reads globals the previous one defines.
+    let helper_pos = html
+        .find("/ui/assets/code-editor.js")
+        .expect("code-editor.js");
+    let form_pos = html
+        .find("/ui/assets/editor-form.js")
+        .expect("editor-form.js");
+    let vd_pos = html.find("/ui/assets/vd-editor.js").expect("vd-editor.js");
+    assert!(
+        helper_pos < form_pos,
+        "code-editor.js must load before editor-form.js"
+    );
+    assert!(
+        form_pos < vd_pos,
+        "editor-form.js must load before vd-editor.js"
+    );
+}
+
+/// #843: a stored view's document — not just the starter one — also
+/// gets its guided-form card built inline, and the two disagreeing about the
+/// selected document would be a real bug (the panel out of sync with the
+/// textarea beside it on first paint).
+#[tokio::test]
+async fn view_definitions_page_builds_the_guided_form_from_the_selected_view() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Observation",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![vd],
+    );
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    let row = row_html(&html, "resource");
+    assert!(row.contains(r#"value="Observation""#), "row: {row}");
+}
+
+/// #843: a Save that fails re-renders the page with the guided-form panel
+/// alongside the textarea, built from the exact text the user submitted —
+/// invalid JSON gets the same invalid-JSON notice `pane=form` itself would
+/// render for it, and text that parses (just not into a valid view) still
+/// gets a form built from it.
+#[tokio::test]
+async fn view_definitions_save_error_rerenders_the_guided_form_panel_from_the_submitted_text() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    // Invalid JSON: the panel shows the invalid-JSON notice, same as
+    // `pane=form` itself would for the identical text.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("id=&action=save&json=%7Bnope"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+    assert!(html.contains("class=\"alert\""));
+    assert!(html.contains("{nope"));
+    assert!(!html.contains("editor-row"));
+
+    // Valid JSON, wrong resourceType: Save refuses it before this ever
+    // reaches storage, but the panel still renders — built from exactly
+    // what was submitted, same as any other re-render.
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair(
+            "json",
+            &serde_json::json!({"resourceType": "Patient"}).to_string(),
+        )
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("must have resourceType"));
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
 }
 
 /// #752: `?vd=<id>&saved=1` (Save's own redirect) renders the just-stored
