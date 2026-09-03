@@ -2637,9 +2637,8 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
 
     // _sort by an indexed date parameter, ascending; the patient without a
     // birthDate sorts last.
-    let sorted = SearchQuery::new("Patient").with_sort(
-        SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)),
-    );
+    let sorted = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)));
     let result = backend.search(&tenant, &sorted).await.unwrap();
     assert_eq!(
         ids(&result),
@@ -2652,9 +2651,8 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
     );
 
     // Descending; keyed resources reverse, the unkeyed one still sorts last.
-    let sorted_desc = SearchQuery::new("Patient").with_sort(
-        SortDirective::parse("-birthdate").with_param_type(Some(SearchParamType::Date)),
-    );
+    let sorted_desc = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("-birthdate").with_param_type(Some(SearchParamType::Date)));
     let result = backend.search(&tenant, &sorted_desc).await.unwrap();
     assert_eq!(
         ids(&result),

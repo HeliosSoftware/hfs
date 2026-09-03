@@ -980,8 +980,7 @@ impl MongoBackend {
                 // at all (#881).
                 let mut positive = param.clone();
                 positive.modifier = None;
-                let filter =
-                    self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+                let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
                 let matching = self.distinct_resource_ids(&search_index, filter).await?;
                 let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
                 all.difference(&matching).cloned().collect::<HashSet<_>>()
@@ -2061,8 +2060,11 @@ mod query_support_tests {
     use super::*;
     use crate::backends::mongodb::MongoBackendConfig;
 
+    /// `birthdate:missing=true` carries the value `true`, which is not a
+    /// date — `:missing` must be accepted as presence-only (#881) rather
+    /// than falling through to type-specific value parsing.
     #[test]
-    fn missing_is_rejected_before_type_specific_value_parsing() {
+    fn missing_is_supported_without_type_specific_value_parsing() {
         let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
         let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
             name: "birthdate".to_string(),
@@ -2073,13 +2075,28 @@ mod query_support_tests {
             components: vec![],
         });
 
+        assert!(backend.validate_query_support(&query).is_ok());
+    }
+
+    #[test]
+    fn below_is_still_rejected() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Below),
+            values: vec![SearchValue::eq("http://example.org|abc")],
+            chain: vec![],
+            components: vec![],
+        });
+
         let error = backend.validate_query_support(&query).unwrap_err();
         assert!(matches!(
             error,
             StorageError::Search(SearchError::UnsupportedModifier {
                 ref modifier,
                 ..
-            }) if modifier == "missing"
+            }) if modifier == "below"
         ));
     }
 }
