@@ -4144,7 +4144,7 @@ async fn capability_json_expand(
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<CapabilityJsonQuery>,
-    headers: HeaderMap,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     let version = match query.version.as_deref() {
